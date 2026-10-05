@@ -24,7 +24,7 @@ impl ApiError {
             Code::Unauthorized => StatusCode::UNAUTHORIZED,
             Code::NotFound => StatusCode::NOT_FOUND,
             Code::Conflict => StatusCode::CONFLICT,
-            Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Code::Unavailable | Code::Uncertain => StatusCode::SERVICE_UNAVAILABLE,
             Code::Internal | Code::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -80,7 +80,9 @@ impl IntoResponse for ApiError {
 
 /// What kind of failure a storage error is to a caller. Whatever is not
 /// the caller's doing and may pass is unavailable; only what should never
-/// happen is internal, and that is said without the detail.
+/// happen is internal, and that is said without the detail. A commit that
+/// failed as a whole, rather than one caller's part of it, may or may not
+/// have been recorded.
 fn code(error: &StorageError) -> Code {
     use StorageError as E;
     match error {
@@ -97,7 +99,7 @@ fn code(error: &StorageError) -> Code {
         | E::Embedding { .. }
         | E::Closed
         | E::Diverged { .. } => Code::Unavailable,
-        E::Shared(shared) => code(shared),
+        E::Shared(_) => Code::Uncertain,
         E::Missing { .. }
         | E::Corrupt { .. }
         | E::UnsupportedVersion { .. }

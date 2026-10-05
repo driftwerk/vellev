@@ -11,8 +11,9 @@ use vellev_index::fusion::Fusion;
 pub const ROOT: &str = "/v1";
 
 /// A request header naming the position a tenant's data must have reached
-/// before the request is answered: what a write of the caller's own
-/// answered with. A node that is not there yet answers `unavailable`.
+/// before a read is answered: what a write of the caller's own answered
+/// with. The node that writes a tenant is always there, and today only it
+/// answers for the tenant.
 pub const MIN_POSITION: &str = "x-vellev-min-position";
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -25,9 +26,12 @@ pub enum Code {
     NotFound,
     /// The request disagrees with what is stored.
     Conflict,
-    /// The node cannot serve this now; the same request may succeed later
-    /// or on another node.
+    /// The node cannot serve this now, and the request has had no effect;
+    /// the same request may succeed later or on another node.
     Unavailable,
+    /// A write failed at a point where nobody can say whether it took
+    /// effect. Read before deciding to send it again.
+    Uncertain,
     Internal,
     /// A code this client does not know, from a newer node.
     #[serde(other)]
@@ -207,24 +211,6 @@ pub enum Change {
         collection: CollectionName,
         filter: Filter,
     },
-}
-
-impl Change {
-    /// Whether making the change twice leaves what making it once does, so
-    /// that it can be sent again when nobody knows if it arrived.
-    pub fn is_repeatable(&self) -> bool {
-        match self {
-            Self::Insert { .. } | Self::Increment { .. } => false,
-            Self::Append { unique, .. } => *unique,
-            Self::Patch { only_if, .. } => only_if.is_none(),
-            Self::CreateCollection { .. }
-            | Self::AddProperty { .. }
-            | Self::DropCollection { .. }
-            | Self::Upsert { .. }
-            | Self::Delete { .. }
-            | Self::DeleteWhere { .. } => true,
-        }
-    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -456,47 +442,6 @@ mod tests {
                 "{unknown}"
             );
         }
-    }
-
-    #[test]
-    fn only_a_change_that_can_be_made_twice_without_harm_is_repeatable() {
-        let id = "00000000-0000-0000-0000-000000000001";
-        let change = |fields: Json| -> Change {
-            let mut change = json!({ "collection": "Notes", "id": id });
-            let fields = fields.as_object().unwrap().clone();
-            change.as_object_mut().unwrap().extend(fields);
-            serde_json::from_value(change).unwrap()
-        };
-        let only_if = json!({ "property": "n", "equals": 1 });
-        for (fields, repeatable) in [
-            (json!({ "op": "upsert" }), true),
-            (json!({ "op": "delete" }), true),
-            (json!({ "op": "patch" }), true),
-            (json!({ "op": "patch", "only_if": only_if }), false),
-            (json!({ "op": "insert" }), false),
-            (
-                json!({ "op": "increment", "property": "n", "by": 1 }),
-                false,
-            ),
-            (
-                json!({ "op": "append", "property": "tags", "values": ["a"] }),
-                false,
-            ),
-            (
-                json!({ "op": "append", "property": "tags", "values": ["a"], "unique": true }),
-                true,
-            ),
-        ] {
-            assert_eq!(
-                change(fields.clone()).is_repeatable(),
-                repeatable,
-                "{fields}"
-            );
-        }
-        let dropped: Change =
-            serde_json::from_value(json!({ "op": "drop_collection", "collection": "Notes" }))
-                .unwrap();
-        assert!(dropped.is_repeatable());
     }
 
     #[test]

@@ -1,28 +1,31 @@
 //! Client for the vellev HTTP API.
 //!
-//! A [`Client`] knows several nodes and asks whichever answers. What a
-//! node cannot serve just now, or a node that cannot be reached, is tried
-//! again on the next node, unless that could make a change twice. The
-//! client remembers the position of its own last write to each tenant and
-//! asks every read to be at least that fresh, so that it always reads its
-//! own writes whichever node answers.
+//! A [`Client`] knows several nodes and asks whichever serves a tenant. A
+//! request that fails in a way that may pass is sent again, on the next
+//! node, but only when that cannot make a change twice: a read always, a
+//! write only when it never arrived or the node says it had no effect. A
+//! write whose fate nobody knows is reported as such and never sent again.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::{Method, StatusCode};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Serialize;
 use vellev_api::{
-    Batch, Change, Changes, Code, Collections, Content, Counted, Counting, Failure, Hybrid,
-    Keyword, Nearest, Objects, Page, Results, Stored, Tenants, Written, MIN_POSITION, ROOT,
+    Batch, Change, Changes, Code, Collections, Content, Counted, Failure, Hybrid, Keyword, Nearest,
+    Objects, Page, Results, Stored, Tenants, Written, MIN_POSITION, ROOT,
 };
 use vellev_core::{Collection, CollectionName, ObjectId, Property, TenantId};
 use vellev_index::filter::Filter;
 
 pub use vellev_api as api;
+
+/// The longest wait between two tries.
+const LONGEST_BACKOFF: Duration = Duration::from_secs(5);
+/// How much of an answer that is not the API's is kept for the error.
+const KEPT_BODY: usize = 300;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -35,11 +38,34 @@ pub enum Error {
         code: Code,
         message: String,
     },
-    /// The node answered with something that is not the API's.
-    #[error("vellev answered {status} with a body that is not its own")]
-    Status { status: StatusCode },
+    /// Something answered that is not the API, such as a load balancer.
+    #[error("{status} from something that is not vellev: {body}")]
+    Status { status: StatusCode, body: String },
+    /// The node answered a success the client could not read.
+    #[error("vellev's answer could not be read: {0}")]
+    Decode(#[from] serde_json::Error),
+    /// [`Records::store_all`] failed part of the way: `stored` objects are
+    /// stored, the last of them readable from `position`.
+    #[error("{stored} objects stored before a failure: {source}")]
+    Partial {
+        stored: usize,
+        position: Option<u64>,
+        source: Box<Error>,
+    },
     #[error("{0}")]
-    Invalid(String),
+    Unusable(&'static str),
+}
+
+/// How a request ended, as far as resending it is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// It had no effect, and the same request may succeed later or on
+    /// another node.
+    NoEffect,
+    /// It may or may not have been carried out.
+    Unknown,
+    /// It was refused for good.
+    Final,
 }
 
 impl Error {
@@ -47,6 +73,7 @@ impl Error {
     pub fn code(&self) -> Option<Code> {
         match self {
             Self::Api { code, .. } => Some(*code),
+            Self::Partial { source, .. } => source.code(),
             _ => None,
         }
     }
@@ -55,19 +82,24 @@ impl Error {
         self.code() == Some(Code::NotFound)
     }
 
-    /// Whether the request never reached a node, so that it cannot have
-    /// had any effect.
-    fn never_arrived(&self) -> bool {
-        matches!(self, Self::Http(error) if error.is_connect())
+    /// Whether a write that failed this way may nevertheless have been
+    /// made. Read before making it again.
+    pub fn is_unknown_outcome(&self) -> bool {
+        self.fate() == Fate::Unknown
     }
 
-    /// Whether another node, or the same one later, might answer.
-    fn may_pass(&self) -> bool {
+    fn fate(&self) -> Fate {
         match self {
-            Self::Http(error) => error.is_connect() || error.is_timeout(),
-            Self::Api { code, .. } => *code == Code::Unavailable,
-            Self::Status { status } => status.is_server_error(),
-            Self::Invalid(_) => false,
+            Self::Http(error) if error.is_connect() => Fate::NoEffect,
+            Self::Http(_) | Self::Decode(_) => Fate::Unknown,
+            Self::Api { code, .. } => match code {
+                Code::Unavailable => Fate::NoEffect,
+                Code::Uncertain => Fate::Unknown,
+                _ => Fate::Final,
+            },
+            Self::Status { status, .. } if status.is_server_error() => Fate::Unknown,
+            Self::Status { .. } | Self::Unusable(_) => Fate::Final,
+            Self::Partial { source, .. } => source.fate(),
         }
     }
 }
@@ -76,12 +108,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// How long one try of a request may take.
+    /// How long one try of a request may take; see [`Client::within`].
     pub timeout: Duration,
     /// How many times a request is tried in all.
     pub attempts: u32,
-    /// How long to wait before the second try; each wait after is twice
-    /// the one before.
+    /// How long to wait once every node has been tried; each wait after
+    /// is twice the one before.
     pub backoff: Duration,
     /// The most objects [`Records::store_all`] sends in one request.
     pub batch_objects: usize,
@@ -102,33 +134,44 @@ impl Default for Options {
     }
 }
 
+/// What the client has learnt about a tenant.
+#[derive(Debug, Default, Clone, Copy)]
+struct Known {
+    /// The node that last answered for it.
+    node: usize,
+    /// The position of this client's last write to it.
+    position: Option<u64>,
+}
+
 struct Inner {
     nodes: Vec<String>,
     key: Option<String>,
     http: reqwest::Client,
     options: Options,
-    /// The node that last answered, asked first next time.
-    preferred: AtomicUsize,
-    positions: Mutex<HashMap<TenantId, u64>>,
+    /// By tenant; requests that concern no tenant are filed under `None`.
+    known: Mutex<HashMap<Option<TenantId>, Known>>,
 }
 
 #[derive(Clone)]
-pub struct Client(Arc<Inner>);
+pub struct Client {
+    inner: Arc<Inner>,
+    timeout: Duration,
+}
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
-            .field("nodes", &self.0.nodes)
-            .field("options", &self.0.options)
+            .field("nodes", &self.inner.nodes)
+            .field("options", &self.inner.options)
             .finish_non_exhaustive()
     }
 }
 
-/// Whether a request may be sent again when nobody knows if it arrived.
+/// What a request is, as far as sending it again is concerned.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Repeat {
-    Freely,
-    OnlyIfItNeverArrived,
+enum Kind {
+    Read,
+    Write,
 }
 
 impl Client {
@@ -149,54 +192,64 @@ impl Client {
     }
 
     fn build(nodes: &[&str], key: Option<String>, options: Options) -> Result<Self> {
-        if nodes.is_empty() || options.attempts == 0 {
-            return Err(Error::Invalid(
-                "a client needs a node to ask and a try to ask it with".into(),
+        if nodes.is_empty() {
+            return Err(Error::Unusable("a client needs a node to ask"));
+        }
+        if options.attempts == 0 || options.batch_objects == 0 {
+            return Err(Error::Unusable(
+                "a client needs at least one try, and one object to a request",
             ));
         }
-        Ok(Self(Arc::new(Inner {
-            nodes: nodes
-                .iter()
-                .map(|node| node.trim_end_matches('/').to_string())
-                .collect(),
-            key,
-            http: reqwest::Client::builder()
-                .timeout(options.timeout)
-                .build()?,
-            options,
-            preferred: AtomicUsize::new(0),
-            positions: Mutex::default(),
-        })))
+        let nodes = nodes
+            .iter()
+            .map(|node| {
+                let node = node.trim_end_matches('/');
+                reqwest::Url::parse(node)
+                    .map(|_| node.to_string())
+                    .map_err(|_| Error::Unusable("a node must be given as a URL"))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            timeout: options.timeout,
+            inner: Arc::new(Inner {
+                nodes,
+                key,
+                http: reqwest::Client::builder().build()?,
+                options,
+                known: Mutex::default(),
+            }),
+        })
     }
 
-    /// Whether the node's process is up.
-    pub async fn live(&self) -> Result<()> {
-        self.check("/health/live").await
-    }
-
-    /// Whether the node can serve requests.
-    pub async fn ready(&self) -> Result<()> {
-        self.check("/health/ready").await
-    }
-
-    async fn check(&self, path: &str) -> Result<()> {
-        let response = self
-            .0
-            .http
-            .get(format!("{}{path}", self.0.nodes[0]))
-            .send()
-            .await?;
-        match response.status() {
-            status if status.is_success() => Ok(()),
-            status => Err(Error::Status { status }),
+    /// This client with `timeout` for each try of its requests, in place
+    /// of [`Options::timeout`]: longer for a large write, shorter where
+    /// someone is waiting.
+    pub fn within(&self, timeout: Duration) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            timeout,
         }
+    }
+
+    /// Whether the first node's process is up.
+    pub async fn live(&self) -> Result<()> {
+        let path = "/health/live";
+        let _: IgnoredAny = self.once(0, &Method::GET, path, None::<&()>, None).await?;
+        Ok(())
+    }
+
+    /// Whether the first node can serve requests.
+    pub async fn ready(&self) -> Result<()> {
+        let path = "/health/ready";
+        let _: IgnoredAny = self.once(0, &Method::GET, path, None::<&()>, None).await?;
+        Ok(())
     }
 
     /// Up to `limit` tenants after `after`, in id order.
     pub async fn tenants(&self, after: Option<&TenantId>, limit: u32) -> Result<Tenants> {
         let after = after.map_or(String::new(), |after| format!("&after={after}"));
-        let path = format!("/tenants?limit={limit}{after}");
-        self.ask(Method::GET, &path, None::<&()>, None, Repeat::Freely)
+        let path = format!("{ROOT}/tenants?limit={limit}{after}");
+        self.ask(Kind::Read, Method::GET, &path, None::<&()>, None)
             .await
     }
 
@@ -207,48 +260,62 @@ impl Client {
         }
     }
 
-    /// The position of this client's last write to `tenant`, which its
-    /// reads of the tenant are asked to have reached.
+    /// The position of this client's last write to `tenant`.
     pub fn position(&self, tenant: &TenantId) -> Option<u64> {
-        self.positions().get(tenant).copied()
+        self.known(Some(tenant)).position
     }
 
-    fn positions(&self) -> std::sync::MutexGuard<'_, HashMap<TenantId, u64>> {
-        self.0.positions.lock().expect("positions lock")
+    fn learnt(&self) -> std::sync::MutexGuard<'_, HashMap<Option<TenantId>, Known>> {
+        self.inner.known.lock().expect("client lock")
     }
 
-    /// Send a request, and again while it fails in a way that may pass and
-    /// sending it again is safe, starting each time from the node that
-    /// last answered.
+    fn known(&self, tenant: Option<&TenantId>) -> Known {
+        self.learnt()
+            .get(&tenant.cloned())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Send a request, and again while it fails in a way that may pass
+    /// and sending it again is safe, starting from the node that last
+    /// answered for the tenant. Every node is tried before any wait.
     async fn ask<T: DeserializeOwned>(
         &self,
+        kind: Kind,
         method: Method,
         path: &str,
         body: Option<&(impl Serialize + ?Sized)>,
         tenant: Option<&TenantId>,
-        repeat: Repeat,
     ) -> Result<T> {
-        let inner = &self.0;
-        let mut backoff = inner.options.backoff;
-        let mut attempt = 1;
-        loop {
-            let node = inner.preferred.load(Ordering::Relaxed) % inner.nodes.len();
-            let failure = match self.once(node, &method, path, body, tenant).await {
-                Ok(answer) => return Ok(answer),
+        let Inner { nodes, options, .. } = self.inner.as_ref();
+        let first = self.known(tenant).node;
+        let mut backoff = options.backoff;
+        for attempt in 0..options.attempts as usize {
+            let node = (first + attempt) % nodes.len();
+            let position = match kind {
+                Kind::Read => tenant.and_then(|tenant| self.position(tenant)),
+                Kind::Write => None,
+            };
+            let failure = match self.once(node, &method, path, body, position).await {
+                Ok(answer) => {
+                    self.learnt().entry(tenant.cloned()).or_default().node = node;
+                    return Ok(answer);
+                }
                 Err(failure) => failure,
             };
-            let again = match repeat {
-                Repeat::Freely => failure.may_pass(),
-                Repeat::OnlyIfItNeverArrived => failure.never_arrived(),
+            let again = match (kind, failure.fate()) {
+                (_, Fate::NoEffect) | (Kind::Read, Fate::Unknown) => true,
+                (Kind::Write, Fate::Unknown) | (_, Fate::Final) => false,
             };
-            if !again || attempt == inner.options.attempts {
+            if !again || attempt + 1 == options.attempts as usize {
                 return Err(failure);
             }
-            inner.preferred.store(node + 1, Ordering::Relaxed);
-            tokio::time::sleep(backoff).await;
-            backoff *= 2;
-            attempt += 1;
+            if (attempt + 1) % nodes.len() == 0 {
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(LONGEST_BACKOFF);
+            }
         }
+        Err(Error::Unusable("a client needs at least one try"))
     }
 
     async fn once<T: DeserializeOwned>(
@@ -257,16 +324,19 @@ impl Client {
         method: &Method,
         path: &str,
         body: Option<&(impl Serialize + ?Sized)>,
-        tenant: Option<&TenantId>,
+        position: Option<u64>,
     ) -> Result<T> {
-        let inner = &self.0;
-        let url = format!("{}{ROOT}{path}", inner.nodes[node]);
-        let request = inner.http.request(method.clone(), url);
-        let request = match &inner.key {
+        let Inner {
+            nodes, key, http, ..
+        } = self.inner.as_ref();
+        let request = http
+            .request(method.clone(), format!("{}{path}", nodes[node]))
+            .timeout(self.timeout);
+        let request = match key {
             Some(key) => request.bearer_auth(key),
             None => request,
         };
-        let request = match tenant.and_then(|tenant| self.position(tenant)) {
+        let request = match position {
             Some(position) => request.header(MIN_POSITION, position),
             None => request,
         };
@@ -279,7 +349,7 @@ impl Client {
         let bytes = response.bytes().await?;
         if status.is_success() {
             let body: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
-            return serde_json::from_slice(body).map_err(|_| Error::Status { status });
+            return Ok(serde_json::from_slice(body)?);
         }
         Err(match serde_json::from_slice::<Failure>(&bytes) {
             Ok(Failure { error }) => Error::Api {
@@ -287,7 +357,13 @@ impl Client {
                 code: error.code,
                 message: error.message,
             },
-            Err(_) => Error::Status { status },
+            Err(_) => Error::Status {
+                status,
+                body: String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .take(KEPT_BODY)
+                    .collect(),
+            },
         })
     }
 }
@@ -305,7 +381,7 @@ impl Tenant {
     }
 
     fn path(&self, rest: &str) -> String {
-        format!("/tenants/{}{rest}", self.id)
+        format!("{ROOT}/tenants/{}{rest}", self.id)
     }
 
     async fn read<T: DeserializeOwned>(
@@ -316,7 +392,7 @@ impl Tenant {
     ) -> Result<T> {
         let path = self.path(rest);
         self.client
-            .ask(method, &path, body, Some(&self.id), Repeat::Freely)
+            .ask(Kind::Read, method, &path, body, Some(&self.id))
             .await
     }
 
@@ -326,16 +402,15 @@ impl Tenant {
         method: Method,
         rest: &str,
         body: Option<&(impl Serialize + ?Sized)>,
-        repeat: Repeat,
     ) -> Result<Written> {
         let path = self.path(rest);
         let written: Written = self
             .client
-            .ask(method, &path, body, Some(&self.id), repeat)
+            .ask(Kind::Write, method, &path, body, Some(&self.id))
             .await?;
-        let mut positions = self.client.positions();
-        let reached = positions.entry(self.id.clone()).or_default();
-        *reached = written.position.max(*reached);
+        let mut learnt = self.client.learnt();
+        let known = learnt.entry(Some(self.id.clone())).or_default();
+        known.position = known.position.max(Some(written.position));
         Ok(written)
     }
 
@@ -343,7 +418,7 @@ impl Tenant {
     pub async fn create(&self) -> Result<()> {
         let path = self.path("");
         self.client
-            .ask(Method::PUT, &path, None::<&()>, None, Repeat::Freely)
+            .ask(Kind::Write, Method::PUT, &path, None::<&()>, Some(&self.id))
             .await
     }
 
@@ -352,14 +427,16 @@ impl Tenant {
         let path = self.path("");
         let dropped: Result<()> = self
             .client
-            .ask(Method::DELETE, &path, None::<&()>, None, Repeat::Freely)
+            .ask(
+                Kind::Write,
+                Method::DELETE,
+                &path,
+                None::<&()>,
+                Some(&self.id),
+            )
             .await;
-        self.client.positions().remove(&self.id);
-        match dropped {
-            Ok(()) => Ok(true),
-            Err(error) if error.is_not_found() => Ok(false),
-            Err(error) => Err(error),
-        }
+        self.client.learnt().remove(&Some(self.id.clone()));
+        found(dropped).map(|dropped| dropped.is_some())
     }
 
     pub async fn collections(&self) -> Result<Vec<Collection>> {
@@ -368,16 +445,9 @@ impl Tenant {
     }
 
     /// Apply `changes` as one atomic step, each seeing those before it.
-    /// Sent again after an unknown outcome only if every change can be
-    /// made twice without harm.
-    pub async fn change(&self, changes: Vec<Change>) -> Result<Written> {
-        let repeat = match changes.iter().all(Change::is_repeatable) {
-            true => Repeat::Freely,
-            false => Repeat::OnlyIfItNeverArrived,
-        };
+    pub async fn apply(&self, changes: Vec<Change>) -> Result<Written> {
         let batch = Batch { changes };
-        self.write(Method::POST, "/changes", Some(&batch), repeat)
-            .await
+        self.write(Method::POST, "/changes", Some(&batch)).await
     }
 
     pub fn collection(&self, collection: &CollectionName) -> Records {
@@ -393,6 +463,12 @@ impl Tenant {
 pub struct Records {
     tenant: Tenant,
     name: CollectionName,
+}
+
+#[derive(Serialize)]
+struct Counting<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<&'a Filter>,
 }
 
 impl Records {
@@ -411,103 +487,95 @@ impl Records {
 
     /// The collection's schema, or `None` if there is no such collection.
     pub async fn schema(&self) -> Result<Option<Collection>> {
-        found(
-            self.tenant
-                .read(Method::GET, &self.path(""), None::<&()>)
-                .await,
-        )
+        let path = self.path("");
+        found(self.tenant.read(Method::GET, &path, None::<&()>).await)
     }
 
     /// Creating a collection that exists exactly so changes nothing.
     pub async fn create(&self, schema: &Collection) -> Result<Written> {
         let path = self.path("");
-        self.tenant
-            .write(Method::PUT, &path, Some(schema), Repeat::Freely)
-            .await
+        self.tenant.write(Method::PUT, &path, Some(schema)).await
     }
 
     pub async fn drop(&self) -> Result<Written> {
         let path = self.path("");
-        self.tenant
-            .write(Method::DELETE, &path, None::<&()>, Repeat::Freely)
-            .await
+        self.tenant.write(Method::DELETE, &path, None::<&()>).await
     }
 
     /// Adding a property that exists unchanged changes nothing.
     pub async fn add_property(&self, property: &Property) -> Result<Written> {
         let path = self.path("/properties");
-        self.tenant
-            .write(Method::POST, &path, Some(property), Repeat::Freely)
-            .await
+        self.tenant.write(Method::POST, &path, Some(property)).await
     }
 
     pub async fn get(&self, id: ObjectId) -> Result<Option<Stored>> {
-        found(
-            self.tenant
-                .read(Method::GET, &self.object(id), None::<&()>)
-                .await,
-        )
+        let path = self.object(id);
+        found(self.tenant.read(Method::GET, &path, None::<&()>).await)
     }
 
     /// Store the object whole, replacing any stored under its id.
     pub async fn put(&self, id: ObjectId, content: &Content) -> Result<Written> {
         let path = self.object(id);
-        self.tenant
-            .write(Method::PUT, &path, Some(content), Repeat::Freely)
-            .await
+        self.tenant.write(Method::PUT, &path, Some(content)).await
     }
 
-    /// Merge into a stored object. With a condition it is sent again only
-    /// if it never arrived: a second arrival would find its own change.
+    /// Merge into a stored object: a property sent as null is removed.
     pub async fn patch(&self, id: ObjectId, changes: &Changes) -> Result<Written> {
-        let repeat = match changes.only_if {
-            None => Repeat::Freely,
-            Some(_) => Repeat::OnlyIfItNeverArrived,
-        };
-        self.tenant
-            .write(Method::PATCH, &self.object(id), Some(changes), repeat)
-            .await
+        let path = self.object(id);
+        self.tenant.write(Method::PATCH, &path, Some(changes)).await
     }
 
+    /// Deleting an object that is not stored changes nothing.
     pub async fn delete(&self, id: ObjectId) -> Result<Written> {
         let path = self.object(id);
-        self.tenant
-            .write(Method::DELETE, &path, None::<&()>, Repeat::Freely)
-            .await
+        self.tenant.write(Method::DELETE, &path, None::<&()>).await
     }
 
     /// Store every object whole, several to a request, each request one
     /// atomic step. Returns the position of the last, or `None` if there
-    /// was nothing to store.
+    /// was nothing to store. If a request fails, those before it stay
+    /// stored, and [`Error::Partial`] says how many objects that is.
     pub async fn store_all(
         &self,
         objects: impl IntoIterator<Item = (ObjectId, Content)>,
     ) -> Result<Option<u64>> {
-        let options = &self.tenant.client.0.options;
+        let options = &self.tenant.client.inner.options;
+        let mut stored = 0;
         let mut position = None;
         let mut batch: Vec<Change> = Vec::new();
         let mut bytes = 0;
-        for (id, content) in objects {
-            let Content { properties, vector } = content;
-            let upsert = Change::Upsert {
-                collection: self.name.clone(),
-                id,
-                properties,
-                vector,
+        let upserts = objects.into_iter().map(|(id, content)| Change::Upsert {
+            collection: self.name.clone(),
+            id,
+            properties: content.properties,
+            vector: content.vector,
+        });
+        for upsert in upserts.map(Some).chain([None]) {
+            let size = match &upsert {
+                Some(upsert) => serde_json::to_vec(upsert)?.len(),
+                None => 0,
             };
-            let size = serde_json::to_vec(&upsert).map_or(0, |encoded| encoded.len());
-            let full =
-                batch.len() >= options.batch_objects.max(1) || bytes + size > options.batch_bytes;
+            let full = batch.len() >= options.batch_objects
+                || bytes + size > options.batch_bytes
+                || upsert.is_none();
             if full && !batch.is_empty() {
                 let sent = std::mem::take(&mut batch);
-                position = Some(self.tenant.change(sent).await?.position);
+                let count = sent.len();
+                let written = self
+                    .tenant
+                    .apply(sent)
+                    .await
+                    .map_err(|source| Error::Partial {
+                        stored,
+                        position,
+                        source: Box::new(source),
+                    })?;
+                stored += count;
+                position = Some(written.position);
                 bytes = 0;
             }
             bytes += size;
-            batch.push(upsert);
-        }
-        if !batch.is_empty() {
-            position = Some(self.tenant.change(batch).await?.position);
+            batch.extend(upsert);
         }
         Ok(position)
     }
@@ -528,7 +596,7 @@ impl Records {
         self.search("/list", page).await
     }
 
-    pub async fn count(&self, filter: Option<Filter>) -> Result<u64> {
+    pub async fn count(&self, filter: Option<&Filter>) -> Result<u64> {
         let counted: Counted = self.search("/count", &Counting { filter }).await?;
         Ok(counted.count)
     }
