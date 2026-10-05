@@ -14,7 +14,6 @@ use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, Tenant
 use vellev_node::Tenant;
 use vellev_storage::{
     Condition, Fused, Hit, Mutation, Query as VectorQuery, Receipt, Scored, State, DEFAULT_ALPHA,
-    DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE,
 };
 use vellev_storage::{Hybrid as HybridQuery, Keywords};
 
@@ -144,7 +143,11 @@ fn mutation(change: Change) -> Mutation {
 }
 
 async fn write(app: &App, tenant: &TenantId, mutations: Vec<Mutation>) -> Answer<Written> {
-    let tenant = app.node.tenant(tenant).await?;
+    mutations.iter().try_for_each(|mutation| match mutation {
+        Mutation::CreateCollection(schema) => app.embeds_through(schema),
+        _ => Ok(()),
+    })?;
+    let tenant = app.node()?.tenant(tenant).await?;
     Ok(Json(written(tenant.write(mutations).await?)))
 }
 
@@ -176,12 +179,15 @@ fn weights(properties: &[Weighted]) -> Vec<(&str, f32)> {
     get,
     path = "/v1/tenants",
     params(TenantPage),
-    responses((status = OK, body = Tenants), (status = "4XX", body = Failure))
+    responses((status = OK, body = Tenants), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn tenants(Shared(app): Shared<App>, Asked(page): Asked<TenantPage>) -> Answer<Tenants> {
     let limit = app.limit(page.limit)?;
-    let tenants = app.node.tenants(page.after.as_ref(), limit).await?;
-    Ok(Json(Tenants { tenants }))
+    let tenants = app.node()?.tenants(page.after.as_ref(), limit).await?;
+    let next = tenants.last().filter(|_| tenants.len() == limit).cloned();
+    Ok(Json(Tenants { tenants, next }))
 }
 
 /// Creating a tenant that exists changes nothing.
@@ -189,13 +195,15 @@ pub async fn tenants(Shared(app): Shared<App>, Asked(page): Asked<TenantPage>) -
     put,
     path = "/v1/tenants/{tenant}",
     params(("tenant" = TenantId, Path,)),
-    responses((status = NO_CONTENT), (status = "4XX", body = Failure))
+    responses((status = NO_CONTENT), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn create_tenant(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
 ) -> Result<StatusCode, ApiError> {
-    app.node.create_tenant(&tenant).await?;
+    app.node()?.create_tenant(&tenant).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -204,13 +212,15 @@ pub async fn create_tenant(
     delete,
     path = "/v1/tenants/{tenant}",
     params(("tenant" = TenantId, Path,)),
-    responses((status = NO_CONTENT), (status = "4XX", body = Failure))
+    responses((status = NO_CONTENT), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn drop_tenant(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
 ) -> Result<StatusCode, ApiError> {
-    match app.node.drop_tenant(&tenant).await? {
+    match app.node()?.drop_tenant(&tenant).await? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::not_found(format!(
             "tenant {tenant} does not exist"
@@ -224,7 +234,9 @@ pub async fn drop_tenant(
     path = "/v1/tenants/{tenant}/changes",
     params(("tenant" = TenantId, Path,)),
     request_body = Batch,
-    responses((status = OK, body = Written), (status = "4XX", body = Failure))
+    responses((status = OK, body = Written), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn changes(
     Shared(app): Shared<App>,
@@ -243,13 +255,15 @@ pub async fn changes(
     get,
     path = "/v1/tenants/{tenant}/collections",
     params(("tenant" = TenantId, Path,)),
-    responses((status = OK, body = Collections), (status = "4XX", body = Failure))
+    responses((status = OK, body = Collections), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn collections(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
 ) -> Answer<Collections> {
-    let tenant = app.node.tenant(&tenant).await?;
+    let tenant = app.node()?.tenant(&tenant).await?;
     let collections = tenant.read(|state| state.collections().cloned().collect());
     Ok(Json(Collections { collections }))
 }
@@ -265,13 +279,15 @@ fn schema(state: &State, collection: &CollectionName) -> Result<Collection, ApiE
     get,
     path = "/v1/tenants/{tenant}/collections/{collection}",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
-    responses((status = OK, body = Collection), (status = "4XX", body = Failure))
+    responses((status = OK, body = Collection), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn collection(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
 ) -> Answer<Collection> {
-    let tenant = app.node.tenant(&tenant).await?;
+    let tenant = app.node()?.tenant(&tenant).await?;
     Ok(Json(tenant.read(|state| schema(state, &collection))?))
 }
 
@@ -280,7 +296,9 @@ pub async fn collection(
     path = "/v1/tenants/{tenant}/collections/{collection}",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Collection,
-    responses((status = OK, body = Written), (status = "4XX", body = Failure))
+    responses((status = OK, body = Written), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn create_collection(
     Shared(app): Shared<App>,
@@ -305,7 +323,9 @@ pub async fn create_collection(
     delete,
     path = "/v1/tenants/{tenant}/collections/{collection}",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
-    responses((status = OK, body = Written), (status = "4XX", body = Failure))
+    responses((status = OK, body = Written), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn drop_collection(
     Shared(app): Shared<App>,
@@ -320,7 +340,9 @@ pub async fn drop_collection(
     path = "/v1/tenants/{tenant}/collections/{collection}/properties",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Property,
-    responses((status = OK, body = Written), (status = "4XX", body = Failure))
+    responses((status = OK, body = Written), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn add_property(
     Shared(app): Shared<App>,
@@ -338,13 +360,15 @@ pub async fn add_property(
     get,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
-    responses((status = OK, body = Stored), (status = "4XX", body = Failure))
+    responses((status = OK, body = Stored), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn object(
     Shared(app): Shared<App>,
     Named((tenant, collection, id)): Named<(TenantId, CollectionName, ObjectId)>,
 ) -> Answer<Stored> {
-    let tenant = app.node.tenant(&tenant).await?;
+    let tenant = app.node()?.tenant(&tenant).await?;
     tenant
         .read(|state| {
             schema(state, &collection)?;
@@ -364,7 +388,9 @@ pub async fn object(
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     request_body = Content,
-    responses((status = OK, body = Written), (status = "4XX", body = Failure))
+    responses((status = OK, body = Written), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn put_object(
     Shared(app): Shared<App>,
@@ -387,7 +413,9 @@ pub async fn put_object(
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     request_body = Changes,
-    responses((status = OK, body = Written), (status = "4XX", body = Failure))
+    responses((status = OK, body = Written), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn patch_object(
     Shared(app): Shared<App>,
@@ -414,7 +442,9 @@ pub async fn patch_object(
     delete,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
-    responses((status = OK, body = Written), (status = "4XX", body = Failure))
+    responses((status = OK, body = Written), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn delete_object(
     Shared(app): Shared<App>,
@@ -459,7 +489,9 @@ fn fused(fused: Fused<'_>, vectors: bool) -> Found {
     path = "/v1/tenants/{tenant}/collections/{collection}/nearest",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Nearest,
-    responses((status = OK, body = Results), (status = "4XX", body = Failure))
+    responses((status = OK, body = Results), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn nearest(
     Shared(app): Shared<App>,
@@ -467,7 +499,8 @@ pub async fn nearest(
     Body(asked): Body<Nearest>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
-    let tenant = app.node.tenant(&tenant).await?;
+    let oversample = app.oversample(asked.oversample)?;
+    let tenant = app.node()?.tenant(&tenant).await?;
     let vector = match (asked.vector, &asked.text) {
         (Some(vector), None) => vector,
         (None, Some(text)) => tenant
@@ -485,7 +518,7 @@ pub async fn nearest(
             vector: &vector,
             limit,
             filter: asked.filter.as_ref(),
-            oversample: asked.oversample.unwrap_or(DEFAULT_OVERSAMPLE),
+            oversample,
         };
         let hits = state.search(&collection, &query)?;
         Ok(hits
@@ -494,7 +527,10 @@ pub async fn nearest(
             .collect())
     })
     .await?;
-    Ok(Json(Results { results }))
+    Ok(Json(Results {
+        results,
+        degraded: false,
+    }))
 }
 
 /// The objects whose searchable text best matches the words of a text.
@@ -503,7 +539,9 @@ pub async fn nearest(
     path = "/v1/tenants/{tenant}/collections/{collection}/keyword",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Keyword,
-    responses((status = OK, body = Results), (status = "4XX", body = Failure))
+    responses((status = OK, body = Results), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn keyword(
     Shared(app): Shared<App>,
@@ -511,7 +549,7 @@ pub async fn keyword(
     Body(asked): Body<Keyword>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
-    let tenant = app.node.tenant(&tenant).await?;
+    let tenant = app.node()?.tenant(&tenant).await?;
     let results = read(tenant, move |state| {
         let query = Keywords {
             text: &asked.text,
@@ -526,7 +564,10 @@ pub async fn keyword(
             .collect())
     })
     .await?;
-    Ok(Json(Results { results }))
+    Ok(Json(Results {
+        results,
+        degraded: false,
+    }))
 }
 
 /// The objects that best match a text by meaning and by wording together.
@@ -536,7 +577,9 @@ pub async fn keyword(
     path = "/v1/tenants/{tenant}/collections/{collection}/hybrid",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Hybrid,
-    responses((status = OK, body = Results), (status = "4XX", body = Failure))
+    responses((status = OK, body = Results), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn hybrid(
     Shared(app): Shared<App>,
@@ -544,14 +587,19 @@ pub async fn hybrid(
     Body(asked): Body<Hybrid>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
-    let tenant = app.node.tenant(&tenant).await?;
-    let vector = match asked.vector.clone() {
-        Some(vector) => Some(vector),
+    let candidates = app.candidates(asked.candidates)?;
+    let oversample = app.oversample(asked.oversample)?;
+    let alpha = asked.alpha.unwrap_or(DEFAULT_ALPHA);
+    let tenant = app.node()?.tenant(&tenant).await?;
+    let weighs_meaning = alpha > 0.0 && alpha <= 1.0;
+    let (vector, degraded) = match asked.vector {
+        Some(vector) => (Some(vector), false),
+        None if !weighs_meaning => (None, false),
         None => match tenant.query_vector(&collection, &asked.text).await {
-            Ok(vector) => vector,
+            Ok(vector) => (vector, false),
             Err(vellev_node::NodeError::Embed(error)) => {
                 tracing::warn!(%error, "searching by words alone");
-                None
+                (None, true)
             }
             Err(error) => return Err(error.into()),
         },
@@ -560,13 +608,13 @@ pub async fn hybrid(
         let query = HybridQuery {
             text: &asked.text,
             vector: vector.as_deref(),
-            alpha: asked.alpha.unwrap_or(DEFAULT_ALPHA),
+            alpha,
             fusion: asked.fusion,
             properties: &weights(&asked.properties),
             limit,
-            candidates: asked.candidates.unwrap_or(DEFAULT_CANDIDATES),
+            candidates,
             filter: asked.filter.as_ref(),
-            oversample: asked.oversample.unwrap_or(DEFAULT_OVERSAMPLE),
+            oversample,
         };
         let found = state.hybrid(&collection, &query)?;
         Ok(found
@@ -575,7 +623,7 @@ pub async fn hybrid(
             .collect())
     })
     .await?;
-    Ok(Json(Results { results }))
+    Ok(Json(Results { results, degraded }))
 }
 
 /// One page of a collection in id order.
@@ -584,7 +632,9 @@ pub async fn hybrid(
     path = "/v1/tenants/{tenant}/collections/{collection}/list",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Page,
-    responses((status = OK, body = Objects), (status = "4XX", body = Failure))
+    responses((status = OK, body = Objects), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn list(
     Shared(app): Shared<App>,
@@ -592,7 +642,7 @@ pub async fn list(
     Body(page): Body<Page>,
 ) -> Answer<Objects> {
     let limit = app.limit(page.limit)?;
-    let tenant = app.node.tenant(&tenant).await?;
+    let tenant = app.node()?.tenant(&tenant).await?;
     read(tenant, move |state| {
         let found = state.list(&collection, page.filter.as_ref(), page.after, limit + 1)?;
         let next = (found.len() > limit).then(|| found[limit - 1].id);
@@ -612,14 +662,16 @@ pub async fn list(
     path = "/v1/tenants/{tenant}/collections/{collection}/count",
     params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Counting,
-    responses((status = OK, body = Counted), (status = "4XX", body = Failure))
+    responses((status = OK, body = Counted), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
 )]
 pub async fn count(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
     Body(counting): Body<Counting>,
 ) -> Answer<Counted> {
-    let tenant = app.node.tenant(&tenant).await?;
+    let tenant = app.node()?.tenant(&tenant).await?;
     read(tenant, move |state| {
         let count = match &counting.filter {
             Some(filter) => state.select(&collection, filter)?.len(),

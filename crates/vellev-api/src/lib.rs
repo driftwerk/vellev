@@ -24,6 +24,9 @@ pub enum Code {
     /// or on another node.
     Unavailable,
     Internal,
+    /// A code this client does not know, from a newer node.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -50,18 +53,24 @@ impl Failure {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema, utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TenantPage {
-    /// The last tenant of the page before.
+    /// What the page before gave as `next`.
     pub after: Option<TenantId>,
-    pub limit: usize,
+    #[cfg_attr(feature = "openapi", param(minimum = 1))]
+    pub limit: u32,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tenants {
     pub tenants: Vec<TenantId>,
+    /// What to send as `after` for the next page; absent once a page comes
+    /// back with fewer tenants than asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<TenantId>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -218,6 +227,9 @@ pub enum Outcome {
     Deleted {
         count: u64,
     },
+    /// An outcome this client does not know, from a newer node.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What a write did, and the position from which it can be read.
@@ -246,12 +258,13 @@ pub struct Nearest {
     pub vector: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    pub limit: usize,
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
+    pub limit: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
     /// How many times `limit` candidates are scored exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oversample: Option<usize>,
+    pub oversample: Option<u32>,
     /// Whether each result carries its vector.
     #[serde(default)]
     pub vectors: bool,
@@ -266,7 +279,8 @@ pub struct Keyword {
     /// Every searchable property, equally, when empty.
     #[serde(default)]
     pub properties: Vec<Weighted>,
-    pub limit: usize,
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
+    pub limit: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
     #[serde(default)]
@@ -290,14 +304,15 @@ pub struct Hybrid {
     pub fusion: Fusion,
     #[serde(default)]
     pub properties: Vec<Weighted>,
-    pub limit: usize,
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
+    pub limit: u32,
     /// How many results each search offers for fusing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidates: Option<usize>,
+    pub candidates: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oversample: Option<usize>,
+    pub oversample: Option<u32>,
     #[serde(default)]
     pub vectors: bool,
 }
@@ -326,6 +341,10 @@ pub struct Found {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Results {
     pub results: Vec<Found>,
+    /// Set when a hybrid search could not embed its text and so ranked by
+    /// the words alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degraded: bool,
 }
 
 /// One page of a collection in id order.
@@ -338,7 +357,8 @@ pub struct Page {
     /// The last id of the page before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<ObjectId>,
-    pub limit: usize,
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
+    pub limit: u32,
     #[serde(default)]
     pub vectors: bool,
 }

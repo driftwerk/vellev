@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use eyre::Result;
+use object_store::ObjectStore;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Notify;
 use vellev::config::Config;
 use vellev::server::App;
 
@@ -17,15 +19,18 @@ struct Cli {
     command: Command,
 }
 
+#[derive(clap::Args)]
+struct Serve {
+    #[arg(long, env = "VELLEV_LISTEN", default_value = "0.0.0.0:8080")]
+    listen: SocketAddr,
+    #[command(flatten)]
+    config: Config,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run a vellev node.
-    Serve {
-        #[arg(long, env = "VELLEV_LISTEN", default_value = "0.0.0.0:8080")]
-        listen: SocketAddr,
-        #[command(flatten)]
-        config: Config,
-    },
+    Serve(Box<Serve>),
     /// Print the API's OpenAPI description.
     Openapi,
     /// Check that a node is live; exits non-zero when it is not. Container
@@ -45,18 +50,32 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     match Cli::parse().command {
-        Command::Serve { listen, config } => {
+        Command::Serve(serve) => {
+            let Serve { listen, config } = *serve;
             tracing_subscriber::fmt().json().init();
-            let node = Arc::new(config.node().await?);
-            let app = App {
-                node: node.clone(),
-                keys: config.keys()?,
-                max_limit: config.max_limit,
-            };
+            let (limits, store) = config.checked()?;
+            let app = App::new(config.keys()?, limits);
             let listener = TcpListener::bind(listen).await?;
             tracing::info!(%listen, version = env!("CARGO_PKG_VERSION"), "vellev listening");
-            vellev::server::serve(listener, app, shutdown_signal()).await?;
-            node.shutdown().await;
+            let starting = tokio::spawn(start(config.clone(), store, app.clone()));
+
+            let told = Arc::new(Notify::new());
+            let stop = told.clone();
+            let served = vellev::server::serve(listener, app.clone(), async move {
+                shutdown_signal().await;
+                stop.notify_one();
+            });
+            let drain = Duration::from_secs(config.drain_secs);
+            tokio::select! {
+                served = served => served?,
+                () = async { told.notified().await; tokio::time::sleep(drain).await } => {
+                    tracing::warn!(?drain, "stopping with requests still in flight");
+                }
+            }
+            starting.abort();
+            if let Some(node) = app.started() {
+                node.shutdown().await;
+            }
             tracing::info!("vellev stopped");
             Ok(ExitCode::SUCCESS)
         }
@@ -74,6 +93,24 @@ async fn main() -> Result<ExitCode> {
                 }
             }
         }
+    }
+}
+
+/// Reach Postgres, however long it takes, and then serve from the node.
+/// A node that gave up would be restarted into the same outage.
+async fn start(config: Config, store: Arc<dyn ObjectStore>, app: App) {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        match config.node(store.clone()).await {
+            Ok(node) => {
+                app.start(Arc::new(node));
+                tracing::info!("vellev ready");
+                return;
+            }
+            Err(error) => tracing::warn!(error = %format!("{error:#}"), ?wait, "not ready yet"),
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(10));
     }
 }
 

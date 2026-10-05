@@ -59,6 +59,8 @@ async fn a_rejected_mutation_fails_the_whole_batch_and_changes_nothing() {
         properties: Default::default(),
         vector: Some(vec![1.0; 3]),
     };
+    let mut resized = schema("notes");
+    resized.embedding.dimensions = 3;
     type Expected = fn(&StorageError) -> bool;
     let rejected: Vec<(Vec<Mutation>, Expected)> = vec![
         (vec![upsert("notes", 2, 2), bad_type], |e| {
@@ -68,7 +70,7 @@ async fn a_rejected_mutation_fails_the_whole_batch_and_changes_nothing() {
         (vec![upsert("notes", 2, 2), upsert("nope", 1, 1)], |e| {
             matches!(e, StorageError::UnknownCollection(_))
         }),
-        (vec![create("notes")], |e| {
+        (vec![Mutation::CreateCollection(Box::new(resized))], |e| {
             matches!(e, StorageError::CollectionExists(_))
         }),
         (vec![delete("nope", 1)], |e| {

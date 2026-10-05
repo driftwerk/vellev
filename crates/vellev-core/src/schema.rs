@@ -71,6 +71,7 @@ impl std::fmt::Display for DataType {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Property {
     pub name: String,
     pub data_type: DataType,
@@ -163,6 +164,7 @@ pub enum Distance {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Bm25 {
     pub k1: f32,
     pub b: f32,
@@ -178,6 +180,7 @@ impl Default for Bm25 {
 /// forgets to filter sees nothing extra.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessRule {
     /// A row is readable when this property equals the caller's identity id.
     pub owner: String,

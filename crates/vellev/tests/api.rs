@@ -57,7 +57,7 @@ async fn tenants_are_created_listed_a_page_at_a_time_and_dropped() {
     }
     assert_eq!(
         served.get("/v1/tenants?limit=2").await.1,
-        json!({ "tenants": ["acme", "mid"] })
+        json!({ "tenants": ["acme", "mid"], "next": "mid" })
     );
     assert_eq!(
         served.get("/v1/tenants?limit=2&after=mid").await.1,
@@ -111,8 +111,19 @@ async fn collections_are_created_read_extended_and_dropped() {
         json!({ "position": 1, "outcomes": [{ "outcome": "applied" }] })
     );
 
-    let (status, body) = served.put(NOTES, notes(supplied())).await;
+    let again = served.ok(Method::PUT, NOTES, Some(notes(supplied()))).await;
+    assert_eq!(
+        again,
+        json!({ "position": 1, "outcomes": [{ "outcome": "unchanged" }] })
+    );
+    let mut resized = notes(supplied());
+    resized["embedding"]["dimensions"] = json!(3);
+    let (status, body) = served.put(NOTES, resized).await;
     assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "conflict"));
+    let mut misspelt = notes(supplied());
+    misspelt["properties"][0]["searchble"] = json!(true);
+    let (status, body) = served.put(NOTES, misspelt).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"));
     let (status, body) = served
         .put("/v1/tenants/acme/collections/other", notes(supplied()))
         .await;
@@ -631,6 +642,29 @@ async fn the_description_covers_every_route_that_needs_a_key() {
             "{method} {path}"
         );
     }
+    let listing = &described["paths"]["/v1/tenants"]["get"];
+    let located: Vec<(&Value, &Value)> = listing["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|parameter| (&parameter["name"], &parameter["in"]))
+        .collect();
+    assert_eq!(
+        located,
+        [
+            (&json!("after"), &json!("query")),
+            (&json!("limit"), &json!("query"))
+        ]
+    );
+    assert_eq!(listing["parameters"][1]["schema"]["minimum"], 1);
+    assert_eq!(listing["parameters"][0]["required"], false);
+    for status in ["200", "4XX", "5XX"] {
+        assert!(listing["responses"].get(status).is_some(), "{status}");
+    }
+    assert_eq!(
+        described["components"]["schemas"]["Nearest"]["properties"]["limit"]["minimum"],
+        1
+    );
     let schemas = described["components"]["schemas"].as_object().unwrap();
     for named in [
         "Collection",
@@ -647,13 +681,19 @@ async fn the_description_covers_every_route_that_needs_a_key() {
 
 /// A stand-in embedding server, which can be made to fail: a text's
 /// vector is its length and its number of words.
+fn calls() -> &'static std::sync::atomic::AtomicUsize {
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &CALLS
+}
+
 async fn embedding_server(down: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
     use axum::extract::State;
     use std::sync::atomic::Ordering;
     let embed = |State(down): State<std::sync::Arc<std::sync::atomic::AtomicBool>>,
                  axum::Json(body): axum::Json<Value>| async move {
+        calls().fetch_add(1, Ordering::SeqCst);
         if down.load(Ordering::SeqCst) {
-            return Err(axum::http::StatusCode::BAD_REQUEST);
+            return Err((axum::http::StatusCode::BAD_REQUEST, "INTERNAL-ONLY detail"));
         }
         let vectors: Vec<[usize; 2]> = body["inputs"]
             .as_array()
@@ -675,11 +715,21 @@ async fn embedding_server(down: std::sync::Arc<std::sync::atomic::AtomicBool>) -
 
 #[tokio::test]
 async fn a_collection_that_embeds_takes_text_and_falls_back_to_words_when_it_cannot() {
-    let served = Served::new().await;
     let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let url = embedding_server(down.clone()).await;
+    let served = Cluster::new()
+        .serve_embedding_through(std::slice::from_ref(&url))
+        .await;
+    let elsewhere = json!({ "provider": "http", "url": "http://169.254.169.254/latest", "model": "m", "dimensions": 2 });
+    served.ok(Method::PUT, "/v1/tenants/acme", None).await;
+    let (status, body) = served.put(NOTES, notes(elsewhere.clone())).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"));
+    let batched = json!({ "changes": [{ "op": "create_collection", "schema": notes(elsewhere) }] });
+    let (status, body) = served.post("/v1/tenants/acme/changes", batched).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"));
     let embedding = json!({
         "provider": "http",
-        "url": embedding_server(down.clone()).await,
+        "url": format!("{url}/"),
         "model": "stand-in",
         "dimensions": 2,
         "properties": ["title"],
@@ -710,6 +760,17 @@ async fn a_collection_that_embeds_takes_text_and_falls_back_to_words_when_it_can
         .await;
     assert_eq!(fused["results"].as_array().unwrap().len(), 2);
     assert!(fused["results"][0]["distance"].is_number());
+    assert!(fused.get("degraded").is_none());
+    let before = calls().load(std::sync::atomic::Ordering::SeqCst);
+    let words_only = json!({ "text": "never embedded", "limit": 5, "alpha": 0.0 });
+    served
+        .ok(Method::POST, &format!("{NOTES}/hybrid"), Some(words_only))
+        .await;
+    assert_eq!(
+        calls().load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "no weight, no embedding"
+    );
 
     down.store(true, std::sync::atomic::Ordering::SeqCst);
     let by_words = served
@@ -721,6 +782,7 @@ async fn a_collection_that_embeds_takes_text_and_falls_back_to_words_when_it_can
         .await;
     assert_eq!(ids(&by_words), [id(2)]);
     assert!(by_words["results"][0].get("distance").is_none());
+    assert_eq!(by_words["degraded"], true);
     let (status, body) = served
         .post(
             &format!("{NOTES}/nearest"),
@@ -737,6 +799,7 @@ async fn a_collection_that_embeds_takes_text_and_falls_back_to_words_when_it_can
         (status, code(&body)),
         (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
     );
+    assert!(!body.to_string().contains("INTERNAL-ONLY"), "{body}");
     let supplied = json!({ "properties": { "title": "an owl" }, "vector": [1.0, 1.0] });
     assert_eq!(served.put(&object(3), supplied).await.0, StatusCode::OK);
     let cached = served
@@ -746,4 +809,108 @@ async fn a_collection_that_embeds_takes_text_and_falls_back_to_words_when_it_can
         cached["results"][0]["distance"].is_number(),
         "a query embedded before is remembered"
     );
+}
+
+#[tokio::test]
+async fn what_a_caller_may_ask_is_bounded_and_refusals_keep_their_shape() {
+    let served = Served::new().await;
+    four_notes(&served).await;
+    for (kind, refused) in [
+        (
+            "hybrid",
+            json!({ "text": "fox", "limit": 1, "candidates": 0 }),
+        ),
+        (
+            "hybrid",
+            json!({ "text": "fox", "limit": 1, "candidates": 101 }),
+        ),
+        (
+            "hybrid",
+            json!({ "text": "fox", "limit": 1, "candidates": 4294967295u32 }),
+        ),
+        (
+            "hybrid",
+            json!({ "text": "fox", "limit": 1, "candidates": 18446744073709551615u64 }),
+        ),
+        (
+            "hybrid",
+            json!({ "text": "fox", "limit": 1, "oversample": 1025 }),
+        ),
+        (
+            "nearest",
+            json!({ "vector": [1.0, 0.0], "limit": 1, "oversample": 0 }),
+        ),
+        (
+            "nearest",
+            json!({ "vector": [1.0, 0.0], "limit": 4294967296u64 }),
+        ),
+    ] {
+        let (status, body) = served
+            .post(&format!("{NOTES}/{kind}"), refused.clone())
+            .await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "invalid"),
+            "{kind} {refused}"
+        );
+    }
+    let allowed = json!({ "text": "fox", "limit": 1, "candidates": 100, "oversample": 1024 });
+    assert_eq!(
+        served.post(&format!("{NOTES}/hybrid"), allowed).await.0,
+        StatusCode::OK
+    );
+
+    let large = json!({ "properties": { "title": "x".repeat(MAX_BODY) } });
+    let (status, body) = served.put(&object(9), large).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::PAYLOAD_TOO_LARGE, "invalid")
+    );
+
+    let (status, body) = served.call(Method::POST, "/v1/tenants/acme", None).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::METHOD_NOT_ALLOWED, "invalid")
+    );
+
+    let unkeyed = served
+        .http
+        .get(format!("{}/v1/tenants?limit=5", served.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unkeyed.headers()["www-authenticate"], "Bearer");
+    let lowercase = served
+        .http
+        .get(format!("{}/v1/tenants?limit=5", served.url))
+        .header("authorization", format!("bearer {KEY}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lowercase.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_node_still_starting_is_live_but_not_ready_and_serves_nothing_yet() {
+    let served = Cluster::new().unstarted(&[]).await;
+    let open = |path: &'static str| served.call_as(None, Method::GET, path, None);
+    assert_eq!(open("/health/live").await.0, StatusCode::OK);
+    let (status, body) = open("/health/ready").await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    );
+    let (status, body) = served.get("/v1/tenants?limit=5").await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    );
+    assert_eq!(
+        open("/v1/tenants?limit=5").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    served.app.start(served.node.clone());
+    assert_eq!(open("/health/ready").await.0, StatusCode::OK);
+    assert_eq!(served.get("/v1/tenants?limit=5").await.0, StatusCode::OK);
 }

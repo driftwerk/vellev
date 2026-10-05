@@ -8,7 +8,7 @@ use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use vellev::server::App;
+use vellev::server::{App, Limits};
 use vellev_core::NodeId;
 use vellev_embed::Embedders;
 use vellev_node::{Node, Settings};
@@ -17,6 +17,7 @@ use vellev_storage::coordinator::MemoryCoordinator;
 
 pub const KEY: &str = "test-key";
 pub const MAX_LIMIT: usize = 50;
+pub const MAX_BODY: usize = 64 * 1024;
 
 /// What the nodes of one cluster share.
 #[derive(Clone)]
@@ -35,21 +36,36 @@ impl Cluster {
 
     /// Start a node and answer with a caller that holds its key.
     pub async fn serve(&self) -> Served {
+        self.serve_embedding_through(&[]).await
+    }
+
+    /// As [`Self::serve`], with collections allowed to name these
+    /// embedding endpoints.
+    pub async fn serve_embedding_through(&self, urls: &[String]) -> Served {
+        let served = self.unstarted(urls).await;
+        served.app.start(served.node.clone());
+        served
+    }
+
+    /// A node that is listening but has not yet reached what it serves
+    /// from.
+    pub async fn unstarted(&self, urls: &[String]) -> Served {
         let node = Arc::new(Node::new(
             self.coordinator.clone(),
             self.blobs.clone(),
             Arc::new(Embedders::new(Default::default())),
             Settings::new(NodeId::generate("node")),
         ));
-        let app = App {
-            node: node.clone(),
-            keys: [KEY.to_string(), "second-key".to_string()].into(),
-            max_limit: MAX_LIMIT,
+        let limits = Limits {
+            results: MAX_LIMIT,
+            body: MAX_BODY,
+            embedding_urls: urls.into(),
         };
+        let app = App::new([KEY.to_string(), "second-key".to_string()].into(), limits);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (stop, stopped) = oneshot::channel::<()>();
-        let served = tokio::spawn(vellev::server::serve(listener, app, async {
+        let served = tokio::spawn(vellev::server::serve(listener, app.clone(), async {
             stopped.await.ok();
         }));
         Served {
@@ -59,6 +75,7 @@ impl Cluster {
                 .build()
                 .unwrap(),
             node,
+            app,
             stop: Some(stop),
             served: Some(served),
         }
@@ -69,6 +86,7 @@ pub struct Served {
     pub url: String,
     pub http: reqwest::Client,
     pub node: Arc<Node>,
+    pub app: App,
     stop: Option<oneshot::Sender<()>>,
     served: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }

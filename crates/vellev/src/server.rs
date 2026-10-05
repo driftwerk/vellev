@@ -1,7 +1,7 @@
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use axum::extract::{Request, State as Shared};
+use axum::extract::{DefaultBodyLimit, Request, State as Shared};
 use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
 use axum::middleware::{from_fn_with_state, Next};
@@ -16,31 +16,108 @@ use utoipa::{Modify, OpenApi as _};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use vellev_api::Code;
+use vellev_core::{Collection, EmbeddingProvider};
 use vellev_node::Node;
+use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE};
 
 use crate::api;
 use crate::problem::ApiError;
 
-/// What every request is served with.
+/// The most candidates per result a search may ask to have scored exactly.
+const MAX_OVERSAMPLE: u32 = 1_024;
+
+/// What a caller may ask of the node.
 #[derive(Debug, Clone)]
-pub struct App {
-    pub node: Arc<Node>,
-    /// The keys a caller may present; with none, nobody may call.
-    pub keys: Arc<[String]>,
+pub struct Limits {
     /// The most results a search or a page may ask for.
-    pub max_limit: usize,
+    pub results: usize,
+    /// The most bytes a request's body may have.
+    pub body: usize,
+    /// The embedding endpoints a collection may name.
+    pub embedding_urls: Arc<[String]>,
+}
+
+/// What every request is served with. The node may not be there yet: a
+/// process that is up answers that it is live, and that it is not ready,
+/// while what it depends on is still being reached.
+#[derive(Clone)]
+pub struct App {
+    node: Arc<OnceLock<Arc<Node>>>,
+    /// The keys a caller may present; with none, nobody may call.
+    keys: Arc<[String]>,
+    limits: Limits,
 }
 
 impl App {
-    /// `asked` if it is a number of results the node will return.
-    pub(crate) fn limit(&self, asked: usize) -> Result<usize, ApiError> {
-        if (1..=self.max_limit).contains(&asked) {
+    pub fn new(keys: Arc<[String]>, limits: Limits) -> Self {
+        Self {
+            node: Arc::default(),
+            keys,
+            limits,
+        }
+    }
+
+    /// Serve from `node` from now on. Only the first node given is kept.
+    pub fn start(&self, node: Arc<Node>) {
+        let _ = self.node.set(node);
+    }
+
+    /// The node being served from, once there is one.
+    pub fn started(&self) -> Option<&Arc<Node>> {
+        self.node.get()
+    }
+
+    pub(crate) fn node(&self) -> Result<&Arc<Node>, ApiError> {
+        self.started()
+            .ok_or_else(|| ApiError::unavailable("the node is still starting"))
+    }
+
+    fn within(name: &str, asked: u32, most: usize) -> Result<usize, ApiError> {
+        let asked = asked as usize;
+        if (1..=most).contains(&asked) {
             Ok(asked)
         } else {
             Err(ApiError::invalid(format!(
-                "limit must be from 1 to {}, not {asked}",
-                self.max_limit
+                "{name} must be from 1 to {most}, not {asked}"
             )))
+        }
+    }
+
+    /// `asked` if it is a number of results the node will return.
+    pub(crate) fn limit(&self, asked: u32) -> Result<usize, ApiError> {
+        Self::within("limit", asked, self.limits.results)
+    }
+
+    /// How many results each side of a hybrid search offers.
+    pub(crate) fn candidates(&self, asked: Option<u32>) -> Result<usize, ApiError> {
+        let most = self.limits.results.max(DEFAULT_CANDIDATES);
+        asked.map_or(Ok(DEFAULT_CANDIDATES), |asked| {
+            Self::within("candidates", asked, most)
+        })
+    }
+
+    pub(crate) fn oversample(&self, asked: Option<u32>) -> Result<usize, ApiError> {
+        asked.map_or(Ok(DEFAULT_OVERSAMPLE), |asked| {
+            Self::within("oversample", asked, MAX_OVERSAMPLE as usize)
+        })
+    }
+
+    /// Refuse a collection that would have the node call an embedding
+    /// endpoint its operator has not named.
+    pub(crate) fn embeds_through(&self, schema: &Collection) -> Result<(), ApiError> {
+        match &schema.embedding.provider {
+            EmbeddingProvider::Http { url, .. }
+                if !self
+                    .limits
+                    .embedding_urls
+                    .iter()
+                    .any(|allowed| allowed == url.trim_end_matches('/')) =>
+            {
+                Err(ApiError::invalid(format!(
+                    "{url} is not an embedding endpoint this node may call"
+                )))
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -64,7 +141,7 @@ async fn live() -> Json<Health> {
 }
 
 async fn ready(Shared(app): Shared<App>) -> Result<Json<Health>, ApiError> {
-    app.node.ready().await?;
+    app.node()?.ready().await?;
     Ok(Json(OK))
 }
 
@@ -87,7 +164,9 @@ async fn authorized(
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, key)| key);
     let known = presented.is_some_and(|presented| {
         app.keys
             .iter()
@@ -158,6 +237,7 @@ pub fn openapi() -> OpenApi {
 pub fn router(app: App) -> Router {
     let (keyed, description) = described();
     let description = Arc::new(description);
+    let body = DefaultBodyLimit::max(app.limits.body);
     Router::new()
         .merge(keyed.route_layer(from_fn_with_state(app.clone(), authorized)))
         .route("/health/live", get(live))
@@ -166,7 +246,14 @@ pub fn router(app: App) -> Router {
             "/openapi.json",
             get(move || async move { Json(description.as_ref().clone()) }),
         )
-        .fallback(|| async { (StatusCode::NOT_FOUND, ApiError::not_found("no such route")) })
+        .fallback(|| async { ApiError::not_found("no such route") })
+        .method_not_allowed_fallback(|| async {
+            ApiError::refused(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "the route has no such method",
+            )
+        })
+        .layer(body)
         .with_state(app)
 }
 
