@@ -25,14 +25,15 @@ impl Fusion {
     pub fn shares(self, weight: f32, values: &[f32]) -> Vec<f32> {
         match self {
             Self::RelativeScore => {
+                let values: Vec<f64> = values.iter().map(|value| bounded(*value)).collect();
                 let (worst, best) = values.iter().fold(
-                    (f32::INFINITY, f32::NEG_INFINITY),
+                    (f64::INFINITY, f64::NEG_INFINITY),
                     |(worst, best), value| (worst.min(*value), best.max(*value)),
                 );
                 let spread = best - worst;
-                let share = |value: &f32| {
+                let share = |value: &f64| {
                     if spread > 0.0 {
-                        weight * (value - worst) / spread
+                        weight * ((value - worst) / spread) as f32
                     } else {
                         weight
                     }
@@ -44,6 +45,13 @@ impl Fusion {
                 .collect(),
         }
     }
+}
+
+/// `value` as a number that can be subtracted from any other: within what
+/// an `f32` holds, with one that is not a number counted as the least.
+fn bounded(value: f32) -> f64 {
+    let value = if value.is_nan() { f32::MIN } else { value };
+    f64::from(value.clamp(f32::MIN, f32::MAX))
 }
 
 #[cfg(test)]
@@ -68,6 +76,21 @@ mod tests {
             [0.25; 3]
         );
         assert_eq!(Fusion::RelativeScore.shares(0.25, &[]), [] as [f32; 0]);
+    }
+
+    #[test]
+    fn the_best_gets_exactly_the_weight_and_no_share_is_ever_not_a_number() {
+        let shares = Fusion::RelativeScore.shares(0.10957855, &[17.71248, 5.3077054]);
+        assert_eq!(shares, [0.10957855, 0.0]);
+        let relative = |values: &[f32]| Fusion::RelativeScore.shares(0.75, values);
+        let above_all = relative(&[f32::INFINITY, 1.0, 0.0]);
+        assert_eq!((above_all[0], above_all[2]), (0.75, 0.0));
+        assert!((0.0..1e-30).contains(&above_all[1]));
+        assert_eq!(relative(&[1.0, 0.0, f32::NEG_INFINITY]), [0.75, 0.75, 0.0]);
+        assert_eq!(relative(&[3e38, 0.0, -3e38]), [0.75, 0.375, 0.0]);
+        assert_eq!(relative(&[1.0, 0.0, f32::NAN])[..2], [0.75, 0.75]);
+        assert_eq!(relative(&[f32::NAN, f32::NAN]), [0.75, 0.75]);
+        assert_eq!(relative(&[f32::INFINITY, f32::INFINITY]), [0.75, 0.75]);
     }
 
     #[test]

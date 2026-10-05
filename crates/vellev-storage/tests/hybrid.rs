@@ -133,17 +133,6 @@ async fn a_search_without_weight_is_not_run_and_no_vector_leaves_the_words_alone
         for alpha in [0.0, DEFAULT_ALPHA, 1.0] {
             assert_eq!(hybrid(state, &Hybrid { alpha, ..fox(None) }), words_only);
         }
-        let unusable = [1.0, 0.0, 0.0];
-        assert_eq!(
-            hybrid(
-                state,
-                &Hybrid {
-                    alpha: 0.0,
-                    ..fox(Some(&unusable))
-                }
-            ),
-            words_only
-        );
 
         let by_vector: Vec<ObjectId> = state
             .search(&name(NOTES), &Query::nearest(&EAST, 10))
@@ -238,8 +227,8 @@ async fn each_search_offers_its_best_candidates_and_the_filter_binds_both() {
             .unwrap()[0]
             .object
             .id;
-        let expected = if best_worded == id(1) { 1.0 } else { 0.75 };
-        close(one_each[0].score, expected);
+        assert_eq!(best_worded, id(1));
+        close(one_each[0].score, 1.0);
 
         let few = hybrid(
             state,
@@ -349,6 +338,24 @@ async fn a_query_the_collection_cannot_answer_is_refused() {
             }),
             StorageError::InvalidQuery(_)
         ));
+        for alpha in [0.0, 1.0] {
+            let unusable = [1.0, 0.0, 0.0];
+            assert!(matches!(
+                refused(Hybrid {
+                    alpha,
+                    ..fox(Some(&unusable))
+                }),
+                StorageError::Object(ObjectError::VectorLength { .. })
+            ));
+            assert!(matches!(
+                refused(Hybrid {
+                    alpha,
+                    properties: &[("n", 1.0)],
+                    ..fox(Some(&EAST))
+                }),
+                StorageError::InvalidQuery(_)
+            ));
+        }
         let unknown = Filter::IsNull {
             property: "nope".into(),
         };
@@ -363,5 +370,77 @@ async fn a_query_the_collection_cannot_answer_is_refused() {
             state.hybrid(&name("missing"), &fox(None)),
             Err(StorageError::UnknownCollection(_))
         ));
+    });
+}
+
+#[tokio::test]
+async fn equal_scores_are_ordered_by_wording_then_nearness_then_id() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![
+            create(NOTES),
+            note(1, "hen", 0, Some([1.0, 0.0])),
+            note(2, "fox", 0, None),
+            note(3, "owl", 0, Some([0.0, 1.0])),
+            note(4, "fox fox fox and a hen with an owl", 0, None),
+            note(5, "owl", 0, Some([0.0, 2.0])),
+        ])
+        .await
+        .unwrap();
+    writer.partition().read(|state| {
+        for fusion in [Fusion::RelativeScore, Fusion::Ranked] {
+            let fused = hybrid(
+                state,
+                &Hybrid {
+                    alpha: 0.5,
+                    fusion,
+                    ..fox(Some(&EAST))
+                },
+            );
+            assert_eq!(
+                ids(&fused),
+                [id(1), id(2), id(4), id(3), id(5)],
+                "{fusion:?}"
+            );
+            assert_eq!(fused[0].score, fused[1].score);
+        }
+        let relative = hybrid(
+            state,
+            &Hybrid {
+                alpha: 0.5,
+                ..fox(Some(&EAST))
+            },
+        );
+        assert_eq!(relative[2].score, relative[4].score);
+    });
+}
+
+#[tokio::test]
+async fn distances_of_any_size_fuse_to_scores_that_are_numbers() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let mut schema = schema(NOTES);
+    schema.distance = Distance::L2;
+    writer
+        .commit(vec![
+            Mutation::CreateCollection(Box::new(schema)),
+            note(1, "fox", 0, Some([1.0, 0.0])),
+            note(2, "fox den", 0, Some([0.0, 2.0])),
+            note(3, "hen", 0, Some([-3e19, 0.0])),
+        ])
+        .await
+        .unwrap();
+    writer
+        .commit(vec![delete(NOTES, 2), note(4, "den", 0, Some([0.0, 2.0]))])
+        .await
+        .unwrap();
+    writer.partition().read(|state| {
+        let fused = hybrid(state, &fox(Some(&EAST)));
+        assert_eq!(ids(&fused), [id(1), id(4), id(3)]);
+        assert_eq!(fused[2].distance, Some(f32::INFINITY));
+        let scores: Vec<f32> = fused.iter().map(|fused| fused.score).collect();
+        assert_eq!((scores[0], scores[2]), (1.0, 0.0));
+        assert!(scores[1] > 0.74 && scores[1] <= 0.75);
     });
 }
