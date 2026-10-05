@@ -243,7 +243,7 @@ async fn a_query_the_collection_cannot_answer_is_refused() {
 
 #[tokio::test]
 async fn a_large_segment_is_shortlisted_and_still_honours_filters_deletes_and_newer_layers() {
-    const ROWS: u64 = 24_000;
+    const ROWS: u64 = 30_000;
     const DIMENSIONS: usize = 128;
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
@@ -257,8 +257,10 @@ async fn a_large_segment_is_shortlisted_and_still_honours_filters_deletes_and_ne
             .map(|(c, e)| c + 0.3 * e)
             .collect()
     };
+    // Groups cut across the clusters, so that a filter on the group leaves
+    // every query with near neighbours to find.
     let rows: Vec<Mutation> = (0..ROWS)
-        .map(|n| put(n, (n % 4) as i64, Some(scattered(n))))
+        .map(|n| put(n, (n / 40 % 4) as i64, Some(scattered(n))))
         .collect();
     writer
         .commit(
@@ -292,6 +294,11 @@ async fn a_large_segment_is_shortlisted_and_still_honours_filters_deletes_and_ne
     };
     let everything = |_: &Object| true;
     let in_group = |object: &Object| object.properties.get("n") == Some(&Value::Int(2));
+    let outside_group = |object: &Object| object.properties.get("n") != Some(&Value::Int(2));
+    let not_group = Filter::Ne {
+        property: "n".into(),
+        value: json!(2),
+    };
 
     writer.partition().read(|state| {
         let unfiltered = found(state, None, &everything);
@@ -304,10 +311,13 @@ async fn a_large_segment_is_shortlisted_and_still_honours_filters_deletes_and_ne
             ..Query::nearest(&queries[0], 10)
         };
         assert_eq!(state.search(&name(VECTORS), &narrow).unwrap().len(), 10);
-        assert_eq!(
-            found(state, Some(&group_is(2)), &in_group),
-            200,
-            "6,000 rows pass, so they are scored exactly"
+
+        let few = found(state, Some(&group_is(2)), &in_group);
+        assert_eq!(few, 200, "7,500 rows pass, so every one is scored");
+        let many = found(state, Some(&not_group), &outside_group);
+        assert!(
+            many >= 190,
+            "{many} of 200 found among the 22,500 rows that pass"
         );
     });
 
