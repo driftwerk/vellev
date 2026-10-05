@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// [`Fusion::Ranked`], near enough.
 const RANK_OFFSET: f32 = 60.0;
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Fusion {

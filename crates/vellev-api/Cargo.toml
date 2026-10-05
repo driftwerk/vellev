@@ -1,0 +1,17 @@
+[package]
+name = "vellev-api"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+openapi = ["dep:utoipa", "vellev-core/openapi", "vellev-index/openapi"]
+
+[dependencies]
+vellev-core.workspace = true
+vellev-index.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+utoipa = { workspace = true, optional = true }

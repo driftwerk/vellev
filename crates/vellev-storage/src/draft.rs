@@ -224,8 +224,10 @@ impl Batch<'_> {
         match mutation {
             Mutation::CreateCollection(schema) => {
                 let op = self.catalog.create_collection(schema)?;
-                self.ops.push(op);
-                Ok(Outcome::Applied)
+                Ok(op.map_or(Outcome::Unchanged, |op| {
+                    self.ops.push(op);
+                    Outcome::Applied
+                }))
             }
             Mutation::AddProperty {
                 collection,

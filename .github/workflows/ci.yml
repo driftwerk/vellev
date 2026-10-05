@@ -82,16 +82,39 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # The image's own health check is the only probe ECS and Swarm get, so
-      # prove a container built from this commit reports healthy.
-      - name: Container reports healthy
+      # prove a container built from this commit reports healthy, and that
+      # what it then serves can be written to and read back.
+      - name: Container reports healthy and serves
         run: |
           set -euo pipefail
-          docker run -d --name vellev --health-interval=1s vellev:ci
-          for _ in $(seq 1 30); do
+          docker network create vellev
+          docker run -d --name postgres --network vellev \
+            -e POSTGRES_USER=vellev -e POSTGRES_PASSWORD=vellev -e POSTGRES_DB=vellev \
+            postgres:16-alpine
+          docker run -d --name vellev --network vellev --restart on-failure \
+            --health-interval=1s -p 8080:8080 \
+            -e VELLEV_DATABASE_URL=postgres://vellev:vellev@postgres:5432/vellev \
+            -e VELLEV_STORE=file:///var/lib/vellev/cache/store \
+            -e VELLEV_API_KEYS=ci-key \
+            vellev:ci
+          for _ in $(seq 1 60); do
             status=$(docker inspect -f '{{.State.Health.Status}}' vellev)
-            [ "$status" = healthy ] && exit 0
+            [ "$status" = healthy ] && break
             sleep 1
           done
-          docker logs vellev
-          echo "::error::container never became healthy (last status: $status)"
-          exit 1
+          if [ "$status" != healthy ]; then
+            docker logs vellev
+            echo "::error::container never became healthy (last status: $status)"
+            exit 1
+          fi
+          # Healthy means the process is up; ready means it has reached Postgres.
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:8080/health/ready && break
+            sleep 1
+          done
+          call() { curl -fsS -H 'authorization: Bearer ci-key' -H 'content-type: application/json' "$@"; }
+          notes=http://127.0.0.1:8080/v1/tenants/ci/collections/notes
+          call -X PUT http://127.0.0.1:8080/v1/tenants/ci
+          call -X PUT "$notes" -d '{"name":"notes","properties":[{"name":"title","data_type":"text","searchable":true}],"embedding":{"provider":"none","model":"client","dimensions":2}}'
+          call -X PUT "$notes/objects/00000000-0000-0000-0000-000000000001" -d '{"properties":{"title":"a red fox"},"vector":[1,0]}'
+          call -X POST "$notes/hybrid" -d '{"text":"fox","vector":[1,0],"limit":1}' | tee /dev/stderr | grep -q '"a red fox"'

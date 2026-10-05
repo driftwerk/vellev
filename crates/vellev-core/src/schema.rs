@@ -33,6 +33,7 @@ pub enum SchemaError {
     PropertyConflict(String),
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DataType {
     #[serde(rename = "text")]
@@ -68,7 +69,9 @@ impl std::fmt::Display for DataType {
     }
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Property {
     pub name: String,
     pub data_type: DataType,
@@ -102,6 +105,7 @@ impl Property {
 }
 
 /// What an embedding endpoint speaks.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpApi {
@@ -112,6 +116,7 @@ pub enum HttpApi {
     Openai,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum EmbeddingProvider {
@@ -129,6 +134,7 @@ pub enum EmbeddingProvider {
     None,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Embedding {
     #[serde(flatten)]
@@ -146,6 +152,7 @@ pub struct Embedding {
     pub properties: Vec<String>,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Distance {
@@ -155,7 +162,9 @@ pub enum Distance {
     L2,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Bm25 {
     pub k1: f32,
     pub b: f32,
@@ -169,7 +178,9 @@ impl Default for Bm25 {
 
 /// Who may read a row. Enforced by the node on every query, so a caller that
 /// forgets to filter sees nothing extra.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessRule {
     /// A row is readable when this property equals the caller's identity id.
     pub owner: String,
@@ -181,6 +192,7 @@ pub struct AccessRule {
     pub team_prefix: String,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Collection {
     pub name: CollectionName,

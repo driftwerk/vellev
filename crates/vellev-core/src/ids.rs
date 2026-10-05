@@ -18,6 +18,7 @@ pub enum IdError {
 /// One organisation or edge. A tenant's data lives under its own storage
 /// prefix, so the id is restricted to characters that are safe in an object
 /// key and can never contain a path separator.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct TenantId(String);
@@ -42,6 +43,7 @@ impl TenantId {
     }
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct CollectionName(String);
@@ -129,6 +131,7 @@ impl fmt::Display for NodeId {
 }
 
 /// Supplied by the client or generated, so ids from an imported store survive.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ObjectId(pub Uuid);

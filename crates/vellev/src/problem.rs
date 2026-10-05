@@ -1,0 +1,156 @@
+//! Failures as the API reports them.
+
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::http::header::WWW_AUTHENTICATE;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use vellev_api::{Code, Failure};
+use vellev_node::NodeError;
+use vellev_storage::coordinator::CoordinatorError;
+use vellev_storage::StorageError;
+
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    code: Code,
+    message: String,
+}
+
+impl ApiError {
+    pub fn new(code: Code, message: impl Into<String>) -> Self {
+        let status = match code {
+            Code::Invalid => StatusCode::BAD_REQUEST,
+            Code::Unauthorized => StatusCode::UNAUTHORIZED,
+            Code::NotFound => StatusCode::NOT_FOUND,
+            Code::Conflict => StatusCode::CONFLICT,
+            Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Code::Internal | Code::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::new(Code::Invalid, message)
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(Code::NotFound, message)
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(Code::Unavailable, message)
+    }
+
+    /// A request that is invalid in a way HTTP has its own status for.
+    pub fn refused(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            ..Self::invalid(message)
+        }
+    }
+
+    /// What is said when a collection's embedding model cannot be used.
+    /// The cause goes to the log, not to the caller: it may quote whatever
+    /// answered at the address the collection names.
+    fn unembedded(cause: impl std::fmt::Display) -> Self {
+        tracing::warn!(%cause, "embedding failed");
+        Self::unavailable("the collection's embedding model could not be used just now")
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let Self {
+            status,
+            code,
+            message,
+        } = self;
+        let body = Json(Failure::new(code, message));
+        match code {
+            Code::Unauthorized => (status, [(WWW_AUTHENTICATE, "Bearer")], body).into_response(),
+            _ => (status, body).into_response(),
+        }
+    }
+}
+
+/// What kind of failure a storage error is to a caller. Whatever is not
+/// the caller's doing and may pass is unavailable; only what should never
+/// happen is internal, and that is said without the detail.
+fn code(error: &StorageError) -> Code {
+    use StorageError as E;
+    match error {
+        E::UnknownCollection(_) | E::UnknownObject { .. } => Code::NotFound,
+        E::CollectionExists(_) | E::ObjectExists { .. } | E::ConditionFailed { .. } => {
+            Code::Conflict
+        }
+        E::InvalidMutation(_) | E::InvalidQuery(_) | E::Schema(_) | E::Filter(_) | E::Object(_) => {
+            Code::Invalid
+        }
+        E::Coordinator(CoordinatorError::InvalidArgument(_)) => Code::Internal,
+        E::Coordinator(_)
+        | E::Blob { .. }
+        | E::Embedding { .. }
+        | E::Closed
+        | E::Diverged { .. } => Code::Unavailable,
+        E::Shared(shared) => code(shared),
+        E::Missing { .. }
+        | E::Corrupt { .. }
+        | E::UnsupportedVersion { .. }
+        | E::Exhausted(_)
+        | E::Encode(_) => Code::Internal,
+    }
+}
+
+impl From<StorageError> for ApiError {
+    fn from(error: StorageError) -> Self {
+        match (code(&error), error.root()) {
+            (_, StorageError::Embedding { .. }) => Self::unembedded(&error),
+            (Code::Internal, _) => {
+                tracing::error!(%error, "request failed");
+                Self::new(Code::Internal, "the node failed to serve the request")
+            }
+            (code, root) => Self::new(code, root.to_string()),
+        }
+    }
+}
+
+impl From<NodeError> for ApiError {
+    fn from(error: NodeError) -> Self {
+        match error {
+            NodeError::UnknownTenant(_) => Self::not_found(error.to_string()),
+            NodeError::Elsewhere { .. } | NodeError::Stopped => {
+                Self::unavailable(error.to_string())
+            }
+            NodeError::Embed(error) => Self::unembedded(error),
+            NodeError::Storage(error) => error.into(),
+        }
+    }
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        match rejection.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => {
+                Self::refused(StatusCode::PAYLOAD_TOO_LARGE, rejection.body_text())
+            }
+            _ => Self::invalid(rejection.body_text()),
+        }
+    }
+}
+
+impl From<PathRejection> for ApiError {
+    fn from(rejection: PathRejection) -> Self {
+        Self::invalid(rejection.body_text())
+    }
+}
+
+impl From<QueryRejection> for ApiError {
+    fn from(rejection: QueryRejection) -> Self {
+        Self::invalid(rejection.body_text())
+    }
+}

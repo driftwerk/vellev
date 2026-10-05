@@ -5,6 +5,9 @@ edition.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+openapi = ["dep:utoipa", "vellev-core/openapi"]
+
 [dependencies]
 vellev-core.workspace = true
 
@@ -13,6 +16,7 @@ roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

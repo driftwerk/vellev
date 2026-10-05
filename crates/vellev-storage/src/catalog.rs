@@ -76,16 +76,19 @@ impl Catalog {
         Ok(())
     }
 
-    /// Validate a new collection, add it, and return the op to log.
-    pub fn create_collection(&mut self, schema: Box<Collection>) -> Result<Op> {
+    /// Validate a new collection, add it, and return the op to log, or
+    /// `None` when the collection exists exactly as `schema` has it.
+    pub fn create_collection(&mut self, schema: Box<Collection>) -> Result<Option<Op>> {
         schema.validate()?;
-        if self.names.contains_key(&schema.name) {
-            return Err(StorageError::CollectionExists(schema.name.clone()));
+        match self.get(&schema.name) {
+            Some((_, stored)) if *stored == *schema => return Ok(None),
+            Some(_) => return Err(StorageError::CollectionExists(schema.name.clone())),
+            None => {}
         }
         let id = CollectionId(self.next_id);
         self.create(id, schema.as_ref().clone())
             .map_err(|_| StorageError::Exhausted("collection ids"))?;
-        Ok(Op::CreateCollection { id, schema })
+        Ok(Some(Op::CreateCollection { id, schema }))
     }
 
     /// Add a property and return the op to log, or `None` when the collection
