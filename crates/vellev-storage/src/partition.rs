@@ -351,6 +351,12 @@ impl Writer {
             .as_ref()
             .map(|(_, file)| encode(Kind::Segment, file))
             .transpose()?;
+        // Indexed here, before the attempt, so that readers are not held
+        // behind the write lock while a large segment is indexed.
+        let segment = segment.map(|(meta, file)| {
+            let indexes = self.partition.read(|state| state.indexed(&file.rows));
+            (meta, (Arc::new(file), Some(Arc::new(indexes))))
+        });
         let frame = encode(Kind::Manifest, &manifest)?;
         attempt(&mut ready, async {
             if let Some(segment_frame) = segment_frame {

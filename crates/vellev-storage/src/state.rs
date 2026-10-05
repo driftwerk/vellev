@@ -125,6 +125,9 @@ impl State {
     /// One page of the collection in object id order: at most `limit`
     /// objects after `after` that pass `filter`. Paging by the last id seen
     /// stays correct while rows are written and deleted in between.
+    ///
+    /// Each page selects every matching row and sorts them, so walking a
+    /// whole collection costs its size once per page.
     pub fn list(
         &self,
         collection: &CollectionName,
@@ -286,7 +289,7 @@ impl State {
     /// Index `rows` for filtering. An index built under an older catalog
     /// stays right: a collection's filterable properties never change, and a
     /// collection created since has no rows in an older layer.
-    fn indexed(&self, rows: &[Row]) -> Indexes {
+    pub(crate) fn indexed(&self, rows: &[Row]) -> Indexes {
         let mut indexes = Indexes::new();
         for (row, Row { collection, object }) in rows.iter().enumerate() {
             if let Some(schema) = self.catalog.schema(*collection) {
@@ -331,6 +334,8 @@ impl State {
                         self.forget(key);
                     });
                     self.memtable.tombstones.retain(|(c, _)| c != collection);
+                    // Nothing can ask for a dropped collection's rows;
+                    // this only frees the memory.
                     self.memtable.indexes.remove(collection);
                 }
                 Op::Upsert { collection, object } => {
@@ -343,6 +348,8 @@ impl State {
                     self.live.insert(key, Location::Memtable(row));
                     if let Some(schema) = self.catalog.schema(*collection) {
                         let index = self.memtable.indexes.entry(*collection).or_default();
+                        // A memtable is flushed long before it holds as
+                        // many rows as a segment may number.
                         index.insert(schema, row as u32, object);
                     }
                     self.memtable.rows.push(Row {
@@ -418,10 +425,10 @@ impl State {
         &mut self,
         manifest_key: &str,
         position: LogPosition,
-        segment: Option<(SegmentMeta, SegmentFile)>,
+        segment: Option<(SegmentMeta, Loaded)>,
     ) -> Result<()> {
-        if let Some((meta, file)) = segment {
-            self.attach(meta, Arc::new(file), None)?;
+        if let Some((meta, (file, indexes))) = segment {
+            self.attach(meta, file, indexes)?;
         }
         self.memtable = Memtable::default();
         self.position = position;

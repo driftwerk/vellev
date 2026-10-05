@@ -227,6 +227,11 @@ impl Batch<'_> {
             Mutation::DeleteWhere { collection, filter } => {
                 let (cid, schema) = self.collection(&collection)?;
                 let predicate = filter.compile(&schema)?;
+                if predicate.is_unconditional() {
+                    return Err(invalid(format!(
+                        "a delete from {collection} needs a condition; drop the collection to empty it"
+                    )));
+                }
                 let doomed = self.passing(cid, &predicate);
                 doomed.iter().for_each(|id| self.delete(cid, *id));
                 Ok(Outcome::Deleted(doomed.len() as u64))

@@ -64,6 +64,8 @@ pub enum Mutation {
     },
     /// Delete every object that passes `filter`, as the batch sees them:
     /// including rows it wrote earlier, excluding rows it already deleted.
+    /// A filter with no condition is refused, so that a caller who built an
+    /// empty one by accident does not empty the collection.
     DeleteWhere {
         collection: CollectionName,
         filter: Filter,

@@ -5,27 +5,32 @@
 //! ([`Predicate::matches`], the definition of what a filter means) or of a
 //! [`RowIndex`] over many ([`Predicate::select`]). The two always agree.
 //!
-//! A value that is absent matches no comparison. `ne` is exactly "not `eq`",
-//! so it does match an absent value: a row with no tags is not excluded by
-//! "tag is not x".
+//! Text matches the whole value and is never tokenized; a text array matches
+//! by element. A value must have its property's type, except that a whole
+//! number is accepted where a number is declared.
+//!
+//! A property with no value matches no comparison. `ne` is exactly "not
+//! `eq`", so it does match one: a row with no tags is not excluded by "tag is
+//! not x". An empty text array is a value, not the lack of one: `is_null`
+//! does not match it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Bound, RangeBounds};
 
 use chrono::{DateTime, Utc};
-use roaring::RoaringBitmap;
+use roaring::{MultiOps, RoaringBitmap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
-use vellev_core::{Collection, DataType, Object, ObjectError, Value};
+use vellev_core::{Collection, DataType, Object, Value};
 
 /// How deeply filters may nest; far beyond any real query, and shallow
 /// enough that evaluating one cannot exhaust the stack.
 pub const MAX_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Filter {
-    /// Equal to `value`; for a text array, contains it.
+    /// Equal to `value`; for a text array, contains the text `value`.
     Eq {
         property: String,
         value: Json,
@@ -86,7 +91,7 @@ pub enum FilterError {
 /// A single value as filters compare it. Within one property every key has
 /// the same variant, so the derived order is the value's own order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Key {
+enum Key {
     Bool(bool),
     Int(i64),
     Number(Finite),
@@ -96,7 +101,7 @@ pub enum Key {
 
 /// A finite `f64` with a total order, in which the two zeros are one value.
 #[derive(Debug, Clone, Copy)]
-pub struct Finite(f64);
+struct Finite(f64);
 
 impl Finite {
     fn new(value: f64) -> Self {
@@ -140,9 +145,13 @@ impl Key {
 }
 
 /// A filter checked against a collection: every property exists and is
-/// filterable, and every value has its property's type.
+/// filterable, and every value has its property's type. It can only be made
+/// by [`Filter::compile`].
 #[derive(Debug, Clone, PartialEq)]
-pub enum Predicate {
+pub struct Predicate(Node);
+
+#[derive(Debug, Clone, PartialEq)]
+enum Node {
     Eq {
         property: String,
         key: Key,
@@ -153,17 +162,17 @@ pub enum Predicate {
         upper: Bound<Key>,
     },
     IsNull(String),
-    And(Vec<Predicate>),
-    Or(Vec<Predicate>),
-    Not(Box<Predicate>),
+    And(Vec<Node>),
+    Or(Vec<Node>),
+    Not(Box<Node>),
 }
 
 impl Filter {
     pub fn compile(&self, collection: &Collection) -> Result<Predicate, FilterError> {
-        self.compiled(collection, MAX_DEPTH)
+        self.compiled(collection, MAX_DEPTH).map(Predicate)
     }
 
-    fn compiled(&self, collection: &Collection, depth: usize) -> Result<Predicate, FilterError> {
+    fn compiled(&self, collection: &Collection, depth: usize) -> Result<Node, FilterError> {
         let deeper = depth.checked_sub(1).ok_or(FilterError::TooDeep)?;
         let all = |filters: &[Filter]| {
             filters
@@ -171,20 +180,25 @@ impl Filter {
                 .map(|f| f.compiled(collection, deeper))
                 .collect::<Result<Vec<_>, _>>()
         };
+        let equals = |property: &String, value: &Json| {
+            key(collection, property, value).map(|key| Node::Eq {
+                property: property.clone(),
+                key,
+            })
+        };
         let range =
             |property: &String, value: &Json, bounds: fn(Key) -> (Bound<Key>, Bound<Key>)| {
-                let key = ordered_key(collection, property, value)?;
-                let (lower, upper) = bounds(key);
-                Ok(Predicate::Range {
+                let (lower, upper) = bounds(ordered_key(collection, property, value)?);
+                Ok(Node::Range {
                     property: property.clone(),
                     lower,
                     upper,
                 })
             };
         match self {
-            Filter::Eq { property, value } => equals(collection, property, value),
+            Filter::Eq { property, value } => equals(property, value),
             Filter::Ne { property, value } => {
-                equals(collection, property, value).map(|eq| Predicate::Not(Box::new(eq)))
+                equals(property, value).map(|eq| Node::Not(Box::new(eq)))
             }
             Filter::Gt { property, value } => range(property, value, |key| {
                 (Bound::Excluded(key), Bound::Unbounded)
@@ -199,13 +213,13 @@ impl Filter {
                 (Bound::Unbounded, Bound::Included(key))
             }),
             Filter::IsNull { property } => {
-                filterable(collection, property).map(|_| Predicate::IsNull(property.clone()))
+                filterable(collection, property).map(|_| Node::IsNull(property.clone()))
             }
-            Filter::And(filters) => all(filters).map(Predicate::And),
-            Filter::Or(filters) => all(filters).map(Predicate::Or),
+            Filter::And(filters) => all(filters).map(Node::And),
+            Filter::Or(filters) => all(filters).map(Node::Or),
             Filter::Not(filter) => filter
                 .compiled(collection, deeper)
-                .map(|p| Predicate::Not(Box::new(p))),
+                .map(|n| Node::Not(Box::new(n))),
         }
     }
 }
@@ -221,36 +235,37 @@ fn filterable(collection: &Collection, property: &str) -> Result<DataType, Filte
     }
 }
 
-/// The key to look `value` up by. A text array is compared by element, so
-/// its value is one text, not an array.
+/// The key to look `value` up by. A text array is
+/// compared by element, so the value it takes is one text.
 fn key(collection: &Collection, property: &str, value: &Json) -> Result<Key, FilterError> {
     let data_type = filterable(collection, property)?;
-    let mismatch = || FilterError::Type {
-        property: property.to_string(),
-        expected: data_type,
-    };
     if value.is_null() {
         return Err(FilterError::Null {
             property: property.to_string(),
         });
     }
-    if data_type == DataType::TextArray {
-        return value
+    let found = match data_type {
+        DataType::Text | DataType::TextArray => {
+            value.as_str().map(|text| Key::Text(text.to_string()))
+        }
+        DataType::Int => value.as_i64().map(Key::Int),
+        DataType::Number => value
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .map(|n| Key::Number(Finite::new(n))),
+        DataType::Bool => value.as_bool().map(Key::Bool),
+        DataType::Date => value
             .as_str()
-            .map(|text| Key::Text(text.to_string()))
-            .ok_or_else(mismatch);
-    }
-    match Value::typed(collection, property, value) {
-        Ok(Some(typed)) => Key::of(&typed).pop().ok_or_else(mismatch),
-        Ok(None) | Err(ObjectError::Type { .. }) => Err(mismatch()),
-        Err(_) => Err(FilterError::UnknownProperty(property.to_string())),
-    }
-}
-
-fn equals(collection: &Collection, property: &str, value: &Json) -> Result<Predicate, FilterError> {
-    key(collection, property, value).map(|key| Predicate::Eq {
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .map(|date| Key::Date(date.with_timezone(&Utc))),
+    };
+    let expected = match data_type {
+        DataType::TextArray => DataType::Text,
+        scalar => scalar,
+    };
+    found.ok_or_else(|| FilterError::Type {
         property: property.to_string(),
-        key,
+        expected,
     })
 }
 
@@ -267,12 +282,26 @@ fn ordered_key(collection: &Collection, property: &str, value: &Json) -> Result<
 impl Predicate {
     /// Whether `object` passes the filter.
     pub fn matches(&self, object: &Object) -> bool {
+        self.0.matches(object)
+    }
+
+    /// The rows of `index` that pass the filter.
+    pub fn select(&self, index: &RowIndex) -> RoaringBitmap {
+        self.0.select(index)
+    }
+
+    /// Whether the filter has no condition at all, and so passes everything.
+    pub fn is_unconditional(&self) -> bool {
+        matches!(&self.0, Node::And(all) if all.is_empty())
+    }
+}
+
+impl Node {
+    fn matches(&self, object: &Object) -> bool {
         let keys = |property: &String| object.properties.get(property).map(Key::of);
         match self {
-            Predicate::Eq { property, key } => {
-                keys(property).is_some_and(|keys| keys.contains(key))
-            }
-            Predicate::Range {
+            Node::Eq { property, key } => keys(property).is_some_and(|keys| keys.contains(key)),
+            Node::Range {
                 property,
                 lower,
                 upper,
@@ -280,25 +309,26 @@ impl Predicate {
                 keys.iter()
                     .any(|key| (lower.as_ref(), upper.as_ref()).contains(key))
             }),
-            Predicate::IsNull(property) => !object.properties.contains_key(property),
-            Predicate::And(all) => all.iter().all(|p| p.matches(object)),
-            Predicate::Or(any) => any.iter().any(|p| p.matches(object)),
-            Predicate::Not(predicate) => !predicate.matches(object),
+            Node::IsNull(property) => !object.properties.contains_key(property),
+            Node::And(all) => all.iter().all(|node| node.matches(object)),
+            Node::Or(any) => any.iter().any(|node| node.matches(object)),
+            Node::Not(node) => !node.matches(object),
         }
     }
 
-    /// The rows of `index` that pass the filter.
-    pub fn select(&self, index: &RowIndex) -> RoaringBitmap {
+    fn select(&self, index: &RowIndex) -> RoaringBitmap {
         let property = |name: &String| index.properties.get(name);
         match self {
-            Predicate::Eq {
+            Node::Eq {
                 property: name,
                 key,
             } => property(name)
                 .and_then(|p| p.values.get(key))
                 .cloned()
                 .unwrap_or_default(),
-            Predicate::Range {
+            // One union over all the values in range: folding them pairwise
+            // copies the growing result once per value.
+            Node::Range {
                 property: name,
                 lower,
                 upper,
@@ -306,20 +336,19 @@ impl Predicate {
                 .map(|p| {
                     p.values
                         .range((lower.as_ref(), upper.as_ref()))
-                        .fold(RoaringBitmap::new(), |found, (_, rows)| found | rows)
+                        .map(|(_, rows)| rows)
+                        .union()
                 })
                 .unwrap_or_default(),
-            Predicate::IsNull(name) => match property(name) {
+            Node::IsNull(name) => match property(name) {
                 Some(p) => &index.rows - &p.present,
                 None => index.rows.clone(),
             },
-            Predicate::And(all) => all
+            Node::And(all) => all
                 .iter()
-                .fold(index.rows.clone(), |found, p| found & p.select(index)),
-            Predicate::Or(any) => any
-                .iter()
-                .fold(RoaringBitmap::new(), |found, p| found | p.select(index)),
-            Predicate::Not(predicate) => &index.rows - predicate.select(index),
+                .fold(index.rows.clone(), |found, n| found & n.select(index)),
+            Node::Or(any) => any.iter().map(|node| node.select(index)).union(),
+            Node::Not(node) => &index.rows - node.select(index),
         }
     }
 }
@@ -332,6 +361,10 @@ struct PropertyIndex {
 
 /// Which rows hold which value, for each filterable property of one
 /// collection's rows. Rows are numbered by the caller.
+///
+/// Every distinct value of a filterable property is kept as a key, so a
+/// property holding long, mostly unique text is cheaper declared not
+/// filterable.
 #[derive(Debug, Clone, Default)]
 pub struct RowIndex {
     rows: RoaringBitmap,
@@ -339,10 +372,6 @@ pub struct RowIndex {
 }
 
 impl RowIndex {
-    pub fn rows(&self) -> &RoaringBitmap {
-        &self.rows
-    }
-
     /// Record `object` as row `row`, indexing its filterable properties.
     pub fn insert(&mut self, collection: &Collection, row: u32, object: &Object) {
         self.rows.insert(row);

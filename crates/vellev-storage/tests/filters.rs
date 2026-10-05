@@ -276,7 +276,7 @@ async fn delete_where_is_atomic_with_its_batch_and_its_group() {
         .unwrap();
     let everything = || Mutation::DeleteWhere {
         collection: name("notes"),
-        filter: filter(json!({ "and": [] })),
+        filter: n("gte", -1000),
     };
 
     let failed = writer
@@ -381,4 +381,74 @@ async fn a_filter_the_schema_cannot_answer_is_an_error_everywhere() {
         .await;
     assert!(unfilterable(&refused.unwrap_err()));
     assert_eq!(cluster.committed().await, before);
+}
+
+#[tokio::test]
+async fn delete_where_sees_a_later_batch_over_an_earlier_one_in_the_same_group() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![
+            create("notes"),
+            upsert("notes", 1, 1),
+            upsert("notes", 2, 1),
+        ])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let ones = || Mutation::DeleteWhere {
+        collection: name("notes"),
+        filter: n("eq", 1),
+    };
+
+    let results = writer
+        .commit_group(vec![
+            vec![
+                upsert("notes", 1, 5),
+                upsert("notes", 3, 1),
+                upsert("notes", 4, 1),
+            ],
+            vec![
+                upsert("notes", 3, 5),
+                upsert("notes", 1, 1),
+                delete("notes", 4),
+                ones(),
+            ],
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        results[1].as_ref().unwrap().outcomes[3],
+        Outcome::Deleted(2),
+        "rows 1 and 2: the batch set 3 to five and deleted 4 itself"
+    );
+    for copy in copies(&cluster, &writer).await {
+        copy.read(|state| {
+            assert_eq!(selected(state, &n("gte", -1000)), these(&[3]));
+            assert_eq!(n_of(state, "notes", 3), Some(5));
+        });
+    }
+}
+
+#[tokio::test]
+async fn a_delete_with_no_condition_is_refused() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    let before = cluster.committed().await;
+    let unconditional = Mutation::DeleteWhere {
+        collection: name("notes"),
+        filter: filter(json!({ "and": [] })),
+    };
+    assert!(matches!(
+        writer.commit(vec![unconditional]).await,
+        Err(StorageError::InvalidMutation(reason)) if reason.contains("needs a condition")
+    ));
+    assert_eq!(cluster.committed().await, before);
+    writer
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), 1));
 }

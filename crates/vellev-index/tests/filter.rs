@@ -231,8 +231,8 @@ fn a_filter_the_schema_cannot_answer_is_refused_with_the_reason() {
         ("deleted", json!("false"), DataType::Bool),
         ("createdAt", json!("yesterday"), DataType::Date),
         ("owner", json!(7), DataType::Text),
-        ("tags", json!(["lesson"]), DataType::TextArray),
-        ("tags", json!(7), DataType::TextArray),
+        ("tags", json!(["lesson"]), DataType::Text),
+        ("tags", json!(7), DataType::Text),
     ] {
         assert_eq!(
             refused(json!({ "eq": { "property": property, "value": value } })),
@@ -261,6 +261,56 @@ fn a_filter_the_schema_cannot_answer_is_refused_with_the_reason() {
             }
         );
     }
+}
+
+#[test]
+fn the_two_zeros_are_one_value() {
+    let objects = vec![
+        object(0, json!({ "importance": -0.0 })),
+        object(1, json!({ "importance": 0.0 })),
+        object(2, json!({ "importance": 0.5 })),
+    ];
+    let zero = |operator: &str, value: f64| {
+        let filter = filter(json!({ operator: { "property": "importance", "value": value } }));
+        passing(&objects, &filter).into_iter().collect::<Vec<_>>()
+    };
+    for value in [0.0, -0.0] {
+        assert_eq!(zero("eq", value), [0, 1]);
+        assert_eq!(zero("gt", value), [2]);
+        assert_eq!(zero("lt", value), [] as [u32; 0]);
+        assert_eq!(zero("gte", value), [0, 1, 2]);
+    }
+}
+
+#[test]
+fn a_misspelt_or_extra_field_is_refused_rather_than_ignored() {
+    for json in [
+        json!({ "eq": { "property": "owner", "valeu": "ada" } }),
+        json!({ "eq": { "property": "owner", "value": "ada", "extra": 1 } }),
+        json!({ "is_null": { "property": "owner", "value": true } }),
+        json!({ "equals": { "property": "owner", "value": "ada" } }),
+    ] {
+        assert!(
+            serde_json::from_value::<Filter>(json.clone()).is_err(),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn only_a_filter_with_no_condition_is_unconditional() {
+    let unconditional = |json: Json| {
+        filter(json)
+            .compile(&collection())
+            .unwrap()
+            .is_unconditional()
+    };
+    assert!(unconditional(json!({ "and": [] })));
+    assert!(!unconditional(
+        json!({ "and": [{ "is_null": { "property": "tags" } }] })
+    ));
+    assert!(!unconditional(json!({ "or": [] })));
+    assert!(!unconditional(json!({ "not": { "or": [] } })));
 }
 
 #[test]
@@ -323,19 +373,24 @@ fn any_comparison() -> impl Strategy<Value = Filter> {
         )),
         (0..DATES.len()).prop_map(|d| ("createdAt", json!(DATES[d]), true)),
     ];
-    (scalar, 0..7usize).prop_map(|((property, value, ordered), operator)| {
-        let property = property.to_string();
-        match (operator, ordered) {
-            (0, _) => Filter::Eq { property, value },
-            (1, _) => Filter::Ne { property, value },
-            (2, _) => Filter::IsNull { property },
-            (3, true) => Filter::Gt { property, value },
-            (4, true) => Filter::Gte { property, value },
-            (5, true) => Filter::Lt { property, value },
-            (6, true) => Filter::Lte { property, value },
-            (_, false) => Filter::Eq { property, value },
-            _ => unreachable!("operators are drawn from 0..7"),
-        }
+    (scalar, any::<prop::sample::Index>()).prop_map(|((property, value, ordered), pick)| {
+        type Build = fn(String, Json) -> Filter;
+        let any_kind: [Build; 3] = [
+            |property, value| Filter::Eq { property, value },
+            |property, value| Filter::Ne { property, value },
+            |property, _| Filter::IsNull { property },
+        ];
+        let ordered_only: [Build; 4] = [
+            |property, value| Filter::Gt { property, value },
+            |property, value| Filter::Gte { property, value },
+            |property, value| Filter::Lt { property, value },
+            |property, value| Filter::Lte { property, value },
+        ];
+        let builders: Vec<Build> = any_kind
+            .into_iter()
+            .chain(ordered_only.into_iter().filter(|_| ordered))
+            .collect();
+        pick.get(&builders)(property.to_string(), value)
     })
 }
 
