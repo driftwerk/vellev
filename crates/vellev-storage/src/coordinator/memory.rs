@@ -245,6 +245,22 @@ impl Coordinator for MemoryCoordinator {
             .map(Row::committed))
     }
 
+    async fn partitions(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<PartitionKey>> {
+        let rows = self.rows.lock().expect("coordinator lock");
+        let mut keys: Vec<PartitionKey> = rows
+            .keys()
+            .filter(|key| after.is_none_or(|after| *key > after))
+            .cloned()
+            .collect();
+        keys.sort_unstable();
+        keys.truncate(limit);
+        Ok(keys)
+    }
+
     async fn ping(&self) -> Result<()> {
         Ok(())
     }

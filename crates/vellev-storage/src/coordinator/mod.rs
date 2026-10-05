@@ -27,7 +27,7 @@ pub use postgres::PostgresCoordinator;
 /// cannot overflow in either implementation.
 pub const MAX_TTL: Duration = Duration::from_secs(60 * 60);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PartitionKey {
     pub tenant: TenantId,
     pub partition: Partition,
@@ -189,6 +189,14 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
 
     /// The committed state, as a follower reads it.
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>>;
+
+    /// Up to `limit` registered partitions after `after`, in key order,
+    /// tenants comparing byte by byte.
+    async fn partitions(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<PartitionKey>>;
 
     /// Whether the coordinator can be reached.
     async fn ping(&self) -> Result<()>;

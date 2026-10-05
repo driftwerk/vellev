@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions};
 use sqlx::query::QueryAs;
 use sqlx::{Executor, FromRow, Postgres};
-use vellev_core::NodeId;
+use vellev_core::{NodeId, Partition, TenantId};
 
 use super::{
     checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease,
@@ -327,6 +327,35 @@ impl Coordinator for PostgresCoordinator {
 
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>> {
         Ok(self.row(key).await?.as_ref().map(Snapshot::committed))
+    }
+
+    async fn partitions(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<PartitionKey>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT tenant, partition FROM vellev.partitions
+             WHERE $1::text IS NULL OR (tenant COLLATE \"C\", partition) > ($1 COLLATE \"C\", $2)
+             ORDER BY tenant COLLATE \"C\", partition
+             LIMIT $3",
+        )
+        .bind(after.map(|key| key.tenant.as_str()))
+        .bind(after.map_or(0, |key| i64::from(key.partition.0)))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(tenant, partition)| {
+                let stored = || invariant(format!("{tenant}/{partition} is not a partition key"));
+                Ok(PartitionKey {
+                    tenant: TenantId::new(tenant.as_str()).map_err(|_| stored())?,
+                    partition: u32::try_from(partition)
+                        .map(Partition)
+                        .map_err(|_| stored())?,
+                })
+            })
+            .collect()
     }
 
     async fn ping(&self) -> Result<()> {

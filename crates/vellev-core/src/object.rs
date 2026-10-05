@@ -99,18 +99,21 @@ impl Value {
     }
 }
 
-fn checked_vector(collection: &Collection, vector: Vec<f32>) -> Result<Vec<f32>, ObjectError> {
-    let expected = collection.embedding.dimensions;
-    if vector.len() != expected as usize {
-        return Err(ObjectError::VectorLength {
-            expected,
-            got: vector.len(),
-        });
+impl Embedding {
+    /// `vector` if it is one this embedding's collection can hold.
+    pub fn checked(&self, vector: Vec<f32>) -> Result<Vec<f32>, ObjectError> {
+        let expected = self.dimensions;
+        if vector.len() != expected as usize {
+            return Err(ObjectError::VectorLength {
+                expected,
+                got: vector.len(),
+            });
+        }
+        if !vector.iter().all(|v| v.is_finite()) {
+            return Err(ObjectError::VectorNotFinite);
+        }
+        Ok(vector)
     }
-    if !vector.iter().all(|v| v.is_finite()) {
-        return Err(ObjectError::VectorNotFinite);
-    }
-    Ok(vector)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,7 +198,7 @@ impl Object {
                     Ok(merged)
                 })?;
         let vector = match vector {
-            Some(vector) => Some(checked_vector(collection, vector)?),
+            Some(vector) => Some(collection.embedding.checked(vector)?),
             None => self.vector.clone(),
         };
         Ok(Object {

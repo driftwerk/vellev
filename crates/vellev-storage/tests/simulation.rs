@@ -186,6 +186,13 @@ impl Coordinator for SimCoordinator {
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
         self.clean.committed(key).await
     }
+    async fn partitions(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<PartitionKey>, CoordinatorError> {
+        self.clean.partitions(after, limit).await
+    }
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.clean.ping().await
     }

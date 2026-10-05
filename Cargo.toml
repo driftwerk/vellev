@@ -6,6 +6,7 @@ members = [
     "crates/vellev-core",
     "crates/vellev-embed",
     "crates/vellev-index",
+    "crates/vellev-node",
     "crates/vellev-storage",
 ]
 
@@ -20,6 +21,7 @@ vellev-client = { path = "crates/vellev-client" }
 vellev-core = { path = "crates/vellev-core" }
 vellev-embed = { path = "crates/vellev-embed" }
 vellev-index = { path = "crates/vellev-index" }
+vellev-node = { path = "crates/vellev-node" }
 vellev-storage = { path = "crates/vellev-storage" }
 
 async-trait = "0.1"

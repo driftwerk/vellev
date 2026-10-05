@@ -26,21 +26,32 @@ pub(crate) struct Draft<'a> {
 }
 
 /// What has been resolved so far: the catalog as it will be, the rows that
-/// will be written (`None` for a delete), whether each is still without the
-/// vector its text calls for, and the ops in order.
+/// will be written (`None` for a delete), the ops in order, and how many
+/// ops there were after each batch.
 struct Pending {
     catalog: Catalog,
     rows: HashMap<RowKey, Option<Object>>,
-    wanting: HashMap<RowKey, bool>,
     ops: Vec<Op>,
+    ends: Vec<usize>,
 }
 
 /// An object a commit writes without the vector its collection embeds for
-/// it: the op that writes it, and what to embed.
+/// it: the last op that writes it, the batch that op came from, and what
+/// to embed.
 pub(crate) struct Wanted {
     pub op: usize,
+    pub batch: usize,
     pub embedding: Embedding,
     pub text: String,
+}
+
+/// The text to embed for `object`, if its collection embeds its objects
+/// and it has text and no vector.
+fn wanting(schema: &Collection, object: &Object) -> Option<String> {
+    let embeds = schema.embedding.provider != EmbeddingProvider::None;
+    (embeds && object.vector.is_none())
+        .then(|| object.embedded_text(&schema.embedding))
+        .filter(|text| !text.trim().is_empty())
 }
 
 /// One batch being resolved on top of a draft, kept apart until it is known
@@ -49,7 +60,6 @@ struct Batch<'a> {
     draft: &'a Draft<'a>,
     catalog: Catalog,
     rows: HashMap<RowKey, Option<Object>>,
-    wanting: HashMap<RowKey, bool>,
     ops: Vec<Op>,
 }
 
@@ -58,8 +68,8 @@ impl<'a> Draft<'a> {
         let pending = Pending {
             catalog: state.catalog().clone(),
             rows: HashMap::new(),
-            wanting: HashMap::new(),
             ops: vec![],
+            ends: vec![],
         };
         Self { state, pending }
     }
@@ -67,11 +77,16 @@ impl<'a> Draft<'a> {
     /// Resolve one caller's batch. Either all of it joins the draft, or, on
     /// the first mutation that cannot be applied, none of it does.
     pub fn batch(&mut self, mutations: Vec<Mutation>) -> Result<Vec<Outcome>> {
+        let outcomes = self.resolved(mutations);
+        self.pending.ends.push(self.pending.ops.len());
+        outcomes
+    }
+
+    fn resolved(&mut self, mutations: Vec<Mutation>) -> Result<Vec<Outcome>> {
         let mut batch = Batch {
             draft: self,
             catalog: self.pending.catalog.clone(),
             rows: HashMap::new(),
-            wanting: HashMap::new(),
             ops: vec![],
         };
         let outcomes = mutations
@@ -79,27 +94,22 @@ impl<'a> Draft<'a> {
             .map(|m| batch.resolve(m))
             .collect::<Result<Vec<_>>>()?;
         let Batch {
-            catalog,
-            rows,
-            wanting,
-            ops,
-            ..
+            catalog, rows, ops, ..
         } = batch;
         self.pending.catalog = catalog;
         self.pending.rows.extend(rows);
-        self.pending.wanting.extend(wanting);
         self.pending.ops.extend(ops);
         Ok(outcomes)
     }
 
-    /// The ops to log, and the objects among them still to be given a
-    /// vector, each named by the last op that writes it.
+    /// The ops to log, and the objects they leave still to be given a
+    /// vector, in the order they are written.
     pub fn finish(self) -> (Vec<Op>, Vec<Wanted>) {
         let Pending {
             catalog,
-            wanting,
+            rows,
             ops,
-            ..
+            ends,
         } = self.pending;
         let last_written: HashMap<RowKey, usize> = ops
             .iter()
@@ -109,19 +119,17 @@ impl<'a> Draft<'a> {
                 _ => None,
             })
             .collect();
-        let mut wanted: Vec<Wanted> = wanting
-            .into_iter()
-            .filter(|(_, wanting)| *wanting)
-            .filter_map(|(key, _)| {
-                let op = *last_written.get(&key)?;
-                let embedding = &catalog.schema(key.0)?.embedding;
-                let Op::Upsert { object, .. } = &ops[op] else {
-                    return None;
-                };
+        let mut wanted: Vec<Wanted> = rows
+            .iter()
+            .filter_map(|(key, row)| {
+                let schema = catalog.schema(key.0)?;
+                let text = wanting(schema, row.as_ref()?)?;
+                let op = *last_written.get(key)?;
                 Some(Wanted {
                     op,
-                    embedding: embedding.clone(),
-                    text: object.embedded_text(embedding),
+                    batch: ends.partition_point(|end| *end <= op),
+                    embedding: schema.embedding.clone(),
+                    text,
                 })
             })
             .collect();
@@ -161,20 +169,12 @@ impl Batch<'_> {
             })
     }
 
-    fn wants(&self, key: RowKey) -> bool {
-        self.wanting
-            .get(&key)
-            .or_else(|| self.draft.pending.wanting.get(&key))
-            .copied()
-            .unwrap_or(false)
-    }
-
     /// Write `next` under its key, unless that is what is stored already.
     ///
     /// Where the collection embeds its own objects and the caller
-    /// `supplied` no vector, the vector follows the text: kept while the
-    /// embedded text is what is stored, and otherwise dropped, to be made
-    /// before the commit is logged.
+    /// `supplied` no vector, the vector follows the text: the one stored
+    /// for the same text if there is one, in this commit or before it, and
+    /// otherwise none, to be made before the commit is logged.
     fn write(
         &mut self,
         collection: CollectionId,
@@ -184,28 +184,17 @@ impl Batch<'_> {
     ) -> Outcome {
         let key = (collection, next.id);
         let embedding = &schema.embedding;
-        let wanting = if supplied || embedding.provider == EmbeddingProvider::None {
-            false
-        } else {
+        if !supplied && embedding.provider != EmbeddingProvider::None {
             let text = next.embedded_text(embedding);
-            let unchanged = self
-                .row(key)
-                .filter(|stored| stored.embedded_text(embedding) == text);
-            match unchanged {
-                Some(stored) => {
-                    next.vector = stored.vector.clone();
-                    self.wants(key)
-                }
-                None => {
-                    next.vector = None;
-                    !text.trim().is_empty()
-                }
-            }
-        };
+            next.vector = [self.row(key), self.draft.state.row(collection, next.id)]
+                .into_iter()
+                .flatten()
+                .filter(|stored| stored.embedded_text(embedding) == text)
+                .find_map(|stored| stored.vector.clone());
+        }
         if self.row(key) == Some(&next) {
             return Outcome::Unchanged;
         }
-        self.wanting.insert(key, wanting);
         self.rows.insert(key, Some(next.clone()));
         self.ops.push(Op::Upsert {
             collection,
@@ -340,7 +329,6 @@ impl Batch<'_> {
     }
 
     fn delete(&mut self, collection: CollectionId, id: ObjectId) {
-        self.wanting.insert((collection, id), false);
         self.rows.insert((collection, id), None);
         self.ops.push(Op::Delete { collection, id });
     }

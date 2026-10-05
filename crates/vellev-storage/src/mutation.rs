@@ -73,18 +73,18 @@ pub enum Mutation {
 }
 
 /// Turns text into vectors for the collections that embed their own
-/// objects. A writer with one fills in the vector of every object written
-/// without one whose embedded text is new or has changed, as part of the
-/// commit, so that a vector always belongs to the text stored beside it.
+/// objects. A writer with one makes, as part of the commit, the vector of
+/// every object written without one, unless the object's embedded text
+/// already has a vector stored for it.
 #[async_trait::async_trait]
 pub trait Vectorize: std::fmt::Debug + Send + Sync {
     /// A vector for each text, in order, as `embedding` embeds what it
-    /// stores; `None` for a text that has none.
+    /// stores. No text is blank.
     async fn vectors(
         &self,
         embedding: &Embedding,
         texts: Vec<String>,
-    ) -> std::result::Result<Vec<Option<Vec<f32>>>, String>;
+    ) -> std::result::Result<Vec<Vec<f32>>, String>;
 }
 
 /// Holds when the stored object's `property` equals `equals`, where JSON

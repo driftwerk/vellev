@@ -451,6 +451,62 @@ async fn concurrent_acquires_hand_out_exactly_one_lease(h: &dyn Harness) {
     assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
 }
 
+/// Every partition, read `page` at a time. Other tests register and remove
+/// their own meanwhile.
+async fn listed(h: &dyn Harness, page: usize) -> Vec<PartitionKey> {
+    let mut all: Vec<PartitionKey> = Vec::new();
+    loop {
+        let next = h.coordinator().partitions(all.last(), page).await.unwrap();
+        assert!(next.len() <= page);
+        if next.is_empty() {
+            return all;
+        }
+        all.extend(next);
+    }
+}
+
+async fn partitions_are_listed_in_key_order_a_page_at_a_time(h: &dyn Harness) {
+    let c = h.coordinator();
+    let shared = uuid::Uuid::new_v4().simple().to_string();
+    let named = |tenant: &str, partition: u32| PartitionKey {
+        tenant: TenantId::new(format!("{shared}{tenant}")).unwrap(),
+        partition: Partition(partition),
+    };
+    let keys = [
+        named("_", 0),
+        named("a", 1),
+        named("a", 0),
+        named("-", 0),
+        named("0", 0),
+    ];
+    for key in &keys {
+        c.register(key).await.unwrap();
+    }
+    let mine = |all: Vec<PartitionKey>| -> Vec<PartitionKey> {
+        all.into_iter().filter(|key| keys.contains(key)).collect()
+    };
+    let expected = [
+        named("-", 0),
+        named("0", 0),
+        named("_", 0),
+        named("a", 0),
+        named("a", 1),
+    ];
+    for page in [1, 2, 1_000] {
+        let all = listed(h, page).await;
+        assert!(all.windows(2).all(|pair| pair[0] < pair[1]), "page {page}");
+        assert_eq!(mine(all), expected, "page {page}");
+    }
+    assert_eq!(c.partitions(None, 0).await.unwrap(), []);
+    assert_eq!(
+        c.partitions(Some(&named("a", 0)), 1).await.unwrap(),
+        [named("a", 1)]
+    );
+
+    c.remove(&named("a", 0)).await.unwrap();
+    assert_eq!(mine(listed(h, 3).await).len(), 4);
+}
+
 async fn ping_succeeds(h: &dyn Harness) {
     h.coordinator().ping().await.unwrap();
 }
@@ -495,6 +551,7 @@ conformance! {
     a_generation_is_never_reused_after_remove_and_register,
     removing_a_partition_makes_it_unknown,
     concurrent_acquires_hand_out_exactly_one_lease,
+    partitions_are_listed_in_key_order_a_page_at_a_time,
     ping_succeeds,
 }
 

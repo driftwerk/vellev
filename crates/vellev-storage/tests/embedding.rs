@@ -10,9 +10,14 @@ const NOTES: &str = "notes";
 #[derive(Debug, Default)]
 struct Lengths {
     asked: Mutex<Vec<Vec<String>>>,
-    failing: AtomicBool,
-    dimensions: AtomicUsize,
+    fault: AtomicUsize,
 }
+
+const AWAY: usize = 1;
+const TOO_LONG: usize = 2;
+const NOT_A_NUMBER: usize = 3;
+const TOO_FEW: usize = 4;
+const SILENT: usize = 5;
 
 fn vector_of(text: &str) -> Vec<f32> {
     vec![text.len() as f32, text.split_whitespace().count() as f32]
@@ -24,15 +29,22 @@ impl Vectorize for Lengths {
         &self,
         embedding: &Embedding,
         texts: Vec<String>,
-    ) -> Result<Vec<Option<Vec<f32>>>, String> {
-        assert_eq!(embedding.model, "lengths");
-        if self.failing.load(Ordering::SeqCst) {
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let fault = self.fault.load(Ordering::SeqCst);
+        if fault == AWAY || embedding.model != "lengths" {
             return Err("the model is away".into());
         }
-        let extra = self.dimensions.load(Ordering::SeqCst);
-        let vectors = texts
+        if fault == SILENT {
+            std::future::pending::<()>().await;
+        }
+        let vectors: Vec<Vec<f32>> = texts
             .iter()
-            .map(|text| Some([vector_of(text), vec![0.0; extra]].concat()))
+            .map(|text| match fault {
+                TOO_LONG => [vector_of(text), vec![0.0]].concat(),
+                NOT_A_NUMBER => vec![f32::NAN, 1.0],
+                _ => vector_of(text),
+            })
+            .skip(usize::from(fault == TOO_FEW))
             .collect();
         self.asked.lock().unwrap().push(texts);
         Ok(vectors)
@@ -255,20 +267,24 @@ async fn a_commit_that_cannot_be_embedded_changes_nothing_and_the_writer_carries
     let before = writer.partition().read(State::position);
     let fox = || vec![note(1, json!({ "title": "fox" }), None)];
 
-    lengths.failing.store(true, Ordering::SeqCst);
+    lengths.fault.store(AWAY, Ordering::SeqCst);
     let failed = writer.commit(fox()).await.unwrap_err();
     assert!(
         matches!(&failed, StorageError::Embedding { model, reason } if model == "lengths" && reason == "the model is away"),
         "{failed}"
     );
-    lengths.failing.store(false, Ordering::SeqCst);
-
-    lengths.dimensions.store(1, Ordering::SeqCst);
-    assert!(matches!(
-        writer.commit(fox()).await,
-        Err(StorageError::Embedding { .. })
-    ));
-    lengths.dimensions.store(0, Ordering::SeqCst);
+    for fault in [TOO_LONG, NOT_A_NUMBER, TOO_FEW] {
+        lengths.fault.store(fault, Ordering::SeqCst);
+        assert!(
+            matches!(
+                writer.commit(fox()).await,
+                Err(StorageError::Embedding { .. })
+            ),
+            "{fault}"
+        );
+    }
+    lengths.fault.store(0, Ordering::SeqCst);
+    lengths.asked();
 
     writer.partition().read(|state| {
         assert_eq!(state.position(), before);
@@ -327,4 +343,205 @@ async fn a_writer_with_nothing_to_embed_with_refuses_only_what_needs_it() {
         .partition()
         .read(|state| state.get(&name("plain"), id(1)).unwrap().vector.clone());
     assert_eq!(kept, Some(vec![1.0, 0.5]));
+}
+
+fn other_notes() -> Mutation {
+    let mut schema = schema("other");
+    schema.embedding = Embedding {
+        provider: EmbeddingProvider::Local,
+        model: "absent".into(),
+        properties: vec!["title".into()],
+        ..schema.embedding
+    };
+    Mutation::CreateCollection(Box::new(schema))
+}
+
+fn other(object: u8, title: &str, vector: Option<Vec<f32>>) -> Mutation {
+    Mutation::Upsert {
+        collection: name("other"),
+        id: id(object),
+        properties: json!({ "title": title }).as_object().unwrap().clone(),
+        vector,
+    }
+}
+
+#[tokio::test]
+async fn a_batch_whose_vectors_cannot_be_made_is_rejected_alone() {
+    let (cluster, writer, lengths) = embedding().await;
+    writer
+        .commit(vec![other_notes(), create("plain")])
+        .await
+        .unwrap();
+    let results = writer
+        .commit_group(vec![
+            vec![upsert("plain", 1, 1)],
+            vec![
+                other(1, "cannot be embedded", None),
+                note(8, json!({ "title": "lost with it" }), None),
+            ],
+            vec![note(1, json!({ "title": "fox" }), None)],
+            vec![other(2, "supplied", Some(vec![1.0, 2.0]))],
+            vec![Mutation::Patch {
+                collection: name("other"),
+                id: id(1),
+                properties: json!({ "n": 1 }).as_object().unwrap().clone(),
+                vector: None,
+                only_if: None,
+            }],
+            vec![
+                note(2, json!({ "title": "fox" }), None),
+                note(3, json!({ "title": "hen" }), None),
+            ],
+        ])
+        .await
+        .unwrap();
+    assert!(
+        matches!(&results[1], Err(StorageError::Embedding { model, .. }) if model == "absent"),
+        "{:?}",
+        results[1]
+    );
+    assert!(matches!(results[4], Err(StorageError::Embedding { .. })));
+    let accepted: Vec<_> = [0, 2, 3, 5]
+        .iter()
+        .map(|at| results[*at].as_ref().unwrap())
+        .collect();
+    assert!(accepted
+        .windows(2)
+        .all(|pair| pair[0].position == pair[1].position));
+    let texts: Vec<String> = lengths.asked().into_iter().flatten().collect();
+    for text in ["fox", "hen"] {
+        let times = texts.iter().filter(|asked| *asked == text).count();
+        assert_eq!(times, 1, "{text} once, however many objects or rounds");
+    }
+
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            assert_eq!(state.count(&name("plain")), 1);
+            assert_eq!(state.count(&name("other")), 1);
+            assert_eq!(state.count(&name(NOTES)), 3);
+            let vector = |object: u8| state.get(&name(NOTES), id(object)).unwrap().vector.clone();
+            assert_eq!(vector(1), Some(vector_of("fox")));
+            assert_eq!(vector(2), Some(vector_of("fox")));
+            assert_eq!(vector(3), Some(vector_of("hen")));
+        });
+    }
+}
+
+#[tokio::test]
+async fn callers_sharing_a_commit_do_not_share_an_embedding_failure() {
+    let (_cluster, writer, _lengths) = embedding().await;
+    writer
+        .commit(vec![other_notes(), create("plain")])
+        .await
+        .unwrap();
+    let commits = vellev_storage::GroupCommitter::spawn(Arc::new(writer), 64, 64);
+    let submitted = (0..20u8).map(|n| {
+        let commits = commits.clone();
+        async move {
+            let mutation = match n % 2 {
+                0 => upsert("plain", n, 1),
+                _ => other(n, "cannot be embedded", None),
+            };
+            commits.submit(vec![mutation]).await
+        }
+    });
+    for (n, outcome) in join_all(submitted).await.into_iter().enumerate() {
+        match n % 2 {
+            0 => assert!(outcome.is_ok(), "{outcome:?}"),
+            _ => assert!(
+                matches!(outcome, Err(StorageError::Embedding { .. })),
+                "{outcome:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn text_that_already_has_a_vector_is_never_embedded_again() {
+    let (_cluster, writer, lengths) = embedding().await;
+    writer
+        .commit(vec![
+            note(1, json!({ "title": "fox" }), None),
+            note(2, json!({ "title": "kept" }), Some(vec![4.0, 4.0])),
+        ])
+        .await
+        .unwrap();
+    lengths.asked();
+
+    writer
+        .commit(vec![
+            patch(1, json!({ "title": "hen" }), None),
+            patch(1, json!({ "title": "fox" }), None),
+            patch(2, json!({ "title": "changed" }), None),
+            patch(2, json!({ "title": "kept" }), None),
+            delete(NOTES, 1),
+            note(1, json!({ "title": "fox", "n": 2 }), None),
+        ])
+        .await
+        .unwrap();
+    assert!(lengths.asked().is_empty());
+    assert_eq!(vector(&writer, 1), Some(vector_of("fox")));
+    assert_eq!(vector(&writer, 2), Some(vec![4.0, 4.0]));
+
+    writer.commit(vec![delete(NOTES, 1)]).await.unwrap();
+    let insert = Mutation::Insert {
+        collection: name(NOTES),
+        id: id(1),
+        properties: json!({ "title": "fox" }).as_object().unwrap().clone(),
+        vector: None,
+    };
+    writer.commit(vec![insert]).await.unwrap();
+    assert_eq!(lengths.asked(), asked(&["fox"]));
+}
+
+#[tokio::test]
+async fn vectors_made_at_commit_survive_a_flush_and_a_new_writer_with_no_embedder() {
+    let (cluster, writer, _lengths) = embedding().await;
+    writer
+        .commit(vec![note(1, json!({ "title": "a red fox" }), None)])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    writer
+        .commit(vec![note(2, json!({ "title": "hen" }), None)])
+        .await
+        .unwrap();
+    let expected = [Some(vector_of("a red fox")), Some(vector_of("hen"))];
+    let vectors = |state: &State| {
+        [1, 2].map(|object| state.get(&name(NOTES), id(object)).unwrap().vector.clone())
+    };
+    assert_eq!(cluster.open().await.partition().read(vectors), expected);
+
+    cluster.clock.advance(TTL);
+    let plain = cluster.writer().await;
+    assert_eq!(plain.partition().read(vectors), expected);
+    plain
+        .commit(vec![patch(1, json!({ "n": 3 }), None)])
+        .await
+        .unwrap();
+    assert_eq!(plain.partition().read(vectors), expected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_embedder_that_never_answers_fails_the_commit_and_frees_the_writer() {
+    let (_cluster, writer, lengths) = embedding().await;
+    lengths.fault.store(SILENT, Ordering::SeqCst);
+    let waited = tokio::time::timeout(
+        Duration::from_secs(3_600),
+        writer.commit(vec![note(1, json!({ "title": "fox" }), None)]),
+    );
+    assert!(matches!(
+        waited.await,
+        Ok(Err(StorageError::Embedding { .. }))
+    ));
+    lengths.fault.store(0, Ordering::SeqCst);
+    writer.flush().await.unwrap();
+    writer
+        .commit(vec![note(1, json!({ "title": "fox" }), None)])
+        .await
+        .unwrap();
+    assert_eq!(vector(&writer, 1), Some(vector_of("fox")));
 }
