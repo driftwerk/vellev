@@ -180,7 +180,7 @@ impl State {
 }
 
 /// The properties a query searches, each with its weight.
-fn searched<'a>(
+pub(crate) fn searched<'a>(
     schema: &'a Collection,
     asked: &'a [(&'a str, f32)],
 ) -> Result<Vec<(&'a str, f32)>> {

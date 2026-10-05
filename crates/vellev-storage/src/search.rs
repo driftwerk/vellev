@@ -1,6 +1,6 @@
 //! Nearest-vector search over a partition's layers.
 
-use vellev_core::{CollectionName, Object, ObjectError};
+use vellev_core::{Collection, CollectionName, Object, ObjectError};
 use vellev_index::filter::{Filter, Predicate};
 use vellev_index::vector::{Scorer, VectorIndex};
 
@@ -54,17 +54,7 @@ impl State {
     /// ties in object id order. Objects without a vector are never returned.
     pub fn search(&self, collection: &CollectionName, query: &Query<'_>) -> Result<Vec<Hit<'_>>> {
         let (id, schema) = self.catalog().known(collection)?;
-        let expected = schema.embedding.dimensions;
-        if query.vector.len() != expected as usize {
-            return Err(ObjectError::VectorLength {
-                expected,
-                got: query.vector.len(),
-            }
-            .into());
-        }
-        if !query.vector.iter().all(|value| value.is_finite()) {
-            return Err(ObjectError::VectorNotFinite.into());
-        }
+        comparable(schema, query.vector)?;
         let predicate = query
             .filter
             .map(|filter| filter.compile(schema))
@@ -82,6 +72,22 @@ impl State {
         hits.truncate(query.limit);
         Ok(hits)
     }
+}
+
+/// Whether `vector` can be compared with the collection's.
+pub(crate) fn comparable(schema: &Collection, vector: &[f32]) -> Result<()> {
+    let expected = schema.embedding.dimensions;
+    if vector.len() != expected as usize {
+        return Err(ObjectError::VectorLength {
+            expected,
+            got: vector.len(),
+        }
+        .into());
+    }
+    if !vector.iter().all(|value| value.is_finite()) {
+        return Err(ObjectError::VectorNotFinite.into());
+    }
+    Ok(())
 }
 
 /// The layer's candidates, each scored exactly: every allowed live row
