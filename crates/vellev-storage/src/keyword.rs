@@ -10,11 +10,14 @@ use vellev_index::text::{self, Posting, TextIndex};
 use crate::state::{Layer, LayerIndex, State};
 use crate::{Result, StorageError};
 
+/// The most a match in one property may count against one in another.
+pub const MAX_WEIGHT: f32 = 1_000.0;
+
 #[derive(Debug, Clone)]
 pub struct Keywords<'a> {
     pub text: &'a str,
-    /// The properties searched and how much a match in each counts; every
-    /// searchable property, equally, when empty.
+    /// The properties searched and how much a match in each counts, up to
+    /// [`MAX_WEIGHT`]; every searchable property, equally, when empty.
     pub properties: &'a [(&'a str, f32)],
     pub limit: usize,
     /// Only rows passing this are returned. It has no part in the scores.
@@ -119,7 +122,7 @@ impl State {
             .layers()
             .filter_map(|layer| layer.indexes.get(&id).map(|index| (layer, index)))
             .collect();
-        let repeats = text::tokens(query.text).fold(BTreeMap::new(), |mut repeats, token| {
+        let repeats = text::terms(query.text).fold(BTreeMap::new(), |mut repeats, token| {
             *repeats.entry(token).or_insert(0u32) += 1;
             repeats
         });
@@ -132,7 +135,7 @@ impl State {
                     property,
                     token,
                     weight: weight * *repeats as f32,
-                    average: field.tokens as f32 / field.rows as f32,
+                    average: field.words as f32 / field.rows as f32,
                 };
                 let holding: usize = layers
                     .iter()
@@ -147,6 +150,9 @@ impl State {
                 })
             })
             .collect();
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut best = BinaryHeap::new();
         for (layer, index) in &layers {
             let allowed = predicate
@@ -178,7 +184,6 @@ fn searched<'a>(
     schema: &'a Collection,
     asked: &'a [(&'a str, f32)],
 ) -> Result<Vec<(&'a str, f32)>> {
-    let invalid = |reason: String| Err(StorageError::InvalidQuery(reason));
     if asked.is_empty() {
         return Ok(schema
             .properties
@@ -187,23 +192,32 @@ fn searched<'a>(
             .map(|property| (property.name.as_str(), 1.0))
             .collect());
     }
-    for (name, weight) in asked {
-        if !schema
-            .property(name)
-            .is_some_and(|property| property.searchable)
-        {
-            return invalid(format!(
-                "{} has no searchable property {name:?}",
-                schema.name
-            ));
-        }
-        if !(weight.is_finite() && *weight > 0.0) {
-            return invalid(format!(
-                "the weight of {name:?} must be positive, not {weight}"
-            ));
-        }
-    }
-    Ok(asked.to_vec())
+    asked
+        .iter()
+        .enumerate()
+        .map(|(at, (name, weight))| {
+            let searchable = schema
+                .property(name)
+                .is_some_and(|property| property.searchable);
+            let refusal = if !searchable {
+                Some(format!(
+                    "{} has no searchable property {name:?}",
+                    schema.name
+                ))
+            } else if asked[..at].iter().any(|(earlier, _)| earlier == name) {
+                Some(format!("{name:?} is searched twice"))
+            } else if !(*weight > 0.0 && *weight <= MAX_WEIGHT) {
+                Some(format!(
+                    "the weight of {name:?} must be above 0 and at most {MAX_WEIGHT}, not {weight}"
+                ))
+            } else {
+                None
+            };
+            refusal.map_or(Ok((*name, *weight)), |reason| {
+                Err(StorageError::InvalidQuery(reason))
+            })
+        })
+        .collect()
 }
 
 /// Every row of a layer that matches a clause, ascending, with its score:

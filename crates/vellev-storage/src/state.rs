@@ -36,37 +36,39 @@ impl LayerIndex {
 }
 
 /// How many live rows of a collection have text in a property, and how many
-/// tokens between them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Field {
+/// words between them.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FieldTotals {
     pub rows: u64,
-    pub tokens: u64,
+    pub words: u64,
 }
 
 /// What keyword scoring needs to know about a collection's live rows as a
 /// whole. It is moved with every row that becomes live or dead, so it is
 /// exact at every position and costs a query nothing to read.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Corpus {
     pub objects: u64,
-    pub fields: HashMap<String, Field>,
+    pub fields: HashMap<String, FieldTotals>,
 }
 
 impl Corpus {
     fn count(&mut self, index: Option<&LayerIndex>, row: u32, live: bool) {
         let step = |total: &mut u64, by: u64| {
-            *total = if live { *total + by } else { *total - by };
+            *total = if live {
+                *total + by
+            } else {
+                total.checked_sub(by).expect("a row dies once")
+            };
         };
         step(&mut self.objects, 1);
         for (property, length) in index.into_iter().flat_map(|index| index.text.lengths(row)) {
-            let count = |field: &mut Field| {
-                step(&mut field.rows, 1);
-                step(&mut field.tokens, u64::from(length));
+            let field = match self.fields.get_mut(property) {
+                Some(field) => field,
+                None => self.fields.entry(property.to_string()).or_default(),
             };
-            match self.fields.get_mut(property) {
-                Some(field) => count(field),
-                None => count(self.fields.entry(property.to_string()).or_default()),
-            }
+            step(&mut field.rows, 1);
+            step(&mut field.words, u64::from(length));
         }
     }
 }
@@ -470,9 +472,10 @@ impl State {
                     // A memtable is flushed long before it holds as many
                     // rows as a segment may number. It has no vector index:
                     // its rows change, and are few enough to score one by
-                    // one. A collection dropped later in the same commit is
-                    // already gone from the catalog, and its rows go
-                    // unindexed.
+                    // one.
+                    //
+                    // A collection dropped later in the same commit is
+                    // already gone from the catalog; its rows go unindexed.
                     let index = self.catalog.schema(*collection).map(|schema| {
                         let index = self.memtable.indexes.entry(*collection).or_default();
                         index.insert(schema, row as u32, object);

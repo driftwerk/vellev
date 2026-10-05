@@ -2,8 +2,8 @@ mod common;
 
 use common::*;
 use vellev_core::Object;
-use vellev_index::text::tokens;
-use vellev_storage::{Keywords, Scored};
+use vellev_index::text::{terms, words};
+use vellev_storage::{Keywords, Scored, MAX_WEIGHT};
 
 const NOTES: &str = "notes";
 const EVERY: [(&str, f32); 3] = [("title", 1.0), ("body", 1.0), ("labels", 1.0)];
@@ -58,7 +58,7 @@ fn brute_force(
 ) -> BTreeMap<ObjectId, f64> {
     let objects: Vec<&Object> = state.scan(&name(NOTES)).collect();
     let (k1, b) = (f64::from(bm25.k1), f64::from(bm25.b));
-    let asked: Vec<String> = tokens(text).collect();
+    let asked: Vec<String> = terms(text).collect();
     let distinct: BTreeSet<&String> = asked.iter().collect();
     let mut scores = BTreeMap::new();
     for (property, weight) in properties {
@@ -66,7 +66,7 @@ fn brute_force(
             .iter()
             .filter_map(|object| {
                 let texts = texts(object, property)?;
-                Some((*object, texts.into_iter().flat_map(tokens).collect()))
+                Some((*object, texts.into_iter().flat_map(words).collect()))
             })
             .collect();
         let total: usize = held.iter().map(|(_, tokens)| tokens.len()).sum();
@@ -83,7 +83,7 @@ fn brute_force(
                 if frequency > 0.0 && keep(object) {
                     let length = tokens.len() as f64 / average;
                     *scores.entry(object.id).or_insert(0.0) +=
-                        f64::from(*weight) * repeats * rarity * frequency * (k1 + 1.0)
+                        f64::from(*weight) * repeats * rarity * frequency
                             / (frequency + k1 * (1.0 - b + b * length));
                 }
             }
@@ -142,13 +142,13 @@ async fn scores_are_bm25_over_the_live_objects() {
         .await
         .unwrap();
     let saturation = |frequency: f32, length: f32, average: f32| {
-        frequency * 2.2 / (frequency + 1.2 * (0.25 + 0.75 * length / average))
+        frequency / (frequency + 1.2 * (0.25 + 0.75 * length / average))
     };
     writer.partition().read(|state| {
         let rarity = (1.0 + 2.5f32 / 2.5).ln();
         let expected = [
-            (id(2), rarity * saturation(2.0, 3.0, 7.0 / 3.0)),
-            (id(1), rarity * saturation(1.0, 2.0, 7.0 / 3.0)),
+            (id(2), rarity * saturation(2.0, 3.0, 8.0 / 3.0)),
+            (id(1), rarity * saturation(1.0, 2.0, 8.0 / 3.0)),
         ];
         let found = ranked(&search(state, &Keywords::matching("red", 10)));
         assert_eq!(found.len(), 2);
@@ -164,7 +164,7 @@ async fn scores_are_bm25_over_the_live_objects() {
         let found = ranked(&search(state, &Keywords::matching("red", 10)));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, id(1));
-        let expected = rarity * saturation(1.0, 2.0, 2.0);
+        let expected = rarity * saturation(1.0, 2.0, 2.5);
         assert!(
             (found[0].1 - expected).abs() < 1e-6,
             "{} is not {expected}",
@@ -357,6 +357,53 @@ async fn a_dropped_collection_takes_its_text_and_totals_with_it() {
 }
 
 #[tokio::test]
+async fn a_property_added_later_is_searched_from_then_on() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![
+            notes(Bm25::default()),
+            titled(1, "fox"),
+            titled(2, "hen"),
+        ])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let follower = cluster.open().await;
+    let summary = Mutation::AddProperty {
+        collection: name(NOTES),
+        property: Property::new("summary", DataType::Text).searchable(),
+    };
+    writer
+        .commit(vec![
+            summary,
+            note(3, json!({ "summary": "a fox in the den" })),
+            note(1, json!({ "title": "fox", "summary": "den" })),
+        ])
+        .await
+        .unwrap();
+    follower.catch_up(&cluster.committed().await).await.unwrap();
+    let every = [
+        ("title", 1.0),
+        ("body", 1.0),
+        ("labels", 1.0),
+        ("summary", 1.0),
+    ];
+    for copy in [
+        writer.partition(),
+        follower.partition(),
+        cluster.open().await.partition(),
+    ] {
+        copy.read(|state| {
+            agrees(state, "fox den hen", &every, Bm25::default());
+            agrees(state, "fox den", &[("summary", 1.0)], Bm25::default());
+            let found = search(state, &Keywords::matching("den", 10));
+            assert_eq!(found.len(), 2);
+        });
+    }
+}
+
+#[tokio::test]
 async fn a_query_the_collection_cannot_answer_is_refused() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
@@ -375,6 +422,8 @@ async fn a_query_the_collection_cannot_answer_is_refused() {
             &[("title", -1.0)],
             &[("title", f32::NAN)],
             &[("title", f32::INFINITY)],
+            &[("title", MAX_WEIGHT * 2.0)],
+            &[("title", 1.0), ("body", 1.0), ("title", 2.0)],
         ] {
             assert!(
                 matches!(
@@ -400,7 +449,12 @@ async fn a_query_the_collection_cannot_answer_is_refused() {
 
 #[derive(Debug, Clone)]
 enum Step {
-    Put(u8, Vec<&'static str>, Vec<&'static str>),
+    Put(
+        u8,
+        Vec<&'static str>,
+        Option<Vec<&'static str>>,
+        Vec<&'static str>,
+    ),
     Delete(u8),
     Flush,
     Recreate,
@@ -410,7 +464,8 @@ fn step() -> impl Strategy<Value = Step> {
     let word = || prop::sample::select(vec!["fox", "hen", "den", "the", "Fox", "owl", "hen-fox"]);
     let words = move |most: usize| prop::collection::vec(word(), 0..=most);
     prop_oneof![
-        6 => (0..12u8, words(5), words(3)).prop_map(|(object, title, labels)| Step::Put(object, title, labels)),
+        6 => (0..12u8, words(5), prop::option::of(words(8)), words(3))
+            .prop_map(|(object, title, body, labels)| Step::Put(object, title, body, labels)),
         3 => (0..12u8).prop_map(Step::Delete),
         2 => Just(Step::Flush),
         1 => Just(Step::Recreate),
@@ -428,10 +483,15 @@ proptest! {
             let writer = cluster.writer().await;
             let bm25 = Bm25::default();
             writer.commit(vec![notes(bm25)]).await.unwrap();
+            let trailing = cluster.open().await;
+            let weighted = [("title", 2.0), ("body", 0.5), ("labels", 1.0)];
             for step in steps {
                 match step {
-                    Step::Put(object, title, labels) => {
-                        let properties = json!({ "title": title.join(" "), "labels": labels });
+                    Step::Put(object, title, body, labels) => {
+                        let mut properties = json!({ "title": title.join(" "), "labels": labels });
+                        if let Some(body) = body {
+                            properties["body"] = json!(body.join(" "));
+                        }
                         writer.commit(vec![note(object, properties)]).await.unwrap();
                     }
                     Step::Delete(object) => {
@@ -446,14 +506,18 @@ proptest! {
                     }
                 }
                 let fresh = cluster.open().await;
+                trailing.catch_up(&cluster.committed().await).await.unwrap();
                 for text in ["fox", "hen owl", "den den fox"] {
-                    let query = Keywords::matching(text, usize::MAX);
+                    let query = Keywords::matching(text, usize::MAX).within(&weighted);
                     let kept = writer.partition().read(|state| {
                         agrees(state, text, &EVERY, bm25);
+                        agrees(state, text, &weighted, bm25);
                         ranked(&search(state, &query))
                     });
-                    let loaded = fresh.partition().read(|state| ranked(&search(state, &query)));
-                    assert_eq!(kept, loaded);
+                    for follower in [&fresh, &trailing] {
+                        let followed = follower.partition().read(|state| ranked(&search(state, &query)));
+                        assert_eq!(kept, followed);
+                    }
                 }
             }
         });

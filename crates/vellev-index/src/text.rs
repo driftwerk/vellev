@@ -1,8 +1,9 @@
-//! Keyword search: tokens, postings, and the BM25 formula.
+//! Keyword search: words, postings, and the BM25 formula, each as Weaviate
+//! has it so that the two rank alike.
 //!
-//! Text is split on anything that is not a letter or a digit, lowercased,
-//! and stripped of English stopwords, both when it is stored and when it is
-//! asked for, by the one [`tokens`] function.
+//! Text is split into [`words`] on anything that is not a letter or a
+//! digit, and lowercased. English stopwords count toward a row's length but
+//! are never looked for, so a query's [`terms`] leave them out.
 
 use std::collections::HashMap;
 
@@ -16,12 +17,27 @@ const STOPWORDS: [&str; 33] = [
     "they", "this", "to", "was", "will", "with",
 ];
 
-/// The tokens of `text`, in order, with repeats.
-pub fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
+/// The words of `text`, in order, with repeats. Each letter is lowercased
+/// on its own, and whatever that adds besides letters is dropped, so that
+/// `İ` becomes `i`.
+pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
-        .filter(|word| STOPWORDS.binary_search(&word.as_str()).is_err())
+        .map(|word| {
+            word.chars()
+                .flat_map(char::to_lowercase)
+                .filter(|c| c.is_alphanumeric())
+                .collect()
+        })
+}
+
+fn is_stopword(word: &str) -> bool {
+    STOPWORDS.binary_search(&word).is_ok()
+}
+
+/// The words of `text` worth looking for.
+pub fn terms(text: &str) -> impl Iterator<Item = String> + '_ {
+    words(text).filter(|word| !is_stopword(word))
 }
 
 /// One row holding a token in a property.
@@ -95,9 +111,11 @@ impl TextIndex {
             };
             let mut frequencies: HashMap<String, u32> = HashMap::new();
             let mut length = 0;
-            for token in texts.iter().flat_map(|text| tokens(text)) {
-                *frequencies.entry(token).or_default() += 1;
+            for word in texts.iter().flat_map(|text| words(text)) {
                 length += 1;
+                if !is_stopword(&word) {
+                    *frequencies.entry(word).or_default() += 1;
+                }
             }
             let field = match self.fields.get_mut(name) {
                 Some(field) => field,
@@ -135,11 +153,12 @@ pub fn idf(objects: u64, holding: u64) -> f32 {
 
 /// One token's contribution to a row's score: its weight `idf`, how often
 /// the row holds it, and the row's length against the average. More
-/// occurrences count for less each, and a long row needs more of them.
+/// occurrences count for less each, never reaching `idf` between them, and
+/// a long row needs more of them.
 pub fn score(parameters: Bm25, idf: f32, frequency: f32, length: f32, average: f32) -> f32 {
     let Bm25 { k1, b } = parameters;
     let relative = if average > 0.0 { length / average } else { 0.0 };
-    idf * frequency * (k1 + 1.0) / (frequency + k1 * (1.0 - b + b * relative))
+    idf * frequency / (frequency + k1 * (1.0 - b + b * relative))
 }
 
 #[cfg(test)]
@@ -147,14 +166,18 @@ mod tests {
     use super::*;
 
     fn words(text: &str) -> Vec<String> {
-        tokens(text).collect()
+        super::words(text).collect()
+    }
+
+    fn terms(text: &str) -> Vec<String> {
+        super::terms(text).collect()
     }
 
     #[test]
     fn text_is_split_on_anything_but_letters_and_digits_and_lowercased() {
         assert_eq!(
             words("Deploys go-out on Tuesdays!"),
-            ["deploys", "go", "out", "tuesdays"]
+            ["deploys", "go", "out", "on", "tuesdays"]
         );
         assert_eq!(
             words("date:2026-07-05 v1.2_final"),
@@ -166,14 +189,19 @@ mod tests {
             ["ærøskøbing", "école", "naïve"]
         );
         assert_eq!(words("東京 tower"), ["東京", "tower"]);
+        assert_eq!(words("İstanbul ΟΔΟΣ"), ["istanbul", "οδοσ"]);
+        assert_eq!(
+            words("The cat AND the hat"),
+            ["the", "cat", "and", "the", "hat"]
+        );
     }
 
     #[test]
-    fn stopwords_are_dropped_whatever_their_case() {
+    fn stopwords_are_not_looked_for_whatever_their_case() {
         assert!(STOPWORDS.is_sorted());
-        assert_eq!(words("The cat AND the hat"), ["cat", "hat"]);
-        assert_eq!(words("to be or not to be"), [] as [&str; 0]);
-        assert_eq!(words("there their theremin"), ["theremin"]);
+        assert_eq!(terms("The cat AND the hat"), ["cat", "hat"]);
+        assert_eq!(terms("to be or not to be"), [] as [&str; 0]);
+        assert_eq!(terms("there their theremin"), ["theremin"]);
     }
 
     #[test]
@@ -190,7 +218,7 @@ mod tests {
         let at = |frequency: f32, length: f32| score(bm25, 1.0, frequency, length, 10.0);
         assert!(at(2.0, 10.0) > at(1.0, 10.0));
         assert!(at(2.0, 10.0) - at(1.0, 10.0) > at(20.0, 10.0) - at(19.0, 10.0));
-        assert!(at(1000.0, 10.0) < bm25.k1 + 1.0);
+        assert!(at(1000.0, 10.0) < 1.0);
         assert!(at(1.0, 5.0) > at(1.0, 10.0));
         assert!(at(1.0, 10.0) > at(1.0, 50.0));
         assert_eq!(at(0.0, 10.0), 0.0);
@@ -201,6 +229,6 @@ mod tests {
             score(ignoring_length, 1.0, 1.0, 5.0, 10.0),
             score(ignoring_length, 1.0, 1.0, 50.0, 10.0)
         );
-        assert_eq!(score(bm25, 2.0, 1.0, 10.0, 10.0), 2.0);
+        assert_eq!(score(bm25, 2.0, 1.0, 10.0, 10.0), 2.0 / 2.2);
     }
 }
