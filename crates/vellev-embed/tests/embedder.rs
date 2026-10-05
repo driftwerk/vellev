@@ -1,11 +1,8 @@
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use vellev_core::{Embedding, EmbeddingProvider, HttpApi, Object, ObjectId, Value};
-use vellev_embed::{
-    document, EmbedError, Embedder, Embedders, Provider, Purpose, Result, Settings,
-};
+use vellev_core::{Embedding, EmbeddingProvider, HttpApi};
+use vellev_embed::{EmbedError, Embedder, Embedders, Provider, Purpose, Result, Settings};
 
 /// Embeds each text as its length and its count of spaces, or as told.
 #[derive(Debug, Default)]
@@ -163,38 +160,6 @@ async fn an_answer_that_does_not_fit_is_refused() {
         );
         assert_eq!(embedder.query("fox").await, Err(expected));
     }
-}
-
-#[test]
-fn an_objects_text_is_its_embedded_properties_in_the_schemas_order() {
-    let object = |properties: Vec<(&str, Value)>| Object {
-        id: ObjectId(uuid::Uuid::from_u128(1)),
-        properties: properties
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), value))
-            .collect::<BTreeMap<_, _>>(),
-        vector: None,
-    };
-    let embedding = embedding(EmbeddingProvider::None);
-    let full = object(vec![
-        ("body", Value::Text("the body".into())),
-        ("labels", Value::TextArray(vec!["one".into(), "two".into()])),
-        ("n", Value::Int(4)),
-        ("other", Value::Text("not embedded".into())),
-        ("title", Value::Text("A title".into())),
-    ]);
-    assert_eq!(document(&embedding, &full), "A title\none\ntwo\nthe body");
-    assert_eq!(
-        document(&embedding, &object(vec![("n", Value::Int(4))])),
-        ""
-    );
-    assert_eq!(
-        document(
-            &embedding,
-            &object(vec![("labels", Value::TextArray(vec![]))])
-        ),
-        ""
-    );
 }
 
 #[tokio::test]

@@ -4095,7 +4095,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "uuid",
  "vellev-core",
 ]
 
@@ -4111,6 +4110,26 @@ dependencies = [
  "thiserror",
  "uuid",
  "vellev-core",
+]
+
+[[package]]
+name = "vellev-node"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "futures",
+ "object_store",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "vellev-core",
+ "vellev-embed",
+ "vellev-storage",
 ]
 
 [[package]]

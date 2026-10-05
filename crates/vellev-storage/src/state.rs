@@ -141,6 +141,12 @@ impl State {
         self.position
     }
 
+    /// How many rows have been written since the last checkpoint, counting
+    /// those since replaced: what a flush would move out of memory.
+    pub fn unflushed(&self) -> usize {
+        self.memtable.rows.len()
+    }
+
     pub fn head(&self) -> Option<&str> {
         self.head.as_deref()
     }

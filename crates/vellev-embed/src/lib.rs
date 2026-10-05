@@ -8,7 +8,7 @@ mod local;
 mod registry;
 
 pub use bedrock::Bedrock;
-pub use embedder::{document, Embedder};
+pub use embedder::Embedder;
 pub use http::Http;
 #[cfg(feature = "local")]
 pub use local::Local;

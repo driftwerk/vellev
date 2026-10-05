@@ -367,6 +367,13 @@ impl Coordinator for Unreliable {
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
         self.inner.committed(key).await
     }
+    async fn partitions(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<PartitionKey>, CoordinatorError> {
+        self.inner.partitions(after, limit).await
+    }
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.inner.ping().await
     }

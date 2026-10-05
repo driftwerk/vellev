@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-use crate::{Collection, DataType, ObjectId};
+use crate::{Collection, DataType, Embedding, ObjectId};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ObjectError {
@@ -99,18 +99,21 @@ impl Value {
     }
 }
 
-fn checked_vector(collection: &Collection, vector: Vec<f32>) -> Result<Vec<f32>, ObjectError> {
-    let expected = collection.embedding.dimensions;
-    if vector.len() != expected as usize {
-        return Err(ObjectError::VectorLength {
-            expected,
-            got: vector.len(),
-        });
+impl Embedding {
+    /// `vector` if it is one this embedding's collection can hold.
+    pub fn checked(&self, vector: Vec<f32>) -> Result<Vec<f32>, ObjectError> {
+        let expected = self.dimensions;
+        if vector.len() != expected as usize {
+            return Err(ObjectError::VectorLength {
+                expected,
+                got: vector.len(),
+            });
+        }
+        if !vector.iter().all(|v| v.is_finite()) {
+            return Err(ObjectError::VectorNotFinite);
+        }
+        Ok(vector)
     }
-    if !vector.iter().all(|v| v.is_finite()) {
-        return Err(ObjectError::VectorNotFinite);
-    }
-    Ok(vector)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,7 +198,7 @@ impl Object {
                     Ok(merged)
                 })?;
         let vector = match vector {
-            Some(vector) => Some(checked_vector(collection, vector)?),
+            Some(vector) => Some(collection.embedding.checked(vector)?),
             None => self.vector.clone(),
         };
         Ok(Object {
@@ -203,6 +206,24 @@ impl Object {
             properties: merged,
             vector,
         })
+    }
+
+    /// The text of this object that a collection embedding as `embedding`
+    /// says turns into its vector: the listed properties' values, in
+    /// order, a line each.
+    pub fn embedded_text(&self, embedding: &Embedding) -> String {
+        embedding
+            .properties
+            .iter()
+            .filter_map(|name| self.properties.get(name))
+            .flat_map(|value| match value {
+                Value::Text(text) => std::slice::from_ref(text),
+                Value::TextArray(texts) => texts.as_slice(),
+                _ => &[],
+            })
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn properties_json(&self) -> serde_json::Map<String, Json> {
@@ -377,6 +398,40 @@ mod tests {
                 expected: 768,
                 got: 3
             })
+        );
+    }
+
+    #[test]
+    fn embedded_text_is_the_listed_properties_in_the_schemas_order() {
+        let mut schema = workforce_memory();
+        schema.embedding.properties = vec!["source".into(), "tags".into(), "content".into()];
+        let object = |properties: serde_json::Value| {
+            Object::from_json(
+                &schema,
+                ObjectId(uuid::Uuid::from_u128(1)),
+                properties.as_object().unwrap(),
+                None,
+            )
+            .unwrap()
+        };
+        let full = object(json!({
+            "content": "the body",
+            "tags": ["one", "two"],
+            "importance": 0.5,
+            "owner": "not embedded",
+            "source": "A source",
+        }));
+        assert_eq!(
+            full.embedded_text(&schema.embedding),
+            "A source\none\ntwo\nthe body"
+        );
+        assert_eq!(
+            object(json!({ "importance": 1 })).embedded_text(&schema.embedding),
+            ""
+        );
+        assert_eq!(
+            object(json!({ "tags": [] })).embedded_text(&schema.embedding),
+            ""
         );
     }
 }

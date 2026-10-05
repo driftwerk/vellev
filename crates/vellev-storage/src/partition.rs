@@ -4,16 +4,17 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use tokio::sync::Mutex;
+use vellev_core::Embedding;
 
 use crate::blobs::{is_plain, Author, Blobs, Layout};
 use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
 };
-use crate::draft::Draft;
-use crate::format::{decode, decode_head, encode, Head, Kind, LogSegment, Manifest};
-use crate::mutation::{Mutation, Receipt};
+use crate::draft::{Draft, Wanted};
+use crate::format::{decode, decode_head, encode, Head, Kind, LogSegment, Manifest, Op};
+use crate::mutation::{Mutation, Receipt, Vectorize};
 use crate::state::{Loaded, State};
 use crate::{Result, StorageError};
 
@@ -21,6 +22,12 @@ use crate::{Result, StorageError};
 /// safe because the coordinator accepts an identical commit twice.
 const COMMIT_ATTEMPTS: u32 = 3;
 const COMMIT_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// How long a commit waits for the vectors it needs made.
+const EMBEDDING_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Vectors by the text they were made from and the way it was embedded.
+pub type Embedded = HashMap<(Embedding, String), Vec<f32>>;
 
 /// A partition's committed data in memory. It only ever moves forward, and
 /// only through its [`Follower`] or [`Writer`].
@@ -236,6 +243,7 @@ pub struct Writer {
     coordinator: Arc<dyn Coordinator>,
     lease: Lease,
     author: Author,
+    vectorize: Option<Arc<dyn Vectorize>>,
     ready: Mutex<bool>,
 }
 
@@ -258,8 +266,18 @@ impl Writer {
             coordinator,
             lease,
             author,
+            vectorize: None,
             ready: Mutex::new(true),
         })
+    }
+
+    /// Embed with `vectorize` for the collections that embed their own
+    /// objects. Without it, a write that needs a vector made is refused.
+    pub fn embedding_with(self, vectorize: Arc<dyn Vectorize>) -> Self {
+        Self {
+            vectorize: Some(vectorize),
+            ..self
+        }
     }
 
     pub fn partition(&self) -> &Arc<Partition> {
@@ -287,19 +305,96 @@ impl Writer {
     /// atomic on its own and sees the batches before it; a rejected batch is
     /// left out with its own error and does not affect the others. Every
     /// accepted batch becomes visible at the same position.
+    ///
+    /// A batch that needs a vector which cannot be made is rejected like
+    /// any other, and the rest are resolved again without it.
     pub async fn commit_group(&self, batches: Vec<Vec<Mutation>>) -> Result<Vec<Result<Receipt>>> {
+        self.commit_group_with(batches, Embedded::new()).await
+    }
+
+    /// The texts `mutations` would leave to be embedded if they were
+    /// committed now, with how each is embedded. A caller can make their
+    /// vectors ahead of the commit and hand them to
+    /// [`Self::commit_group_with`], rather than have the commit make them
+    /// while every other write waits.
+    pub fn wanted(&self, mutations: &[Mutation]) -> Vec<(Embedding, String)> {
+        self.partition.read(|state| {
+            let mut draft = Draft::new(state);
+            let _ = draft.batch(mutations.to_vec());
+            let (_, wanted) = draft.finish();
+            wanted
+                .into_iter()
+                .map(|wanted| (wanted.embedding, wanted.text))
+                .collect()
+        })
+    }
+
+    /// As [`Self::commit_group`], using `made` for any vector the commit
+    /// needs that it holds: one is used only for the very text and way of
+    /// embedding the commit itself arrives at, and only if the collection
+    /// can hold it.
+    pub async fn commit_group_with(
+        &self,
+        batches: Vec<Vec<Mutation>>,
+        made: Embedded,
+    ) -> Result<Vec<Result<Receipt>>> {
         let mut ready = self.ready.lock().await;
         if !*ready {
             return Err(StorageError::Closed);
         }
-        let ((position, prev), outcomes, ops) = self.partition.read(|state| {
-            let mut draft = Draft::new(state);
-            let outcomes: Vec<_> = batches
-                .into_iter()
-                .map(|batch| draft.batch(batch))
-                .collect();
-            (state.at(), outcomes, draft.into_ops())
-        });
+        let mut unembedded: Vec<Option<(String, String)>> = vec![None; batches.len()];
+        let mut made: Embedded = made
+            .into_iter()
+            .filter_map(|((embedding, text), vector)| {
+                let vector = embedding.checked(vector).ok()?;
+                Some(((embedding, text), vector))
+            })
+            .collect();
+        let mut failed: HashMap<Embedding, String> = HashMap::new();
+        let ((position, prev), outcomes, ops) = loop {
+            let (at, outcomes, (mut ops, wanted)) = self.partition.read(|state| {
+                let mut draft = Draft::new(state);
+                let outcomes: Vec<_> = batches
+                    .iter()
+                    .zip(&unembedded)
+                    .map(|(batch, unembedded)| match unembedded {
+                        Some(_) => draft.batch(Vec::new()),
+                        None => draft.batch(batch.clone()),
+                    })
+                    .collect();
+                (state.at(), outcomes, draft.finish())
+            });
+            self.make(&wanted, &mut made, &mut failed).await;
+            let unmade = |wanted: &&Wanted| failed.contains_key(&wanted.embedding);
+            if !wanted.iter().any(|wanted| unmade(&wanted)) {
+                for Wanted {
+                    op,
+                    embedding,
+                    text,
+                    ..
+                } in wanted
+                {
+                    if let Op::Upsert { object, .. } = &mut ops[op] {
+                        object.vector = made.get(&(embedding, text)).cloned();
+                    }
+                }
+                break (at, outcomes, ops);
+            }
+            let rejected = |unembedded: &[Option<_>]| unembedded.iter().flatten().count();
+            let before = rejected(&unembedded);
+            for wanted in wanted.iter().filter(unmade) {
+                let reason = failed[&wanted.embedding].clone();
+                unembedded[wanted.batch] = Some((wanted.embedding.model.clone(), reason));
+            }
+            if rejected(&unembedded) == before {
+                let (model, reason) = failed
+                    .into_iter()
+                    .next()
+                    .map(|(embedding, reason)| (embedding.model, reason))
+                    .unwrap_or_default();
+                return Err(StorageError::Embedding { model, reason });
+            }
+        };
         let position = if ops.is_empty() {
             position
         } else {
@@ -323,8 +418,83 @@ impl Writer {
         };
         Ok(outcomes
             .into_iter()
-            .map(|outcomes| outcomes.map(|outcomes| Receipt { position, outcomes }))
+            .zip(unembedded)
+            .map(|(outcomes, unembedded)| match unembedded {
+                Some((model, reason)) => Err(StorageError::Embedding { model, reason }),
+                None => outcomes.map(|outcomes| Receipt { position, outcomes }),
+            })
             .collect())
+    }
+
+    /// Make the vectors `wanted` that are not `made` yet, each way of
+    /// embedding at the same time as the others, and note in `failed` why
+    /// for each way that could not make all of its own. A way that has
+    /// failed is not asked again.
+    ///
+    /// The writer is held meanwhile, so that no other write can change a
+    /// text a vector is being made for.
+    async fn make(
+        &self,
+        wanted: &[Wanted],
+        made: &mut Embedded,
+        failed: &mut HashMap<Embedding, String>,
+    ) {
+        let mut missing: HashMap<&Embedding, Vec<&String>> = HashMap::new();
+        for Wanted {
+            embedding, text, ..
+        } in wanted
+        {
+            let known = failed.contains_key(embedding)
+                || made.contains_key(&(embedding.clone(), text.clone()));
+            let texts = missing.entry(embedding).or_default();
+            if !known && !texts.contains(&text) {
+                texts.push(text);
+            }
+        }
+        let asked = missing
+            .into_iter()
+            .filter(|(_, texts)| !texts.is_empty())
+            .map(|(embedding, texts)| async move {
+                let texts: Vec<String> = texts.into_iter().cloned().collect();
+                let vectors = self.vectors(embedding, texts.clone()).await;
+                (embedding, vectors.map(|vectors| (texts, vectors)))
+            });
+        for (embedding, outcome) in join_all(asked).await {
+            match outcome {
+                Ok((texts, vectors)) => made.extend(
+                    texts
+                        .into_iter()
+                        .zip(vectors)
+                        .map(|(text, vector)| ((embedding.clone(), text), vector)),
+                ),
+                Err(reason) => {
+                    failed.insert(embedding.clone(), reason);
+                }
+            }
+        }
+    }
+
+    /// A vector the collection can hold for each of `texts`, or why not.
+    async fn vectors(
+        &self,
+        embedding: &Embedding,
+        texts: Vec<String>,
+    ) -> std::result::Result<Vec<Vec<f32>>, String> {
+        let vectorize = self
+            .vectorize
+            .as_ref()
+            .ok_or("this writer has nothing to embed with")?;
+        let asked = texts.len();
+        let vectors = tokio::time::timeout(EMBEDDING_TIMEOUT, vectorize.vectors(embedding, texts))
+            .await
+            .map_err(|_| format!("no vectors within {EMBEDDING_TIMEOUT:?}"))??;
+        if vectors.len() != asked {
+            return Err(format!("{} vectors for {asked} texts", vectors.len()));
+        }
+        vectors
+            .into_iter()
+            .map(|vector| embedding.checked(vector).map_err(|error| error.to_string()))
+            .collect()
     }
 
     /// Write a checkpoint: move the rows held in memory into a segment and

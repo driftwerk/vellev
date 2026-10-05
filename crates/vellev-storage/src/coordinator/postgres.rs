@@ -5,14 +5,17 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions};
 use sqlx::query::QueryAs;
 use sqlx::{Executor, FromRow, Postgres};
-use vellev_core::NodeId;
+use vellev_core::{NodeId, Partition, TenantId};
 
 use super::{
     checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease,
     LogPosition, ManifestRef, PartitionKey, Result,
 };
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../migrations/0001_partitions.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../migrations/0001_partitions.sql")),
+    (2, include_str!("../../migrations/0002_tenant_order.sql")),
+];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
 /// so it is released with the transaction and never pins an RDS Proxy session.
@@ -327,6 +330,48 @@ impl Coordinator for PostgresCoordinator {
 
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>> {
         Ok(self.row(key).await?.as_ref().map(Snapshot::committed))
+    }
+
+    async fn partitions(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<PartitionKey>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<(String, i64)> = match after {
+            None => {
+                sqlx::query_as(
+                    "SELECT tenant, partition FROM vellev.partitions
+                     ORDER BY tenant, partition LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some(after) => {
+                sqlx::query_as(
+                    "SELECT tenant, partition FROM vellev.partitions
+                     WHERE (tenant, partition) > ($1, $2)
+                     ORDER BY tenant, partition LIMIT $3",
+                )
+                .bind(after.tenant.as_str())
+                .bind(i64::from(after.partition.0))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.into_iter()
+            .map(|(tenant, partition)| {
+                let stored = || invariant(format!("{tenant}/{partition} is not a partition key"));
+                Ok(PartitionKey {
+                    tenant: TenantId::new(tenant.as_str()).map_err(|_| stored())?,
+                    partition: u32::try_from(partition)
+                        .map(Partition)
+                        .map_err(|_| stored())?,
+                })
+            })
+            .collect()
     }
 
     async fn ping(&self) -> Result<()> {

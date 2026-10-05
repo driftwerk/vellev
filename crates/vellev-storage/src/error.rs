@@ -48,6 +48,8 @@ pub enum StorageError {
     InvalidMutation(String),
     #[error("{0}")]
     InvalidQuery(String),
+    #[error("embedding with {model} failed: {reason}")]
+    Embedding { model: String, reason: String },
     #[error(transparent)]
     Schema(#[from] SchemaError),
     #[error(transparent)]

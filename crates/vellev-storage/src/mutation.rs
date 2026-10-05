@@ -1,5 +1,5 @@
 use serde_json::{Map, Value as Json};
-use vellev_core::{Collection, CollectionName, ObjectId, Property, Value};
+use vellev_core::{Collection, CollectionName, Embedding, ObjectId, Property, Value};
 
 use vellev_index::filter::Filter;
 
@@ -70,6 +70,21 @@ pub enum Mutation {
         collection: CollectionName,
         filter: Filter,
     },
+}
+
+/// Turns text into vectors for the collections that embed their own
+/// objects. A writer with one makes, as part of the commit, the vector of
+/// every object written without one, unless the object's embedded text
+/// already has a vector stored for it.
+#[async_trait::async_trait]
+pub trait Vectorize: std::fmt::Debug + Send + Sync {
+    /// A vector for each text, in order, as `embedding` embeds what it
+    /// stores. No text is blank.
+    async fn vectors(
+        &self,
+        embedding: &Embedding,
+        texts: Vec<String>,
+    ) -> std::result::Result<Vec<Vec<f32>>, String>;
 }
 
 /// Holds when the stored object's `property` equals `equals`, where JSON
