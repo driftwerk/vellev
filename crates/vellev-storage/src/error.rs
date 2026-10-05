@@ -1,4 +1,6 @@
-use vellev_core::{CollectionName, ObjectError, SchemaError};
+use std::sync::Arc;
+
+use vellev_core::{CollectionName, ObjectError, ObjectId, SchemaError};
 
 use crate::coordinator::CoordinatorError;
 
@@ -26,6 +28,24 @@ pub enum StorageError {
     UnknownCollection(CollectionName),
     #[error("collection {0} already exists")]
     CollectionExists(CollectionName),
+    #[error("object {id} does not exist in {collection}")]
+    UnknownObject {
+        collection: CollectionName,
+        id: ObjectId,
+    },
+    #[error("object {id} already exists in {collection}")]
+    ObjectExists {
+        collection: CollectionName,
+        id: ObjectId,
+    },
+    #[error("object {id} in {collection} does not have the expected {property:?}")]
+    ConditionFailed {
+        collection: CollectionName,
+        id: ObjectId,
+        property: String,
+    },
+    #[error("{0}")]
+    InvalidMutation(String),
     #[error(transparent)]
     Schema(#[from] SchemaError),
     #[error(transparent)]
@@ -38,9 +58,20 @@ pub enum StorageError {
     Exhausted(&'static str),
     #[error("encoding failed: {0}")]
     Encode(String),
+    /// A failure of a commit shared by several callers, as each of them sees it.
+    #[error(transparent)]
+    Shared(Arc<StorageError>),
 }
 
 impl StorageError {
+    /// The failure itself, looking through [`StorageError::Shared`].
+    pub fn root(&self) -> &StorageError {
+        match self {
+            Self::Shared(shared) => shared.root(),
+            other => other,
+        }
+    }
+
     pub(crate) fn corrupt(key: &str, reason: impl Into<String>) -> Self {
         Self::Corrupt {
             key: key.to_string(),

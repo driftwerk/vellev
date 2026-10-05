@@ -76,7 +76,10 @@ impl State {
     }
 
     pub fn get(&self, collection: &CollectionName, id: ObjectId) -> Option<&Object> {
-        let (collection, _) = self.catalog.get(collection)?;
+        self.row(self.catalog.get(collection)?.0, id)
+    }
+
+    pub(crate) fn row(&self, collection: CollectionId, id: ObjectId) -> Option<&Object> {
         self.live
             .get(&(collection, id))
             .map(|location| match *location {

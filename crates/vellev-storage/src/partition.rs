@@ -8,11 +8,12 @@ use futures::future::try_join_all;
 use tokio::sync::Mutex;
 
 use crate::blobs::{is_plain, Author, Blobs, Layout};
-use crate::catalog::Mutation;
 use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
 };
+use crate::draft::Draft;
 use crate::format::{decode, decode_head, encode, Head, Kind, LogSegment, Manifest, SegmentFile};
+use crate::mutation::{Mutation, Receipt};
 use crate::state::State;
 use crate::{Result, StorageError};
 
@@ -273,40 +274,57 @@ impl Writer {
         &self.author
     }
 
-    /// Commit `mutations` as one atomic step and return its position. A
-    /// rejected mutation fails the whole batch and changes nothing.
-    pub async fn commit(&self, mutations: Vec<Mutation>) -> Result<LogPosition> {
+    /// Commit `mutations` as one atomic step. A rejected mutation fails the
+    /// whole batch and changes nothing.
+    pub async fn commit(&self, mutations: Vec<Mutation>) -> Result<Receipt> {
+        self.commit_group(vec![mutations])
+            .await?
+            .pop()
+            .expect("one result per batch")
+    }
+
+    /// Commit several callers' batches as one log segment. Each batch is
+    /// atomic on its own and sees the batches before it; a rejected batch is
+    /// left out with its own error and does not affect the others. Every
+    /// accepted batch becomes visible at the same position.
+    pub async fn commit_group(&self, batches: Vec<Vec<Mutation>>) -> Result<Vec<Result<Receipt>>> {
         let mut ready = self.ready.lock().await;
         if !*ready {
             return Err(StorageError::Closed);
         }
-        let ((position, prev), mut catalog) = self
-            .partition
-            .read(|state| (state.at(), state.catalog().clone()));
-        let ops = mutations
-            .into_iter()
-            .filter_map(|mutation| catalog.resolve(mutation).transpose())
-            .collect::<Result<Vec<_>>>()?;
-        if ops.is_empty() {
-            return Ok(position);
-        }
-        let log = LogSegment {
-            position: following(position)?,
-            prev,
-            ops,
+        let ((position, prev), outcomes, ops) = self.partition.read(|state| {
+            let mut draft = Draft::new(state);
+            let outcomes: Vec<_> = batches
+                .into_iter()
+                .map(|batch| draft.batch(batch))
+                .collect();
+            (state.at(), outcomes, draft.into_ops())
+        });
+        let position = if ops.is_empty() {
+            position
+        } else {
+            let log = LogSegment {
+                position: following(position)?,
+                prev,
+                ops,
+            };
+            let key = Layout(&self.lease.key).log(log.position, &self.author);
+            let frame = encode(Kind::Log, &log)?;
+            attempt(&mut ready, async {
+                self.publish(&key, frame, log.position).await?;
+                self.partition
+                    .state
+                    .write()
+                    .expect("partition lock")
+                    .apply(&key, &log)
+            })
+            .await?;
+            log.position
         };
-        let key = Layout(&self.lease.key).log(log.position, &self.author);
-        let frame = encode(Kind::Log, &log)?;
-        attempt(&mut ready, async {
-            self.publish(&key, frame, log.position).await?;
-            self.partition
-                .state
-                .write()
-                .expect("partition lock")
-                .apply(&key, &log)
-        })
-        .await?;
-        Ok(log.position)
+        Ok(outcomes
+            .into_iter()
+            .map(|outcomes| outcomes.map(|outcomes| Receipt { position, outcomes }))
+            .collect())
     }
 
     /// Write a checkpoint: move the rows held in memory into a segment and
