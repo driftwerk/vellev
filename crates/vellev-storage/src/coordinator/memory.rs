@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ use super::{
     LogPosition, ManifestRef, PartitionKey, Result,
 };
 
-pub trait Clock: Send + Sync {
+pub trait Clock: fmt::Debug + Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
@@ -66,19 +67,11 @@ impl Row {
 
 /// The coordinator's rules without a database: the same fencing, driven by an
 /// injectable clock.
+#[derive(Debug)]
 pub struct MemoryCoordinator {
     clock: Arc<dyn Clock>,
     generations: AtomicU64,
     rows: Mutex<HashMap<PartitionKey, Row>>,
-}
-
-impl std::fmt::Debug for MemoryCoordinator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemoryCoordinator")
-            .field("generations", &self.generations)
-            .field("rows", &self.rows)
-            .finish_non_exhaustive()
-    }
 }
 
 impl Default for MemoryCoordinator {
@@ -129,7 +122,7 @@ impl MemoryCoordinator {
 }
 
 fn expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
-    chrono::Duration::from_std(checked_ttl(ttl)?)
+    chrono::Duration::from_std(ttl)
         .ok()
         .and_then(|ttl| now.checked_add_signed(ttl))
         .ok_or_else(|| {
@@ -168,16 +161,18 @@ impl Coordinator for MemoryCoordinator {
         holder: &NodeId,
         ttl: Duration,
     ) -> Result<Acquired> {
+        let ttl = checked_ttl(ttl)?;
         let requested_at = Instant::now();
         self.with_row(key, |row, now| {
-            match &row.lease {
-                Some((current, expires_at)) if *expires_at > now && current != holder => {
-                    return Ok(Acquired::Held {
-                        holder: current.clone(),
-                        expires_at: *expires_at,
-                    })
-                }
-                _ => {}
+            let live = row
+                .lease
+                .as_ref()
+                .filter(|(current, expires_at)| *expires_at > now && current != holder);
+            if let Some((current, expires_at)) = live {
+                return Ok(Acquired::Held {
+                    holder: current.clone(),
+                    expires_at: *expires_at,
+                });
             }
             let expires_at = expiry(now, ttl)?;
             row.generation = self.next_generation();
@@ -197,6 +192,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease> {
+        let ttl = checked_ttl(ttl)?;
         let requested_at = Instant::now();
         self.with_current(lease, |row, now| {
             let expires_at = expiry(now, ttl)?;

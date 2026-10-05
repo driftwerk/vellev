@@ -223,14 +223,20 @@ async fn a_zero_ttl_lease_is_expired_at_once(h: &dyn Harness) {
 
 async fn a_ttl_beyond_the_maximum_is_refused(h: &dyn Harness) {
     let c = h.coordinator();
+    let too_long = [MAX_TTL + Duration::from_secs(1), Duration::MAX];
+    let invalid = |r: Result<Acquired, CoordinatorError>| {
+        matches!(r, Err(CoordinatorError::InvalidArgument(_)))
+    };
+
+    let unregistered = key();
     let key = registered(h).await;
-    for ttl in [MAX_TTL + Duration::from_secs(1), Duration::MAX] {
-        assert!(matches!(
-            c.acquire(&key, &node("a"), ttl).await,
-            Err(CoordinatorError::InvalidArgument(_))
-        ));
-    }
     let (lease, _) = lease(h, &key, &node("a")).await;
+    for ttl in too_long {
+        assert!(invalid(c.acquire(&unregistered, &node("x"), ttl).await));
+        assert!(invalid(c.acquire(&key, &node("x"), ttl).await));
+        assert!(invalid(c.acquire(&key, &node("a"), ttl).await));
+    }
+    assert!(held_by(h, &key, &lease.holder).await);
     assert!(matches!(
         c.renew(&lease, Duration::MAX).await,
         Err(CoordinatorError::InvalidArgument(_))

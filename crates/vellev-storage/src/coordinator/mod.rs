@@ -136,8 +136,8 @@ impl CoordinatorError {
         Self::Backend(Box::new(error))
     }
 
-    /// Only a backend failure leaves the outcome unknown; every other error
-    /// is a definite answer.
+    /// A backend failure or transient contention leaves the outcome unknown
+    /// and is worth retrying; every other error is a definite answer.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Backend(_))
     }
@@ -149,11 +149,6 @@ fn checked_ttl(ttl: Duration) -> Result<Duration> {
     (ttl <= MAX_TTL).then_some(ttl).ok_or_else(|| {
         CoordinatorError::InvalidArgument(format!("ttl {ttl:?} exceeds {MAX_TTL:?}"))
     })
-}
-
-fn bigint(value: u64) -> Result<i64> {
-    i64::try_from(value)
-        .map_err(|_| CoordinatorError::InvalidArgument(format!("{value} exceeds the bigint range")))
 }
 
 #[async_trait]

@@ -8,8 +8,8 @@ use sqlx::{Executor, FromRow, Postgres};
 use vellev_core::NodeId;
 
 use super::{
-    bigint, checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Lease, LogPosition, ManifestRef, PartitionKey, Result,
+    checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease,
+    LogPosition, ManifestRef, PartitionKey, Result,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../migrations/0001_partitions.sql"))];
@@ -17,8 +17,6 @@ const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../migrations/0001_par
 /// Serialises migrations across nodes starting together. Transaction-scoped,
 /// so it is released with the transaction and never pins an RDS Proxy session.
 const MIGRATION_LOCK: i64 = 0x76656c_6c6576;
-
-const COLUMNS: &str = "generation, lease_holder, lease_expires_at, log_position, manifest";
 
 /// How many times `acquire` re-reads a row that changed under it before
 /// giving up; each retry needs a release to land between its two statements.
@@ -48,41 +46,42 @@ impl PostgresCoordinator {
     }
 
     async fn row(&self, key: &PartitionKey) -> Result<Option<Snapshot>> {
-        Ok(keyed(
-            &format!(
-                "SELECT {COLUMNS} FROM vellev.partitions WHERE tenant = $1 AND partition = $2"
-            ),
+        Ok(snapshot(
+            "SELECT generation, lease_holder, lease_expires_at, log_position, manifest
+             FROM vellev.partitions WHERE tenant = $1 AND partition = $2",
             key,
         )
         .fetch_optional(&self.pool)
         .await?)
     }
 
-    /// Why a fenced statement on `lease` did nothing. `on_current` explains the
-    /// case where the generation still matches, so the predicate failed for
-    /// another reason.
-    async fn refusal(
-        &self,
-        lease: &Lease,
-        on_current: impl FnOnce(&Snapshot) -> CoordinatorError + Send,
-    ) -> CoordinatorError {
-        match self.row(&lease.key).await {
-            Err(error) => error,
-            Ok(None) => CoordinatorError::UnknownPartition(lease.key.clone()),
-            Ok(Some(row)) if row.generation != lease.generation => lease.fenced_by(row.generation),
-            Ok(Some(row)) => on_current(&row),
+    /// Why a fenced statement on `lease` changed no row. `Ok` means the
+    /// generation is still current, so the statement failed on another clause.
+    async fn refusal(&self, lease: &Lease) -> Result<Snapshot> {
+        match self.row(&lease.key).await? {
+            None => Err(CoordinatorError::UnknownPartition(lease.key.clone())),
+            Some(row) if row.generation != lease.generation => Err(lease.fenced_by(row.generation)),
+            Some(row) => Ok(row),
         }
     }
 }
 
-fn keyed<'q>(sql: &'q str, key: &'q PartitionKey) -> QueryAs<'q, Postgres, Snapshot, PgArguments> {
+fn snapshot<'q>(
+    sql: &'static str,
+    key: &'q PartitionKey,
+) -> QueryAs<'q, Postgres, Snapshot, PgArguments> {
     sqlx::query_as(sql)
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
 }
 
-fn changed_underneath(_: &Snapshot) -> CoordinatorError {
-    CoordinatorError::InvalidArgument("partition changed between two statements".into())
+fn bigint(value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| CoordinatorError::InvalidArgument(format!("{value} exceeds the bigint range")))
+}
+
+fn invariant(message: String) -> CoordinatorError {
+    CoordinatorError::Backend(message.into())
 }
 
 async fn migrate(pool: &PgPool) -> Result<()> {
@@ -95,18 +94,31 @@ async fn migrate(pool: &PgPool) -> Result<()> {
     tx.execute(
         "CREATE TABLE IF NOT EXISTS vellev.schema_version (
              version bigint PRIMARY KEY,
+             sql text NOT NULL,
              applied_at timestamptz NOT NULL DEFAULT now()
          )",
     )
     .await?;
-    let applied: i64 =
-        sqlx::query_scalar("SELECT coalesce(max(version), 0) FROM vellev.schema_version")
-            .fetch_one(&mut *tx)
+    let applied: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version, sql FROM vellev.schema_version ORDER BY version")
+            .fetch_all(&mut *tx)
             .await?;
-    for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version > applied) {
+    for (version, sql) in &applied {
+        match MIGRATIONS.iter().find(|(v, _)| v == version) {
+            Some((_, expected)) if expected == sql => {}
+            _ => {
+                return Err(invariant(format!(
+                    "migration {version} differs from the one applied; recreate the database"
+                )))
+            }
+        }
+    }
+    let latest = applied.last().map_or(0, |(version, _)| *version);
+    for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version > latest) {
         tx.execute(sqlx::raw_sql(sql)).await?;
-        sqlx::query("INSERT INTO vellev.schema_version (version) VALUES ($1)")
+        sqlx::query("INSERT INTO vellev.schema_version (version, sql) VALUES ($1, $2)")
             .bind(version)
+            .bind(sql)
             .execute(&mut *tx)
             .await?;
     }
@@ -192,25 +204,25 @@ impl Coordinator for PostgresCoordinator {
         ttl: Duration,
     ) -> Result<Acquired> {
         let ttl = checked_ttl(ttl)?;
-        let sql = format!(
-            "UPDATE vellev.partitions
-             SET generation = nextval('vellev.generations'),
-                 lease_holder = $3,
-                 lease_expires_at = now() + make_interval(secs => $4)
-             WHERE tenant = $1 AND partition = $2
-               AND (lease_expires_at IS NULL OR lease_expires_at <= now() OR lease_holder = $3)
-             RETURNING {COLUMNS}"
-        );
         for _ in 0..ACQUIRE_ATTEMPTS {
             let requested_at = Instant::now();
-            let taken = keyed(&sql, key)
-                .bind(holder.as_str())
-                .bind(ttl.as_secs_f64())
-                .fetch_optional(&self.pool)
-                .await?;
+            let taken = snapshot(
+                "UPDATE vellev.partitions
+                 SET generation = nextval('vellev.generations'),
+                     lease_holder = $3,
+                     lease_expires_at = now() + make_interval(secs => $4)
+                 WHERE tenant = $1 AND partition = $2
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= now() OR lease_holder = $3)
+                 RETURNING generation, lease_holder, lease_expires_at, log_position, manifest",
+                key,
+            )
+            .bind(holder.as_str())
+            .bind(ttl.as_secs_f64())
+            .fetch_optional(&self.pool)
+            .await?;
             if let Some(row) = taken {
                 let (_, expires_at) = row.lease().ok_or_else(|| {
-                    CoordinatorError::InvalidArgument("acquired lease has no expiry".into())
+                    invariant(format!("lease on {key} was taken without an expiry"))
                 })?;
                 return Ok(Acquired::Lease {
                     lease: Lease {
@@ -232,7 +244,7 @@ impl Coordinator for PostgresCoordinator {
                 return Ok(Acquired::Held { holder, expires_at });
             }
         }
-        Err(CoordinatorError::InvalidArgument(format!(
+        Err(invariant(format!(
             "lease on {key} kept changing across {ACQUIRE_ATTEMPTS} attempts"
         )))
     }
@@ -242,14 +254,13 @@ impl Coordinator for PostgresCoordinator {
         let requested_at = Instant::now();
         let expires_at: Option<DateTime<Utc>> = sqlx::query_scalar(
             "UPDATE vellev.partitions
-             SET lease_holder = $4, lease_expires_at = now() + make_interval(secs => $5)
+             SET lease_expires_at = now() + make_interval(secs => $4)
              WHERE tenant = $1 AND partition = $2 AND generation = $3
              RETURNING lease_expires_at",
         )
         .bind(lease.key.tenant.as_str())
         .bind(i64::from(lease.key.partition.0))
         .bind(bigint(lease.generation.0)?)
-        .bind(lease.holder.as_str())
         .bind(ttl.as_secs_f64())
         .fetch_optional(&self.pool)
         .await?;
@@ -260,7 +271,13 @@ impl Coordinator for PostgresCoordinator {
                 requested_at,
                 ..lease.clone()
             }),
-            None => Err(self.refusal(lease, changed_underneath).await),
+            None => {
+                self.refusal(lease).await?;
+                Err(invariant(format!(
+                    "renewing {} changed no row at a current generation",
+                    lease.key
+                )))
+            }
         }
     }
 
@@ -281,28 +298,29 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
-        let sql = format!(
+        let done = snapshot(
             "UPDATE vellev.partitions
              SET log_position = $4, manifest = $5
              WHERE tenant = $1 AND partition = $2 AND generation = $3
                AND (log_position < $4 OR (log_position = $4 AND manifest IS NOT DISTINCT FROM $5))
-             RETURNING {COLUMNS}"
-        );
-        let done = keyed(&sql, &lease.key)
-            .bind(bigint(lease.generation.0)?)
-            .bind(bigint(commit.log_position.0)?)
-            .bind(commit.manifest.as_ref().map(|m| m.0.as_str()))
-            .fetch_optional(&self.pool)
-            .await?;
+             RETURNING generation, lease_holder, lease_expires_at, log_position, manifest",
+            &lease.key,
+        )
+        .bind(bigint(lease.generation.0)?)
+        .bind(bigint(commit.log_position.0)?)
+        .bind(commit.manifest.as_ref().map(|m| m.0.as_str()))
+        .fetch_optional(&self.pool)
+        .await?;
         match done {
             Some(row) => Ok(row.committed()),
-            None => Err(self
-                .refusal(lease, |row| CoordinatorError::Regressed {
+            None => {
+                let row = self.refusal(lease).await?;
+                Err(CoordinatorError::Regressed {
                     key: lease.key.clone(),
                     committed: row.log_position,
                     attempted: commit.log_position,
                 })
-                .await),
+            }
         }
     }
 
