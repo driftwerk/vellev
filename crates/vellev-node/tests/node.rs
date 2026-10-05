@@ -19,7 +19,8 @@ use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{Node, NodeError, Settings};
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
 use vellev_storage::coordinator::{
-    Coordinator, CoordinatorError, ManualClock, MemoryCoordinator, PartitionKey,
+    Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, ManualClock,
+    MemoryCoordinator, PartitionKey,
 };
 use vellev_storage::{Mutation, State, StorageError};
 
@@ -656,17 +657,108 @@ async fn a_node_notices_that_another_took_its_tenant() {
     let taken = second.tenant(&tenant("acme")).await.unwrap();
     assert_eq!(taken.read(count), 1);
 
-    let mut noticed = false;
+    let started = std::time::Instant::now();
+    let mut noticed = None;
     for _ in 0..40 {
         if matches!(
             first.tenant(&tenant("acme")).await,
             Err(NodeError::Elsewhere { .. })
         ) {
-            noticed = true;
+            noticed = Some(started.elapsed());
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(noticed, "the first node still hands out the tenant it lost");
+    let noticed = noticed.expect("the first node still hands out the tenant it lost");
+    assert!(
+        noticed < lease * 2 / 3,
+        "noticed at the next renewal, not when the hold ran out: {noticed:?}"
+    );
     assert!(held.write(vec![note(2, "hen", None)]).await.is_err());
+}
+
+/// A coordinator whose renewals can be made to fail as a backend would.
+#[derive(Debug)]
+struct Unrenewing {
+    inner: Arc<MemoryCoordinator>,
+    failing: AtomicBool,
+}
+
+#[async_trait]
+impl Coordinator for Unrenewing {
+    async fn register(&self, key: &PartitionKey) -> Result<(), CoordinatorError> {
+        self.inner.register(key).await
+    }
+    async fn remove(&self, key: &PartitionKey) -> Result<bool, CoordinatorError> {
+        self.inner.remove(key).await
+    }
+    async fn acquire(
+        &self,
+        key: &PartitionKey,
+        holder: &NodeId,
+        ttl: Duration,
+    ) -> Result<Acquired, CoordinatorError> {
+        self.inner.acquire(key, holder, ttl).await
+    }
+    async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease, CoordinatorError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::Backend("connection reset".into()));
+        }
+        self.inner.renew(lease, ttl).await
+    }
+    async fn release(&self, lease: &Lease) -> Result<(), CoordinatorError> {
+        self.inner.release(lease).await
+    }
+    async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed, CoordinatorError> {
+        self.inner.commit(lease, commit).await
+    }
+    async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
+        self.inner.committed(key).await
+    }
+    async fn partitions(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<PartitionKey>, CoordinatorError> {
+        self.inner.partitions(after, limit).await
+    }
+    async fn ping(&self) -> Result<(), CoordinatorError> {
+        self.inner.ping().await
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_whose_hold_could_not_be_renewed_in_time_is_opened_afresh() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_millis(300);
+    let coordinator = Arc::new(Unrenewing {
+        inner: cluster.coordinator.clone(),
+        failing: AtomicBool::new(false),
+    });
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            lease,
+            ..Settings::new(NodeId::generate("node"))
+        },
+    );
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    tokio::time::sleep(lease).await;
+    let same = node.tenant(&tenant("acme")).await.unwrap();
+    assert!(Arc::ptr_eq(&acme, &same), "renewed meanwhile");
+
+    coordinator.failing.store(true, Ordering::SeqCst);
+    tokio::time::sleep(lease + lease / 2).await;
+    let afresh = node.tenant(&tenant("acme")).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&acme, &afresh),
+        "its hold ran out, so it was opened again"
+    );
+    assert_eq!(afresh.read(count), 1);
 }
