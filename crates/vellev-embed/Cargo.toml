@@ -1,0 +1,30 @@
+[package]
+name = "vellev-embed"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["local"]
+local = ["dep:fastembed"]
+
+[dependencies]
+vellev-core.workspace = true
+
+async-trait.workspace = true
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls", "sso", "credentials-process"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

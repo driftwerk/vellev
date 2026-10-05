@@ -13,6 +13,13 @@ allow = [
     "Zlib",
 ]
 
+# MPL-2.0 binds only changes to the crate's own files, and it is used as
+# published. It comes in through the model downloader's choice of cache
+# directory.
+[[licenses.exceptions]]
+crate = "option-ext"
+allow = ["MPL-2.0"]
+
 [licenses.private]
 ignore = true
 

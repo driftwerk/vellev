@@ -4,6 +4,7 @@ members = [
     "crates/vellev",
     "crates/vellev-client",
     "crates/vellev-core",
+    "crates/vellev-embed",
     "crates/vellev-index",
     "crates/vellev-storage",
 ]
@@ -17,6 +18,7 @@ publish = false
 [workspace.dependencies]
 vellev-client = { path = "crates/vellev-client" }
 vellev-core = { path = "crates/vellev-core" }
+vellev-embed = { path = "crates/vellev-embed" }
 vellev-index = { path = "crates/vellev-index" }
 vellev-storage = { path = "crates/vellev-storage" }
 
