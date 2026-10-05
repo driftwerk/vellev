@@ -24,7 +24,7 @@ impl ApiError {
             Code::Unauthorized => StatusCode::UNAUTHORIZED,
             Code::NotFound => StatusCode::NOT_FOUND,
             Code::Conflict => StatusCode::CONFLICT,
-            Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Code::Unavailable | Code::Uncertain => StatusCode::SERVICE_UNAVAILABLE,
             Code::Internal | Code::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -80,7 +80,9 @@ impl IntoResponse for ApiError {
 
 /// What kind of failure a storage error is to a caller. Whatever is not
 /// the caller's doing and may pass is unavailable; only what should never
-/// happen is internal, and that is said without the detail.
+/// happen is internal, and that is said without the detail. A commit that
+/// failed as a whole, rather than one caller's part of it, may or may not
+/// have been recorded.
 fn code(error: &StorageError) -> Code {
     use StorageError as E;
     match error {
@@ -97,7 +99,7 @@ fn code(error: &StorageError) -> Code {
         | E::Embedding { .. }
         | E::Closed
         | E::Diverged { .. } => Code::Unavailable,
-        E::Shared(shared) => code(shared),
+        E::Shared(_) => Code::Uncertain,
         E::Missing { .. }
         | E::Corrupt { .. }
         | E::UnsupportedVersion { .. }
@@ -152,5 +154,42 @@ impl From<PathRejection> for ApiError {
 impl From<QueryRejection> for ApiError {
     fn from(rejection: QueryRejection) -> Self {
         Self::invalid(rejection.body_text())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn a_commit_that_failed_as_a_whole_is_uncertain_and_one_callers_refusal_is_not() {
+        let blob = || StorageError::Blob {
+            key: "k".into(),
+            source: "connection reset".into(),
+        };
+        let told = |error: StorageError| {
+            let ApiError { status, code, .. } = error.into();
+            (status, code)
+        };
+        let unavailable = (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable);
+        let uncertain = (StatusCode::SERVICE_UNAVAILABLE, Code::Uncertain);
+        assert_eq!(told(StorageError::Shared(Arc::new(blob()))), uncertain);
+        assert_eq!(
+            told(StorageError::Shared(Arc::new(StorageError::Closed))),
+            uncertain
+        );
+        assert_eq!(told(StorageError::Closed), unavailable);
+        assert_eq!(told(blob()), unavailable);
+        let unembedded = || StorageError::Embedding {
+            model: "m".into(),
+            reason: "away".into(),
+        };
+        assert_eq!(told(unembedded()), unavailable);
+        assert_eq!(
+            told(StorageError::Shared(Arc::new(unembedded()))),
+            unavailable
+        );
     }
 }

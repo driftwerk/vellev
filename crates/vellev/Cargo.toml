@@ -26,4 +26,5 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 
 [dev-dependencies]
+vellev-index.workspace = true
 reqwest.workspace = true

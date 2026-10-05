@@ -4140,6 +4140,7 @@ dependencies = [
  "vellev-client",
  "vellev-core",
  "vellev-embed",
+ "vellev-index",
  "vellev-node",
  "vellev-storage",
 ]
@@ -4160,7 +4161,13 @@ name = "vellev-client"
 version = "0.1.0"
 dependencies = [
  "reqwest",
+ "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
+ "vellev-api",
+ "vellev-core",
+ "vellev-index",
 ]
 
 [[package]]

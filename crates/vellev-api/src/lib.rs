@@ -10,6 +10,12 @@ use vellev_index::fusion::Fusion;
 /// The path every versioned route starts with.
 pub const ROOT: &str = "/v1";
 
+/// A request header naming the position a tenant's data must have reached
+/// before a read is answered: what a write of the caller's own answered
+/// with. The node that writes a tenant is always there, and today only it
+/// answers for the tenant.
+pub const MIN_POSITION: &str = "x-vellev-min-position";
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,9 +26,12 @@ pub enum Code {
     NotFound,
     /// The request disagrees with what is stored.
     Conflict,
-    /// The node cannot serve this now; the same request may succeed later
-    /// or on another node.
+    /// The node cannot serve this now, and the request has had no effect;
+    /// the same request may succeed later or on another node.
     Unavailable,
+    /// A write failed at a point where nobody can say whether it took
+    /// effect. Read before deciding to send it again.
+    Uncertain,
     Internal,
     /// A code this client does not know, from a newer node.
     #[serde(other)]
