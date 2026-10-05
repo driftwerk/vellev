@@ -46,6 +46,8 @@ pub enum StorageError {
     },
     #[error("{0}")]
     InvalidMutation(String),
+    #[error("{0}")]
+    InvalidQuery(String),
     #[error(transparent)]
     Schema(#[from] SchemaError),
     #[error(transparent)]

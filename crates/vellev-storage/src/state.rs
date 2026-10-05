@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use vellev_core::{Collection, CollectionName, Object, ObjectId};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
+use vellev_index::text::TextIndex;
 use vellev_index::vector::BinaryIndex;
 
 use crate::catalog::Catalog;
@@ -18,11 +19,58 @@ type RowKey = (CollectionId, ObjectId);
 pub(crate) const SHORTLIST_ABOVE: usize = 4_000;
 
 /// What is indexed about one collection's rows in a layer: their filterable
-/// values and, once there are too many to score one by one, their vectors.
+/// values, their searchable text and, once there are too many to score one
+/// by one, their vectors.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LayerIndex {
     pub rows: RowIndex,
+    pub text: TextIndex,
     pub vectors: Option<BinaryIndex>,
+}
+
+impl LayerIndex {
+    fn insert(&mut self, schema: &Collection, row: u32, object: &Object) {
+        self.rows.insert(schema, row, object);
+        self.text.insert(schema, row, object);
+    }
+}
+
+/// How many live rows of a collection have text in a property, and how many
+/// words between them.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FieldTotals {
+    pub rows: u64,
+    pub words: u64,
+}
+
+/// What keyword scoring needs to know about a collection's live rows as a
+/// whole. It is moved with every row that becomes live or dead, so it is
+/// exact at every position and costs a query nothing to read.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Corpus {
+    pub objects: u64,
+    pub fields: HashMap<String, FieldTotals>,
+}
+
+impl Corpus {
+    fn count(&mut self, index: Option<&LayerIndex>, row: u32, live: bool) {
+        let step = |total: &mut u64, by: u64| {
+            *total = if live {
+                *total + by
+            } else {
+                total.checked_sub(by).expect("a row dies once")
+            };
+        };
+        step(&mut self.objects, 1);
+        for (property, length) in index.into_iter().flat_map(|index| index.text.lengths(row)) {
+            let field = match self.fields.get_mut(property) {
+                Some(field) => field,
+                None => self.fields.entry(property.to_string()).or_default(),
+            };
+            step(&mut field.rows, 1);
+            step(&mut field.words, u64::from(length));
+        }
+    }
 }
 
 /// A layer's indexes, one per collection with rows in it. Like liveness
@@ -77,6 +125,7 @@ pub struct State {
     segments: Vec<Segment>,
     memtable: Memtable,
     live: HashMap<RowKey, Location>,
+    corpora: HashMap<CollectionId, Corpus>,
     has_commits_since_checkpoint: bool,
 }
 
@@ -212,6 +261,10 @@ impl State {
         &self.catalog
     }
 
+    pub(crate) fn corpus(&self, collection: CollectionId) -> Option<&Corpus> {
+        self.corpora.get(&collection)
+    }
+
     pub(crate) fn loaded_segments(&self) -> impl Iterator<Item = (&str, Loaded)> {
         self.segments.iter().map(|segment| {
             let loaded = (segment.file.clone(), Some(segment.indexes.clone()));
@@ -225,9 +278,30 @@ impl State {
     }
 
     fn mark_dead(&mut self, location: Location) {
-        match location {
-            Location::Memtable(row) => self.memtable.dead[row] = true,
-            Location::Segment(segment, row) => self.segments[segment].dead[row] = true,
+        let (rows, dead, indexes, row) = match location {
+            Location::Memtable(row) => {
+                let Memtable {
+                    rows,
+                    dead,
+                    indexes,
+                    ..
+                } = &mut self.memtable;
+                (rows.as_slice(), dead, &*indexes, row)
+            }
+            Location::Segment(segment, row) => {
+                let segment = &mut self.segments[segment];
+                (
+                    segment.file.rows.as_slice(),
+                    &mut segment.dead,
+                    &*segment.indexes,
+                    row,
+                )
+            }
+        };
+        dead[row] = true;
+        let collection = rows[row].collection;
+        if let Some(corpus) = self.corpora.get_mut(&collection) {
+            corpus.count(indexes.get(&collection), row as u32, false);
         }
     }
 
@@ -293,6 +367,7 @@ impl State {
         for key in &file.tombstones {
             self.forget(*key);
         }
+        let indexes = indexes.unwrap_or_else(|| Arc::new(self.indexed(&file.rows)));
         let dead = file
             .rows
             .iter()
@@ -304,11 +379,15 @@ impl State {
                     if let Some(shadowed) = self.live.insert((*collection, object.id), location) {
                         self.mark_dead(shadowed);
                     }
+                    self.corpora.entry(*collection).or_default().count(
+                        indexes.get(collection),
+                        row as u32,
+                        true,
+                    );
                 }
                 !live
             })
             .collect();
-        let indexes = indexes.unwrap_or_else(|| Arc::new(self.indexed(&file.rows)));
         self.segments.push(Segment {
             meta,
             file,
@@ -318,17 +397,17 @@ impl State {
         Ok(())
     }
 
-    /// Index `rows` for filtering and for vector search. An index built
-    /// under an older catalog stays right: a collection's filterable
-    /// properties never change, and a collection created since has no rows
-    /// in an older layer.
+    /// Index `rows` for filtering, keyword search and vector search. An
+    /// index built under an older catalog stays right: a property never
+    /// changes once added, and neither a property nor a collection added
+    /// since has anything in an older layer.
     pub(crate) fn indexed(&self, rows: &[Row]) -> Indexes {
         let mut indexes = Indexes::new();
         let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
         for (row, Row { collection, object }) in rows.iter().enumerate() {
             if let Some(schema) = self.catalog.schema(*collection) {
                 let index = indexes.entry(*collection).or_default();
-                index.rows.insert(schema, row as u32, object);
+                index.insert(schema, row as u32, object);
                 if let Some(vector) = &object.vector {
                     vectors
                         .entry(*collection)
@@ -380,6 +459,7 @@ impl State {
                     // Nothing can ask for a dropped collection's rows;
                     // this only frees the memory.
                     self.memtable.indexes.remove(collection);
+                    self.corpora.remove(collection);
                 }
                 Op::Upsert { collection, object } => {
                     let key = (*collection, object.id);
@@ -389,14 +469,22 @@ impl State {
                         .retain(|tombstone| *tombstone != key);
                     let row = self.memtable.rows.len();
                     self.live.insert(key, Location::Memtable(row));
-                    if let Some(schema) = self.catalog.schema(*collection) {
+                    // A memtable is flushed long before it holds as many
+                    // rows as a segment may number. It has no vector index:
+                    // its rows change, and are few enough to score one by
+                    // one.
+                    //
+                    // A collection dropped later in the same commit is
+                    // already gone from the catalog; its rows go unindexed.
+                    let index = self.catalog.schema(*collection).map(|schema| {
                         let index = self.memtable.indexes.entry(*collection).or_default();
-                        // A memtable is flushed long before it holds as
-                        // many rows as a segment may number. It has no
-                        // vector index: its rows change, and are few
-                        // enough to score one by one.
-                        index.rows.insert(schema, row as u32, object);
-                    }
+                        index.insert(schema, row as u32, object);
+                        &*index
+                    });
+                    self.corpora
+                        .entry(*collection)
+                        .or_default()
+                        .count(index, row as u32, true);
                     self.memtable.rows.push(Row {
                         collection: *collection,
                         object: object.clone(),
