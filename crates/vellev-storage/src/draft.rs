@@ -47,7 +47,7 @@ pub(crate) struct Wanted {
 
 /// The text to embed for `object`, if its collection embeds its objects
 /// and it has text and no vector.
-fn wanting(schema: &Collection, object: &Object) -> Option<String> {
+fn wanting_text(schema: &Collection, object: &Object) -> Option<String> {
     let embeds = schema.embedding.provider != EmbeddingProvider::None;
     (embeds && object.vector.is_none())
         .then(|| object.embedded_text(&schema.embedding))
@@ -103,36 +103,53 @@ impl<'a> Draft<'a> {
     }
 
     /// The ops to log, and the objects they leave still to be given a
-    /// vector, in the order they are written.
+    /// vector, in the order they are last written. Each is put down to the
+    /// batch that first left it with the text it ends with and no vector:
+    /// a later batch that only changed something else is not to blame.
     pub fn finish(self) -> (Vec<Op>, Vec<Wanted>) {
         let Pending {
-            catalog,
-            rows,
-            ops,
-            ends,
+            catalog, ops, ends, ..
         } = self.pending;
-        let last_written: HashMap<RowKey, usize> = ops
-            .iter()
-            .enumerate()
-            .filter_map(|(at, op)| match op {
-                Op::Upsert { collection, object } => Some(((*collection, object.id), at)),
-                _ => None,
-            })
-            .collect();
-        let mut wanted: Vec<Wanted> = rows
-            .iter()
-            .filter_map(|(key, row)| {
-                let schema = catalog.schema(key.0)?;
-                let text = wanting(schema, row.as_ref()?)?;
-                let op = *last_written.get(key)?;
-                Some(Wanted {
-                    op,
-                    batch: ends.partition_point(|end| *end <= op),
-                    embedding: schema.embedding.clone(),
-                    text,
-                })
-            })
-            .collect();
+        let mut wanting: HashMap<RowKey, Wanted> = HashMap::new();
+        for (op, written) in ops.iter().enumerate() {
+            let batch = ends.partition_point(|end| *end <= op);
+            match written {
+                Op::Upsert { collection, object } => {
+                    let key = (*collection, object.id);
+                    let needed = catalog
+                        .schema(*collection)
+                        .and_then(|schema| Some((schema, wanting_text(schema, object)?)));
+                    match needed {
+                        Some((schema, text)) => {
+                            let since = wanting
+                                .remove(&key)
+                                .filter(|earlier| earlier.text == text)
+                                .map_or(batch, |earlier| earlier.batch);
+                            let embedding = schema.embedding.clone();
+                            wanting.insert(
+                                key,
+                                Wanted {
+                                    op,
+                                    batch: since,
+                                    embedding,
+                                    text,
+                                },
+                            );
+                        }
+                        None => {
+                            wanting.remove(&key);
+                        }
+                    }
+                }
+                Op::Delete { collection, id } => {
+                    wanting.remove(&(*collection, *id));
+                }
+                Op::CreateCollection { .. }
+                | Op::AddProperty { .. }
+                | Op::DropCollection { .. } => {}
+            }
+        }
+        let mut wanted: Vec<Wanted> = wanting.into_values().collect();
         wanted.sort_unstable_by_key(|wanted| wanted.op);
         (ops, wanted)
     }

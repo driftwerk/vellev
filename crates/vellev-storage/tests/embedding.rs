@@ -10,6 +10,7 @@ const NOTES: &str = "notes";
 #[derive(Debug, Default)]
 struct Lengths {
     asked: Mutex<Vec<Vec<String>>>,
+    calls: AtomicUsize,
     fault: AtomicUsize,
 }
 
@@ -30,6 +31,7 @@ impl Vectorize for Lengths {
         embedding: &Embedding,
         texts: Vec<String>,
     ) -> Result<Vec<Vec<f32>>, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let fault = self.fault.load(Ordering::SeqCst);
         if fault == AWAY || embedding.model != "lengths" {
             return Err("the model is away".into());
@@ -400,7 +402,10 @@ async fn a_batch_whose_vectors_cannot_be_made_is_rejected_alone() {
         "{:?}",
         results[1]
     );
-    assert!(matches!(results[4], Err(StorageError::Embedding { .. })));
+    assert!(matches!(
+        results[4],
+        Err(StorageError::UnknownObject { .. })
+    ));
     let accepted: Vec<_> = [0, 2, 3, 5]
         .iter()
         .map(|at| results[*at].as_ref().unwrap())
@@ -544,4 +549,87 @@ async fn an_embedder_that_never_answers_fails_the_commit_and_frees_the_writer() 
         .await
         .unwrap();
     assert_eq!(vector(&writer, 1), Some(vector_of("fox")));
+}
+
+#[tokio::test]
+async fn a_failing_embedder_is_asked_once_a_commit_and_only_the_batch_that_needs_it_is_refused() {
+    let (_cluster, writer, lengths) = embedding().await;
+    writer
+        .commit(vec![note(1, json!({ "title": "fox", "n": 1 }), None)])
+        .await
+        .unwrap();
+    lengths.fault.store(AWAY, Ordering::SeqCst);
+    lengths.calls.store(0, Ordering::SeqCst);
+    let retitled = |object: u8| {
+        vec![note(
+            object,
+            json!({ "title": format!("new {object}") }),
+            None,
+        )]
+    };
+    let counted = vec![Mutation::Increment {
+        collection: name(NOTES),
+        id: id(1),
+        property: "n".into(),
+        by: 1.0,
+    }];
+    let batches = [vec![retitled(1), counted], (2..10).map(retitled).collect()].concat();
+    let results = writer.commit_group(batches).await.unwrap();
+    assert!(matches!(results[0], Err(StorageError::Embedding { .. })));
+    assert_eq!(
+        results[1].as_ref().unwrap().outcomes,
+        [Outcome::Value(Value::Int(2))]
+    );
+    assert!(results[2..]
+        .iter()
+        .all(|result| matches!(result, Err(StorageError::Embedding { .. }))));
+    assert_eq!(lengths.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(vector(&writer, 1), Some(vector_of("fox")));
+    assert_eq!(n_of_note(&writer, 1), 2);
+}
+
+fn n_of_note(writer: &Writer, object: u8) -> i64 {
+    writer
+        .partition()
+        .read(|state| n_of(state, NOTES, object).unwrap())
+}
+
+#[tokio::test]
+async fn vectors_made_ahead_are_used_only_for_the_text_and_embedding_the_commit_arrives_at() {
+    let (_cluster, writer, lengths) = embedding().await;
+    let mutations = vec![
+        note(1, json!({ "title": "fox" }), None),
+        note(2, json!({ "title": "hen" }), None),
+        note(3, json!({ "title": "owl" }), None),
+        note(4, json!({ "title": "supplied" }), Some(vec![0.0, 1.0])),
+    ];
+    let wanted = writer.wanted(&mutations);
+    let texts: Vec<&str> = wanted.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(texts, ["fox", "hen", "owl"]);
+    let embedding = wanted[0].0.clone();
+    let other = Embedding {
+        model: "another".into(),
+        ..embedding.clone()
+    };
+    let made = [
+        ((embedding.clone(), "fox".to_string()), vec![5.0, 5.0]),
+        ((embedding.clone(), "hen".to_string()), vec![5.0, 5.0, 5.0]),
+        ((other, "owl".to_string()), vec![6.0, 6.0]),
+        ((embedding, "elk".to_string()), vec![7.0, 7.0]),
+    ]
+    .into();
+    writer
+        .commit_group_with(vec![mutations], made)
+        .await
+        .unwrap()[0]
+        .as_ref()
+        .unwrap();
+    assert_eq!(lengths.asked(), asked(&["hen", "owl"]));
+    assert_eq!(vector(&writer, 1), Some(vec![5.0, 5.0]));
+    assert_eq!(vector(&writer, 2), Some(vector_of("hen")));
+    assert_eq!(vector(&writer, 3), Some(vector_of("owl")));
+    assert_eq!(vector(&writer, 4), Some(vec![0.0, 1.0]));
+    assert!(writer
+        .wanted(&[note(1, json!({ "title": "fox" }), None)])
+        .is_empty());
 }

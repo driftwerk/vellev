@@ -30,6 +30,7 @@ const LEASE: Duration = Duration::from_secs(30);
 struct Store {
     inner: ObjectBlobs,
     failing: AtomicBool,
+    unreadable: AtomicBool,
 }
 
 #[async_trait]
@@ -44,6 +45,12 @@ impl Blobs for Store {
         self.inner.put(key, bytes).await
     }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        if self.unreadable.load(Ordering::SeqCst) {
+            return Err(StorageError::Blob {
+                key: key.into(),
+                source: "connection reset".into(),
+            });
+        }
         self.inner.get(key).await
     }
 }
@@ -66,6 +73,7 @@ impl Cluster {
             store: Arc::new(Store {
                 inner: ObjectBlobs::new(Arc::new(InMemory::new())),
                 failing: AtomicBool::new(false),
+                unreadable: AtomicBool::new(false),
             }),
         }
     }
@@ -189,14 +197,19 @@ async fn tenants_are_created_listed_a_page_at_a_time_and_dropped() {
     ));
     let orphaned = acme.write(vec![note(2, "hen", None)]).await.unwrap_err();
     assert!(
-        matches!(
-            &orphaned,
-            NodeError::Storage(error) if matches!(
-                error.root(),
-                StorageError::Coordinator(CoordinatorError::UnknownPartition(_))
-            )
-        ),
+        matches!(&orphaned, NodeError::UnknownTenant(id) if *id == tenant("acme")),
         "{orphaned}"
+    );
+    for n in 0..50 {
+        let ghost = tenant(&format!("ghost-{n}"));
+        assert!(matches!(
+            node.tenant(&ghost).await,
+            Err(NodeError::UnknownTenant(_))
+        ));
+    }
+    assert!(
+        !format!("{node:?}").contains("ghost-"),
+        "unopened tenants are not kept"
     );
 
     node.create_tenant(&tenant("acme")).await.unwrap();
@@ -275,6 +288,11 @@ async fn a_tenant_is_written_by_one_node_until_it_lets_go_or_its_hold_runs_out()
         ),
         "{fenced}"
     );
+    assert!(matches!(
+        first.tenant(&tenant("acme")).await,
+        Err(NodeError::Stopped)
+    ));
+    let first = cluster.node();
     assert!(matches!(
         first.tenant(&tenant("acme")).await,
         Err(NodeError::Elsewhere { .. })
@@ -366,10 +384,10 @@ async fn a_tenant_is_flushed_once_enough_has_been_written() {
     assert_eq!(acme.read(State::unflushed), 0);
 }
 
-/// A stand-in embedding server: a text's vector is its length and its
-/// number of words.
+/// A stand-in embedding server. Under `/lengths` a text's vector is its
+/// length and its number of words; under `/swapped`, the other way round.
 async fn embedding_server(calls: Arc<AtomicUsize>) -> String {
-    let embed = |Shared(calls): Shared<Arc<AtomicUsize>>, Json(body): Json<Value>| async move {
+    async fn embed(calls: Arc<AtomicUsize>, body: Value, swapped: bool) -> Json<Value> {
         calls.fetch_add(1, Ordering::SeqCst);
         let vectors: Vec<[usize; 2]> = body["inputs"]
             .as_array()
@@ -377,14 +395,36 @@ async fn embedding_server(calls: Arc<AtomicUsize>) -> String {
             .iter()
             .map(|text| text.as_str().unwrap())
             .map(|text| [text.len(), text.split_whitespace().count()])
+            .map(|[length, words]| {
+                if swapped {
+                    [words, length]
+                } else {
+                    [length, words]
+                }
+            })
             .collect();
         Json(json!(vectors))
+    }
+    let lengths = |Shared(calls): Shared<Arc<AtomicUsize>>, Json(body): Json<Value>| {
+        embed(calls, body, false)
     };
-    let router = Router::new().route("/embed", post(embed)).with_state(calls);
+    let swapped =
+        |Shared(calls): Shared<Arc<AtomicUsize>>, Json(body): Json<Value>| embed(calls, body, true);
+    let router = Router::new()
+        .route("/lengths/embed", post(lengths))
+        .route("/swapped/embed", post(swapped))
+        .with_state(calls);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     url
+}
+
+fn served_by(url: &str, flavour: &str) -> EmbeddingProvider {
+    EmbeddingProvider::Http {
+        url: format!("{url}/{flavour}"),
+        api: HttpApi::Tei,
+    }
 }
 
 #[tokio::test]
@@ -392,10 +432,8 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
     let cluster = Cluster::new();
     let node = cluster.node();
     let calls = Arc::new(AtomicUsize::new(0));
-    let embedded = EmbeddingProvider::Http {
-        url: embedding_server(calls.clone()).await,
-        api: HttpApi::Tei,
-    };
+    let url = embedding_server(calls.clone()).await;
+    let embedded = served_by(&url, "lengths");
     node.create_tenant(&tenant("acme")).await.unwrap();
     let acme = node.tenant(&tenant("acme")).await.unwrap();
     acme.write(vec![
@@ -465,4 +503,86 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
         None
     );
     assert_eq!(calls.load(Ordering::SeqCst), calls_so_far);
+}
+
+#[tokio::test]
+async fn a_vector_is_made_the_way_the_collection_embeds_when_the_write_lands() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let url = embedding_server(Arc::new(AtomicUsize::new(0))).await;
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![
+        schema(served_by(&url, "lengths")),
+        note(1, "a red fox", None),
+    ])
+    .await
+    .unwrap();
+    let vector = |n: u64| acme.read(|state| state.get(&notes(), id(n)).unwrap().vector.clone());
+    assert_eq!(vector(1), Some(vec![9.0, 3.0]));
+
+    acme.write(vec![
+        Mutation::DropCollection(notes()),
+        schema(served_by(&url, "swapped")),
+        note(1, "a red fox", None),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(vector(1), Some(vec![3.0, 9.0]));
+
+    acme.write(vec![
+        Mutation::DropCollection(notes()),
+        schema(EmbeddingProvider::None),
+        note(1, "a red fox", None),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(vector(1), None);
+}
+
+#[tokio::test]
+async fn an_opening_that_fails_lets_go_of_the_tenant_and_a_stopped_node_opens_nothing() {
+    let cluster = Cluster::new();
+    let (first, second, third) = (cluster.node(), cluster.node(), cluster.node());
+    first.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = first.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    acme.flush().await.unwrap();
+    first.shutdown().await;
+
+    cluster.store.unreadable.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        second.tenant(&tenant("acme")).await,
+        Err(NodeError::Storage(_))
+    ));
+    cluster.store.unreadable.store(false, Ordering::SeqCst);
+    assert_eq!(third.tenant(&tenant("acme")).await.unwrap().read(count), 1);
+
+    third.shutdown().await;
+    assert!(matches!(
+        third.tenant(&tenant("acme")).await,
+        Err(NodeError::Stopped)
+    ));
+    assert_eq!(second.tenant(&tenant("acme")).await.unwrap().read(count), 1);
+}
+
+#[tokio::test]
+async fn a_writer_lost_to_a_failed_flush_is_replaced_on_the_next_call() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    cluster.store.failing.store(true, Ordering::SeqCst);
+    assert!(acme.flush().await.is_err());
+    cluster.store.failing.store(false, Ordering::SeqCst);
+
+    let reopened = node.tenant(&tenant("acme")).await.unwrap();
+    assert!(!Arc::ptr_eq(&acme, &reopened));
+    reopened.write(vec![note(2, "hen", None)]).await.unwrap();
+    assert_eq!(reopened.read(count), 2);
 }

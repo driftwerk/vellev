@@ -26,8 +26,8 @@ const COMMIT_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// How long a commit waits for the vectors it needs made.
 const EMBEDDING_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The vectors made so far for one commit, by what was embedded and how.
-type Made = HashMap<(Embedding, String), Vec<f32>>;
+/// Vectors by the text they were made from and the way it was embedded.
+pub type Embedded = HashMap<(Embedding, String), Vec<f32>>;
 
 /// A partition's committed data in memory. It only ever moves forward, and
 /// only through its [`Follower`] or [`Writer`].
@@ -309,12 +309,48 @@ impl Writer {
     /// A batch that needs a vector which cannot be made is rejected like
     /// any other, and the rest are resolved again without it.
     pub async fn commit_group(&self, batches: Vec<Vec<Mutation>>) -> Result<Vec<Result<Receipt>>> {
+        self.commit_group_with(batches, Embedded::new()).await
+    }
+
+    /// The texts `mutations` would leave to be embedded if they were
+    /// committed now, with how each is embedded. A caller can make their
+    /// vectors ahead of the commit and hand them to
+    /// [`Self::commit_group_with`], rather than have the commit make them
+    /// while every other write waits.
+    pub fn wanted(&self, mutations: &[Mutation]) -> Vec<(Embedding, String)> {
+        self.partition.read(|state| {
+            let mut draft = Draft::new(state);
+            let _ = draft.batch(mutations.to_vec());
+            let (_, wanted) = draft.finish();
+            wanted
+                .into_iter()
+                .map(|wanted| (wanted.embedding, wanted.text))
+                .collect()
+        })
+    }
+
+    /// As [`Self::commit_group`], using `made` for any vector the commit
+    /// needs that it holds: one is used only for the very text and way of
+    /// embedding the commit itself arrives at, and only if the collection
+    /// can hold it.
+    pub async fn commit_group_with(
+        &self,
+        batches: Vec<Vec<Mutation>>,
+        made: Embedded,
+    ) -> Result<Vec<Result<Receipt>>> {
         let mut ready = self.ready.lock().await;
         if !*ready {
             return Err(StorageError::Closed);
         }
         let mut unembedded: Vec<Option<(String, String)>> = vec![None; batches.len()];
-        let mut made = Made::new();
+        let mut made: Embedded = made
+            .into_iter()
+            .filter_map(|((embedding, text), vector)| {
+                let vector = embedding.checked(vector).ok()?;
+                Some(((embedding, text), vector))
+            })
+            .collect();
+        let mut failed: HashMap<Embedding, String> = HashMap::new();
         let ((position, prev), outcomes, ops) = loop {
             let (at, outcomes, (mut ops, wanted)) = self.partition.read(|state| {
                 let mut draft = Draft::new(state);
@@ -328,8 +364,9 @@ impl Writer {
                     .collect();
                 (state.at(), outcomes, draft.finish())
             });
-            let failed = self.make(&wanted, &mut made).await;
-            if failed.is_empty() {
+            self.make(&wanted, &mut made, &mut failed).await;
+            let unmade = |wanted: &&Wanted| failed.contains_key(&wanted.embedding);
+            if !wanted.iter().any(|wanted| unmade(&wanted)) {
                 for Wanted {
                     op,
                     embedding,
@@ -345,13 +382,10 @@ impl Writer {
             }
             let rejected = |unembedded: &[Option<_>]| unembedded.iter().flatten().count();
             let before = rejected(&unembedded);
-            for wanted in &wanted {
-                if let Some(reason) = failed.get(&wanted.embedding) {
-                    unembedded[wanted.batch] =
-                        Some((wanted.embedding.model.clone(), reason.clone()));
-                }
+            for wanted in wanted.iter().filter(unmade) {
+                let reason = failed[&wanted.embedding].clone();
+                unembedded[wanted.batch] = Some((wanted.embedding.model.clone(), reason));
             }
-            // Each round must reject a batch it had not, or it would never end.
             if rejected(&unembedded) == before {
                 let (model, reason) = failed
                     .into_iter()
@@ -393,19 +427,27 @@ impl Writer {
     }
 
     /// Make the vectors `wanted` that are not `made` yet, each way of
-    /// embedding at the same time as the others. Returns why, for each way
-    /// that could not make all of its own.
+    /// embedding at the same time as the others, and note in `failed` why
+    /// for each way that could not make all of its own. A way that has
+    /// failed is not asked again.
     ///
     /// The writer is held meanwhile, so that no other write can change a
     /// text a vector is being made for.
-    async fn make(&self, wanted: &[Wanted], made: &mut Made) -> HashMap<Embedding, String> {
+    async fn make(
+        &self,
+        wanted: &[Wanted],
+        made: &mut Embedded,
+        failed: &mut HashMap<Embedding, String>,
+    ) {
         let mut missing: HashMap<&Embedding, Vec<&String>> = HashMap::new();
         for Wanted {
             embedding, text, ..
         } in wanted
         {
+            let known = failed.contains_key(embedding)
+                || made.contains_key(&(embedding.clone(), text.clone()));
             let texts = missing.entry(embedding).or_default();
-            if !texts.contains(&text) && !made.contains_key(&(embedding.clone(), text.clone())) {
+            if !known && !texts.contains(&text) {
                 texts.push(text);
             }
         }
@@ -417,7 +459,6 @@ impl Writer {
                 let vectors = self.vectors(embedding, texts.clone()).await;
                 (embedding, vectors.map(|vectors| (texts, vectors)))
             });
-        let mut failed = HashMap::new();
         for (embedding, outcome) in join_all(asked).await {
             match outcome {
                 Ok((texts, vectors)) => made.extend(
@@ -431,7 +472,6 @@ impl Writer {
                 }
             }
         }
-        failed
     }
 
     /// A vector the collection can hold for each of `texts`, or why not.

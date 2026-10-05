@@ -3,11 +3,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::mutation::{Mutation, Receipt};
-use crate::partition::Writer;
+use crate::partition::{Embedded, Writer};
 use crate::{Result, StorageError};
 
 struct Request {
     mutations: Vec<Mutation>,
+    made: Embedded,
     reply: oneshot::Sender<Result<Receipt>>,
 }
 
@@ -40,12 +41,16 @@ impl GroupCommitter {
                         Err(_) => break,
                     }
                 }
+                let mut made = Embedded::new();
                 let (batches, replies): (Vec<_>, Vec<_>) = group
                     .into_iter()
                     .filter(|request| !request.reply.is_closed())
-                    .map(|request| (request.mutations, request.reply))
+                    .map(|request| {
+                        made.extend(request.made);
+                        (request.mutations, request.reply)
+                    })
                     .unzip();
-                let results = match writer.commit_group(batches).await {
+                let results = match writer.commit_group_with(batches, made).await {
                     Ok(results) => results,
                     Err(StorageError::Closed) => {
                         replies.iter().map(|_| Err(StorageError::Closed)).collect()
@@ -74,9 +79,20 @@ impl GroupCommitter {
     /// must use mutations that are safe to repeat. A failure of the shared
     /// commit arrives as [`StorageError::Shared`]; see [`StorageError::root`].
     pub async fn submit(&self, mutations: Vec<Mutation>) -> Result<Receipt> {
+        self.submit_with(mutations, Embedded::new()).await
+    }
+
+    /// As [`Self::submit`], with vectors made ahead for the commit to use;
+    /// see [`Writer::commit_group_with`].
+    pub async fn submit_with(&self, mutations: Vec<Mutation>, made: Embedded) -> Result<Receipt> {
         let (reply, outcome) = oneshot::channel();
+        let request = Request {
+            mutations,
+            made,
+            reply,
+        };
         self.queue
-            .send(Request { mutations, reply })
+            .send(request)
             .await
             .map_err(|_| StorageError::Closed)?;
         outcome.await.map_err(|_| StorageError::Closed)?

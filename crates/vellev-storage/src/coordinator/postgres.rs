@@ -12,7 +12,10 @@ use super::{
     LogPosition, ManifestRef, PartitionKey, Result,
 };
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../migrations/0001_partitions.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../migrations/0001_partitions.sql")),
+    (2, include_str!("../../migrations/0002_tenant_order.sql")),
+];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
 /// so it is released with the transaction and never pins an RDS Proxy session.
@@ -334,17 +337,30 @@ impl Coordinator for PostgresCoordinator {
         after: Option<&PartitionKey>,
         limit: usize,
     ) -> Result<Vec<PartitionKey>> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT tenant, partition FROM vellev.partitions
-             WHERE $1::text IS NULL OR (tenant COLLATE \"C\", partition) > ($1 COLLATE \"C\", $2)
-             ORDER BY tenant COLLATE \"C\", partition
-             LIMIT $3",
-        )
-        .bind(after.map(|key| key.tenant.as_str()))
-        .bind(after.map_or(0, |key| i64::from(key.partition.0)))
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
-        .await?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<(String, i64)> = match after {
+            None => {
+                sqlx::query_as(
+                    "SELECT tenant, partition FROM vellev.partitions
+                     ORDER BY tenant, partition LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some(after) => {
+                sqlx::query_as(
+                    "SELECT tenant, partition FROM vellev.partitions
+                     WHERE (tenant, partition) > ($1, $2)
+                     ORDER BY tenant, partition LIMIT $3",
+                )
+                .bind(after.tenant.as_str())
+                .bind(i64::from(after.partition.0))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         rows.into_iter()
             .map(|(tenant, partition)| {
                 let stored = || invariant(format!("{tenant}/{partition} is not a partition key"));
