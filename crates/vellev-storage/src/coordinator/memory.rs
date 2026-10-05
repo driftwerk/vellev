@@ -133,16 +133,16 @@ fn expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
 #[async_trait]
 impl Coordinator for MemoryCoordinator {
     async fn register(&self, key: &PartitionKey) -> Result<()> {
-        self.rows
-            .lock()
-            .expect("coordinator lock")
-            .entry(key.clone())
-            .or_insert(Row {
-                generation: Generation(0),
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        if !rows.contains_key(key) {
+            let row = Row {
+                generation: self.next_generation(),
                 lease: None,
                 log_position: LogPosition(0),
                 manifest: None,
-            });
+            };
+            rows.insert(key.clone(), row);
+        }
         Ok(())
     }
 

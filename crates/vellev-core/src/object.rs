@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
 use crate::{Collection, DataType, ObjectId};
@@ -20,7 +21,7 @@ pub enum ObjectError {
     VectorNotFinite,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Text(String),
     TextArray(Vec<String>),
@@ -76,13 +77,48 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Object {
     pub id: ObjectId,
     /// Only the properties that have a value. A property that is absent, or
     /// sent as JSON null, is not stored.
     pub properties: BTreeMap<String, Value>,
+    #[serde(with = "vector_bytes")]
     pub vector: Option<Vec<f32>>,
+}
+
+/// Vectors are stored as little-endian bytes: a quarter of the size of a
+/// self-describing array of floats, and exact.
+mod vector_bytes {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use serde_bytes::ByteBuf;
+
+    pub fn serialize<S: Serializer>(vector: &Option<Vec<f32>>, s: S) -> Result<S::Ok, S::Error> {
+        match vector {
+            Some(vector) => s.serialize_some(&ByteBuf::from(
+                vector
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            )),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error> {
+        Option::<ByteBuf>::deserialize(d)?
+            .map(|bytes| {
+                let chunks = bytes.chunks_exact(4);
+                if !chunks.remainder().is_empty() {
+                    return Err(D::Error::custom("vector bytes are not a multiple of four"));
+                }
+                Ok(chunks
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect())
+            })
+            .transpose()
+    }
 }
 
 impl Object {

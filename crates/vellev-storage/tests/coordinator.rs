@@ -153,15 +153,14 @@ async fn registering_is_idempotent_and_unregistered_partitions_are_unknown(h: &d
     ));
 
     c.register(&key).await.unwrap();
-    c.register(&key).await.unwrap();
+    let registered = c.committed(&key).await.unwrap().unwrap();
+    assert!(registered.generation > Generation(0));
     assert_eq!(
-        c.committed(&key).await.unwrap(),
-        Some(Committed {
-            generation: Generation(0),
-            log_position: LogPosition(0),
-            manifest: None
-        })
+        (registered.log_position, &registered.manifest),
+        (LogPosition(0), &None)
     );
+    c.register(&key).await.unwrap();
+    assert_eq!(c.committed(&key).await.unwrap(), Some(registered));
 }
 
 async fn the_first_lease_starts_a_fresh_generation_at_position_zero(h: &dyn Harness) {
@@ -405,6 +404,7 @@ async fn a_generation_is_never_reused_after_remove_and_register(h: &dyn Harness)
 
     assert!(c.remove(&key).await.unwrap());
     c.register(&key).await.unwrap();
+    assert!(generation(h, &key).await > zombie.generation);
     let (fresh, _) = lease(h, &key, &node("b")).await;
     assert!(fresh.generation > zombie.generation);
     assert!(fenced(
