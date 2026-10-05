@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use vellev_core::{Bm25, Collection, Object, Value};
 
 /// The words too common to be worth matching on, in the list Lucene and the
-/// engines built on it use for English.
+/// engines built on it use for English. Sorted, to be searched.
 const STOPWORDS: [&str; 33] = [
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
     "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
@@ -21,27 +21,55 @@ pub fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
-        .filter(|word| !STOPWORDS.contains(&word.as_str()))
+        .filter(|word| STOPWORDS.binary_search(&word.as_str()).is_err())
 }
 
-/// The rows holding one token in one property, ascending, each with how
-/// many times it holds it.
+/// One row holding a token in a property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Posting {
+    pub row: u32,
+    /// How many times the row holds the token.
+    pub frequency: u32,
+    /// How many tokens the row has in the property in all.
+    pub length: u32,
+}
+
+/// The rows holding one token, as positions in the field's `rows`.
 #[derive(Debug, Clone, Default)]
-pub struct Postings {
+struct Postings {
+    holders: Vec<u32>,
+    frequencies: Vec<u32>,
+}
+
+/// One property's text: the rows that have it, ascending, with their
+/// lengths, and for every token the rows holding it.
+#[derive(Debug, Clone, Default)]
+pub struct Field {
     rows: Vec<u32>,
-    counts: Vec<u32>,
-}
-
-impl Postings {
-    pub fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.rows.iter().copied().zip(self.counts.iter().copied())
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct Field {
+    lengths: Vec<u32>,
     postings: HashMap<String, Postings>,
-    lengths: HashMap<u32, u32>,
+}
+
+impl Field {
+    /// The rows holding `token`, ascending.
+    pub fn holding<'a>(&'a self, token: &str) -> impl Iterator<Item = Posting> + 'a {
+        self.postings.get(token).into_iter().flat_map(|postings| {
+            postings
+                .holders
+                .iter()
+                .zip(&postings.frequencies)
+                .map(|(holder, frequency)| Posting {
+                    row: self.rows[*holder as usize],
+                    frequency: *frequency,
+                    length: self.lengths[*holder as usize],
+                })
+        })
+    }
+
+    fn length(&self, row: u32) -> Option<u32> {
+        let at = self.rows.binary_search(&row).ok()?;
+        Some(self.lengths[at])
+    }
 }
 
 /// The searchable text of one collection's rows, by property. Rows are
@@ -65,44 +93,36 @@ impl TextIndex {
                 Value::TextArray(texts) => texts,
                 _ => continue,
             };
-            let field = self.fields.entry(name.clone()).or_default();
-            let mut counts: HashMap<String, u32> = HashMap::new();
+            let mut frequencies: HashMap<String, u32> = HashMap::new();
             let mut length = 0;
             for token in texts.iter().flat_map(|text| tokens(text)) {
-                *counts.entry(token).or_default() += 1;
+                *frequencies.entry(token).or_default() += 1;
                 length += 1;
             }
-            field.lengths.insert(row, length);
-            for (token, count) in counts {
+            let field = match self.fields.get_mut(name) {
+                Some(field) => field,
+                None => self.fields.entry(name.clone()).or_default(),
+            };
+            let holder = field.rows.len() as u32;
+            field.rows.push(row);
+            field.lengths.push(length);
+            for (token, frequency) in frequencies {
                 let postings = field.postings.entry(token).or_default();
-                postings.rows.push(row);
-                postings.counts.push(count);
+                postings.holders.push(holder);
+                postings.frequencies.push(frequency);
             }
         }
     }
 
-    /// The rows holding `token` in `property`.
-    pub fn postings(&self, property: &str, token: &str) -> Option<&Postings> {
-        self.fields.get(property)?.postings.get(token)
-    }
-
-    /// How many tokens `row` has in `property`; zero when it has none.
-    pub fn length(&self, property: &str, row: u32) -> u32 {
-        self.fields
-            .get(property)
-            .and_then(|field| field.lengths.get(&row))
-            .copied()
-            .unwrap_or(0)
+    pub fn field(&self, property: &str) -> Option<&Field> {
+        self.fields.get(property)
     }
 
     /// How many tokens `row` has in each property it has text in.
     pub fn lengths(&self, row: u32) -> impl Iterator<Item = (&str, u32)> + '_ {
-        self.fields.iter().filter_map(move |(name, field)| {
-            field
-                .lengths
-                .get(&row)
-                .map(|length| (name.as_str(), *length))
-        })
+        self.fields
+            .iter()
+            .filter_map(move |(name, field)| Some((name.as_str(), field.length(row)?)))
     }
 }
 
@@ -150,6 +170,7 @@ mod tests {
 
     #[test]
     fn stopwords_are_dropped_whatever_their_case() {
+        assert!(STOPWORDS.is_sorted());
         assert_eq!(words("The cat AND the hat"), ["cat", "hat"]);
         assert_eq!(words("to be or not to be"), [] as [&str; 0]);
         assert_eq!(words("there their theremin"), ["theremin"]);
