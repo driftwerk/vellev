@@ -13,8 +13,8 @@ chrono.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
+tokio.workspace = true
 uuid.workspace = true

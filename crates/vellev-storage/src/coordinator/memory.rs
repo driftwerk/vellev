@@ -1,14 +1,15 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use vellev_core::NodeId;
 
 use super::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
-    ManifestRef, PartitionKey, Result,
+    checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease,
+    LogPosition, ManifestRef, PartitionKey, Result,
 };
 
 pub trait Clock: Send + Sync {
@@ -67,7 +68,17 @@ impl Row {
 /// injectable clock.
 pub struct MemoryCoordinator {
     clock: Arc<dyn Clock>,
+    generations: AtomicU64,
     rows: Mutex<HashMap<PartitionKey, Row>>,
+}
+
+impl std::fmt::Debug for MemoryCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryCoordinator")
+            .field("generations", &self.generations)
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for MemoryCoordinator {
@@ -80,8 +91,13 @@ impl MemoryCoordinator {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             clock,
+            generations: AtomicU64::new(0),
             rows: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn next_generation(&self) -> Generation {
+        Generation(self.generations.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     fn with_row<T>(
@@ -97,26 +113,28 @@ impl MemoryCoordinator {
         f(row, now)
     }
 
-    fn current<T>(
+    fn with_current<T>(
         &self,
         lease: &Lease,
         f: impl FnOnce(&mut Row, DateTime<Utc>) -> Result<T>,
     ) -> Result<T> {
         self.with_row(&lease.key, |row, now| {
-            if row.generation != lease.generation {
-                return Err(CoordinatorError::Fenced {
-                    key: lease.key.clone(),
-                    held: lease.generation,
-                    current: row.generation,
-                });
+            if row.generation == lease.generation {
+                f(row, now)
+            } else {
+                Err(lease.fenced_by(row.generation))
             }
-            f(row, now)
         })
     }
 }
 
-fn expiry(now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
-    now + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX)
+fn expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
+    chrono::Duration::from_std(checked_ttl(ttl)?)
+        .ok()
+        .and_then(|ttl| now.checked_add_signed(ttl))
+        .ok_or_else(|| {
+            CoordinatorError::InvalidArgument(format!("ttl {ttl:?} overflows the clock"))
+        })
 }
 
 #[async_trait]
@@ -150,17 +168,19 @@ impl Coordinator for MemoryCoordinator {
         holder: &NodeId,
         ttl: Duration,
     ) -> Result<Acquired> {
+        let requested_at = Instant::now();
         self.with_row(key, |row, now| {
-            if let Some((holder, expires_at)) = &row.lease {
-                if *expires_at > now {
+            match &row.lease {
+                Some((current, expires_at)) if *expires_at > now && current != holder => {
                     return Ok(Acquired::Held {
-                        holder: holder.clone(),
+                        holder: current.clone(),
                         expires_at: *expires_at,
-                    });
+                    })
                 }
+                _ => {}
             }
-            let expires_at = expiry(now, ttl);
-            row.generation = Generation(row.generation.0 + 1);
+            let expires_at = expiry(now, ttl)?;
+            row.generation = self.next_generation();
             row.lease = Some((holder.clone(), expires_at));
             Ok(Acquired::Lease {
                 lease: Lease {
@@ -169,6 +189,7 @@ impl Coordinator for MemoryCoordinator {
                     generation: row.generation,
                     ttl,
                     expires_at,
+                    requested_at,
                 },
                 committed: row.committed(),
             })
@@ -176,12 +197,14 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease> {
-        self.current(lease, |row, now| {
-            let expires_at = expiry(now, ttl);
+        let requested_at = Instant::now();
+        self.with_current(lease, |row, now| {
+            let expires_at = expiry(now, ttl)?;
             row.lease = Some((lease.holder.clone(), expires_at));
             Ok(Lease {
                 ttl,
                 expires_at,
+                requested_at,
                 ..lease.clone()
             })
         })
@@ -189,18 +212,22 @@ impl Coordinator for MemoryCoordinator {
 
     async fn release(&self, lease: &Lease) -> Result<()> {
         let mut rows = self.rows.lock().expect("coordinator lock");
-        if let Some(row) = rows.get_mut(&lease.key) {
-            if row.generation == lease.generation {
-                row.generation = Generation(row.generation.0 + 1);
-                row.lease = None;
-            }
+        if let Some(row) = rows
+            .get_mut(&lease.key)
+            .filter(|row| row.generation == lease.generation)
+        {
+            row.generation = self.next_generation();
+            row.lease = None;
         }
         Ok(())
     }
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
-        self.current(lease, |row, _| {
-            if commit.log_position <= row.log_position {
+        self.with_current(lease, |row, _| {
+            let advances = commit.log_position > row.log_position;
+            let repeats =
+                commit.log_position == row.log_position && commit.manifest == row.manifest;
+            if !(advances || repeats) {
                 return Err(CoordinatorError::Regressed {
                     key: lease.key.clone(),
                     committed: row.log_position,
