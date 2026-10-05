@@ -12,9 +12,9 @@ use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
 };
 use crate::draft::Draft;
-use crate::format::{decode, decode_head, encode, Head, Kind, LogSegment, Manifest, SegmentFile};
+use crate::format::{decode, decode_head, encode, Head, Kind, LogSegment, Manifest};
 use crate::mutation::{Mutation, Receipt};
-use crate::state::State;
+use crate::state::{Loaded, State};
 use crate::{Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
@@ -171,24 +171,24 @@ impl Partition {
     }
 
     async fn restore(&self, key: &str, manifest: Manifest) -> Result<State> {
-        let loaded: HashMap<String, Arc<SegmentFile>> = self.read(|state| {
+        let held: HashMap<String, Loaded> = self.read(|state| {
             state
-                .segment_files()
-                .map(|(key, file)| (key.to_string(), file.clone()))
+                .loaded_segments()
+                .map(|(key, loaded)| (key.to_string(), loaded))
                 .collect()
         });
-        let files = try_join_all(manifest.segments.iter().map(|meta| {
-            let loaded = loaded.get(&meta.key).cloned();
+        let segments = try_join_all(manifest.segments.iter().map(|meta| {
+            let held = held.get(&meta.key).cloned();
             async move {
-                match loaded {
-                    Some(file) => Ok(file),
+                match held {
+                    Some(loaded) => Ok(loaded),
                     None => decode(&meta.key, Kind::Segment, &self.fetch(&meta.key).await?)
-                        .map(Arc::new),
+                        .map(|file| (Arc::new(file), None)),
                 }
             }
         }))
         .await?;
-        State::from_manifest(key, manifest, files)
+        State::from_manifest(key, manifest, segments)
     }
 }
 
@@ -351,6 +351,12 @@ impl Writer {
             .as_ref()
             .map(|(_, file)| encode(Kind::Segment, file))
             .transpose()?;
+        // Indexed here, before the attempt, so that readers are not held
+        // behind the write lock while a large segment is indexed.
+        let segment = segment.map(|(meta, file)| {
+            let indexes = self.partition.read(|state| state.indexed(&file.rows));
+            (meta, (Arc::new(file), Some(Arc::new(indexes))))
+        });
         let frame = encode(Kind::Manifest, &manifest)?;
         attempt(&mut ready, async {
             if let Some(segment_frame) = segment_frame {

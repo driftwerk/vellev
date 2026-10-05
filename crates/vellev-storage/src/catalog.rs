@@ -44,6 +44,10 @@ impl Catalog {
         self.schemas.iter().map(|(id, schema)| (*id, schema))
     }
 
+    pub fn schema(&self, id: CollectionId) -> Option<&Collection> {
+        self.schemas.get(&id)
+    }
+
     pub fn contains(&self, id: CollectionId) -> bool {
         self.schemas.contains_key(&id)
     }

@@ -1110,6 +1110,8 @@ enum Change {
     Insert(usize, u8, i64),
     Increment(usize, u8, i64),
     Delete(usize, u8),
+    /// Delete every row whose `n` is at least this.
+    DeleteFrom(usize, i64),
 }
 
 #[derive(Debug, Clone)]
@@ -1154,6 +1156,13 @@ impl Change {
                 by: by as f64,
             },
             Change::Delete(c, object) => delete(COLLECTIONS[c], object),
+            Change::DeleteFrom(c, least) => Mutation::DeleteWhere {
+                collection: name(COLLECTIONS[c]),
+                filter: Filter::Gte {
+                    property: "n".into(),
+                    value: json!(least),
+                },
+            },
         }
     }
 
@@ -1162,9 +1171,10 @@ impl Change {
         let rows = |c: usize| model.get(COLLECTIONS[c]);
         match *self {
             Change::Create(c) => rows(c).map(|_| Change::Drop(c)),
-            Change::Drop(c) | Change::Upsert(c, ..) | Change::Delete(c, _) => {
-                rows(c).is_none().then_some(Change::Create(c))
-            }
+            Change::Drop(c)
+            | Change::Upsert(c, ..)
+            | Change::Delete(c, _)
+            | Change::DeleteFrom(c, _) => rows(c).is_none().then_some(Change::Create(c)),
             Change::Insert(c, object, _) => match rows(c) {
                 None => Some(Change::Create(c)),
                 Some(rows) => rows
@@ -1207,6 +1217,12 @@ impl Change {
                 .unwrap()
                 .remove(&object)
                 .is_some(),
+            Change::DeleteFrom(c, least) => {
+                let rows = model.get_mut(COLLECTIONS[c]).unwrap();
+                let before = rows.len();
+                rows.retain(|_, (n, _)| *n < least);
+                rows.len() < before
+            }
         }
     }
 }
@@ -1237,6 +1253,7 @@ fn change() -> impl Strategy<Value = Change> {
         3 => (collection(), 0..IDS, -3i64..4).prop_map(|(c, o, n)| Change::Insert(c, o, n)),
         4 => (collection(), 0..IDS, -3i64..4).prop_map(|(c, o, n)| Change::Increment(c, o, n)),
         5 => (collection(), 0..IDS).prop_map(|(c, o)| Change::Delete(c, o)),
+        2 => (collection(), -3i64..5).prop_map(|(c, least)| Change::DeleteFrom(c, least)),
     ]
 }
 
@@ -1279,6 +1296,30 @@ fn assert_matches_model(state: &State, model: &Model, context: &str) {
         assert_eq!(state.count(&name(collection)), expected.len(), "{context}");
     }
     assert_eq!(state.collections().count(), model.len(), "{context}");
+    for (collection, rows) in model {
+        for wanted in -3i64..4 {
+            let filter = Filter::Gte {
+                property: "n".into(),
+                value: json!(wanted),
+            };
+            let mut selected: Vec<ObjectId> = state
+                .select(&name(collection), &filter)
+                .unwrap()
+                .iter()
+                .map(|o| o.id)
+                .collect();
+            selected.sort_unstable();
+            let expected: Vec<ObjectId> = rows
+                .iter()
+                .filter(|(_, (n, _))| *n >= wanted)
+                .map(|(object, _)| id(*object))
+                .collect();
+            assert_eq!(
+                selected, expected,
+                "{context}: n >= {wanted} in {collection}"
+            );
+        }
+    }
 }
 
 async fn run(actions: Vec<Action>) {

@@ -1,8 +1,10 @@
 //! Resolving what callers ask for into what the log records.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use vellev_core::{Collection, CollectionName, DataType, Object, ObjectError, ObjectId, Value};
+
+use vellev_index::filter::Predicate;
 
 use crate::catalog::Catalog;
 use crate::format::{CollectionId, Op};
@@ -219,14 +221,54 @@ impl Batch<'_> {
                 if self.row((cid, id)).is_none() {
                     return Ok(Outcome::Unchanged);
                 }
-                self.rows.insert((cid, id), None);
-                self.ops.push(Op::Delete {
-                    collection: cid,
-                    id,
-                });
+                self.delete(cid, id);
                 Ok(Outcome::Applied)
             }
+            Mutation::DeleteWhere { collection, filter } => {
+                let (cid, schema) = self.collection(&collection)?;
+                let predicate = filter.compile(&schema)?;
+                if predicate.is_unconditional() {
+                    return Err(invalid(format!(
+                        "a delete from {collection} needs a condition; drop the collection to empty it"
+                    )));
+                }
+                let doomed = self.passing(cid, &predicate);
+                doomed.iter().for_each(|id| self.delete(cid, *id));
+                Ok(Outcome::Deleted(doomed.len() as u64))
+            }
         }
+    }
+
+    fn delete(&mut self, collection: CollectionId, id: ObjectId) {
+        self.rows.insert((collection, id), None);
+        self.ops.push(Op::Delete { collection, id });
+    }
+
+    /// The ids of the collection's rows, as this batch sees them, that pass
+    /// `predicate`: stored rows nothing pending has replaced, and pending
+    /// rows, a batch's own taking precedence. In id order, so that the ops a
+    /// filter resolves to do not depend on how rows happen to be stored.
+    fn passing(&self, collection: CollectionId, predicate: &Predicate) -> BTreeSet<ObjectId> {
+        let pending = &self.draft.pending.rows;
+        let overlaid = |id: ObjectId| {
+            let key = (collection, id);
+            self.rows.contains_key(&key) || pending.contains_key(&key)
+        };
+        let stored = self
+            .draft
+            .state
+            .matching(collection, predicate)
+            .map(|object| object.id)
+            .filter(|id| !overlaid(*id));
+        let written = pending
+            .iter()
+            .filter(|(key, _)| !self.rows.contains_key(key))
+            .chain(&self.rows)
+            .filter(|((c, _), _)| *c == collection)
+            .filter_map(|(_, row)| row.as_ref())
+            .filter(|object| predicate.matches(object))
+            .map(|object| object.id);
+        stored.chain(written).collect()
     }
 }
 

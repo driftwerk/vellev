@@ -17,3 +17,4 @@ pub use group::GroupCommitter;
 pub use mutation::{Condition, Mutation, Outcome, Receipt};
 pub use partition::{Follower, Partition, Writer};
 pub use state::State;
+pub use vellev_index::filter::{Filter, FilterError};
