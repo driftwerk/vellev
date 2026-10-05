@@ -586,3 +586,87 @@ async fn a_writer_lost_to_a_failed_flush_is_replaced_on_the_next_call() {
     reopened.write(vec![note(2, "hen", None)]).await.unwrap();
     assert_eq!(reopened.read(count), 2);
 }
+
+#[tokio::test]
+async fn a_tenant_is_held_while_its_node_lives_and_passes_to_another_when_it_dies() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_millis(300);
+    let node_with_lease = || {
+        let settings = Settings {
+            lease,
+            ..Settings::new(NodeId::generate("node"))
+        };
+        Node::new(
+            cluster.coordinator.clone(),
+            cluster.store.clone(),
+            Arc::new(Embedders::new(EmbedSettings::default())),
+            settings,
+        )
+    };
+    let (first, second) = (node_with_lease(), node_with_lease());
+    first.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = first.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    for n in 0..5 {
+        acme.write(vec![note(n, "fox", None)]).await.unwrap();
+        cluster.clock.advance(lease * 2 / 3);
+        tokio::time::sleep(lease / 2).await;
+        assert!(
+            matches!(
+                second.tenant(&tenant("acme")).await,
+                Err(NodeError::Elsewhere { .. })
+            ),
+            "renewed, so still held after {n} rounds"
+        );
+    }
+
+    drop(acme);
+    drop(first);
+    cluster.clock.advance(lease * 2);
+    let taken = second.tenant(&tenant("acme")).await.unwrap();
+    assert_eq!(taken.read(count), 5, "every acknowledged write is there");
+    taken.write(vec![note(9, "hen", None)]).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_node_notices_that_another_took_its_tenant() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_millis(1_500);
+    let node_with_lease = || {
+        let settings = Settings {
+            lease,
+            ..Settings::new(NodeId::generate("node"))
+        };
+        Node::new(
+            cluster.coordinator.clone(),
+            cluster.store.clone(),
+            Arc::new(Embedders::new(EmbedSettings::default())),
+            settings,
+        )
+    };
+    let (first, second) = (node_with_lease(), node_with_lease());
+    first.create_tenant(&tenant("acme")).await.unwrap();
+    let held = first.tenant(&tenant("acme")).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    cluster.clock.advance(lease * 2);
+    let taken = second.tenant(&tenant("acme")).await.unwrap();
+    assert_eq!(taken.read(count), 1);
+
+    let mut noticed = false;
+    for _ in 0..40 {
+        if matches!(
+            first.tenant(&tenant("acme")).await,
+            Err(NodeError::Elsewhere { .. })
+        ) {
+            noticed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(noticed, "the first node still hands out the tenant it lost");
+    assert!(held.write(vec![note(2, "hen", None)]).await.is_err());
+}

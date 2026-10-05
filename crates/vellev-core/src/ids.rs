@@ -113,6 +113,21 @@ impl NodeId {
         Self(format!("{host}-{}", Uuid::new_v4().simple()))
     }
 
+    /// An id that also says where the node can be reached, so that another
+    /// node finding this one holding a tenant can send it the writes. The
+    /// address comes first and a URL has no spaces, so it reads back.
+    pub fn reachable_at(address: &str, host: &str) -> Self {
+        match address.trim() {
+            "" => Self::generate(host),
+            address => Self(format!("{address} {}", Self::generate(host).0)),
+        }
+    }
+
+    /// Where the node said it can be reached, if it did.
+    pub fn address(&self) -> Option<&str> {
+        self.0.split_once(' ').map(|(address, _)| address)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

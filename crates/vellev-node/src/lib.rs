@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -23,6 +23,7 @@ use vellev_storage::{
 pub struct Settings {
     pub node: NodeId,
     /// How long the node's hold on a tenant lasts without being renewed.
+    /// It is renewed every third of this while the tenant is open.
     pub lease: Duration,
     /// The most callers' writes that share one commit.
     pub group: usize,
@@ -113,11 +114,24 @@ pub struct Tenant {
     /// Set once the writer can no longer write, so that the node opens the
     /// tenant afresh for the next caller.
     broken: Arc<AtomicBool>,
+    /// When the hold on the tenant runs out unless renewed, by this node's
+    /// own clock.
+    deadline: Arc<Mutex<Instant>>,
 }
 
 impl Tenant {
     pub fn id(&self) -> &TenantId {
         &self.id
+    }
+
+    /// Whether this node still holds the tenant, as far as it can tell
+    /// without asking: its hold has not run out and nothing has failed.
+    fn held(&self) -> bool {
+        !self.broken.load(Ordering::SeqCst) && Instant::now() < *self.deadline()
+    }
+
+    fn deadline(&self) -> std::sync::MutexGuard<'_, Instant> {
+        self.deadline.lock().expect("deadline lock")
     }
 
     /// Run `f` against the tenant's data as of its last commit.
@@ -293,7 +307,7 @@ impl Node {
                 .tenants
                 .get(tenant)
                 .and_then(|opening| opening.get())
-                .is_some_and(|tenant| tenant.broken.load(Ordering::SeqCst));
+                .is_some_and(|tenant| !tenant.held());
             if lost {
                 open.tenants.remove(tenant);
             }
@@ -389,6 +403,8 @@ impl Inner {
             }
         };
         let broken = Arc::new(AtomicBool::new(false));
+        let deadline = Arc::new(Mutex::new(lease.deadline()));
+        self.renewing(writer.clone(), broken.clone(), deadline.clone());
         let (flushes, mut wanted) = mpsc::channel(1);
         let (flushing, failed, flushed, rows) =
             (writer.clone(), broken.clone(), tenant.clone(), *flush_rows);
@@ -411,6 +427,45 @@ impl Inner {
             flush_rows: *flush_rows,
             flushes,
             broken,
+            deadline,
         }))
+    }
+
+    /// Keep the hold on `writer`'s tenant for as long as the writer lives,
+    /// and note when it is lost.
+    fn renewing(
+        &self,
+        writer: Arc<Writer>,
+        broken: Arc<AtomicBool>,
+        deadline: Arc<Mutex<Instant>>,
+    ) {
+        let coordinator = self.coordinator.clone();
+        let ttl = self.settings.lease;
+        let writer = Arc::downgrade(&writer);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(ttl / 3);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                let Some(writer) = writer.upgrade() else {
+                    return;
+                };
+                if broken.load(Ordering::SeqCst) {
+                    return;
+                }
+                match coordinator.renew(writer.lease(), ttl).await {
+                    Ok(renewed) => *deadline.lock().expect("deadline lock") = renewed.deadline(),
+                    Err(error) => {
+                        if !error.is_retryable() {
+                            tracing::warn!(partition = %writer.lease().key, %error, "hold on the tenant lost");
+                            broken.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        tracing::warn!(partition = %writer.lease().key, %error, "renewing the hold failed");
+                    }
+                }
+            }
+        });
     }
 }

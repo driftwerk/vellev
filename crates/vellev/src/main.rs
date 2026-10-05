@@ -57,7 +57,8 @@ async fn main() -> Result<ExitCode> {
             let app = App::new(config.keys()?, limits);
             let listener = TcpListener::bind(listen).await?;
             tracing::info!(%listen, version = env!("CARGO_PKG_VERSION"), "vellev listening");
-            let starting = tokio::spawn(start(config.clone(), store, app.clone()));
+            let port = listener.local_addr()?.port();
+            let starting = tokio::spawn(start(config.clone(), store, app.clone(), port));
 
             let told = Arc::new(Notify::new());
             let stop = told.clone();
@@ -98,10 +99,10 @@ async fn main() -> Result<ExitCode> {
 
 /// Reach Postgres, however long it takes, and then serve from the node.
 /// A node that gave up would be restarted into the same outage.
-async fn start(config: Config, store: Arc<dyn ObjectStore>, app: App) {
+async fn start(config: Config, store: Arc<dyn ObjectStore>, app: App, port: u16) {
     let mut wait = Duration::from_secs(1);
     loop {
-        match config.node(store.clone()).await {
+        match config.node(store.clone(), port).await {
             Ok(node) => {
                 app.start(Arc::new(node));
                 tracing::info!("vellev ready");
