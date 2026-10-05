@@ -444,3 +444,28 @@ async fn distances_of_any_size_fuse_to_scores_that_are_numbers() {
         assert!(scores[1] > 0.74 && scores[1] <= 0.75);
     });
 }
+
+#[tokio::test]
+async fn objects_both_searches_offer_at_swapped_places_are_ordered_by_wording() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![
+            create(NOTES),
+            note(1, "fox den den", 0, Some([1.0, 0.0])),
+            note(2, "fox", 0, Some([1.0, 0.5])),
+        ])
+        .await
+        .unwrap();
+    writer.partition().read(|state| {
+        let query = Hybrid {
+            alpha: 0.5,
+            fusion: Fusion::Ranked,
+            ..fox(Some(&EAST))
+        };
+        let fused = hybrid(state, &query);
+        assert_eq!(fused[0].score, fused[1].score);
+        assert!(fused[0].distance > fused[1].distance);
+        assert_eq!(ids(&fused), [id(2), id(1)]);
+    });
+}
