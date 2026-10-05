@@ -24,7 +24,7 @@ pub use vellev_storage::coordinator::{
 pub use vellev_storage::format::{
     self, CollectionId, Kind, LogSegment, Manifest, Row, SegmentFile, SegmentMeta,
 };
-pub use vellev_storage::{Follower, Mutation, State, StorageError, Writer};
+pub use vellev_storage::{Filter, Follower, Mutation, State, StorageError, Writer};
 
 pub const TTL: Duration = Duration::from_secs(30);
 

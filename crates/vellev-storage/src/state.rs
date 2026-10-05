@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use vellev_core::{Collection, CollectionName, Object, ObjectId};
+use vellev_index::filter::{Filter, Predicate, RowIndex};
 
 use crate::catalog::Catalog;
 use crate::coordinator::LogPosition;
@@ -9,6 +10,14 @@ use crate::format::{CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, Se
 use crate::{Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
+
+/// A layer's filter indexes, one per collection with rows in it. Like
+/// liveness they are derived from the rows and never stored.
+pub(crate) type Indexes = HashMap<CollectionId, RowIndex>;
+
+/// A segment as loaded: its file and the indexes built over it, shared by
+/// every state that holds the segment.
+pub(crate) type Loaded = (Arc<SegmentFile>, Option<Arc<Indexes>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Location {
@@ -22,6 +31,7 @@ enum Location {
 struct Segment {
     meta: SegmentMeta,
     file: Arc<SegmentFile>,
+    indexes: Arc<Indexes>,
     dead: Vec<bool>,
 }
 
@@ -30,6 +40,7 @@ struct Memtable {
     rows: Vec<Row>,
     dead: Vec<bool>,
     tombstones: Vec<RowKey>,
+    indexes: Indexes,
 }
 
 /// A partition in memory as of one position: flushed segments, the rows
@@ -103,14 +114,74 @@ impl State {
         self.scan(collection).count()
     }
 
+    /// Every live object in the collection that passes `filter`, in no
+    /// particular order.
+    pub fn select(&self, collection: &CollectionName, filter: &Filter) -> Result<Vec<&Object>> {
+        let (id, schema) = self.catalog.known(collection)?;
+        let predicate = filter.compile(schema)?;
+        Ok(self.matching(id, &predicate).collect())
+    }
+
+    /// One page of the collection in object id order: at most `limit`
+    /// objects after `after` that pass `filter`. Paging by the last id seen
+    /// stays correct while rows are written and deleted in between.
+    pub fn list(
+        &self,
+        collection: &CollectionName,
+        filter: Option<&Filter>,
+        after: Option<ObjectId>,
+        limit: usize,
+    ) -> Result<Vec<&Object>> {
+        let mut page = match filter {
+            Some(filter) => self.select(collection, filter)?,
+            None => {
+                self.catalog.known(collection)?;
+                self.scan(collection).collect()
+            }
+        };
+        page.retain(|object| after.is_none_or(|after| object.id > after));
+        page.sort_unstable_by_key(|object| object.id);
+        page.truncate(limit);
+        Ok(page)
+    }
+
+    pub(crate) fn matching<'a, 'p>(
+        &'a self,
+        collection: CollectionId,
+        predicate: &'p Predicate,
+    ) -> impl Iterator<Item = &'a Object> + 'p
+    where
+        'a: 'p,
+    {
+        let layer = move |indexes: &'a Indexes, rows: &'a [Row], dead: &'a [bool]| {
+            indexes
+                .get(&collection)
+                .map(|index| predicate.select(index))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| row as usize)
+                .filter(move |row| !dead[*row])
+                .map(move |row| &rows[row].object)
+        };
+        self.segments
+            .iter()
+            .flat_map(move |segment| layer(&segment.indexes, &segment.file.rows, &segment.dead))
+            .chain(layer(
+                &self.memtable.indexes,
+                &self.memtable.rows,
+                &self.memtable.dead,
+            ))
+    }
+
     pub(crate) fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    pub(crate) fn segment_files(&self) -> impl Iterator<Item = (&str, &Arc<SegmentFile>)> {
-        self.segments
-            .iter()
-            .map(|segment| (segment.meta.key.as_str(), &segment.file))
+    pub(crate) fn loaded_segments(&self) -> impl Iterator<Item = (&str, Loaded)> {
+        self.segments.iter().map(|segment| {
+            let loaded = (segment.file.clone(), Some(segment.indexes.clone()));
+            (segment.meta.key.as_str(), loaded)
+        })
     }
 
     /// Whether recovery would have to replay log on top of the last checkpoint.
@@ -135,13 +206,13 @@ impl State {
         }
     }
 
-    /// Rebuild the partition as of a checkpoint. `files` are the manifest's
-    /// segments in its order, oldest first; a newer segment's rows and
+    /// Rebuild the partition as of a checkpoint. `segments` are the
+    /// manifest's in its order, oldest first; a newer segment's rows and
     /// tombstones shadow an older one's.
     pub(crate) fn from_manifest(
         key: &str,
         manifest: Manifest,
-        files: Vec<Arc<SegmentFile>>,
+        segments: Vec<Loaded>,
     ) -> Result<Self> {
         let catalog = Catalog::restore(manifest.next_collection_id, manifest.collections)
             .map_err(|reason| StorageError::corrupt(key, reason))?;
@@ -151,20 +222,27 @@ impl State {
             catalog,
             ..State::default()
         };
-        manifest
-            .segments
-            .into_iter()
-            .zip(files)
-            .try_fold(state, |mut state, (meta, file)| {
-                state.attach(meta, file)?;
+        manifest.segments.into_iter().zip(segments).try_fold(
+            state,
+            |mut state, (meta, (file, indexes))| {
+                state.attach(meta, file, indexes)?;
                 Ok(state)
-            })
+            },
+        )
     }
 
     /// Add a segment as the newest. The file is checked before anything is
     /// changed, so on error the state is as it was.
-    fn attach(&mut self, meta: SegmentMeta, file: Arc<SegmentFile>) -> Result<()> {
+    fn attach(
+        &mut self,
+        meta: SegmentMeta,
+        file: Arc<SegmentFile>,
+        indexes: Option<Arc<Indexes>>,
+    ) -> Result<()> {
         let corrupt = |reason: &str| StorageError::corrupt(&meta.key, reason);
+        if u32::try_from(file.rows.len()).is_err() {
+            return Err(corrupt("more rows than a segment can number"));
+        }
         if (file.rows.len() as u64, file.tombstones.len() as u64) != (meta.rows, meta.tombstones) {
             return Err(corrupt("row or tombstone count differs from the manifest"));
         }
@@ -195,8 +273,30 @@ impl State {
                 !live
             })
             .collect();
-        self.segments.push(Segment { meta, file, dead });
+        let indexes = indexes.unwrap_or_else(|| Arc::new(self.indexed(&file.rows)));
+        self.segments.push(Segment {
+            meta,
+            file,
+            indexes,
+            dead,
+        });
         Ok(())
+    }
+
+    /// Index `rows` for filtering. An index built under an older catalog
+    /// stays right: a collection's filterable properties never change, and a
+    /// collection created since has no rows in an older layer.
+    fn indexed(&self, rows: &[Row]) -> Indexes {
+        let mut indexes = Indexes::new();
+        for (row, Row { collection, object }) in rows.iter().enumerate() {
+            if let Some(schema) = self.catalog.schema(*collection) {
+                indexes
+                    .entry(*collection)
+                    .or_default()
+                    .insert(schema, row as u32, object);
+            }
+        }
+        indexes
     }
 
     /// Apply one committed log segment, which must be the commit made
@@ -231,6 +331,7 @@ impl State {
                         self.forget(key);
                     });
                     self.memtable.tombstones.retain(|(c, _)| c != collection);
+                    self.memtable.indexes.remove(collection);
                 }
                 Op::Upsert { collection, object } => {
                     let key = (*collection, object.id);
@@ -238,8 +339,12 @@ impl State {
                     self.memtable
                         .tombstones
                         .retain(|tombstone| *tombstone != key);
-                    self.live
-                        .insert(key, Location::Memtable(self.memtable.rows.len()));
+                    let row = self.memtable.rows.len();
+                    self.live.insert(key, Location::Memtable(row));
+                    if let Some(schema) = self.catalog.schema(*collection) {
+                        let index = self.memtable.indexes.entry(*collection).or_default();
+                        index.insert(schema, row as u32, object);
+                    }
                     self.memtable.rows.push(Row {
                         collection: *collection,
                         object: object.clone(),
@@ -316,7 +421,7 @@ impl State {
         segment: Option<(SegmentMeta, SegmentFile)>,
     ) -> Result<()> {
         if let Some((meta, file)) = segment {
-            self.attach(meta, Arc::new(file))?;
+            self.attach(meta, Arc::new(file), None)?;
         }
         self.memtable = Memtable::default();
         self.position = position;

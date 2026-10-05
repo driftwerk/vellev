@@ -1279,6 +1279,30 @@ fn assert_matches_model(state: &State, model: &Model, context: &str) {
         assert_eq!(state.count(&name(collection)), expected.len(), "{context}");
     }
     assert_eq!(state.collections().count(), model.len(), "{context}");
+    for (collection, rows) in model {
+        for wanted in -3i64..4 {
+            let filter = Filter::Gte {
+                property: "n".into(),
+                value: json!(wanted),
+            };
+            let mut selected: Vec<ObjectId> = state
+                .select(&name(collection), &filter)
+                .unwrap()
+                .iter()
+                .map(|o| o.id)
+                .collect();
+            selected.sort_unstable();
+            let expected: Vec<ObjectId> = rows
+                .iter()
+                .filter(|(_, (n, _))| *n >= wanted)
+                .map(|(object, _)| id(*object))
+                .collect();
+            assert_eq!(
+                selected, expected,
+                "{context}: n >= {wanted} in {collection}"
+            );
+        }
+    }
 }
 
 async fn run(actions: Vec<Action>) {

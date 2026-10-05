@@ -49,6 +49,8 @@ pub enum StorageError {
     #[error(transparent)]
     Schema(#[from] SchemaError),
     #[error(transparent)]
+    Filter(#[from] vellev_index::filter::FilterError),
+    #[error(transparent)]
     Object(#[from] ObjectError),
     #[error("the committed history no longer contains {head:?}; reopen the partition")]
     Diverged { head: Option<String> },

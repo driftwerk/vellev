@@ -1,6 +1,8 @@
 use serde_json::{Map, Value as Json};
 use vellev_core::{Collection, CollectionName, ObjectId, Property, Value};
 
+use vellev_index::filter::Filter;
+
 use crate::coordinator::LogPosition;
 
 /// A change a caller asks for, by collection name. The writer resolves it
@@ -60,6 +62,12 @@ pub enum Mutation {
         collection: CollectionName,
         id: ObjectId,
     },
+    /// Delete every object that passes `filter`, as the batch sees them:
+    /// including rows it wrote earlier, excluding rows it already deleted.
+    DeleteWhere {
+        collection: CollectionName,
+        filter: Filter,
+    },
 }
 
 /// Holds when the stored object's `property` equals `equals`, where JSON
@@ -77,6 +85,8 @@ pub enum Outcome {
     Unchanged,
     /// The property's value after an [`Mutation::Increment`].
     Value(Value),
+    /// How many objects a [`Mutation::DeleteWhere`] deleted.
+    Deleted(u64),
 }
 
 /// What one caller's batch did, and the position at which it is visible.
