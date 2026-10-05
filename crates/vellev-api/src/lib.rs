@@ -459,6 +459,47 @@ mod tests {
     }
 
     #[test]
+    fn only_a_change_that_can_be_made_twice_without_harm_is_repeatable() {
+        let id = "00000000-0000-0000-0000-000000000001";
+        let change = |fields: Json| -> Change {
+            let mut change = json!({ "collection": "Notes", "id": id });
+            let fields = fields.as_object().unwrap().clone();
+            change.as_object_mut().unwrap().extend(fields);
+            serde_json::from_value(change).unwrap()
+        };
+        let only_if = json!({ "property": "n", "equals": 1 });
+        for (fields, repeatable) in [
+            (json!({ "op": "upsert" }), true),
+            (json!({ "op": "delete" }), true),
+            (json!({ "op": "patch" }), true),
+            (json!({ "op": "patch", "only_if": only_if }), false),
+            (json!({ "op": "insert" }), false),
+            (
+                json!({ "op": "increment", "property": "n", "by": 1 }),
+                false,
+            ),
+            (
+                json!({ "op": "append", "property": "tags", "values": ["a"] }),
+                false,
+            ),
+            (
+                json!({ "op": "append", "property": "tags", "values": ["a"], "unique": true }),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                change(fields.clone()).is_repeatable(),
+                repeatable,
+                "{fields}"
+            );
+        }
+        let dropped: Change =
+            serde_json::from_value(json!({ "op": "drop_collection", "collection": "Notes" }))
+                .unwrap();
+        assert!(dropped.is_repeatable());
+    }
+
+    #[test]
     fn a_search_must_say_how_many_and_a_result_carries_only_the_scores_it_has() {
         assert!(serde_json::from_value::<Nearest>(json!({ "vector": [1.0] })).is_err());
         assert!(serde_json::from_value::<Keyword>(json!({ "text": "fox" })).is_err());
