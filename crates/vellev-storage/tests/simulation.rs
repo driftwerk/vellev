@@ -11,7 +11,7 @@ mod common;
 use std::collections::VecDeque;
 
 use common::*;
-use proptest::test_runner::{Config, TestCaseError, TestRunner};
+use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use vellev_storage::Outcome;
 
 const COLLECTION: &str = "sim";
@@ -48,11 +48,10 @@ enum CommitFault {
 /// A dependency broken on purpose, to prove the checker notices.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Canary {
-    None,
     /// The coordinator says yes to a commit it did not record.
     AcknowledgesUnrecordedCommits,
-    /// The store accepts an upload and keeps nothing.
-    DropsUploads,
+    /// The store accepts a segment and keeps nothing.
+    DropsSegments,
 }
 
 #[derive(Debug, Default)]
@@ -68,7 +67,7 @@ struct Faults {
 struct SimBlobs {
     clean: Arc<dyn Blobs>,
     faults: Arc<Mutex<Faults>>,
-    canary: Canary,
+    canary: Option<Canary>,
     written: Mutex<BTreeSet<String>>,
     delayed: Mutex<Vec<(String, Bytes)>>,
     rewritten: Mutex<Vec<String>>,
@@ -80,7 +79,7 @@ impl SimBlobs {
             self.rewritten.lock().unwrap().push(key.to_string());
         }
         match self.canary {
-            Canary::DropsUploads if key.contains("/segment/") => Ok(()),
+            Some(Canary::DropsSegments) if key.contains("/segment/") => Ok(()),
             _ => self.clean.put(key, bytes).await,
         }
     }
@@ -122,13 +121,15 @@ impl Blobs for SimBlobs {
     }
 }
 
-/// A coordinator that fails on command and counts the commits it recorded.
+/// A coordinator that fails on command, counts the commits it recorded, and
+/// notes any it recorded for a lease that was no longer the current one.
 #[derive(Debug)]
 struct SimCoordinator {
     clean: Arc<MemoryCoordinator>,
     faults: Arc<Mutex<Faults>>,
-    canary: Canary,
+    canary: Option<Canary>,
     recorded: AtomicUsize,
+    unfenced: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -154,17 +155,21 @@ impl Coordinator for SimCoordinator {
         self.clean.release(lease).await
     }
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed, CoordinatorError> {
-        let unreachable = || CoordinatorError::backend(std::io::Error::other("connection reset"));
+        let reset = || CoordinatorError::backend(std::io::Error::other("connection reset"));
         let fault = self.faults.lock().unwrap().commits.pop_front();
         if fault == Some(CommitFault::Refuse) {
-            return Err(unreachable());
+            return Err(reset());
         }
         let outcome = self.clean.commit(lease, commit.clone()).await;
-        match outcome {
-            Ok(_) => {
+        match &outcome {
+            Ok(committed) => {
                 self.recorded.fetch_add(1, Ordering::SeqCst);
+                if committed.generation != lease.generation {
+                    let stale = format!("{:?} at {:?}", lease.generation, commit.log_position);
+                    self.unfenced.lock().unwrap().push(stale);
+                }
             }
-            Err(_) if self.canary == Canary::AcknowledgesUnrecordedCommits => {
+            Err(_) if self.canary == Some(Canary::AcknowledgesUnrecordedCommits) => {
                 return Ok(Committed {
                     generation: lease.generation,
                     log_position: commit.log_position,
@@ -174,7 +179,7 @@ impl Coordinator for SimCoordinator {
             Err(_) => {}
         }
         match fault {
-            Some(CommitFault::LoseResponse) => Err(unreachable()),
+            Some(CommitFault::LoseResponse) => Err(reset()),
             _ => outcome,
         }
     }
@@ -186,18 +191,26 @@ impl Coordinator for SimCoordinator {
     }
 }
 
+/// Which writer acts: the one the cluster would use, or any writer there
+/// has ever been, which may be stalled, fenced or closed and not know it.
+#[derive(Debug, Clone, Copy)]
+enum Who {
+    Current,
+    Any(usize),
+}
+
 #[derive(Debug, Clone)]
 enum Action {
-    /// A writer, counted back from the newest, inserts this many rows.
     Write {
-        writer: usize,
+        who: Who,
         rows: u64,
     },
     Flush {
-        writer: usize,
+        who: Who,
     },
+    /// The lease expires and another node takes it.
     Takeover,
-    /// The newest writer's node restarts it on the lease it still holds.
+    /// The node holding the lease restarts its writer on it.
     Reopen,
     FailUpload(PutFault),
     FailCommits(CommitFault, usize),
@@ -208,20 +221,22 @@ enum Action {
 }
 
 fn action() -> impl Strategy<Value = Action> {
-    let writer = || prop_oneof![4 => Just(0usize), 1 => 1..4usize];
+    let who = || prop_oneof![4 => Just(Who::Current), 1 => any::<usize>().prop_map(Who::Any)];
     let put_fault = prop_oneof![
         Just(PutFault::Refuse),
         Just(PutFault::LandThenFail),
         Just(PutFault::Delay)
     ];
     let commit_fault = prop_oneof![Just(CommitFault::Refuse), Just(CommitFault::LoseResponse)];
+    // Three failed tries close a writer, so most runs of faults stop short of that.
+    let times = prop_oneof![3 => 1..3usize, 1 => 3..5usize];
     prop_oneof![
-        12 => (writer(), 1..4u64).prop_map(|(writer, rows)| Action::Write { writer, rows }),
-        3 => writer().prop_map(|writer| Action::Flush { writer }),
-        3 => Just(Action::Takeover),
-        2 => Just(Action::Reopen),
+        14 => (who(), 1..4u64).prop_map(|(who, rows)| Action::Write { who, rows }),
+        4 => who().prop_map(|who| Action::Flush { who }),
+        2 => Just(Action::Takeover),
+        1 => Just(Action::Reopen),
         2 => put_fault.prop_map(Action::FailUpload),
-        3 => (commit_fault, 1..5usize).prop_map(|(fault, times)| Action::FailCommits(fault, times)),
+        2 => (commit_fault, times).prop_map(|(fault, times)| Action::FailCommits(fault, times)),
         1 => (1..4usize).prop_map(Action::FailReads),
         1 => Just(Action::DeliverDelayed),
         3 => Just(Action::Follow),
@@ -252,13 +267,20 @@ fn snapshot(state: &State) -> Snapshot {
     (state.position(), rows)
 }
 
+/// A writer, and whether it can still commit. Any failed write closes one.
+struct Seat {
+    writer: Writer,
+    open: bool,
+}
+
 struct World {
-    key: PartitionKey,
-    clock: Arc<ManualClock>,
+    cluster: Cluster,
     faults: Arc<Mutex<Faults>>,
     blobs: Arc<SimBlobs>,
     coordinator: Arc<SimCoordinator>,
-    writers: Vec<Writer>,
+    /// The lease most recently taken, whether or not its writer opened.
+    held: Lease,
+    seats: Vec<Seat>,
     follower: Follower,
     attempts: Vec<Attempt>,
     readings: Vec<Committed>,
@@ -274,49 +296,35 @@ fn check(holds: bool, violation: impl FnOnce() -> String) -> Violation {
 }
 
 impl World {
-    async fn new(canary: Canary) -> Self {
-        let clock = Arc::new(ManualClock::starting_at(
-            Utc.with_ymd_and_hms(2026, 10, 5, 9, 0, 0).unwrap(),
-        ));
+    async fn new(canary: Option<Canary>) -> Self {
+        let cluster = Cluster::new().await;
         let faults = Arc::new(Mutex::new(Faults::default()));
-        let key = PartitionKey {
-            tenant: TenantId::new("sim").unwrap(),
-            partition: PartitionNumber::DEFAULT,
-        };
-        let clean = Arc::new(MemoryCoordinator::new(clock.clone()));
-        clean.register(&key).await.unwrap();
         let coordinator = Arc::new(SimCoordinator {
-            clean,
+            clean: cluster.coordinator.clone(),
             faults: faults.clone(),
             canary,
             recorded: AtomicUsize::new(0),
+            unfenced: Mutex::default(),
         });
         let blobs = Arc::new(SimBlobs {
-            clean: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new()))),
+            clean: cluster.blobs.clone(),
             faults: faults.clone(),
             canary,
             written: Mutex::default(),
             delayed: Mutex::default(),
             rewritten: Mutex::default(),
         });
-        let empty = coordinator.clean.committed(&key).await.unwrap().unwrap();
-        let follower = Follower::open(key.clone(), blobs.clone(), &empty)
+        let follower = Follower::open(
+            cluster.key.clone(),
+            blobs.clone(),
+            &cluster.committed().await,
+        )
+        .await
+        .unwrap();
+        let (held, committed) = cluster.lease().await;
+        let writer = Writer::open(blobs.clone(), coordinator.clone(), held.clone(), &committed)
             .await
             .unwrap();
-        let mut world = Self {
-            key,
-            clock,
-            faults,
-            blobs,
-            coordinator,
-            writers: Vec::new(),
-            follower,
-            attempts: Vec::new(),
-            readings: Vec::new(),
-            next_row: 0,
-            history: BTreeMap::from([(LogPosition(0), BTreeMap::new())]),
-        };
-        world.take_over().await;
         let setup = vec![
             create(COLLECTION),
             Mutation::Insert {
@@ -326,54 +334,66 @@ impl World {
                 vector: None,
             },
         ];
-        world.writers[0].commit(setup).await.unwrap();
+        writer.commit(setup).await.unwrap();
+        let mut world = Self {
+            cluster,
+            faults,
+            blobs,
+            coordinator,
+            held,
+            seats: vec![Seat { writer, open: true }],
+            follower,
+            attempts: Vec::new(),
+            readings: Vec::new(),
+            next_row: 0,
+            history: BTreeMap::from([(LogPosition(0), BTreeMap::new())]),
+        };
         world.verify().await.unwrap();
         world
     }
 
-    async fn committed(&self) -> Committed {
-        self.coordinator
-            .clean
-            .committed(&self.key)
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    /// The lease expires and a new node takes it. Opening its writer reads
-    /// through the faulty store, so it may fail; the lease has moved either
-    /// way, and every earlier writer is now a zombie.
+    /// The lease expires and a new node takes it; every earlier writer is
+    /// now a zombie, whether or not the new one manages to open.
     async fn take_over(&mut self) {
-        self.clock.advance(TTL);
-        let holder = NodeId::generate("node");
-        let Acquired::Lease { lease, committed } = self
-            .coordinator
-            .acquire(&self.key, &holder, TTL)
-            .await
-            .unwrap()
-        else {
-            panic!("the lease should have expired");
-        };
-        self.open_writer(lease, &committed).await;
+        let (lease, committed) = self.cluster.lease().await;
+        self.held = lease;
+        self.open_writer(&committed).await;
     }
 
-    async fn open_writer(&mut self, lease: Lease, committed: &Committed) {
-        let opened = Writer::open(
-            self.blobs.clone(),
-            self.coordinator.clone(),
-            lease,
-            committed,
-        );
-        if let Ok(writer) = opened.await {
-            self.writers.push(writer);
+    /// Open a writer on the held lease through the faulty store. A node
+    /// whose first try fails while reads are failing tries once more.
+    async fn open_writer(&mut self, committed: &Committed) {
+        for _ in 0..2 {
+            let opened = Writer::open(
+                self.blobs.clone(),
+                self.coordinator.clone(),
+                self.held.clone(),
+                committed,
+            );
+            if let Ok(writer) = opened.await {
+                self.seats.push(Seat { writer, open: true });
+                return;
+            }
+            self.faults.lock().unwrap().failing_gets = 0;
         }
     }
 
-    fn writer(&self, back: usize) -> &Writer {
-        &self.writers[self.writers.len() - 1 - back % self.writers.len()]
+    /// The seat `who` writes from. The cluster always has a current writer:
+    /// when the newest is closed a node takes over before the write.
+    async fn seat(&mut self, who: Who) -> usize {
+        match who {
+            Who::Any(pick) => pick % self.seats.len(),
+            Who::Current => {
+                if !self.seats[self.seats.len() - 1].open {
+                    self.take_over().await;
+                }
+                self.seats.len() - 1
+            }
+        }
     }
 
-    async fn write(&mut self, back: usize, rows: u64) {
+    async fn write(&mut self, who: Who, rows: u64) -> Violation {
+        let seat = self.seat(who).await;
         let rows: Vec<u64> = (self.next_row..self.next_row + rows).collect();
         self.next_row += rows.len() as u64;
         let attempt = self.attempts.len() as i64;
@@ -391,29 +411,43 @@ impl World {
         };
         let mutations = rows.iter().map(insert).chain([count]).collect();
         let before = self.coordinator.recorded.load(Ordering::SeqCst);
-        let outcome = self.writer(back).commit(mutations).await;
+        let outcome = self.seats[seat].writer.commit(mutations).await;
         let recorded = self.coordinator.recorded.load(Ordering::SeqCst) > before;
-        let acknowledged = matches!(
-            &outcome,
-            Ok(receipt) if matches!(receipt.outcomes.last(), Some(Outcome::Value(_)))
-        );
+        self.seats[seat].open = outcome.is_ok();
         self.attempts.push(Attempt {
             rows,
-            acknowledged,
+            acknowledged: outcome.is_ok(),
             recorded,
         });
+
+        let Ok(receipt) = outcome else { return Ok(()) };
+        let counted = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.recorded)
+            .count() as i64;
+        check(
+            receipt.outcomes.last() == Some(&Outcome::Value(Value::Int(counted))),
+            || {
+                format!(
+                    "a write was told the counter is {:?} after {counted} recorded attempts",
+                    receipt.outcomes.last()
+                )
+            },
+        )
     }
 
     async fn step(&mut self, action: Action) -> Violation {
         match action {
-            Action::Write { writer, rows } => self.write(writer, rows).await,
-            Action::Flush { writer } => {
-                let _ = self.writer(writer).flush().await;
+            Action::Write { who, rows } => return self.write(who, rows).await,
+            Action::Flush { who } => {
+                let seat = self.seat(who).await;
+                self.seats[seat].open = self.seats[seat].writer.flush().await.is_ok();
             }
             Action::Takeover => self.take_over().await,
             Action::Reopen => {
-                let (lease, committed) = (self.writer(0).lease().clone(), self.committed().await);
-                self.open_writer(lease, &committed).await;
+                let committed = self.cluster.committed().await;
+                self.open_writer(&committed).await;
             }
             Action::FailUpload(fault) => self.faults.lock().unwrap().puts.push_back(fault),
             Action::FailCommits(fault, times) => self
@@ -433,7 +467,7 @@ impl World {
     /// A follower catches up through the faulty store. It may fail while
     /// reads are failing; once they recover it must reach the committed state.
     async fn follow(&mut self) -> Violation {
-        let committed = self.committed().await;
+        let committed = self.cluster.committed().await;
         let reads_were_failing = self.faults.lock().unwrap().failing_gets > 0;
         if let Err(error) = self.follower.catch_up(&committed).await {
             check(reads_were_failing, || {
@@ -469,10 +503,14 @@ impl World {
     /// The committed state as a node starting with nothing reads it from a
     /// healthy store.
     async fn truth(&self, committed: &Committed) -> std::result::Result<Snapshot, String> {
-        Follower::open(self.key.clone(), self.blobs.clean.clone(), committed)
-            .await
-            .map(|fresh| fresh.partition().read(snapshot))
-            .map_err(|error| format!("the committed state cannot be read: {error}"))
+        Follower::open(
+            self.cluster.key.clone(),
+            self.blobs.clean.clone(),
+            committed,
+        )
+        .await
+        .map(|fresh| fresh.partition().read(snapshot))
+        .map_err(|error| format!("the committed state cannot be read: {error}"))
     }
 
     async fn verify(&mut self) -> Violation {
@@ -480,8 +518,12 @@ impl World {
         check(rewritten.is_empty(), || {
             format!("files were written twice: {rewritten:?}")
         })?;
+        let unfenced = self.coordinator.unfenced.lock().unwrap().clone();
+        check(unfenced.is_empty(), || {
+            format!("a superseded lease committed: {unfenced:?}")
+        })?;
 
-        let committed = self.committed().await;
+        let committed = self.cluster.committed().await;
         let newest = self.history.keys().next_back().copied().unwrap_or_default();
         check(committed.log_position >= newest, || {
             format!(
@@ -500,14 +542,15 @@ impl World {
         })?;
 
         let (_, rows) = self.truth(&committed).await?;
-        let recorded: Vec<&Attempt> = self.attempts.iter().filter(|a| a.recorded).collect();
-        let expected: BTreeMap<ObjectId, i64> = self
-            .attempts
-            .iter()
-            .enumerate()
-            .filter(|(_, attempt)| attempt.recorded)
+        let recorded = || {
+            self.attempts
+                .iter()
+                .enumerate()
+                .filter(|(_, attempt)| attempt.recorded)
+        };
+        let expected: BTreeMap<ObjectId, i64> = recorded()
             .flat_map(|(n, attempt)| attempt.rows.iter().map(move |r| (row(*r), n as i64)))
-            .chain([(counter(), recorded.len() as i64)])
+            .chain([(counter(), recorded().count() as i64)])
             .collect();
         check(rows == expected, || {
             let missing: Vec<_> = expected
@@ -523,9 +566,9 @@ impl World {
         self.history.insert(committed.log_position, rows);
 
         let copies = self
-            .writers
+            .seats
             .iter()
-            .map(Writer::partition)
+            .map(|seat| seat.writer.partition())
             .chain([self.follower.partition()]);
         copies.map(|copy| copy.read(snapshot)).try_for_each(|(position, held)| {
             check(self.history.get(&position) == Some(&held), || {
@@ -535,7 +578,7 @@ impl World {
     }
 }
 
-async fn simulate(actions: Vec<Action>, canary: Canary) -> Violation {
+async fn simulate(actions: Vec<Action>, canary: Option<Canary>) -> Violation {
     let mut world = World::new(canary).await;
     for (step, action) in actions.into_iter().enumerate() {
         let described = format!("step {step} ({action:?})");
@@ -560,7 +603,7 @@ async fn simulate(actions: Vec<Action>, canary: Canary) -> Violation {
         .map_err(|violation| format!("at the end: {violation}"))
 }
 
-fn run(actions: Vec<Action>, canary: Canary) -> Violation {
+fn run(actions: Vec<Action>, canary: Option<Canary>) -> Violation {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
@@ -578,33 +621,43 @@ proptest! {
     fn no_history_of_faults_loses_an_acknowledged_write_or_shows_an_unrecorded_one(
         actions in histories()
     ) {
-        run(actions, Canary::None).map_err(TestCaseError::fail)?;
+        run(actions, None).map_err(TestCaseError::fail)?;
     }
 }
 
-/// Whether the simulation finds a violation when one of its dependencies is
-/// broken in the given way.
-fn caught(canary: Canary) -> bool {
-    let mut runner = TestRunner::new_with_rng(
-        Config {
-            cases: 2_000,
-            failure_persistence: None,
-            ..Config::default()
-        },
-        proptest::test_runner::TestRng::deterministic_rng(
-            proptest::test_runner::RngAlgorithm::ChaCha,
-        ),
-    );
-    runner
-        .run(&histories(), |actions| {
-            run(actions, canary).map_err(TestCaseError::fail)
+/// The first violation the simulation reports over a fixed set of histories
+/// when one of its dependencies is broken in the given way.
+fn first_violation(canary: Option<Canary>) -> Option<String> {
+    let config = Config {
+        cases: 200,
+        failure_persistence: None,
+        max_shrink_iters: 0,
+        ..Config::default()
+    };
+    let rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+    let found = Mutex::new(None);
+    let _ = TestRunner::new_with_rng(config, rng).run(&histories(), |actions| {
+        run(actions, canary).map_err(|violation| {
+            found.lock().unwrap().get_or_insert(violation.clone());
+            TestCaseError::fail(violation)
         })
-        .is_err()
+    });
+    found.into_inner().unwrap()
 }
 
 #[test]
 fn the_checker_passes_a_healthy_system_and_catches_a_broken_one() {
-    assert!(!caught(Canary::None));
-    assert!(caught(Canary::AcknowledgesUnrecordedCommits));
-    assert!(caught(Canary::DropsUploads));
+    assert_eq!(first_violation(None), None);
+
+    // A commit acknowledged without being recorded shows up as whichever of
+    // its symptoms the history reaches first.
+    let symptoms = ["never recorded", "never committed", "was told the counter"];
+    let unrecorded = first_violation(Some(Canary::AcknowledgesUnrecordedCommits)).unwrap();
+    assert!(
+        symptoms.iter().any(|symptom| unrecorded.contains(symptom)),
+        "{unrecorded}"
+    );
+
+    let dropped = first_violation(Some(Canary::DropsSegments)).unwrap();
+    assert!(dropped.contains("cannot be read"), "{dropped}");
 }

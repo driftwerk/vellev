@@ -9,7 +9,8 @@ on:
     inputs:
       cases:
         description: Histories to generate per property test
-        default: '20000'
+        type: number
+        default: 20000
 
 permissions:
   contents: read
