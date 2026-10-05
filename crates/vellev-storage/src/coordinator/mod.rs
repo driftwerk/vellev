@@ -1,7 +1,8 @@
 //! Who may write to a partition, and what is committed.
 //!
-//! Correctness rests on the generation, not on clocks. Taking or releasing a
-//! lease moves the partition to a fresh generation, and renew and commit
+//! Correctness rests on the generation, not on clocks. Registering a
+//! partition, and taking or releasing its lease, each move it to a fresh
+//! generation, and renew and commit
 //! succeed only while the lease's generation is still current, so a writer
 //! that stalls past its lease and carries on is fenced the moment it tries
 //! to commit. Generations come from one sequence per coordinator, so a
@@ -159,7 +160,8 @@ fn checked_ttl(ttl: Duration) -> Result<Duration> {
 
 #[async_trait]
 pub trait Coordinator: fmt::Debug + Send + Sync {
-    /// Create the partition's row. Registering an existing partition changes nothing.
+    /// Create the partition's row at a fresh generation. Registering an
+    /// existing partition changes nothing.
     async fn register(&self, key: &PartitionKey) -> Result<()>;
 
     /// Delete the partition's row. Returns whether it existed.

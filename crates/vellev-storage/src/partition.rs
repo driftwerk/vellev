@@ -88,11 +88,14 @@ impl Partition {
         if stale {
             return Ok(position);
         }
-        let lost = || match &head {
-            Some(_) => StorageError::Diverged { head: head.clone() },
-            None => StorageError::corrupt(
-                target.unwrap_or("the empty head"),
-                format!("nothing leads to it at {:?}", committed.log_position),
+        let lost = || match (&head, target) {
+            (Some(_), _) => StorageError::Diverged { head: head.clone() },
+            (None, Some(target)) => {
+                StorageError::corrupt(target, "its history does not reach the start of the log")
+            }
+            (None, None) => StorageError::corrupt(
+                &Layout(&self.key).prefix(),
+                format!("{:?} is committed with no head", committed.log_position),
             ),
         };
         if committed.log_position == position && target == head.as_deref() {

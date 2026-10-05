@@ -1003,6 +1003,35 @@ async fn a_reading_from_a_removed_history_is_ignored_even_when_it_is_further_alo
 }
 
 #[tokio::test]
+async fn a_removed_history_is_never_adopted_before_anyone_takes_a_new_lease() {
+    let cluster = Cluster::new().await;
+    let removed = cluster.writer().await;
+    removed
+        .commit(vec![create("old"), upsert("old", 1, 1)])
+        .await
+        .unwrap();
+    removed.commit(vec![upsert("old", 2, 2)]).await.unwrap();
+    let old = cluster.committed().await;
+    let holding_old = cluster.open().await;
+
+    cluster.coordinator.remove(&cluster.key).await.unwrap();
+    cluster.coordinator.register(&cluster.key).await.unwrap();
+    let registered = cluster.committed().await;
+    assert!(registered.generation > old.generation);
+
+    let fresh = cluster.open().await;
+    assert_eq!(fresh.catch_up(&old).await.unwrap(), LogPosition(0));
+    fresh
+        .partition()
+        .read(|state| assert!(state.collection(&name("old")).is_none()));
+
+    assert!(matches!(
+        holding_old.catch_up(&registered).await,
+        Err(StorageError::Diverged { .. })
+    ));
+}
+
+#[tokio::test]
 async fn a_log_that_reuses_a_dropped_collection_id_is_refused() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
