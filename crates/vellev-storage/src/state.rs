@@ -8,10 +8,14 @@ use vellev_index::vector::BinaryIndex;
 use crate::catalog::Catalog;
 use crate::coordinator::LogPosition;
 use crate::format::{CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentMeta};
-use crate::search::EXACT_UP_TO;
 use crate::{Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
+
+/// Up to this many of a collection's rows a layer scores every one exactly
+/// on a vector search; only beyond it is a vector index built, and with it
+/// any approximation used. Scoring this many takes well under a millisecond.
+pub(crate) const SHORTLIST_ABOVE: usize = 4_000;
 
 /// What is indexed about one collection's rows in a layer: their filterable
 /// values and, once there are too many to score one by one, their vectors.
@@ -333,7 +337,7 @@ impl State {
                 }
             }
         }
-        for (collection, vectors) in vectors.iter().filter(|(_, v)| v.len() > EXACT_UP_TO) {
+        for (collection, vectors) in vectors.iter().filter(|(_, v)| v.len() > SHORTLIST_ABOVE) {
             if let Some(index) = indexes.get_mut(collection) {
                 index.vectors = BinaryIndex::build(vectors);
             }
@@ -388,7 +392,9 @@ impl State {
                     if let Some(schema) = self.catalog.schema(*collection) {
                         let index = self.memtable.indexes.entry(*collection).or_default();
                         // A memtable is flushed long before it holds as
-                        // many rows as a segment may number.
+                        // many rows as a segment may number. It has no
+                        // vector index: its rows change, and are few
+                        // enough to score one by one.
                         index.rows.insert(schema, row as u32, object);
                     }
                     self.memtable.rows.push(Row {

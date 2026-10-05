@@ -207,3 +207,19 @@ impl Cluster {
         })
     }
 }
+
+/// A small deterministic generator of values in -0.5..0.5.
+pub struct Random(pub u64);
+
+impl Random {
+    pub fn unit(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    }
+
+    pub fn vector(&mut self, dimensions: usize) -> Vec<f32> {
+        (0..dimensions).map(|_| self.unit()).collect()
+    }
+}

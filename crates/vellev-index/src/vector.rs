@@ -6,8 +6,8 @@
 //! every code produces a shortlist cheaply, and only the shortlist is scored
 //! with the full vectors and the real distance.
 //!
-//! The shortlist is the only approximate step, and it only ever considers
-//! rows the caller allows, so a filter cannot cause a miss.
+//! The shortlist is the only approximate step. It is taken from the rows the
+//! caller allows, not filtered afterwards, so a filter never thins it.
 
 use roaring::RoaringBitmap;
 use vellev_core::Distance;
@@ -91,9 +91,10 @@ impl<'q> Scorer<'q> {
         match self.metric {
             Distance::Cosine => {
                 let (dot, norm) = dot_and_norm(self.query, vector);
-                let norms = self.query_norm * norm.sqrt();
-                if norms > 0.0 {
-                    1.0 - (dot / norms).clamp(-1.0, 1.0)
+                // Not finite for a zero vector, or when a length overflows.
+                let cosine = dot / (self.query_norm * norm.sqrt());
+                if cosine.is_finite() {
+                    1.0 - cosine.clamp(-1.0, 1.0)
                 } else {
                     1.0
                 }
@@ -103,10 +104,9 @@ impl<'q> Scorer<'q> {
         }
     }
 
-    /// A cosine distance on the scale `(1 + cosine) / 2`, from 0 for opposite
-    /// to 1 for identical. Other metrics have no such scale.
+    /// See [`certainty`].
     pub fn certainty(&self, distance: f32) -> Option<f32> {
-        (self.metric == Distance::Cosine).then_some(1.0 - distance / 2.0)
+        certainty(self.metric, distance)
     }
 }
 
@@ -115,9 +115,10 @@ pub fn distance(metric: Distance, a: &[f32], b: &[f32]) -> f32 {
     Scorer::new(metric, a).distance(b)
 }
 
-/// The certainty of a distance under `metric`; see [`Scorer::certainty`].
+/// A cosine distance on the scale `(1 + cosine) / 2`, from 0 for opposite to
+/// 1 for identical. Other metrics have no such scale.
 pub fn certainty(metric: Distance, distance: f32) -> Option<f32> {
-    Scorer::new(metric, &[]).certainty(distance)
+    (metric == Distance::Cosine).then_some(1.0 - distance / 2.0)
 }
 
 /// A way to pick, cheaply, the rows most likely to be nearest a query.
@@ -156,6 +157,8 @@ impl BinaryIndex {
     /// length. Returns `None` when there is nothing to index.
     pub fn build(vectors: &[(u32, &[f32])]) -> Option<Self> {
         let dimensions = vectors.first()?.1.len();
+        debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
         let count = vectors.len() as f32;
         let mean = vectors
             .iter()
@@ -165,29 +168,15 @@ impl BinaryIndex {
                     .for_each(|(sum, value)| *sum += value / count);
                 sum
             });
-        let words = dimensions.div_ceil(64);
-        let mut index = Self {
-            mean,
-            words,
+        Some(Self {
+            words: dimensions.div_ceil(64),
             rows: vectors.iter().map(|(row, _)| *row).collect(),
-            codes: Vec::with_capacity(vectors.len() * words),
-        };
-        for (_, vector) in vectors {
-            let code = index.encode(vector);
-            index.codes.extend(code);
-        }
-        Some(index)
-    }
-
-    fn encode(&self, vector: &[f32]) -> Vec<u64> {
-        let mut code = vec![0u64; self.words];
-        let above = vector
-            .iter()
-            .zip(&self.mean)
-            .enumerate()
-            .filter(|(_, (v, mean))| v > mean);
-        above.for_each(|(dimension, _)| code[dimension / 64] |= 1 << (dimension % 64));
-        code
+            codes: vectors
+                .iter()
+                .flat_map(|(_, vector)| encode(&mean, vector))
+                .collect(),
+            mean,
+        })
     }
 
     fn hamming(&self, position: usize, query: &[u64]) -> u32 {
@@ -197,6 +186,24 @@ impl BinaryIndex {
             .map(|(a, b)| (a ^ b).count_ones())
             .sum()
     }
+}
+
+/// One bit per dimension, set where the vector is above the mean. Built
+/// without a branch per dimension, which a coin-flip bit would mispredict
+/// half the time.
+fn encode<'a>(mean: &'a [f32], vector: &'a [f32]) -> impl Iterator<Item = u64> + 'a {
+    vector
+        .chunks(64)
+        .zip(mean.chunks(64))
+        .map(|(values, means)| {
+            values
+                .iter()
+                .zip(means)
+                .enumerate()
+                .fold(0u64, |word, (bit, (value, mean))| {
+                    word | (u64::from(value > mean) << bit)
+                })
+        })
 }
 
 impl VectorIndex for BinaryIndex {
@@ -214,7 +221,7 @@ impl VectorIndex for BinaryIndex {
         if count == 0 || query.len() != self.mean.len() {
             return Vec::new();
         }
-        let query = self.encode(query);
+        let query: Vec<u64> = encode(&self.mean, query).collect();
         let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
         let scored = |position: usize| (self.hamming(position, &query), self.rows[position]);
         let mut nearest: Vec<(u32, u32)> = match only {
@@ -222,11 +229,17 @@ impl VectorIndex for BinaryIndex {
                 .filter(|p| kept(self.rows[*p]))
                 .map(scored)
                 .collect(),
+            // Both are in ascending row order, so one pass finds each allowed
+            // row's position without a search per row.
             Some(only) => only
                 .iter()
                 .filter(|row| kept(*row))
-                .filter_map(|row| self.rows.binary_search(&row).ok())
-                .map(scored)
+                .scan(0, |position, row| {
+                    *position += self.rows[*position..].partition_point(|indexed| *indexed < row);
+                    Some((*position, row))
+                })
+                .filter(|(position, row)| self.rows.get(*position) == Some(row))
+                .map(|(position, _)| scored(position))
                 .collect(),
         };
         if nearest.len() > count {
@@ -346,6 +359,46 @@ mod tests {
                 .count();
         }
         assert!(found >= 190, "{found} of 200 true neighbours shortlisted");
+    }
+
+    #[test]
+    fn codes_are_taken_about_the_mean_so_an_offset_shared_by_all_vectors_costs_nothing() {
+        let mut random = Random(9);
+        let centres: Vec<Vec<f32>> = (0..20).map(|_| random.vector(256)).collect();
+        let vectors: Vec<Vec<f32>> = (0..4000)
+            .map(|n| {
+                let noise = random.vector(256);
+                centres[n % 20]
+                    .iter()
+                    .zip(noise)
+                    .map(|(c, e)| 5.0 + c + 0.3 * e)
+                    .collect()
+            })
+            .collect();
+        let index = indexed(&vectors);
+        let mut found = 0;
+        for query in vectors.iter().step_by(200) {
+            let mut exact: Vec<(f32, u32)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (distance(Distance::L2, query, v), row as u32 * 2))
+                .collect();
+            exact.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let shortlist = index.shortlist(query, 160, None, &[]);
+            found += exact[..10]
+                .iter()
+                .filter(|(_, row)| shortlist.contains(row))
+                .count();
+        }
+        assert!(found >= 180, "{found} of 200 true neighbours shortlisted");
+    }
+
+    #[test]
+    fn lengths_that_overflow_or_vanish_give_a_finite_cosine_distance() {
+        for vector in [[1e30f32, 0.0], [1e-30, 0.0], [0.0, 0.0]] {
+            let distance = distance(Distance::Cosine, &vector, &vector);
+            assert!(distance.is_finite(), "{vector:?} gave {distance}");
+        }
     }
 
     #[test]

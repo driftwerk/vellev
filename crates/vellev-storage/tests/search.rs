@@ -2,7 +2,6 @@ mod common;
 
 use common::*;
 use vellev_core::{Object, ObjectError};
-use vellev_index::vector::distance;
 use vellev_storage::{Hit, Query};
 
 const VECTORS: &str = "vectors";
@@ -34,24 +33,26 @@ fn remove(n: u64) -> Mutation {
     }
 }
 
-/// A small deterministic generator of values in -0.5..0.5.
-struct Random(u64);
-
-impl Random {
-    fn unit(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5
-    }
-
-    fn vector(&mut self, dimensions: usize) -> Vec<f32> {
-        (0..dimensions).map(|_| self.unit()).collect()
-    }
-}
-
 fn ids(hits: &[Hit<'_>]) -> Vec<ObjectId> {
     hits.iter().map(|hit| hit.object.id).collect()
+}
+
+/// The distance worked out the long way, so that the search is not checked
+/// against its own arithmetic.
+fn distance(metric: Distance, a: &[f32], b: &[f32]) -> f32 {
+    let sum = |term: fn(f32, f32) -> f32| a.iter().zip(b).map(|(x, y)| term(*x, *y)).sum::<f32>();
+    match metric {
+        Distance::Cosine => {
+            let lengths = (sum(|x, _| x * x) * sum(|_, y| y * y)).sqrt();
+            if lengths > 0.0 {
+                1.0 - sum(|x, y| x * y) / lengths
+            } else {
+                1.0
+            }
+        }
+        Distance::Dot => -sum(|x, y| x * y),
+        Distance::L2 => sum(|x, y| (x - y) * (x - y)),
+    }
 }
 
 /// What a search must return when every row is scored: the live objects
@@ -241,10 +242,11 @@ async fn a_query_the_collection_cannot_answer_is_refused() {
     });
 }
 
-#[tokio::test]
-async fn a_large_segment_is_shortlisted_and_still_honours_filters_deletes_and_newer_layers() {
-    const ROWS: u64 = 30_000;
-    const DIMENSIONS: usize = 128;
+/// A collection of clustered vectors in one flushed segment, with the
+/// queries to ask of it. Groups cut across the clusters, so a filter on the
+/// group leaves every query with near neighbours to find.
+async fn clustered(rows: u64) -> (Cluster, Writer, Vec<Vec<f32>>) {
+    const DIMENSIONS: usize = 64;
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
     let mut random = Random(5);
@@ -257,82 +259,124 @@ async fn a_large_segment_is_shortlisted_and_still_honours_filters_deletes_and_ne
             .map(|(c, e)| c + 0.3 * e)
             .collect()
     };
-    // Groups cut across the clusters, so that a filter on the group leaves
-    // every query with near neighbours to find.
-    let rows: Vec<Mutation> = (0..ROWS)
+    let puts: Vec<Mutation> = (0..rows)
         .map(|n| put(n, (n / 40 % 4) as i64, Some(scattered(n))))
         .collect();
+    let create = collection(DIMENSIONS as u32, Distance::Cosine);
     writer
-        .commit(
-            [collection(DIMENSIONS as u32, Distance::Cosine)]
-                .into_iter()
-                .chain(rows)
-                .collect(),
-        )
+        .commit([create].into_iter().chain(puts).collect())
         .await
         .unwrap();
     writer.flush().await.unwrap();
-    let queries: Vec<Vec<f32>> = (0..20).map(|n| scattered(n * 13)).collect();
+    let queries = (0..20).map(|n| scattered(n * 13)).collect();
+    (cluster, writer, queries)
+}
 
-    let found = |state: &State, filter: Option<&Filter>, keep: &dyn Fn(&Object) -> bool| -> usize {
-        queries
-            .iter()
-            .map(|query| {
-                let asked = Query {
-                    filter,
-                    ..Query::nearest(query, 10)
-                };
-                let hits = state.search(&name(VECTORS), &asked).unwrap();
-                assert!(
-                    hits.iter().all(|hit| keep(hit.object)),
-                    "a hit the filter excludes"
-                );
-                let truth = brute_force(state, Distance::Cosine, query, 10, keep);
-                ids(&hits).iter().filter(|id| truth.contains(id)).count()
-            })
-            .sum()
-    };
-    let everything = |_: &Object| true;
-    let in_group = |object: &Object| object.properties.get("n") == Some(&Value::Int(2));
-    let outside_group = |object: &Object| object.properties.get("n") != Some(&Value::Int(2));
-    let not_group = Filter::Ne {
+/// How many of the true ten nearest each query finds, summed over `queries`.
+fn found(
+    state: &State,
+    queries: &[Vec<f32>],
+    oversample: usize,
+    filter: Option<&Filter>,
+    keep: &dyn Fn(&Object) -> bool,
+) -> usize {
+    queries
+        .iter()
+        .map(|query| {
+            let asked = Query {
+                filter,
+                oversample,
+                ..Query::nearest(query, 10)
+            };
+            let hits = state.search(&name(VECTORS), &asked).unwrap();
+            assert!(
+                hits.iter().all(|hit| keep(hit.object)),
+                "a hit the filter excludes"
+            );
+            let truth = brute_force(state, Distance::Cosine, query, 10, keep);
+            ids(&hits).iter().filter(|id| truth.contains(id)).count()
+        })
+        .sum()
+}
+
+fn in_group_two(object: &Object) -> bool {
+    object.properties.get("n") == Some(&Value::Int(2))
+}
+
+#[tokio::test]
+async fn a_large_segment_is_shortlisted_only_where_many_rows_are_allowed() {
+    let (_cluster, writer, queries) = clustered(12_000).await;
+    let not_two = Filter::Ne {
         property: "n".into(),
         value: json!(2),
     };
-
     writer.partition().read(|state| {
-        let unfiltered = found(state, None, &everything);
+        let everything = found(state, &queries, 64, None, &|_| true);
         assert!(
-            unfiltered >= 190,
-            "{unfiltered} of 200 true neighbours found"
+            everything >= 190,
+            "{everything} of 200 true neighbours found"
+        );
+        let many = found(state, &queries, 64, Some(&not_two), &|object| {
+            !in_group_two(object)
+        });
+        assert!(
+            many >= 190,
+            "{many} of 200 found among the 9,000 rows that pass"
+        );
+
+        // With a shortlist no longer than the answer, only scoring every
+        // row finds all of them: 3,000 rows pass, which is few enough.
+        assert_eq!(
+            found(state, &queries, 1, Some(&group_is(2)), &in_group_two),
+            200
+        );
+        assert!(found(state, &queries, 1, None, &|_| true) < 200);
+        assert_eq!(
+            found(state, &queries, 0, None, &|_| true),
+            found(state, &queries, 1, None, &|_| true)
         );
         let narrow = Query {
-            oversample: 1,
+            oversample: 0,
             ..Query::nearest(&queries[0], 10)
         };
         assert_eq!(state.search(&name(VECTORS), &narrow).unwrap().len(), 10);
-
-        let few = found(state, Some(&group_is(2)), &in_group);
-        assert_eq!(few, 200, "7,500 rows pass, so every one is scored");
-        let many = found(state, Some(&not_group), &outside_group);
-        assert!(
-            many >= 190,
-            "{many} of 200 found among the 22,500 rows that pass"
-        );
     });
+}
 
-    let nearest_to_first = writer.partition().read(|state| {
+#[tokio::test]
+async fn a_large_segment_with_few_rows_left_alive_is_scored_exactly() {
+    let (cluster, writer, queries) = clustered(12_000).await;
+    writer
+        .commit((0..12_000).filter(|n| n % 10 != 0).map(remove).collect())
+        .await
+        .unwrap();
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            assert_eq!(state.count(&name(VECTORS)), 1_200);
+            assert_eq!(found(state, &queries, 1, None, &|_| true), 200);
+        });
+    }
+}
+
+#[tokio::test]
+async fn a_shortlisted_segment_gives_way_to_newer_layers() {
+    let (cluster, writer, queries) = clustered(12_000).await;
+    let query = &queries[0];
+    let nearest = writer.partition().read(|state| {
         ids(&state
-            .search(&name(VECTORS), &Query::nearest(&queries[0], 3))
+            .search(&name(VECTORS), &Query::nearest(query, 3))
             .unwrap())
     });
     let as_number = |id: ObjectId| id.0.as_u128() as u64;
-    let far: Vec<f32> = queries[0].iter().map(|v| -v).collect();
+    let far: Vec<f32> = query.iter().map(|v| -v).collect();
     writer
         .commit(vec![
-            remove(as_number(nearest_to_first[0])),
-            put(as_number(nearest_to_first[1]), 0, Some(far)),
-            put(ROWS + 1, 0, Some(queries[0].clone())),
+            remove(as_number(nearest[0])),
+            put(as_number(nearest[1]), 0, Some(far)),
+            put(99_999, 0, Some(query.clone())),
         ])
         .await
         .unwrap();
@@ -342,15 +386,12 @@ async fn a_large_segment_is_shortlisted_and_still_honours_filters_deletes_and_ne
     ] {
         copy.read(|state| {
             let hits = state
-                .search(&name(VECTORS), &Query::nearest(&queries[0], 3))
+                .search(&name(VECTORS), &Query::nearest(query, 3))
                 .unwrap();
-            assert_eq!(hits[0].object.id, row(ROWS + 1));
+            assert_eq!(hits[0].object.id, row(99_999));
             assert_eq!(hits[0].certainty, Some(1.0));
-            assert_eq!(hits[1].object.id, nearest_to_first[2]);
-            assert!(
-                !ids(&hits).contains(&nearest_to_first[0])
-                    && !ids(&hits).contains(&nearest_to_first[1])
-            );
+            assert_eq!(hits[1].object.id, nearest[2]);
+            assert!(!ids(&hits).contains(&nearest[0]) && !ids(&hits).contains(&nearest[1]));
         });
     }
 }
