@@ -199,10 +199,10 @@ async fn one_commit_embeds_each_object_once_as_it_ends_up() {
             note(1, json!({ "title": "first" }), None),
             patch(1, json!({ "title": "second" }), None),
             patch(1, json!({ "n": 4 }), None),
-        ],
-        vec![
             note(2, json!({ "title": "written then deleted" }), None),
             delete(NOTES, 2),
+        ],
+        vec![
             note(3, json!({ "title": "rejected with its batch" }), None),
             patch(9, json!({ "n": 1 }), None),
         ],
@@ -290,10 +290,12 @@ async fn a_commit_that_cannot_be_embedded_changes_nothing_and_the_writer_carries
 async fn a_writer_with_nothing_to_embed_with_refuses_only_what_needs_it() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
+    let mut plain = schema("plain");
+    plain.embedding.properties = vec!["title".into()];
     writer
         .commit(vec![
             embedding_notes(),
-            create("plain"),
+            Mutation::CreateCollection(Box::new(plain)),
             upsert("plain", 1, 1),
             note(1, json!({ "title": "supplied" }), Some(vec![1.0, 2.0])),
             note(2, json!({ "n": 2 }), None),
