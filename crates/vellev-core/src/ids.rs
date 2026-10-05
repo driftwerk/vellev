@@ -100,6 +100,34 @@ impl Partition {
     pub const DEFAULT: Partition = Partition(0);
 }
 
+/// Identifies one running node for the lifetime of its process. A restarted
+/// node gets a new id, so a lease it held before is never mistaken for its own.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeId(String);
+
+impl NodeId {
+    pub fn generate(host: &str) -> Self {
+        Self(format!("{host}-{}", Uuid::new_v4().simple()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for NodeId {
+    fn from(id: String) -> Self {
+        Self(id)
+    }
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Supplied by the client or generated, so ids from an imported store survive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]

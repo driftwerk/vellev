@@ -6,3 +6,15 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+vellev-core.workspace = true
+
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
