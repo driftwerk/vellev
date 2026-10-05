@@ -10,11 +10,13 @@ pub mod format;
 mod group;
 mod mutation;
 mod partition;
+mod search;
 mod state;
 
 pub use error::{Result, StorageError};
 pub use group::GroupCommitter;
 pub use mutation::{Condition, Mutation, Outcome, Receipt};
 pub use partition::{Follower, Partition, Writer};
+pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::State;
 pub use vellev_index::filter::{Filter, FilterError};

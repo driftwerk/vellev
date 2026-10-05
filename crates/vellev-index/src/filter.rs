@@ -372,6 +372,11 @@ pub struct RowIndex {
 }
 
 impl RowIndex {
+    /// Every row recorded.
+    pub fn rows(&self) -> &RoaringBitmap {
+        &self.rows
+    }
+
     /// Record `object` as row `row`, indexing its filterable properties.
     pub fn insert(&mut self, collection: &Collection, row: u32, object: &Object) {
         self.rows.insert(row);
