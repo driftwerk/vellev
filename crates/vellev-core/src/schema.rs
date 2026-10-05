@@ -101,7 +101,18 @@ impl Property {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What an embedding endpoint speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpApi {
+    /// A text-embeddings-inference server's `/embed`.
+    #[default]
+    Tei,
+    /// An OpenAI-compatible `/v1/embeddings`.
+    Openai,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum EmbeddingProvider {
     /// A model run in the node's own process.
@@ -109,15 +120,16 @@ pub enum EmbeddingProvider {
     Bedrock {
         region: String,
     },
-    /// A TEI or OpenAI-compatible endpoint.
     Http {
         url: String,
+        #[serde(default)]
+        api: HttpApi,
     },
     /// The client supplies every vector.
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Embedding {
     #[serde(flatten)]
     pub provider: EmbeddingProvider,

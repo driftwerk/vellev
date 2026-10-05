@@ -327,7 +327,8 @@ mod tests {
     #[test]
     fn every_embedding_provider_survives_the_file_format() {
         use vellev_core::{
-            Bm25, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, Property,
+            Bm25, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, HttpApi,
+            Property,
         };
         let providers = [
             EmbeddingProvider::Local,
@@ -336,6 +337,11 @@ mod tests {
             },
             EmbeddingProvider::Http {
                 url: "http://embeddings:80".into(),
+                api: HttpApi::Tei,
+            },
+            EmbeddingProvider::Http {
+                url: "https://api.example.test".into(),
+                api: HttpApi::Openai,
             },
             EmbeddingProvider::None,
         ];

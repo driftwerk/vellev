@@ -1,7 +1,9 @@
 name: Nightly
 
 # The simulation and the storage property test at a far higher case count
-# than the per-commit run, to reach histories the short run does not.
+# than the per-commit run, to reach histories the short run does not, and a
+# look for dependencies with newly reported faults, which would otherwise
+# fail unrelated commits.
 on:
   schedule:
     - cron: '17 2 * * *'
@@ -38,3 +40,12 @@ jobs:
           name: proptest-regressions
           path: crates/vellev-storage/tests/*.proptest-regressions
           if-no-files-found: ignore
+
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

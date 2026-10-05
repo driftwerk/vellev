@@ -7,6 +7,6 @@ mod schema;
 pub use ids::{CollectionName, IdError, NodeId, ObjectId, Partition, TenantId};
 pub use object::{Object, ObjectError, Value};
 pub use schema::{
-    AccessRule, Bm25, Collection, DataType, Distance, Embedding, EmbeddingProvider, Property,
-    SchemaError, MAX_DIMENSIONS,
+    AccessRule, Bm25, Collection, DataType, Distance, Embedding, EmbeddingProvider, HttpApi,
+    Property, SchemaError, MAX_DIMENSIONS,
 };
