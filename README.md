@@ -26,5 +26,18 @@ cargo run -p vellev -- serve --listen 127.0.0.1:8080
 cargo run -p vellev -- health --url http://127.0.0.1:8080
 ```
 
+## Simulation
+
+`crates/vellev-storage/tests/simulation.rs` drives random histories of writes,
+checkpoints, takeovers and catch-ups with faults injected into the store and
+the coordinator, and checks after every step that nothing acknowledged is
+lost and nothing unrecorded is visible. A failure prints the shortest history
+that reproduces it.
+
+```sh
+cargo test -p vellev-storage --test simulation
+PROPTEST_CASES=20000 cargo test --release -p vellev-storage --test simulation   # as the nightly run does
+```
+
 CI runs `cargo fmt --check`, `cargo clippy -D warnings`, the tests, a licence
 check (`cargo deny check`, config in `deny.toml`) and an image build.
