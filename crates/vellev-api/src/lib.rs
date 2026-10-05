@@ -10,6 +10,11 @@ use vellev_index::fusion::Fusion;
 /// The path every versioned route starts with.
 pub const ROOT: &str = "/v1";
 
+/// A request header naming the position a tenant's data must have reached
+/// before the request is answered: what a write of the caller's own
+/// answered with. A node that is not there yet answers `unavailable`.
+pub const MIN_POSITION: &str = "x-vellev-min-position";
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -202,6 +207,24 @@ pub enum Change {
         collection: CollectionName,
         filter: Filter,
     },
+}
+
+impl Change {
+    /// Whether making the change twice leaves what making it once does, so
+    /// that it can be sent again when nobody knows if it arrived.
+    pub fn is_repeatable(&self) -> bool {
+        match self {
+            Self::Insert { .. } | Self::Increment { .. } => false,
+            Self::Append { unique, .. } => *unique,
+            Self::Patch { only_if, .. } => only_if.is_none(),
+            Self::CreateCollection { .. }
+            | Self::AddProperty { .. }
+            | Self::DropCollection { .. }
+            | Self::Upsert { .. }
+            | Self::Delete { .. }
+            | Self::DeleteWhere { .. } => true,
+        }
+    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
