@@ -586,6 +586,19 @@ async fn a_failing_embedder_is_asked_once_a_commit_and_only_the_batch_that_needs
     assert_eq!(lengths.calls.load(Ordering::SeqCst), 1);
     assert_eq!(vector(&writer, 1), Some(vector_of("fox")));
     assert_eq!(n_of_note(&writer, 1), 2);
+
+    lengths.calls.store(0, Ordering::SeqCst);
+    let rewritten = |title: &str| vec![patch(1, json!({ "title": title }), None)];
+    let chained = vec![rewritten("first"), rewritten("second"), rewritten("third")];
+    let results = writer.commit_group(chained).await.unwrap();
+    assert!(results
+        .iter()
+        .all(|result| matches!(result, Err(StorageError::Embedding { .. }))));
+    assert_eq!(
+        lengths.calls.load(Ordering::SeqCst),
+        1,
+        "one call, though three rounds"
+    );
 }
 
 fn n_of_note(writer: &Writer, object: u8) -> i64 {
