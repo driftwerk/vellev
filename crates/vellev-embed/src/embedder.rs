@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::OnceCell;
-use vellev_core::{Embedding, Object, Value};
+use vellev_core::Embedding;
 
 use crate::{EmbedError, Provider, Purpose, Result};
 
@@ -11,23 +11,6 @@ use crate::{EmbedError, Provider, Purpose, Result};
 const QUERY_CACHE: usize = 1_024;
 /// Queries longer than this, in bytes, are not kept.
 const LONGEST_KEPT: usize = 1_024;
-
-/// The text of `object` that its collection embeds: the listed properties'
-/// values, in order, a line each.
-pub fn document(embedding: &Embedding, object: &Object) -> String {
-    embedding
-        .properties
-        .iter()
-        .filter_map(|name| object.properties.get(name))
-        .flat_map(|value| match value {
-            Value::Text(text) => std::slice::from_ref(text),
-            Value::TextArray(texts) => texts.as_slice(),
-            _ => &[],
-        })
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 type Kept = Arc<OnceCell<Option<Vec<f32>>>>;
 

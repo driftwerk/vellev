@@ -11,9 +11,10 @@ use crate::blobs::{is_plain, Author, Blobs, Layout};
 use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
 };
-use crate::draft::Draft;
+use crate::draft::{Draft, Wanted};
+use crate::format::Op;
 use crate::format::{decode, decode_head, encode, Head, Kind, LogSegment, Manifest};
-use crate::mutation::{Mutation, Receipt};
+use crate::mutation::{Mutation, Receipt, Vectorize};
 use crate::state::{Loaded, State};
 use crate::{Result, StorageError};
 
@@ -236,6 +237,7 @@ pub struct Writer {
     coordinator: Arc<dyn Coordinator>,
     lease: Lease,
     author: Author,
+    vectorize: Option<Arc<dyn Vectorize>>,
     ready: Mutex<bool>,
 }
 
@@ -258,8 +260,18 @@ impl Writer {
             coordinator,
             lease,
             author,
+            vectorize: None,
             ready: Mutex::new(true),
         })
+    }
+
+    /// Embed with `vectorize` for the collections that embed their own
+    /// objects. Without it, a write that needs a vector made is refused.
+    pub fn embedding_with(self, vectorize: Arc<dyn Vectorize>) -> Self {
+        Self {
+            vectorize: Some(vectorize),
+            ..self
+        }
     }
 
     pub fn partition(&self) -> &Arc<Partition> {
@@ -292,14 +304,15 @@ impl Writer {
         if !*ready {
             return Err(StorageError::Closed);
         }
-        let ((position, prev), outcomes, ops) = self.partition.read(|state| {
+        let ((position, prev), outcomes, (ops, wanted)) = self.partition.read(|state| {
             let mut draft = Draft::new(state);
             let outcomes: Vec<_> = batches
                 .into_iter()
                 .map(|batch| draft.batch(batch))
                 .collect();
-            (state.at(), outcomes, draft.into_ops())
+            (state.at(), outcomes, draft.finish())
         });
+        let ops = self.embedded(ops, wanted).await?;
         let position = if ops.is_empty() {
             position
         } else {
@@ -371,6 +384,56 @@ impl Writer {
         })
         .await?;
         Ok(position)
+    }
+
+    /// `ops` with a vector made for each object that is `wanted` one. The
+    /// writer is held meanwhile, so that no other write can change the
+    /// text a vector is being made for.
+    async fn embedded(&self, mut ops: Vec<Op>, wanted: Vec<Wanted>) -> Result<Vec<Op>> {
+        let mut alike: HashMap<_, Vec<(usize, String)>> = HashMap::new();
+        for Wanted {
+            op,
+            embedding,
+            text,
+        } in wanted
+        {
+            alike.entry(embedding).or_default().push((op, text));
+        }
+        for (embedding, texts) in alike {
+            let failed = |reason: String| StorageError::Embedding {
+                model: embedding.model.clone(),
+                reason,
+            };
+            let vectorize = self
+                .vectorize
+                .as_ref()
+                .ok_or_else(|| failed("this writer has nothing to embed with".into()))?;
+            let (at, texts): (Vec<usize>, Vec<String>) = texts.into_iter().unzip();
+            let vectors = vectorize.vectors(&embedding, texts).await.map_err(failed)?;
+            if vectors.len() != at.len() {
+                return Err(failed(format!(
+                    "{} vectors for {} texts",
+                    vectors.len(),
+                    at.len()
+                )));
+            }
+            for (at, vector) in at.into_iter().zip(vectors) {
+                let fits = vector.as_ref().is_none_or(|vector| {
+                    vector.len() == embedding.dimensions as usize
+                        && vector.iter().all(|value| value.is_finite())
+                });
+                if !fits {
+                    return Err(failed(format!(
+                        "a vector that is not {} finite numbers",
+                        embedding.dimensions
+                    )));
+                }
+                if let Op::Upsert { object, .. } = &mut ops[at] {
+                    object.vector = vector;
+                }
+            }
+        }
+        Ok(ops)
     }
 
     async fn publish(&self, key: &str, frame: Bytes, position: LogPosition) -> Result<()> {

@@ -19,7 +19,7 @@ pub use error::{Result, StorageError};
 pub use group::GroupCommitter;
 pub use hybrid::{Fused, Hybrid, DEFAULT_ALPHA, DEFAULT_CANDIDATES};
 pub use keyword::{Keywords, Scored, MAX_WEIGHT};
-pub use mutation::{Condition, Mutation, Outcome, Receipt};
+pub use mutation::{Condition, Mutation, Outcome, Receipt, Vectorize};
 pub use partition::{Follower, Partition, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::State;

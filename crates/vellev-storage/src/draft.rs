@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use vellev_core::{Collection, CollectionName, DataType, Object, ObjectError, ObjectId, Value};
+use vellev_core::{
+    Collection, CollectionName, DataType, Embedding, EmbeddingProvider, Object, ObjectError,
+    ObjectId, Value,
+};
 
 use vellev_index::filter::Predicate;
 
@@ -23,11 +26,21 @@ pub(crate) struct Draft<'a> {
 }
 
 /// What has been resolved so far: the catalog as it will be, the rows that
-/// will be written (`None` for a delete), and the ops in order.
+/// will be written (`None` for a delete), whether each is still without the
+/// vector its text calls for, and the ops in order.
 struct Pending {
     catalog: Catalog,
     rows: HashMap<RowKey, Option<Object>>,
+    wanting: HashMap<RowKey, bool>,
     ops: Vec<Op>,
+}
+
+/// An object a commit writes without the vector its collection embeds for
+/// it: the op that writes it, and what to embed.
+pub(crate) struct Wanted {
+    pub op: usize,
+    pub embedding: Embedding,
+    pub text: String,
 }
 
 /// One batch being resolved on top of a draft, kept apart until it is known
@@ -36,6 +49,7 @@ struct Batch<'a> {
     draft: &'a Draft<'a>,
     catalog: Catalog,
     rows: HashMap<RowKey, Option<Object>>,
+    wanting: HashMap<RowKey, bool>,
     ops: Vec<Op>,
 }
 
@@ -44,6 +58,7 @@ impl<'a> Draft<'a> {
         let pending = Pending {
             catalog: state.catalog().clone(),
             rows: HashMap::new(),
+            wanting: HashMap::new(),
             ops: vec![],
         };
         Self { state, pending }
@@ -56,6 +71,7 @@ impl<'a> Draft<'a> {
             draft: self,
             catalog: self.pending.catalog.clone(),
             rows: HashMap::new(),
+            wanting: HashMap::new(),
             ops: vec![],
         };
         let outcomes = mutations
@@ -63,16 +79,54 @@ impl<'a> Draft<'a> {
             .map(|m| batch.resolve(m))
             .collect::<Result<Vec<_>>>()?;
         let Batch {
-            catalog, rows, ops, ..
+            catalog,
+            rows,
+            wanting,
+            ops,
+            ..
         } = batch;
         self.pending.catalog = catalog;
         self.pending.rows.extend(rows);
+        self.pending.wanting.extend(wanting);
         self.pending.ops.extend(ops);
         Ok(outcomes)
     }
 
-    pub fn into_ops(self) -> Vec<Op> {
-        self.pending.ops
+    /// The ops to log, and the objects among them still to be given a
+    /// vector, each named by the last op that writes it.
+    pub fn finish(self) -> (Vec<Op>, Vec<Wanted>) {
+        let Pending {
+            catalog,
+            wanting,
+            ops,
+            ..
+        } = self.pending;
+        let last_written: HashMap<RowKey, usize> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(at, op)| match op {
+                Op::Upsert { collection, object } => Some(((*collection, object.id), at)),
+                _ => None,
+            })
+            .collect();
+        let mut wanted: Vec<Wanted> = wanting
+            .into_iter()
+            .filter(|(_, wanting)| *wanting)
+            .filter_map(|(key, _)| {
+                let op = *last_written.get(&key)?;
+                let embedding = &catalog.schema(key.0)?.embedding;
+                let Op::Upsert { object, .. } = &ops[op] else {
+                    return None;
+                };
+                Some(Wanted {
+                    op,
+                    embedding: embedding.clone(),
+                    text: object.embedded_text(embedding),
+                })
+            })
+            .collect();
+        wanted.sort_unstable_by_key(|wanted| wanted.op);
+        (ops, wanted)
     }
 }
 
@@ -107,12 +161,52 @@ impl Batch<'_> {
             })
     }
 
+    fn wants(&self, key: RowKey) -> bool {
+        self.wanting
+            .get(&key)
+            .or_else(|| self.draft.pending.wanting.get(&key))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// Write `next` under its key, unless that is what is stored already.
-    fn write(&mut self, collection: CollectionId, next: Object) -> Outcome {
-        if self.row((collection, next.id)) == Some(&next) {
+    ///
+    /// Where the collection embeds its own objects and the caller
+    /// `supplied` no vector, the vector follows the text: kept while the
+    /// embedded text is what is stored, and otherwise dropped, to be made
+    /// before the commit is logged.
+    fn write(
+        &mut self,
+        collection: CollectionId,
+        schema: &Collection,
+        mut next: Object,
+        supplied: bool,
+    ) -> Outcome {
+        let key = (collection, next.id);
+        let embedding = &schema.embedding;
+        let wanting = if supplied || embedding.provider == EmbeddingProvider::None {
+            false
+        } else {
+            let text = next.embedded_text(embedding);
+            let unchanged = self
+                .row(key)
+                .filter(|stored| stored.embedded_text(embedding) == text);
+            match unchanged {
+                Some(stored) => {
+                    next.vector = stored.vector.clone();
+                    self.wants(key)
+                }
+                None => {
+                    next.vector = None;
+                    !text.trim().is_empty()
+                }
+            }
+        };
+        if self.row(key) == Some(&next) {
             return Outcome::Unchanged;
         }
-        self.rows.insert((collection, next.id), Some(next.clone()));
+        self.wanting.insert(key, wanting);
+        self.rows.insert(key, Some(next.clone()));
         self.ops.push(Op::Upsert {
             collection,
             object: next,
@@ -149,7 +243,9 @@ impl Batch<'_> {
                 vector,
             } => {
                 let (cid, schema) = self.collection(&collection)?;
-                Ok(self.write(cid, Object::from_json(&schema, id, &properties, vector)?))
+                let supplied = vector.is_some();
+                let object = Object::from_json(&schema, id, &properties, vector)?;
+                Ok(self.write(cid, &schema, object, supplied))
             }
             Mutation::Insert {
                 collection,
@@ -161,7 +257,9 @@ impl Batch<'_> {
                 if self.row((cid, id)).is_some() {
                     return Err(StorageError::ObjectExists { collection, id });
                 }
-                Ok(self.write(cid, Object::from_json(&schema, id, &properties, vector)?))
+                let supplied = vector.is_some();
+                let object = Object::from_json(&schema, id, &properties, vector)?;
+                Ok(self.write(cid, &schema, object, supplied))
             }
             Mutation::Patch {
                 collection,
@@ -182,7 +280,9 @@ impl Batch<'_> {
                         });
                     }
                 }
-                Ok(self.write(cid, stored.patched(&schema, &properties, vector)?))
+                let supplied = vector.is_some();
+                let patched = stored.patched(&schema, &properties, vector)?;
+                Ok(self.write(cid, &schema, patched, supplied))
             }
             Mutation::Increment {
                 collection,
@@ -195,7 +295,7 @@ impl Batch<'_> {
                 let value = incremented(&schema, &object, &property, by)?;
                 if by != 0.0 {
                     object.properties.insert(property, value.clone());
-                    self.write(cid, object);
+                    self.write(cid, &schema, object, false);
                 }
                 Ok(Outcome::Value(value))
             }
@@ -214,7 +314,7 @@ impl Batch<'_> {
                 object
                     .properties
                     .insert(property, Value::TextArray(appended));
-                Ok(self.write(cid, object))
+                Ok(self.write(cid, &schema, object, false))
             }
             Mutation::Delete { collection, id } => {
                 let (cid, _) = self.collection(&collection)?;
@@ -240,6 +340,7 @@ impl Batch<'_> {
     }
 
     fn delete(&mut self, collection: CollectionId, id: ObjectId) {
+        self.wanting.insert((collection, id), false);
         self.rows.insert((collection, id), None);
         self.ops.push(Op::Delete { collection, id });
     }
