@@ -8,6 +8,7 @@ mod error;
 #[doc(hidden)]
 pub mod format;
 mod group;
+mod keyword;
 mod mutation;
 mod partition;
 mod search;
@@ -15,6 +16,7 @@ mod state;
 
 pub use error::{Result, StorageError};
 pub use group::GroupCommitter;
+pub use keyword::{Keywords, Scored};
 pub use mutation::{Condition, Mutation, Outcome, Receipt};
 pub use partition::{Follower, Partition, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
