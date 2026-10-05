@@ -3,13 +3,17 @@
 pub mod blobs;
 mod catalog;
 pub mod coordinator;
+mod draft;
 mod error;
 #[doc(hidden)]
 pub mod format;
+mod group;
+mod mutation;
 mod partition;
 mod state;
 
-pub use catalog::Mutation;
 pub use error::{Result, StorageError};
+pub use group::GroupCommitter;
+pub use mutation::{Condition, Mutation, Outcome, Receipt};
 pub use partition::{Follower, Partition, Writer};
 pub use state::State;

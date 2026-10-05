@@ -65,6 +65,28 @@ impl Value {
         })
     }
 
+    /// Read `json` as the type `collection` declares for `property`; JSON
+    /// null is no value.
+    pub fn typed(
+        collection: &Collection,
+        property: &str,
+        json: &Json,
+    ) -> Result<Option<Value>, ObjectError> {
+        let expected = collection
+            .property(property)
+            .ok_or_else(|| ObjectError::UnknownProperty(property.to_string()))?
+            .data_type;
+        if json.is_null() {
+            return Ok(None);
+        }
+        Value::from_json(expected, json)
+            .map(Some)
+            .ok_or_else(|| ObjectError::Type {
+                property: property.to_string(),
+                expected,
+            })
+    }
+
     pub fn to_json(&self) -> Json {
         match self {
             Value::Text(s) => Json::from(s.as_str()),
@@ -75,6 +97,20 @@ impl Value {
             Value::Date(d) => Json::from(d.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
         }
     }
+}
+
+fn checked_vector(collection: &Collection, vector: Vec<f32>) -> Result<Vec<f32>, ObjectError> {
+    let expected = collection.embedding.dimensions;
+    if vector.len() != expected as usize {
+        return Err(ObjectError::VectorLength {
+            expected,
+            got: vector.len(),
+        });
+    }
+    if !vector.iter().all(|v| v.is_finite()) {
+        return Err(ObjectError::VectorNotFinite);
+    }
+    Ok(vector)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,36 +167,40 @@ impl Object {
         properties: &serde_json::Map<String, Json>,
         vector: Option<Vec<f32>>,
     ) -> Result<Object, ObjectError> {
-        let mut typed = BTreeMap::new();
-        for (name, json) in properties {
-            let property = collection
-                .property(name)
-                .ok_or_else(|| ObjectError::UnknownProperty(name.clone()))?;
-            if json.is_null() {
-                continue;
-            }
-            let value =
-                Value::from_json(property.data_type, json).ok_or_else(|| ObjectError::Type {
-                    property: name.clone(),
-                    expected: property.data_type,
-                })?;
-            typed.insert(name.clone(), value);
-        }
-        if let Some(vector) = &vector {
-            let expected = collection.embedding.dimensions;
-            if vector.len() != expected as usize {
-                return Err(ObjectError::VectorLength {
-                    expected,
-                    got: vector.len(),
-                });
-            }
-            if !vector.iter().all(|v| v.is_finite()) {
-                return Err(ObjectError::VectorNotFinite);
-            }
-        }
-        Ok(Object {
+        Object {
             id,
-            properties: typed,
+            properties: BTreeMap::new(),
+            vector: None,
+        }
+        .patched(collection, properties, vector)
+    }
+
+    /// This object with `properties` merged in: a property sent as JSON null
+    /// is removed, any other replaces the stored value. `vector` replaces the
+    /// stored vector when given.
+    pub fn patched(
+        &self,
+        collection: &Collection,
+        properties: &serde_json::Map<String, Json>,
+        vector: Option<Vec<f32>>,
+    ) -> Result<Object, ObjectError> {
+        let merged =
+            properties
+                .iter()
+                .try_fold(self.properties.clone(), |mut merged, (name, json)| {
+                    match Value::typed(collection, name, json)? {
+                        Some(value) => merged.insert(name.clone(), value),
+                        None => merged.remove(name),
+                    };
+                    Ok(merged)
+                })?;
+        let vector = match vector {
+            Some(vector) => Some(checked_vector(collection, vector)?),
+            None => self.vector.clone(),
+        };
+        Ok(Object {
+            id: self.id,
+            properties: merged,
             vector,
         })
     }
@@ -285,6 +325,58 @@ mod tests {
         assert_eq!(
             parse(json!({}), Some(vector)),
             Err(ObjectError::VectorNotFinite)
+        );
+    }
+
+    #[test]
+    fn a_patch_merges_removes_and_keeps_what_it_does_not_mention() {
+        let original = parse(
+            json!({ "content": "v1", "importance": 0.5, "tags": ["a"] }),
+            Some(vec![0.25; 768]),
+        )
+        .unwrap();
+        let patch = json!({ "content": "v2", "importance": null, "deleted": true });
+        let patched = original
+            .patched(&workforce_memory(), patch.as_object().unwrap(), None)
+            .unwrap();
+        assert_eq!(patched.id, original.id);
+        assert_eq!(patched.properties["content"], Value::Text("v2".into()));
+        assert_eq!(patched.properties["deleted"], Value::Bool(true));
+        assert_eq!(
+            patched.properties["tags"],
+            Value::TextArray(vec!["a".into()])
+        );
+        assert!(!patched.properties.contains_key("importance"));
+        assert_eq!(patched.vector, original.vector);
+
+        let revectored = original
+            .patched(
+                &workforce_memory(),
+                &serde_json::Map::new(),
+                Some(vec![1.0; 768]),
+            )
+            .unwrap();
+        assert_eq!(revectored.vector, Some(vec![1.0; 768]));
+        assert_eq!(revectored.properties, original.properties);
+
+        let wrong = json!({ "importance": "high" });
+        assert_eq!(
+            original.patched(&workforce_memory(), wrong.as_object().unwrap(), None),
+            Err(ObjectError::Type {
+                property: "importance".into(),
+                expected: DataType::Number
+            })
+        );
+        assert_eq!(
+            original.patched(
+                &workforce_memory(),
+                &serde_json::Map::new(),
+                Some(vec![0.0; 3])
+            ),
+            Err(ObjectError::VectorLength {
+                expected: 768,
+                got: 3
+            })
         );
     }
 }

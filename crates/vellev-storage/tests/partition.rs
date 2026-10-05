@@ -1,207 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+mod common;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use chrono::{TimeZone, Utc};
-use object_store::memory::InMemory;
-use proptest::prelude::*;
-use serde_json::json;
-use vellev_core::{
-    Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, NodeId,
-    ObjectId, Partition as PartitionNumber, Property, TenantId, Value,
-};
-use vellev_storage::blobs::{Author, Blobs, CachedBlobs, Layout, ObjectBlobs};
-use vellev_storage::coordinator::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
-    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey,
-};
-use vellev_storage::format::{
-    self, CollectionId, Kind, LogSegment, Manifest, Row, SegmentFile, SegmentMeta,
-};
-use vellev_storage::{Follower, Mutation, State, StorageError, Writer};
-
-const TTL: Duration = Duration::from_secs(30);
-
-fn name(collection: &str) -> CollectionName {
-    CollectionName::new(collection).unwrap()
-}
-
-fn id(n: u8) -> ObjectId {
-    ObjectId(uuid::Uuid::from_u128(u128::from(n)))
-}
-
-fn schema(collection: &str) -> Collection {
-    Collection {
-        name: name(collection),
-        properties: vec![
-            Property::new("title", DataType::Text).searchable(),
-            Property::new("n", DataType::Int),
-        ],
-        embedding: Embedding {
-            provider: EmbeddingProvider::None,
-            model: "test".into(),
-            dimensions: 2,
-            query_prefix: None,
-            document_prefix: None,
-            properties: vec![],
-        },
-        distance: Distance::Cosine,
-        bm25: Bm25::default(),
-        access_rule: None,
-    }
-}
-
-fn create(collection: &str) -> Mutation {
-    Mutation::CreateCollection(Box::new(schema(collection)))
-}
-
-fn upsert(collection: &str, object: u8, n: i64) -> Mutation {
-    Mutation::Upsert {
-        collection: name(collection),
-        id: id(object),
-        properties: json!({ "title": format!("row {object}"), "n": n })
-            .as_object()
-            .unwrap()
-            .clone(),
-        vector: Some(vec![n as f32, 0.5]),
-    }
-}
-
-fn delete(collection: &str, object: u8) -> Mutation {
-    Mutation::Delete {
-        collection: name(collection),
-        id: id(object),
-    }
-}
-
-fn n_of(state: &State, collection: &str, object: u8) -> Option<i64> {
-    state
-        .get(&name(collection), id(object))
-        .map(|object| match object.properties["n"] {
-            Value::Int(n) => n,
-            ref other => panic!("{other:?}"),
-        })
-}
-
-#[derive(Debug)]
-struct Observed {
-    inner: Arc<dyn Blobs>,
-    gets: Mutex<Vec<String>>,
-    fail_puts: AtomicBool,
-}
-
-impl Observed {
-    fn fetched(&self) -> Vec<String> {
-        std::mem::take(&mut self.gets.lock().unwrap())
-    }
-}
-
-#[async_trait]
-impl Blobs for Observed {
-    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
-        if self.fail_puts.load(Ordering::SeqCst) {
-            return Err(StorageError::Blob {
-                key: key.into(),
-                source: "connection reset".into(),
-            });
-        }
-        self.inner.put(key, bytes).await
-    }
-    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
-        self.gets.lock().unwrap().push(key.to_string());
-        self.inner.get(key).await
-    }
-}
-
-/// One partition's shared infrastructure: object storage and a coordinator.
-struct Cluster {
-    key: PartitionKey,
-    blobs: Arc<dyn Blobs>,
-    clock: Arc<ManualClock>,
-    coordinator: Arc<MemoryCoordinator>,
-}
-
-impl Cluster {
-    async fn new() -> Self {
-        let clock = Arc::new(ManualClock::starting_at(
-            Utc.with_ymd_and_hms(2026, 10, 5, 9, 0, 0).unwrap(),
-        ));
-        let coordinator = Arc::new(MemoryCoordinator::new(clock.clone()));
-        let key = PartitionKey {
-            tenant: TenantId::new("tenant-a").unwrap(),
-            partition: PartitionNumber::DEFAULT,
-        };
-        coordinator.register(&key).await.unwrap();
-        Self {
-            key,
-            blobs: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new()))),
-            clock,
-            coordinator,
-        }
-    }
-
-    async fn committed(&self) -> Committed {
-        self.coordinator
-            .committed(&self.key)
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    /// A new node takes the lease, waiting out whoever holds it.
-    async fn lease(&self) -> (Lease, Committed) {
-        let holder = NodeId::generate("node");
-        if let Acquired::Lease { lease, committed } = self
-            .coordinator
-            .acquire(&self.key, &holder, TTL)
-            .await
-            .unwrap()
-        {
-            return (lease, committed);
-        }
-        self.clock.advance(TTL);
-        match self
-            .coordinator
-            .acquire(&self.key, &holder, TTL)
-            .await
-            .unwrap()
-        {
-            Acquired::Lease { lease, committed } => (lease, committed),
-            held => panic!("{held:?}"),
-        }
-    }
-
-    async fn writer(&self) -> Writer {
-        self.writer_on(self.coordinator.clone()).await
-    }
-
-    async fn writer_on(&self, coordinator: Arc<dyn Coordinator>) -> Writer {
-        let (lease, committed) = self.lease().await;
-        Writer::open(self.blobs.clone(), coordinator, lease, &committed)
-            .await
-            .unwrap()
-    }
-
-    async fn open(&self) -> Follower {
-        self.open_on(self.blobs.clone()).await.unwrap()
-    }
-
-    async fn open_on(&self, blobs: Arc<dyn Blobs>) -> vellev_storage::Result<Follower> {
-        Follower::open(self.key.clone(), blobs, &self.committed().await).await
-    }
-
-    /// The store wrapped so that reads are recorded and writes can be failed.
-    fn observed(&self) -> Arc<Observed> {
-        Arc::new(Observed {
-            inner: self.blobs.clone(),
-            gets: Mutex::default(),
-            fail_puts: AtomicBool::new(false),
-        })
-    }
-}
+use common::*;
 
 #[tokio::test]
 async fn data_survives_a_restart_with_nothing_held_locally() {
@@ -219,7 +18,8 @@ async fn data_survives_a_restart_with_nothing_held_locally() {
     let position = writer
         .commit(vec![upsert("notes", 2, 21), upsert("notes", 3, 30)])
         .await
-        .unwrap();
+        .unwrap()
+        .position;
     drop(writer);
 
     let reopened = cluster.open().await;
@@ -244,7 +44,8 @@ async fn a_rejected_mutation_fails_the_whole_batch_and_changes_nothing() {
     let position = writer
         .commit(vec![create("notes"), upsert("notes", 1, 1)])
         .await
-        .unwrap();
+        .unwrap()
+        .position;
 
     let bad_type = Mutation::Upsert {
         collection: name("notes"),
@@ -287,7 +88,11 @@ async fn a_rejected_mutation_fails_the_whole_batch_and_changes_nothing() {
         assert_eq!(state.count(&name("notes")), 1);
     });
     assert_eq!(
-        writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap(),
+        writer
+            .commit(vec![upsert("notes", 2, 2)])
+            .await
+            .unwrap()
+            .position,
         LogPosition(position.0 + 1)
     );
 }
@@ -297,15 +102,21 @@ async fn a_commit_or_flush_with_nothing_to_do_writes_nothing() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
     assert_eq!(writer.flush().await.unwrap(), LogPosition(0));
-    assert_eq!(writer.commit(vec![]).await.unwrap(), LogPosition(0));
+    assert_eq!(
+        writer.commit(vec![]).await.unwrap().position,
+        LogPosition(0)
+    );
     assert_eq!(cluster.committed().await.manifest, None);
 
-    let position = writer.commit(vec![create("notes")]).await.unwrap();
+    let position = writer.commit(vec![create("notes")]).await.unwrap().position;
     let unchanged = Mutation::AddProperty {
         collection: name("notes"),
         property: Property::new("n", DataType::Int),
     };
-    assert_eq!(writer.commit(vec![unchanged]).await.unwrap(), position);
+    assert_eq!(
+        writer.commit(vec![unchanged]).await.unwrap().position,
+        position
+    );
     let flushed = writer.flush().await.unwrap();
     let head = cluster.committed().await;
     assert_eq!(writer.flush().await.unwrap(), flushed);
@@ -435,7 +246,11 @@ async fn a_follower_catches_up_across_commits_and_checkpoints() {
     writer.flush().await.unwrap();
     writer.commit(vec![delete("notes", 1)]).await.unwrap();
     writer.flush().await.unwrap();
-    let position = writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
+    let position = writer
+        .commit(vec![upsert("notes", 3, 3)])
+        .await
+        .unwrap()
+        .position;
     assert_eq!(
         follower.catch_up(&cluster.committed().await).await.unwrap(),
         position
@@ -482,7 +297,11 @@ async fn a_fenced_writer_changes_nothing_and_its_file_is_never_read() {
         .partition()
         .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
 
-    let position = successor.commit(vec![upsert("notes", 4, 4)]).await.unwrap();
+    let position = successor
+        .commit(vec![upsert("notes", 4, 4)])
+        .await
+        .unwrap()
+        .position;
     cluster.open().await.partition().read(|state| {
         assert_eq!(state.position(), position);
         assert_eq!(n_of(state, "notes", 1), Some(100));
@@ -567,7 +386,8 @@ async fn a_lost_commit_response_is_retried_and_an_unknown_outcome_closes_the_wri
     let position = writer
         .commit(vec![create("notes"), upsert("notes", 1, 1)])
         .await
-        .unwrap();
+        .unwrap()
+        .position;
     assert_eq!(cluster.committed().await.log_position, position);
     writer
         .partition()
@@ -698,7 +518,11 @@ async fn an_orphan_at_a_committed_position_is_never_read() {
     let stalled = cluster.writer().await;
     stalled.commit(vec![create("notes")]).await.unwrap();
     let successor = cluster.writer().await;
-    let position = successor.commit(vec![upsert("notes", 1, 1)]).await.unwrap();
+    let position = successor
+        .commit(vec![upsert("notes", 1, 1)])
+        .await
+        .unwrap()
+        .position;
     stalled
         .commit(vec![upsert("notes", 1, -1)])
         .await
@@ -762,7 +586,11 @@ async fn an_older_reading_of_the_committed_state_is_ignored() {
     let before_checkpoint = cluster.committed().await;
     writer.flush().await.unwrap();
     let older = cluster.committed().await;
-    let position = writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+    let position = writer
+        .commit(vec![upsert("notes", 2, 2)])
+        .await
+        .unwrap()
+        .position;
 
     let follower = cluster.open().await;
     for stale in [&older, &before_checkpoint] {
@@ -983,7 +811,7 @@ async fn a_reading_from_a_removed_history_is_ignored_even_when_it_is_further_alo
     cluster.coordinator.remove(&cluster.key).await.unwrap();
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let writer = cluster.writer().await;
-    let position = writer.commit(vec![create("notes")]).await.unwrap();
+    let position = writer.commit(vec![create("notes")]).await.unwrap().position;
     assert!(position < old.log_position);
 
     let follower = cluster.open().await;
@@ -992,7 +820,11 @@ async fn a_reading_from_a_removed_history_is_ignored_even_when_it_is_further_alo
         .partition()
         .read(|state| assert!(state.collection(&name("old")).is_none()));
 
-    let next = writer.commit(vec![upsert("notes", 1, 1)]).await.unwrap();
+    let next = writer
+        .commit(vec![upsert("notes", 1, 1)])
+        .await
+        .unwrap()
+        .position;
     assert_eq!(
         follower.catch_up(&cluster.committed().await).await.unwrap(),
         next
@@ -1275,6 +1107,8 @@ enum Change {
     Create(usize),
     Drop(usize),
     Upsert(usize, u8, i64),
+    Insert(usize, u8, i64),
+    Increment(usize, u8, i64),
     Delete(usize, u8),
 }
 
@@ -1289,7 +1123,9 @@ enum Action {
     FollowStale(usize),
 }
 
-type Model = BTreeMap<&'static str, BTreeMap<u8, i64>>;
+/// Per collection, each row's `n` and the `n` its vector was written with:
+/// an increment changes the first and leaves the second.
+type Model = BTreeMap<&'static str, BTreeMap<u8, (i64, i64)>>;
 
 impl Change {
     fn mutation(&self) -> Mutation {
@@ -1297,63 +1133,110 @@ impl Change {
             Change::Create(c) => create(COLLECTIONS[c]),
             Change::Drop(c) => Mutation::DropCollection(name(COLLECTIONS[c])),
             Change::Upsert(c, object, n) => upsert(COLLECTIONS[c], object, n),
+            Change::Insert(c, object, n) => match upsert(COLLECTIONS[c], object, n) {
+                Mutation::Upsert {
+                    collection,
+                    id,
+                    properties,
+                    vector,
+                } => Mutation::Insert {
+                    collection,
+                    id,
+                    properties,
+                    vector,
+                },
+                other => other,
+            },
+            Change::Increment(c, object, by) => Mutation::Increment {
+                collection: name(COLLECTIONS[c]),
+                id: id(object),
+                property: "n".into(),
+                by: by as f64,
+            },
             Change::Delete(c, object) => delete(COLLECTIONS[c], object),
         }
     }
 
-    fn collection(&self) -> usize {
+    /// The change that has to come first for this one to be valid, if any.
+    fn prerequisite(&self, model: &Model) -> Option<Change> {
+        let rows = |c: usize| model.get(COLLECTIONS[c]);
         match *self {
-            Change::Create(c) | Change::Drop(c) | Change::Upsert(c, ..) | Change::Delete(c, _) => c,
+            Change::Create(c) => rows(c).map(|_| Change::Drop(c)),
+            Change::Drop(c) | Change::Upsert(c, ..) | Change::Delete(c, _) => {
+                rows(c).is_none().then_some(Change::Create(c))
+            }
+            Change::Insert(c, object, _) => match rows(c) {
+                None => Some(Change::Create(c)),
+                Some(rows) => rows
+                    .contains_key(&object)
+                    .then_some(Change::Delete(c, object)),
+            },
+            Change::Increment(c, object, _) => match rows(c) {
+                None => Some(Change::Create(c)),
+                Some(rows) => (!rows.contains_key(&object)).then_some(Change::Upsert(c, object, 0)),
+            },
         }
     }
 
-    fn applied(&self, model: &mut Model) {
+    /// Apply the change to the model and say whether storage logs anything
+    /// for it: a change that leaves the row as it was is valid and not logged.
+    fn applied(&self, model: &mut Model) -> bool {
         match *self {
             Change::Create(c) => {
                 model.insert(COLLECTIONS[c], BTreeMap::new());
+                true
             }
             Change::Drop(c) => {
                 model.remove(COLLECTIONS[c]);
+                true
             }
-            Change::Upsert(c, object, n) => {
-                model.get_mut(COLLECTIONS[c]).unwrap().insert(object, n);
+            Change::Upsert(c, object, n) | Change::Insert(c, object, n) => {
+                model
+                    .get_mut(COLLECTIONS[c])
+                    .unwrap()
+                    .insert(object, (n, n))
+                    != Some((n, n))
             }
-            Change::Delete(c, object) => {
-                model.get_mut(COLLECTIONS[c]).unwrap().remove(&object);
+            Change::Increment(c, object, by) => {
+                let rows = model.get_mut(COLLECTIONS[c]).unwrap();
+                rows.get_mut(&object).unwrap().0 += by;
+                by != 0
             }
+            Change::Delete(c, object) => model
+                .get_mut(COLLECTIONS[c])
+                .unwrap()
+                .remove(&object)
+                .is_some(),
         }
     }
 }
 
-/// Make every change valid for the model it meets, by first creating a
-/// missing collection or dropping one that is in the way, so that generated
-/// histories spend their time writing rows rather than being rejected.
-fn valid_batch(changes: Vec<Change>, model: &mut Model) -> Vec<Change> {
-    changes
-        .into_iter()
-        .flat_map(|change| {
-            let c = change.collection();
-            let exists = model.contains_key(COLLECTIONS[c]);
-            let prelude = match (&change, exists) {
-                (Change::Create(_), true) => Some(Change::Drop(c)),
-                (Change::Create(_), false) => None,
-                (_, false) => Some(Change::Create(c)),
-                (_, true) => None,
-            };
-            let steps: Vec<Change> = prelude.into_iter().chain([change]).collect();
-            steps.iter().for_each(|step| step.applied(model));
-            steps
-        })
-        .collect()
+/// Make every change valid for the model it meets by putting what it needs
+/// in front of it, so that generated histories spend their time writing rows
+/// rather than being rejected. Returns the batch and whether it logs anything.
+fn valid_batch(changes: Vec<Change>, model: &mut Model) -> (Vec<Change>, bool) {
+    let mut logged = false;
+    let mut batch = Vec::new();
+    for change in changes {
+        while let Some(first) = change.prerequisite(model) {
+            logged |= first.applied(model);
+            batch.push(first);
+        }
+        logged |= change.applied(model);
+        batch.push(change);
+    }
+    (batch, logged)
 }
 
 fn change() -> impl Strategy<Value = Change> {
-    let collection = 0..COLLECTIONS.len();
+    let collection = || 0..COLLECTIONS.len();
     prop_oneof![
-        1 => collection.clone().prop_map(Change::Create),
-        1 => collection.clone().prop_map(Change::Drop),
-        12 => (collection.clone(), 0..IDS, -3i64..4).prop_map(|(c, o, n)| Change::Upsert(c, o, n)),
-        5 => (collection, 0..IDS).prop_map(|(c, o)| Change::Delete(c, o)),
+        1 => collection().prop_map(Change::Create),
+        1 => collection().prop_map(Change::Drop),
+        8 => (collection(), 0..IDS, -3i64..4).prop_map(|(c, o, n)| Change::Upsert(c, o, n)),
+        3 => (collection(), 0..IDS, -3i64..4).prop_map(|(c, o, n)| Change::Insert(c, o, n)),
+        4 => (collection(), 0..IDS, -3i64..4).prop_map(|(c, o, n)| Change::Increment(c, o, n)),
+        5 => (collection(), 0..IDS).prop_map(|(c, o)| Change::Delete(c, o)),
     ]
 }
 
@@ -1383,7 +1266,7 @@ fn assert_matches_model(state: &State, model: &Model, context: &str) {
         for object in 0..IDS {
             assert_eq!(
                 n_of(state, collection, object),
-                expected.get(&object).copied(),
+                expected.get(&object).map(|(n, _)| *n),
                 "{context}"
             );
         }
@@ -1409,15 +1292,20 @@ async fn run(actions: Vec<Action>) {
         let context = format!("step {step}: {action:?}");
         match action {
             Action::Commit(changes) => {
-                let batch = valid_batch(changes, &mut model);
-                let position = writer.partition().read(State::position);
-                let committed = writer
+                let (batch, logged) = valid_batch(changes, &mut model);
+                let before = writer.partition().read(State::position);
+                let expected = if logged {
+                    before.next().unwrap()
+                } else {
+                    before
+                };
+                let receipt = writer
                     .commit(batch.iter().map(Change::mutation).collect())
                     .await;
-                assert_eq!(committed.unwrap(), position.next().unwrap(), "{context}");
+                assert_eq!(receipt.unwrap().position, expected, "{context}");
             }
             Action::Rejected(changes) => {
-                let batch = valid_batch(changes, &mut model.clone());
+                let (batch, _) = valid_batch(changes, &mut model.clone());
                 let mutations = batch
                     .iter()
                     .map(Change::mutation)

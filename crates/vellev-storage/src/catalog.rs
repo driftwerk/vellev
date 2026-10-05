@@ -1,32 +1,9 @@
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value as Json};
-use vellev_core::{Collection, CollectionName, Object, ObjectId, Property};
+use vellev_core::{Collection, CollectionName, Property};
 
 use crate::format::{CollectionId, Op};
 use crate::{Result, StorageError};
-
-/// A change a caller asks for, by collection name. The writer resolves it
-/// against the catalog into an [`Op`], which is what the log records.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Mutation {
-    CreateCollection(Box<Collection>),
-    AddProperty {
-        collection: CollectionName,
-        property: Property,
-    },
-    DropCollection(CollectionName),
-    Upsert {
-        collection: CollectionName,
-        id: ObjectId,
-        properties: Map<String, Json>,
-        vector: Option<Vec<f32>>,
-    },
-    Delete {
-        collection: CollectionName,
-        id: ObjectId,
-    },
-}
 
 /// The partition's collections, by name and by id.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -76,7 +53,7 @@ impl Catalog {
         self.schemas.get(&id).map(|schema| (id, schema))
     }
 
-    fn known(&self, name: &CollectionName) -> Result<(CollectionId, &Collection)> {
+    pub fn known(&self, name: &CollectionName) -> Result<(CollectionId, &Collection)> {
         self.get(name)
             .ok_or_else(|| StorageError::UnknownCollection(name.clone()))
     }
@@ -95,61 +72,44 @@ impl Catalog {
         Ok(())
     }
 
-    /// Validate `mutation` and turn it into the op to log, applying schema
-    /// changes here so later mutations in the same batch see them. `None`
-    /// means the mutation changes nothing.
-    pub fn resolve(&mut self, mutation: Mutation) -> Result<Option<Op>> {
-        Ok(Some(match mutation {
-            Mutation::CreateCollection(schema) => {
-                schema.validate()?;
-                if self.names.contains_key(&schema.name) {
-                    return Err(StorageError::CollectionExists(schema.name.clone()));
-                }
-                let id = CollectionId(self.next_id);
-                self.create(id, schema.as_ref().clone())
-                    .map_err(|_| StorageError::Exhausted("collection ids"))?;
-                Op::CreateCollection { id, schema }
-            }
-            Mutation::AddProperty {
-                collection,
+    /// Validate a new collection, add it, and return the op to log.
+    pub fn create_collection(&mut self, schema: Box<Collection>) -> Result<Op> {
+        schema.validate()?;
+        if self.names.contains_key(&schema.name) {
+            return Err(StorageError::CollectionExists(schema.name.clone()));
+        }
+        let id = CollectionId(self.next_id);
+        self.create(id, schema.as_ref().clone())
+            .map_err(|_| StorageError::Exhausted("collection ids"))?;
+        Ok(Op::CreateCollection { id, schema })
+    }
+
+    /// Add a property and return the op to log, or `None` when the collection
+    /// already has exactly that property.
+    pub fn add_property(
+        &mut self,
+        collection: &CollectionName,
+        property: Property,
+    ) -> Result<Option<Op>> {
+        let (id, _) = self.known(collection)?;
+        let added = self
+            .schemas
+            .get_mut(&id)
+            .map(|schema| schema.add_property(property.clone()));
+        Ok(added
+            .transpose()?
+            .unwrap_or(false)
+            .then_some(Op::AddProperty {
+                collection: id,
                 property,
-            } => {
-                let (id, _) = self.known(&collection)?;
-                let added = self
-                    .schemas
-                    .get_mut(&id)
-                    .map(|s| s.add_property(property.clone()));
-                if !added.transpose()?.unwrap_or(false) {
-                    return Ok(None);
-                }
-                Op::AddProperty {
-                    collection: id,
-                    property,
-                }
-            }
-            Mutation::DropCollection(collection) => {
-                let (id, _) = self.known(&collection)?;
-                self.schemas.remove(&id);
-                self.names.remove(&collection);
-                Op::DropCollection { collection: id }
-            }
-            Mutation::Upsert {
-                collection,
-                id,
-                properties,
-                vector,
-            } => {
-                let (collection, schema) = self.known(&collection)?;
-                Op::Upsert {
-                    collection,
-                    object: Object::from_json(schema, id, &properties, vector)?,
-                }
-            }
-            Mutation::Delete { collection, id } => Op::Delete {
-                collection: self.known(&collection)?.0,
-                id,
-            },
-        }))
+            }))
+    }
+
+    pub fn drop_collection(&mut self, collection: &CollectionName) -> Result<Op> {
+        let (id, _) = self.known(collection)?;
+        self.schemas.remove(&id);
+        self.names.remove(collection);
+        Ok(Op::DropCollection { collection: id })
     }
 
     /// Apply the schema effect of a logged op. An op the catalog cannot apply
