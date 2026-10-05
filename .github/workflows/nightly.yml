@@ -1,0 +1,39 @@
+name: Nightly
+
+# The simulation and the storage property test at a far higher case count
+# than the per-commit run, to reach histories the short run does not.
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: Histories to generate per property test
+        default: '20000'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  PROPTEST_CASES: ${{ inputs.cases || '20000' }}
+
+jobs:
+  simulation:
+    name: Simulation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --locked -p vellev-storage --test simulation --test partition
+      # A failing history is shrunk and written next to the test; keep it so
+      # it can be committed as a regression seed.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions
+          path: crates/vellev-storage/tests/*.proptest-regressions
+          if-no-files-found: ignore
