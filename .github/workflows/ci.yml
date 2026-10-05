@@ -107,6 +107,11 @@ jobs:
             echo "::error::container never became healthy (last status: $status)"
             exit 1
           fi
+          # Healthy means the process is up; ready means it has reached Postgres.
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:8080/health/ready && break
+            sleep 1
+          done
           call() { curl -fsS -H 'authorization: Bearer ci-key' -H 'content-type: application/json' "$@"; }
           notes=http://127.0.0.1:8080/v1/tenants/ci/collections/notes
           call -X PUT http://127.0.0.1:8080/v1/tenants/ci
