@@ -152,7 +152,7 @@ fn checked_ttl(ttl: Duration) -> Result<Duration> {
 }
 
 #[async_trait]
-pub trait Coordinator: Send + Sync {
+pub trait Coordinator: fmt::Debug + Send + Sync {
     /// Create the partition's row. Registering an existing partition changes nothing.
     async fn register(&self, key: &PartitionKey) -> Result<()>;
 
