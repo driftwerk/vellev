@@ -275,14 +275,17 @@ impl Node {
         Ok(existed)
     }
 
-    /// Up to `limit` tenants after `after`, in id order.
+    /// Up to `limit` tenants after `after`, in id order; fewer where a
+    /// tenant has several partitions.
     pub async fn tenants(&self, after: Option<&TenantId>, limit: usize) -> Result<Vec<TenantId>> {
         let after = after.map(|tenant| PartitionKey {
             tenant: tenant.clone(),
             partition: Partition(u32::MAX),
         });
         let keys = self.coordinator.partitions(after.as_ref(), limit).await?;
-        Ok(keys.into_iter().map(|key| key.tenant).collect())
+        let mut tenants: Vec<TenantId> = keys.into_iter().map(|key| key.tenant).collect();
+        tenants.dedup();
+        Ok(tenants)
     }
 
     fn opened(&self) -> std::sync::MutexGuard<'_, HashMap<TenantId, Opening>> {

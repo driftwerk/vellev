@@ -13,12 +13,14 @@ use object_store::memory::InMemory;
 use serde_json::{json, Value};
 use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, HttpApi,
-    NodeId, ObjectId, Property, TenantId,
+    NodeId, ObjectId, Partition, Property, TenantId,
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{Node, NodeError, Settings};
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
-use vellev_storage::coordinator::{CoordinatorError, ManualClock, MemoryCoordinator};
+use vellev_storage::coordinator::{
+    Coordinator, CoordinatorError, ManualClock, MemoryCoordinator, PartitionKey,
+};
 use vellev_storage::{Mutation, State, StorageError};
 
 const LEASE: Duration = Duration::from_secs(30);
@@ -157,6 +159,20 @@ async fn tenants_are_created_listed_a_page_at_a_time_and_dropped() {
         [tenant("zeta")]
     );
     assert_eq!(node.tenants(Some(&tenant("zeta")), 2).await.unwrap(), []);
+    let second = PartitionKey {
+        tenant: tenant("mid"),
+        partition: Partition(1),
+    };
+    cluster.coordinator.register(&second).await.unwrap();
+    assert_eq!(
+        node.tenants(None, 10).await.unwrap(),
+        [tenant("acme"), tenant("mid"), tenant("zeta")]
+    );
+    assert_eq!(
+        node.tenants(Some(&tenant("mid")), 10).await.unwrap(),
+        [tenant("zeta")]
+    );
+    cluster.coordinator.remove(&second).await.unwrap();
 
     let acme = node.tenant(&tenant("acme")).await.unwrap();
     acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
@@ -413,6 +429,12 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
         calls.load(Ordering::SeqCst),
         3,
         "only the new text is embedded"
+    );
+    acme.write(vec![note(1, "a red fox", None)]).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "stored text is not embedded again"
     );
     let before = acme.read(State::position);
     let together =

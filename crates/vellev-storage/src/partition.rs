@@ -343,11 +343,22 @@ impl Writer {
                 }
                 break (at, outcomes, ops);
             }
+            let rejected = |unembedded: &[Option<_>]| unembedded.iter().flatten().count();
+            let before = rejected(&unembedded);
             for wanted in &wanted {
                 if let Some(reason) = failed.get(&wanted.embedding) {
                     unembedded[wanted.batch] =
                         Some((wanted.embedding.model.clone(), reason.clone()));
                 }
+            }
+            // Each round must reject a batch it had not, or it would never end.
+            if rejected(&unembedded) == before {
+                let (model, reason) = failed
+                    .into_iter()
+                    .next()
+                    .map(|(embedding, reason)| (embedding.model, reason))
+                    .unwrap_or_default();
+                return Err(StorageError::Embedding { model, reason });
             }
         };
         let position = if ops.is_empty() {
