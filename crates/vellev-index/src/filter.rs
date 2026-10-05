@@ -27,6 +27,7 @@ use vellev_core::{Collection, DataType, Object, Value};
 /// enough that evaluating one cannot exhaust the stack.
 pub const MAX_DEPTH: usize = 32;
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Filter {
@@ -60,9 +61,12 @@ pub enum Filter {
         property: String,
     },
     /// Every one holds; with none, everything matches.
+    #[cfg_attr(feature = "openapi", schema(no_recursion))]
     And(Vec<Filter>),
     /// At least one holds; with none, nothing matches.
+    #[cfg_attr(feature = "openapi", schema(no_recursion))]
     Or(Vec<Filter>),
+    #[cfg_attr(feature = "openapi", schema(no_recursion))]
     Not(Box<Filter>),
 }
 

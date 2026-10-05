@@ -1,3 +1,6 @@
-//! The vellev node: HTTP API, embedding, search and writes.
+//! The vellev node: its HTTP API over the tenants it writes for.
 
+mod api;
+pub mod config;
+mod problem;
 pub mod server;

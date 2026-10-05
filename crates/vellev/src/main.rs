@@ -1,11 +1,14 @@
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use eyre::Result;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
+use vellev::config::Config;
+use vellev::server::App;
 
 #[derive(Parser)]
 #[command(name = "vellev", version, about = "Vellev vector database")]
@@ -20,7 +23,11 @@ enum Command {
     Serve {
         #[arg(long, env = "VELLEV_LISTEN", default_value = "0.0.0.0:8080")]
         listen: SocketAddr,
+        #[command(flatten)]
+        config: Config,
     },
+    /// Print the API's OpenAPI description.
+    Openapi,
     /// Check that a node is live; exits non-zero when it is not. Container
     /// health checks run this, so the image needs no curl or shell.
     Health {
@@ -38,12 +45,23 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     match Cli::parse().command {
-        Command::Serve { listen } => {
+        Command::Serve { listen, config } => {
             tracing_subscriber::fmt().json().init();
+            let node = Arc::new(config.node().await?);
+            let app = App {
+                node: node.clone(),
+                keys: config.keys()?,
+                max_limit: config.max_limit,
+            };
             let listener = TcpListener::bind(listen).await?;
             tracing::info!(%listen, version = env!("CARGO_PKG_VERSION"), "vellev listening");
-            vellev::server::serve(listener, shutdown_signal()).await?;
+            vellev::server::serve(listener, app, shutdown_signal()).await?;
+            node.shutdown().await;
             tracing::info!("vellev stopped");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Openapi => {
+            println!("{}", vellev::server::openapi().to_pretty_json()?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Health { url, timeout_secs } => {
