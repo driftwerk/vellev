@@ -39,7 +39,8 @@ pub enum Mutation {
         vector: Option<Vec<f32>>,
         only_if: Option<Condition>,
     },
-    /// Add `by` to a numeric property, counting an absent value as zero.
+    /// Add `by` to a numeric property, counting an absent value as zero. An
+    /// int moves only by whole numbers, which `by` holds exactly up to 2^53.
     Increment {
         collection: CollectionName,
         id: ObjectId,

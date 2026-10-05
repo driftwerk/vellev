@@ -180,22 +180,39 @@ async fn a_mutation_that_changes_nothing_is_not_logged() {
     let (cluster, writer) = notes().await;
     writer.commit(vec![append(1, &["a"], true)]).await.unwrap();
     let before = cluster.committed().await;
+    let stored = writer
+        .partition()
+        .read(|state| state.get(&name("notes"), id(1)).cloned().unwrap());
+    let identical = Mutation::Upsert {
+        collection: name("notes"),
+        id: id(1),
+        properties: stored.properties_json(),
+        vector: stored.vector.clone(),
+    };
     let unchanged = vec![
+        identical,
         patch(1, json!({ "n": 10 }), None),
         patch(1, json!({ "score": null }), None),
         append(1, &["a"], true),
         append(1, &[], false),
         delete("notes", 7),
+        increment(1, "n", 0.0),
+        increment(1, "score", -0.0),
     ];
     let receipt = writer.commit(unchanged).await.unwrap();
+    assert_eq!(receipt.position, before.log_position);
+    assert_eq!(receipt.outcomes[..6], vec![Outcome::Unchanged; 6]);
     assert_eq!(
-        receipt,
-        Receipt {
-            position: before.log_position,
-            outcomes: vec![Outcome::Unchanged; 5]
-        }
+        receipt.outcomes[6..],
+        [
+            Outcome::Value(Value::Int(10)),
+            Outcome::Value(Value::Number(0.0))
+        ]
     );
     assert_eq!(cluster.committed().await, before);
+    writer.partition().read(|state| {
+        assert_eq!(state.get(&name("notes"), id(1)), Some(&stored));
+    });
 }
 
 #[tokio::test]
@@ -280,16 +297,22 @@ async fn increment_adds_to_a_number_and_returns_the_new_value() {
         .unwrap();
     for bad in [
         increment(1, "n", 0.5),
-        increment(1, "n", 1.0),
         increment(1, "n", 1e30),
         increment(1, "n", f64::NAN),
         increment(1, "score", f64::INFINITY),
         increment(1, "title", 1.0),
         increment(1, "tags", 1.0),
-        increment(1, "nope", 1.0),
     ] {
         refused(&cluster, &writer, vec![bad], invalid).await;
     }
+    refused(&cluster, &writer, vec![increment(1, "n", 1.0)], |e| {
+        matches!(e, StorageError::InvalidMutation(reason) if reason.contains("leaves its range"))
+    })
+    .await;
+    refused(&cluster, &writer, vec![increment(1, "nope", 1.0)], |e| {
+        matches!(e, StorageError::Object(_))
+    })
+    .await;
     refused(&cluster, &writer, vec![increment(9, "n", 1.0)], |e| {
         matches!(e, StorageError::UnknownObject { .. })
     })
@@ -565,4 +588,94 @@ async fn a_writer_failure_reaches_every_caller_in_the_group_and_after_it() {
         .await
         .partition()
         .read(|state| assert_eq!(n_of(state, "notes", 1), Some(0)));
+}
+
+#[tokio::test]
+async fn updates_to_rows_in_a_segment_and_a_recreated_collection_replay_identically() {
+    let (cluster, writer) = notes().await;
+    writer.flush().await.unwrap();
+    let recreate = || [Mutation::DropCollection(name("notes")), create("notes")];
+    let results = writer
+        .commit_group(vec![
+            vec![
+                increment(1, "n", 1.0),
+                patch(1, json!({ "title": "from a segment" }), None),
+            ],
+            recreate()
+                .into_iter()
+                .chain([insert(1, json!({ "n": 5 })), increment(1, "n", 1.0)])
+                .collect(),
+            recreate()
+                .into_iter()
+                .chain([increment(1, "n", 1.0)])
+                .collect(),
+            vec![increment(1, "n", 1.0)],
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0].as_ref().unwrap().outcomes[0],
+        Outcome::Value(Value::Int(11))
+    );
+    assert_eq!(
+        results[1].as_ref().unwrap().outcomes[3],
+        Outcome::Value(Value::Int(6))
+    );
+    assert!(matches!(
+        results[2],
+        Err(StorageError::UnknownObject { .. })
+    ));
+    assert_eq!(
+        results[3].as_ref().unwrap().outcomes[0],
+        Outcome::Value(Value::Int(7))
+    );
+
+    let follower = cluster.open().await;
+    writer.flush().await.unwrap();
+    let reopened = cluster.open().await;
+    for copy in [
+        writer.partition(),
+        follower.partition(),
+        reopened.partition(),
+    ] {
+        copy.read(|state| {
+            assert_eq!(n_of(state, "notes", 1), Some(7));
+            assert_eq!(property(state, 1, "title"), None);
+            assert_eq!(state.count(&name("notes")), 1);
+        });
+    }
+}
+
+#[tokio::test]
+async fn a_caller_that_gave_up_before_its_turn_is_skipped() {
+    let cluster = Cluster::new().await;
+    let (lease, committed) = cluster.lease().await;
+    let slow: Arc<dyn Blobs> = Arc::new(Slow(cluster.blobs.clone()));
+    let writer = Arc::new(
+        Writer::open(slow, cluster.coordinator.clone(), lease, &committed)
+            .await
+            .unwrap(),
+    );
+    let committer = GroupCommitter::spawn(writer, 16, 16);
+    committer
+        .submit(vec![create("notes"), upsert("notes", 1, 0)])
+        .await
+        .unwrap();
+
+    let in_flight = tokio::spawn({
+        let committer = committer.clone();
+        async move { committer.submit(vec![increment(1, "n", 1.0)]).await }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let impatient = committer.submit(vec![increment(1, "n", 100.0)]);
+    assert!(tokio::time::timeout(Duration::from_millis(1), impatient)
+        .await
+        .is_err());
+    in_flight.await.unwrap().unwrap();
+
+    let receipt = committer
+        .submit(vec![increment(1, "n", 1.0)])
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcomes, vec![Outcome::Value(Value::Int(2))]);
 }

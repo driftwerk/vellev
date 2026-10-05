@@ -21,9 +21,14 @@ pub struct GroupCommitter {
 }
 
 impl GroupCommitter {
-    /// Start committing for `writer`. At most `max_group` batches share one
-    /// commit, and at most `queue` wait before a submitter is held back. The
-    /// task ends when the last clone of the committer is dropped.
+    /// Start committing for `writer`. At most `max_group` batches, whatever
+    /// their size, share one commit, and at most `queue` wait before a
+    /// submitter is held back. The task ends when the last clone of the
+    /// committer is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, because the queue is drained by a spawned task.
     pub fn spawn(writer: Arc<Writer>, max_group: usize, queue: usize) -> Self {
         let (sender, mut waiting) = mpsc::channel::<Request>(queue.max(1));
         tokio::spawn(async move {
@@ -37,10 +42,14 @@ impl GroupCommitter {
                 }
                 let (batches, replies): (Vec<_>, Vec<_>) = group
                     .into_iter()
+                    .filter(|request| !request.reply.is_closed())
                     .map(|request| (request.mutations, request.reply))
                     .unzip();
                 let results = match writer.commit_group(batches).await {
                     Ok(results) => results,
+                    Err(StorageError::Closed) => {
+                        replies.iter().map(|_| Err(StorageError::Closed)).collect()
+                    }
                     Err(error) => {
                         let shared = Arc::new(error);
                         replies
@@ -58,6 +67,12 @@ impl GroupCommitter {
     }
 
     /// Commit `mutations` atomically, together with whatever else is waiting.
+    ///
+    /// A caller that stops waiting before its batch is taken into a commit is
+    /// skipped. One that stops waiting after that point cannot be: its batch
+    /// is committed all the same, so a caller that retries after a timeout
+    /// must use mutations that are safe to repeat. A failure of the shared
+    /// commit arrives as [`StorageError::Shared`]; see [`StorageError::root`].
     pub async fn submit(&self, mutations: Vec<Mutation>) -> Result<Receipt> {
         let (reply, outcome) = oneshot::channel();
         self.queue

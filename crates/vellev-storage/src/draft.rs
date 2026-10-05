@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use vellev_core::{Collection, CollectionName, DataType, Object, ObjectId, Value};
+use vellev_core::{Collection, CollectionName, DataType, Object, ObjectError, ObjectId, Value};
 
 use crate::catalog::Catalog;
 use crate::format::{CollectionId, Op};
@@ -105,18 +105,16 @@ impl Batch<'_> {
             })
     }
 
-    fn write(&mut self, collection: CollectionId, object: Object) {
-        self.rows
-            .insert((collection, object.id), Some(object.clone()));
-        self.ops.push(Op::Upsert { collection, object });
-    }
-
-    /// Write `next` in place of `stored`, unless they are the same.
-    fn replace(&mut self, collection: CollectionId, stored: &Object, next: Object) -> Outcome {
-        if *stored == next {
+    /// Write `next` under its key, unless that is what is stored already.
+    fn write(&mut self, collection: CollectionId, next: Object) -> Outcome {
+        if self.row((collection, next.id)) == Some(&next) {
             return Outcome::Unchanged;
         }
-        self.write(collection, next);
+        self.rows.insert((collection, next.id), Some(next.clone()));
+        self.ops.push(Op::Upsert {
+            collection,
+            object: next,
+        });
         Outcome::Applied
     }
 
@@ -148,12 +146,8 @@ impl Batch<'_> {
                 properties,
                 vector,
             } => {
-                let (collection, schema) = self.collection(&collection)?;
-                self.write(
-                    collection,
-                    Object::from_json(&schema, id, &properties, vector)?,
-                );
-                Ok(Outcome::Applied)
+                let (cid, schema) = self.collection(&collection)?;
+                Ok(self.write(cid, Object::from_json(&schema, id, &properties, vector)?))
             }
             Mutation::Insert {
                 collection,
@@ -165,8 +159,7 @@ impl Batch<'_> {
                 if self.row((cid, id)).is_some() {
                     return Err(StorageError::ObjectExists { collection, id });
                 }
-                self.write(cid, Object::from_json(&schema, id, &properties, vector)?);
-                Ok(Outcome::Applied)
+                Ok(self.write(cid, Object::from_json(&schema, id, &properties, vector)?))
             }
             Mutation::Patch {
                 collection,
@@ -187,8 +180,7 @@ impl Batch<'_> {
                         });
                     }
                 }
-                let patched = stored.patched(&schema, &properties, vector)?;
-                Ok(self.replace(cid, &stored, patched))
+                Ok(self.write(cid, stored.patched(&schema, &properties, vector)?))
             }
             Mutation::Increment {
                 collection,
@@ -199,8 +191,10 @@ impl Batch<'_> {
                 let (cid, schema) = self.collection(&collection)?;
                 let mut object = self.stored(&collection, (cid, id))?;
                 let value = incremented(&schema, &object, &property, by)?;
-                object.properties.insert(property, value.clone());
-                self.write(cid, object);
+                if by != 0.0 {
+                    object.properties.insert(property, value.clone());
+                    self.write(cid, object);
+                }
                 Ok(Outcome::Value(value))
             }
             Mutation::Append {
@@ -211,11 +205,14 @@ impl Batch<'_> {
                 unique,
             } => {
                 let (cid, schema) = self.collection(&collection)?;
-                let stored = self.stored(&collection, (cid, id))?;
-                let appended = appended(&schema, &stored, &property, values, unique)?;
-                let mut next = stored.clone();
-                next.properties.insert(property, Value::TextArray(appended));
-                Ok(self.replace(cid, &stored, next))
+                let mut object = self.stored(&collection, (cid, id))?;
+                let Some(appended) = appended(&schema, &object, &property, values, unique)? else {
+                    return Ok(Outcome::Unchanged);
+                };
+                object
+                    .properties
+                    .insert(property, Value::TextArray(appended));
+                Ok(self.write(cid, object))
             }
             Mutation::Delete { collection, id } => {
                 let (cid, _) = self.collection(&collection)?;
@@ -237,14 +234,12 @@ fn declared(schema: &Collection, property: &str) -> Result<DataType> {
     schema
         .property(property)
         .map(|p| p.data_type)
-        .ok_or_else(|| {
-            invalid(format!(
-                "property {property:?} is not declared on {}",
-                schema.name
-            ))
-        })
+        .ok_or_else(|| ObjectError::UnknownProperty(property.to_string()).into())
 }
 
+/// The property's value after adding `by`. A stored value always has its
+/// declared type, because a property's type never changes, so anything else
+/// is the absent case and counts as zero.
 fn incremented(schema: &Collection, object: &Object, property: &str, by: f64) -> Result<Value> {
     let out_of_range = || {
         invalid(format!(
@@ -257,12 +252,17 @@ fn incremented(schema: &Collection, object: &Object, property: &str, by: f64) ->
                 Some(Value::Int(n)) => *n,
                 _ => 0,
             };
-            let whole = by.fract() == 0.0 && by.abs() < i64::MAX as f64;
-            whole
-                .then(|| current.checked_add(by as i64))
-                .flatten()
+            // `i64::MAX as f64` rounds up to 2^63, so this admits exactly the
+            // whole numbers the cast below represents without saturating.
+            if by.fract() != 0.0 || by.abs() >= i64::MAX as f64 {
+                return Err(invalid(format!(
+                    "{property:?} is an int and cannot move by {by}"
+                )));
+            }
+            current
+                .checked_add(by as i64)
                 .map(Value::Int)
-                .ok_or_else(|| invalid(format!("{property:?} is an int and cannot move by {by}")))
+                .ok_or_else(out_of_range)
         }
         (DataType::Number, current) => {
             let current = match current {
@@ -280,13 +280,14 @@ fn incremented(schema: &Collection, object: &Object, property: &str, by: f64) ->
     }
 }
 
+/// The array after appending `values`, or `None` when that adds nothing.
 fn appended(
     schema: &Collection,
     object: &Object,
     property: &str,
     values: Vec<String>,
     unique: bool,
-) -> Result<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     if declared(schema, property)? != DataType::TextArray {
         return Err(invalid(format!(
             "{property:?} is not a text array and cannot be appended to"
@@ -296,10 +297,12 @@ fn appended(
         Some(Value::TextArray(stored)) => stored.clone(),
         _ => Vec::new(),
     };
-    Ok(values.into_iter().fold(stored, |mut all, value| {
+    let before = stored.len();
+    let appended = values.into_iter().fold(stored, |mut all, value| {
         if !(unique && all.contains(&value)) {
             all.push(value);
         }
         all
-    }))
+    });
+    Ok((appended.len() > before).then_some(appended))
 }

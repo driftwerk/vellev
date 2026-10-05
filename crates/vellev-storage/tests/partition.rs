@@ -1123,7 +1123,9 @@ enum Action {
     FollowStale(usize),
 }
 
-type Model = BTreeMap<&'static str, BTreeMap<u8, i64>>;
+/// Per collection, each row's `n` and the `n` its vector was written with:
+/// an increment changes the first and leaves the second.
+type Model = BTreeMap<&'static str, BTreeMap<u8, (i64, i64)>>;
 
 impl Change {
     fn mutation(&self) -> Mutation {
@@ -1177,7 +1179,7 @@ impl Change {
     }
 
     /// Apply the change to the model and say whether storage logs anything
-    /// for it: deleting a row that is not there is valid and changes nothing.
+    /// for it: a change that leaves the row as it was is valid and not logged.
     fn applied(&self, model: &mut Model) -> bool {
         match *self {
             Change::Create(c) => {
@@ -1189,16 +1191,16 @@ impl Change {
                 true
             }
             Change::Upsert(c, object, n) | Change::Insert(c, object, n) => {
-                model.get_mut(COLLECTIONS[c]).unwrap().insert(object, n);
-                true
-            }
-            Change::Increment(c, object, by) => {
-                *model
+                model
                     .get_mut(COLLECTIONS[c])
                     .unwrap()
-                    .get_mut(&object)
-                    .unwrap() += by;
-                true
+                    .insert(object, (n, n))
+                    != Some((n, n))
+            }
+            Change::Increment(c, object, by) => {
+                let rows = model.get_mut(COLLECTIONS[c]).unwrap();
+                rows.get_mut(&object).unwrap().0 += by;
+                by != 0
             }
             Change::Delete(c, object) => model
                 .get_mut(COLLECTIONS[c])
@@ -1264,7 +1266,7 @@ fn assert_matches_model(state: &State, model: &Model, context: &str) {
         for object in 0..IDS {
             assert_eq!(
                 n_of(state, collection, object),
-                expected.get(&object).copied(),
+                expected.get(&object).map(|(n, _)| *n),
                 "{context}"
             );
         }
