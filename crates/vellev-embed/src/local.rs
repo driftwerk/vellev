@@ -231,6 +231,7 @@ mod tests {
     struct Runs {
         ran: Receiver<Vec<String>>,
         go: Sender<()>,
+        loads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Runs {
@@ -252,7 +253,10 @@ mod tests {
         let (go, gate) = channel::<()>();
         let gate = Arc::new(std::sync::Mutex::new(gate));
         let mut failing = failing_loads;
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = loads.clone();
         let load: Load = Box::new(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if failing > 0 {
                 failing -= 1;
                 return Err("no model to be had".to_string());
@@ -272,7 +276,7 @@ mod tests {
         });
         (
             Arc::new(Local::spawn("stand-in", load).unwrap()),
-            Runs { ran, go },
+            Runs { ran, go, loads },
         )
     }
 
@@ -352,8 +356,10 @@ mod tests {
         assert_eq!(embed("fox").await, Err(failed("no model to be had")));
         assert_eq!(embed("fox").await, Ok(vec![vec![3.0]]));
         assert_eq!(embed("fail").await, Err(failed("told to")));
+        assert_eq!(runs.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(embed("panic").await, Err(failed("the model panicked")));
         assert_eq!(embed("hen").await, Ok(vec![vec![3.0]]));
+        assert_eq!(runs.loads.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -366,11 +372,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let after = start(&local, texts("e", 40), Purpose::Document);
         tokio::time::sleep(Duration::from_millis(100)).await;
+        let behind = start(&local, texts("f", 5), Purpose::Document);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         runs.let_through(4);
         assert_eq!(first.await.unwrap().unwrap().len(), 32);
         assert_eq!(failing.await.unwrap(), Err(failed("told to")));
         assert_eq!(beside.await.unwrap(), Err(failed("told to")));
         assert_eq!(after.await.unwrap(), Err(failed("told to")));
+        assert_eq!(behind.await.unwrap().unwrap().len(), 5);
         assert_eq!(
             local.embed(vec!["fox".into()], Purpose::Query).await,
             Ok(vec![vec![3.0]])
