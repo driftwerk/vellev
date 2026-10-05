@@ -30,22 +30,33 @@ pub enum Mutation {
 
 /// The partition's collections, by name and by id.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Catalog {
+pub(crate) struct Catalog {
     next_id: u64,
     names: BTreeMap<CollectionName, CollectionId>,
     schemas: BTreeMap<CollectionId, Collection>,
 }
 
 impl Catalog {
-    pub fn restore(next_id: u64, collections: Vec<(CollectionId, Collection)>) -> Self {
-        Self {
-            next_id,
-            names: collections
-                .iter()
-                .map(|(id, schema)| (schema.name.clone(), *id))
-                .collect(),
-            schemas: collections.into_iter().collect(),
-        }
+    /// Rebuild a catalog from a manifest, or say why the manifest cannot be
+    /// right: ids and names must be unique and below `next_id`, which is what
+    /// keeps a dropped collection's id from ever being given out again.
+    pub fn restore(
+        next_id: u64,
+        collections: Vec<(CollectionId, Collection)>,
+    ) -> std::result::Result<Self, String> {
+        collections.into_iter().try_fold(
+            Self {
+                next_id,
+                ..Self::default()
+            },
+            |mut catalog, (id, schema)| {
+                if id.0 >= next_id {
+                    return Err(format!("collection id {} is not below {next_id}", id.0));
+                }
+                catalog.create(id, schema)?;
+                Ok(catalog)
+            },
+        )
     }
 
     pub fn next_id(&self) -> u64 {
@@ -70,27 +81,45 @@ impl Catalog {
             .ok_or_else(|| StorageError::UnknownCollection(name.clone()))
     }
 
+    fn create(&mut self, id: CollectionId, schema: Collection) -> std::result::Result<(), String> {
+        if self.contains(id) || self.names.contains_key(&schema.name) {
+            return Err(format!(
+                "collection {} ({}) exists twice",
+                schema.name, id.0
+            ));
+        }
+        let after = id.0.checked_add(1).ok_or("collection ids are exhausted")?;
+        self.next_id = self.next_id.max(after);
+        self.names.insert(schema.name.clone(), id);
+        self.schemas.insert(id, schema);
+        Ok(())
+    }
+
     /// Validate `mutation` and turn it into the op to log, applying schema
     /// changes here so later mutations in the same batch see them. `None`
     /// means the mutation changes nothing.
     pub fn resolve(&mut self, mutation: Mutation) -> Result<Option<Op>> {
-        let op = match mutation {
+        Ok(Some(match mutation {
             Mutation::CreateCollection(schema) => {
                 schema.validate()?;
                 if self.names.contains_key(&schema.name) {
                     return Err(StorageError::CollectionExists(schema.name.clone()));
                 }
-                Op::CreateCollection {
-                    id: CollectionId(self.next_id),
-                    schema,
-                }
+                let id = CollectionId(self.next_id);
+                self.create(id, schema.as_ref().clone())
+                    .map_err(StorageError::Encode)?;
+                Op::CreateCollection { id, schema }
             }
             Mutation::AddProperty {
                 collection,
                 property,
             } => {
-                let (id, schema) = self.known(&collection)?;
-                if !schema.clone().add_property(property.clone())? {
+                let (id, _) = self.known(&collection)?;
+                let added = self
+                    .schemas
+                    .get_mut(&id)
+                    .map(|s| s.add_property(property.clone()));
+                if !added.transpose()?.unwrap_or(false) {
                     return Ok(None);
                 }
                 Op::AddProperty {
@@ -98,9 +127,12 @@ impl Catalog {
                     property,
                 }
             }
-            Mutation::DropCollection(collection) => Op::DropCollection {
-                collection: self.known(&collection)?.0,
-            },
+            Mutation::DropCollection(collection) => {
+                let (id, _) = self.known(&collection)?;
+                self.schemas.remove(&id);
+                self.names.remove(&collection);
+                Op::DropCollection { collection: id }
+            }
             Mutation::Upsert {
                 collection,
                 id,
@@ -117,47 +149,37 @@ impl Catalog {
                 collection: self.known(&collection)?.0,
                 id,
             },
-        };
-        self.apply(&op)
-            .map_err(|reason| StorageError::corrupt("catalog", reason))?;
-        Ok(Some(op))
+        }))
     }
 
     /// Apply the schema effect of a logged op. An op the catalog cannot apply
     /// means the log does not belong to this state, and the reason is returned.
     pub fn apply(&mut self, op: &Op) -> std::result::Result<(), String> {
+        let unknown = |id: &CollectionId| format!("collection {} is unknown", id.0);
         match op {
-            Op::CreateCollection { id, schema } => {
-                if self.contains(*id) || self.names.contains_key(&schema.name) {
-                    return Err(format!("collection {} is created twice", schema.name));
-                }
-                self.next_id = self.next_id.max(id.0 + 1);
-                self.names.insert(schema.name.clone(), *id);
-                self.schemas.insert(*id, schema.as_ref().clone());
-            }
+            Op::CreateCollection { id, schema } => self.create(*id, schema.as_ref().clone()),
             Op::AddProperty {
                 collection,
                 property,
-            } => {
-                self.schemas
-                    .get_mut(collection)
-                    .ok_or_else(|| format!("property added to unknown collection {collection:?}"))?
-                    .add_property(property.clone())
-                    .map_err(|e| e.to_string())?;
-            }
+            } => self
+                .schemas
+                .get_mut(collection)
+                .ok_or_else(|| unknown(collection))?
+                .add_property(property.clone())
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
             Op::DropCollection { collection } => {
                 let schema = self
                     .schemas
                     .remove(collection)
-                    .ok_or_else(|| format!("unknown collection {collection:?} is dropped"))?;
+                    .ok_or_else(|| unknown(collection))?;
                 self.names.remove(&schema.name);
+                Ok(())
             }
-            Op::Upsert { collection, .. } | Op::Delete { collection, .. } => {
-                if !self.contains(*collection) {
-                    return Err(format!("row written to unknown collection {collection:?}"));
-                }
-            }
+            Op::Upsert { collection, .. } | Op::Delete { collection, .. } => self
+                .contains(*collection)
+                .then_some(())
+                .ok_or_else(|| unknown(collection)),
         }
-        Ok(())
     }
 }

@@ -48,7 +48,13 @@ pub struct Generation(pub u64);
 #[serde(transparent)]
 pub struct LogPosition(pub u64);
 
-/// The object key of a manifest.
+impl LogPosition {
+    pub fn next(self) -> Option<LogPosition> {
+        self.0.checked_add(1).map(LogPosition)
+    }
+}
+
+/// The object key of the newest committed file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ManifestRef(pub String);

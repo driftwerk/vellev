@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,12 +13,15 @@ use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, NodeId,
     ObjectId, Partition as PartitionNumber, Property, TenantId, Value,
 };
-use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, CachedBlobs, Layout, ObjectBlobs};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, LogPosition, ManualClock,
     MemoryCoordinator, PartitionKey,
 };
-use vellev_storage::{Mutation, Partition, State, StorageError, Writer};
+use vellev_storage::format::{
+    self, CollectionId, Kind, LogSegment, Manifest, Row, SegmentFile, SegmentMeta,
+};
+use vellev_storage::{Follower, Mutation, State, StorageError, Writer};
 
 const TTL: Duration = Duration::from_secs(30);
 
@@ -81,6 +84,36 @@ fn n_of(state: &State, collection: &str, object: u8) -> Option<i64> {
             Value::Int(n) => n,
             ref other => panic!("{other:?}"),
         })
+}
+
+#[derive(Debug)]
+struct Observed {
+    inner: Arc<dyn Blobs>,
+    gets: Mutex<Vec<String>>,
+    fail_puts: AtomicBool,
+}
+
+impl Observed {
+    fn fetched(&self) -> Vec<String> {
+        std::mem::take(&mut self.gets.lock().unwrap())
+    }
+}
+
+#[async_trait]
+impl Blobs for Observed {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if self.fail_puts.load(Ordering::SeqCst) {
+            return Err(StorageError::Blob {
+                key: key.into(),
+                source: "connection reset".into(),
+            });
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.gets.lock().unwrap().push(key.to_string());
+        self.inner.get(key).await
+    }
 }
 
 /// One partition's shared infrastructure: object storage and a coordinator.
@@ -152,14 +185,21 @@ impl Cluster {
             .unwrap()
     }
 
-    async fn open(&self) -> Partition {
-        Partition::open(
-            self.key.clone(),
-            self.blobs.clone(),
-            &self.committed().await,
-        )
-        .await
-        .unwrap()
+    async fn open(&self) -> Follower {
+        self.open_on(self.blobs.clone()).await.unwrap()
+    }
+
+    async fn open_on(&self, blobs: Arc<dyn Blobs>) -> vellev_storage::Result<Follower> {
+        Follower::open(self.key.clone(), blobs, &self.committed().await).await
+    }
+
+    /// The store wrapped so that reads are recorded and writes can be failed.
+    fn observed(&self) -> Arc<Observed> {
+        Arc::new(Observed {
+            inner: self.blobs.clone(),
+            gets: Mutex::default(),
+            fail_puts: AtomicBool::new(false),
+        })
     }
 }
 
@@ -183,7 +223,7 @@ async fn data_survives_a_restart_with_nothing_held_locally() {
     drop(writer);
 
     let reopened = cluster.open().await;
-    reopened.read(|state| {
+    reopened.partition().read(|state| {
         assert_eq!(state.position(), position);
         assert_eq!(n_of(state, "notes", 1), Some(10));
         assert_eq!(n_of(state, "notes", 2), Some(21));
@@ -292,7 +332,7 @@ async fn schema_changes_are_durable() {
         if flush {
             writer.flush().await.unwrap();
         }
-        cluster.open().await.read(|state| {
+        cluster.open().await.partition().read(|state| {
             assert!(state
                 .collection(&name("notes"))
                 .unwrap()
@@ -339,9 +379,9 @@ async fn deletes_and_overwrites_hold_across_checkpoints() {
         assert_eq!(state.count(&name("notes")), 2);
     };
     writer.partition().read(expect);
-    cluster.open().await.read(expect);
+    cluster.open().await.partition().read(expect);
     writer.flush().await.unwrap();
-    cluster.open().await.read(expect);
+    cluster.open().await.partition().read(expect);
 }
 
 #[tokio::test]
@@ -370,9 +410,9 @@ async fn a_dropped_collection_does_not_come_back_with_its_rows() {
         assert_eq!(state.count(&name("notes")), 1);
     };
     writer.partition().read(expect);
-    cluster.open().await.read(expect);
+    cluster.open().await.partition().read(expect);
     writer.flush().await.unwrap();
-    cluster.open().await.read(expect);
+    cluster.open().await.partition().read(expect);
 }
 
 #[tokio::test]
@@ -380,7 +420,7 @@ async fn a_follower_catches_up_across_commits_and_checkpoints() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
     let follower = cluster.open().await;
-    assert_eq!(follower.read(State::position), LogPosition(0));
+    assert_eq!(follower.partition().read(State::position), LogPosition(0));
 
     writer
         .commit(vec![create("notes"), upsert("notes", 1, 1)])
@@ -388,7 +428,9 @@ async fn a_follower_catches_up_across_commits_and_checkpoints() {
         .unwrap();
     writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
     follower.catch_up(&cluster.committed().await).await.unwrap();
-    follower.read(|state| assert_eq!(state.count(&name("notes")), 2));
+    follower
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), 2));
 
     writer.flush().await.unwrap();
     writer.commit(vec![delete("notes", 1)]).await.unwrap();
@@ -398,7 +440,7 @@ async fn a_follower_catches_up_across_commits_and_checkpoints() {
         follower.catch_up(&cluster.committed().await).await.unwrap(),
         position
     );
-    follower.read(|state| {
+    follower.partition().read(|state| {
         assert_eq!(n_of(state, "notes", 1), None);
         assert_eq!(n_of(state, "notes", 2), Some(2));
         assert_eq!(n_of(state, "notes", 3), Some(3));
@@ -441,7 +483,7 @@ async fn a_fenced_writer_changes_nothing_and_its_file_is_never_read() {
         .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
 
     let position = successor.commit(vec![upsert("notes", 4, 4)]).await.unwrap();
-    cluster.open().await.read(|state| {
+    cluster.open().await.partition().read(|state| {
         assert_eq!(state.position(), position);
         assert_eq!(n_of(state, "notes", 1), Some(100));
         assert_eq!(n_of(state, "notes", 2), None);
@@ -456,6 +498,7 @@ struct Unreliable {
     inner: Arc<MemoryCoordinator>,
     lose_responses: AtomicUsize,
     refuse_commits: AtomicUsize,
+    hang_after_commit: AtomicBool,
 }
 
 fn lost() -> CoordinatorError {
@@ -494,6 +537,9 @@ impl Coordinator for Unreliable {
             return Err(lost());
         }
         let committed = self.inner.commit(lease, commit).await?;
+        if self.hang_after_commit.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if take(&self.lose_responses) {
             return Err(lost());
         }
@@ -514,6 +560,7 @@ async fn a_lost_commit_response_is_retried_and_an_unknown_outcome_closes_the_wri
         inner: cluster.coordinator.clone(),
         lose_responses: AtomicUsize::new(2),
         refuse_commits: AtomicUsize::new(0),
+        hang_after_commit: AtomicBool::new(false),
     });
     let writer = cluster.writer_on(unreliable.clone()).await;
 
@@ -549,28 +596,244 @@ async fn a_lost_commit_response_is_retried_and_an_unknown_outcome_closes_the_wri
     cluster
         .open()
         .await
+        .partition()
         .read(|state| assert_eq!(n_of(state, "notes", 2), Some(20)));
 }
 
-#[derive(Debug)]
-struct Counting {
-    inner: Arc<dyn Blobs>,
-    gets: AtomicUsize,
+#[tokio::test]
+async fn a_write_the_caller_stopped_waiting_for_closes_the_writer() {
+    let cluster = Cluster::new().await;
+    let unreliable = Arc::new(Unreliable {
+        inner: cluster.coordinator.clone(),
+        lose_responses: AtomicUsize::new(0),
+        refuse_commits: AtomicUsize::new(0),
+        hang_after_commit: AtomicBool::new(false),
+    });
+    let writer = cluster.writer_on(unreliable.clone()).await;
+    writer.commit(vec![create("notes")]).await.unwrap();
+
+    unreliable.hang_after_commit.store(true, Ordering::SeqCst);
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(50),
+        writer.commit(vec![upsert("notes", 1, 1)]),
+    )
+    .await;
+    assert!(abandoned.is_err());
+    unreliable.hang_after_commit.store(false, Ordering::SeqCst);
+
+    let head = cluster.committed().await;
+    for batch in [vec![upsert("notes", 2, 2)], vec![], vec![create("notes")]] {
+        assert!(matches!(
+            writer.commit(batch).await,
+            Err(StorageError::Closed)
+        ));
+    }
+    assert!(matches!(writer.flush().await, Err(StorageError::Closed)));
+    assert_eq!(cluster.committed().await, head);
+    cluster.open().await.partition().read(|state| {
+        assert_eq!(n_of(state, "notes", 1), Some(1));
+        assert_eq!(n_of(state, "notes", 2), None);
+    });
 }
 
-#[async_trait]
-impl Blobs for Counting {
-    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
-        self.inner.put(key, bytes).await
-    }
-    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
-        self.gets.fetch_add(1, Ordering::SeqCst);
-        self.inner.get(key).await
+#[tokio::test]
+async fn a_failed_upload_closes_the_writer() {
+    let cluster = Cluster::new().await;
+    let store = cluster.observed();
+    let (lease, committed) = cluster.lease().await;
+    let writer = Writer::open(
+        store.clone(),
+        cluster.coordinator.clone(),
+        lease,
+        &committed,
+    )
+    .await
+    .unwrap();
+    writer.commit(vec![create("notes")]).await.unwrap();
+
+    store.fail_puts.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        writer.commit(vec![upsert("notes", 1, 1)]).await,
+        Err(StorageError::Blob { .. })
+    ));
+    store.fail_puts.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        writer.commit(vec![upsert("notes", 2, 2)]).await,
+        Err(StorageError::Closed)
+    ));
+    cluster
+        .open()
+        .await
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), 0));
+}
+
+#[tokio::test]
+async fn a_fenced_writer_cannot_checkpoint() {
+    let cluster = Cluster::new().await;
+    let stalled = cluster.writer().await;
+    stalled
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    let successor = cluster.writer().await;
+    let head = cluster.committed().await;
+
+    assert!(matches!(
+        stalled.flush().await,
+        Err(StorageError::Coordinator(CoordinatorError::Fenced { .. }))
+    ));
+    assert_eq!(cluster.committed().await, head);
+    successor.flush().await.unwrap();
+    cluster
+        .open()
+        .await
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
+}
+
+#[tokio::test]
+async fn an_orphan_at_a_committed_position_is_never_read() {
+    let cluster = Cluster::new().await;
+    let stalled = cluster.writer().await;
+    stalled.commit(vec![create("notes")]).await.unwrap();
+    let successor = cluster.writer().await;
+    let position = successor.commit(vec![upsert("notes", 1, 1)]).await.unwrap();
+    stalled
+        .commit(vec![upsert("notes", 1, -1)])
+        .await
+        .unwrap_err();
+
+    let orphan = Layout(&cluster.key).log(position, stalled.lease().generation);
+    cluster
+        .blobs
+        .get(&orphan)
+        .await
+        .expect("the fenced writer did upload its file");
+
+    let store = cluster.observed();
+    let reopened = cluster.open_on(store.clone()).await.unwrap();
+    assert!(!store.fetched().contains(&orphan));
+    reopened
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
+}
+
+#[tokio::test]
+async fn a_follower_fetches_only_what_it_does_not_already_hold() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+
+    let store = cluster.observed();
+    let follower = cluster.open_on(store.clone()).await.unwrap();
+    assert_eq!(store.fetched().len(), 2, "a manifest and its segment");
+
+    writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+    follower.catch_up(&cluster.committed().await).await.unwrap();
+    assert_eq!(store.fetched().len(), 1, "one log segment");
+
+    writer.flush().await.unwrap();
+    writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
+    writer.flush().await.unwrap();
+    follower.catch_up(&cluster.committed().await).await.unwrap();
+    assert_eq!(
+        store.fetched().len(),
+        3,
+        "the newest manifest and the two segments it added"
+    );
+    follower
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), 3));
+}
+
+#[tokio::test]
+async fn an_older_reading_of_the_committed_state_is_ignored() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    let before_checkpoint = cluster.committed().await;
+    writer.flush().await.unwrap();
+    let older = cluster.committed().await;
+    let position = writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+
+    let follower = cluster.open().await;
+    for stale in [&older, &before_checkpoint] {
+        assert_eq!(follower.catch_up(stale).await.unwrap(), position);
+        follower.partition().read(|state| {
+            assert_eq!(state.position(), position);
+            assert_eq!(n_of(state, "notes", 2), Some(2));
+        });
     }
 }
 
 #[tokio::test]
-async fn files_are_read_from_the_store_once_and_then_from_local_disk() {
+async fn a_follower_of_a_replaced_partition_is_told_to_reopen() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    let follower = cluster.open().await;
+
+    cluster.coordinator.remove(&cluster.key).await.unwrap();
+    cluster.coordinator.register(&cluster.key).await.unwrap();
+    let replacement = cluster.writer().await;
+    assert!(matches!(
+        follower.catch_up(&cluster.committed().await).await,
+        Err(StorageError::Diverged { .. })
+    ));
+    replacement.commit(vec![create("other")]).await.unwrap();
+    assert!(matches!(
+        follower.catch_up(&cluster.committed().await).await,
+        Err(StorageError::Diverged { .. })
+    ));
+    follower
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
+}
+
+#[tokio::test]
+async fn a_checkpoint_is_written_for_schema_only_history_and_holds_no_empty_segment() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer.commit(vec![create("notes")]).await.unwrap();
+    writer.commit(vec![upsert("notes", 1, 1)]).await.unwrap();
+    writer
+        .commit(vec![
+            Mutation::DropCollection(name("notes")),
+            create("other"),
+        ])
+        .await
+        .unwrap();
+    let position = writer.flush().await.unwrap();
+
+    let head = cluster.committed().await.manifest.unwrap().0;
+    let manifest: Manifest = format::decode(
+        &head,
+        Kind::Manifest,
+        &cluster.blobs.get(&head).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.position, position);
+    assert_eq!(manifest.segments, vec![]);
+    assert_eq!(manifest.collections.len(), 1);
+    cluster.open().await.partition().read(|state| {
+        assert!(state.collection(&name("notes")).is_none());
+        assert!(state.collection(&name("other")).is_some());
+    });
+}
+
+#[tokio::test]
+async fn files_are_read_from_the_store_once_and_a_damaged_cache_entry_is_refetched() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
     writer
@@ -581,25 +844,203 @@ async fn files_are_read_from_the_store_once_and_then_from_local_disk() {
     writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Counting {
-        inner: cluster.blobs.clone(),
-        gets: AtomicUsize::new(0),
-    });
+    let store = cluster.observed();
     let cached: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(store.clone(), dir.path()));
-    let committed = cluster.committed().await;
+    let count = |follower: Follower| {
+        follower
+            .partition()
+            .read(|state| state.count(&name("notes")))
+    };
 
-    let first = Partition::open(cluster.key.clone(), cached.clone(), &committed)
-        .await
-        .unwrap();
-    let fetched = store.gets.load(Ordering::SeqCst);
-    assert_eq!(fetched, 3, "a log segment, a manifest and a segment");
-    let second = Partition::open(cluster.key.clone(), cached, &committed)
-        .await
-        .unwrap();
-    assert_eq!(store.gets.load(Ordering::SeqCst), fetched);
-    for partition in [first, second] {
-        partition.read(|state| assert_eq!(state.count(&name("notes")), 2));
+    assert_eq!(count(cluster.open_on(cached.clone()).await.unwrap()), 2);
+    assert_eq!(
+        store.fetched().len(),
+        3,
+        "a log segment, a manifest and a segment"
+    );
+    assert_eq!(count(cluster.open_on(cached.clone()).await.unwrap()), 2);
+    assert_eq!(store.fetched(), Vec::<String>::new());
+
+    let head = cluster.committed().await.manifest.unwrap().0;
+    std::fs::write(dir.path().join(&head), b"").unwrap();
+    assert_eq!(count(cluster.open_on(cached.clone()).await.unwrap()), 2);
+    assert_eq!(store.fetched(), vec![head]);
+    assert_eq!(count(cluster.open_on(cached).await.unwrap()), 2);
+    assert_eq!(store.fetched(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn the_cache_never_reads_or_writes_outside_its_directory() {
+    let outside = tempfile::tempdir().unwrap();
+    let dir = outside.path().join("cache");
+    let store: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let cached = CachedBlobs::new(store.clone(), &dir);
+    let frame = format::encode(
+        Kind::Segment,
+        &SegmentFile {
+            position: LogPosition(1),
+            rows: vec![],
+            tombstones: vec![],
+        },
+    )
+    .unwrap();
+    std::fs::write(outside.path().join("secret"), &frame).unwrap();
+
+    assert!(matches!(
+        cached.get("../secret").await,
+        Err(StorageError::Missing { .. })
+    ));
+    let absolute = outside.path().join("secret");
+    assert!(cached.get(absolute.to_str().unwrap()).await.is_err());
+    cached.put("a/../../planted", frame).await.unwrap();
+    assert!(!outside.path().join("planted").exists());
+}
+
+/// A partition whose committed head is a hand-made file.
+async fn forged(
+    cluster: &Cluster,
+    files: Vec<(String, Bytes)>,
+    position: u64,
+) -> vellev_storage::Result<Follower> {
+    for (key, frame) in &files {
+        cluster.blobs.put(key, frame.clone()).await.unwrap();
     }
+    let committed = Committed {
+        log_position: LogPosition(position),
+        manifest: files
+            .last()
+            .map(|(key, _)| vellev_storage::coordinator::ManifestRef(key.clone())),
+        ..cluster.committed().await
+    };
+    Follower::open(cluster.key.clone(), cluster.blobs.clone(), &committed).await
+}
+
+fn manifest_of(segments: Vec<SegmentMeta>) -> Manifest {
+    Manifest {
+        position: LogPosition(1),
+        next_collection_id: 1,
+        collections: vec![(CollectionId(0), schema("notes"))],
+        segments,
+    }
+}
+
+#[tokio::test]
+async fn a_history_that_loops_or_skips_a_position_is_refused() {
+    let cluster = Cluster::new().await;
+    let key = |position| {
+        Layout(&cluster.key).log(
+            LogPosition(position),
+            vellev_storage::coordinator::Generation(1),
+        )
+    };
+    let log = |position, prev: Option<String>| {
+        format::encode(
+            Kind::Log,
+            &LogSegment {
+                position: LogPosition(position),
+                prev,
+                ops: vec![],
+            },
+        )
+        .unwrap()
+    };
+
+    let looping = vec![(key(1), log(1, Some(key(1))))];
+    assert!(matches!(
+        forged(&cluster, looping, 1).await,
+        Err(StorageError::Diverged { .. })
+    ));
+
+    let skipping = vec![(key(1), log(1, None)), (key(3), log(3, Some(key(1))))];
+    assert!(matches!(
+        forged(&cluster, skipping, 3).await,
+        Err(StorageError::Corrupt { key: k, .. }) if k == key(1)
+    ));
+
+    let mislabelled = vec![(key(2), log(2, None))];
+    assert!(matches!(
+        forged(&cluster, mislabelled, 5).await,
+        Err(StorageError::Corrupt { key: k, .. }) if k == key(2)
+    ));
+}
+
+#[tokio::test]
+async fn a_checkpoint_that_contradicts_itself_is_refused() {
+    let cluster = Cluster::new().await;
+    let layout = Layout(&cluster.key);
+    let generation = vellev_storage::coordinator::Generation(1);
+    let segment_key = layout.segment(LogPosition(1), generation);
+    let manifest_key = layout.manifest(LogPosition(1), generation);
+    let row = |object: u8| Row {
+        collection: CollectionId(0),
+        object: vellev_core::Object {
+            id: id(object),
+            properties: Default::default(),
+            vector: None,
+        },
+    };
+    let segment = |rows: Vec<Row>| {
+        format::encode(
+            Kind::Segment,
+            &SegmentFile {
+                position: LogPosition(1),
+                rows,
+                tombstones: vec![],
+            },
+        )
+        .unwrap()
+    };
+    let listing = |key: &str, rows: u64| {
+        format::encode(
+            Kind::Manifest,
+            &manifest_of(vec![SegmentMeta {
+                key: key.into(),
+                rows,
+                tombstones: 0,
+            }]),
+        )
+        .unwrap()
+    };
+    let refused = |files: Vec<(String, Bytes)>| async {
+        match forged(&cluster, files, 1).await {
+            Err(StorageError::Corrupt { key, .. }) => key,
+            other => panic!("{other:?}"),
+        }
+    };
+
+    let repeated = vec![
+        (segment_key.clone(), segment(vec![row(1), row(1)])),
+        (manifest_key.clone(), listing(&segment_key, 2)),
+    ];
+    assert_eq!(refused(repeated).await, segment_key);
+
+    let miscounted = vec![
+        (segment_key.clone(), segment(vec![row(1)])),
+        (manifest_key.clone(), listing(&segment_key, 2)),
+    ];
+    assert_eq!(refused(miscounted).await, segment_key);
+
+    let foreign = "tenant-b/0/segment/1.segment";
+    let trespassing = vec![(manifest_key.clone(), listing(foreign, 0))];
+    assert_eq!(refused(trespassing).await, foreign);
+
+    let mut duplicate_ids = manifest_of(vec![]);
+    duplicate_ids
+        .collections
+        .push((CollectionId(0), schema("other")));
+    let duplicated = vec![(
+        manifest_key.clone(),
+        format::encode(Kind::Manifest, &duplicate_ids).unwrap(),
+    )];
+    assert_eq!(refused(duplicated).await, manifest_key);
+
+    let mut reusable_id = manifest_of(vec![]);
+    reusable_id.next_collection_id = 0;
+    let reusable = vec![(
+        manifest_key.clone(),
+        format::encode(Kind::Manifest, &reusable_id).unwrap(),
+    )];
+    assert_eq!(refused(reusable).await, manifest_key);
 }
 
 #[tokio::test]
@@ -610,31 +1051,32 @@ async fn a_damaged_or_missing_file_stops_recovery_with_its_name() {
         .commit(vec![create("notes"), upsert("notes", 1, 1)])
         .await
         .unwrap();
-    let committed = cluster.committed().await;
-    let head = committed.manifest.clone().unwrap().0;
+    writer.flush().await.unwrap();
+    writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+    writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
 
-    let mut damaged = cluster.blobs.get(&head).await.unwrap().to_vec();
-    *damaged.last_mut().unwrap() ^= 0xff;
-    let broken: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
-    broken.put(&head, Bytes::from(damaged)).await.unwrap();
-    assert!(matches!(
-        Partition::open(cluster.key.clone(), broken, &committed).await,
-        Err(StorageError::Corrupt { key, .. }) if key == head
-    ));
+    let store = cluster.observed();
+    cluster.open_on(store.clone()).await.unwrap();
+    let files = store.fetched();
+    assert_eq!(files.len(), 4, "two log segments, a manifest and a segment");
+
+    for file in &files {
+        let healthy = cluster.blobs.get(file).await.unwrap();
+        let mut damaged = healthy.to_vec();
+        *damaged.last_mut().unwrap() ^= 0xff;
+        cluster.blobs.put(file, Bytes::from(damaged)).await.unwrap();
+        assert!(
+            matches!(cluster.open_on(cluster.blobs.clone()).await, Err(StorageError::Corrupt { key, .. }) if key == *file),
+            "{file}"
+        );
+        cluster.blobs.put(file, healthy).await.unwrap();
+    }
+    cluster.open().await;
 
     let empty: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
     assert!(matches!(
-        Partition::open(cluster.key.clone(), empty, &committed).await,
-        Err(StorageError::Missing { key }) if key == head
-    ));
-
-    let behind = Committed {
-        log_position: LogPosition(committed.log_position.0 + 1),
-        ..committed
-    };
-    assert!(matches!(
-        Partition::open(cluster.key.clone(), cluster.blobs.clone(), &behind).await,
-        Err(StorageError::Corrupt { .. })
+        cluster.open_on(empty).await,
+        Err(StorageError::Missing { key }) if key == files[0]
     ));
 }
 
@@ -652,6 +1094,7 @@ enum Change {
 #[derive(Debug, Clone)]
 enum Action {
     Commit(Vec<Change>),
+    Rejected(Vec<Change>),
     Flush,
     Restart,
     Takeover,
@@ -670,24 +1113,50 @@ impl Change {
         }
     }
 
-    /// The change applied to the model, or `None` when the storage layer must reject it.
-    fn applied(&self, mut model: Model) -> Option<Model> {
+    fn collection(&self) -> usize {
         match *self {
-            Change::Create(c) => model
-                .insert(COLLECTIONS[c], BTreeMap::new())
-                .is_none()
-                .then_some(model),
-            Change::Drop(c) => model.remove(COLLECTIONS[c]).map(|_| model),
+            Change::Create(c) | Change::Drop(c) | Change::Upsert(c, ..) | Change::Delete(c, _) => c,
+        }
+    }
+
+    fn applied(&self, model: &mut Model) {
+        match *self {
+            Change::Create(c) => {
+                model.insert(COLLECTIONS[c], BTreeMap::new());
+            }
+            Change::Drop(c) => {
+                model.remove(COLLECTIONS[c]);
+            }
             Change::Upsert(c, object, n) => {
-                model.get_mut(COLLECTIONS[c])?.insert(object, n);
-                Some(model)
+                model.get_mut(COLLECTIONS[c]).unwrap().insert(object, n);
             }
             Change::Delete(c, object) => {
-                model.get_mut(COLLECTIONS[c])?.remove(&object);
-                Some(model)
+                model.get_mut(COLLECTIONS[c]).unwrap().remove(&object);
             }
         }
     }
+}
+
+/// Make every change valid for the model it meets, by first creating a
+/// missing collection or dropping one that is in the way, so that generated
+/// histories spend their time writing rows rather than being rejected.
+fn valid_batch(changes: Vec<Change>, model: &mut Model) -> Vec<Change> {
+    changes
+        .into_iter()
+        .flat_map(|change| {
+            let c = change.collection();
+            let exists = model.contains_key(COLLECTIONS[c]);
+            let prelude = match (&change, exists) {
+                (Change::Create(_), true) => Some(Change::Drop(c)),
+                (Change::Create(_), false) => None,
+                (_, false) => Some(Change::Create(c)),
+                (_, true) => None,
+            };
+            let steps: Vec<Change> = prelude.into_iter().chain([change]).collect();
+            steps.iter().for_each(|step| step.applied(model));
+            steps
+        })
+        .collect()
 }
 
 fn change() -> impl Strategy<Value = Change> {
@@ -695,18 +1164,20 @@ fn change() -> impl Strategy<Value = Change> {
     prop_oneof![
         1 => collection.clone().prop_map(Change::Create),
         1 => collection.clone().prop_map(Change::Drop),
-        6 => (collection.clone(), 0..IDS, -3i64..4).prop_map(|(c, o, n)| Change::Upsert(c, o, n)),
-        3 => (collection, 0..IDS).prop_map(|(c, o)| Change::Delete(c, o)),
+        12 => (collection.clone(), 0..IDS, -3i64..4).prop_map(|(c, o, n)| Change::Upsert(c, o, n)),
+        5 => (collection, 0..IDS).prop_map(|(c, o)| Change::Delete(c, o)),
     ]
 }
 
 fn action() -> impl Strategy<Value = Action> {
+    let changes = || prop::collection::vec(change(), 1..5);
     prop_oneof![
-        8 => prop::collection::vec(change(), 0..5).prop_map(Action::Commit),
-        3 => Just(Action::Flush),
+        10 => changes().prop_map(Action::Commit),
+        1 => changes().prop_map(Action::Rejected),
+        4 => Just(Action::Flush),
         2 => Just(Action::Restart),
         2 => Just(Action::Takeover),
-        2 => Just(Action::Follow),
+        3 => Just(Action::Follow),
     ]
 }
 
@@ -735,6 +1206,7 @@ fn assert_matches_model(state: &State, model: &Model, context: &str) {
         );
         assert_eq!(state.count(&name(collection)), expected.len(), "{context}");
     }
+    assert_eq!(state.collections().count(), model.len(), "{context}");
 }
 
 async fn run(actions: Vec<Action>) {
@@ -747,19 +1219,26 @@ async fn run(actions: Vec<Action>) {
         let context = format!("step {step}: {action:?}");
         match action {
             Action::Commit(changes) => {
-                let next = changes
-                    .iter()
-                    .try_fold(model.clone(), |m, change| change.applied(m));
-                let outcome = writer
-                    .commit(changes.iter().map(Change::mutation).collect())
+                let batch = valid_batch(changes, &mut model);
+                let position = writer.partition().read(State::position);
+                let committed = writer
+                    .commit(batch.iter().map(Change::mutation).collect())
                     .await;
-                match next {
-                    Some(next) => {
-                        outcome.unwrap_or_else(|e| panic!("{context}: {e}"));
-                        model = next;
-                    }
-                    None => assert!(outcome.is_err(), "{context}"),
-                }
+                assert_eq!(committed.unwrap(), position.next().unwrap(), "{context}");
+            }
+            Action::Rejected(changes) => {
+                let batch = valid_batch(changes, &mut model.clone());
+                let mutations = batch
+                    .iter()
+                    .map(Change::mutation)
+                    .chain([upsert("missing", 0, 0)]);
+                assert!(
+                    matches!(
+                        writer.commit(mutations.collect()).await,
+                        Err(StorageError::UnknownCollection(_))
+                    ),
+                    "{context}"
+                );
             }
             Action::Flush => {
                 writer.flush().await.unwrap();
@@ -767,17 +1246,7 @@ async fn run(actions: Vec<Action>) {
             Action::Restart => writer = cluster.writer().await,
             Action::Takeover => {
                 let stalled = std::mem::replace(&mut writer, cluster.writer().await);
-                let attempt = stalled
-                    .commit(vec![create("a"), Mutation::DropCollection(name("a"))])
-                    .await;
-                let attempt = match attempt {
-                    Err(StorageError::CollectionExists(_)) => {
-                        stalled
-                            .commit(vec![Mutation::DropCollection(name("a")), create("a")])
-                            .await
-                    }
-                    other => other,
-                };
+                let attempt = stalled.commit(vec![create("fence_probe")]).await;
                 assert!(
                     matches!(
                         attempt,
@@ -788,7 +1257,9 @@ async fn run(actions: Vec<Action>) {
             }
             Action::Follow => {
                 follower.catch_up(&cluster.committed().await).await.unwrap();
-                follower.read(|state| assert_matches_model(state, &model, &context));
+                follower
+                    .partition()
+                    .read(|state| assert_matches_model(state, &model, &context));
             }
         }
         writer
@@ -803,9 +1274,12 @@ async fn run(actions: Vec<Action>) {
     cluster
         .open()
         .await
+        .partition()
         .read(|state| assert_matches_model(state, &model, "reopened at the end"));
     follower.catch_up(&cluster.committed().await).await.unwrap();
-    follower.read(|state| assert_matches_model(state, &model, "follower at the end"));
+    follower
+        .partition()
+        .read(|state| assert_matches_model(state, &model, "follower at the end"));
 }
 
 proptest! {
@@ -813,8 +1287,12 @@ proptest! {
 
     #[test]
     fn any_history_of_commits_flushes_restarts_and_takeovers_matches_a_plain_map(
-        actions in prop::collection::vec(action(), 1..40)
+        actions in prop::collection::vec(action(), 1..60)
     ) {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(run(actions));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(run(actions));
     }
 }

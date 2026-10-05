@@ -1,29 +1,36 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
+use bytes::Bytes;
 use futures::future::try_join_all;
 use tokio::sync::Mutex;
 
 use crate::blobs::{Blobs, Layout};
 use crate::catalog::Mutation;
 use crate::coordinator::{
-    Commit, Committed, Coordinator, CoordinatorError, Lease, LogPosition, ManifestRef, PartitionKey,
+    Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
 };
 use crate::format::{decode, decode_head, encode, Head, Kind, LogSegment, Manifest, SegmentFile};
 use crate::state::State;
 use crate::{Result, StorageError};
 
-/// How many times a commit whose outcome is unknown is repeated before the
-/// writer gives up. Repeating is safe because the coordinator accepts an
-/// identical commit twice.
-const COMMIT_ATTEMPTS: usize = 3;
+/// How many times a commit whose outcome is unknown is tried. Repeating is
+/// safe because the coordinator accepts an identical commit twice.
+const COMMIT_ATTEMPTS: u32 = 3;
+const COMMIT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
-/// A partition's committed data, readable on any node.
+/// A partition's committed data in memory. It only ever moves forward, and
+/// only through its [`Follower`] or [`Writer`].
 #[derive(Debug)]
 pub struct Partition {
     key: PartitionKey,
     blobs: Arc<dyn Blobs>,
     state: RwLock<State>,
+    /// Serialises catch-up, and remembers the newest coordinator generation
+    /// seen so an older reading of the committed state is recognised as stale.
+    seen: Mutex<Generation>,
 }
 
 /// The committed commits between a state and a newer head, oldest first, and
@@ -35,21 +42,6 @@ struct Tail {
 }
 
 impl Partition {
-    /// Load the partition exactly as committed.
-    pub async fn open(
-        key: PartitionKey,
-        blobs: Arc<dyn Blobs>,
-        committed: &Committed,
-    ) -> Result<Self> {
-        let partition = Self {
-            key,
-            blobs,
-            state: RwLock::new(State::default()),
-        };
-        partition.catch_up(committed).await?;
-        Ok(partition)
-    }
-
     pub fn key(&self) -> &PartitionKey {
         &self.key
     }
@@ -59,60 +51,99 @@ impl Partition {
         f(&self.state.read().expect("partition lock"))
     }
 
-    /// Bring this copy up to `committed`, reading only files reachable from
-    /// its head. Returns the position reached.
-    pub async fn catch_up(&self, committed: &Committed) -> Result<LogPosition> {
+    async fn load(key: PartitionKey, blobs: Arc<dyn Blobs>, committed: &Committed) -> Result<Self> {
+        let partition = Self {
+            key,
+            blobs,
+            state: RwLock::new(State::default()),
+            seen: Mutex::new(Generation(0)),
+        };
+        partition.advance(committed).await?;
+        Ok(partition)
+    }
+
+    /// A file named by data rather than built by [`Layout`]: it must belong
+    /// to this partition before it is fetched.
+    async fn fetch(&self, key: &str) -> Result<Bytes> {
+        if !key.starts_with(&Layout(&self.key).prefix()) {
+            return Err(StorageError::corrupt(
+                key,
+                "the key belongs to another partition",
+            ));
+        }
+        self.blobs.get(key).await
+    }
+
+    async fn advance(&self, committed: &Committed) -> Result<LogPosition> {
+        let mut seen = self.seen.lock().await;
         let (position, head) =
             self.read(|state| (state.position(), state.head().map(String::from)));
         let target = committed.manifest.as_ref().map(|head| head.0.as_str());
-        if target == head.as_deref() && committed.log_position == position {
+        let stale = committed.generation <= *seen && committed.log_position < position;
+        if stale || (committed.log_position == position && target == head.as_deref()) {
             return Ok(position);
         }
-        let tail = self.tail(target, head.as_deref()).await?;
-        let mut state = match tail.checkpoint {
-            Some((key, manifest)) => self.restore(&key, manifest).await?,
-            None => self.read(State::clone),
-        };
-        for (key, log) in &tail.logs {
-            state.apply(key, log)?;
+        if committed.log_position <= position {
+            return Err(StorageError::Diverged { head });
         }
-        if state.position() != committed.log_position {
-            return Err(StorageError::corrupt(
-                target.unwrap_or("the empty head"),
-                format!(
-                    "head is at {:?}, and the coordinator committed {:?}",
-                    state.position(),
-                    committed.log_position
-                ),
-            ));
+        let tail = self.tail(committed, position, head.as_deref()).await?;
+        match tail.checkpoint {
+            Some((key, manifest)) => {
+                let mut state = self.restore(&key, manifest).await?;
+                tail.logs
+                    .iter()
+                    .try_for_each(|(key, log)| state.apply(key, log))?;
+                *self.state.write().expect("partition lock") = state;
+            }
+            None => {
+                let mut state = self.state.write().expect("partition lock");
+                tail.logs
+                    .iter()
+                    .try_for_each(|(key, log)| state.apply(key, log))?;
+            }
         }
-        *self.state.write().expect("partition lock") = state;
+        *seen = committed.generation.max(*seen);
         Ok(committed.log_position)
     }
 
-    /// Walk back from `target` until reaching `known`, a checkpoint, or the
-    /// start of the partition's history.
-    async fn tail(&self, target: Option<&str>, known: Option<&str>) -> Result<Tail> {
+    /// Walk back from the committed head until reaching the head this copy
+    /// is at, or a checkpoint. Each file must sit exactly one position below
+    /// the one that named it, so the walk is bounded and cannot loop.
+    async fn tail(
+        &self,
+        committed: &Committed,
+        position: LogPosition,
+        known: Option<&str>,
+    ) -> Result<Tail> {
         let mut logs = Vec::new();
-        let mut cursor = target.map(String::from);
+        let mut cursor = committed.manifest.as_ref().map(|head| head.0.clone());
+        let mut expected = committed.log_position;
         let checkpoint = loop {
-            match cursor {
-                None if known.is_none() => break None,
-                None => {
-                    let lost = known.unwrap_or_default();
-                    return Err(StorageError::corrupt(
-                        lost,
-                        "the committed history does not include it",
-                    ));
+            let key = match cursor {
+                reached if reached.as_deref() == known && expected == position => break None,
+                Some(key) if expected > position => key,
+                _ => {
+                    return Err(StorageError::Diverged {
+                        head: known.map(String::from),
+                    })
                 }
-                Some(key) if Some(key.as_str()) == known => break None,
-                Some(key) => match decode_head(&key, &self.blobs.get(&key).await?)? {
-                    Head::Manifest(manifest) => break Some((key, manifest)),
-                    Head::Log(log) => {
-                        cursor = log.prev.clone();
-                        logs.push((key, log));
-                    }
-                },
+            };
+            let head = decode_head(&key, &self.fetch(&key).await?)?;
+            let found = match &head {
+                Head::Log(log) => log.position,
+                Head::Manifest(manifest) => manifest.position,
+            };
+            if found != expected {
+                let reason = format!("it is at {found:?} where {expected:?} was committed");
+                return Err(StorageError::corrupt(&key, reason));
+            }
+            match head {
+                Head::Manifest(manifest) => break Some((key, manifest)),
+                Head::Log(log) => {
+                    expected = LogPosition(expected.0 - 1);
+                    cursor = log.prev.clone();
+                    logs.push((key, log));
+                }
             }
         };
         logs.reverse();
@@ -131,19 +162,54 @@ impl Partition {
             async move {
                 match loaded {
                     Some(file) => Ok(file),
-                    None => decode(&meta.key, Kind::Segment, &self.blobs.get(&meta.key).await?)
+                    None => decode(&meta.key, Kind::Segment, &self.fetch(&meta.key).await?)
                         .map(Arc::new),
                 }
             }
         }))
         .await?;
-        Ok(State::from_manifest(key, manifest, files))
+        State::from_manifest(key, manifest, files)
+    }
+}
+
+/// A read-only copy of a partition that follows what the writer commits.
+#[derive(Debug, Clone)]
+pub struct Follower(Arc<Partition>);
+
+impl Follower {
+    /// Load the partition exactly as committed.
+    pub async fn open(
+        key: PartitionKey,
+        blobs: Arc<dyn Blobs>,
+        committed: &Committed,
+    ) -> Result<Self> {
+        Partition::load(key, blobs, committed)
+            .await
+            .map(Arc::new)
+            .map(Self)
+    }
+
+    pub fn partition(&self) -> &Arc<Partition> {
+        &self.0
+    }
+
+    /// Bring this copy up to `committed`, reading only files reachable from
+    /// its head, and return the position it is now at. A reading of the
+    /// committed state older than one already applied is ignored.
+    pub async fn catch_up(&self, committed: &Committed) -> Result<LogPosition> {
+        self.0.advance(committed).await
     }
 }
 
 /// The one node allowed to change a partition, for as long as its lease's
 /// generation is current. Nothing it writes is visible, here or anywhere,
 /// until the coordinator has accepted the commit.
+///
+/// A file's name is fixed by its position and the lease's generation, so a
+/// writer must never attempt the same position twice. From the first upload
+/// of an attempt until it is applied in memory the writer is closed, and it
+/// reopens only on success: an error, or a caller that stops waiting, leaves
+/// it closed for good.
 #[derive(Debug)]
 pub struct Writer {
     partition: Arc<Partition>,
@@ -160,7 +226,7 @@ impl Writer {
         lease: Lease,
         committed: &Committed,
     ) -> Result<Self> {
-        let partition = Arc::new(Partition::open(lease.key.clone(), blobs, committed).await?);
+        let partition = Arc::new(Partition::load(lease.key.clone(), blobs, committed).await?);
         Ok(Self {
             partition,
             coordinator,
@@ -181,13 +247,13 @@ impl Writer {
     /// rejected mutation fails the whole batch and changes nothing.
     pub async fn commit(&self, mutations: Vec<Mutation>) -> Result<LogPosition> {
         let mut open = self.open.lock().await;
-        let (position, prev, mut catalog) = self.partition.read(|state| {
+        let (position, prev, mut catalog) = self.snapshot(&open, |state| {
             (
                 state.position(),
                 state.head().map(String::from),
                 state.catalog().clone(),
             )
-        });
+        })?;
         let ops = mutations
             .into_iter()
             .filter_map(|mutation| catalog.resolve(mutation).transpose())
@@ -196,18 +262,21 @@ impl Writer {
             return Ok(position);
         }
         let log = LogSegment {
-            position: LogPosition(position.0 + 1),
+            position: self.following(position)?,
             prev,
             ops,
         };
         let key = Layout(&self.lease.key).log(log.position, self.lease.generation);
-        self.publish(&mut open, &key, encode(Kind::Log, &log)?, log.position)
-            .await?;
-        self.partition
-            .state
-            .write()
-            .expect("partition lock")
-            .apply(&key, &log)?;
+        let frame = encode(Kind::Log, &log)?;
+        attempt(&mut open, async {
+            self.publish(&key, frame, log.position).await?;
+            self.partition
+                .state
+                .write()
+                .expect("partition lock")
+                .apply(&key, &log)
+        })
+        .await?;
         Ok(log.position)
     }
 
@@ -215,69 +284,75 @@ impl Writer {
     /// commit a manifest, so recovery no longer needs the log before it.
     pub async fn flush(&self) -> Result<LogPosition> {
         let mut open = self.open.lock().await;
-        let (position, unflushed) = self
-            .partition
-            .read(|state| (state.position(), state.has_unflushed_writes()));
-        if !unflushed {
+        let (position, pending) = self.snapshot(&open, |state| {
+            (state.position(), state.has_commits_since_checkpoint())
+        })?;
+        if !pending {
             return Ok(position);
         }
-        let position = LogPosition(position.0 + 1);
+        let position = self.following(position)?;
         let layout = Layout(&self.lease.key);
         let segment_key = layout.segment(position, self.lease.generation);
+        let key = layout.manifest(position, self.lease.generation);
         let (segment, manifest) = self
             .partition
             .read(|state| state.checkpoint(position, &segment_key));
-        if let Some(segment) = &segment {
-            self.put(&mut open, &segment_key, encode(Kind::Segment, segment)?)
-                .await?;
-        }
-        let key = layout.manifest(position, self.lease.generation);
-        self.publish(
-            &mut open,
-            &key,
-            encode(Kind::Manifest, &manifest)?,
-            position,
-        )
+        let segment_frame = segment
+            .as_ref()
+            .map(|s| encode(Kind::Segment, s))
+            .transpose()?;
+        let frame = encode(Kind::Manifest, &manifest)?;
+        attempt(&mut open, async {
+            if let Some(segment_frame) = segment_frame {
+                self.partition
+                    .blobs
+                    .put(&segment_key, segment_frame)
+                    .await?;
+            }
+            self.publish(&key, frame, position).await?;
+            let mut state = self.partition.state.write().expect("partition lock");
+            state.checkpointed(&key, &manifest, segment)
+        })
         .await?;
-        self.partition
-            .state
-            .write()
-            .expect("partition lock")
-            .checkpointed(&key, &manifest, segment);
         Ok(position)
     }
 
-    async fn put(&self, open: &mut bool, key: &str, frame: bytes::Bytes) -> Result<()> {
-        if !*open {
-            return Err(StorageError::Closed);
-        }
-        self.partition.blobs.put(key, frame).await
+    fn snapshot<T>(&self, open: &bool, f: impl FnOnce(&State) -> T) -> Result<T> {
+        open.then(|| self.partition.read(f))
+            .ok_or(StorageError::Closed)
     }
 
-    /// Upload a head file and commit it. Once the upload has happened, any
-    /// failure to commit leaves the outcome unknown, so the writer closes.
-    async fn publish(
-        &self,
-        open: &mut bool,
-        key: &str,
-        frame: bytes::Bytes,
-        position: LogPosition,
-    ) -> Result<()> {
-        self.put(open, key, frame).await?;
+    fn following(&self, position: LogPosition) -> Result<LogPosition> {
+        position
+            .next()
+            .ok_or_else(|| StorageError::Encode(format!("{} is out of positions", self.lease.key)))
+    }
+
+    /// Upload a head file and commit it.
+    async fn publish(&self, key: &str, frame: Bytes, position: LogPosition) -> Result<()> {
+        self.partition.blobs.put(key, frame).await?;
         let commit = Commit {
             log_position: position,
             manifest: Some(ManifestRef(key.to_string())),
         };
-        let mut outcome = self.coordinator.commit(&self.lease, commit.clone()).await;
-        for _ in 1..COMMIT_ATTEMPTS {
-            if !matches!(&outcome, Err(error) if error.is_retryable()) {
-                break;
+        let mut attempt = 1;
+        loop {
+            match self.coordinator.commit(&self.lease, commit.clone()).await {
+                Err(error) if error.is_retryable() && attempt < COMMIT_ATTEMPTS => {
+                    tokio::time::sleep(COMMIT_RETRY_DELAY * attempt).await;
+                    attempt += 1;
+                }
+                outcome => return outcome.map(|_| ()).map_err(Into::into),
             }
-            outcome = self.coordinator.commit(&self.lease, commit.clone()).await;
         }
-        outcome.map(|_| ()).map_err(|error: CoordinatorError| {
-            *open = false;
-            error.into()
-        })
     }
+}
+
+/// Run one write attempt with the writer closed, reopening it only if the
+/// attempt ran to completion and succeeded.
+async fn attempt<T>(open: &mut bool, work: impl Future<Output = Result<T>>) -> Result<T> {
+    *open = false;
+    let done = work.await?;
+    *open = true;
+    Ok(done)
 }

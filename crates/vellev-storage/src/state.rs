@@ -42,6 +42,7 @@ pub struct State {
     segments: Vec<Segment>,
     memtable: Memtable,
     live: HashMap<RowKey, Location>,
+    commits_since_checkpoint: usize,
 }
 
 fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a Row> {
@@ -60,8 +61,8 @@ impl State {
         self.head.as_deref()
     }
 
-    pub fn catalog(&self) -> &Catalog {
-        &self.catalog
+    pub fn collections(&self) -> impl Iterator<Item = &Collection> {
+        self.catalog.collections().map(|(_, schema)| schema)
     }
 
     pub fn collection(&self, name: &CollectionName) -> Option<&Collection> {
@@ -93,14 +94,19 @@ impl State {
         self.scan(collection).count()
     }
 
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     pub(crate) fn segment_files(&self) -> impl Iterator<Item = (&str, &Arc<SegmentFile>)> {
         self.segments
             .iter()
             .map(|segment| (segment.meta.key.as_str(), &segment.file))
     }
 
-    pub(crate) fn has_unflushed_writes(&self) -> bool {
-        !self.memtable.rows.is_empty() || !self.memtable.tombstones.is_empty()
+    /// Whether recovery would have to replay log on top of the last checkpoint.
+    pub(crate) fn has_commits_since_checkpoint(&self) -> bool {
+        self.commits_since_checkpoint > 0
     }
 
     fn mark_dead(&mut self, location: Location) {
@@ -127,59 +133,74 @@ impl State {
         key: &str,
         manifest: Manifest,
         files: Vec<Arc<SegmentFile>>,
-    ) -> Self {
-        let mut state = State {
+    ) -> Result<Self> {
+        let catalog = Catalog::restore(manifest.next_collection_id, manifest.collections)
+            .map_err(|reason| StorageError::corrupt(key, reason))?;
+        let state = State {
             position: manifest.position,
             head: Some(key.to_string()),
-            catalog: Catalog::restore(manifest.next_collection_id, manifest.collections),
+            catalog,
             ..State::default()
         };
-        for (meta, file) in manifest.segments.into_iter().zip(files) {
-            state.attach(meta, file);
-        }
-        state
+        manifest
+            .segments
+            .into_iter()
+            .zip(files)
+            .try_fold(state, |mut state, (meta, file)| {
+                state.attach(meta, file)?;
+                Ok(state)
+            })
     }
 
-    fn attach(&mut self, meta: SegmentMeta, file: Arc<SegmentFile>) {
+    fn attach(&mut self, meta: SegmentMeta, file: Arc<SegmentFile>) -> Result<()> {
+        let corrupt = |reason: &str| StorageError::corrupt(&meta.key, reason);
+        if (file.rows.len() as u64, file.tombstones.len() as u64) != (meta.rows, meta.tombstones) {
+            return Err(corrupt("row or tombstone count differs from the manifest"));
+        }
         let index = self.segments.len();
         for key in &file.tombstones {
             self.forget(*key);
         }
-        let dead = file
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(row, Row { collection, object })| {
-                if !self.catalog.contains(*collection) {
-                    return true;
+        let mut dead = Vec::with_capacity(file.rows.len());
+        for (row, Row { collection, object }) in file.rows.iter().enumerate() {
+            let live = self.catalog.contains(*collection);
+            if live {
+                match self
+                    .live
+                    .insert((*collection, object.id), Location::Segment(index, row))
+                {
+                    Some(Location::Segment(segment, _)) if segment == index => {
+                        return Err(corrupt("a key appears twice"));
+                    }
+                    Some(shadowed) => self.mark_dead(shadowed),
+                    None => {}
                 }
-                let key = (*collection, object.id);
-                if let Some(shadowed) = self.live.insert(key, Location::Segment(index, row)) {
-                    self.mark_dead(shadowed);
-                }
-                false
-            })
-            .collect();
+            }
+            dead.push(!live);
+        }
         self.segments.push(Segment { meta, file, dead });
+        Ok(())
     }
 
-    /// Apply one committed log segment. It must be the commit made directly
-    /// on top of this state.
+    /// Apply one committed log segment, which must be the commit made
+    /// directly on top of this state. Either the whole commit is applied or,
+    /// on error, none of it.
     pub(crate) fn apply(&mut self, key: &str, log: &LogSegment) -> Result<()> {
-        let expected = LogPosition(self.position.0 + 1);
-        if log.position != expected || log.prev.as_deref() != self.head() {
-            return Err(StorageError::corrupt(
-                key,
-                format!(
-                    "commit {:?} on {:?} does not follow {:?} at {:?}",
-                    log.position, log.prev, self.head, self.position
-                ),
-            ));
+        let corrupt = |reason: String| StorageError::corrupt(key, reason);
+        if self.position.next() != Some(log.position) || log.prev.as_deref() != self.head() {
+            return Err(corrupt(format!(
+                "commit {:?} on {:?} does not follow {:?} at {:?}",
+                log.position, log.prev, self.head, self.position
+            )));
         }
+        self.catalog = log
+            .ops
+            .iter()
+            .try_fold(self.catalog.clone(), |mut catalog, op| {
+                catalog.apply(op).map_err(corrupt)?;
+                Ok::<_, StorageError>(catalog)
+            })?;
         for op in &log.ops {
-            self.catalog
-                .apply(op)
-                .map_err(|reason| StorageError::corrupt(key, reason))?;
             match op {
                 Op::CreateCollection { .. } | Op::AddProperty { .. } => {}
                 Op::DropCollection { collection } => {
@@ -218,23 +239,26 @@ impl State {
         }
         self.position = log.position;
         self.head = Some(key.to_string());
+        self.commits_since_checkpoint += 1;
         Ok(())
     }
 
-    /// What a checkpoint at `position` writes: the segment holding the
-    /// memtable's live rows and tombstones, if there are any, and the
-    /// manifest listing `segment_key` after the existing segments.
+    /// What a checkpoint at `position` writes: a segment holding the
+    /// memtable's live rows and tombstones, if it has any, and the manifest
+    /// listing `segment_key` after the existing segments.
     pub(crate) fn checkpoint(
         &self,
         position: LogPosition,
         segment_key: &str,
     ) -> (Option<SegmentFile>, Manifest) {
-        let segment = self.has_unflushed_writes().then(|| SegmentFile {
+        let rows: Vec<Row> = live_rows(&self.memtable.rows, &self.memtable.dead)
+            .cloned()
+            .collect();
+        let tombstones = self.memtable.tombstones.clone();
+        let segment = (!rows.is_empty() || !tombstones.is_empty()).then_some(SegmentFile {
             position,
-            rows: live_rows(&self.memtable.rows, &self.memtable.dead)
-                .cloned()
-                .collect(),
-            tombstones: self.memtable.tombstones.clone(),
+            rows,
+            tombstones,
         });
         let flushed = segment.as_ref().map(|file| SegmentMeta {
             key: segment_key.to_string(),
@@ -259,21 +283,23 @@ impl State {
         (segment, manifest)
     }
 
-    /// Adopt a committed checkpoint made from this state: the memtable's rows
-    /// now live in `segment`.
+    /// Adopt a committed checkpoint made from this state by [`Self::checkpoint`]:
+    /// the memtable's rows now live in `segment`, the manifest's last segment.
     pub(crate) fn checkpointed(
         &mut self,
         manifest_key: &str,
         manifest: &Manifest,
         segment: Option<SegmentFile>,
-    ) {
+    ) -> Result<()> {
         self.live
             .retain(|_, location| !matches!(location, Location::Memtable(_)));
         self.memtable = Memtable::default();
         if let (Some(file), Some(meta)) = (segment, manifest.segments.last()) {
-            self.attach(meta.clone(), Arc::new(file));
+            self.attach(meta.clone(), Arc::new(file))?;
         }
         self.position = manifest.position;
         self.head = Some(manifest_key.to_string());
+        self.commits_since_checkpoint = 0;
+        Ok(())
     }
 }

@@ -30,7 +30,9 @@ pub enum StorageError {
     Schema(#[from] SchemaError),
     #[error(transparent)]
     Object(#[from] ObjectError),
-    #[error("the writer closed after a commit whose outcome is unknown; reopen the partition")]
+    #[error("the committed history no longer contains {head:?}; reopen the partition")]
+    Diverged { head: Option<String> },
+    #[error("the writer closed after a write whose outcome is unknown; reopen the partition")]
     Closed,
     #[error("encoding failed: {0}")]
     Encode(String),

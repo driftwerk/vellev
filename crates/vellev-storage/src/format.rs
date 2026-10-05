@@ -2,8 +2,12 @@
 //!
 //! A frame is `magic, kind, version, body length, CRC, body`, where the CRC
 //! covers everything between the magic and itself as well as the body. The
-//! body is self-describing, so a newer writer can add fields an older reader
-//! skips.
+//! header layout never changes between versions, so damage is told apart from
+//! a newer format before the version is interpreted.
+//!
+//! The body is self-describing: a reader skips struct fields it does not
+//! know, so a field can be added without a new version. A new enum variant
+//! cannot be skipped and needs a new `FORMAT_VERSION`.
 
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -148,8 +152,20 @@ fn checksum(described: &[u8], body: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+/// Check a frame's integrity without decoding its body.
+pub fn verify(key: &str, frame: &[u8]) -> Result<()> {
+    open(key, frame).map(|_| ())
+}
+
 fn parse<T: DeserializeOwned>(key: &str, body: &[u8]) -> Result<T> {
-    rmp_serde::from_slice(body).map_err(|e| StorageError::corrupt(key, e.to_string()))
+    let mut reader = std::io::Cursor::new(body);
+    let value =
+        rmp_serde::from_read(&mut reader).map_err(|e| StorageError::corrupt(key, e.to_string()))?;
+    if reader.position() == body.len() as u64 {
+        Ok(value)
+    } else {
+        Err(StorageError::corrupt(key, "bytes follow the encoded value"))
+    }
 }
 
 fn open<'a>(key: &str, frame: &'a [u8]) -> Result<(Kind, &'a [u8])> {
@@ -160,7 +176,14 @@ fn open<'a>(key: &str, frame: &'a [u8]) -> Result<(Kind, &'a [u8])> {
     if header[..4] != MAGIC {
         return Err(corrupt("not a vellev file"));
     }
-    let kind = Kind::from_byte(header[4]).ok_or_else(|| corrupt("unknown file kind"))?;
+    let length = u64::from_le_bytes(header[7..15].try_into().expect("eight bytes"));
+    let crc = u32::from_le_bytes(header[15..19].try_into().expect("four bytes"));
+    if length != body.len() as u64 {
+        return Err(corrupt("body length does not match the header"));
+    }
+    if crc != checksum(&header[MAGIC.len()..15], body) {
+        return Err(corrupt("checksum mismatch"));
+    }
     let version = u16::from_le_bytes([header[5], header[6]]);
     if version == 0 {
         return Err(corrupt("format version zero"));
@@ -172,14 +195,7 @@ fn open<'a>(key: &str, frame: &'a [u8]) -> Result<(Kind, &'a [u8])> {
             supported: FORMAT_VERSION,
         });
     }
-    let length = u64::from_le_bytes(header[7..15].try_into().expect("eight bytes"));
-    let crc = u32::from_le_bytes(header[15..19].try_into().expect("four bytes"));
-    if length != body.len() as u64 {
-        return Err(corrupt("body length does not match the header"));
-    }
-    if crc != checksum(&header[MAGIC.len()..15], body) {
-        return Err(corrupt("checksum mismatch"));
-    }
+    let kind = Kind::from_byte(header[4]).ok_or_else(|| corrupt("unknown file kind"))?;
     Ok((kind, body))
 }
 
@@ -253,5 +269,101 @@ mod tests {
             decode_head("k", &frame),
             Err(StorageError::Corrupt { .. })
         ));
+    }
+
+    fn frame(kind: Kind, body: &[u8]) -> Vec<u8> {
+        let mut frame = MAGIC.to_vec();
+        frame.push(kind as u8);
+        frame.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&checksum(&frame[MAGIC.len()..], body).to_le_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    #[test]
+    fn bytes_after_the_encoded_value_are_refused() {
+        let mut body = rmp_serde::to_vec_named(&log()).unwrap();
+        assert_eq!(
+            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, &body)).unwrap(),
+            log()
+        );
+        body.push(0xc0);
+        assert!(matches!(
+            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, &body)),
+            Err(StorageError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_field_added_by_a_newer_writer_is_skipped() {
+        #[derive(Serialize)]
+        struct NewerLogSegment {
+            position: LogPosition,
+            prev: Option<String>,
+            ops: Vec<Op>,
+            written_by: String,
+        }
+        let LogSegment {
+            position,
+            prev,
+            ops,
+        } = log();
+        let newer = NewerLogSegment {
+            position,
+            prev,
+            ops,
+            written_by: "vellev 9".into(),
+        };
+        let body = rmp_serde::to_vec_named(&newer).unwrap();
+        assert_eq!(
+            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, &body)).unwrap(),
+            log()
+        );
+    }
+
+    #[test]
+    fn every_embedding_provider_survives_the_file_format() {
+        use vellev_core::{
+            Bm25, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, Property,
+        };
+        let providers = [
+            EmbeddingProvider::Local,
+            EmbeddingProvider::Bedrock {
+                region: "eu-west-2".into(),
+            },
+            EmbeddingProvider::Http {
+                url: "http://embeddings:80".into(),
+            },
+            EmbeddingProvider::None,
+        ];
+        for provider in providers {
+            let schema = Collection {
+                name: CollectionName::new("Notes").unwrap(),
+                properties: vec![Property::new("body", DataType::Text).searchable()],
+                embedding: Embedding {
+                    provider,
+                    model: "m".into(),
+                    dimensions: 4,
+                    query_prefix: Some("q: ".into()),
+                    document_prefix: None,
+                    properties: vec!["body".into()],
+                },
+                distance: Distance::Dot,
+                bm25: Bm25::default(),
+                access_rule: None,
+            };
+            let manifest = Manifest {
+                position: LogPosition(3),
+                next_collection_id: 2,
+                collections: vec![(CollectionId(1), schema)],
+                segments: vec![],
+            };
+            let frame = encode(Kind::Manifest, &manifest).unwrap();
+            assert_eq!(
+                decode::<Manifest>("k", Kind::Manifest, &frame).unwrap(),
+                manifest
+            );
+        }
     }
 }

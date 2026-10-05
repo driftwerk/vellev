@@ -8,7 +8,7 @@ pub mod format;
 mod partition;
 mod state;
 
-pub use catalog::{Catalog, Mutation};
+pub use catalog::Mutation;
 pub use error::{Result, StorageError};
-pub use partition::{Partition, Writer};
+pub use partition::{Follower, Partition, Writer};
 pub use state::State;
