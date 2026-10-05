@@ -1,0 +1,33 @@
+# Local dependencies for developing vellev: the Postgres that holds the commit
+# pointer and writer lease, and an S3-compatible store for segments.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vellev
+      POSTGRES_PASSWORD: vellev
+      POSTGRES_DB: vellev
+    ports:
+      - "54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vellev"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # S3-compatible store for local development and tests. MinIO's images can
+  # no longer be pulled from Docker Hub or Quay, so this uses Adobe S3Mock.
+  # It does not check credentials; any access key works.
+  s3:
+    image: adobe/s3mock@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: vellev-dev
+    ports:
+      - "59090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/vellev-dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

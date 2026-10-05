@@ -1,0 +1,17 @@
+[package]
+name = "vellev"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+vellev-client.workspace = true
+
+axum.workspace = true
+clap.workspace = true
+eyre.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
