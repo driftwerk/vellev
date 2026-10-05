@@ -1,0 +1,147 @@
+//! Vector and keyword search fused into one ranking.
+
+use std::collections::HashMap;
+
+use vellev_core::{CollectionName, Object, ObjectId};
+use vellev_index::filter::Filter;
+use vellev_index::fusion::Fusion;
+
+use crate::keyword::Keywords;
+use crate::search::{Query, DEFAULT_OVERSAMPLE};
+use crate::state::State;
+use crate::{Result, StorageError};
+
+/// How much of a fused score is the vector search's to give.
+pub const DEFAULT_ALPHA: f32 = 0.75;
+
+/// How many results each search offers for fusing, when `limit` asks for
+/// no more.
+pub const DEFAULT_CANDIDATES: usize = 100;
+
+#[derive(Debug, Clone)]
+pub struct Hybrid<'a> {
+    pub text: &'a str,
+    /// What `text` means, when known. Without it the keyword search stands
+    /// alone, with the whole weight.
+    pub vector: Option<&'a [f32]>,
+    /// The vector search's weight, from 0 to 1; the keyword search has the
+    /// rest. A search with no weight is not run.
+    pub alpha: f32,
+    pub fusion: Fusion,
+    /// As [`Keywords::properties`].
+    pub properties: &'a [(&'a str, f32)],
+    pub limit: usize,
+    pub candidates: usize,
+    pub filter: Option<&'a Filter>,
+    pub oversample: usize,
+}
+
+impl<'a> Hybrid<'a> {
+    pub fn matching(text: &'a str, vector: Option<&'a [f32]>, limit: usize) -> Self {
+        Self {
+            text,
+            vector,
+            alpha: DEFAULT_ALPHA,
+            fusion: Fusion::default(),
+            properties: &[],
+            limit,
+            candidates: DEFAULT_CANDIDATES,
+            filter: None,
+            oversample: DEFAULT_OVERSAMPLE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fused<'a> {
+    pub object: &'a Object,
+    /// Larger is better; at most 1.
+    pub score: f32,
+    /// As [`crate::Hit`], when the vector search offered the object.
+    pub distance: Option<f32>,
+    pub certainty: Option<f32>,
+    /// As [`crate::Scored`], when the keyword search offered the object.
+    pub keyword: Option<f32>,
+}
+
+impl<'a> Fused<'a> {
+    fn of(object: &'a Object) -> Self {
+        Self {
+            object,
+            score: 0.0,
+            distance: None,
+            certainty: None,
+            keyword: None,
+        }
+    }
+}
+
+impl State {
+    /// The collection's live objects that best match `query` by meaning and
+    /// by wording together, best first, ties in object id order.
+    pub fn hybrid(
+        &self,
+        collection: &CollectionName,
+        query: &Hybrid<'_>,
+    ) -> Result<Vec<Fused<'_>>> {
+        if !(0.0..=1.0).contains(&query.alpha) {
+            return Err(StorageError::InvalidQuery(format!(
+                "alpha must be from 0 to 1, not {}",
+                query.alpha
+            )));
+        }
+        let alpha = query.vector.map_or(0.0, |_| query.alpha);
+        let candidates = query.candidates.max(query.limit);
+        let nearest = match query.vector {
+            Some(vector) if alpha > 0.0 => self.search(
+                collection,
+                &Query {
+                    vector,
+                    limit: candidates,
+                    filter: query.filter,
+                    oversample: query.oversample,
+                },
+            )?,
+            _ => Vec::new(),
+        };
+        let worded = if alpha < 1.0 {
+            let keywords = Keywords {
+                text: query.text,
+                properties: query.properties,
+                limit: candidates,
+                filter: query.filter,
+            };
+            self.keyword(collection, &keywords)?
+        } else {
+            Vec::new()
+        };
+
+        let nearness: Vec<f32> = nearest.iter().map(|hit| 1.0 - hit.distance).collect();
+        let wording: Vec<f32> = worded.iter().map(|scored| scored.score).collect();
+        let mut fused: HashMap<ObjectId, Fused<'_>> = HashMap::new();
+        for (hit, share) in nearest.iter().zip(query.fusion.shares(alpha, &nearness)) {
+            let entry = fused.entry(hit.object.id).or_insert(Fused::of(hit.object));
+            entry.score += share;
+            entry.distance = Some(hit.distance);
+            entry.certainty = hit.certainty;
+        }
+        for (scored, share) in worded
+            .iter()
+            .zip(query.fusion.shares(1.0 - alpha, &wording))
+        {
+            let entry = fused
+                .entry(scored.object.id)
+                .or_insert(Fused::of(scored.object));
+            entry.score += share;
+            entry.keyword = Some(scored.score);
+        }
+        let mut fused: Vec<Fused<'_>> = fused.into_values().collect();
+        fused.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then(a.object.id.cmp(&b.object.id))
+        });
+        fused.truncate(query.limit);
+        Ok(fused)
+    }
+}

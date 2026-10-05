@@ -8,6 +8,7 @@ mod error;
 #[doc(hidden)]
 pub mod format;
 mod group;
+mod hybrid;
 mod keyword;
 mod mutation;
 mod partition;
@@ -16,9 +17,11 @@ mod state;
 
 pub use error::{Result, StorageError};
 pub use group::GroupCommitter;
+pub use hybrid::{Fused, Hybrid, DEFAULT_ALPHA, DEFAULT_CANDIDATES};
 pub use keyword::{Keywords, Scored, MAX_WEIGHT};
 pub use mutation::{Condition, Mutation, Outcome, Receipt};
 pub use partition::{Follower, Partition, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::State;
 pub use vellev_index::filter::{Filter, FilterError};
+pub use vellev_index::fusion::Fusion;
