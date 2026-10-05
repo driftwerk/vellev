@@ -3,17 +3,35 @@ use std::sync::Arc;
 
 use vellev_core::{Collection, CollectionName, Object, ObjectId};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
+use vellev_index::vector::BinaryIndex;
 
 use crate::catalog::Catalog;
 use crate::coordinator::LogPosition;
 use crate::format::{CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentMeta};
+use crate::search::EXACT_UP_TO;
 use crate::{Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
 
-/// A layer's filter indexes, one per collection with rows in it. Like
-/// liveness they are derived from the rows and never stored.
-pub(crate) type Indexes = HashMap<CollectionId, RowIndex>;
+/// What is indexed about one collection's rows in a layer: their filterable
+/// values and, once there are too many to score one by one, their vectors.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LayerIndex {
+    pub rows: RowIndex,
+    pub vectors: Option<BinaryIndex>,
+}
+
+/// A layer's indexes, one per collection with rows in it. Like liveness
+/// they are derived from the rows and never stored.
+pub(crate) type Indexes = HashMap<CollectionId, LayerIndex>;
+
+/// The rows of one layer, a segment or the memtable, with what is known
+/// about them. Later layers shadow earlier ones.
+pub(crate) struct Layer<'a> {
+    pub rows: &'a [Row],
+    pub dead: &'a [bool],
+    pub indexes: &'a Indexes,
+}
 
 /// A segment as loaded: its file and the indexes built over it, shared by
 /// every state that holds the segment.
@@ -148,6 +166,23 @@ impl State {
         Ok(page)
     }
 
+    /// Every layer, oldest first.
+    pub(crate) fn layers(&self) -> impl Iterator<Item = Layer<'_>> {
+        let memtable = Layer {
+            rows: &self.memtable.rows,
+            dead: &self.memtable.dead,
+            indexes: &self.memtable.indexes,
+        };
+        self.segments
+            .iter()
+            .map(|segment| Layer {
+                rows: &segment.file.rows,
+                dead: &segment.dead,
+                indexes: &segment.indexes,
+            })
+            .chain([memtable])
+    }
+
     pub(crate) fn matching<'a, 'p>(
         &'a self,
         collection: CollectionId,
@@ -156,24 +191,17 @@ impl State {
     where
         'a: 'p,
     {
-        let layer = move |indexes: &'a Indexes, rows: &'a [Row], dead: &'a [bool]| {
-            indexes
+        self.layers().flat_map(move |layer| {
+            layer
+                .indexes
                 .get(&collection)
-                .map(|index| predicate.select(index))
+                .map(|index| predicate.select(&index.rows))
                 .unwrap_or_default()
                 .into_iter()
                 .map(|row| row as usize)
-                .filter(move |row| !dead[*row])
-                .map(move |row| &rows[row].object)
-        };
-        self.segments
-            .iter()
-            .flat_map(move |segment| layer(&segment.indexes, &segment.file.rows, &segment.dead))
-            .chain(layer(
-                &self.memtable.indexes,
-                &self.memtable.rows,
-                &self.memtable.dead,
-            ))
+                .filter(move |row| !layer.dead[*row])
+                .map(move |row| &layer.rows[row].object)
+        })
     }
 
     pub(crate) fn catalog(&self) -> &Catalog {
@@ -286,17 +314,28 @@ impl State {
         Ok(())
     }
 
-    /// Index `rows` for filtering. An index built under an older catalog
-    /// stays right: a collection's filterable properties never change, and a
-    /// collection created since has no rows in an older layer.
+    /// Index `rows` for filtering and for vector search. An index built
+    /// under an older catalog stays right: a collection's filterable
+    /// properties never change, and a collection created since has no rows
+    /// in an older layer.
     pub(crate) fn indexed(&self, rows: &[Row]) -> Indexes {
         let mut indexes = Indexes::new();
+        let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
         for (row, Row { collection, object }) in rows.iter().enumerate() {
             if let Some(schema) = self.catalog.schema(*collection) {
-                indexes
-                    .entry(*collection)
-                    .or_default()
-                    .insert(schema, row as u32, object);
+                let index = indexes.entry(*collection).or_default();
+                index.rows.insert(schema, row as u32, object);
+                if let Some(vector) = &object.vector {
+                    vectors
+                        .entry(*collection)
+                        .or_default()
+                        .push((row as u32, vector));
+                }
+            }
+        }
+        for (collection, vectors) in vectors.iter().filter(|(_, v)| v.len() > EXACT_UP_TO) {
+            if let Some(index) = indexes.get_mut(collection) {
+                index.vectors = BinaryIndex::build(vectors);
             }
         }
         indexes
@@ -350,7 +389,7 @@ impl State {
                         let index = self.memtable.indexes.entry(*collection).or_default();
                         // A memtable is flushed long before it holds as
                         // many rows as a segment may number.
-                        index.insert(schema, row as u32, object);
+                        index.rows.insert(schema, row as u32, object);
                     }
                     self.memtable.rows.push(Row {
                         collection: *collection,
