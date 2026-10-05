@@ -6,8 +6,9 @@
 //! a newer format before the version is interpreted.
 //!
 //! The body is self-describing: a reader skips struct fields it does not
-//! know, so a field can be added without a new version. A new enum variant
-//! cannot be skipped and needs a new `FORMAT_VERSION`.
+//! know. A field may be added without a new version only if an older node
+//! may both ignore it and drop it when it rewrites the file; anything else,
+//! and any new enum variant, needs a new `FORMAT_VERSION`.
 
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -115,15 +116,20 @@ pub enum Head {
 }
 
 pub fn encode<T: Serialize>(kind: Kind, value: &T) -> Result<Bytes> {
-    let body = rmp_serde::to_vec_named(value).map_err(|e| StorageError::Encode(e.to_string()))?;
+    rmp_serde::to_vec_named(value)
+        .map(|body| Bytes::from(frame(kind, FORMAT_VERSION, &body)))
+        .map_err(|e| StorageError::Encode(e.to_string()))
+}
+
+fn frame(kind: Kind, version: u16, body: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(HEADER + body.len());
     frame.extend_from_slice(&MAGIC);
     frame.push(kind as u8);
-    frame.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    frame.extend_from_slice(&version.to_le_bytes());
     frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    frame.extend_from_slice(&checksum(&frame[MAGIC.len()..], &body).to_le_bytes());
-    frame.extend_from_slice(&body);
-    Ok(Bytes::from(frame))
+    frame.extend_from_slice(&checksum(&frame[MAGIC.len()..], body).to_le_bytes());
+    frame.extend_from_slice(body);
+    frame
 }
 
 pub fn decode<T: DeserializeOwned>(key: &str, kind: Kind, frame: &[u8]) -> Result<T> {
@@ -157,6 +163,8 @@ pub fn verify(key: &str, frame: &[u8]) -> Result<()> {
     open(key, frame).map(|_| ())
 }
 
+/// Decoded through a cursor so that bytes left over after the value, which
+/// `from_slice` would accept, are noticed.
 fn parse<T: DeserializeOwned>(key: &str, body: &[u8]) -> Result<T> {
     let mut reader = std::io::Cursor::new(body);
     let value =
@@ -242,14 +250,18 @@ mod tests {
 
     #[test]
     fn a_newer_format_version_is_refused_by_name() {
-        let mut frame = encode(Kind::Log, &log()).unwrap().to_vec();
-        frame[5..7].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
-        let crc = checksum(&frame[MAGIC.len()..15], &frame[HEADER..]);
-        frame[15..19].copy_from_slice(&crc.to_le_bytes());
+        let body = rmp_serde::to_vec_named(&log()).unwrap();
+        for (version, supported) in [(FORMAT_VERSION, true), (FORMAT_VERSION + 1, false)] {
+            let outcome = decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, version, &body));
+            assert_eq!(outcome.is_ok(), supported);
+            assert_eq!(
+                matches!(outcome, Err(StorageError::UnsupportedVersion { found, .. }) if found == version),
+                !supported
+            );
+        }
         assert!(matches!(
-            decode::<LogSegment>("k", Kind::Log, &frame),
-            Err(StorageError::UnsupportedVersion { found, supported, .. })
-                if found == FORMAT_VERSION + 1 && supported == FORMAT_VERSION
+            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, 0, &body)),
+            Err(StorageError::Corrupt { .. })
         ));
     }
 
@@ -271,26 +283,16 @@ mod tests {
         ));
     }
 
-    fn frame(kind: Kind, body: &[u8]) -> Vec<u8> {
-        let mut frame = MAGIC.to_vec();
-        frame.push(kind as u8);
-        frame.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        frame.extend_from_slice(&checksum(&frame[MAGIC.len()..], body).to_le_bytes());
-        frame.extend_from_slice(body);
-        frame
-    }
-
     #[test]
     fn bytes_after_the_encoded_value_are_refused() {
         let mut body = rmp_serde::to_vec_named(&log()).unwrap();
         assert_eq!(
-            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, &body)).unwrap(),
+            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, FORMAT_VERSION, &body)).unwrap(),
             log()
         );
         body.push(0xc0);
         assert!(matches!(
-            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, &body)),
+            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, FORMAT_VERSION, &body)),
             Err(StorageError::Corrupt { .. })
         ));
     }
@@ -317,7 +319,7 @@ mod tests {
         };
         let body = rmp_serde::to_vec_named(&newer).unwrap();
         assert_eq!(
-            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, &body)).unwrap(),
+            decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, FORMAT_VERSION, &body)).unwrap(),
             log()
         );
     }

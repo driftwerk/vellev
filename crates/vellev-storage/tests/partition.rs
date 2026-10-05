@@ -13,10 +13,10 @@ use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, NodeId,
     ObjectId, Partition as PartitionNumber, Property, TenantId, Value,
 };
-use vellev_storage::blobs::{Blobs, CachedBlobs, Layout, ObjectBlobs};
+use vellev_storage::blobs::{Author, Blobs, CachedBlobs, Layout, ObjectBlobs};
 use vellev_storage::coordinator::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, LogPosition, ManualClock,
-    MemoryCoordinator, PartitionKey,
+    Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
+    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey,
 };
 use vellev_storage::format::{
     self, CollectionId, Kind, LogSegment, Manifest, Row, SegmentFile, SegmentMeta,
@@ -704,7 +704,7 @@ async fn an_orphan_at_a_committed_position_is_never_read() {
         .await
         .unwrap_err();
 
-    let orphan = Layout(&cluster.key).log(position, stalled.lease().generation);
+    let orphan = Layout(&cluster.key).log(position, stalled.author());
     cluster
         .blobs
         .get(&orphan)
@@ -892,8 +892,146 @@ async fn the_cache_never_reads_or_writes_outside_its_directory() {
     ));
     let absolute = outside.path().join("secret");
     assert!(cached.get(absolute.to_str().unwrap()).await.is_err());
-    cached.put("a/../../planted", frame).await.unwrap();
+    cached.put("a/../../planted", frame.clone()).await.unwrap();
     assert!(!outside.path().join("planted").exists());
+
+    cached.put("a/b", frame).await.unwrap();
+    for alias in ["a/./b", "a//b", "a/b/", "./a/b"] {
+        let through_cache = cached.get(alias).await.is_ok();
+        assert_eq!(through_cache, store.get(alias).await.is_ok(), "{alias}");
+    }
+}
+
+#[tokio::test]
+async fn a_writer_reopened_on_a_live_lease_cannot_replace_a_commit_that_landed_late() {
+    let cluster = Cluster::new().await;
+    let unreliable = Arc::new(Unreliable {
+        inner: cluster.coordinator.clone(),
+        lose_responses: AtomicUsize::new(0),
+        refuse_commits: AtomicUsize::new(0),
+        hang_after_commit: AtomicBool::new(false),
+    });
+    let (lease, committed) = cluster.lease().await;
+    let first = Writer::open(
+        cluster.blobs.clone(),
+        unreliable.clone(),
+        lease.clone(),
+        &committed,
+    )
+    .await
+    .unwrap();
+    first.commit(vec![create("notes")]).await.unwrap();
+
+    unreliable
+        .refuse_commits
+        .store(usize::MAX, Ordering::SeqCst);
+    first
+        .commit(vec![upsert("notes", 1, 111)])
+        .await
+        .unwrap_err();
+    unreliable.refuse_commits.store(0, Ordering::SeqCst);
+
+    let before = cluster.committed().await;
+    let position = before.log_position.next().unwrap();
+    let late = Layout(&cluster.key).log(position, first.author());
+    let second = Writer::open(
+        cluster.blobs.clone(),
+        unreliable.clone(),
+        lease.clone(),
+        &before,
+    )
+    .await
+    .unwrap();
+    assert_ne!(Layout(&cluster.key).log(position, second.author()), late);
+
+    let landed = Commit {
+        log_position: position,
+        manifest: Some(ManifestRef(late.clone())),
+    };
+    cluster.coordinator.commit(&lease, landed).await.unwrap();
+    let follower = cluster.open().await;
+
+    assert!(matches!(
+        second
+            .commit(vec![upsert("notes", 1, 222), upsert("notes", 2, 2)])
+            .await,
+        Err(StorageError::Coordinator(
+            CoordinatorError::Regressed { .. }
+        ))
+    ));
+    assert_eq!(cluster.committed().await.manifest, Some(ManifestRef(late)));
+    for copy in [follower, cluster.open().await] {
+        copy.partition().read(|state| {
+            assert_eq!(n_of(state, "notes", 1), Some(111));
+            assert_eq!(n_of(state, "notes", 2), None);
+        });
+    }
+}
+
+#[tokio::test]
+async fn a_reading_from_a_removed_history_is_ignored_even_when_it_is_further_along() {
+    let cluster = Cluster::new().await;
+    let removed = cluster.writer().await;
+    removed
+        .commit(vec![create("old"), upsert("old", 1, 1)])
+        .await
+        .unwrap();
+    removed.flush().await.unwrap();
+    removed.commit(vec![upsert("old", 2, 2)]).await.unwrap();
+    let old = cluster.committed().await;
+
+    cluster.coordinator.remove(&cluster.key).await.unwrap();
+    cluster.coordinator.register(&cluster.key).await.unwrap();
+    let writer = cluster.writer().await;
+    let position = writer.commit(vec![create("notes")]).await.unwrap();
+    assert!(position < old.log_position);
+
+    let follower = cluster.open().await;
+    assert_eq!(follower.catch_up(&old).await.unwrap(), position);
+    follower
+        .partition()
+        .read(|state| assert!(state.collection(&name("old")).is_none()));
+
+    let next = writer.commit(vec![upsert("notes", 1, 1)]).await.unwrap();
+    assert_eq!(
+        follower.catch_up(&cluster.committed().await).await.unwrap(),
+        next
+    );
+    follower
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
+}
+
+#[tokio::test]
+async fn a_log_that_reuses_a_dropped_collection_id_is_refused() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    writer
+        .commit(vec![Mutation::DropCollection(name("notes"))])
+        .await
+        .unwrap();
+
+    let head = cluster.committed().await;
+    let position = head.log_position.next().unwrap();
+    let key = Layout(&cluster.key).log(position, &forger());
+    let reusing = LogSegment {
+        position,
+        prev: head.manifest.map(|head| head.0),
+        ops: vec![format::Op::CreateCollection {
+            id: CollectionId(0),
+            schema: Box::new(schema("notes")),
+        }],
+    };
+    let forgery = vec![(key.clone(), format::encode(Kind::Log, &reusing).unwrap())];
+    assert!(matches!(
+        forged(&cluster, forgery, position.0).await,
+        Err(StorageError::Corrupt { key: k, .. }) if k == key
+    ));
 }
 
 /// A partition whose committed head is a hand-made file.
@@ -907,12 +1045,17 @@ async fn forged(
     }
     let committed = Committed {
         log_position: LogPosition(position),
-        manifest: files
-            .last()
-            .map(|(key, _)| vellev_storage::coordinator::ManifestRef(key.clone())),
+        manifest: files.last().map(|(key, _)| ManifestRef(key.clone())),
         ..cluster.committed().await
     };
     Follower::open(cluster.key.clone(), cluster.blobs.clone(), &committed).await
+}
+
+fn forger() -> Author {
+    Author {
+        generation: Generation(1),
+        writer: uuid::Uuid::nil(),
+    }
 }
 
 fn manifest_of(segments: Vec<SegmentMeta>) -> Manifest {
@@ -927,12 +1070,7 @@ fn manifest_of(segments: Vec<SegmentMeta>) -> Manifest {
 #[tokio::test]
 async fn a_history_that_loops_or_skips_a_position_is_refused() {
     let cluster = Cluster::new().await;
-    let key = |position| {
-        Layout(&cluster.key).log(
-            LogPosition(position),
-            vellev_storage::coordinator::Generation(1),
-        )
-    };
+    let key = |position| Layout(&cluster.key).log(LogPosition(position), &forger());
     let log = |position, prev: Option<String>| {
         format::encode(
             Kind::Log,
@@ -948,7 +1086,22 @@ async fn a_history_that_loops_or_skips_a_position_is_refused() {
     let looping = vec![(key(1), log(1, Some(key(1))))];
     assert!(matches!(
         forged(&cluster, looping, 1).await,
-        Err(StorageError::Diverged { .. })
+        Err(StorageError::Corrupt { key: k, .. }) if k == key(1)
+    ));
+
+    let ending_early = vec![(key(3), log(3, None))];
+    assert!(matches!(
+        forged(&cluster, ending_early, 3).await,
+        Err(StorageError::Corrupt { key: k, .. }) if k == key(3)
+    ));
+
+    let headless = Committed {
+        log_position: LogPosition(4),
+        ..cluster.committed().await
+    };
+    assert!(matches!(
+        Follower::open(cluster.key.clone(), cluster.blobs.clone(), &headless).await,
+        Err(StorageError::Corrupt { .. })
     ));
 
     let skipping = vec![(key(1), log(1, None)), (key(3), log(3, Some(key(1))))];
@@ -968,9 +1121,8 @@ async fn a_history_that_loops_or_skips_a_position_is_refused() {
 async fn a_checkpoint_that_contradicts_itself_is_refused() {
     let cluster = Cluster::new().await;
     let layout = Layout(&cluster.key);
-    let generation = vellev_storage::coordinator::Generation(1);
-    let segment_key = layout.segment(LogPosition(1), generation);
-    let manifest_key = layout.manifest(LogPosition(1), generation);
+    let segment_key = layout.segment(LogPosition(1), &forger());
+    let manifest_key = layout.manifest(LogPosition(1), &forger());
     let row = |object: u8| Row {
         collection: CollectionId(0),
         object: vellev_core::Object {
@@ -1020,9 +1172,15 @@ async fn a_checkpoint_that_contradicts_itself_is_refused() {
     ];
     assert_eq!(refused(miscounted).await, segment_key);
 
-    let foreign = "tenant-b/0/segment/1.segment";
-    let trespassing = vec![(manifest_key.clone(), listing(foreign, 0))];
-    assert_eq!(refused(trespassing).await, foreign);
+    for foreign in [
+        "tenant-b/0/segment/1.segment",
+        "tenant-a/0/../../tenant-b/0/segment/1.segment",
+        "tenant-a/0//x",
+        "tenant-a/0/./x",
+    ] {
+        let trespassing = vec![(manifest_key.clone(), listing(foreign, 0))];
+        assert_eq!(refused(trespassing).await, foreign);
+    }
 
     let mut duplicate_ids = manifest_of(vec![]);
     duplicate_ids
@@ -1099,6 +1257,7 @@ enum Action {
     Restart,
     Takeover,
     Follow,
+    FollowStale(usize),
 }
 
 type Model = BTreeMap<&'static str, BTreeMap<u8, i64>>;
@@ -1178,6 +1337,7 @@ fn action() -> impl Strategy<Value = Action> {
         2 => Just(Action::Restart),
         2 => Just(Action::Takeover),
         3 => Just(Action::Follow),
+        1 => any::<usize>().prop_map(Action::FollowStale),
     ]
 }
 
@@ -1214,6 +1374,7 @@ async fn run(actions: Vec<Action>) {
     let mut writer = cluster.writer().await;
     let follower = cluster.open().await;
     let mut model = Model::new();
+    let mut readings: Vec<Committed> = Vec::new();
 
     for (step, action) in actions.into_iter().enumerate() {
         let context = format!("step {step}: {action:?}");
@@ -1256,10 +1417,22 @@ async fn run(actions: Vec<Action>) {
                 );
             }
             Action::Follow => {
-                follower.catch_up(&cluster.committed().await).await.unwrap();
+                let committed = cluster.committed().await;
+                follower.catch_up(&committed).await.unwrap();
                 follower
                     .partition()
                     .read(|state| assert_matches_model(state, &model, &context));
+                readings.push(committed);
+            }
+            Action::FollowStale(pick) => {
+                if let Some(stale) = readings.get(pick % readings.len().max(1)) {
+                    let position = follower.partition().read(State::position);
+                    assert_eq!(
+                        follower.catch_up(stale).await.unwrap(),
+                        position,
+                        "{context}"
+                    );
+                }
             }
         }
         writer

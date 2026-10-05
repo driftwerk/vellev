@@ -107,7 +107,7 @@ impl Catalog {
                 }
                 let id = CollectionId(self.next_id);
                 self.create(id, schema.as_ref().clone())
-                    .map_err(StorageError::Encode)?;
+                    .map_err(|_| StorageError::Exhausted("collection ids"))?;
                 Op::CreateCollection { id, schema }
             }
             Mutation::AddProperty {
@@ -157,6 +157,9 @@ impl Catalog {
     pub fn apply(&mut self, op: &Op) -> std::result::Result<(), String> {
         let unknown = |id: &CollectionId| format!("collection {} is unknown", id.0);
         match op {
+            Op::CreateCollection { id, .. } if id.0 < self.next_id => {
+                Err(format!("collection id {} was already given out", id.0))
+            }
             Op::CreateCollection { id, schema } => self.create(*id, schema.as_ref().clone()),
             Op::AddProperty {
                 collection,

@@ -2,14 +2,13 @@
 //! changes, which is what makes caching them on local disk safe.
 
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{ObjectStore, PutPayload};
-use tokio::io::AsyncWriteExt;
 
 use crate::coordinator::{Generation, LogPosition, PartitionKey};
 use crate::format::verify;
@@ -21,37 +20,52 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     async fn get(&self, key: &str) -> Result<Bytes>;
 }
 
-/// Where a partition's files live. Every name carries the position and the
-/// writer's generation, so two writers can never produce the same key.
+/// Who wrote a file: the lease's generation and the writer instance. Two
+/// writers never share both, so no two writers can produce the same key, even
+/// when one is reopened on a lease that is still current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Author {
+    pub generation: Generation,
+    pub writer: uuid::Uuid,
+}
+
+/// Where a partition's files live.
 #[derive(Debug, Clone, Copy)]
 pub struct Layout<'a>(pub &'a PartitionKey);
 
 impl Layout<'_> {
-    /// The prefix every one of the partition's keys starts with.
     pub fn prefix(&self) -> String {
         format!("{}/{}/", self.0.tenant, self.0.partition.0)
     }
 
-    pub fn log(&self, position: LogPosition, generation: Generation) -> String {
-        self.key("log", position, generation)
+    pub fn log(&self, position: LogPosition, author: &Author) -> String {
+        self.key("log", position, author)
     }
 
-    pub fn segment(&self, position: LogPosition, generation: Generation) -> String {
-        self.key("segment", position, generation)
+    pub fn segment(&self, position: LogPosition, author: &Author) -> String {
+        self.key("segment", position, author)
     }
 
-    pub fn manifest(&self, position: LogPosition, generation: Generation) -> String {
-        self.key("manifest", position, generation)
+    pub fn manifest(&self, position: LogPosition, author: &Author) -> String {
+        self.key("manifest", position, author)
     }
 
-    fn key(&self, kind: &str, position: LogPosition, generation: Generation) -> String {
+    fn key(&self, kind: &str, position: LogPosition, author: &Author) -> String {
         format!(
-            "{}{kind}/{:020}-{:020}.{kind}",
+            "{}{kind}/{:020}-{:020}-{}.{kind}",
             self.prefix(),
             position.0,
-            generation.0
+            author.generation.0,
+            author.writer.simple()
         )
     }
+}
+
+/// Whether `key` is a plain path: no empty, `.` or `..` parts and no
+/// backslash. Keys read out of files are data, and only a plain one names
+/// the same object to every store and to the cache.
+pub(crate) fn is_plain(key: &str) -> bool {
+    !key.contains('\\') && key.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
 #[derive(Debug, Clone)]
@@ -118,15 +132,8 @@ impl CachedBlobs {
         }
     }
 
-    /// Where `key` is cached, or `None` for a key that would not stay inside
-    /// the cache directory. Keys can come from file contents, so they are not
-    /// trusted to be well formed.
     fn path(&self, key: &str) -> Option<PathBuf> {
-        let relative = Path::new(key);
-        let plain = relative
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)));
-        (plain && !key.is_empty()).then(|| self.dir.join(relative))
+        is_plain(key).then(|| self.dir.join(key))
     }
 
     async fn cached(&self, key: &str, path: &Path) -> Option<Bytes> {
@@ -149,8 +156,9 @@ impl CachedBlobs {
     }
 }
 
-/// Written and synced under a name of its own, then renamed, so a reader
-/// never sees a partly written file and a crash leaves no truncated entry.
+/// Written under a name of its own and then renamed, so a reader never sees
+/// a partly written file. Nothing is synced: an entry torn by a crash fails
+/// its checksum and is fetched again.
 async fn write_atomically(path: &Path, bytes: &Bytes) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -159,9 +167,7 @@ async fn write_atomically(path: &Path, bytes: &Bytes) -> std::io::Result<()> {
     let unique = PARTIAL.fetch_add(1, Ordering::Relaxed);
     let partial = path.with_extension(format!("partial-{}-{unique}", std::process::id()));
     let written = async {
-        let mut file = tokio::fs::File::create(&partial).await?;
-        file.write_all(bytes).await?;
-        file.sync_all().await?;
+        tokio::fs::write(&partial, bytes).await?;
         tokio::fs::rename(&partial, path).await
     }
     .await;

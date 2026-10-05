@@ -4,6 +4,7 @@ pub mod blobs;
 mod catalog;
 pub mod coordinator;
 mod error;
+#[doc(hidden)]
 pub mod format;
 mod partition;
 mod state;

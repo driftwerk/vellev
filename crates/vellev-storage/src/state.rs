@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use vellev_core::{Collection, CollectionName, Object, ObjectId};
@@ -12,7 +12,9 @@ type RowKey = (CollectionId, ObjectId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Location {
+    /// A row index in the memtable.
     Memtable(usize),
+    /// A segment's index in the state, and a row index in its file.
     Segment(usize, usize),
 }
 
@@ -42,7 +44,7 @@ pub struct State {
     segments: Vec<Segment>,
     memtable: Memtable,
     live: HashMap<RowKey, Location>,
-    commits_since_checkpoint: usize,
+    has_commits_since_checkpoint: bool,
 }
 
 fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a Row> {
@@ -59,6 +61,10 @@ impl State {
 
     pub fn head(&self) -> Option<&str> {
         self.head.as_deref()
+    }
+
+    pub(crate) fn at(&self) -> (LogPosition, Option<String>) {
+        (self.position, self.head.clone())
     }
 
     pub fn collections(&self) -> impl Iterator<Item = &Collection> {
@@ -106,7 +112,7 @@ impl State {
 
     /// Whether recovery would have to replay log on top of the last checkpoint.
     pub(crate) fn has_commits_since_checkpoint(&self) -> bool {
-        self.commits_since_checkpoint > 0
+        self.has_commits_since_checkpoint
     }
 
     fn mark_dead(&mut self, location: Location) {
@@ -152,32 +158,40 @@ impl State {
             })
     }
 
+    /// Add a segment as the newest. The file is checked before anything is
+    /// changed, so on error the state is as it was.
     fn attach(&mut self, meta: SegmentMeta, file: Arc<SegmentFile>) -> Result<()> {
         let corrupt = |reason: &str| StorageError::corrupt(&meta.key, reason);
         if (file.rows.len() as u64, file.tombstones.len() as u64) != (meta.rows, meta.tombstones) {
             return Err(corrupt("row or tombstone count differs from the manifest"));
         }
+        let mut keys = HashSet::with_capacity(file.rows.len());
+        if !file
+            .rows
+            .iter()
+            .all(|row| keys.insert((row.collection, row.object.id)))
+        {
+            return Err(corrupt("a key appears twice"));
+        }
         let index = self.segments.len();
         for key in &file.tombstones {
             self.forget(*key);
         }
-        let mut dead = Vec::with_capacity(file.rows.len());
-        for (row, Row { collection, object }) in file.rows.iter().enumerate() {
-            let live = self.catalog.contains(*collection);
-            if live {
-                match self
-                    .live
-                    .insert((*collection, object.id), Location::Segment(index, row))
-                {
-                    Some(Location::Segment(segment, _)) if segment == index => {
-                        return Err(corrupt("a key appears twice"));
+        let dead = file
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(row, Row { collection, object })| {
+                let live = self.catalog.contains(*collection);
+                if live {
+                    let location = Location::Segment(index, row);
+                    if let Some(shadowed) = self.live.insert((*collection, object.id), location) {
+                        self.mark_dead(shadowed);
                     }
-                    Some(shadowed) => self.mark_dead(shadowed),
-                    None => {}
                 }
-            }
-            dead.push(!live);
-        }
+                !live
+            })
+            .collect();
         self.segments.push(Segment { meta, file, dead });
         Ok(())
     }
@@ -239,32 +253,38 @@ impl State {
         }
         self.position = log.position;
         self.head = Some(key.to_string());
-        self.commits_since_checkpoint += 1;
+        self.has_commits_since_checkpoint = true;
         Ok(())
     }
 
-    /// What a checkpoint at `position` writes: a segment holding the
-    /// memtable's live rows and tombstones, if it has any, and the manifest
-    /// listing `segment_key` after the existing segments.
+    /// What a checkpoint at `position` writes: a segment under `segment_key`
+    /// holding the memtable's live rows and tombstones, if it has any, and a
+    /// manifest listing it after the existing segments.
     pub(crate) fn checkpoint(
         &self,
         position: LogPosition,
         segment_key: &str,
-    ) -> (Option<SegmentFile>, Manifest) {
+    ) -> (Option<(SegmentMeta, SegmentFile)>, Manifest) {
         let rows: Vec<Row> = live_rows(&self.memtable.rows, &self.memtable.dead)
             .cloned()
             .collect();
         let tombstones = self.memtable.tombstones.clone();
-        let segment = (!rows.is_empty() || !tombstones.is_empty()).then_some(SegmentFile {
-            position,
-            rows,
-            tombstones,
+        let segment = (!rows.is_empty() || !tombstones.is_empty()).then(|| {
+            let meta = SegmentMeta {
+                key: segment_key.to_string(),
+                rows: rows.len() as u64,
+                tombstones: tombstones.len() as u64,
+            };
+            (
+                meta,
+                SegmentFile {
+                    position,
+                    rows,
+                    tombstones,
+                },
+            )
         });
-        let flushed = segment.as_ref().map(|file| SegmentMeta {
-            key: segment_key.to_string(),
-            rows: file.rows.len() as u64,
-            tombstones: file.tombstones.len() as u64,
-        });
+        let flushed = segment.iter().map(|(meta, _)| meta.clone());
         let manifest = Manifest {
             position,
             next_collection_id: self.catalog.next_id(),
@@ -283,23 +303,22 @@ impl State {
         (segment, manifest)
     }
 
-    /// Adopt a committed checkpoint made from this state by [`Self::checkpoint`]:
-    /// the memtable's rows now live in `segment`, the manifest's last segment.
+    /// Adopt a committed checkpoint made from this state by [`Self::checkpoint`].
+    /// Attaching the segment repoints every live memtable row at it, which
+    /// leaves the memtable with nothing live to lose.
     pub(crate) fn checkpointed(
         &mut self,
         manifest_key: &str,
-        manifest: &Manifest,
-        segment: Option<SegmentFile>,
+        position: LogPosition,
+        segment: Option<(SegmentMeta, SegmentFile)>,
     ) -> Result<()> {
-        self.live
-            .retain(|_, location| !matches!(location, Location::Memtable(_)));
-        self.memtable = Memtable::default();
-        if let (Some(file), Some(meta)) = (segment, manifest.segments.last()) {
-            self.attach(meta.clone(), Arc::new(file))?;
+        if let Some((meta, file)) = segment {
+            self.attach(meta, Arc::new(file))?;
         }
-        self.position = manifest.position;
+        self.memtable = Memtable::default();
+        self.position = position;
         self.head = Some(manifest_key.to_string());
-        self.commits_since_checkpoint = 0;
+        self.has_commits_since_checkpoint = false;
         Ok(())
     }
 }

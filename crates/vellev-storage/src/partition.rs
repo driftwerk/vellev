@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::future::try_join_all;
 use tokio::sync::Mutex;
 
-use crate::blobs::{Blobs, Layout};
+use crate::blobs::{is_plain, Author, Blobs, Layout};
 use crate::catalog::Mutation;
 use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
@@ -46,7 +46,8 @@ impl Partition {
         &self.key
     }
 
-    /// Run `f` against a consistent view of the partition.
+    /// Run `f` against a consistent view of the partition. The lock is a
+    /// blocking one and is never held across an await.
     pub fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {
         f(&self.state.read().expect("partition lock"))
     }
@@ -62,31 +63,50 @@ impl Partition {
         Ok(partition)
     }
 
-    /// A file named by data rather than built by [`Layout`]: it must belong
-    /// to this partition before it is fetched.
+    /// Fetch a file named by data rather than built by [`Layout`], which must
+    /// be a plain key of this partition's.
     async fn fetch(&self, key: &str) -> Result<Bytes> {
-        if !key.starts_with(&Layout(&self.key).prefix()) {
+        if !(is_plain(key) && key.starts_with(&Layout(&self.key).prefix())) {
             return Err(StorageError::corrupt(
                 key,
-                "the key belongs to another partition",
+                "the key is not one of this partition's",
             ));
         }
         self.blobs.get(key).await
     }
 
+    /// Generations only grow, so a reading from an older generation than one
+    /// already applied is out of date whatever its position, and so is a
+    /// lower position from the same generation. A reading that is not ahead
+    /// and not stale means the history this copy holds was replaced.
     async fn advance(&self, committed: &Committed) -> Result<LogPosition> {
         let mut seen = self.seen.lock().await;
-        let (position, head) =
-            self.read(|state| (state.position(), state.head().map(String::from)));
+        let (position, head) = self.read(State::at);
         let target = committed.manifest.as_ref().map(|head| head.0.as_str());
-        let stale = committed.generation <= *seen && committed.log_position < position;
-        if stale || (committed.log_position == position && target == head.as_deref()) {
+        let stale = committed.generation < *seen
+            || (committed.generation == *seen && committed.log_position < position);
+        if stale {
+            return Ok(position);
+        }
+        let lost = || match &head {
+            Some(_) => StorageError::Diverged { head: head.clone() },
+            None => StorageError::corrupt(
+                target.unwrap_or("the empty head"),
+                format!("nothing leads to it at {:?}", committed.log_position),
+            ),
+        };
+        if committed.log_position == position && target == head.as_deref() {
+            *seen = committed.generation;
             return Ok(position);
         }
         if committed.log_position <= position {
-            return Err(StorageError::Diverged { head });
+            return Err(lost());
         }
-        let tail = self.tail(committed, position, head.as_deref()).await?;
+        let tail = self
+            .tail(committed, position, head.as_deref())
+            .await?
+            .ok_or_else(lost)?;
+        *seen = committed.generation;
         match tail.checkpoint {
             Some((key, manifest)) => {
                 let mut state = self.restore(&key, manifest).await?;
@@ -102,19 +122,19 @@ impl Partition {
                     .try_for_each(|(key, log)| state.apply(key, log))?;
             }
         }
-        *seen = committed.generation.max(*seen);
         Ok(committed.log_position)
     }
 
     /// Walk back from the committed head until reaching the head this copy
-    /// is at, or a checkpoint. Each file must sit exactly one position below
-    /// the one that named it, so the walk is bounded and cannot loop.
+    /// is at, or a checkpoint; `None` when the chain leads to neither. Each
+    /// file must sit exactly one position below the one that named it, so the
+    /// walk is bounded and cannot loop.
     async fn tail(
         &self,
         committed: &Committed,
         position: LogPosition,
         known: Option<&str>,
-    ) -> Result<Tail> {
+    ) -> Result<Option<Tail>> {
         let mut logs = Vec::new();
         let mut cursor = committed.manifest.as_ref().map(|head| head.0.clone());
         let mut expected = committed.log_position;
@@ -122,11 +142,7 @@ impl Partition {
             let key = match cursor {
                 reached if reached.as_deref() == known && expected == position => break None,
                 Some(key) if expected > position => key,
-                _ => {
-                    return Err(StorageError::Diverged {
-                        head: known.map(String::from),
-                    })
-                }
+                _ => return Ok(None),
             };
             let head = decode_head(&key, &self.fetch(&key).await?)?;
             let found = match &head {
@@ -147,7 +163,7 @@ impl Partition {
             }
         };
         logs.reverse();
-        Ok(Tail { checkpoint, logs })
+        Ok(Some(Tail { checkpoint, logs }))
     }
 
     async fn restore(&self, key: &str, manifest: Manifest) -> Result<State> {
@@ -205,21 +221,23 @@ impl Follower {
 /// generation is current. Nothing it writes is visible, here or anywhere,
 /// until the coordinator has accepted the commit.
 ///
-/// A file's name is fixed by its position and the lease's generation, so a
-/// writer must never attempt the same position twice. From the first upload
-/// of an attempt until it is applied in memory the writer is closed, and it
-/// reopens only on success: an error, or a caller that stops waiting, leaves
-/// it closed for good.
+/// A file is named by its position and its author, and is never rewritten.
+/// The writer therefore never attempts a position twice: from the first
+/// upload of an attempt until it is applied in memory the writer is not
+/// ready, and it becomes ready again only on success. An error, or a caller
+/// that stops waiting, leaves it closed for good.
 #[derive(Debug)]
 pub struct Writer {
     partition: Arc<Partition>,
     coordinator: Arc<dyn Coordinator>,
     lease: Lease,
-    open: Mutex<bool>,
+    author: Author,
+    ready: Mutex<bool>,
 }
 
 impl Writer {
-    /// Start writing from the state the lease was taken at.
+    /// Start writing from the state the lease was taken at: `committed` must
+    /// be what the coordinator returned together with `lease`.
     pub async fn open(
         blobs: Arc<dyn Blobs>,
         coordinator: Arc<dyn Coordinator>,
@@ -227,11 +245,16 @@ impl Writer {
         committed: &Committed,
     ) -> Result<Self> {
         let partition = Arc::new(Partition::load(lease.key.clone(), blobs, committed).await?);
+        let author = Author {
+            generation: lease.generation,
+            writer: uuid::Uuid::new_v4(),
+        };
         Ok(Self {
             partition,
             coordinator,
             lease,
-            open: Mutex::new(true),
+            author,
+            ready: Mutex::new(true),
         })
     }
 
@@ -243,17 +266,20 @@ impl Writer {
         &self.lease
     }
 
+    pub fn author(&self) -> &Author {
+        &self.author
+    }
+
     /// Commit `mutations` as one atomic step and return its position. A
     /// rejected mutation fails the whole batch and changes nothing.
     pub async fn commit(&self, mutations: Vec<Mutation>) -> Result<LogPosition> {
-        let mut open = self.open.lock().await;
-        let (position, prev, mut catalog) = self.snapshot(&open, |state| {
-            (
-                state.position(),
-                state.head().map(String::from),
-                state.catalog().clone(),
-            )
-        })?;
+        let mut ready = self.ready.lock().await;
+        if !*ready {
+            return Err(StorageError::Closed);
+        }
+        let ((position, prev), mut catalog) = self
+            .partition
+            .read(|state| (state.at(), state.catalog().clone()));
         let ops = mutations
             .into_iter()
             .filter_map(|mutation| catalog.resolve(mutation).transpose())
@@ -262,13 +288,13 @@ impl Writer {
             return Ok(position);
         }
         let log = LogSegment {
-            position: self.following(position)?,
+            position: following(position)?,
             prev,
             ops,
         };
-        let key = Layout(&self.lease.key).log(log.position, self.lease.generation);
+        let key = Layout(&self.lease.key).log(log.position, &self.author);
         let frame = encode(Kind::Log, &log)?;
-        attempt(&mut open, async {
+        attempt(&mut ready, async {
             self.publish(&key, frame, log.position).await?;
             self.partition
                 .state
@@ -283,26 +309,29 @@ impl Writer {
     /// Write a checkpoint: move the rows held in memory into a segment and
     /// commit a manifest, so recovery no longer needs the log before it.
     pub async fn flush(&self) -> Result<LogPosition> {
-        let mut open = self.open.lock().await;
-        let (position, pending) = self.snapshot(&open, |state| {
-            (state.position(), state.has_commits_since_checkpoint())
-        })?;
+        let mut ready = self.ready.lock().await;
+        if !*ready {
+            return Err(StorageError::Closed);
+        }
+        let (position, pending) = self
+            .partition
+            .read(|state| (state.position(), state.has_commits_since_checkpoint()));
         if !pending {
             return Ok(position);
         }
-        let position = self.following(position)?;
+        let position = following(position)?;
         let layout = Layout(&self.lease.key);
-        let segment_key = layout.segment(position, self.lease.generation);
-        let key = layout.manifest(position, self.lease.generation);
+        let segment_key = layout.segment(position, &self.author);
+        let key = layout.manifest(position, &self.author);
         let (segment, manifest) = self
             .partition
             .read(|state| state.checkpoint(position, &segment_key));
         let segment_frame = segment
             .as_ref()
-            .map(|s| encode(Kind::Segment, s))
+            .map(|(_, file)| encode(Kind::Segment, file))
             .transpose()?;
         let frame = encode(Kind::Manifest, &manifest)?;
-        attempt(&mut open, async {
+        attempt(&mut ready, async {
             if let Some(segment_frame) = segment_frame {
                 self.partition
                     .blobs
@@ -311,36 +340,24 @@ impl Writer {
             }
             self.publish(&key, frame, position).await?;
             let mut state = self.partition.state.write().expect("partition lock");
-            state.checkpointed(&key, &manifest, segment)
+            state.checkpointed(&key, position, segment)
         })
         .await?;
         Ok(position)
     }
 
-    fn snapshot<T>(&self, open: &bool, f: impl FnOnce(&State) -> T) -> Result<T> {
-        open.then(|| self.partition.read(f))
-            .ok_or(StorageError::Closed)
-    }
-
-    fn following(&self, position: LogPosition) -> Result<LogPosition> {
-        position
-            .next()
-            .ok_or_else(|| StorageError::Encode(format!("{} is out of positions", self.lease.key)))
-    }
-
-    /// Upload a head file and commit it.
     async fn publish(&self, key: &str, frame: Bytes, position: LogPosition) -> Result<()> {
         self.partition.blobs.put(key, frame).await?;
         let commit = Commit {
             log_position: position,
             manifest: Some(ManifestRef(key.to_string())),
         };
-        let mut attempt = 1;
+        let mut tries = 1;
         loop {
             match self.coordinator.commit(&self.lease, commit.clone()).await {
-                Err(error) if error.is_retryable() && attempt < COMMIT_ATTEMPTS => {
-                    tokio::time::sleep(COMMIT_RETRY_DELAY * attempt).await;
-                    attempt += 1;
+                Err(error) if error.is_retryable() && tries < COMMIT_ATTEMPTS => {
+                    tokio::time::sleep(COMMIT_RETRY_DELAY * tries).await;
+                    tries += 1;
                 }
                 outcome => return outcome.map(|_| ()).map_err(Into::into),
             }
@@ -348,11 +365,17 @@ impl Writer {
     }
 }
 
-/// Run one write attempt with the writer closed, reopening it only if the
-/// attempt ran to completion and succeeded.
-async fn attempt<T>(open: &mut bool, work: impl Future<Output = Result<T>>) -> Result<T> {
-    *open = false;
+fn following(position: LogPosition) -> Result<LogPosition> {
+    position
+        .next()
+        .ok_or(StorageError::Exhausted("log positions"))
+}
+
+/// Run one write attempt with the writer not ready, making it ready again
+/// only if the attempt ran to completion and succeeded.
+async fn attempt<T>(ready: &mut bool, work: impl Future<Output = Result<T>>) -> Result<T> {
+    *ready = false;
     let done = work.await?;
-    *open = true;
+    *ready = true;
     Ok(done)
 }

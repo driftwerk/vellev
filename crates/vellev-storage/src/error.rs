@@ -32,8 +32,10 @@ pub enum StorageError {
     Object(#[from] ObjectError),
     #[error("the committed history no longer contains {head:?}; reopen the partition")]
     Diverged { head: Option<String> },
-    #[error("the writer closed after a write whose outcome is unknown; reopen the partition")]
+    #[error("the writer closed after a write whose outcome is unknown; open a new writer")]
     Closed,
+    #[error("{0} are exhausted")]
+    Exhausted(&'static str),
     #[error("encoding failed: {0}")]
     Encode(String),
 }
