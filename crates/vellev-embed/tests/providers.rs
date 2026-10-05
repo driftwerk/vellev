@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aws_sdk_bedrockruntime::config::retry::RetryConfig;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Credentials, Region};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -10,7 +9,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use vellev_core::HttpApi;
-use vellev_embed::{Bedrock, EmbedError, Http, Provider};
+use vellev_core::{Embedding, EmbeddingProvider};
+use vellev_embed::{Bedrock, EmbedError, Embedders, Http, Provider, Purpose, Settings};
 
 /// What a stand-in server was sent, and how many of its first requests it
 /// is to refuse.
@@ -120,8 +120,11 @@ async fn openai(seen: Arc<Seen>) -> String {
 async fn a_tei_server_is_sent_batches_and_answers_in_order() {
     let seen = Arc::new(Seen::default());
     let url = tei(seen.clone()).await;
-    let provider = Http::new(&format!("{url}/"), HttpApi::Tei, "bge", None);
-    let vectors = provider.embed(numbered(70)).await.unwrap();
+    let provider = Http::new(&format!("{url}/"), HttpApi::Tei, "bge", None).unwrap();
+    let vectors = provider
+        .embed(numbered(70), Purpose::Document)
+        .await
+        .unwrap();
     assert_eq!(vectors, (0..70).map(|n| vec![n as f32]).collect::<Vec<_>>());
 
     let bodies = seen.bodies();
@@ -146,8 +149,12 @@ async fn an_openai_endpoint_is_sent_the_model_and_key_and_answers_in_any_order()
         HttpApi::Openai,
         "text-embedding-3-small",
         Some("sk-secret".into()),
-    );
-    let vectors = provider.embed(numbered(3)).await.unwrap();
+    )
+    .unwrap();
+    let vectors = provider
+        .embed(numbered(3), Purpose::Document)
+        .await
+        .unwrap();
     assert_eq!(vectors, [vec![0.0], vec![1.0], vec![2.0]]);
     assert_eq!(
         seen.bodies(),
@@ -163,9 +170,12 @@ async fn an_openai_endpoint_is_sent_the_model_and_key_and_answers_in_any_order()
 async fn throttling_and_server_errors_are_tried_again_but_a_refusal_is_final() {
     for status in [429, 500, 503] {
         let seen = Seen::refusing(2, status);
-        let provider = Http::new(&tei(seen.clone()).await, HttpApi::Tei, "bge", None);
+        let provider = Http::new(&tei(seen.clone()).await, HttpApi::Tei, "bge", None).unwrap();
         assert_eq!(
-            provider.embed(numbered(1)).await.unwrap(),
+            provider
+                .embed(numbered(1), Purpose::Document)
+                .await
+                .unwrap(),
             [vec![0.0]],
             "{status}"
         );
@@ -178,8 +188,12 @@ async fn throttling_and_server_errors_are_tried_again_but_a_refusal_is_final() {
         HttpApi::Openai,
         "m",
         Some("sk-secret".into()),
-    );
-    let refused = provider.embed(numbered(1)).await.unwrap_err();
+    )
+    .unwrap();
+    let refused = provider
+        .embed(numbered(1), Purpose::Document)
+        .await
+        .unwrap_err();
     assert_eq!(
         refused,
         EmbedError::Failed {
@@ -191,22 +205,25 @@ async fn throttling_and_server_errors_are_tried_again_but_a_refusal_is_final() {
 }
 
 #[tokio::test]
-async fn a_server_that_never_recovers_or_cannot_be_reached_fails_after_four_tries() {
+async fn a_server_that_never_recovers_or_cannot_be_reached_fails_after_five_tries() {
     let seen = Seen::refusing(usize::MAX, 500);
-    let provider = Http::new(&tei(seen.clone()).await, HttpApi::Tei, "bge", None);
-    let failed = provider.embed(numbered(1)).await.unwrap_err();
+    let provider = Http::new(&tei(seen.clone()).await, HttpApi::Tei, "bge", None).unwrap();
+    let failed = provider
+        .embed(numbered(1), Purpose::Document)
+        .await
+        .unwrap_err();
     assert!(
         matches!(&failed, EmbedError::Failed { reason, .. } if reason.starts_with("500")),
         "{failed}"
     );
-    assert_eq!(seen.bodies().len(), 4);
+    assert_eq!(seen.bodies().len(), 5);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let unreachable = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let provider = Http::new(&unreachable, HttpApi::Tei, "bge", None);
+    let provider = Http::new(&unreachable, HttpApi::Tei, "bge", None).unwrap();
     assert!(matches!(
-        provider.embed(numbered(1)).await,
+        provider.embed(numbered(1), Purpose::Document).await,
         Err(EmbedError::Failed { .. })
     ));
 }
@@ -225,7 +242,8 @@ async fn an_answer_that_is_not_embeddings_is_malformed() {
     let url = serve(router).await;
     for api in [HttpApi::Tei, HttpApi::Openai] {
         let failed = Http::new(&url, api, "m", None)
-            .embed(numbered(1))
+            .unwrap()
+            .embed(numbered(1), Purpose::Document)
             .await
             .unwrap_err();
         assert!(
@@ -264,9 +282,7 @@ async fn bedrock(seen: Arc<Seen>) -> Bedrock {
     let router = Router::new()
         .route("/model/{model}/invoke", post(invoke))
         .with_state(seen);
-    let retries = RetryConfig::standard()
-        .with_max_attempts(vellev_embed::BEDROCK_ATTEMPTS)
-        .with_initial_backoff(Duration::from_millis(5));
+    let retries = Bedrock::retries().with_initial_backoff(Duration::from_millis(5));
     let config = aws_sdk_bedrockruntime::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("eu-west-2"))
@@ -279,8 +295,14 @@ async fn bedrock(seen: Arc<Seen>) -> Bedrock {
         ))
         .endpoint_url(serve(router).await)
         .retry_config(retries)
+        .timeout_config(Bedrock::timeouts())
         .build();
-    Bedrock::with_client(aws_sdk_bedrockruntime::Client::from_conf(config), TITAN, 2)
+    Bedrock::with_client(
+        aws_sdk_bedrockruntime::Client::from_conf(config),
+        TITAN,
+        256,
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -288,7 +310,7 @@ async fn titan_is_sent_one_signed_normalised_text_a_call_with_few_in_flight() {
     let seen = Arc::new(Seen::default());
     let provider = bedrock(seen.clone()).await;
     let texts: Vec<String> = (1..=40).map(|n| "x".repeat(n)).collect();
-    let vectors = provider.embed(texts).await.unwrap();
+    let vectors = provider.embed(texts, Purpose::Document).await.unwrap();
     assert_eq!(
         vectors,
         (1..=40).map(|n| vec![n as f32, 1.0]).collect::<Vec<_>>()
@@ -296,7 +318,7 @@ async fn titan_is_sent_one_signed_normalised_text_a_call_with_few_in_flight() {
 
     let bodies = seen.bodies();
     assert_eq!(bodies.len(), 40);
-    assert!(bodies.contains(&json!({ "inputText": "xxx", "dimensions": 2, "normalize": true })));
+    assert!(bodies.contains(&json!({ "inputText": "xxx", "dimensions": 256, "normalize": true })));
     let most = seen.most_in_flight.load(Ordering::SeqCst);
     assert!((2..=10).contains(&most), "{most} calls in flight");
     assert!(seen
@@ -316,17 +338,204 @@ async fn titan_is_tried_again_when_throttled_and_long_text_is_cut() {
     for status in [429, 500, 503] {
         let seen = Seen::refusing(2, status);
         let provider = bedrock(seen.clone()).await;
-        let vectors = provider.embed(vec!["é".repeat(40_000)]).await.unwrap();
+        let vectors = provider
+            .embed(vec!["é".repeat(40_000)], Purpose::Document)
+            .await
+            .unwrap();
         assert_eq!(vectors, [vec![30_000.0, 1.0]], "{status}");
         assert_eq!(seen.bodies().len(), 3);
     }
 
     let seen = Seen::refusing(usize::MAX, 400);
     let provider = bedrock(seen.clone()).await;
-    let failed = provider.embed(vec!["fox".into()]).await.unwrap_err();
+    let failed = provider
+        .embed(vec!["fox".into()], Purpose::Document)
+        .await
+        .unwrap_err();
     assert!(
         matches!(&failed, EmbedError::Failed { model, .. } if model == TITAN),
         "{failed}"
     );
     assert_eq!(seen.bodies().len(), 1);
+}
+
+#[tokio::test]
+async fn a_key_goes_only_to_the_endpoint_it_is_for_and_never_into_an_error() {
+    let seen = Seen::refusing(usize::MAX, 400);
+    let url = openai(seen.clone()).await;
+    let embedding = |url: &str| Embedding {
+        provider: EmbeddingProvider::Http {
+            url: url.into(),
+            api: HttpApi::Openai,
+        },
+        model: "m".into(),
+        dimensions: 1,
+        query_prefix: None,
+        document_prefix: None,
+        properties: vec![],
+    };
+    let embedders = Embedders::new(Settings {
+        keys: [(url.clone(), "sk-secret".to_string())].into(),
+        ..Settings::default()
+    });
+    for (asked, sent) in [
+        (format!("{url}/"), Some("Bearer sk-secret".to_string())),
+        (format!("{url}/v1"), None),
+    ] {
+        let embedder = embedders.embedder(&embedding(&asked)).unwrap().unwrap();
+        let refused = embedder.query("fox").await.unwrap_err().to_string();
+        assert!(!refused.contains("sk-secret"), "{refused}");
+        assert_eq!(seen.authorizations.lock().unwrap().last().unwrap(), &sent);
+    }
+
+    let padded = |State(key): State<String>| async move {
+        (StatusCode::BAD_REQUEST, format!("{}{key}", "x".repeat(290)))
+    };
+    let router = Router::new()
+        .route("/embed", post(padded))
+        .with_state("sk-0123456789abcdef".to_string());
+    let provider = Http::new(
+        &serve(router).await,
+        HttpApi::Tei,
+        "m",
+        Some("sk-0123456789abcdef".into()),
+    )
+    .unwrap();
+    let refused = provider
+        .embed(numbered(1), Purpose::Document)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!refused.contains("sk-0"), "{refused}");
+
+    let seen = Seen::refusing(usize::MAX, 400);
+    let provider = Http::new(
+        &tei(seen.clone()).await,
+        HttpApi::Tei,
+        "m",
+        Some("  ".into()),
+    )
+    .unwrap();
+    let refused = provider
+        .embed(numbered(1), Purpose::Document)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        EmbedError::Failed {
+            model: "m".into(),
+            reason: "400 Bad Request: refused ".into()
+        }
+    );
+    assert_eq!(*seen.authorizations.lock().unwrap(), [None]);
+}
+
+#[tokio::test]
+async fn an_openai_endpoint_may_be_named_with_its_version_and_must_number_its_vectors_in_turn() {
+    let seen = Arc::new(Seen::default());
+    let url = openai(seen.clone()).await;
+    let provider = Http::new(&format!("{url}/v1/"), HttpApi::Openai, "m", None).unwrap();
+    assert_eq!(
+        provider.embed(numbered(2), Purpose::Query).await.unwrap(),
+        [vec![0.0], vec![1.0]]
+    );
+
+    let twice = || async {
+        Json(json!({ "data": [
+            { "index": 0, "embedding": [1.0] },
+            { "index": 0, "embedding": [2.0] },
+        ] }))
+    };
+    let url = serve(Router::new().route("/v1/embeddings", post(twice))).await;
+    let provider = Http::new(&url, HttpApi::Openai, "m", None).unwrap();
+    assert_eq!(
+        provider.embed(numbered(2), Purpose::Document).await,
+        Err(EmbedError::Malformed {
+            model: "m".into(),
+            reason: "vectors numbered other than in turn".into()
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_is_given_the_wait_it_asks_for_and_a_request_that_cannot_be_sent_is_not_retried(
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let throttled = |State(calls): State<Arc<AtomicUsize>>| async move {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err((StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")]));
+        }
+        Ok(Json(json!([[7.0]])))
+    };
+    let router = Router::new()
+        .route("/embed", post(throttled))
+        .with_state(calls);
+    let provider = Http::new(&serve(router).await, HttpApi::Tei, "m", None).unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        provider.embed(numbered(1), Purpose::Query).await.unwrap(),
+        [vec![7.0]]
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let seen = Arc::new(Seen::default());
+    let provider = Http::new(
+        &tei(seen.clone()).await,
+        HttpApi::Tei,
+        "m",
+        Some("two\nlines".into()),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        provider.embed(numbered(1), Purpose::Query).await,
+        Err(EmbedError::Failed { .. })
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(seen.bodies().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bedrock_that_never_answers_fails_rather_than_hangs() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("eu-west-2"))
+        .credentials_provider(Credentials::new(
+            "AKIDEXAMPLE",
+            "secret",
+            None,
+            None,
+            "test",
+        ))
+        .endpoint_url(url)
+        .retry_config(Bedrock::retries())
+        .timeout_config(Bedrock::timeouts())
+        .build();
+    let provider = Bedrock::with_client(
+        aws_sdk_bedrockruntime::Client::from_conf(config),
+        TITAN,
+        256,
+    )
+    .unwrap();
+    let waited = tokio::time::timeout(
+        Duration::from_secs(600),
+        provider.embed(vec!["fox".into()], Purpose::Document),
+    );
+    assert!(matches!(waited.await, Ok(Err(EmbedError::Failed { .. }))));
 }

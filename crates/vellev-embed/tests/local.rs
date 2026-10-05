@@ -21,7 +21,10 @@ async fn bge_base_embeds_text_so_that_like_is_near_like() {
     let cache = std::env::var("VELLEV_MODEL_CACHE")
         .map(Into::into)
         .unwrap_or_else(|_| std::env::temp_dir().join("vellev-models"));
-    let embedders = Embedders::new(Settings { cache, key: None });
+    let embedders = Embedders::new(Settings {
+        cache,
+        ..Settings::default()
+    });
     let embedder = embedders
         .embedder(&Embedding {
             provider: EmbeddingProvider::Local,

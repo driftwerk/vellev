@@ -3,18 +3,36 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use vellev_core::{Embedding, EmbeddingProvider, HttpApi, Object, ObjectId, Value};
-use vellev_embed::{document, EmbedError, Embedder, Embedders, Provider, Result, Settings};
+use vellev_embed::{
+    document, EmbedError, Embedder, Embedders, Provider, Purpose, Result, Settings,
+};
 
 /// Embeds each text as its length and its count of spaces, or as told.
 #[derive(Debug, Default)]
 struct Fake {
     asked: Mutex<Vec<Vec<String>>>,
+    purposes: Mutex<Vec<Purpose>>,
     answer: Option<Vec<Vec<f32>>>,
+    failures: Mutex<usize>,
 }
 
 #[async_trait]
 impl Provider for Fake {
-    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: Vec<String>, purpose: Purpose) -> Result<Vec<Vec<f32>>> {
+        tokio::task::yield_now().await;
+        self.purposes.lock().unwrap().push(purpose);
+        let failing = {
+            let mut failures = self.failures.lock().unwrap();
+            let failing = *failures > 0;
+            *failures = failures.saturating_sub(1);
+            failing
+        };
+        if failing {
+            return Err(EmbedError::Failed {
+                model: "fake".into(),
+                reason: "not now".into(),
+            });
+        }
         let vectors = texts
             .iter()
             .map(|text| vec![text.len() as f32, text.matches(' ').count() as f32])
@@ -214,42 +232,100 @@ async fn collections_that_embed_alike_share_an_embedder() {
     assert!(!Arc::ptr_eq(&first, &elsewhere));
     assert!(!Arc::ptr_eq(&first, &reworded));
     assert_eq!(first.embedding(), &http("http://one.test"));
-
-    let bedrock = embedding(EmbeddingProvider::Bedrock {
-        region: "eu-west-2".into(),
-    });
-    assert!(embedders.embedder(&bedrock).unwrap().is_some());
 }
 
 #[cfg(feature = "local")]
 #[test]
-fn a_local_model_must_be_one_that_can_be_run_at_its_own_size() {
+fn a_model_that_cannot_be_embedded_with_is_refused_when_asked_for() {
     let embedders = Embedders::new(Settings::default());
-    let local = |model: &str, dimensions| Embedding {
+    let with = |provider: EmbeddingProvider, model: &str, dimensions| Embedding {
         model: model.into(),
         dimensions,
-        ..embedding(EmbeddingProvider::Local)
+        ..embedding(provider)
     };
-    for model in [
-        "BAAI/bge-base-en-v1.5",
-        "Xenova/bge-base-en-v1.5",
-        "bge-base-en-v1.5",
-    ] {
-        assert!(
-            embedders.embedder(&local(model, 768)).unwrap().is_some(),
-            "{model}"
-        );
+    let bedrock = || EmbeddingProvider::Bedrock {
+        region: "eu-west-2".into(),
+    };
+    let refused = |embedding: Embedding| embedders.embedder(&embedding).unwrap_err();
+    assert!(embedders
+        .embedder(&with(
+            EmbeddingProvider::Local,
+            "BAAI/bge-base-en-v1.5",
+            768
+        ))
+        .unwrap()
+        .is_some());
+    assert!(matches!(
+        refused(with(
+            EmbeddingProvider::Local,
+            "BAAI/bge-base-en-v1.5",
+            1024
+        )),
+        EmbedError::Unsupported(_)
+    ));
+    assert!(matches!(
+        refused(with(EmbeddingProvider::Local, "acme/unheard-of", 768)),
+        EmbedError::Unsupported(_)
+    ));
+    for dimensions in [256, 512, 1024] {
+        let titan = with(bedrock(), "amazon.titan-embed-text-v2:0", dimensions);
+        assert!(embedders.embedder(&titan).unwrap().is_some());
     }
     assert_eq!(
-        embedders
-            .embedder(&local("BAAI/bge-base-en-v1.5", 1024))
-            .unwrap_err(),
-        EmbedError::Unsupported("BAAI/bge-base-en-v1.5 has 768 dimensions, not 1024".into())
+        refused(with(bedrock(), "amazon.titan-embed-text-v2:0", 768)),
+        EmbedError::Unsupported(
+            "amazon.titan-embed-text-v2:0 has 256, 512 or 1024 dimensions, not 768".into()
+        )
     );
-    assert_eq!(
-        embedders
-            .embedder(&local("acme/unheard-of", 768))
-            .unwrap_err(),
-        EmbedError::Unsupported("acme/unheard-of cannot be run locally".into())
-    );
+    assert!(matches!(
+        refused(with(bedrock(), "cohere.embed-english-v3", 1024)),
+        EmbedError::Unsupported(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_query_asked_by_many_at_once_is_embedded_once_and_a_failure_is_not_kept() {
+    let (fake, embedder) = embedder(Fake::default());
+    let embedder = Arc::new(embedder);
+    let asking = (0..8).map(|_| {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.query("fox").await.unwrap() })
+    });
+    for answer in futures::future::join_all(asking).await {
+        assert_eq!(answer.unwrap(), Some(vec![9.0, 1.0]));
+    }
+    assert_eq!(fake.asked.lock().unwrap().len(), 1);
+    assert_eq!(*fake.purposes.lock().unwrap(), [Purpose::Query]);
+    embedder.documents(&texts(&["fox"])).await.unwrap();
+    assert_eq!(fake.purposes.lock().unwrap()[1], Purpose::Document);
+
+    let failing = Fake {
+        failures: Mutex::new(1),
+        ..Fake::default()
+    };
+    let (fake, embedder) = self::embedder(failing);
+    assert!(embedder.query("hen").await.is_err());
+    assert_eq!(embedder.query("hen").await.unwrap(), Some(vec![9.0, 1.0]));
+    assert_eq!(embedder.query("hen").await.unwrap(), Some(vec![9.0, 1.0]));
+    assert_eq!(fake.purposes.lock().unwrap().len(), 2);
+
+    let long = "long ".repeat(300);
+    embedder.query(&long).await.unwrap();
+    embedder.query(&long).await.unwrap();
+    assert_eq!(fake.purposes.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn settings_never_print_a_key() {
+    let settings = Settings {
+        cache: "/models".into(),
+        keys: [(
+            "https://api.example.test".to_string(),
+            "sk-secret".to_string(),
+        )]
+        .into(),
+    };
+    let printed = format!("{settings:?} {:?}", Embedders::new(settings.clone()));
+    assert!(printed.contains("https://api.example.test"), "{printed}");
+    assert!(!printed.contains("sk-secret"), "{printed}");
 }

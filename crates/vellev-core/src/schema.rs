@@ -102,7 +102,7 @@ impl Property {
 }
 
 /// What an embedding endpoint speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpApi {
     /// A text-embeddings-inference server's `/embed`.
@@ -112,7 +112,7 @@ pub enum HttpApi {
     Openai,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum EmbeddingProvider {
     /// A model run in the node's own process.
@@ -129,7 +129,7 @@ pub enum EmbeddingProvider {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Embedding {
     #[serde(flatten)]
     pub provider: EmbeddingProvider,

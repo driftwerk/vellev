@@ -7,7 +7,7 @@ mod http;
 mod local;
 mod registry;
 
-pub use bedrock::{Bedrock, ATTEMPTS as BEDROCK_ATTEMPTS};
+pub use bedrock::Bedrock;
 pub use embedder::{document, Embedder};
 pub use http::Http;
 #[cfg(feature = "local")]
@@ -28,9 +28,17 @@ pub enum EmbedError {
 
 pub type Result<T> = std::result::Result<T, EmbedError>;
 
+/// What texts are embedded for. Someone is waiting on a query, so where a
+/// model has a queue, queries go ahead of documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    Document,
+    Query,
+}
+
 /// A model that turns texts into vectors.
 #[async_trait]
 pub trait Provider: std::fmt::Debug + Send + Sync {
     /// One vector for each text, in order. No text is blank.
-    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>>;
+    async fn embed(&self, texts: Vec<String>, purpose: Purpose) -> Result<Vec<Vec<f32>>>;
 }

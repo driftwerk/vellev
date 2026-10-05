@@ -13,15 +13,21 @@ allow = [
     "Zlib",
 ]
 
-# MPL-2.0 binds only changes to the crate's own files, and it is used as
-# published. It comes in through the model downloader's choice of cache
-# directory.
+# MPL-2.0 is copyleft for the crate's own files only. It is used unchanged,
+# so what it asks of a binary shipped to a customer is a notice of where
+# that crate's source can be had. It comes in through the model
+# downloader's choice of cache directory.
 [[licenses.exceptions]]
 crate = "option-ext"
 allow = ["MPL-2.0"]
 
 [licenses.private]
 ignore = true
+
+# `paste` is finished rather than abandoned: a small macro crate with no
+# known fault, used by the tokenizer the local model needs.
+[advisories]
+ignore = ["RUSTSEC-2024-0436"]
 
 [bans]
 multiple-versions = "allow"

@@ -13,8 +13,8 @@ local = ["dep:fastembed"]
 vellev-core.workspace = true
 
 async-trait.workspace = true
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls", "sso", "credentials-process"] }
-aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "sso", "credentials-process"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 futures.workspace = true
 reqwest.workspace = true
