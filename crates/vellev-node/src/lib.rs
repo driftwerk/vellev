@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, OnceCell};
-use vellev_core::{CollectionName, Embedding, NodeId, Partition, TenantId};
+use vellev_core::{
+    CollectionName, Embedding, EmbeddingProvider, NodeId, Object, Partition, TenantId,
+};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
@@ -118,9 +120,74 @@ impl Tenant {
         self.writer.partition().read(f)
     }
 
+    /// `mutations` with vectors made for the objects that are written
+    /// whole, to a collection that embeds them, with text that has no
+    /// vector stored. Callers embed side by side here; whatever is not
+    /// made here, for any reason, is made or refused by the commit, one
+    /// commit at a time.
+    async fn embedded(&self, mut mutations: Vec<Mutation>) -> Vec<Mutation> {
+        let wanted: Vec<(usize, Embedding, String)> = self.read(|state| {
+            mutations
+                .iter()
+                .enumerate()
+                .filter_map(|(at, mutation)| {
+                    let (Mutation::Upsert {
+                        collection,
+                        id,
+                        properties,
+                        vector: None,
+                    }
+                    | Mutation::Insert {
+                        collection,
+                        id,
+                        properties,
+                        vector: None,
+                    }) = mutation
+                    else {
+                        return None;
+                    };
+                    let schema = state.collection(collection)?;
+                    let embedding = &schema.embedding;
+                    let text = Object::from_json(schema, *id, properties, None)
+                        .ok()?
+                        .embedded_text(embedding);
+                    let stored = state
+                        .get(collection, *id)
+                        .is_some_and(|stored| stored.embedded_text(embedding) == text);
+                    let wanted = embedding.provider != EmbeddingProvider::None
+                        && !stored
+                        && !text.trim().is_empty();
+                    wanted.then(|| (at, embedding.clone(), text))
+                })
+                .collect()
+        });
+        let mut alike: HashMap<Embedding, Vec<(usize, String)>> = HashMap::new();
+        for (at, embedding, text) in wanted {
+            alike.entry(embedding).or_default().push((at, text));
+        }
+        for (embedding, texts) in alike {
+            let (at, texts): (Vec<usize>, Vec<String>) = texts.into_iter().unzip();
+            let Ok(Some(embedder)) = self.embedders.embedder(&embedding) else {
+                continue;
+            };
+            let Ok(vectors) = embedder.documents(&texts).await else {
+                continue;
+            };
+            for (at, made) in at.into_iter().zip(vectors) {
+                if let Mutation::Upsert { vector, .. } | Mutation::Insert { vector, .. } =
+                    &mut mutations[at]
+                {
+                    *vector = made;
+                }
+            }
+        }
+        mutations
+    }
+
     /// Commit `mutations` as one atomic step, sharing the commit with
     /// whoever else is writing.
     pub async fn write(&self, mutations: Vec<Mutation>) -> Result<Receipt> {
+        let mutations = self.embedded(mutations).await;
         let receipt = self.commits.submit(mutations).await.inspect_err(|error| {
             let lost = matches!(
                 error.root(),

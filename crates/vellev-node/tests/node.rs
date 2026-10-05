@@ -405,6 +405,32 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
         Err(NodeError::Storage(StorageError::UnknownCollection(_)))
     ));
 
+    acme.write(vec![note(1, "a red fox", None), note(3, "hen", None)])
+        .await
+        .unwrap();
+    assert_eq!(vector(3), Some(vec![3.0, 1.0]));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "only the new text is embedded"
+    );
+    let before = acme.read(State::position);
+    let together =
+        join_all((10..40).map(|n| acme.write(vec![note(n, &format!("note {n}"), None)])));
+    assert!(together.await.iter().all(Result::is_ok));
+    let commits = acme.read(State::position).0 - before.0;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        33,
+        "each caller embeds for itself"
+    );
+    assert!(
+        commits < 30,
+        "{commits} commits for 30 callers embedding side by side"
+    );
+    assert!((10..40).all(|n| vector(n) == Some(vec![7.0, 2.0])));
+    let calls_so_far = calls.load(Ordering::SeqCst);
+
     node.create_tenant(&tenant("plain")).await.unwrap();
     let plain = node.tenant(&tenant("plain")).await.unwrap();
     plain
@@ -416,5 +442,5 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
         plain.read(|state| state.get(&notes(), id(1)).unwrap().vector.clone()),
         None
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), calls_so_far);
 }
