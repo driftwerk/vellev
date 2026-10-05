@@ -156,3 +156,40 @@ impl From<QueryRejection> for ApiError {
         Self::invalid(rejection.body_text())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn a_commit_that_failed_as_a_whole_is_uncertain_and_one_callers_refusal_is_not() {
+        let blob = || StorageError::Blob {
+            key: "k".into(),
+            source: "connection reset".into(),
+        };
+        let told = |error: StorageError| {
+            let ApiError { status, code, .. } = error.into();
+            (status, code)
+        };
+        let unavailable = (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable);
+        let uncertain = (StatusCode::SERVICE_UNAVAILABLE, Code::Uncertain);
+        assert_eq!(told(StorageError::Shared(Arc::new(blob()))), uncertain);
+        assert_eq!(
+            told(StorageError::Shared(Arc::new(StorageError::Closed))),
+            uncertain
+        );
+        assert_eq!(told(StorageError::Closed), unavailable);
+        assert_eq!(told(blob()), unavailable);
+        let unembedded = || StorageError::Embedding {
+            model: "m".into(),
+            reason: "away".into(),
+        };
+        assert_eq!(told(unembedded()), unavailable);
+        assert_eq!(
+            told(StorageError::Shared(Arc::new(unembedded()))),
+            unavailable
+        );
+    }
+}
