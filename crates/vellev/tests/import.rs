@@ -330,7 +330,12 @@ async fn a_named_vector_and_a_tenant_of_a_multi_tenant_class_are_copied_beside_a
     let refused = import::weaviate(&untenanted, &tenant, &options)
         .await
         .unwrap_err();
-    assert!(refused.to_string().contains("multi-tenancy"), "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("say which Weaviate tenant to copy"),
+        "{refused}"
+    );
 
     let source = Source {
         tenant: Some("t1".into()),
