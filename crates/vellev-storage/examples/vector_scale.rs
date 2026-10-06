@@ -156,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let flushing = Instant::now();
         writer.flush().await?;
+        writer.clean(Duration::ZERO).await?;
         println!(
             "segment {segment}: committed and flushed by {:.1?} (flush {:.1?}), rss {} MB",
             started.elapsed(),
