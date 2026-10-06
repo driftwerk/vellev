@@ -2,5 +2,5 @@
   "generation": 2,
   "incarnation": 1,
   "log_position": 16,
-  "manifest": "tenant-a/0/log/00000000000000000016-00000000000000000002-ba9604c704ef4ad98bf13fbfd32992d4.log"
+  "manifest": "tenant-a/0/manifest/00000000000000000016-00000000000000000002-95448493e7cb43f8b09a7e02ed034763.manifest"
 }

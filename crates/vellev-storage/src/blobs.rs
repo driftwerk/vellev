@@ -97,7 +97,13 @@ impl Layout<'_> {
         self.named(kind, position, author, "")
     }
 
-    fn named(&self, kind: &str, position: LogPosition, author: &Author, suffix: &str) -> String {
+    pub(crate) fn named(
+        &self,
+        kind: &str,
+        position: LogPosition,
+        author: &Author,
+        suffix: &str,
+    ) -> String {
         format!(
             "{}{kind}/{:020}-{:020}-{}{suffix}.{kind}",
             self.prefix(),

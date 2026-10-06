@@ -347,7 +347,35 @@ pub struct State {
     memtable: Memtable,
     live: HashMap<RowKey, Location>,
     corpora: HashMap<CollectionId, Corpus>,
-    has_commits_since_checkpoint: bool,
+    /// The logs applied since the last checkpoint, oldest first: what is
+    /// in the memtable and in no segment.
+    since: Vec<String>,
+}
+
+/// What a flush takes out of the memtable: freeing it takes long enough
+/// that it is better done without holding the state.
+pub(crate) struct Discarded {
+    _rows: Vec<Row>,
+    _indexes: Indexes,
+}
+
+/// What a flush takes from the state to build its segment while commits go
+/// on: the memtable's live rows and tombstones at `position`, and where
+/// each row lies in the memtable.
+#[derive(Debug, Clone)]
+pub(crate) struct Snapshot {
+    pub position: LogPosition,
+    pub checkpoint: Option<String>,
+    pub catalog: Catalog,
+    pub rows: Vec<Row>,
+    pub tombstones: Vec<RowKey>,
+    /// Where each of `rows` lies in the memtable.
+    at: Vec<usize>,
+    /// How many rows the memtable held: every one of them is in the
+    /// flushed segment or dead by the time the flush is adopted.
+    held: usize,
+    /// How many of the logs since the checkpoint it covers.
+    logs: usize,
 }
 
 fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a Row> {
@@ -600,11 +628,6 @@ impl State {
         })
     }
 
-    /// Whether recovery would have to replay log on top of the last checkpoint.
-    pub(crate) fn has_commits_since_checkpoint(&self) -> bool {
-        self.has_commits_since_checkpoint
-    }
-
     fn mark_dead(&mut self, location: Location) {
         let (rows, dead, deaths, indexes, row) = match location {
             Location::Memtable(row) => {
@@ -807,7 +830,7 @@ impl State {
         }
         self.position = log.position;
         self.head = Some(key.to_string());
-        self.has_commits_since_checkpoint = true;
+        self.since.push(key.to_string());
         Ok(())
     }
 
@@ -999,23 +1022,8 @@ impl State {
                 },
             )
         });
-        let flushed = segment.iter().map(|(meta, _)| meta.clone());
-        let manifest = Manifest {
-            position,
-            prev: self.checkpoint.clone(),
-            next_collection_id: self.catalog.next_id(),
-            collections: self
-                .catalog
-                .collections()
-                .map(|(id, schema)| (id, schema.clone()))
-                .collect(),
-            segments: self
-                .segments
-                .iter()
-                .map(|s| s.meta.clone())
-                .chain(flushed)
-                .collect(),
-        };
+        let flushed = segment.as_ref().map(|(meta, _)| meta.clone());
+        let manifest = self.manifest(position, &self.catalog, flushed);
         (segment, manifest)
     }
 
@@ -1035,7 +1043,214 @@ impl State {
         self.position = position;
         self.head = Some(manifest_key.to_string());
         self.checkpoint = Some(manifest_key.to_string());
-        self.has_commits_since_checkpoint = false;
+        self.since.clear();
         Ok(())
+    }
+
+    /// What a flush needs to build its segment without the writer, or
+    /// `None` when nothing was committed since the last checkpoint. Its
+    /// rows are left to be copied by [`Self::copy_rows`], a part at a time,
+    /// so that commits are not held up while all of them are.
+    pub(crate) fn snapshot(&self) -> Option<Snapshot> {
+        if self.since.is_empty() {
+            return None;
+        }
+        let at: Vec<usize> = (0..self.memtable.rows.len())
+            .filter(|row| !self.memtable.dead[*row])
+            .collect();
+        Some(Snapshot {
+            position: self.position,
+            checkpoint: self.checkpoint.clone(),
+            catalog: self.catalog.clone(),
+            rows: Vec::with_capacity(at.len()),
+            tombstones: self.memtable.tombstones.clone(),
+            at,
+            held: self.memtable.rows.len(),
+            logs: self.since.len(),
+        })
+    }
+
+    /// Copy into `snapshot` up to `most` more of its rows. A memtable row
+    /// never changes once written, and none goes until the flush that took
+    /// the snapshot is adopted, so they may be copied in parts while
+    /// commits go on. Returns whether any are left to copy.
+    pub(crate) fn copy_rows(&self, snapshot: &mut Snapshot, most: usize) -> bool {
+        let from = snapshot.rows.len();
+        let to = (from + most).min(snapshot.at.len());
+        let rows = &self.memtable.rows;
+        snapshot
+            .rows
+            .extend(snapshot.at[from..to].iter().map(|row| rows[*row].clone()));
+        to < snapshot.at.len()
+    }
+
+    /// The manifest a flush built from `snapshot` commits at `position`:
+    /// the segments there are, then the flushed one if any, the collections
+    /// as at the snapshot, and the logs committed since to apply on top.
+    pub(crate) fn flushed_manifest(
+        &self,
+        position: LogPosition,
+        snapshot: &Snapshot,
+        flushed: Option<SegmentMeta>,
+    ) -> Manifest {
+        debug_assert_eq!(self.checkpoint, snapshot.checkpoint);
+        Manifest {
+            replay: self.since[snapshot.logs..].to_vec(),
+            replay_after: snapshot.position,
+            ..self.manifest(position, &snapshot.catalog, flushed)
+        }
+    }
+
+    /// A manifest at `position` of the segments there are, then `flushed`,
+    /// with the collections of `catalog` and nothing to replay.
+    fn manifest(
+        &self,
+        position: LogPosition,
+        catalog: &Catalog,
+        flushed: Option<SegmentMeta>,
+    ) -> Manifest {
+        Manifest {
+            position,
+            prev: self.checkpoint.clone(),
+            next_collection_id: catalog.next_id(),
+            collections: catalog
+                .collections()
+                .map(|(id, schema)| (id, schema.clone()))
+                .collect(),
+            segments: self
+                .segments
+                .iter()
+                .map(|segment| segment.meta.clone())
+                .chain(flushed)
+                .collect(),
+            replay: Vec::new(),
+            replay_after: LogPosition::default(),
+        }
+    }
+
+    /// Adopt a committed flush built from `snapshot`, returning the rows
+    /// and indexes it takes out of memory. Each of its rows
+    /// still live moves from the memtable to the new segment, where it is
+    /// live; one replaced or deleted since is dead there too. The memtable
+    /// then keeps only what was committed after the snapshot, indexed
+    /// afresh: as much as was committed while the flush was built.
+    pub(crate) fn flushed(
+        &mut self,
+        manifest_key: &str,
+        position: LogPosition,
+        snapshot: Snapshot,
+        segment: Option<(SegmentMeta, Loaded)>,
+    ) -> Result<Discarded> {
+        if let Some((meta, loaded)) = segment {
+            let indexes = loaded.indexed(&meta.key, &self.catalog)?;
+            let Loaded { file, vectors, .. } = loaded;
+            let index = self.segments.len();
+            debug_assert_eq!(file.rows.len(), snapshot.at.len());
+            let dead: Vec<bool> = file
+                .rows
+                .iter()
+                .zip(&snapshot.at)
+                .enumerate()
+                .map(|(at, (Row { collection, object }, row))| {
+                    let key = (*collection, object.id);
+                    let still = self.live.get(&key) == Some(&Location::Memtable(*row));
+                    if still {
+                        self.live.insert(key, Location::Segment(index, at));
+                        self.memtable.dead[*row] = true;
+                        self.memtable.deaths += 1;
+                    }
+                    !still
+                })
+                .collect();
+            self.segments.push(Segment {
+                meta,
+                file,
+                vectors,
+                indexes,
+                deaths: dead.iter().filter(|dead| **dead).count(),
+                dead,
+            });
+        }
+        let flushed: HashSet<RowKey> = snapshot.tombstones.into_iter().collect();
+        self.memtable
+            .tombstones
+            .retain(|tombstone| !flushed.contains(tombstone));
+        let discarded = self.drop_flushed_rows(snapshot.held);
+        self.since.drain(..snapshot.logs);
+        self.position = position;
+        self.head = Some(manifest_key.to_string());
+        self.checkpoint = Some(manifest_key.to_string());
+        Ok(discarded)
+    }
+
+    /// Take out the memtable's first `held` rows, every one of them dead,
+    /// renumbering and indexing afresh those after them. Returns what was
+    /// taken out, to be freed without holding the state.
+    fn drop_flushed_rows(&mut self, held: usize) -> Discarded {
+        debug_assert!(self.memtable.dead[..held].iter().all(|dead| *dead));
+        let Memtable {
+            rows,
+            dead,
+            deaths,
+            indexes,
+            ..
+        } = &mut self.memtable;
+        let discarded = Discarded {
+            _rows: rows.drain(..held).collect(),
+            _indexes: std::mem::take(indexes),
+        };
+        dead.drain(..held);
+        *deaths -= held;
+        for (row, Row { collection, object }) in rows.iter().enumerate() {
+            if let Some(schema) = self.catalog.schema(*collection) {
+                indexes
+                    .entry(*collection)
+                    .or_default()
+                    .insert(schema, row as u32, object);
+            }
+        }
+        for location in self.live.values_mut() {
+            if let Location::Memtable(row) = location {
+                *row -= held;
+            }
+        }
+        discarded
+    }
+
+    /// The state rebuilt from a manifest's segments, brought through the
+    /// manifest's replayed logs to the manifest itself, under `key` at
+    /// `position`. The logs must start just after `after`, the position
+    /// the segments hold, as applying them checks, and end just before
+    /// the manifest.
+    pub(crate) fn replayed(
+        self,
+        key: &str,
+        position: LogPosition,
+        after: LogPosition,
+        logs: &[(String, LogSegment)],
+    ) -> Result<Self> {
+        let Some((_, first)) = logs.first() else {
+            return Ok(self);
+        };
+        let mut state = State {
+            position: after,
+            head: first.prev.clone(),
+            ..self
+        };
+        for (log_key, log) in logs {
+            state.apply(log_key, log)?;
+        }
+        if state.position.next() != Some(position) {
+            return Err(StorageError::corrupt(
+                key,
+                "its replayed logs do not end just before it",
+            ));
+        }
+        Ok(State {
+            position,
+            head: Some(key.to_string()),
+            checkpoint: Some(key.to_string()),
+            ..state
+        })
     }
 }

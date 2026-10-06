@@ -229,3 +229,58 @@ impl Random {
         (0..dimensions).map(|_| self.unit()).collect()
     }
 }
+
+/// Blobs that, once armed, report each file of one kind they have stored
+/// and then hold the upload until released, and report each listing taken.
+#[derive(Debug)]
+pub struct Paused {
+    inner: Arc<dyn Blobs>,
+    kind: &'static str,
+    pub armed: AtomicBool,
+    events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    pub release: tokio::sync::Notify,
+}
+
+impl Paused {
+    pub fn new(
+        cluster: &mut Cluster,
+        kind: &'static str,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    ) {
+        let (events, seen) = tokio::sync::mpsc::unbounded_channel();
+        let paused = Arc::new(Self {
+            inner: cluster.blobs.clone(),
+            kind,
+            armed: AtomicBool::new(false),
+            events,
+            release: tokio::sync::Notify::new(),
+        });
+        cluster.blobs = paused.clone();
+        (paused, seen)
+    }
+}
+
+#[async_trait]
+impl Blobs for Paused {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await?;
+        if self.armed.load(Ordering::SeqCst) && key.contains(self.kind) {
+            self.events.send("stored").unwrap();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        let listed = self.inner.list(prefix).await?;
+        self.events.send("listed").unwrap();
+        Ok(listed)
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
