@@ -218,7 +218,14 @@ impl Tenant {
     /// answered as it was, and not made again.
     pub async fn write(&self, batch: impl Into<Batch>) -> Result<Receipt> {
         let batch = batch.into();
-        let made = self.embedded(&batch.mutations).await;
+        // A request answered already is answered without its vectors.
+        let answered = batch
+            .request
+            .is_some_and(|request| self.read(|state| state.answered(request)));
+        let made = match answered {
+            true => Embedded::new(),
+            false => self.embedded(&batch.mutations).await,
+        };
         let receipt = self
             .commits
             .submit_batch(batch, made)

@@ -20,7 +20,7 @@ use vellev_index::clustered::ClusteredIndex;
 
 use crate::coordinator::LogPosition;
 use crate::mutation::Outcome;
-use crate::{Result, StorageError};
+use crate::{Refusal, Result, StorageError};
 
 const MAGIC: [u8; 4] = *b"VLLV";
 const HEADER: usize = 4 + 1 + 2 + 8 + 4;
@@ -100,13 +100,22 @@ pub struct LogSegment {
     pub answered: Vec<Answered>,
 }
 
-/// A request a commit answered: what it did, and when the commit was made,
-/// in milliseconds since the Unix epoch.
+/// A request a commit answered: how, and when the commit was made, in
+/// milliseconds since the Unix epoch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Answered {
     pub request: RequestId,
     pub at: u64,
-    pub outcomes: Vec<Outcome>,
+    pub answer: Answer,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Answer {
+    /// The request's changes were made, or changed nothing, with these
+    /// outcomes.
+    Made(Vec<Outcome>),
+    /// The request was refused, and none of it made.
+    Refused(Refusal),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -311,16 +320,26 @@ mod tests {
                 collection: CollectionId(1),
                 id: ObjectId(uuid::Uuid::from_u128(7)),
             }],
-            answered: vec![Answered {
-                request: RequestId(uuid::Uuid::from_u128(9)),
-                at: 1_791_300_000_000,
-                outcomes: vec![
-                    Outcome::Applied,
-                    Outcome::Unchanged,
-                    Outcome::Value(vellev_core::Value::Int(3)),
-                    Outcome::Deleted(2),
-                ],
-            }],
+            answered: vec![
+                Answered {
+                    request: RequestId(uuid::Uuid::from_u128(9)),
+                    at: 1_791_300_000_000,
+                    answer: Answer::Made(vec![
+                        Outcome::Applied,
+                        Outcome::Unchanged,
+                        Outcome::Value(vellev_core::Value::Int(3)),
+                        Outcome::Deleted(2),
+                    ]),
+                },
+                Answered {
+                    request: RequestId(uuid::Uuid::from_u128(10)),
+                    at: 1_791_300_000_000,
+                    answer: Answer::Refused(Refusal {
+                        kind: crate::Refused::Conflict,
+                        message: "object 7 already exists in notes".into(),
+                    }),
+                },
+            ],
         }
     }
 

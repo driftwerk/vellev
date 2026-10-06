@@ -17,12 +17,12 @@ use crate::coordinator::{
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
-    decode, decode_head, encode, Answered, Head, Kind, LogSegment, Manifest, Op, SegmentFile,
-    SegmentIndex, SegmentMeta,
+    decode, decode_head, encode, Answer, Answered, Head, Kind, LogSegment, Manifest, Op,
+    SegmentFile, SegmentIndex, SegmentMeta,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Vectorize};
 use crate::state::{self, Indexes, Loaded, Merging, Names, Shape, State, Stored};
-use crate::{Result, StorageError};
+use crate::{Refusal, Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
 /// safe because the coordinator accepts an identical commit twice.
@@ -338,8 +338,8 @@ impl Partition {
 /// anything.
 enum Earlier {
     None,
-    /// A commit before this one, with this receipt.
-    Answered(Receipt),
+    /// A commit before this one, which made it or refused it.
+    Answered(std::result::Result<Receipt, Refusal>),
     /// The batch at this place in the same group.
     InGroup(usize),
 }
@@ -509,10 +509,12 @@ impl Writer {
     /// As [`Self::commit_group_with`], for batches that may name the
     /// request they came in. A request this partition answered lately is
     /// answered again as it was and nothing of it is made, and so is a
-    /// request that comes twice in one group, the second time. Those
-    /// answered by a commit are recorded with it, so that a writer which
-    /// takes the partition over answers them alike. A batch that changed
-    /// nothing is not recorded: making it again is making it later.
+    /// request that comes twice in one group, the second time. A request
+    /// is answered by the commit that makes it, refuses it or finds it
+    /// changes nothing, and is recorded with that commit, so that a writer
+    /// which takes the partition over answers it alike. One that fails in
+    /// a way that may pass, an embedding that could not be made, is not
+    /// answered and may be tried again.
     pub async fn commit_batches(
         &self,
         batches: Vec<Batch>,
@@ -537,8 +539,11 @@ impl Writer {
                     let Some(request) = batch.request else {
                         return Earlier::None;
                     };
-                    if let Some((position, outcomes)) = state.answered(request) {
-                        return Earlier::Answered(receipt(position, outcomes.to_vec()));
+                    if let Some((position, answer)) = state.answer(request) {
+                        return Earlier::Answered(match answer {
+                            Answer::Made(outcomes) => Ok(receipt(position, outcomes.clone())),
+                            Answer::Refused(refusal) => Err(refusal.clone()),
+                        });
                     }
                     match batches[..at]
                         .iter()
@@ -606,25 +611,30 @@ impl Writer {
                 return Err(StorageError::Embedding { model, reason });
             }
         };
-        let at = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as u64);
-        let answered = batches
+        let at = self.partition.read(|state| state.stamp(now));
+        // Every request whose fate this commit decides, made or refused,
+        // even if it changed nothing, so that no later try makes it.
+        let answered: Vec<Answered> = batches
             .iter()
             .zip(&outcomes)
             .zip(unembedded.iter().zip(&earlier))
-            .filter_map(
-                |((batch, outcomes), made)| match (batch.request, outcomes, made) {
-                    (Some(request), Ok(outcomes), (None, Earlier::None)) => Some(Answered {
-                        request,
-                        at,
-                        outcomes: outcomes.clone(),
-                    }),
-                    _ => None,
-                },
-            )
+            .filter_map(|((batch, outcomes), decided)| {
+                let answer = match (outcomes, decided) {
+                    (Ok(outcomes), (None, Earlier::None)) => Answer::Made(outcomes.clone()),
+                    (Err(error), (None, Earlier::None)) => Answer::Refused(error.refusal()?),
+                    _ => return None,
+                };
+                Some(Answered {
+                    request: batch.request?,
+                    at,
+                    answer,
+                })
+            })
             .collect();
-        let position = if ops.is_empty() {
+        let position = if ops.is_empty() && answered.is_empty() {
             position
         } else {
             let log = LogSegment {
@@ -646,28 +656,38 @@ impl Writer {
             .await?;
             log.position
         };
+        // A batch whose request comes again later in the group shares its
+        // failure with that later one.
+        let repeated: HashSet<usize> = earlier
+            .iter()
+            .filter_map(|earlier| match earlier {
+                Earlier::InGroup(first) => Some(*first),
+                _ => None,
+            })
+            .collect();
         let mut results: Vec<Result<Receipt>> = outcomes
             .into_iter()
             .zip(unembedded)
-            .map(|(outcomes, unembedded)| match unembedded {
-                Some((model, reason)) => Err(StorageError::Embedding { model, reason }),
-                None => outcomes.map(|outcomes| receipt(position, outcomes)),
+            .enumerate()
+            .map(|(at, (outcomes, unembedded))| {
+                let result = match unembedded {
+                    Some((model, reason)) => Err(StorageError::Embedding { model, reason }),
+                    None => outcomes.map(|outcomes| receipt(position, outcomes)),
+                };
+                result.map_err(|error| match repeated.contains(&at) {
+                    true => StorageError::Shared(Arc::new(error)),
+                    false => error,
+                })
             })
             .collect();
         for (at, earlier) in earlier.into_iter().enumerate() {
             results[at] = match earlier {
                 Earlier::None => continue,
-                Earlier::Answered(receipt) => Ok(receipt),
-                Earlier::InGroup(first) => match &mut results[first] {
+                Earlier::Answered(answer) => answer.map_err(StorageError::Refused),
+                Earlier::InGroup(first) => match &results[first] {
                     Ok(receipt) => Ok(receipt.clone()),
-                    Err(error) => {
-                        let shared = match std::mem::replace(error, StorageError::Closed) {
-                            StorageError::Shared(shared) => shared,
-                            other => Arc::new(other),
-                        };
-                        *error = StorageError::Shared(shared.clone());
-                        Err(StorageError::Shared(shared))
-                    }
+                    Err(StorageError::Shared(shared)) => Err(StorageError::Shared(shared.clone())),
+                    Err(_) => unreachable!("a repeated request's failure is shared"),
                 },
             };
         }

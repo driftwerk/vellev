@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use vellev_core::RequestId;
-use vellev_storage::{Batch, Embedded, Receipt};
+use vellev_storage::{Batch, Embedded, Outcome, Receipt};
 
 fn increment(object: u8, by: f64) -> Mutation {
     Mutation::Increment {
@@ -119,7 +119,7 @@ async fn a_request_twice_in_one_commit_is_made_once() {
 }
 
 #[tokio::test]
-async fn a_refused_request_is_not_remembered() {
+async fn a_refused_request_is_refused_again_as_it_was() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
     let request = RequestId::generate();
@@ -128,10 +128,63 @@ async fn a_refused_request_is_not_remembered() {
         mutations: vec![upsert("notes", 1, 7)],
     };
     let refused = made(&writer, vec![batch()]).await.pop().unwrap();
-    assert!(refused.is_err());
+    let refusal = refused.unwrap_err().refusal().unwrap();
     writer.commit(vec![create("notes")]).await.unwrap();
-    made(&writer, vec![batch()]).await.pop().unwrap().unwrap();
+    let again = made(&writer, vec![batch()]).await.pop().unwrap();
+    assert_eq!(again.unwrap_err().refusal(), Some(refusal));
     writer
         .partition()
-        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(7)));
+        .read(|state| assert_eq!(n_of(state, "notes", 1), None));
+}
+
+#[tokio::test]
+async fn a_request_that_changed_nothing_does_not_undo_a_later_write_when_it_comes_late() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer.commit(vec![create("notes")]).await.unwrap();
+    let request = RequestId::generate();
+    let delete = || Batch {
+        request: Some(request),
+        mutations: vec![delete("notes", 1)],
+    };
+    let first = made(&writer, vec![delete()]).await.pop().unwrap().unwrap();
+    assert_eq!(first.outcomes, [Outcome::Unchanged]);
+    writer.commit(vec![upsert("notes", 1, 5)]).await.unwrap();
+    let late = made(&writer, vec![delete()]).await.pop().unwrap().unwrap();
+    assert_eq!(late, first);
+    writer
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(5)));
+}
+
+#[tokio::test]
+async fn a_request_made_while_a_flush_builds_is_known_to_whoever_takes_over_and_every_copy() {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
+    let writer = Arc::new(cluster.writer().await);
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 0)])
+        .await
+        .unwrap();
+    paused.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    assert_eq!(stored.recv().await, Some("stored"));
+    paused.armed.store(false, Ordering::SeqCst);
+    let request = RequestId::generate();
+    let first = requested(&writer, request, vec![increment(1, 5.0)]).await;
+    paused.release.notify_one();
+    flushing.await.unwrap().unwrap();
+    writer.commit(vec![upsert("notes", 1, 100)]).await.unwrap();
+
+    let copy = cluster.open().await;
+    assert!(copy.partition().read(|state| state.answered(request)));
+    let taken = cluster.writer().await;
+    let again = requested(&taken, request, vec![increment(1, 5.0)]).await;
+    assert_eq!(again, first);
+    taken
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(100)));
 }

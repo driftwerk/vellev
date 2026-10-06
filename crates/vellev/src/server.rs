@@ -296,11 +296,14 @@ async fn forwarded(
     let Some(address) = holder.address() else {
         return Ok(next.run(request).await);
     };
-    let unreachable = |error: &dyn std::fmt::Display| {
+    // Only a request that never reached the holder certainly had no effect.
+    let unreachable = |error: &reqwest::Error| {
         tracing::warn!(%tenant, %holder, %error, "the node holding the tenant could not be reached");
-        ApiError::unavailable(format!(
-            "the node holding tenant {tenant} could not be reached"
-        ))
+        let message = format!("the node holding tenant {tenant} could not be reached");
+        match error.is_connect() {
+            true => ApiError::unavailable(message),
+            false => ApiError::new(Code::Uncertain, message),
+        }
     };
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, app.limits.body)

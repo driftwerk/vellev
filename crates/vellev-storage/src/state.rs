@@ -13,9 +13,8 @@ use crate::catalog::Catalog;
 use crate::column::Column;
 use crate::coordinator::LogPosition;
 use crate::format::{
-    CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
+    Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
 };
-use crate::mutation::Outcome;
 use crate::{Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
@@ -855,10 +854,22 @@ impl State {
         Ok(())
     }
 
-    /// Where `request` became visible and what it did, if this partition
-    /// answered it lately.
-    pub(crate) fn answered(&self, request: RequestId) -> Option<(LogPosition, &[Outcome])> {
+    /// Whether this partition answered `request` lately, so that a try of
+    /// it again will be answered as it was.
+    pub fn answered(&self, request: RequestId) -> bool {
+        self.answers.get(request).is_some()
+    }
+
+    /// Where `request` became visible and how it was answered, if this
+    /// partition answered it lately.
+    pub(crate) fn answer(&self, request: RequestId) -> Option<(LogPosition, &Answer)> {
         self.answers.get(request)
+    }
+
+    /// When a commit made at `now`, in milliseconds since the epoch, is to
+    /// say it was made: see [`Answers::stamp`].
+    pub(crate) fn stamp(&self, now: u64) -> u64 {
+        self.answers.stamp(now)
     }
 
     /// The merge most worth doing, if any: a stale segment on its own, else

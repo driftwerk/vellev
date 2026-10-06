@@ -531,8 +531,6 @@ impl Records {
         self.tenant.write(Method::PUT, &path, Some(schema)).await
     }
 
-    /// Not sent again when its outcome is unknown: once made, making it
-    /// again is refused, as there is no collection to drop.
     pub async fn drop(&self) -> Result<Written> {
         let path = self.path("");
         self.tenant.write(Method::DELETE, &path, None::<&()>).await
