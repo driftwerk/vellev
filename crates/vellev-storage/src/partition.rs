@@ -690,12 +690,14 @@ impl Writer {
             .partition
             .read(|state| state.flushed_manifest(position, &snapshot, flushed));
         let frame = encode(Kind::Manifest, &manifest)?;
-        attempt(&mut ready, async {
+        let discarded = attempt(&mut ready, async {
             self.publish(&key, frame, position).await?;
             let mut state = self.partition.state.write().expect("partition lock");
             state.flushed(&key, position, snapshot, segment)
         })
         .await?;
+        drop(ready);
+        blocking(move || drop(discarded)).await?;
         Ok(position)
     }
 

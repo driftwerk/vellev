@@ -352,6 +352,13 @@ pub struct State {
     since: Vec<String>,
 }
 
+/// What a flush takes out of the memtable: freeing it takes long enough
+/// that it is better done without holding the state.
+pub(crate) struct Discarded {
+    _rows: Vec<Row>,
+    _indexes: Indexes,
+}
+
 /// What a flush takes from the state to build its segment while commits go
 /// on: the memtable's live rows and tombstones at `position`, and where
 /// each row lies in the memtable.
@@ -1121,7 +1128,8 @@ impl State {
         }
     }
 
-    /// Adopt a committed flush built from `snapshot`. Each of its rows
+    /// Adopt a committed flush built from `snapshot`, returning the rows
+    /// and indexes it takes out of memory. Each of its rows
     /// still live moves from the memtable to the new segment, where it is
     /// live; one replaced or deleted since is dead there too. The memtable
     /// then keeps only what was committed after the snapshot, indexed
@@ -1132,7 +1140,7 @@ impl State {
         position: LogPosition,
         snapshot: Snapshot,
         segment: Option<(SegmentMeta, Loaded)>,
-    ) -> Result<()> {
+    ) -> Result<Discarded> {
         if let Some((meta, loaded)) = segment {
             let indexes = loaded.indexed(&meta.key, &self.catalog)?;
             let Loaded { file, vectors, .. } = loaded;
@@ -1167,17 +1175,18 @@ impl State {
         self.memtable
             .tombstones
             .retain(|tombstone| !flushed.contains(tombstone));
-        self.drop_flushed_rows(snapshot.held);
+        let discarded = self.drop_flushed_rows(snapshot.held);
         self.since.drain(..snapshot.logs);
         self.position = position;
         self.head = Some(manifest_key.to_string());
         self.checkpoint = Some(manifest_key.to_string());
-        Ok(())
+        Ok(discarded)
     }
 
     /// Take out the memtable's first `held` rows, every one of them dead,
-    /// renumbering and indexing afresh those after them.
-    fn drop_flushed_rows(&mut self, held: usize) {
+    /// renumbering and indexing afresh those after them. Returns what was
+    /// taken out, to be freed without holding the state.
+    fn drop_flushed_rows(&mut self, held: usize) -> Discarded {
         debug_assert!(self.memtable.dead[..held].iter().all(|dead| *dead));
         let Memtable {
             rows,
@@ -1186,10 +1195,12 @@ impl State {
             indexes,
             ..
         } = &mut self.memtable;
-        rows.drain(..held);
+        let discarded = Discarded {
+            _rows: rows.drain(..held).collect(),
+            _indexes: std::mem::take(indexes),
+        };
         dead.drain(..held);
         *deaths -= held;
-        *indexes = Indexes::new();
         for (row, Row { collection, object }) in rows.iter().enumerate() {
             if let Some(schema) = self.catalog.schema(*collection) {
                 indexes
@@ -1203,6 +1214,7 @@ impl State {
                 *row -= held;
             }
         }
+        discarded
     }
 
     /// The state rebuilt from a manifest's segments, brought through the
