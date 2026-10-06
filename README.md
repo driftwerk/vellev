@@ -96,6 +96,13 @@ cargo run --release -p vellev-index --example clustered_bench -- 200000 768   # 
 OBJECTS=1000000 cargo run --release -p vellev-storage --example vector_scale  # commit, flush, merge, search
 ```
 
+## Upgrades
+
+Two releases run side by side during a rolling deploy and after a
+rollback. What a release may change to keep that working, for files,
+Postgres, the API and between nodes, is in
+[docs/compatibility.md](docs/compatibility.md).
+
 ## Simulation
 
 `crates/vellev-storage/tests/simulation.rs` drives random histories of writes,
