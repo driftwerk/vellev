@@ -31,7 +31,7 @@ async fn data_survives_a_restart_with_nothing_held_locally() {
         assert_eq!(state.count(&name("notes")), 3);
         assert_eq!(
             state.get(&name("notes"), id(2)).unwrap().vector,
-            Some(vec![21.0, 0.5])
+            Some(&[21.0, 0.5][..])
         );
         assert_eq!(state.collection(&name("notes")), Some(&schema("notes")));
     });
@@ -152,7 +152,7 @@ async fn schema_changes_are_durable() {
                 .property("reviewed")
                 .is_some());
             assert_eq!(
-                state.get(&name("notes"), id(1)).unwrap().properties["reviewed"],
+                state.get(&name("notes"), id(1)).unwrap().object.properties["reviewed"],
                 Value::Bool(true)
             );
         });
@@ -564,7 +564,11 @@ async fn a_follower_fetches_only_what_it_does_not_already_hold() {
 
     let store = cluster.observed();
     let follower = cluster.open_on(store.clone()).await.unwrap();
-    assert_eq!(store.fetched().len(), 2, "a manifest and its segment");
+    assert_eq!(
+        store.fetched().len(),
+        3,
+        "a manifest, its segment and the vectors"
+    );
 
     writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
     follower.catch_up(&cluster.committed().await).await.unwrap();
@@ -576,8 +580,8 @@ async fn a_follower_fetches_only_what_it_does_not_already_hold() {
     follower.catch_up(&cluster.committed().await).await.unwrap();
     assert_eq!(
         store.fetched().len(),
-        3,
-        "the newest manifest and the two segments it added"
+        5,
+        "the newest manifest, the two segments it added and their vectors"
     );
     follower
         .partition()
@@ -692,8 +696,8 @@ async fn files_are_read_from_the_store_once_and_a_damaged_cache_entry_is_refetch
     assert_eq!(count(cluster.open_on(cached.clone()).await.unwrap()), 2);
     assert_eq!(
         store.fetched().len(),
-        3,
-        "a log segment, a manifest and a segment"
+        4,
+        "a log segment, a manifest, a segment and its vectors"
     );
     assert_eq!(count(cluster.open_on(cached.clone()).await.unwrap()), 2);
     assert_eq!(store.fetched(), Vec::<String>::new());
@@ -1021,6 +1025,7 @@ async fn a_checkpoint_that_contradicts_itself_is_refused() {
                 rows,
                 tombstones: 0,
                 index: None,
+                vectors: None,
             }]),
         )
         .unwrap()
@@ -1088,7 +1093,11 @@ async fn a_damaged_or_missing_file_stops_recovery_with_its_name() {
     let store = cluster.observed();
     cluster.open_on(store.clone()).await.unwrap();
     let files = store.fetched();
-    assert_eq!(files.len(), 4, "two log segments, a manifest and a segment");
+    assert_eq!(
+        files.len(),
+        5,
+        "two log segments, a manifest, a segment and its vectors"
+    );
 
     for file in &files {
         let healthy = cluster.blobs.get(file).await.unwrap();
@@ -1300,7 +1309,7 @@ fn assert_matches_model(state: &State, model: &Model, context: &str) {
                 "{context}"
             );
         }
-        let scanned: BTreeSet<ObjectId> = state.scan(&name(collection)).map(|o| o.id).collect();
+        let scanned: BTreeSet<ObjectId> = state.scan(&name(collection)).map(|o| o.id()).collect();
         assert_eq!(
             scanned,
             expected.keys().map(|object| id(*object)).collect(),
@@ -1319,7 +1328,7 @@ fn assert_matches_model(state: &State, model: &Model, context: &str) {
                 .select(&name(collection), &filter)
                 .unwrap()
                 .iter()
-                .map(|o| o.id)
+                .map(|o| o.id())
                 .collect();
             selected.sort_unstable();
             let expected: Vec<ObjectId> = rows

@@ -22,6 +22,12 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>>;
     /// Remove a file; one that is not there is no error.
     async fn delete(&self, key: &str) -> Result<()>;
+    /// Where a copy of the file lies on local disk, if the store keeps one,
+    /// fetching it first if need be. The copy is never written again once
+    /// it is there.
+    async fn local(&self, _key: &str) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
 }
 
 /// A file as a listing shows it.
@@ -77,6 +83,16 @@ impl Layout<'_> {
         self.named("index", position, author, "-merged")
     }
 
+    /// The vectors file of the segment a flush at `position` writes.
+    pub fn vectors(&self, position: LogPosition, author: &Author) -> String {
+        self.key("vectors", position, author)
+    }
+
+    /// The vectors file of the segment a merge at `position` writes.
+    pub fn merged_vectors(&self, position: LogPosition, author: &Author) -> String {
+        self.named("vectors", position, author, "-merged")
+    }
+
     fn key(&self, kind: &str, position: LogPosition, author: &Author) -> String {
         self.named(kind, position, author, "")
     }
@@ -95,7 +111,7 @@ impl Layout<'_> {
     /// for a key not laid out this way.
     pub(crate) fn position(&self, key: &str) -> Option<LogPosition> {
         let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
-        if !matches!(kind, "log" | "segment" | "manifest" | "index") {
+        if !matches!(kind, "log" | "segment" | "manifest" | "index" | "vectors") {
             return None;
         }
         name.get(..20)?.parse().ok().map(LogPosition)
@@ -268,5 +284,15 @@ impl Blobs for CachedBlobs {
             let _ = tokio::fs::remove_file(path).await;
         }
         Ok(())
+    }
+
+    async fn local(&self, key: &str) -> Result<Option<PathBuf>> {
+        let Some(path) = self.path(key) else {
+            return Ok(None);
+        };
+        if tokio::fs::metadata(&path).await.is_err() {
+            self.get(key).await?;
+        }
+        Ok(tokio::fs::metadata(&path).await.is_ok().then_some(path))
     }
 }

@@ -2,6 +2,7 @@
 
 pub mod blobs;
 mod catalog;
+mod column;
 pub mod coordinator;
 mod draft;
 mod error;
@@ -22,6 +23,6 @@ pub use keyword::{Keywords, Scored, MAX_WEIGHT};
 pub use mutation::{Condition, Mutation, Outcome, Receipt, Vectorize};
 pub use partition::{Embedded, Follower, Partition, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
-pub use state::{Merging, State};
+pub use state::{Found, Merging, State};
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;

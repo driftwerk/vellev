@@ -66,13 +66,8 @@ fn brute_force(
 ) -> Vec<ObjectId> {
     let mut scored: Vec<(f32, ObjectId)> = state
         .scan(&name(VECTORS))
-        .filter(|object| keep(object))
-        .filter_map(|object| {
-            Some((
-                distance(metric, query, object.vector.as_deref()?),
-                object.id,
-            ))
-        })
+        .filter(|found| keep(found.object))
+        .filter_map(|found| Some((distance(metric, query, found.vector?), found.id())))
         .collect();
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     scored.into_iter().take(limit).map(|(_, id)| id).collect()

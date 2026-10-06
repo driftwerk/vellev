@@ -43,6 +43,7 @@ impl<'a> Query<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit<'a> {
     pub object: &'a Object,
+    pub vector: &'a [f32],
     /// Under the collection's metric; smaller is nearer.
     pub distance: f32,
     /// For cosine, `(1 + cosine) / 2`.
@@ -121,10 +122,12 @@ fn nearest<'a>(
     candidates
         .into_iter()
         .filter_map(|row| {
-            let object = &layer.rows[row as usize].object;
-            let distance = scorer.distance(object.vector.as_deref()?);
+            let found = layer.found(row as usize);
+            let vector = found.vector?;
+            let distance = scorer.distance(vector);
             Some(Hit {
-                object,
+                object: found.object,
+                vector,
                 distance,
                 certainty: scorer.certainty(distance),
             })

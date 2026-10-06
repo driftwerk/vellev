@@ -504,7 +504,15 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
     ])
     .await
     .unwrap();
-    let vector = |n: u64| acme.read(|state| state.get(&notes(), id(n)).unwrap().vector.clone());
+    let vector = |n: u64| {
+        acme.read(|state| {
+            state
+                .get(&notes(), id(n))
+                .unwrap()
+                .vector
+                .map(<[f32]>::to_vec)
+        })
+    };
     assert_eq!(vector(1), Some(vec![9.0, 3.0]));
     assert_eq!(vector(2), Some(vec![1.0, 0.0]));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -560,7 +568,11 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
         .unwrap();
     assert_eq!(plain.query_vector(&notes(), "fox").await.unwrap(), None);
     assert_eq!(
-        plain.read(|state| state.get(&notes(), id(1)).unwrap().vector.clone()),
+        plain.read(|state| state
+            .get(&notes(), id(1))
+            .unwrap()
+            .vector
+            .map(<[f32]>::to_vec)),
         None
     );
     assert_eq!(calls.load(Ordering::SeqCst), calls_so_far);
@@ -579,7 +591,15 @@ async fn a_vector_is_made_the_way_the_collection_embeds_when_the_write_lands() {
     ])
     .await
     .unwrap();
-    let vector = |n: u64| acme.read(|state| state.get(&notes(), id(n)).unwrap().vector.clone());
+    let vector = |n: u64| {
+        acme.read(|state| {
+            state
+                .get(&notes(), id(n))
+                .unwrap()
+                .vector
+                .map(<[f32]>::to_vec)
+        })
+    };
     assert_eq!(vector(1), Some(vec![9.0, 3.0]));
 
     acme.write(vec![

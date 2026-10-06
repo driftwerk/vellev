@@ -49,6 +49,7 @@ impl<'a> Keywords<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scored<'a> {
     pub object: &'a Object,
+    pub vector: Option<&'a [f32]>,
     /// The BM25 score; larger is a better match.
     pub score: f32,
 }
@@ -162,8 +163,10 @@ impl State {
                 .filter(|(row, _)| !layer.dead[*row as usize])
                 .filter(|(row, _)| allowed.as_ref().is_none_or(|rows| rows.contains(*row)))
                 .for_each(|(row, score)| {
+                    let found = layer.found(row as usize);
                     best.push(Worst(Scored {
-                        object: &layer.rows[row as usize].object,
+                        object: found.object,
+                        vector: found.vector,
                         score,
                     }));
                     if best.len() > query.limit {

@@ -9,6 +9,7 @@ use vellev_index::text::TextIndex;
 use vellev_index::vector::{BinaryIndex, VectorIndex};
 
 use crate::catalog::Catalog;
+use crate::column::Column;
 use crate::coordinator::LogPosition;
 use crate::format::{
     CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
@@ -107,6 +108,37 @@ impl VectorIndex for Vectors {
 /// Clustered indexes read from a segment's index file, by collection.
 pub(crate) type Stored = HashMap<CollectionId, Arc<ClusteredIndex>>;
 
+/// The keys a segment and its companion files are written under.
+#[derive(Debug, Clone)]
+pub(crate) struct Names {
+    pub segment: String,
+    pub index: String,
+    pub vectors: String,
+}
+
+impl Names {
+    /// How the manifest lists a segment of `rows`, which have their
+    /// vectors with them still, with the companion files it will have.
+    pub fn meta(
+        &self,
+        catalog: &Catalog,
+        rows: &[Row],
+        tombstones: usize,
+        clustered_above: usize,
+    ) -> SegmentMeta {
+        SegmentMeta {
+            key: self.segment.clone(),
+            rows: rows.len() as u64,
+            tombstones: tombstones as u64,
+            index: clustered(catalog, rows, clustered_above).then(|| self.index.clone()),
+            vectors: rows
+                .iter()
+                .any(|row| row.object.vector.is_some())
+                .then(|| self.vectors.clone()),
+        }
+    }
+}
+
 impl From<SegmentIndex> for Stored {
     fn from(index: SegmentIndex) -> Self {
         index.vectors.into_iter().collect()
@@ -162,39 +194,78 @@ impl Corpus {
 /// they are derived from the rows and never stored.
 pub(crate) type Indexes = HashMap<CollectionId, LayerIndex>;
 
+/// A live object, and its vector where the layer keeps the two apart.
+#[derive(Debug, Clone, Copy)]
+pub struct Found<'a> {
+    pub object: &'a Object,
+    pub vector: Option<&'a [f32]>,
+}
+
+impl Found<'_> {
+    pub fn id(&self) -> ObjectId {
+        self.object.id
+    }
+
+    /// The object whole, with its vector.
+    pub fn to_object(self) -> Object {
+        Object {
+            vector: self.vector.map(<[f32]>::to_vec),
+            ..self.object.clone()
+        }
+    }
+
+    /// Whether this is `object`, vector and all.
+    pub fn is(&self, object: &Object) -> bool {
+        self.object.id == object.id
+            && self.object.properties == object.properties
+            && self.vector == object.vector.as_deref()
+    }
+}
+
 /// The rows of one layer, a segment or the memtable, with what is known
-/// about them. Later layers shadow earlier ones.
+/// about them. Later layers shadow earlier ones. A segment's rows carry no
+/// vectors; its column does.
 pub(crate) struct Layer<'a> {
     pub rows: &'a [Row],
     pub dead: &'a [bool],
     pub indexes: &'a Indexes,
+    pub vectors: Option<&'a Column>,
 }
 
-/// A segment as loaded: its file and the indexes built over it, shared by
-/// every state that holds the segment.
-/// A segment file with its indexes, built already or, failing that, read
-/// from its index file as far as they were kept.
+impl<'a> Layer<'a> {
+    pub fn vector(&self, row: usize) -> Option<&'a [f32]> {
+        match self.vectors {
+            Some(column) => column.get(row),
+            None => self.rows[row].object.vector.as_deref(),
+        }
+    }
+
+    pub fn found(&self, row: usize) -> Found<'a> {
+        Found {
+            object: &self.rows[row].object,
+            vector: self.vector(row),
+        }
+    }
+}
+
+/// A segment as loaded: its file, without the rows' vectors, which are in
+/// its column, and its indexes, built already or, failing that, read from
+/// its index file as far as they were kept.
 #[derive(Debug, Clone)]
 pub(crate) struct Loaded {
     pub file: Arc<SegmentFile>,
+    pub vectors: Arc<Column>,
     pub indexes: Option<Arc<Indexes>>,
     pub stored: Stored,
 }
 
 impl Loaded {
-    pub fn fresh(file: SegmentFile, stored: Stored) -> Self {
+    pub fn fresh(file: SegmentFile, vectors: Column, stored: Stored) -> Self {
         Self {
             file: Arc::new(file),
+            vectors: Arc::new(vectors),
             indexes: None,
             stored,
-        }
-    }
-
-    pub fn built(file: SegmentFile, indexes: Indexes) -> Self {
-        Self {
-            file: Arc::new(file),
-            indexes: Some(Arc::new(indexes)),
-            stored: Stored::default(),
         }
     }
 }
@@ -211,6 +282,7 @@ enum Location {
 struct Segment {
     meta: SegmentMeta,
     file: Arc<SegmentFile>,
+    vectors: Arc<Column>,
     indexes: Arc<Indexes>,
     dead: Vec<bool>,
 }
@@ -256,9 +328,10 @@ fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a 
 /// writer does. An index built under an older catalog stays right: a
 /// property never changes once added, and neither a property nor a
 /// collection added since has anything in an older layer.
-pub(crate) fn indexed(
+pub(crate) fn indexed<'a>(
     catalog: &Catalog,
-    rows: &[Row],
+    rows: &'a [Row],
+    vector_of: impl Fn(usize) -> Option<&'a [f32]>,
     stored: &Stored,
     clustered_above: Option<usize>,
 ) -> Indexes {
@@ -268,7 +341,7 @@ pub(crate) fn indexed(
         if let Some(schema) = catalog.schema(*collection) {
             let index = indexes.entry(*collection).or_default();
             index.insert(schema, row as u32, object);
-            if let Some(vector) = &object.vector {
+            if let Some(vector) = vector_of(row) {
                 vectors
                     .entry(*collection)
                     .or_default()
@@ -361,28 +434,33 @@ impl State {
         self.catalog.get(name).map(|(_, schema)| schema)
     }
 
-    pub fn get(&self, collection: &CollectionName, id: ObjectId) -> Option<&Object> {
+    pub fn get(&self, collection: &CollectionName, id: ObjectId) -> Option<Found<'_>> {
         self.row(self.catalog.get(collection)?.0, id)
     }
 
-    pub(crate) fn row(&self, collection: CollectionId, id: ObjectId) -> Option<&Object> {
+    pub(crate) fn row(&self, collection: CollectionId, id: ObjectId) -> Option<Found<'_>> {
         self.live
             .get(&(collection, id))
             .map(|location| match *location {
-                Location::Memtable(row) => &self.memtable.rows[row].object,
-                Location::Segment(segment, row) => &self.segments[segment].file.rows[row].object,
+                Location::Memtable(row) => Found {
+                    object: &self.memtable.rows[row].object,
+                    vector: self.memtable.rows[row].object.vector.as_deref(),
+                },
+                Location::Segment(segment, row) => Found {
+                    object: &self.segments[segment].file.rows[row].object,
+                    vector: self.segments[segment].vectors.get(row),
+                },
             })
     }
 
     /// Every live object in the collection, in no particular order.
-    pub fn scan<'a>(&'a self, collection: &CollectionName) -> impl Iterator<Item = &'a Object> {
+    pub fn scan<'a>(&'a self, collection: &CollectionName) -> impl Iterator<Item = Found<'a>> {
         let wanted = self.catalog.get(collection).map(|(id, _)| id);
-        self.segments
-            .iter()
-            .flat_map(|segment| live_rows(&segment.file.rows, &segment.dead))
-            .chain(live_rows(&self.memtable.rows, &self.memtable.dead))
-            .filter(move |row| Some(row.collection) == wanted)
-            .map(|row| &row.object)
+        self.layers().flat_map(move |layer| {
+            (0..layer.rows.len())
+                .filter(move |row| !layer.dead[*row] && Some(layer.rows[*row].collection) == wanted)
+                .map(move |row| layer.found(row))
+        })
     }
 
     pub fn count(&self, collection: &CollectionName) -> usize {
@@ -391,7 +469,7 @@ impl State {
 
     /// Every live object in the collection that passes `filter`, in no
     /// particular order.
-    pub fn select(&self, collection: &CollectionName, filter: &Filter) -> Result<Vec<&Object>> {
+    pub fn select(&self, collection: &CollectionName, filter: &Filter) -> Result<Vec<Found<'_>>> {
         let (id, schema) = self.catalog.known(collection)?;
         let predicate = filter.compile(schema)?;
         Ok(self.matching(id, &predicate).collect())
@@ -409,7 +487,7 @@ impl State {
         filter: Option<&Filter>,
         after: Option<ObjectId>,
         limit: usize,
-    ) -> Result<Vec<&Object>> {
+    ) -> Result<Vec<Found<'_>>> {
         let mut page = match filter {
             Some(filter) => self.select(collection, filter)?,
             None => {
@@ -417,8 +495,8 @@ impl State {
                 self.scan(collection).collect()
             }
         };
-        page.retain(|object| after.is_none_or(|after| object.id > after));
-        page.sort_unstable_by_key(|object| object.id);
+        page.retain(|found| after.is_none_or(|after| found.id() > after));
+        page.sort_unstable_by_key(Found::id);
         page.truncate(limit);
         Ok(page)
     }
@@ -429,6 +507,7 @@ impl State {
             rows: &self.memtable.rows,
             dead: &self.memtable.dead,
             indexes: &self.memtable.indexes,
+            vectors: None,
         };
         self.segments
             .iter()
@@ -436,6 +515,7 @@ impl State {
                 rows: &segment.file.rows,
                 dead: &segment.dead,
                 indexes: &segment.indexes,
+                vectors: Some(&segment.vectors),
             })
             .chain([memtable])
     }
@@ -444,7 +524,7 @@ impl State {
         &'a self,
         collection: CollectionId,
         predicate: &'p Predicate,
-    ) -> impl Iterator<Item = &'a Object> + 'p
+    ) -> impl Iterator<Item = Found<'a>> + 'p
     where
         'a: 'p,
     {
@@ -457,7 +537,7 @@ impl State {
                 .into_iter()
                 .map(|row| row as usize)
                 .filter(move |row| !layer.dead[*row])
-                .map(move |row| &layer.rows[row].object)
+                .map(move |row| layer.found(row))
         })
     }
 
@@ -473,6 +553,7 @@ impl State {
         self.segments.iter().map(|segment| {
             let loaded = Loaded {
                 file: segment.file.clone(),
+                vectors: segment.vectors.clone(),
                 indexes: Some(segment.indexes.clone()),
                 stored: Stored::default(),
             };
@@ -555,6 +636,7 @@ impl State {
     fn attach(&mut self, meta: SegmentMeta, loaded: Loaded) -> Result<()> {
         let Loaded {
             file,
+            vectors,
             indexes,
             stored,
         } = loaded;
@@ -577,8 +659,13 @@ impl State {
         for key in &file.tombstones {
             self.forget(*key);
         }
-        let indexes =
-            indexes.unwrap_or_else(|| Arc::new(indexed(&self.catalog, &file.rows, &stored, None)));
+        if vectors.len() != file.rows.len() {
+            return Err(corrupt("the vectors are not one per row"));
+        }
+        let indexes = indexes.unwrap_or_else(|| {
+            let column = |row| vectors.get(row);
+            Arc::new(indexed(&self.catalog, &file.rows, column, &stored, None))
+        });
         let dead = file
             .rows
             .iter()
@@ -602,6 +689,7 @@ impl State {
         self.segments.push(Segment {
             meta,
             file,
+            vectors,
             indexes,
             dead,
         });
@@ -741,8 +829,15 @@ impl State {
         let run = &self.segments[merge.run.clone()];
         let rows: Vec<Row> = run
             .iter()
-            .flat_map(|segment| live_rows(&segment.file.rows, &segment.dead))
-            .cloned()
+            .flat_map(|segment| {
+                (0..segment.file.rows.len())
+                    .filter(|row| !segment.dead[*row])
+                    .map(|row| {
+                        let mut copy = segment.file.rows[row].clone();
+                        copy.object.vector = segment.vectors.get(row).map(<[f32]>::to_vec);
+                        copy
+                    })
+            })
             .collect();
         let tombstones: Vec<RowKey> = match merge.run.start {
             0 => Vec::new(),
@@ -776,14 +871,12 @@ impl State {
     pub(crate) fn compaction(
         &self,
         position: LogPosition,
-        segment_key: &str,
-        index_key: &str,
+        names: &Names,
         clustered_above: usize,
         merge: &Merge,
         merged: SegmentMeta,
     ) -> (Option<(SegmentMeta, SegmentFile)>, Manifest) {
-        let (flushed, mut manifest) =
-            self.checkpoint(position, segment_key, index_key, clustered_above);
+        let (flushed, mut manifest) = self.checkpoint(position, names, clustered_above);
         manifest.segments.splice(merge.run.clone(), [merged]);
         (flushed, manifest)
     }
@@ -804,12 +897,15 @@ impl State {
             meta,
             Loaded {
                 file,
+                vectors,
                 indexes,
                 stored,
             },
         ) = merged;
-        let indexes =
-            indexes.unwrap_or_else(|| Arc::new(indexed(&self.catalog, &file.rows, &stored, None)));
+        let indexes = indexes.unwrap_or_else(|| {
+            let column = |row| vectors.get(row);
+            Arc::new(indexed(&self.catalog, &file.rows, column, &stored, None))
+        });
         let run = merge.run.clone();
         let gone = run.len() - 1;
         let at_row: HashMap<RowKey, usize> = file
@@ -844,6 +940,7 @@ impl State {
             [Segment {
                 meta,
                 file,
+                vectors,
                 indexes,
                 dead,
             }],
@@ -858,8 +955,7 @@ impl State {
     pub(crate) fn checkpoint(
         &self,
         position: LogPosition,
-        segment_key: &str,
-        index_key: &str,
+        names: &Names,
         clustered_above: usize,
     ) -> (Option<(SegmentMeta, SegmentFile)>, Manifest) {
         let rows: Vec<Row> = live_rows(&self.memtable.rows, &self.memtable.dead)
@@ -867,13 +963,7 @@ impl State {
             .collect();
         let tombstones = self.memtable.tombstones.clone();
         let segment = (!rows.is_empty() || !tombstones.is_empty()).then(|| {
-            let meta = SegmentMeta {
-                key: segment_key.to_string(),
-                rows: rows.len() as u64,
-                tombstones: tombstones.len() as u64,
-                index: clustered(&self.catalog, &rows, clustered_above)
-                    .then(|| index_key.to_string()),
-            };
+            let meta = names.meta(&self.catalog, &rows, tombstones.len(), clustered_above);
             (
                 meta,
                 SegmentFile {

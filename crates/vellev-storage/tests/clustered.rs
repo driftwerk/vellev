@@ -178,7 +178,7 @@ async fn cleanup_keeps_an_index_file_with_its_segment() {
         .map(|listed| listed.key.rsplit('.').next().unwrap())
         .collect();
     kinds.sort_unstable();
-    assert_eq!(kinds, ["index", "manifest", "segment"]);
+    assert_eq!(kinds, ["index", "manifest", "segment", "vectors"]);
     cluster
         .open()
         .await

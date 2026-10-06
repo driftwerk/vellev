@@ -98,9 +98,13 @@ async fn embedding() -> (Cluster, Writer, Arc<Lengths>) {
 }
 
 fn vector(writer: &Writer, object: u8) -> Option<Vec<f32>> {
-    writer
-        .partition()
-        .read(|state| state.get(&name(NOTES), id(object)).unwrap().vector.clone())
+    writer.partition().read(|state| {
+        state
+            .get(&name(NOTES), id(object))
+            .unwrap()
+            .vector
+            .map(<[f32]>::to_vec)
+    })
 }
 
 fn asked(texts: &[&str]) -> Vec<Vec<String>> {
@@ -130,9 +134,13 @@ async fn an_object_written_without_a_vector_is_given_the_one_its_text_embeds_to(
     assert_eq!(vector(&writer, 4), None);
 
     let follower = cluster.open().await;
-    let followed = follower
-        .partition()
-        .read(|state| state.get(&name(NOTES), id(1)).unwrap().vector.clone());
+    let followed = follower.partition().read(|state| {
+        state
+            .get(&name(NOTES), id(1))
+            .unwrap()
+            .vector
+            .map(<[f32]>::to_vec)
+    });
     assert_eq!(followed, vector(&writer, 1));
     assert!(lengths.asked().is_empty());
 }
@@ -244,7 +252,13 @@ async fn one_commit_embeds_each_object_once_as_it_ends_up() {
         cluster.open().await.partition().clone(),
     ] {
         copy.read(|state| {
-            let vector = |object: u8| state.get(&name(NOTES), id(object)).unwrap().vector.clone();
+            let vector = |object: u8| {
+                state
+                    .get(&name(NOTES), id(object))
+                    .unwrap()
+                    .vector
+                    .map(<[f32]>::to_vec)
+            };
             assert_eq!(vector(1), Some(vector_of("second")));
             assert_eq!(vector(4), Some(vector_of("other caller")));
             assert_eq!(vector(5), Some(vec![1.0, 1.0]));
@@ -341,9 +355,13 @@ async fn a_writer_with_nothing_to_embed_with_refuses_only_what_needs_it() {
         only_if: None,
     };
     writer.commit(vec![plain]).await.unwrap();
-    let kept = writer
-        .partition()
-        .read(|state| state.get(&name("plain"), id(1)).unwrap().vector.clone());
+    let kept = writer.partition().read(|state| {
+        state
+            .get(&name("plain"), id(1))
+            .unwrap()
+            .vector
+            .map(<[f32]>::to_vec)
+    });
     assert_eq!(kept, Some(vec![1.0, 0.5]));
 }
 
@@ -427,7 +445,13 @@ async fn a_batch_whose_vectors_cannot_be_made_is_rejected_alone() {
             assert_eq!(state.count(&name("plain")), 1);
             assert_eq!(state.count(&name("other")), 1);
             assert_eq!(state.count(&name(NOTES)), 3);
-            let vector = |object: u8| state.get(&name(NOTES), id(object)).unwrap().vector.clone();
+            let vector = |object: u8| {
+                state
+                    .get(&name(NOTES), id(object))
+                    .unwrap()
+                    .vector
+                    .map(<[f32]>::to_vec)
+            };
             assert_eq!(vector(1), Some(vector_of("fox")));
             assert_eq!(vector(2), Some(vector_of("fox")));
             assert_eq!(vector(3), Some(vector_of("hen")));
@@ -516,7 +540,13 @@ async fn vectors_made_at_commit_survive_a_flush_and_a_new_writer_with_no_embedde
         .unwrap();
     let expected = [Some(vector_of("a red fox")), Some(vector_of("hen"))];
     let vectors = |state: &State| {
-        [1, 2].map(|object| state.get(&name(NOTES), id(object)).unwrap().vector.clone())
+        [1, 2].map(|object| {
+            state
+                .get(&name(NOTES), id(object))
+                .unwrap()
+                .vector
+                .map(<[f32]>::to_vec)
+        })
     };
     assert_eq!(cluster.open().await.partition().read(vectors), expected);
 

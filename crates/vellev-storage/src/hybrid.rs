@@ -56,6 +56,7 @@ impl<'a> Hybrid<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fused<'a> {
     pub object: &'a Object,
+    pub vector: Option<&'a [f32]>,
     /// Larger is better.
     pub score: f32,
     /// As [`crate::Hit`], when the vector search offered the object.
@@ -66,9 +67,10 @@ pub struct Fused<'a> {
 }
 
 impl<'a> Fused<'a> {
-    fn of(object: &'a Object) -> Self {
+    fn of(object: &'a Object, vector: Option<&'a [f32]>) -> Self {
         Self {
             object,
+            vector,
             score: 0.0,
             distance: None,
             certainty: None,
@@ -140,7 +142,7 @@ impl State {
                 let found = Fused {
                     distance: Some(hit.distance),
                     certainty: hit.certainty,
-                    ..Fused::of(hit.object)
+                    ..Fused::of(hit.object, Some(hit.vector))
                 };
                 (found, share)
             });
@@ -150,7 +152,7 @@ impl State {
             .map(|(scored, share)| {
                 let found = Fused {
                     keyword: Some(scored.score),
-                    ..Fused::of(scored.object)
+                    ..Fused::of(scored.object, scored.vector)
                 };
                 (found, share)
             });
@@ -159,9 +161,10 @@ impl State {
             .fold(HashMap::new(), |mut fused, (found, share)| {
                 let entry = fused
                     .entry(found.object.id)
-                    .or_insert(Fused::of(found.object));
+                    .or_insert(Fused::of(found.object, found.vector));
                 *entry = Fused {
                     object: entry.object,
+                    vector: entry.vector.or(found.vector),
                     score: entry.score + share,
                     distance: found.distance.or(entry.distance),
                     certainty: found.certainty.or(entry.certainty),

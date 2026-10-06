@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use vellev_core::Embedding;
 
 use crate::blobs::{is_plain, Author, Blobs, Layout, Listed};
+use crate::column::Column;
 use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
 };
@@ -18,17 +19,31 @@ use crate::format::{
     SegmentMeta,
 };
 use crate::mutation::{Mutation, Receipt, Vectorize};
-use crate::state::{self, Loaded, Merging, State, Stored};
+use crate::state::{self, Indexes, Loaded, Merging, Names, State, Stored};
 use crate::{Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
 /// safe because the coordinator accepts an identical commit twice.
 const COMMIT_ATTEMPTS: u32 = 3;
 
-/// A segment's frame and its index file's.
-type Frames = (Bytes, Option<Bytes>);
-/// A segment ready to be written and attached.
-type Indexed = (SegmentMeta, Loaded, Frames);
+/// A segment built and ready to write: its file without the rows'
+/// vectors, which the column holds, its indexes, and the frames of the
+/// file and the column.
+struct Built {
+    file: SegmentFile,
+    vectors: Column,
+    indexes: Indexes,
+    segment: Bytes,
+    column: Bytes,
+}
+
+/// A built segment as the manifest names it, with its index file's frame
+/// if it has one.
+struct Prepared {
+    meta: SegmentMeta,
+    built: Built,
+    index: Option<Bytes>,
+}
 const COMMIT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// How long a commit waits for the vectors it needs made.
@@ -82,13 +97,42 @@ impl Partition {
     /// Fetch a file named by data rather than built by [`Layout`], which must
     /// be a plain key of this partition's.
     async fn fetch(&self, key: &str) -> Result<Bytes> {
-        if !(is_plain(key) && key.starts_with(&Layout(&self.key).prefix())) {
-            return Err(StorageError::corrupt(
+        self.own(key)?;
+        self.blobs.get(key).await
+    }
+
+    fn own(&self, key: &str) -> Result<()> {
+        match is_plain(key) && key.starts_with(&Layout(&self.key).prefix()) {
+            true => Ok(()),
+            false => Err(StorageError::corrupt(
                 key,
                 "the key is not one of this partition's",
-            ));
+            )),
         }
-        self.blobs.get(key).await
+    }
+
+    /// The vectors under `key`, read in place from the store's copy on
+    /// local disk when it keeps one; otherwise `held`, the same vectors
+    /// still in memory, or when there is no such thing the file fetched
+    /// and decoded into memory.
+    async fn column(&self, key: &str, held: Option<Column>) -> Result<Column> {
+        self.own(key)?;
+        match self.blobs.local(key).await {
+            Ok(Some(path)) => match Column::map(key, &path) {
+                Ok(column) => return Ok(column),
+                Err(error) => {
+                    tracing::warn!(key, %error, "a vectors file on local disk could not be read in place")
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(key, %error, "a vectors file could not be copied to local disk")
+            }
+        }
+        match held {
+            Some(column) => Ok(column),
+            None => Column::decode(key, &self.blobs.get(key).await?),
+        }
     }
 
     /// Generations only grow, so a reading from an older generation than one
@@ -198,12 +242,17 @@ impl Partition {
                 if let Some(loaded) = held {
                     return Ok::<_, StorageError>(loaded);
                 }
-                let file = decode(&meta.key, Kind::Segment, &self.fetch(&meta.key).await?)?;
+                let mut file: SegmentFile =
+                    decode(&meta.key, Kind::Segment, &self.fetch(&meta.key).await?)?;
+                let vectors = match &meta.vectors {
+                    Some(key) => self.column(key, None).await?,
+                    None => Column::taken_from(&mut file.rows),
+                };
                 let stored = match &meta.index {
                     Some(index) => self.stored(index, &meta.key).await,
                     None => Stored::default(),
                 };
-                Ok(Loaded::fresh(file, stored))
+                Ok(Loaded::fresh(file, vectors, stored))
             }
         }))
         .await?;
@@ -561,75 +610,118 @@ impl Writer {
         }
         let position = following(position)?;
         let layout = Layout(&self.lease.key);
-        let segment_key = layout.segment(position, &self.author);
+        let names = self.names(position, false);
         let key = layout.manifest(position, &self.author);
-        let (segment, manifest) = self.partition.read(|state| {
-            state.checkpoint(
-                position,
-                &segment_key,
-                &layout.index(position, &self.author),
-                self.merging.clustered_above,
-            )
-        });
+        let (segment, manifest) = self
+            .partition
+            .read(|state| state.checkpoint(position, &names, self.merging.clustered_above));
         let segment = match segment {
-            Some((meta, file)) => Some(self.prepared(meta, file).await?),
+            Some((meta, file)) => Some(Self::prepared(meta, self.built(file).await?)?),
             None => None,
         };
         let frame = encode(Kind::Manifest, &manifest)?;
         attempt(&mut ready, async {
-            if let Some((meta, _, files)) = &segment {
-                self.upload(meta, files).await?;
+            if let Some(segment) = &segment {
+                self.upload(segment).await?;
             }
             self.publish(&key, frame, position).await?;
+            let segment = match segment {
+                Some(segment) => Some(self.loaded(segment).await),
+                None => None,
+            };
             let mut state = self.partition.state.write().expect("partition lock");
-            state.checkpointed(
-                &key,
-                position,
-                segment.map(|(meta, loaded, _)| (meta, loaded)),
-            )
+            state.checkpointed(&key, position, segment)
         })
         .await?;
         Ok(position)
     }
 
-    /// Encode a segment and index its rows, off the async threads and before
-    /// anything is written, so that readers are not held behind the write
-    /// lock while a large segment is indexed. Returns the segment ready to
-    /// attach and its frame.
-    async fn built(&self, file: SegmentFile) -> Result<(Loaded, Bytes)> {
+    fn names(&self, position: LogPosition, merged: bool) -> Names {
+        let layout = Layout(&self.lease.key);
+        match merged {
+            false => Names {
+                segment: layout.segment(position, &self.author),
+                index: layout.index(position, &self.author),
+                vectors: layout.vectors(position, &self.author),
+            },
+            true => Names {
+                segment: layout.merged(position, &self.author),
+                index: layout.merged_index(position, &self.author),
+                vectors: layout.merged_vectors(position, &self.author),
+            },
+        }
+    }
+
+    /// Index a segment's rows, which have their vectors with them, then
+    /// take the vectors into their column and encode both, off the async
+    /// threads and before anything is written, so that readers are not
+    /// held behind the write lock while a large segment is indexed.
+    async fn built(&self, mut file: SegmentFile) -> Result<Built> {
         let catalog = self.partition.read(|state| state.catalog().clone());
         let above = Some(self.merging.clustered_above);
         blocking(move || {
-            let frame = encode(Kind::Segment, &file)?;
-            let indexes = state::indexed(&catalog, &file.rows, &Stored::default(), above);
-            Ok((Loaded::built(file, indexes), frame))
+            let inline = |row: usize| file.rows[row].object.vector.as_deref();
+            let indexes = state::indexed(&catalog, &file.rows, inline, &Stored::default(), above);
+            let vectors = Column::taken_from(&mut file.rows);
+            let segment = encode(Kind::Segment, &file)?;
+            let column = vectors.encode();
+            Ok(Built {
+                file,
+                vectors,
+                indexes,
+                segment,
+                column,
+            })
         })
         .await?
     }
 
-    /// A built segment as `meta` names it, with the frames to upload: its
-    /// own and its index file's, if it has one.
-    fn named(meta: SegmentMeta, (loaded, frame): (Loaded, Bytes)) -> Result<Indexed> {
-        let indexes = loaded.indexes.as_deref().expect("built with its indexes");
+    /// A built segment as `meta` names it, with its index file's frame if
+    /// it has one.
+    fn prepared(meta: SegmentMeta, built: Built) -> Result<Prepared> {
         let index = meta
             .index
             .is_some()
-            .then(|| encode(Kind::Index, &state::stored(&meta.key, indexes)))
+            .then(|| encode(Kind::Index, &state::stored(&meta.key, &built.indexes)))
             .transpose()?;
-        Ok((meta, loaded, (frame, index)))
+        Ok(Prepared { meta, built, index })
     }
 
-    async fn prepared(&self, meta: SegmentMeta, file: SegmentFile) -> Result<Indexed> {
-        Self::named(meta, self.built(file).await?)
-    }
-
-    /// Upload a segment's files, the index first so that the segment never
-    /// sits in the store without it.
-    async fn upload(&self, meta: &SegmentMeta, (segment, index): &Frames) -> Result<()> {
+    /// Upload a segment's files, the segment's own last so that it never
+    /// sits in the store without its companions.
+    async fn upload(&self, prepared: &Prepared) -> Result<()> {
+        let Prepared { meta, built, index } = prepared;
+        if let Some(key) = &meta.vectors {
+            self.partition.blobs.put(key, built.column.clone()).await?;
+        }
         if let Some((key, frame)) = meta.index.as_deref().zip(index.clone()) {
             self.partition.blobs.put(key, frame).await?;
         }
-        self.partition.blobs.put(&meta.key, segment.clone()).await
+        self.partition
+            .blobs
+            .put(&meta.key, built.segment.clone())
+            .await
+    }
+
+    /// An uploaded segment as the state holds it, with its vectors read
+    /// from local disk where the store keeps a copy.
+    async fn loaded(&self, prepared: Prepared) -> (SegmentMeta, Loaded) {
+        let Prepared { meta, built, .. } = prepared;
+        let vectors = match &meta.vectors {
+            Some(key) => self
+                .partition
+                .column(key, Some(built.vectors))
+                .await
+                .expect("the vectors are held in memory"),
+            None => built.vectors,
+        };
+        let loaded = Loaded {
+            file: Arc::new(built.file),
+            vectors: Arc::new(vectors),
+            indexes: Some(Arc::new(built.indexes)),
+            stored: Stored::default(),
+        };
+        (meta, loaded)
     }
 
     /// Carry out the merge the partition most needs, if any: replace a run
@@ -644,14 +736,18 @@ impl Writer {
             return Ok(None);
         };
         let above = self.merging.clustered_above;
-        let Some((file, wants_index)) = self.partition.read(|state| {
+        let Some((file, described)) = self.partition.read(|state| {
             let file = state.merged(&merge, state.position())?;
-            let wants_index = state::clustered(state.catalog(), &file.rows, above);
-            Some((file, wants_index))
+            let unnamed = Names {
+                segment: String::new(),
+                index: String::new(),
+                vectors: String::new(),
+            };
+            let described = unnamed.meta(state.catalog(), &file.rows, file.tombstones.len(), above);
+            Some((file, described))
         }) else {
             return Ok(None);
         };
-        let (rows, tombstones) = (file.rows.len() as u64, file.tombstones.len() as u64);
         let built = self.built(file).await?;
         let layout = Layout(&self.lease.key);
         let mut ready = self.ready.lock().await;
@@ -659,32 +755,25 @@ impl Writer {
             return Err(StorageError::Closed);
         }
         let position = following(self.partition.read(State::position))?;
-        let segment_key = layout.segment(position, &self.author);
         let key = layout.manifest(position, &self.author);
+        let names = self.names(position, true);
         let meta = SegmentMeta {
-            key: layout.merged(position, &self.author),
-            rows,
-            tombstones,
-            index: wants_index.then(|| layout.merged_index(position, &self.author)),
+            key: names.segment,
+            index: described.index.map(|_| names.index),
+            vectors: described.vectors.map(|_| names.vectors),
+            ..described
         };
+        let flushed_names = self.names(position, false);
         let Some((flushed, manifest)) = self.partition.read(|state| {
-            state.unchanged(&merge).then(|| {
-                let index_key = layout.index(position, &self.author);
-                state.compaction(
-                    position,
-                    &segment_key,
-                    &index_key,
-                    above,
-                    &merge,
-                    meta.clone(),
-                )
-            })
+            state
+                .unchanged(&merge)
+                .then(|| state.compaction(position, &flushed_names, above, &merge, meta.clone()))
         }) else {
             return Ok(None);
         };
-        let merged = Self::named(meta, built)?;
+        let merged = Self::prepared(meta, built)?;
         let flushed = match flushed {
-            Some((meta, file)) => Some(self.prepared(meta, file).await?),
+            Some((meta, file)) => Some(Self::prepared(meta, self.built(file).await?)?),
             None => None,
         };
         if !self.partition.read(|state| state.unchanged(&merge)) {
@@ -692,19 +781,18 @@ impl Writer {
         }
         let frame = encode(Kind::Manifest, &manifest)?;
         attempt(&mut ready, async {
-            self.upload(&merged.0, &merged.2).await?;
-            if let Some((meta, _, files)) = &flushed {
-                self.upload(meta, files).await?;
+            self.upload(&merged).await?;
+            if let Some(flushed) = &flushed {
+                self.upload(flushed).await?;
             }
             self.publish(&key, frame, position).await?;
+            let merged = self.loaded(merged).await;
+            let flushed = match flushed {
+                Some(flushed) => Some(self.loaded(flushed).await),
+                None => None,
+            };
             let mut state = self.partition.state.write().expect("partition lock");
-            state.compacted(
-                &key,
-                position,
-                flushed.map(|(meta, loaded, _)| (meta, loaded)),
-                &merge,
-                (merged.0, merged.1),
-            )
+            state.compacted(&key, position, flushed, &merge, merged)
         })
         .await?;
         Ok(Some(position))
@@ -767,7 +855,13 @@ impl Writer {
         let kept: HashSet<&str> = base
             .segments
             .iter()
-            .flat_map(|meta| [Some(meta.key.as_str()), meta.index.as_deref()])
+            .flat_map(|meta| {
+                [
+                    Some(meta.key.as_str()),
+                    meta.index.as_deref(),
+                    meta.vectors.as_deref(),
+                ]
+            })
             .flatten()
             .collect();
         let orphans = files

@@ -85,7 +85,7 @@ pub fn delete(collection: &str, object: u8) -> Mutation {
 pub fn n_of(state: &State, collection: &str, object: u8) -> Option<i64> {
     state
         .get(&name(collection), id(object))
-        .map(|object| match object.properties["n"] {
+        .map(|found| match found.object.properties["n"] {
             Value::Int(n) => n,
             ref other => panic!("{other:?}"),
         })

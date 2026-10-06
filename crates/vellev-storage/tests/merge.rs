@@ -1,11 +1,11 @@
 mod common;
 
 use common::*;
-use vellev_core::Object;
+use vellev_storage::Found;
 use vellev_storage::Merging;
 
-fn ids(objects: Vec<&Object>) -> Vec<ObjectId> {
-    let mut ids: Vec<ObjectId> = objects.into_iter().map(|object| object.id).collect();
+fn ids(found: Vec<Found<'_>>) -> Vec<ObjectId> {
+    let mut ids: Vec<ObjectId> = found.into_iter().map(|found| found.id()).collect();
     ids.sort_unstable();
     ids
 }
@@ -314,7 +314,11 @@ async fn files_nothing_reaches_are_deleted_but_never_those_ahead_of_the_writer()
         logs.contains(&ahead),
         "a newer writer's upload is not touched"
     );
-    assert_eq!(deleted, before - 4);
+    assert_eq!(
+        deleted,
+        before - 4 + 4,
+        "four files stay: the merged segment, the checkpoint, the commit since and the stray ahead; four vectors files go with their segments"
+    );
 
     let follower = cluster.open().await;
     follower
@@ -435,8 +439,8 @@ async fn files_a_recent_head_still_reaches_stay_until_that_head_is_old() {
     age().await;
     assert_eq!(
         writer.clean(grace).await.unwrap(),
-        1 + 4 + 2,
-        "the log, the segments, the checkpoint and a stale writer's manifest"
+        1 + 4 + 4 + 2,
+        "the log, the segments and their vectors, the checkpoint and a stale writer's manifest"
     );
     let (logs, segments, manifests) = files(&cluster).await;
     assert_eq!((logs.len(), segments.len(), manifests.len()), (0, 2, 1));
