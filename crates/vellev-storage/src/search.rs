@@ -144,7 +144,7 @@ fn many_are_live<I: Iterator<Item = u32>>(
     live: impl Fn() -> I,
 ) -> bool {
     let threshold = SHORTLIST_ABOVE as u64;
-    let dead = layer.dead.iter().filter(|dead| **dead).count() as u64;
+    let dead = layer.deaths as u64;
     allowed > threshold
         && (allowed - allowed.min(dead) > threshold || live().count() as u64 > threshold)
 }
