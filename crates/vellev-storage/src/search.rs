@@ -12,7 +12,7 @@ use crate::Result;
 /// layers estimate nearest, taken together, and as many from each smaller
 /// layer. Higher finds more of the true nearest at more cost per query;
 /// zero is taken as one.
-pub const DEFAULT_OVERSAMPLE: usize = 64;
+pub const DEFAULT_OVERSAMPLE: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct Query<'a> {
