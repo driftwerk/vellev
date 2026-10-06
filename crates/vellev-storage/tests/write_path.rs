@@ -52,6 +52,7 @@ fn append(object_id: u8, values: &[&str], unique: bool) -> Mutation {
 fn property(state: &State, object_id: u8, property: &str) -> Option<Value> {
     state
         .get(&name("notes"), id(object_id))?
+        .object
         .properties
         .get(property)
         .cloned()
@@ -140,7 +141,7 @@ async fn patch_merges_removes_and_keeps_the_rest() {
         assert_eq!(n_of(state, "notes", 1), Some(10));
         assert_eq!(
             state.get(&name("notes"), id(1)).unwrap().vector,
-            Some(vec![10.0, 0.5])
+            Some(&[10.0, 0.5][..])
         );
     });
 
@@ -155,7 +156,7 @@ async fn patch_merges_removes_and_keeps_the_rest() {
     writer.partition().read(|state| {
         assert_eq!(
             state.get(&name("notes"), id(1)).unwrap().vector,
-            Some(vec![1.0, 2.0])
+            Some(&[1.0, 2.0][..])
         );
     });
 
@@ -182,7 +183,7 @@ async fn a_mutation_that_changes_nothing_is_not_logged() {
     let before = cluster.committed().await;
     let stored = writer
         .partition()
-        .read(|state| state.get(&name("notes"), id(1)).cloned().unwrap());
+        .read(|state| state.get(&name("notes"), id(1)).unwrap().to_object());
     let identical = Mutation::Upsert {
         collection: name("notes"),
         id: id(1),
@@ -211,7 +212,7 @@ async fn a_mutation_that_changes_nothing_is_not_logged() {
     );
     assert_eq!(cluster.committed().await, before);
     writer.partition().read(|state| {
-        assert_eq!(state.get(&name("notes"), id(1)), Some(&stored));
+        assert!(state.get(&name("notes"), id(1)).unwrap().is(&stored));
     });
 }
 

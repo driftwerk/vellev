@@ -276,8 +276,8 @@ type Snapshot = (LogPosition, BTreeMap<ObjectId, i64>);
 fn snapshot(state: &State) -> Snapshot {
     let rows = state
         .scan(&name(COLLECTION))
-        .map(|object| match object.properties.get("n") {
-            Some(Value::Int(n)) => (object.id, *n),
+        .map(|found| match found.object.properties.get("n") {
+            Some(Value::Int(n)) => (found.id(), *n),
             other => panic!("{other:?}"),
         })
         .collect();

@@ -56,7 +56,7 @@ fn brute_force(
     bm25: Bm25,
     keep: impl Fn(&Object) -> bool,
 ) -> BTreeMap<ObjectId, f64> {
-    let objects: Vec<&Object> = state.scan(&name(NOTES)).collect();
+    let objects: Vec<&Object> = state.scan(&name(NOTES)).map(|found| found.object).collect();
     let (k1, b) = (f64::from(bm25.k1), f64::from(bm25.b));
     let asked: Vec<String> = terms(text).collect();
     let distinct: BTreeSet<&String> = asked.iter().collect();

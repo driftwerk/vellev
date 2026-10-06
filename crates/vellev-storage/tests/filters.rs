@@ -21,8 +21,8 @@ fn tagged(object: u8, n: i64, tags: &[&str]) -> Mutation {
     }
 }
 
-fn ids(objects: Vec<&vellev_core::Object>) -> Vec<ObjectId> {
-    let mut ids: Vec<ObjectId> = objects.into_iter().map(|object| object.id).collect();
+fn ids(found: Vec<vellev_storage::Live<'_>>) -> Vec<ObjectId> {
+    let mut ids: Vec<ObjectId> = found.into_iter().map(|found| found.id()).collect();
     ids.sort_unstable();
     ids
 }
@@ -174,7 +174,7 @@ async fn a_list_pages_in_id_order_and_stays_correct_while_rows_change() {
             let page = state
                 .list(&name("notes"), filter, after.map(id), 3)
                 .unwrap();
-            page.into_iter().map(|object| object.id).collect::<Vec<_>>()
+            page.into_iter().map(|found| found.id()).collect::<Vec<_>>()
         })
     };
     assert_eq!(page(None, None), these(&[1, 2, 3]));

@@ -22,6 +22,12 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>>;
     /// Remove a file; one that is not there is no error.
     async fn delete(&self, key: &str) -> Result<()>;
+    /// Where a copy of the file lies on local disk, if the store keeps one,
+    /// fetching it first if need be. The copy is never written again once
+    /// it is there.
+    async fn local(&self, _key: &str) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
 }
 
 /// A file as a listing shows it.
@@ -77,6 +83,16 @@ impl Layout<'_> {
         self.named("index", position, author, "-merged")
     }
 
+    /// The vectors file of the segment a flush at `position` writes.
+    pub fn vectors(&self, position: LogPosition, author: &Author) -> String {
+        self.key("vectors", position, author)
+    }
+
+    /// The vectors file of the segment a merge at `position` writes.
+    pub fn merged_vectors(&self, position: LogPosition, author: &Author) -> String {
+        self.named("vectors", position, author, "-merged")
+    }
+
     fn key(&self, kind: &str, position: LogPosition, author: &Author) -> String {
         self.named(kind, position, author, "")
     }
@@ -95,7 +111,7 @@ impl Layout<'_> {
     /// for a key not laid out this way.
     pub(crate) fn position(&self, key: &str) -> Option<LogPosition> {
         let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
-        if !matches!(kind, "log" | "segment" | "manifest" | "index") {
+        if !matches!(kind, "log" | "segment" | "manifest" | "index" | "vectors") {
             return None;
         }
         name.get(..20)?.parse().ok().map(LogPosition)
@@ -110,11 +126,26 @@ pub(crate) fn is_plain(key: &str) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub struct ObjectBlobs(Arc<dyn ObjectStore>);
+pub struct ObjectBlobs {
+    store: Arc<dyn ObjectStore>,
+    /// Where the store keeps its files when it is a local directory, whose
+    /// files are then read in place.
+    root: Option<PathBuf>,
+}
 
 impl ObjectBlobs {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self(store)
+        Self { store, root: None }
+    }
+
+    /// A store that is the local directory `root`, which writes a file
+    /// whole under another name and renames it into place, as
+    /// `object_store`'s local file system does.
+    pub fn on_disk(store: Arc<dyn ObjectStore>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            store,
+            root: Some(root.into()),
+        }
     }
 }
 
@@ -133,7 +164,7 @@ fn blob_error(key: &str, error: object_store::Error) -> StorageError {
 #[async_trait]
 impl Blobs for ObjectBlobs {
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
-        self.0
+        self.store
             .put(
                 &object_store::path::Path::from(key),
                 PutPayload::from_bytes(bytes),
@@ -145,7 +176,7 @@ impl Blobs for ObjectBlobs {
 
     async fn get(&self, key: &str) -> Result<Bytes> {
         let found = self
-            .0
+            .store
             .get(&object_store::path::Path::from(key))
             .await
             .map_err(|e| blob_error(key, e))?;
@@ -155,7 +186,7 @@ impl Blobs for ObjectBlobs {
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
         use futures::TryStreamExt;
         let under = object_store::path::Path::from(prefix);
-        self.0
+        self.store
             .list(Some(&under))
             .map_ok(|meta| Listed {
                 key: meta.location.to_string(),
@@ -167,10 +198,22 @@ impl Blobs for ObjectBlobs {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        match self.0.delete(&object_store::path::Path::from(key)).await {
+        match self
+            .store
+            .delete(&object_store::path::Path::from(key))
+            .await
+        {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(blob_error(key, error)),
         }
+    }
+
+    async fn local(&self, key: &str) -> Result<Option<PathBuf>> {
+        let Some(path) = self.root.as_ref().filter(|_| is_plain(key)) else {
+            return Ok(None);
+        };
+        let path = path.join(key);
+        Ok(tokio::fs::metadata(&path).await.is_ok().then_some(path))
     }
 }
 
@@ -268,5 +311,16 @@ impl Blobs for CachedBlobs {
             let _ = tokio::fs::remove_file(path).await;
         }
         Ok(())
+    }
+
+    async fn local(&self, key: &str) -> Result<Option<PathBuf>> {
+        let Some(path) = self.path(key) else {
+            return Ok(None);
+        };
+        if tokio::fs::metadata(&path).await.is_ok() {
+            return Ok(Some(path));
+        }
+        self.get(key).await?;
+        Ok(tokio::fs::metadata(&path).await.is_ok().then_some(path))
     }
 }

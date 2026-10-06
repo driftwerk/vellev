@@ -78,6 +78,12 @@ true nearest ten of sample queries, built when the segment is written and
 kept in a file beside it. A filter is applied during the scan, so results
 are exact with respect to it.
 
+A segment's vectors live in a column file of their own, read in place
+from the node's local copy of the store (`VELLEV_CACHE_DIR`, set in the
+image) or from a `file://` store's own files, so memory goes on codes and
+properties rather than on the vectors themselves; a node with neither holds
+every vector in memory.
+
 ```sh
 cargo run --release -p vellev-index --example clustered_bench -- 200000 768   # the index alone
 OBJECTS=1000000 cargo run --release -p vellev-storage --example vector_scale  # commit, flush, merge, search

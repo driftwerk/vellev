@@ -64,8 +64,8 @@ pub enum StorageError {
     Exhausted(&'static str),
     #[error("encoding failed: {0}")]
     Encode(String),
-    #[error("indexing did not finish: {0}")]
-    Indexing(String),
+    #[error("work off the async threads did not finish: {0}")]
+    Background(String),
     /// A failure of a commit shared by several callers, as each of them sees it.
     #[error(transparent)]
     Shared(Arc<StorageError>),

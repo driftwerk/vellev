@@ -10,10 +10,12 @@ vellev-core.workspace = true
 vellev-index.workspace = true
 
 async-trait.workspace = true
+bytemuck.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 crc32fast.workspace = true
 futures.workspace = true
+memmap2.workspace = true
 object_store.workspace = true
 rmp-serde.workspace = true
 roaring.workspace = true

@@ -12,7 +12,7 @@ use vellev_index::filter::Predicate;
 use crate::catalog::Catalog;
 use crate::format::{CollectionId, Op};
 use crate::mutation::{Condition, Mutation, Outcome};
-use crate::state::State;
+use crate::state::{Live, State};
 use crate::{Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
@@ -160,13 +160,16 @@ fn invalid(reason: String) -> StorageError {
 }
 
 impl Batch<'_> {
-    fn row(&self, key: RowKey) -> Option<&Object> {
+    fn row(&self, key: RowKey) -> Option<Live<'_>> {
         match self
             .rows
             .get(&key)
             .or_else(|| self.draft.pending.rows.get(&key))
         {
-            Some(pending) => pending.as_ref(),
+            Some(pending) => pending.as_ref().map(|object| Live {
+                object,
+                vector: object.vector.as_deref(),
+            }),
             None => self.draft.state.row(key.0, key.1),
         }
     }
@@ -179,7 +182,7 @@ impl Batch<'_> {
 
     fn stored(&self, name: &CollectionName, key: RowKey) -> Result<Object> {
         self.row(key)
-            .cloned()
+            .map(|found| found.to_object())
             .ok_or_else(|| StorageError::UnknownObject {
                 collection: name.clone(),
                 id: key.1,
@@ -206,10 +209,10 @@ impl Batch<'_> {
             next.vector = [self.row(key), self.draft.state.row(collection, next.id)]
                 .into_iter()
                 .flatten()
-                .filter(|stored| stored.embedded_text(embedding) == text)
-                .find_map(|stored| stored.vector.clone());
+                .filter(|stored| stored.object.embedded_text(embedding) == text)
+                .find_map(|stored| stored.vector.map(<[f32]>::to_vec));
         }
-        if self.row(key) == Some(&next) {
+        if self.row(key).is_some_and(|stored| stored.is(&next)) {
             return Outcome::Unchanged;
         }
         self.rows.insert(key, Some(next.clone()));
@@ -366,7 +369,7 @@ impl Batch<'_> {
             .draft
             .state
             .matching(collection, predicate)
-            .map(|object| object.id)
+            .map(|found| found.id())
             .filter(|id| !overlaid(*id));
         let written = pending
             .iter()

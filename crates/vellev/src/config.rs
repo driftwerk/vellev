@@ -9,7 +9,6 @@ use eyre::{bail, eyre, Result, WrapErr};
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use object_store::ObjectStore;
 use vellev_core::NodeId;
 use vellev_embed::Embedders;
 use vellev_node::{Node, Settings};
@@ -29,7 +28,8 @@ pub struct Config {
     /// region, endpoint and credentials; `file:///path`; or `memory://`.
     #[arg(long, env = "VELLEV_STORE")]
     pub store: String,
-    /// A local directory to keep fetched data files in.
+    /// A local directory to keep fetched data files in. Vectors are read
+    /// in place from it; a node without one holds every vector in memory.
     #[arg(long, env = "VELLEV_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
     /// The keys callers may present, separated by commas.
@@ -95,22 +95,24 @@ pub struct Config {
 /// The store a URL names. A bucket is used whole: a path within one would
 /// be ignored, and two nodes given different paths would write the same
 /// files.
-fn store(url: &str) -> Result<Arc<dyn ObjectStore>> {
+fn store(url: &str) -> Result<ObjectBlobs> {
     if url == "memory://" {
-        return Ok(Arc::new(InMemory::new()));
+        return Ok(ObjectBlobs::new(Arc::new(InMemory::new())));
     }
     if let Some(path) = url.strip_prefix("file://") {
         if !path.starts_with('/') {
             bail!("{url} must name an absolute path, as file:///path");
         }
         std::fs::create_dir_all(path).wrap_err_with(|| format!("creating {path}"))?;
-        return Ok(Arc::new(LocalFileSystem::new_with_prefix(path)?));
+        let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
+        return Ok(ObjectBlobs::on_disk(store, path));
     }
     if let Some(bucket) = url.strip_prefix("s3://") {
         if bucket.is_empty() || bucket.trim_end_matches('/').contains('/') {
             bail!("{url} must name a bucket and nothing within it");
         }
-        return Ok(Arc::new(AmazonS3Builder::from_env().with_url(url).build()?));
+        let store = AmazonS3Builder::from_env().with_url(url).build()?;
+        return Ok(ObjectBlobs::new(Arc::new(store)));
     }
     bail!("{url} is not an s3://, file:// or memory:// store")
 }
@@ -151,7 +153,7 @@ impl Config {
     /// What callers may ask of the node, and the store it keeps data in.
     /// Everything that can be wrong without reaching another machine is
     /// found wrong here.
-    pub fn checked(&self) -> Result<(Limits, Arc<dyn ObjectStore>)> {
+    pub fn checked(&self) -> Result<(Limits, ObjectBlobs)> {
         let keyed = self.embedding_keys()?;
         let embedding_urls = self
             .embedding_urls
@@ -181,12 +183,12 @@ impl Config {
 
     /// A node over `store`, once Postgres can be reached, reachable by
     /// other nodes at `advertise_url` or else at this host on `port`.
-    pub async fn node(&self, store: Arc<dyn ObjectStore>, port: u16) -> Result<Node> {
+    pub async fn node(&self, store: ObjectBlobs, port: u16) -> Result<Node> {
         let coordinator =
             PostgresCoordinator::connect(&self.database_url, self.database_connections)
                 .await
                 .wrap_err("connecting to Postgres")?;
-        let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(store));
+        let blobs: Arc<dyn Blobs> = Arc::new(store);
         let blobs = match &self.cache_dir {
             Some(dir) => Arc::new(CachedBlobs::new(blobs, dir)),
             None => blobs,

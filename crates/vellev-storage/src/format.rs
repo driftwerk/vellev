@@ -32,13 +32,20 @@ pub enum Kind {
     Manifest = 2,
     Segment = 3,
     Index = 4,
+    Vectors = 5,
 }
 
 impl Kind {
     fn from_byte(byte: u8) -> Option<Self> {
-        [Kind::Log, Kind::Manifest, Kind::Segment, Kind::Index]
-            .into_iter()
-            .find(|kind| *kind as u8 == byte)
+        [
+            Kind::Log,
+            Kind::Manifest,
+            Kind::Segment,
+            Kind::Index,
+            Kind::Vectors,
+        ]
+        .into_iter()
+        .find(|kind| *kind as u8 == byte)
     }
 }
 
@@ -104,6 +111,10 @@ pub struct SegmentMeta {
     /// large enough to have any.
     #[serde(default)]
     pub index: Option<String>,
+    /// The file holding the rows' vectors, if any row has one; the rows in
+    /// the segment file then carry none.
+    #[serde(default)]
+    pub vectors: Option<String>,
 }
 
 /// The vector indexes of a segment that took long enough to build to be
@@ -142,15 +153,35 @@ pub fn encode<T: Serialize>(kind: Kind, value: &T) -> Result<Bytes> {
 }
 
 fn frame(kind: Kind, version: u16, body: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(HEADER + body.len());
+    framed(kind, version, body.len(), |frame| {
+        frame.extend_from_slice(body)
+    })
+}
+
+/// A frame whose body `fill` writes in place, for one too large to build
+/// first and copy. `fill` must append exactly `length` bytes.
+pub(crate) fn framed(
+    kind: Kind,
+    version: u16,
+    length: usize,
+    fill: impl FnOnce(&mut Vec<u8>),
+) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(HEADER + length);
     frame.extend_from_slice(&MAGIC);
     frame.push(kind as u8);
     frame.extend_from_slice(&version.to_le_bytes());
-    frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    frame.extend_from_slice(&checksum(&frame[MAGIC.len()..], body).to_le_bytes());
-    frame.extend_from_slice(body);
+    frame.extend_from_slice(&(length as u64).to_le_bytes());
+    frame.extend_from_slice(&[0; 4]);
+    fill(&mut frame);
+    debug_assert_eq!(frame.len(), HEADER + length);
+    let (header, body) = frame.split_at(HEADER);
+    let checksum = checksum(&header[MAGIC.len()..HEADER - 4], body).to_le_bytes();
+    frame[HEADER - 4..HEADER].copy_from_slice(&checksum);
     frame
 }
+
+/// Where a frame's body starts.
+pub(crate) const BODY: usize = HEADER;
 
 pub fn decode<T: DeserializeOwned>(key: &str, kind: Kind, frame: &[u8]) -> Result<T> {
     let (found, body) = open(key, frame)?;
@@ -167,7 +198,7 @@ pub fn decode_head(key: &str, frame: &[u8]) -> Result<Head> {
     match open(key, frame)? {
         (Kind::Log, body) => parse(key, body).map(Head::Log),
         (Kind::Manifest, body) => parse(key, body).map(Head::Manifest),
-        (Kind::Segment | Kind::Index, _) => Err(StorageError::corrupt(
+        (Kind::Segment | Kind::Index | Kind::Vectors, _) => Err(StorageError::corrupt(
             key,
             "only a log or a manifest can be a head",
         )),
@@ -199,7 +230,7 @@ fn parse<T: DeserializeOwned>(key: &str, body: &[u8]) -> Result<T> {
     }
 }
 
-fn open<'a>(key: &str, frame: &'a [u8]) -> Result<(Kind, &'a [u8])> {
+pub(crate) fn open<'a>(key: &str, frame: &'a [u8]) -> Result<(Kind, &'a [u8])> {
     let corrupt = |reason: &str| StorageError::corrupt(key, reason);
     let (header, body) = frame
         .split_at_checked(HEADER)

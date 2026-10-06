@@ -5,7 +5,9 @@
 //!   cargo run --release -p vellev-storage --example vector_scale
 //!
 //! Environment: OBJECTS (1000000), DIMS (768), SEGMENTS (4), QUERIES (50),
-//! GROUPS (1000).
+//! GROUPS (1000). The store is kept in memory with a local copy on disk,
+//! so vectors are read in place as a node would read them, or on disk
+//! alone with STORE=file, which is what a run too large for memory needs.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +20,7 @@ use vellev_core::{
 };
 use vellev_index::filter::Filter;
 use vellev_index::vector::distance;
-use vellev_storage::blobs::ObjectBlobs;
+use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Acquired, Coordinator, MemoryCoordinator, PartitionKey};
 use vellev_storage::{Mutation, Query, Writer};
 
@@ -84,7 +86,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let centres: Vec<Vec<f32>> = (0..groups)
         .map(|_| (0..dimensions).map(|_| noise.unit()).collect())
         .collect();
-    let vector = |n: usize, noise: &mut Noise| -> Vec<f32> {
+    // Object `n`'s vector, the same however often it is asked for; `salt`
+    // tells a query apart from the object it is near.
+    let vector = |n: usize, salt: u64| -> Vec<f32> {
+        let mut noise = Noise((n as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt);
+        (0..3).for_each(|_| {
+            noise.unit();
+        });
         centres[n % groups]
             .iter()
             .map(|c| c + 0.6 * noise.unit())
@@ -98,7 +106,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let coordinator = Arc::new(MemoryCoordinator::default());
     coordinator.register(&key).await?;
-    let blobs = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir()?;
+    let blobs: Arc<dyn Blobs> = match std::env::var("STORE").as_deref() {
+        Ok("file") => {
+            let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path())?;
+            Arc::new(ObjectBlobs::on_disk(Arc::new(local), dir.path()))
+        }
+        _ => {
+            let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+            Arc::new(CachedBlobs::new(store, dir.path()))
+        }
+    };
     let Acquired::Lease { lease, committed } = coordinator
         .acquire(&key, &NodeId::generate("bench"), Duration::from_secs(3600))
         .await?
@@ -114,7 +132,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{objects} objects of {dimensions} dims in {groups} groups, {segments} segments");
 
     let started = Instant::now();
-    let mut data = Noise(2);
     for (segment, chunk) in ids.chunks(objects.div_ceil(segments)).enumerate() {
         let first = segment * objects.div_ceil(segments);
         for (batch, batch_ids) in chunk.chunks(1_000).enumerate() {
@@ -132,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_object()
                     .expect("an object")
                     .clone(),
-                    vector: Some(vector(start + i, &mut data)),
+                    vector: Some(vector(start + i, 0)),
                 })
                 .collect();
             writer.commit(mutations).await?;
@@ -147,10 +164,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let merging = Instant::now();
-    let position = writer.merge().await?;
+    let mut merges = 0;
+    while writer.merge().await?.is_some() {
+        merges += 1;
+        writer.clean(Duration::ZERO).await?;
+    }
     println!(
-        "merge: {:?} in {:.1?}, rss {} MB",
-        position,
+        "{merges} merges in {:.1?}, rss {} MB",
         merging.elapsed(),
         resident_mb()
     );
@@ -162,49 +182,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     println!("segments (rows, clustered): {shape:?}");
 
-    let mut probe = Noise(3);
     let probes: Vec<Vec<f32>> = (0..queries)
-        .map(|q| vector(q * (objects / queries), &mut probe))
+        .map(|q| vector(q * (objects / queries), 3))
         .collect();
-    let exact: Vec<Vec<ObjectId>> = {
-        let mut regen = Noise(2);
-        let all: Vec<Vec<f32>> = (0..objects).map(|n| vector(n, &mut regen)).collect();
-        probes
-            .iter()
-            .map(|query| {
-                let mut scored: Vec<(f32, usize)> = all
-                    .iter()
-                    .enumerate()
-                    .map(|(n, v)| (distance(Distance::Cosine, query, v), n))
-                    .collect();
-                scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-                scored[..10].iter().map(|(_, n)| ids[*n]).collect()
+    // The true nearest ten of every query among the first `count` objects,
+    // found in one pass over the vectors made again, a slice per thread.
+    let exact = |count: usize| -> Vec<Vec<ObjectId>> {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let slice = count.div_ceil(threads);
+        let mut best: Vec<Vec<(f32, usize)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|t| {
+                    let probes = &probes;
+                    let vector = &vector;
+                    scope.spawn(move || {
+                        let (from, to) = (t * slice, ((t + 1) * slice).min(count));
+                        let mut best = vec![Vec::<(f32, usize)>::new(); probes.len()];
+                        for n in from..to {
+                            let v = vector(n, 0);
+                            for (q, query) in probes.iter().enumerate() {
+                                let d = distance(Distance::Cosine, query, &v);
+                                let top = &mut best[q];
+                                if top.len() < 10 || d < top[9].0 {
+                                    top.push((d, n));
+                                    top.sort_by(|a, b| a.0.total_cmp(&b.0));
+                                    top.truncate(10);
+                                }
+                            }
+                        }
+                        best
+                    })
+                })
+                .collect();
+            let mut merged = vec![Vec::<(f32, usize)>::new(); probes.len()];
+            for worker in workers {
+                for (q, top) in worker.join().expect("a worker").into_iter().enumerate() {
+                    merged[q].extend(top);
+                }
+            }
+            merged
+        });
+        best.iter_mut()
+            .map(|top| {
+                top.sort_by(|a, b| a.0.total_cmp(&b.0));
+                top[..10].iter().map(|(_, n)| ids[*n]).collect()
             })
             .collect()
     };
+    let exacting = Instant::now();
+    let exact_all = exact(objects);
     let half = Filter::Lt {
         property: "line".into(),
         value: json!(objects / 2),
     };
-    let exact_half: Vec<Vec<ObjectId>> = {
-        let mut regen = Noise(2);
-        let all: Vec<Vec<f32>> = (0..objects / 2).map(|n| vector(n, &mut regen)).collect();
-        probes
-            .iter()
-            .map(|query| {
-                let mut scored: Vec<(f32, usize)> = all
-                    .iter()
-                    .enumerate()
-                    .map(|(n, v)| (distance(Distance::Cosine, query, v), n))
-                    .collect();
-                scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-                scored[..10].iter().map(|(_, n)| ids[*n]).collect()
-            })
-            .collect()
-    };
+    let exact_half = exact(objects / 2);
+    println!("exact answers in {:.1?}", exacting.elapsed());
 
     for (label, filter, truth) in [
-        ("unfiltered", None, &exact),
+        ("unfiltered", None, &exact_all),
         ("filtered to half", Some(&half), &exact_half),
     ] {
         for oversample in [16usize, 64] {

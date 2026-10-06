@@ -36,11 +36,11 @@ pub struct Named<T>(T);
 #[from_request(via(Query), rejection(ApiError))]
 pub struct Asked<T>(T);
 
-fn stored(object: &Object, vectors: bool) -> Stored {
+fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool) -> Stored {
     Stored {
         id: object.id,
         properties: object.properties_json(),
-        vector: object.vector.clone().filter(|_| vectors),
+        vector: vector.filter(|_| vectors).map(<[f32]>::to_vec),
     }
 }
 
@@ -374,7 +374,7 @@ pub async fn object(
             schema(state, &collection)?;
             let found = state
                 .get(&collection, id)
-                .map(|object| stored(object, true));
+                .map(|found| stored(found.object, found.vector, true));
             found.ok_or_else(|| {
                 ApiError::not_found(format!("object {id} does not exist in {collection}"))
             })
@@ -455,7 +455,7 @@ pub async fn delete_object(
 
 fn hit(hit: Hit<'_>, vectors: bool) -> Found {
     Found {
-        object: stored(hit.object, vectors),
+        object: stored(hit.object, Some(hit.vector), vectors),
         score: None,
         distance: Some(hit.distance),
         certainty: hit.certainty,
@@ -465,7 +465,7 @@ fn hit(hit: Hit<'_>, vectors: bool) -> Found {
 
 fn scored(scored: Scored<'_>, vectors: bool) -> Found {
     Found {
-        object: stored(scored.object, vectors),
+        object: stored(scored.object, scored.vector, vectors),
         score: None,
         distance: None,
         certainty: None,
@@ -475,7 +475,7 @@ fn scored(scored: Scored<'_>, vectors: bool) -> Found {
 
 fn fused(fused: Fused<'_>, vectors: bool) -> Found {
     Found {
-        object: stored(fused.object, vectors),
+        object: stored(fused.object, fused.vector, vectors),
         score: Some(fused.score),
         distance: fused.distance,
         certainty: fused.certainty,
@@ -645,11 +645,11 @@ pub async fn list(
     let tenant = app.node()?.tenant(&tenant).await?;
     read(tenant, move |state| {
         let found = state.list(&collection, page.filter.as_ref(), page.after, limit + 1)?;
-        let next = (found.len() > limit).then(|| found[limit - 1].id);
+        let next = (found.len() > limit).then(|| found[limit - 1].id());
         let objects = found
             .into_iter()
             .take(limit)
-            .map(|object| stored(object, page.vectors))
+            .map(|found| stored(found.object, found.vector, page.vectors))
             .collect();
         Ok(Json(Objects { objects, next }))
     })
