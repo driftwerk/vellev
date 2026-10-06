@@ -122,7 +122,7 @@ fn nearest<'a>(
     candidates
         .into_iter()
         .filter_map(|row| {
-            let found = layer.found(row as usize);
+            let found = layer.live(row as usize);
             let vector = found.vector?;
             let distance = scorer.distance(vector);
             Some(Hit {

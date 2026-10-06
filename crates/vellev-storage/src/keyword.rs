@@ -163,7 +163,7 @@ impl State {
                 .filter(|(row, _)| !layer.dead[*row as usize])
                 .filter(|(row, _)| allowed.as_ref().is_none_or(|rows| rows.contains(*row)))
                 .for_each(|(row, score)| {
-                    let found = layer.found(row as usize);
+                    let found = layer.live(row as usize);
                     best.push(Worst(Scored {
                         object: found.object,
                         vector: found.vector,

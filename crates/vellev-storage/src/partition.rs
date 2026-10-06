@@ -19,7 +19,7 @@ use crate::format::{
     SegmentMeta,
 };
 use crate::mutation::{Mutation, Receipt, Vectorize};
-use crate::state::{self, Indexes, Loaded, Merging, Names, State, Stored};
+use crate::state::{self, Indexes, Loaded, Merging, Names, Shape, State, Stored};
 use crate::{Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
@@ -116,14 +116,16 @@ impl Partition {
     /// still in memory, or when there is no such thing the file fetched
     /// and decoded into memory.
     async fn column(&self, key: &str, held: Option<Column>) -> Result<Column> {
-        self.own(key)?;
         match self.blobs.local(key).await {
-            Ok(Some(path)) => match Column::map(key, &path) {
-                Ok(column) => return Ok(column),
-                Err(error) => {
-                    tracing::warn!(key, %error, "a vectors file on local disk could not be read in place")
+            Ok(Some(path)) => {
+                let name = key.to_string();
+                match blocking(move || Column::map(&name, &path)).await? {
+                    Ok(column) => return Ok(column),
+                    Err(error) => {
+                        tracing::warn!(key, %error, "a vectors file on local disk could not be read in place")
+                    }
                 }
-            },
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(key, %error, "a vectors file could not be copied to local disk")
@@ -131,7 +133,11 @@ impl Partition {
         }
         match held {
             Some(column) => Ok(column),
-            None => Column::decode(key, &self.blobs.get(key).await?),
+            None => {
+                self.own(key)?;
+                let (name, bytes) = (key.to_string(), self.blobs.get(key).await?);
+                blocking(move || Column::decode(&name, &bytes)).await?
+            }
         }
     }
 
@@ -287,7 +293,7 @@ impl Partition {
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|error| StorageError::Indexing(error.to_string()))
+        .map_err(|error| StorageError::Background(error.to_string()))
 }
 
 /// A read-only copy of a partition that follows what the writer commits.
@@ -626,7 +632,7 @@ impl Writer {
             }
             self.publish(&key, frame, position).await?;
             let segment = match segment {
-                Some(segment) => Some(self.loaded(segment).await),
+                Some(segment) => Some(self.loaded(segment).await?),
                 None => None,
             };
             let mut state = self.partition.state.write().expect("partition lock");
@@ -705,14 +711,10 @@ impl Writer {
 
     /// An uploaded segment as the state holds it, with its vectors read
     /// from local disk where the store keeps a copy.
-    async fn loaded(&self, prepared: Prepared) -> (SegmentMeta, Loaded) {
+    async fn loaded(&self, prepared: Prepared) -> Result<(SegmentMeta, Loaded)> {
         let Prepared { meta, built, .. } = prepared;
         let vectors = match &meta.vectors {
-            Some(key) => self
-                .partition
-                .column(key, Some(built.vectors))
-                .await
-                .expect("the vectors are held in memory"),
+            Some(key) => self.partition.column(key, Some(built.vectors)).await?,
             None => built.vectors,
         };
         let loaded = Loaded {
@@ -721,7 +723,7 @@ impl Writer {
             indexes: Some(Arc::new(built.indexes)),
             stored: Stored::default(),
         };
-        (meta, loaded)
+        Ok((meta, loaded))
     }
 
     /// Carry out the merge the partition most needs, if any: replace a run
@@ -736,15 +738,10 @@ impl Writer {
             return Ok(None);
         };
         let above = self.merging.clustered_above;
-        let Some((file, described)) = self.partition.read(|state| {
+        let Some((file, shape)) = self.partition.read(|state| {
             let file = state.merged(&merge, state.position())?;
-            let unnamed = Names {
-                segment: String::new(),
-                index: String::new(),
-                vectors: String::new(),
-            };
-            let described = unnamed.meta(state.catalog(), &file.rows, file.tombstones.len(), above);
-            Some((file, described))
+            let shape = Shape::of(state.catalog(), &file.rows, file.tombstones.len(), above);
+            Some((file, shape))
         }) else {
             return Ok(None);
         };
@@ -756,13 +753,7 @@ impl Writer {
         }
         let position = following(self.partition.read(State::position))?;
         let key = layout.manifest(position, &self.author);
-        let names = self.names(position, true);
-        let meta = SegmentMeta {
-            key: names.segment,
-            index: described.index.map(|_| names.index),
-            vectors: described.vectors.map(|_| names.vectors),
-            ..described
-        };
+        let meta = self.names(position, true).meta(shape);
         let flushed_names = self.names(position, false);
         let Some((flushed, manifest)) = self.partition.read(|state| {
             state
@@ -786,9 +777,9 @@ impl Writer {
                 self.upload(flushed).await?;
             }
             self.publish(&key, frame, position).await?;
-            let merged = self.loaded(merged).await;
+            let merged = self.loaded(merged).await?;
             let flushed = match flushed {
-                Some(flushed) => Some(self.loaded(flushed).await),
+                Some(flushed) => Some(self.loaded(flushed).await?),
                 None => None,
             };
             let mut state = self.partition.state.write().expect("partition lock");

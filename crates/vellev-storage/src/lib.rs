@@ -23,6 +23,6 @@ pub use keyword::{Keywords, Scored, MAX_WEIGHT};
 pub use mutation::{Condition, Mutation, Outcome, Receipt, Vectorize};
 pub use partition::{Embedded, Follower, Partition, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
-pub use state::{Found, Merging, State};
+pub use state::{Live, Merging, State};
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;

@@ -290,9 +290,10 @@ impl Blobs for CachedBlobs {
         let Some(path) = self.path(key) else {
             return Ok(None);
         };
-        if tokio::fs::metadata(&path).await.is_err() {
-            self.get(key).await?;
+        if tokio::fs::metadata(&path).await.is_ok() {
+            return Ok(Some(path));
         }
+        self.get(key).await?;
         Ok(tokio::fs::metadata(&path).await.is_ok().then_some(path))
     }
 }

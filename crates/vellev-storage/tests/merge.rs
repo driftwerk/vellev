@@ -1,10 +1,10 @@
 mod common;
 
 use common::*;
-use vellev_storage::Found;
+use vellev_storage::Live;
 use vellev_storage::Merging;
 
-fn ids(found: Vec<Found<'_>>) -> Vec<ObjectId> {
+fn ids(found: Vec<Live<'_>>) -> Vec<ObjectId> {
     let mut ids: Vec<ObjectId> = found.into_iter().map(|found| found.id()).collect();
     ids.sort_unstable();
     ids

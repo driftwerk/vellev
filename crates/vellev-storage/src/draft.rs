@@ -12,7 +12,7 @@ use vellev_index::filter::Predicate;
 use crate::catalog::Catalog;
 use crate::format::{CollectionId, Op};
 use crate::mutation::{Condition, Mutation, Outcome};
-use crate::state::{Found, State};
+use crate::state::{Live, State};
 use crate::{Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
@@ -160,13 +160,13 @@ fn invalid(reason: String) -> StorageError {
 }
 
 impl Batch<'_> {
-    fn row(&self, key: RowKey) -> Option<Found<'_>> {
+    fn row(&self, key: RowKey) -> Option<Live<'_>> {
         match self
             .rows
             .get(&key)
             .or_else(|| self.draft.pending.rows.get(&key))
         {
-            Some(pending) => pending.as_ref().map(|object| Found {
+            Some(pending) => pending.as_ref().map(|object| Live {
                 object,
                 vector: object.vector.as_deref(),
             }),

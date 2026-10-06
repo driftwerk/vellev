@@ -21,7 +21,7 @@ fn tagged(object: u8, n: i64, tags: &[&str]) -> Mutation {
     }
 }
 
-fn ids(found: Vec<vellev_storage::Found<'_>>) -> Vec<ObjectId> {
+fn ids(found: Vec<vellev_storage::Live<'_>>) -> Vec<ObjectId> {
     let mut ids: Vec<ObjectId> = found.into_iter().map(|found| found.id()).collect();
     ids.sort_unstable();
     ids

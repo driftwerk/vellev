@@ -100,13 +100,19 @@ impl Column {
     }
 
     /// The column in the file at `path`, holding `key`'s frame, read in
-    /// place. The file must not change while the column is open; the
-    /// store's cache writes a file once and never again.
+    /// place. The file must never be written in place while the column is
+    /// open: the store's cache only ever replaces an entry by renaming a
+    /// whole new file over it or unlinks it, either of which leaves a
+    /// mapping on the old file untouched. That holds on Unix alone, so
+    /// elsewhere a column is never mapped.
     pub fn map(key: &str, path: &Path) -> Result<Self> {
+        if !cfg!(unix) {
+            return Err(StorageError::corrupt(key, "read in place only on Unix"));
+        }
         let io = |error: std::io::Error| StorageError::corrupt(key, error.to_string());
         let file = std::fs::File::open(path).map_err(io)?;
-        // SAFETY: the mapped file is a cache entry, written whole under
-        // another name and renamed into place, and never written again.
+        // SAFETY: the file is a cache entry, replaced only by rename or
+        // unlink and never written in place, so the mapping stays valid.
         let map = unsafe { memmap2::Mmap::map(&file) }.map_err(io)?;
         let (values, offsets) = Self::parts(key, &map)?;
         let start = values.as_ptr() as usize - map.as_ptr() as usize;
@@ -130,8 +136,13 @@ impl Column {
         let (rest, count) = body
             .split_last_chunk::<8>()
             .ok_or_else(|| corrupt("shorter than a row count"))?;
-        let rows = u64::from_le_bytes(*count) as usize;
-        let table = (rows + 1) * 8;
+        let rows = usize::try_from(u64::from_le_bytes(*count))
+            .ok()
+            .and_then(|rows| rows.checked_add(1))
+            .ok_or_else(|| corrupt("row count too large"))?;
+        let table = rows
+            .checked_mul(8)
+            .ok_or_else(|| corrupt("row count too large"))?;
         let split = rest
             .len()
             .checked_sub(table)
@@ -197,6 +208,31 @@ mod tests {
             assert_eq!(copy.get(4), None);
         }
         assert_eq!(Column::taken_from(&mut []).len(), 0);
+    }
+
+    #[test]
+    fn offsets_that_do_not_fit_the_values_are_refused() {
+        let reframed = |offsets: &[u64], rows: u64| {
+            let values = [1.0f32, 2.0, 3.0];
+            let length = PADDING + values.len() * 4 + offsets.len() * 8 + 8;
+            let frame = framed(Kind::Vectors, FORMAT_VERSION, length, |frame| {
+                frame.extend_from_slice(&[0; PADDING]);
+                frame.extend_from_slice(bytemuck::cast_slice(&values));
+                offsets
+                    .iter()
+                    .for_each(|offset| frame.extend_from_slice(&offset.to_le_bytes()));
+                frame.extend_from_slice(&rows.to_le_bytes());
+            });
+            Column::decode("k", &frame)
+        };
+        assert!(reframed(&[0, 2, 3], 2).is_ok());
+        assert!(reframed(&[0, 3, 2], 2).is_err(), "not ascending");
+        assert!(reframed(&[0, 2, 4], 2).is_err(), "past the values");
+        assert!(
+            reframed(&[0, 2, 3], u64::MAX).is_err(),
+            "more rows than offsets"
+        );
+        assert!(reframed(&[0, 2, 3], 1).is_err(), "fewer rows than offsets");
     }
 
     #[test]
