@@ -22,6 +22,7 @@ impl ApiError {
         let status = match code {
             Code::Invalid => StatusCode::BAD_REQUEST,
             Code::Unauthorized => StatusCode::UNAUTHORIZED,
+            Code::Forbidden => StatusCode::FORBIDDEN,
             Code::NotFound => StatusCode::NOT_FOUND,
             Code::Conflict => StatusCode::CONFLICT,
             Code::Unavailable | Code::Uncertain => StatusCode::SERVICE_UNAVAILABLE,
@@ -135,6 +136,7 @@ impl From<NodeError> for ApiError {
             NodeError::Elsewhere { .. }
             | NodeError::Outdated { .. }
             | NodeError::Stopped
+            | NodeError::Busy
             | NodeError::Lost(_)
             | NodeError::Behind(_) => Self::unavailable(error.to_string()),
             NodeError::Embed(error) => Self::unembedded(error),

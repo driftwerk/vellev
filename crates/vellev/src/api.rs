@@ -9,8 +9,8 @@ use serde::Serialize;
 use serde_json::Value as Document;
 use vellev_api::{
     After, Batch, Change, Changes, Collections, Consistency, Content, Counted, Counting, Failure,
-    Found, Hybrid, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, Results, Stored, TenantPage,
-    Tenants, Weighted, Written, AFTER, CONSISTENCY, REQUEST,
+    Found, Hybrid, IssuedKey, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, Results, Stored,
+    TenantKey, TenantKeys, TenantPage, Tenants, Weighted, Written, AFTER, CONSISTENCY, REQUEST,
 };
 use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, RequestId, TenantId};
 use vellev_node::{Freshness, Reader};
@@ -378,6 +378,78 @@ pub async fn create_tenant(
 ) -> Result<StatusCode, ApiError> {
     app.node()?.create_tenant(&tenant).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Issue a key that reaches this tenant alone. Only an admin key may.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant}/keys",
+    params(("tenant" = TenantId, Path,)),
+    responses((status = CREATED, body = IssuedKey), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn issue_key(
+    Shared(app): Shared<App>,
+    Named(tenant): Named<TenantId>,
+) -> Result<(StatusCode, Json<IssuedKey>), ApiError> {
+    let issued = app
+        .node()?
+        .issue_key(&tenant)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("tenant {tenant} does not exist")))?;
+    let issued = IssuedKey {
+        id: issued.key.id,
+        key: issued.secret,
+        created: issued.key.created,
+    };
+    Ok((StatusCode::CREATED, Json(issued)))
+}
+
+/// The keys that reach this tenant, without their secrets. Only an admin
+/// key may list them.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant}/keys",
+    params(("tenant" = TenantId, Path,)),
+    responses((status = OK, body = TenantKeys), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn tenant_keys(
+    Shared(app): Shared<App>,
+    Named(tenant): Named<TenantId>,
+) -> Answer<TenantKeys> {
+    let keys = app.node()?.keys(&tenant).await?;
+    let keys = keys
+        .into_iter()
+        .map(|key| TenantKey {
+            id: key.id,
+            created: key.created,
+        })
+        .collect();
+    Ok(Json(TenantKeys { keys }))
+}
+
+/// Revoke one of this tenant's keys. Only an admin key may.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant}/keys/{id}",
+    params(("tenant" = TenantId, Path,), ("id" = uuid::Uuid, Path,)),
+    responses((status = NO_CONTENT), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn revoke_key(
+    Shared(app): Shared<App>,
+    Named((tenant, id)): Named<(TenantId, uuid::Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    match app.node()?.revoke_key(&tenant, id).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::not_found(format!(
+            "tenant {tenant} has no key {id}"
+        ))),
+    }
 }
 
 /// Forget the tenant and everything in it.

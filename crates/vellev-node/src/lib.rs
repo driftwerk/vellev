@@ -13,15 +13,19 @@ use vellev_core::{CollectionName, Embedding, NodeId, Partition, TenantId};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
-    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, Versions,
+    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, TenantKey, Versions,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
     Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
 };
 
+mod keys;
 mod reading;
 
+use keys::Keys;
+
+pub use keys::{Issued, REMEMBERED_FOR as KEYS_REMEMBERED_FOR};
 pub use reading::{Freshness, Reader};
 
 /// The node-to-node protocol this release speaks: what a request one node
@@ -93,6 +97,8 @@ pub enum NodeError {
     Elsewhere { tenant: TenantId, holder: NodeId },
     #[error("the node is stopping")]
     Stopped,
+    #[error("the node is looking up too many keys at once")]
+    Busy,
     #[error("the hold on tenant {0} ran out while it was being opened")]
     Lost(TenantId),
     #[error("this node has not caught up with tenant {0} as far as asked")]
@@ -317,6 +323,7 @@ struct Inner {
     open: Mutex<Open>,
     /// When object storage last answered a readiness check.
     store_answered: Mutex<Option<Instant>>,
+    keys: Keys,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +343,7 @@ impl Node {
             settings,
             open: Mutex::default(),
             store_answered: Mutex::default(),
+            keys: Keys::default(),
         }))
     }
 
@@ -418,6 +426,31 @@ impl Node {
         Ok(Versions { format, protocol })
     }
 
+    /// Issue a key that reaches `tenant`; `None` if there is no such tenant.
+    pub async fn issue_key(&self, tenant: &TenantId) -> Result<Option<Issued>> {
+        self.0.keys.issue(self.0.coordinator.as_ref(), tenant).await
+    }
+
+    /// The keys that reach `tenant`, oldest first, without their secrets.
+    pub async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>> {
+        Ok(self.0.coordinator.keys(tenant).await?)
+    }
+
+    /// Revoke one of `tenant`'s keys. Returns whether it was one.
+    pub async fn revoke_key(&self, tenant: &TenantId, id: uuid::Uuid) -> Result<bool> {
+        let revoked = self.0.coordinator.revoke_key(tenant, id).await?;
+        self.0.keys.forget(tenant);
+        Ok(revoked)
+    }
+
+    /// The tenant the key `secret` reaches, if it is one.
+    pub async fn key_tenant(&self, secret: &str) -> Result<Option<TenantId>> {
+        self.0
+            .keys
+            .tenant(self.0.coordinator.as_ref(), secret)
+            .await
+    }
+
     /// Creating a tenant that exists changes nothing.
     pub async fn create_tenant(&self, tenant: &TenantId) -> Result<()> {
         Ok(self.0.coordinator.register(&key(tenant)).await?)
@@ -429,6 +462,7 @@ impl Node {
     /// lease.
     pub async fn drop_tenant(&self, tenant: &TenantId) -> Result<bool> {
         let existed = self.0.coordinator.remove(&key(tenant)).await?;
+        self.0.keys.forget(tenant);
         self.0.opened().followers.remove(tenant);
         let opening = self.0.opened().tenants.remove(tenant);
         if let Some(opened) = opening.as_ref().and_then(|opening| opening.get()) {

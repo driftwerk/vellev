@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use vellev_core::NodeId;
+use uuid::Uuid;
+use vellev_core::{NodeId, TenantId};
 
 use super::{
     checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result, Versions,
+    Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Result, TenantKey,
+    Versions,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -76,6 +78,7 @@ pub struct MemoryCoordinator {
     rows: Mutex<HashMap<PartitionKey, Row>>,
     nodes: Mutex<HashMap<NodeId, Versions>>,
     format: Mutex<u16>,
+    keys: Mutex<Vec<(TenantId, KeyHash, TenantKey)>>,
 }
 
 impl Default for MemoryCoordinator {
@@ -92,6 +95,7 @@ impl MemoryCoordinator {
             rows: Mutex::new(HashMap::new()),
             nodes: Mutex::new(HashMap::new()),
             format: Mutex::new(1),
+            keys: Mutex::new(Vec::new()),
         }
     }
 
@@ -155,12 +159,15 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn remove(&self, key: &PartitionKey) -> Result<bool> {
-        Ok(self
-            .rows
-            .lock()
-            .expect("coordinator lock")
-            .remove(key)
-            .is_some())
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        let existed = rows.remove(key).is_some();
+        if !rows.keys().any(|other| other.tenant == key.tenant) {
+            self.keys
+                .lock()
+                .expect("coordinator lock")
+                .retain(|(tenant, ..)| tenant != &key.tenant);
+        }
+        Ok(existed)
     }
 
     async fn acquire(
@@ -307,5 +314,60 @@ impl Coordinator for MemoryCoordinator {
             *current = format;
         }
         Ok(*current)
+    }
+
+    async fn issue_key(
+        &self,
+        tenant: &TenantId,
+        id: Uuid,
+        hash: &KeyHash,
+    ) -> Result<Option<TenantKey>> {
+        let rows = self.rows.lock().expect("coordinator lock");
+        if !rows.keys().any(|key| &key.tenant == tenant) {
+            return Ok(None);
+        }
+        let issued = TenantKey {
+            id,
+            created: self.clock.now(),
+        };
+        let mut keys = self.keys.lock().expect("coordinator lock");
+        if keys
+            .iter()
+            .any(|(_, kept, key)| kept == hash || key.id == id)
+        {
+            return Err(CoordinatorError::InvalidArgument(
+                "a key with this id or secret is already kept".into(),
+            ));
+        }
+        keys.push((tenant.clone(), *hash, issued.clone()));
+        Ok(Some(issued))
+    }
+
+    async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>> {
+        Ok(self
+            .keys
+            .lock()
+            .expect("coordinator lock")
+            .iter()
+            .filter(|(of, ..)| of == tenant)
+            .map(|(.., key)| key.clone())
+            .collect())
+    }
+
+    async fn revoke_key(&self, tenant: &TenantId, id: Uuid) -> Result<bool> {
+        let mut keys = self.keys.lock().expect("coordinator lock");
+        let before = keys.len();
+        keys.retain(|(of, _, key)| !(of == tenant && key.id == id));
+        Ok(keys.len() < before)
+    }
+
+    async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>> {
+        Ok(self
+            .keys
+            .lock()
+            .expect("coordinator lock")
+            .iter()
+            .find(|(_, kept, _)| kept == hash)
+            .map(|(tenant, ..)| tenant.clone()))
     }
 }

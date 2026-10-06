@@ -33,7 +33,9 @@ pub struct Config {
     /// in place from it; a node without one holds every vector in memory.
     #[arg(long, env = "VELLEV_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
-    /// The keys callers may present, separated by commas.
+    /// The admin keys, separated by commas: each reaches every tenant and
+    /// alone may create, drop and list tenants and issue their keys. A key
+    /// that reaches one tenant is issued through the API.
     #[arg(
         long,
         env = "VELLEV_API_KEYS",

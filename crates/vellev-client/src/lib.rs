@@ -15,8 +15,9 @@ use reqwest::{Method, StatusCode};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Serialize;
 use vellev_api::{
-    After, Batch, Change, Changes, Code, Collections, Content, Counted, Failure, Hybrid, Keyword,
-    Nearest, Objects, Page, Results, Stored, Tenants, Written, AFTER, REQUEST, ROOT,
+    After, Batch, Change, Changes, Code, Collections, Content, Counted, Failure, Hybrid, IssuedKey,
+    Keyword, Nearest, Objects, Page, Results, Stored, TenantKey, TenantKeys, Tenants, Written,
+    AFTER, REQUEST, ROOT,
 };
 use vellev_core::{Collection, CollectionName, ObjectId, Property, RequestId, TenantId};
 use vellev_index::filter::Filter;
@@ -467,6 +468,46 @@ impl Tenant {
             .await;
         self.client.learnt().remove(&Some(self.id.clone()));
         found(dropped).map(|dropped| dropped.is_some())
+    }
+
+    /// Issue a key that reaches this tenant alone; needs an admin key. A
+    /// try sent again after its answer was lost issues another key, whose
+    /// secret nobody learns; revoke it from [`Self::keys`].
+    pub async fn issue_key(&self) -> Result<IssuedKey> {
+        let path = self.path("/keys");
+        self.client
+            .ask(
+                Kind::Repeatable,
+                Method::POST,
+                &path,
+                None::<&()>,
+                Some(&self.id),
+            )
+            .await
+    }
+
+    /// The keys that reach this tenant, without their secrets; needs an
+    /// admin key.
+    pub async fn keys(&self) -> Result<Vec<TenantKey>> {
+        let listed: TenantKeys = self.read(Method::GET, "/keys", None::<&()>).await?;
+        Ok(listed.keys)
+    }
+
+    /// Revoke one of this tenant's keys; needs an admin key. Returns
+    /// whether it was one.
+    pub async fn revoke_key(&self, id: uuid::Uuid) -> Result<bool> {
+        let path = self.path(&format!("/keys/{id}"));
+        let revoked: Result<()> = self
+            .client
+            .ask(
+                Kind::Repeatable,
+                Method::DELETE,
+                &path,
+                None::<&()>,
+                Some(&self.id),
+            )
+            .await;
+        found(revoked).map(|revoked| revoked.is_some())
     }
 
     pub async fn collections(&self) -> Result<Vec<Collection>> {

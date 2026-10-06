@@ -12,6 +12,8 @@ openapi = ["dep:utoipa", "vellev-core/openapi", "vellev-index/openapi"]
 vellev-core.workspace = true
 vellev-index.workspace = true
 
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 utoipa = { workspace = true, optional = true }
