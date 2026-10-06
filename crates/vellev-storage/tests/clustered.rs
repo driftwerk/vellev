@@ -61,13 +61,19 @@ fn exact(vectors: &[Vec<f32>], query: &[f32]) -> Vec<ObjectId> {
         .collect()
 }
 
+/// How many times the limit is scored: few enough of these rows that an
+/// index which misleads shows in what is found.
+const OVERSAMPLE: usize = 64;
+
 fn found(state: &State, vectors: &[Vec<f32>]) -> (usize, usize) {
     let (mut hits, mut total) = (0, 0);
     for query in vectors.iter().step_by(vectors.len() / 25) {
         let nearest = exact(vectors, query);
-        let got = state
-            .search(&name("notes"), &Query::nearest(query, 10))
-            .unwrap();
+        let asked = Query {
+            oversample: OVERSAMPLE,
+            ..Query::nearest(query, 10)
+        };
+        let got = state.search(&name("notes"), &asked).unwrap();
         assert_eq!(got.len(), 10);
         hits += got
             .iter()
