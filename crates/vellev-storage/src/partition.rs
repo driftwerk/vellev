@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use vellev_core::Embedding;
 
 use crate::blobs::{is_plain, Author, Blobs, Layout, Listed};
+use crate::catalog::Catalog;
 use crate::column::Column;
 use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Incarnation, Lease, LogPosition, ManifestRef,
@@ -291,25 +292,8 @@ impl Partition {
         .await?;
         let key = key.to_string();
         blocking(move || {
-            let position = manifest.position;
-            let state = State::from_manifest(&key, manifest, segments)?;
-            let Some((_, first)) = replay.first() else {
-                return Ok(state);
-            };
-            let start = first.position.0.checked_sub(1).ok_or_else(|| {
-                StorageError::corrupt(&key, "a replayed log is at the start of the log")
-            })?;
-            let mut state = state.before_replay(LogPosition(start), first.prev.clone());
-            for (log_key, log) in &replay {
-                state.apply(log_key, log)?;
-            }
-            match state.position().next() == Some(position) {
-                true => Ok(state.at_manifest(&key, position)),
-                false => Err(StorageError::corrupt(
-                    &key,
-                    "its replayed logs do not end just before it",
-                )),
-            }
+            let (position, after) = (manifest.position, manifest.replay_after);
+            State::from_manifest(&key, manifest, segments)?.replayed(&key, position, after, &replay)
         })
         .await?
     }
@@ -681,7 +665,8 @@ impl Writer {
                     rows,
                     tombstones: snapshot.tombstones.clone(),
                 };
-                let prepared = Self::prepared(names.meta(shape), self.built(file).await?)?;
+                let built = self.built(file, snapshot.catalog.clone()).await?;
+                let prepared = Self::prepared(names.meta(shape), built)?;
                 self.upload(&prepared).await?;
                 Some(prepared)
             }
@@ -690,13 +675,7 @@ impl Writer {
         if !*ready {
             return Err(StorageError::Closed);
         }
-        let (current, follows) = self
-            .partition
-            .read(|state| (state.position(), state.follows(&snapshot)));
-        if !follows {
-            return Ok(current);
-        }
-        let position = following(current)?;
+        let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
         let flushed = segment.as_ref().map(|prepared| prepared.meta.clone());
         let manifest = self
@@ -719,9 +698,15 @@ impl Writer {
     /// Names for the files of a segment built from the partition as it was
     /// at `position`, apart from those of any other build from there.
     fn staged(&self, position: LogPosition) -> Names {
-        let layout = Layout(&self.lease.key);
         let nonce = uuid::Uuid::new_v4().as_u64_pair().0;
-        let named = |kind| layout.staged(kind, position, &self.author, nonce);
+        self.names(position, &format!("-{nonce:016x}"))
+    }
+
+    /// Names for a segment's files written at `position`, told apart from
+    /// others written there by `suffix`.
+    fn names(&self, position: LogPosition, suffix: &str) -> Names {
+        let layout = Layout(&self.lease.key);
+        let named = |kind| layout.named(kind, position, &self.author, suffix);
         Names {
             segment: named("segment"),
             index: named("index"),
@@ -729,28 +714,11 @@ impl Writer {
         }
     }
 
-    fn names(&self, position: LogPosition, merged: bool) -> Names {
-        let layout = Layout(&self.lease.key);
-        match merged {
-            false => Names {
-                segment: layout.segment(position, &self.author),
-                index: layout.index(position, &self.author),
-                vectors: layout.vectors(position, &self.author),
-            },
-            true => Names {
-                segment: layout.merged(position, &self.author),
-                index: layout.merged_index(position, &self.author),
-                vectors: layout.merged_vectors(position, &self.author),
-            },
-        }
-    }
-
     /// Index a segment's rows, which have their vectors with them, then
     /// take the vectors into their column and encode both, off the async
     /// threads and before anything is written, so that readers are not
     /// held behind the write lock while a large segment is indexed.
-    async fn built(&self, mut file: SegmentFile) -> Result<Built> {
-        let catalog = self.partition.read(|state| state.catalog().clone());
+    async fn built(&self, mut file: SegmentFile, catalog: Catalog) -> Result<Built> {
         let above = Some(self.merging.clustered_above);
         blocking(move || {
             let inline = |row: usize| file.rows[row].object.vector.as_deref();
@@ -833,7 +801,8 @@ impl Writer {
         }) else {
             return Ok(None);
         };
-        let built = self.built(file).await?;
+        let catalog = self.partition.read(|state| state.catalog().clone());
+        let built = self.built(file, catalog).await?;
         let layout = Layout(&self.lease.key);
         let mut ready = self.ready.lock().await;
         if !*ready {
@@ -841,8 +810,8 @@ impl Writer {
         }
         let position = following(self.partition.read(State::position))?;
         let key = layout.manifest(position, &self.author);
-        let meta = self.names(position, true).meta(shape);
-        let flushed_names = self.names(position, false);
+        let meta = self.names(position, "-merged").meta(shape);
+        let flushed_names = self.names(position, "");
         let Some((flushed, manifest)) = self.partition.read(|state| {
             state
                 .unchanged(&merge)
@@ -852,7 +821,10 @@ impl Writer {
         };
         let merged = Self::prepared(meta, built)?;
         let flushed = match flushed {
-            Some((meta, file)) => Some(Self::prepared(meta, self.built(file).await?)?),
+            Some((meta, file)) => {
+                let catalog = self.partition.read(|state| state.catalog().clone());
+                Some(Self::prepared(meta, self.built(file, catalog).await?)?)
+            }
             None => None,
         };
         if !self.partition.read(|state| state.unchanged(&merge)) {
@@ -893,7 +865,10 @@ impl Writer {
     /// The files are listed before the head is read, with the writer held
     /// so that no commit is in flight: a file this writer uploaded and had
     /// not yet published when the listing was taken is reached by then or
-    /// belongs to a commit that failed.
+    /// belongs to a commit that failed. A flush uploads its segment's files
+    /// without the writer, under the position of the partition it was built
+    /// from, which is past the latest checkpoint and so past anything this
+    /// deletes until a checkpoint after it has been committed.
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
         let layout = Layout(&self.lease.key);
         let listed = self.partition.blobs.list(&layout.prefix()).await?;

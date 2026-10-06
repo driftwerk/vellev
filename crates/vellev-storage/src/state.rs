@@ -364,6 +364,9 @@ pub(crate) struct Snapshot {
     pub tombstones: Vec<RowKey>,
     /// Where each of `rows` lies in the memtable.
     at: Vec<usize>,
+    /// How many rows the memtable held: every one of them is in the
+    /// flushed segment or dead by the time the flush is adopted.
+    held: usize,
     /// How many of the logs since the checkpoint it covers.
     logs: usize,
 }
@@ -462,10 +465,10 @@ impl State {
         self.position
     }
 
-    /// How many rows written since the last checkpoint are still live: what
-    /// a flush would move out of memory.
+    /// How many rows have been written since the last checkpoint, counting
+    /// those since replaced: what a flush would move out of memory.
     pub fn unflushed(&self) -> usize {
-        self.memtable.rows.len() - self.memtable.deaths
+        self.memtable.rows.len()
     }
 
     pub fn head(&self) -> Option<&str> {
@@ -1012,24 +1015,8 @@ impl State {
                 },
             )
         });
-        let flushed = segment.iter().map(|(meta, _)| meta.clone());
-        let manifest = Manifest {
-            position,
-            prev: self.checkpoint.clone(),
-            next_collection_id: self.catalog.next_id(),
-            collections: self
-                .catalog
-                .collections()
-                .map(|(id, schema)| (id, schema.clone()))
-                .collect(),
-            segments: self
-                .segments
-                .iter()
-                .map(|s| s.meta.clone())
-                .chain(flushed)
-                .collect(),
-            replay: Vec::new(),
-        };
+        let flushed = segment.as_ref().map(|(meta, _)| meta.clone());
+        let manifest = self.manifest(position, &self.catalog, flushed);
         (segment, manifest)
     }
 
@@ -1072,14 +1059,9 @@ impl State {
                 .collect(),
             tombstones: self.memtable.tombstones.clone(),
             at,
+            held: self.memtable.rows.len(),
             logs: self.since.len(),
         })
-    }
-
-    /// Whether the state can still adopt a flush built from `snapshot`:
-    /// no checkpoint has been made since it was taken.
-    pub(crate) fn follows(&self, snapshot: &Snapshot) -> bool {
-        self.checkpoint == snapshot.checkpoint && self.since.len() >= snapshot.logs
     }
 
     /// The manifest a flush built from `snapshot` commits at `position`:
@@ -1091,12 +1073,27 @@ impl State {
         snapshot: &Snapshot,
         flushed: Option<SegmentMeta>,
     ) -> Manifest {
+        debug_assert_eq!(self.checkpoint, snapshot.checkpoint);
+        Manifest {
+            replay: self.since[snapshot.logs..].to_vec(),
+            replay_after: snapshot.position,
+            ..self.manifest(position, &snapshot.catalog, flushed)
+        }
+    }
+
+    /// A manifest at `position` of the segments there are, then `flushed`,
+    /// with the collections of `catalog` and nothing to replay.
+    fn manifest(
+        &self,
+        position: LogPosition,
+        catalog: &Catalog,
+        flushed: Option<SegmentMeta>,
+    ) -> Manifest {
         Manifest {
             position,
             prev: self.checkpoint.clone(),
-            next_collection_id: snapshot.catalog.next_id(),
-            collections: snapshot
-                .catalog
+            next_collection_id: catalog.next_id(),
+            collections: catalog
                 .collections()
                 .map(|(id, schema)| (id, schema.clone()))
                 .collect(),
@@ -1106,15 +1103,16 @@ impl State {
                 .map(|segment| segment.meta.clone())
                 .chain(flushed)
                 .collect(),
-            replay: self.since[snapshot.logs..].to_vec(),
+            replay: Vec::new(),
+            replay_after: LogPosition::default(),
         }
     }
 
     /// Adopt a committed flush built from `snapshot`. Each of its rows
-    /// still live moves from the memtable to the new segment, where it
-    /// is live; one replaced or deleted since is dead there too. The
-    /// memtable keeps what was committed after the snapshot, and its rows
-    /// moved stay in it, dead, until the next flush.
+    /// still live moves from the memtable to the new segment, where it is
+    /// live; one replaced or deleted since is dead there too. The memtable
+    /// then keeps only what was committed after the snapshot, indexed
+    /// afresh: as much as was committed while the flush was built.
     pub(crate) fn flushed(
         &mut self,
         manifest_key: &str,
@@ -1126,6 +1124,7 @@ impl State {
             let indexes = loaded.indexed(&meta.key, &self.catalog)?;
             let Loaded { file, vectors, .. } = loaded;
             let index = self.segments.len();
+            debug_assert_eq!(file.rows.len(), snapshot.at.len());
             let dead: Vec<bool> = file
                 .rows
                 .iter()
@@ -1155,6 +1154,7 @@ impl State {
         self.memtable
             .tombstones
             .retain(|tombstone| !flushed.contains(tombstone));
+        self.drop_flushed_rows(snapshot.held);
         self.since.drain(..snapshot.logs);
         self.position = position;
         self.head = Some(manifest_key.to_string());
@@ -1162,23 +1162,72 @@ impl State {
         Ok(())
     }
 
-    /// The state rebuilt from a manifest's segments, set back to where the
-    /// manifest's replayed logs start: `position`, headed by `head`.
-    pub(crate) fn before_replay(self, position: LogPosition, head: Option<String>) -> Self {
-        State {
-            position,
-            head,
-            ..self
+    /// Take out the memtable's first `held` rows, every one of them dead,
+    /// renumbering and indexing afresh those after them.
+    fn drop_flushed_rows(&mut self, held: usize) {
+        debug_assert!(self.memtable.dead[..held].iter().all(|dead| *dead));
+        let Memtable {
+            rows,
+            dead,
+            deaths,
+            indexes,
+            ..
+        } = &mut self.memtable;
+        rows.drain(..held);
+        dead.drain(..held);
+        *deaths -= held;
+        *indexes = Indexes::new();
+        for (row, Row { collection, object }) in rows.iter().enumerate() {
+            if let Some(schema) = self.catalog.schema(*collection) {
+                indexes
+                    .entry(*collection)
+                    .or_default()
+                    .insert(schema, row as u32, object);
+            }
+        }
+        for location in self.live.values_mut() {
+            if let Location::Memtable(row) = location {
+                *row -= held;
+            }
         }
     }
 
-    /// The state after a manifest's replayed logs: at the manifest itself.
-    pub(crate) fn at_manifest(self, key: &str, position: LogPosition) -> Self {
-        State {
+    /// The state rebuilt from a manifest's segments, brought through the
+    /// manifest's replayed logs to the manifest itself, under `key` at
+    /// `position`. The logs must start just after `after`, the position
+    /// the segments hold, and end just before the manifest.
+    pub(crate) fn replayed(
+        self,
+        key: &str,
+        position: LogPosition,
+        after: LogPosition,
+        logs: &[(String, LogSegment)],
+    ) -> Result<Self> {
+        let Some((_, first)) = logs.first() else {
+            return Ok(self);
+        };
+        let corrupt = |reason: &str| StorageError::corrupt(key, reason);
+        if after.next() != Some(first.position) {
+            return Err(corrupt(
+                "its replayed logs do not start where its segments end",
+            ));
+        }
+        let mut state = State {
+            position: after,
+            head: first.prev.clone(),
+            ..self
+        };
+        for (log_key, log) in logs {
+            state.apply(log_key, log)?;
+        }
+        if state.position.next() != Some(position) {
+            return Err(corrupt("its replayed logs do not end just before it"));
+        }
+        Ok(State {
             position,
             head: Some(key.to_string()),
             checkpoint: Some(key.to_string()),
-            ..self
-        }
+            ..state
+        })
     }
 }

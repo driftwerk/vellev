@@ -119,6 +119,7 @@ async fn commits_made_while_a_flush_builds_are_kept_by_the_writer_and_every_read
     );
 
     midway.catch_up(&committed).await.unwrap();
+    writer.clean(Duration::ZERO).await.unwrap();
     for (name, copy) in [
         ("a copy caught up from midway", midway.partition().clone()),
         (
@@ -130,16 +131,47 @@ async fn commits_made_while_a_flush_builds_are_kept_by_the_writer_and_every_read
         assert_eq!(copy.read(State::position), flushed, "{name}");
     }
 
-    writer.commit(vec![delete("notes", 4)]).await.unwrap();
-    writer.flush().await.unwrap();
-    assert_eq!(writer.partition().read(State::unflushed), 0);
-    writer.clean(Duration::ZERO).await.unwrap();
-    let expected = writer.partition().read(seen);
+    let again = writer.flush().await.unwrap();
+    assert!(
+        again > flushed,
+        "what was written while it built is flushed next"
+    );
+    assert_eq!(
+        writer.partition().read(State::unflushed),
+        0,
+        "and leaves memory"
+    );
+    let head = cluster.committed().await.manifest.unwrap().0;
+    let manifest: Manifest = format::decode(
+        &head,
+        Kind::Manifest,
+        &cluster.blobs.get(&head).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.replay, Vec::<String>::new());
+    assert_eq!(manifest.segments.len(), 2);
+    assert_eq!(writer.partition().read(seen), expected);
     assert_eq!(cluster.open().await.partition().read(seen), expected);
 }
 
 #[tokio::test]
-async fn a_flush_overtaken_by_a_checkpoint_leaves_it_be() {
+async fn rows_written_over_count_toward_a_flush() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for n in 0..5 {
+        writer.commit(vec![upsert("notes", 1, n)]).await.unwrap();
+    }
+    assert_eq!(writer.partition().read(State::unflushed), 5);
+    writer.flush().await.unwrap();
+    assert_eq!(writer.partition().read(State::unflushed), 0);
+    writer
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(4)));
+}
+
+#[tokio::test]
+async fn a_flush_waiting_on_another_finds_nothing_more_to_flush() {
     let mut cluster = Cluster::new().await;
     let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
     let writer = Arc::new(cluster.writer().await);

@@ -153,6 +153,10 @@ pub struct Manifest {
     /// The logs to apply after the segments, oldest first.
     #[serde(default)]
     pub replay: Vec<String>,
+    /// The position the segments hold, just before the first log to
+    /// replay; unused when there is none.
+    #[serde(default)]
+    pub replay_after: LogPosition,
 }
 
 /// A file a head reference can point at.
@@ -438,6 +442,7 @@ mod tests {
                 collections: vec![(CollectionId(1), schema)],
                 segments: vec![],
                 replay: vec!["a/0/log/x.log".into()],
+                replay_after: LogPosition(2),
             };
             let frame = encode(Kind::Manifest, &manifest).unwrap();
             assert_eq!(
