@@ -386,6 +386,18 @@ async fn a_request_is_sent_again_only_where_that_cannot_make_a_change_twice() {
     }
     patch("torn").await.unwrap_err();
     assert_eq!(asked("torn", "PATCH"), 1, "a patch is not sent again");
+    let posted = asked("torn", "POST");
+    let stored = client
+        .tenant(&tenant("torn"))
+        .collection(&notes_named())
+        .store_all([(oid(1), content("fox", 1, None))])
+        .await;
+    assert!(matches!(stored, Err(Error::Partial { stored: 0, .. })));
+    assert_eq!(
+        asked("torn", "POST") - posted,
+        3,
+        "whole objects stored together are sent again"
+    );
 
     let proxied = write("proxied").await.unwrap_err();
     assert!(
