@@ -8,7 +8,7 @@ use axum::Json;
 use vellev_api::{Code, Failure};
 use vellev_node::NodeError;
 use vellev_storage::coordinator::CoordinatorError;
-use vellev_storage::StorageError;
+use vellev_storage::{Refused, StorageError};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -100,6 +100,11 @@ fn code(error: &StorageError) -> Code {
         | E::Closed
         | E::Diverged { .. } => Code::Unavailable,
         E::Shared(_) => Code::Uncertain,
+        E::Refused(refusal) => match refusal.kind {
+            Refused::NotFound => Code::NotFound,
+            Refused::Conflict => Code::Conflict,
+            Refused::Invalid => Code::Invalid,
+        },
         E::Missing { .. }
         | E::Corrupt { .. }
         | E::UnsupportedVersion { .. }

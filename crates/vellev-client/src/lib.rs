@@ -2,9 +2,10 @@
 //!
 //! A [`Client`] knows several nodes and asks whichever serves a tenant. A
 //! request that fails in a way that may pass is sent again, on the next
-//! node, but only when that cannot make a change twice: a read always, a
-//! write only when it never arrived or the node says it had no effect. A
-//! write whose fate nobody knows is reported as such and never sent again.
+//! node, as long as that cannot make a change twice. Each write is named,
+//! the same on every try, and a node answers a try of a write it has
+//! already made as it did then, so a write whose fate is unknown is sent
+//! again like a read.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,9 +16,9 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Serialize;
 use vellev_api::{
     After, Batch, Change, Changes, Code, Collections, Content, Counted, Failure, Hybrid, Keyword,
-    Nearest, Objects, Page, Results, Stored, Tenants, Written, AFTER, ROOT,
+    Nearest, Objects, Page, Results, Stored, Tenants, Written, AFTER, REQUEST, ROOT,
 };
-use vellev_core::{Collection, CollectionName, ObjectId, Property, TenantId};
+use vellev_core::{Collection, CollectionName, ObjectId, Property, RequestId, TenantId};
 use vellev_index::filter::Filter;
 
 pub use vellev_api as api;
@@ -82,8 +83,9 @@ impl Error {
         self.code() == Some(Code::NotFound)
     }
 
-    /// Whether a write that failed this way may nevertheless have been
-    /// made. Read before making it again.
+    /// Whether a write that failed this way, every try of it, may
+    /// nevertheless have been made. Read before making it again: a new
+    /// call is a new write.
     pub fn is_unknown_outcome(&self) -> bool {
         self.fate() == Fate::Unknown
     }
@@ -167,17 +169,17 @@ impl std::fmt::Debug for Client {
     }
 }
 
-/// What a request is, as far as sending it again is concerned.
+/// What a request is, as far as sending it again is concerned. Every kind
+/// is sent again when its outcome is unknown.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Read,
-    /// A write whose effect is the same however many times it is made:
-    /// sent again when its outcome is unknown, like a read. A try that
-    /// outlives the timeout may still land after the one sent again, which
-    /// undoes a later write of the caller's only if that try is slower
-    /// still.
+    /// A change to the tenants whose effect is the same however many times
+    /// it is made.
     Repeatable,
-    Write,
+    /// A change to a tenant's data, named so that a node answers a try of
+    /// it again as it answered the first.
+    Write(RequestId),
 }
 
 impl Client {
@@ -240,14 +242,18 @@ impl Client {
     /// Whether the first node's process is up.
     pub async fn live(&self) -> Result<()> {
         let path = "/health/live";
-        let _: IgnoredAny = self.once(0, &Method::GET, path, None::<&()>, None).await?;
+        let _: IgnoredAny = self
+            .once(0, &Method::GET, path, None::<&()>, None, None)
+            .await?;
         Ok(())
     }
 
     /// Whether the first node can serve requests.
     pub async fn ready(&self) -> Result<()> {
         let path = "/health/ready";
-        let _: IgnoredAny = self.once(0, &Method::GET, path, None::<&()>, None).await?;
+        let _: IgnoredAny = self
+            .once(0, &Method::GET, path, None::<&()>, None, None)
+            .await?;
         Ok(())
     }
 
@@ -299,22 +305,19 @@ impl Client {
         let mut backoff = options.backoff;
         for attempt in 0..options.attempts as usize {
             let node = (first + attempt) % nodes.len();
-            let after = match kind {
-                Kind::Read => tenant.and_then(|tenant| self.after(tenant)),
-                Kind::Repeatable | Kind::Write => None,
+            let (after, request) = match kind {
+                Kind::Read => (tenant.and_then(|tenant| self.after(tenant)), None),
+                Kind::Repeatable => (None, None),
+                Kind::Write(request) => (None, Some(request)),
             };
-            let failure = match self.once(node, &method, path, body, after).await {
+            let failure = match self.once(node, &method, path, body, after, request).await {
                 Ok(answer) => {
                     self.learnt().entry(tenant.cloned()).or_default().node = node;
                     return Ok(answer);
                 }
                 Err(failure) => failure,
             };
-            let again = match (kind, failure.fate()) {
-                (_, Fate::NoEffect) | (Kind::Read | Kind::Repeatable, Fate::Unknown) => true,
-                (Kind::Write, Fate::Unknown) | (_, Fate::Final) => false,
-            };
-            if !again || attempt + 1 == options.attempts as usize {
+            if failure.fate() == Fate::Final || attempt + 1 == options.attempts as usize {
                 return Err(failure);
             }
             if (attempt + 1) % nodes.len() == 0 {
@@ -332,6 +335,7 @@ impl Client {
         path: &str,
         body: Option<&(impl Serialize + ?Sized)>,
         after: Option<After>,
+        named: Option<RequestId>,
     ) -> Result<T> {
         let Inner {
             nodes, key, http, ..
@@ -345,6 +349,10 @@ impl Client {
         };
         let request = match after {
             Some(after) => request.header(AFTER, after.to_string()),
+            None => request,
+        };
+        let request = match named {
+            Some(named) => request.header(REQUEST, named.to_string()),
             None => request,
         };
         let request = match body {
@@ -403,10 +411,9 @@ impl Tenant {
             .await
     }
 
-    /// Send a write, and remember where it can be read from.
+    /// Send a write, named afresh, and remember where it can be read from.
     async fn write(
         &self,
-        kind: Kind,
         method: Method,
         rest: &str,
         body: Option<&(impl Serialize + ?Sized)>,
@@ -414,7 +421,13 @@ impl Tenant {
         let path = self.path(rest);
         let written: Written = self
             .client
-            .ask(kind, method, &path, body, Some(&self.id))
+            .ask(
+                Kind::Write(RequestId::generate()),
+                method,
+                &path,
+                body,
+                Some(&self.id),
+            )
             .await?;
         let mut learnt = self.client.learnt();
         let known = learnt.entry(Some(self.id.clone())).or_default();
@@ -463,13 +476,12 @@ impl Tenant {
 
     /// Apply `changes` as one atomic step, each seeing those before it.
     pub async fn apply(&self, changes: Vec<Change>) -> Result<Written> {
-        self.batch(Kind::Write, changes).await
+        self.batch(changes).await
     }
 
-    async fn batch(&self, kind: Kind, changes: Vec<Change>) -> Result<Written> {
+    async fn batch(&self, changes: Vec<Change>) -> Result<Written> {
         let batch = Batch { changes };
-        self.write(kind, Method::POST, "/changes", Some(&batch))
-            .await
+        self.write(Method::POST, "/changes", Some(&batch)).await
     }
 
     pub fn collection(&self, collection: &CollectionName) -> Records {
@@ -516,26 +528,18 @@ impl Records {
     /// Creating a collection that exists exactly so changes nothing.
     pub async fn create(&self, schema: &Collection) -> Result<Written> {
         let path = self.path("");
-        self.tenant
-            .write(Kind::Repeatable, Method::PUT, &path, Some(schema))
-            .await
+        self.tenant.write(Method::PUT, &path, Some(schema)).await
     }
 
-    /// Not sent again when its outcome is unknown: once made, making it
-    /// again is refused, as there is no collection to drop.
     pub async fn drop(&self) -> Result<Written> {
         let path = self.path("");
-        self.tenant
-            .write(Kind::Write, Method::DELETE, &path, None::<&()>)
-            .await
+        self.tenant.write(Method::DELETE, &path, None::<&()>).await
     }
 
     /// Adding a property that exists unchanged changes nothing.
     pub async fn add_property(&self, property: &Property) -> Result<Written> {
         let path = self.path("/properties");
-        self.tenant
-            .write(Kind::Repeatable, Method::POST, &path, Some(property))
-            .await
+        self.tenant.write(Method::POST, &path, Some(property)).await
     }
 
     pub async fn get(&self, id: ObjectId) -> Result<Option<Stored>> {
@@ -546,25 +550,19 @@ impl Records {
     /// Store the object whole, replacing any stored under its id.
     pub async fn put(&self, id: ObjectId, content: &Content) -> Result<Written> {
         let path = self.object(id);
-        self.tenant
-            .write(Kind::Repeatable, Method::PUT, &path, Some(content))
-            .await
+        self.tenant.write(Method::PUT, &path, Some(content)).await
     }
 
     /// Merge into a stored object: a property sent as null is removed.
     pub async fn patch(&self, id: ObjectId, changes: &Changes) -> Result<Written> {
         let path = self.object(id);
-        self.tenant
-            .write(Kind::Write, Method::PATCH, &path, Some(changes))
-            .await
+        self.tenant.write(Method::PATCH, &path, Some(changes)).await
     }
 
     /// Deleting an object that is not stored changes nothing.
     pub async fn delete(&self, id: ObjectId) -> Result<Written> {
         let path = self.object(id);
-        self.tenant
-            .write(Kind::Repeatable, Method::DELETE, &path, None::<&()>)
-            .await
+        self.tenant.write(Method::DELETE, &path, None::<&()>).await
     }
 
     /// Store every object whole, several to a request, each request one
@@ -597,15 +595,15 @@ impl Records {
             if full && !batch.is_empty() {
                 let sent = std::mem::take(&mut batch);
                 let count = sent.len();
-                let written =
-                    self.tenant
-                        .batch(Kind::Repeatable, sent)
-                        .await
-                        .map_err(|source| Error::Partial {
-                            stored,
-                            position,
-                            source: Box::new(source),
-                        })?;
+                let written = self
+                    .tenant
+                    .batch(sent)
+                    .await
+                    .map_err(|source| Error::Partial {
+                        stored,
+                        position,
+                        source: Box::new(source),
+                    })?;
                 stored += count;
                 position = Some(written.position);
                 bytes = 0;

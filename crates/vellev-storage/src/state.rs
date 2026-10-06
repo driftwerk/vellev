@@ -2,17 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
-use vellev_core::{Collection, CollectionName, Object, ObjectId};
+use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId};
 use vellev_index::clustered::ClusteredIndex;
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
 use vellev_index::vector::{BinaryIndex, VectorIndex};
 
+use crate::answers::Answers;
 use crate::catalog::Catalog;
 use crate::column::Column;
 use crate::coordinator::LogPosition;
 use crate::format::{
-    CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
+    Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
 };
 use crate::{Result, StorageError};
 
@@ -360,6 +361,7 @@ pub struct State {
     /// The logs applied since the last checkpoint, oldest first: what is
     /// in the memtable and in no segment.
     since: Vec<String>,
+    answers: Answers,
 }
 
 /// What a flush takes out of the memtable: freeing it takes long enough
@@ -700,6 +702,7 @@ impl State {
             head: Some(key.to_string()),
             checkpoint: Some(key.to_string()),
             catalog,
+            answers: Answers::of(manifest.answered),
             ..State::default()
         };
         manifest
@@ -842,10 +845,31 @@ impl State {
                 }
             }
         }
+        for answered in &log.answered {
+            self.answers.remember(log.position, answered.clone());
+        }
         self.position = log.position;
         self.head = Some(key.to_string());
         self.since.push(key.to_string());
         Ok(())
+    }
+
+    /// Whether this partition answered `request` lately, so that a try of
+    /// it again will be answered as it was.
+    pub fn answered(&self, request: RequestId) -> bool {
+        self.answers.get(request).is_some()
+    }
+
+    /// Where `request` became visible and how it was answered, if this
+    /// partition answered it lately.
+    pub(crate) fn answer(&self, request: RequestId) -> Option<(LogPosition, &Answer)> {
+        self.answers.get(request)
+    }
+
+    /// When a commit made at `now`, in milliseconds since the epoch, is to
+    /// say it was made: see [`Answers::stamp`].
+    pub(crate) fn stamp(&self, now: u64) -> u64 {
+        self.answers.stamp(now)
     }
 
     /// The merge most worth doing, if any: a stale segment on its own, else
@@ -1139,6 +1163,7 @@ impl State {
                 .collect(),
             replay: Vec::new(),
             replay_after: LogPosition::default(),
+            answered: self.answers.kept(),
         }
     }
 

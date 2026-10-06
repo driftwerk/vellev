@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use vellev_core::{CollectionName, ObjectError, ObjectId, SchemaError};
 
 use crate::coordinator::CoordinatorError;
@@ -69,6 +71,27 @@ pub enum StorageError {
     /// A failure of a commit shared by several callers, as each of them sees it.
     #[error(transparent)]
     Shared(Arc<StorageError>),
+    /// A request refused before, refused again as it was then.
+    #[error("{}", .0.message)]
+    Refused(Refusal),
+}
+
+/// Why a request was refused, kept so that a try of it again is refused
+/// alike: what kind of refusal it was, and what it said.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub kind: Refused,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refused {
+    /// Something the request names does not exist.
+    NotFound,
+    /// What it would do clashes with what is stored.
+    Conflict,
+    /// It is not a request that can be made.
+    Invalid,
 }
 
 impl StorageError {
@@ -78,6 +101,29 @@ impl StorageError {
             Self::Shared(shared) => shared.root(),
             other => other,
         }
+    }
+
+    /// What refusal the failure is, if it is the request's own doing and
+    /// so would be the same however often the request were made: not a
+    /// failure that may pass.
+    pub fn refusal(&self) -> Option<Refusal> {
+        let kind = match self.root() {
+            Self::UnknownCollection(_) | Self::UnknownObject { .. } => Refused::NotFound,
+            Self::CollectionExists(_)
+            | Self::ObjectExists { .. }
+            | Self::ConditionFailed { .. } => Refused::Conflict,
+            Self::InvalidMutation(_)
+            | Self::InvalidQuery(_)
+            | Self::Schema(_)
+            | Self::Filter(_)
+            | Self::Object(_) => Refused::Invalid,
+            Self::Refused(refusal) => return Some(refusal.clone()),
+            _ => return None,
+        };
+        Some(Refusal {
+            kind,
+            message: self.root().to_string(),
+        })
     }
 
     pub(crate) fn corrupt(key: &str, reason: impl Into<String>) -> Self {

@@ -17,12 +17,12 @@ use crate::coordinator::{
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
-    decode, decode_head, encode, Head, Kind, LogSegment, Manifest, Op, SegmentFile, SegmentIndex,
-    SegmentMeta,
+    decode, decode_head, encode, Answer, Answered, Head, Kind, LogSegment, Manifest, Op,
+    SegmentFile, SegmentIndex, SegmentMeta,
 };
-use crate::mutation::{Mutation, Receipt, Vectorize};
+use crate::mutation::{Batch, Mutation, Receipt, Vectorize};
 use crate::state::{self, Indexes, Loaded, Merging, Names, Shape, State, Stored};
-use crate::{Result, StorageError};
+use crate::{Refusal, Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
 /// safe because the coordinator accepts an identical commit twice.
@@ -334,6 +334,16 @@ impl Partition {
     }
 }
 
+/// What a batch's request was answered by before this commit, if
+/// anything.
+enum Earlier {
+    None,
+    /// A commit before this one, which made it or refused it.
+    Answered(std::result::Result<Receipt, Refusal>),
+    /// The batch at this place in the same group.
+    InGroup(usize),
+}
+
 /// Run `work`, which takes long enough to hold up the async threads, on
 /// one of its own.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
@@ -492,10 +502,59 @@ impl Writer {
         batches: Vec<Vec<Mutation>>,
         made: Embedded,
     ) -> Result<Vec<Result<Receipt>>> {
+        let batches = batches.into_iter().map(Batch::from).collect();
+        self.commit_batches(batches, made).await
+    }
+
+    /// As [`Self::commit_group_with`], for batches that may name the
+    /// request they came in. A request this partition answered lately is
+    /// answered again as it was and nothing of it is made, and so is a
+    /// request that comes twice in one group, the second time. A request
+    /// is answered by the commit that makes it, refuses it or finds it
+    /// changes nothing, and is recorded with that commit, so that a writer
+    /// which takes the partition over answers it alike. One that fails in
+    /// a way that may pass, an embedding that could not be made, is not
+    /// answered and may be tried again.
+    pub async fn commit_batches(
+        &self,
+        batches: Vec<Batch>,
+        made: Embedded,
+    ) -> Result<Vec<Result<Receipt>>> {
         let mut ready = self.ready.lock().await;
         if !*ready {
             return Err(StorageError::Closed);
         }
+        let receipt = |position, outcomes| Receipt {
+            incarnation: self.partition.incarnation,
+            position,
+            outcomes,
+        };
+        // Each batch either answered already, or the first of its request
+        // in the group, if it is not that first itself.
+        let earlier: Vec<Earlier> = self.partition.read(|state| {
+            batches
+                .iter()
+                .enumerate()
+                .map(|(at, batch)| {
+                    let Some(request) = batch.request else {
+                        return Earlier::None;
+                    };
+                    if let Some((position, answer)) = state.answer(request) {
+                        return Earlier::Answered(match answer {
+                            Answer::Made(outcomes) => Ok(receipt(position, outcomes.clone())),
+                            Answer::Refused(refusal) => Err(refusal.clone()),
+                        });
+                    }
+                    match batches[..at]
+                        .iter()
+                        .position(|before| before.request == Some(request))
+                    {
+                        Some(first) => Earlier::InGroup(first),
+                        None => Earlier::None,
+                    }
+                })
+                .collect()
+        });
         let mut unembedded: Vec<Option<(String, String)>> = vec![None; batches.len()];
         let mut made: Embedded = made
             .into_iter()
@@ -511,10 +570,13 @@ impl Writer {
                 let outcomes: Vec<_> = batches
                     .iter()
                     .zip(&unembedded)
-                    .map(|(batch, unembedded)| match unembedded {
-                        Some(_) => draft.batch(Vec::new()),
-                        None => draft.batch(batch.clone()),
-                    })
+                    .zip(&earlier)
+                    .map(
+                        |((batch, unembedded), earlier)| match (unembedded, earlier) {
+                            (None, Earlier::None) => draft.batch(batch.mutations.clone()),
+                            _ => draft.batch(Vec::new()),
+                        },
+                    )
                     .collect();
                 (state.at(), outcomes, draft.finish())
             });
@@ -549,13 +611,37 @@ impl Writer {
                 return Err(StorageError::Embedding { model, reason });
             }
         };
-        let position = if ops.is_empty() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let at = self.partition.read(|state| state.stamp(now));
+        // Every request whose fate this commit decides, made or refused,
+        // even if it changed nothing, so that no later try makes it.
+        let answered: Vec<Answered> = batches
+            .iter()
+            .zip(&outcomes)
+            .zip(unembedded.iter().zip(&earlier))
+            .filter_map(|((batch, outcomes), decided)| {
+                let answer = match (outcomes, decided) {
+                    (Ok(outcomes), (None, Earlier::None)) => Answer::Made(outcomes.clone()),
+                    (Err(error), (None, Earlier::None)) => Answer::Refused(error.refusal()?),
+                    _ => return None,
+                };
+                Some(Answered {
+                    request: batch.request?,
+                    at,
+                    answer,
+                })
+            })
+            .collect();
+        let position = if ops.is_empty() && answered.is_empty() {
             position
         } else {
             let log = LogSegment {
                 position: following(position)?,
                 prev,
                 ops,
+                answered,
             };
             let key = Layout(&self.lease.key).log(log.position, &self.author);
             let frame = encode(Kind::Log, &log)?;
@@ -570,18 +656,42 @@ impl Writer {
             .await?;
             log.position
         };
-        Ok(outcomes
+        // A batch whose request comes again later in the group shares its
+        // failure with that later one.
+        let repeated: HashSet<usize> = earlier
+            .iter()
+            .filter_map(|earlier| match earlier {
+                Earlier::InGroup(first) => Some(*first),
+                _ => None,
+            })
+            .collect();
+        let mut results: Vec<Result<Receipt>> = outcomes
             .into_iter()
             .zip(unembedded)
-            .map(|(outcomes, unembedded)| match unembedded {
-                Some((model, reason)) => Err(StorageError::Embedding { model, reason }),
-                None => outcomes.map(|outcomes| Receipt {
-                    incarnation: self.partition.incarnation,
-                    position,
-                    outcomes,
-                }),
+            .enumerate()
+            .map(|(at, (outcomes, unembedded))| {
+                let result = match unembedded {
+                    Some((model, reason)) => Err(StorageError::Embedding { model, reason }),
+                    None => outcomes.map(|outcomes| receipt(position, outcomes)),
+                };
+                result.map_err(|error| match repeated.contains(&at) {
+                    true => StorageError::Shared(Arc::new(error)),
+                    false => error,
+                })
             })
-            .collect())
+            .collect();
+        for (at, earlier) in earlier.into_iter().enumerate() {
+            results[at] = match earlier {
+                Earlier::None => continue,
+                Earlier::Answered(answer) => answer.map_err(StorageError::Refused),
+                Earlier::InGroup(first) => match &results[first] {
+                    Ok(receipt) => Ok(receipt.clone()),
+                    Err(StorageError::Shared(shared)) => Err(StorageError::Shared(shared.clone())),
+                    Err(_) => unreachable!("a repeated request's failure is shared"),
+                },
+            };
+        }
+        Ok(results)
     }
 
     /// Make the vectors `wanted` that are not `made` yet, each way of

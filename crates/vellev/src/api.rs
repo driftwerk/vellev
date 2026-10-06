@@ -10,15 +10,15 @@ use serde_json::Value as Document;
 use vellev_api::{
     After, Batch, Change, Changes, Collections, Consistency, Content, Counted, Counting, Failure,
     Found, Hybrid, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, Results, Stored, TenantPage,
-    Tenants, Weighted, Written, AFTER, CONSISTENCY,
+    Tenants, Weighted, Written, AFTER, CONSISTENCY, REQUEST,
 };
-use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, TenantId};
+use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, RequestId, TenantId};
 use vellev_node::{Freshness, Reader};
 use vellev_storage::coordinator::{Incarnation, LogPosition};
+use vellev_storage::{Batch as Writes, Hybrid as HybridQuery, Keywords};
 use vellev_storage::{
     Condition, Fused, Hit, Mutation, Query as VectorQuery, Receipt, Scored, State, DEFAULT_ALPHA,
 };
-use vellev_storage::{Hybrid as HybridQuery, Keywords};
 
 use crate::problem::ApiError;
 use crate::server::App;
@@ -124,6 +124,40 @@ pub struct ReadHeaders {
     /// `session` (the default), `strong` or `eventual`.
     #[param(rename = "x-vellev-consistency", value_type = Option<Consistency>)]
     consistency: Option<String>,
+}
+
+/// The header that names a write, so that a try of it again is answered
+/// as the first was rather than made twice.
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Header)]
+pub struct WriteHeaders {
+    /// A UUID naming the write, the same on every try of it. A write
+    /// naming one answered in the last fifteen minutes is answered as it
+    /// was then, and nothing of it is made again.
+    #[param(rename = "x-vellev-request", value_type = Option<String>, format = Uuid)]
+    request: Option<String>,
+}
+
+/// The request a write names in its [`WriteHeaders`], if any.
+pub struct Requested(Option<RequestId>);
+
+impl<S: Send + Sync> FromRequestParts<S> for Requested {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, ApiError> {
+        let invalid = || ApiError::invalid(format!("{REQUEST} is not a UUID"));
+        let request = parts
+            .headers
+            .get(REQUEST)
+            .map(|value| value.to_str().map(str::to_string).map_err(|_| invalid()))
+            .transpose()?;
+        let asked = WriteHeaders { request };
+        asked
+            .request
+            .map(|text| text.parse().map_err(|_| invalid()))
+            .transpose()
+            .map(Requested)
+    }
 }
 
 /// How fresh a read must be, from its [`ReadHeaders`]. A session read
@@ -275,13 +309,19 @@ fn mutation(change: Change) -> Mutation {
     }
 }
 
-async fn write(app: &App, tenant: &TenantId, mutations: Vec<Mutation>) -> Answer<Written> {
+async fn write(
+    app: &App,
+    tenant: &TenantId,
+    request: Option<RequestId>,
+    mutations: Vec<Mutation>,
+) -> Answer<Written> {
     mutations.iter().try_for_each(|mutation| match mutation {
         Mutation::CreateCollection(schema) => app.embeds_through(schema),
         _ => Ok(()),
     })?;
     let tenant = app.node()?.tenant(tenant).await?;
-    Ok(Json(written(tenant.write(mutations).await?)))
+    let batch = Writes { request, mutations };
+    Ok(Json(written(tenant.write(batch).await?)))
 }
 
 /// Read the tenant off the async runtime's threads: a search can take
@@ -365,7 +405,7 @@ pub async fn drop_tenant(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/changes",
-    params(("tenant" = TenantId, Path,)),
+    params(WriteHeaders, ("tenant" = TenantId, Path,)),
     request_body = Batch,
     responses((status = OK, body = Written), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -374,11 +414,13 @@ pub async fn drop_tenant(
 pub async fn changes(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
+    Requested(request): Requested,
     Strict(batch): Strict<Batch>,
 ) -> Answer<Written> {
     write(
         &app,
         &tenant,
+        request,
         batch.changes.into_iter().map(mutation).collect(),
     )
     .await
@@ -429,7 +471,7 @@ pub async fn collection(
 #[utoipa::path(
     put,
     path = "/v1/tenants/{tenant}/collections/{collection}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(WriteHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Collection,
     responses((status = OK, body = Written), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -438,6 +480,7 @@ pub async fn collection(
 pub async fn create_collection(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Requested(request): Requested,
     Strict(schema): Strict<Collection>,
 ) -> Answer<Written> {
     if schema.name != collection {
@@ -449,6 +492,7 @@ pub async fn create_collection(
     write(
         &app,
         &tenant,
+        request,
         vec![Mutation::CreateCollection(Box::new(schema))],
     )
     .await
@@ -457,7 +501,7 @@ pub async fn create_collection(
 #[utoipa::path(
     delete,
     path = "/v1/tenants/{tenant}/collections/{collection}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(WriteHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     responses((status = OK, body = Written), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -465,15 +509,22 @@ pub async fn create_collection(
 pub async fn drop_collection(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Requested(request): Requested,
 ) -> Answer<Written> {
-    write(&app, &tenant, vec![Mutation::DropCollection(collection)]).await
+    write(
+        &app,
+        &tenant,
+        request,
+        vec![Mutation::DropCollection(collection)],
+    )
+    .await
 }
 
 /// Adding a property that exists unchanged changes nothing.
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/properties",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(WriteHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Property,
     responses((status = OK, body = Written), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -482,13 +533,14 @@ pub async fn drop_collection(
 pub async fn add_property(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Requested(request): Requested,
     Strict(property): Strict<Property>,
 ) -> Answer<Written> {
     let added = Mutation::AddProperty {
         collection,
         property,
     };
-    write(&app, &tenant, vec![added]).await
+    write(&app, &tenant, request, vec![added]).await
 }
 
 #[utoipa::path(
@@ -522,7 +574,7 @@ pub async fn object(
 #[utoipa::path(
     put,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
+    params(WriteHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     request_body = Content,
     responses((status = OK, body = Written), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -531,6 +583,7 @@ pub async fn object(
 pub async fn put_object(
     Shared(app): Shared<App>,
     Named((tenant, collection, id)): Named<(TenantId, CollectionName, ObjectId)>,
+    Requested(request): Requested,
     Body(content): Body<Content>,
 ) -> Answer<Written> {
     let Content { properties, vector } = content;
@@ -540,14 +593,14 @@ pub async fn put_object(
         properties,
         vector,
     };
-    write(&app, &tenant, vec![upsert]).await
+    write(&app, &tenant, request, vec![upsert]).await
 }
 
 /// Merge into a stored object: a property sent as null is removed.
 #[utoipa::path(
     patch,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
+    params(WriteHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     request_body = Changes,
     responses((status = OK, body = Written), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -556,6 +609,7 @@ pub async fn put_object(
 pub async fn patch_object(
     Shared(app): Shared<App>,
     Named((tenant, collection, id)): Named<(TenantId, CollectionName, ObjectId)>,
+    Requested(request): Requested,
     Body(changes): Body<Changes>,
 ) -> Answer<Written> {
     let Changes {
@@ -570,14 +624,14 @@ pub async fn patch_object(
         vector,
         only_if: condition(only_if),
     };
-    write(&app, &tenant, vec![patch]).await
+    write(&app, &tenant, request, vec![patch]).await
 }
 
 /// Deleting an object that is not stored changes nothing.
 #[utoipa::path(
     delete,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
+    params(WriteHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     responses((status = OK, body = Written), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -585,8 +639,15 @@ pub async fn patch_object(
 pub async fn delete_object(
     Shared(app): Shared<App>,
     Named((tenant, collection, id)): Named<(TenantId, CollectionName, ObjectId)>,
+    Requested(request): Requested,
 ) -> Answer<Written> {
-    write(&app, &tenant, vec![Mutation::Delete { collection, id }]).await
+    write(
+        &app,
+        &tenant,
+        request,
+        vec![Mutation::Delete { collection, id }],
+    )
+    .await
 }
 
 fn hit(hit: Hit<'_>, vectors: bool) -> Found {

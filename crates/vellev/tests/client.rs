@@ -9,7 +9,7 @@ use common::*;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use vellev_api::{
-    Change, Changes, Code, Content, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, AFTER,
+    Change, Changes, Code, Content, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, AFTER, REQUEST,
 };
 use vellev_client::api::After;
 use vellev_client::{Client, Error, Options};
@@ -72,15 +72,16 @@ fn increment() -> Vec<Change> {
 }
 
 /// A stand-in node that answers each request as `answer` says and
-/// remembers what it was asked, with the freshness each request asked for.
+/// remembers what it was asked, with the freshness each request asked for
+/// and the name each write was sent under.
 #[derive(Clone)]
 struct Stub {
     url: String,
     asked: Arc<Mutex<Vec<Request>>>,
 }
 
-/// A request's method and path, and the freshness it asked for.
-type Request = (String, Option<String>);
+/// A request's method and path, the freshness it asked for, and its name.
+type Request = (String, Option<String>, Option<String>);
 
 impl Stub {
     async fn answering(
@@ -94,12 +95,16 @@ impl Stub {
                 let answer = answer.clone();
                 let seen = seen.clone();
                 async move {
-                    let fresh = headers
-                        .get(AFTER)
-                        .map(|value| value.to_str().unwrap().to_string());
-                    seen.lock()
-                        .unwrap()
-                        .push((format!("{method} {}", uri.path()), fresh));
+                    let header = |name| {
+                        headers.get(name).map(|value: &axum::http::HeaderValue| {
+                            value.to_str().unwrap().to_string()
+                        })
+                    };
+                    seen.lock().unwrap().push((
+                        format!("{method} {}", uri.path()),
+                        header(AFTER),
+                        header(REQUEST),
+                    ));
                     let (status, body) = answer(&method, uri.path());
                     let status = Answered::from_u16(status).unwrap();
                     match body {
@@ -120,7 +125,7 @@ impl Stub {
         let asked = self.asked.lock().unwrap();
         asked
             .iter()
-            .filter(|(request, _)| request.contains(part))
+            .filter(|(request, ..)| request.contains(part))
             .count()
     }
 }
@@ -312,7 +317,7 @@ async fn the_whole_api_is_reached_through_the_client() {
 }
 
 #[tokio::test]
-async fn a_request_is_sent_again_only_where_that_cannot_make_a_change_twice() {
+async fn a_request_is_sent_again_unless_it_was_refused_for_good() {
     let stub = Stub::answering(by_tenant).await;
     let client = Client::connect(&[&stub.url], KEY, quick(3)).unwrap();
     let write = |name: &'static str| {
@@ -325,25 +330,42 @@ async fn a_request_is_sent_again_only_where_that_cannot_make_a_change_twice() {
     };
     let asked = |name: &str, method: &str| {
         let asked = stub.asked.lock().unwrap();
-        let of = |(request, _): &&Request| {
+        let of = |(request, ..): &&Request| {
             request.starts_with(method) && request.contains(&format!("/tenants/{name}/"))
         };
         asked.iter().filter(of).count()
     };
+    // The names the writes to a tenant were sent under.
+    let named = |name: &str| {
+        let asked = stub.asked.lock().unwrap();
+        let names: std::collections::HashSet<String> = asked
+            .iter()
+            .filter(|(request, ..)| {
+                request.starts_with("POST") && request.contains(&format!("/tenants/{name}/"))
+            })
+            .map(|(.., named)| named.clone().expect("every write is named"))
+            .collect();
+        names
+    };
 
     for (name, sends, unknown) in [
         ("away", 3, false),
-        ("torn", 1, true),
-        ("proxied", 1, true),
+        ("torn", 3, true),
+        ("proxied", 3, true),
         ("missing", 1, false),
         ("clash", 1, false),
         ("wrong", 1, false),
         ("locked", 1, false),
         ("broken", 1, false),
-        ("garbled", 1, true),
+        ("garbled", 3, true),
     ] {
         let failed = write(name).await.unwrap_err();
         assert_eq!(asked(name, "POST"), sends, "a write to {name}: {failed}");
+        assert_eq!(
+            named(name).len(),
+            1,
+            "every try of a write to {name} has one name"
+        );
         assert_eq!(
             failed.is_unknown_outcome(),
             unknown,
@@ -385,7 +407,7 @@ async fn a_request_is_sent_again_only_where_that_cannot_make_a_change_twice() {
         );
     }
     patch("torn").await.unwrap_err();
-    assert_eq!(asked("torn", "PATCH"), 1, "a patch is not sent again");
+    assert_eq!(asked("torn", "PATCH"), 3, "and a patch, which is named");
     let posted = asked("torn", "POST");
     let stored = client
         .tenant(&tenant("torn"))
@@ -497,28 +519,25 @@ async fn faulty(answers: bool) -> (String, Arc<AtomicUsize>) {
 }
 
 #[tokio::test]
-async fn a_request_cut_off_or_left_unanswered_is_only_read_again_never_written_again() {
+async fn a_request_cut_off_or_left_unanswered_is_sent_again() {
     let served = Served::new().await;
     served.with_notes(supplied()).await;
     let (dropping, dropped) = faulty(true).await;
     let client = Client::connect(&[&dropping, &served.url], KEY, tries(2)).unwrap();
-    let cut = client
-        .tenant(&tenant("cut"))
-        .apply(increment())
+    let acme = client.tenant(&tenant("acme"));
+    acme.collection(&notes_named())
+        .put(oid(1), &content("fox", 1, None))
         .await
-        .unwrap_err();
-    assert!(cut.is_unknown_outcome(), "{cut}");
-    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        .unwrap();
     assert_eq!(
-        client
-            .tenant(&tenant("acme"))
-            .collections()
-            .await
-            .unwrap()
-            .len(),
-        1
+        dropped.load(Ordering::SeqCst),
+        1,
+        "a write cut off is sent again"
     );
-    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    let reader = Client::connect(&[&dropping, &served.url], KEY, tries(2)).unwrap();
+    let collections = reader.tenant(&tenant("acme")).collections().await.unwrap();
+    assert_eq!(collections.len(), 1);
+    assert_eq!(dropped.load(Ordering::SeqCst), 2, "and so is a read");
 
     let (silent, kept) = faulty(false).await;
     let patient = Client::connect(&[&silent], KEY, quick(2)).unwrap();
@@ -540,7 +559,7 @@ async fn a_request_cut_off_or_left_unanswered_is_only_read_again_never_written_a
         .await
         .unwrap_err();
     assert!(unwritten.is_unknown_outcome());
-    assert_eq!(kept.load(Ordering::SeqCst), 3, "a write is not");
+    assert_eq!(kept.load(Ordering::SeqCst), 4, "and a write");
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the client's own timeout was not waited"
@@ -595,8 +614,8 @@ async fn a_read_asks_to_be_as_fresh_as_the_clients_own_last_write() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(asked, _)| asked.starts_with("GET "))
-        .map(|(_, fresh)| fresh.clone())
+        .filter(|(asked, ..)| asked.starts_with("GET "))
+        .map(|(_, fresh, _)| fresh.clone())
         .collect();
     let at = |text: &str| Some(text.to_string());
     assert_eq!(
@@ -645,9 +664,10 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     let whole = notes_of(tries(1));
     assert_eq!(
         whole.store_all(objects()).await.unwrap(),
-        Some(start + 3),
-        "storing the same again changes nothing"
+        Some(start + 4),
+        "storing the same again changes nothing, but is remembered as asked"
     );
+    assert_eq!(whole.count(None).await.unwrap(), 25);
 
     served.ok(reqwest::Method::DELETE, NOTES, None).await;
     served
@@ -659,7 +679,7 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     });
     assert_eq!(
         one_each.store_all(objects()).await.unwrap(),
-        Some(start + 3 + 2 + 25)
+        Some(start + 4 + 2 + 25)
     );
 
     served.ok(reqwest::Method::DELETE, NOTES, None).await;
@@ -775,4 +795,92 @@ async fn a_node_stopped_and_replaced_under_load_fails_no_request() {
     let count = acme.collection(&notes_named()).count(None).await.unwrap();
     assert_eq!(count, written as u64);
     assert_eq!(replacement.get("/health/ready").await.0, StatusCode::OK);
+}
+
+/// A node in front of `served` that passes every request on and answers
+/// as it answered, except that it loses the answer to the first write,
+/// after `meanwhile` has run, saying instead that the write's fate is
+/// unknown.
+async fn losing_first_answer(
+    served: &str,
+    meanwhile: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+) -> String {
+    let served = served.to_string();
+    let lost = Arc::new(AtomicUsize::new(0));
+    let meanwhile = Arc::new(meanwhile);
+    let router = axum::Router::new().fallback(
+        move |method: Asked, uri: Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+            let (served, lost, meanwhile) = (served.clone(), lost.clone(), meanwhile.clone());
+            async move {
+                let passed = headers
+                    .iter()
+                    .filter(|(name, _)| *name != axum::http::header::HOST)
+                    .fold(
+                        reqwest::header::HeaderMap::new(),
+                        |mut passed, (name, value)| {
+                            passed.append(name.clone(), value.clone());
+                            passed
+                        },
+                    );
+                let method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap();
+                let writes = method != reqwest::Method::GET;
+                let answer = reqwest::Client::new()
+                    .request(method, format!("{served}{uri}"))
+                    .headers(passed)
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = Answered::from_u16(answer.status().as_u16()).unwrap();
+                let body = answer.bytes().await.unwrap();
+                if writes && lost.fetch_add(1, Ordering::SeqCst) == 0 {
+                    meanwhile().await;
+                    return (
+                        Answered::SERVICE_UNAVAILABLE,
+                        axum::Json(failure("uncertain")),
+                    )
+                        .into_response();
+                }
+                (status, body).into_response()
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    url
+}
+
+#[tokio::test]
+async fn a_write_whose_answer_was_lost_is_answered_as_it_was_and_a_later_write_survives() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    let direct = Client::connect(&[&served.url], KEY, tries(1)).unwrap();
+    let notes = direct.tenant(&tenant("acme")).collection(&notes_named());
+    notes.put(oid(1), &content("fox", 1, None)).await.unwrap();
+
+    let other = notes.clone();
+    let lossy = losing_first_answer(&served.url, move || {
+        let other = other.clone();
+        Box::pin(async move {
+            other.put(oid(1), &content("fox", 100, None)).await.unwrap();
+        })
+    })
+    .await;
+    let client = Client::connect(&[&lossy], KEY, quick(3)).unwrap();
+    let written = client
+        .tenant(&tenant("acme"))
+        .apply(increment())
+        .await
+        .unwrap();
+    assert_eq!(written.outcomes, [Outcome::Value { value: json!(2) }]);
+    let stored = notes.get(oid(1)).await.unwrap().unwrap();
+    assert_eq!(
+        stored.properties["n"],
+        json!(100),
+        "the later write survives"
+    );
 }
