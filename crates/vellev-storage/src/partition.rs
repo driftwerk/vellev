@@ -267,23 +267,35 @@ impl Partition {
                 .map(|(key, loaded)| (key.to_string(), loaded))
                 .collect()
         });
+        // Each segment is decoded and indexed on a thread of its own as it
+        // arrives, rather than all of them in turn once every one has.
+        let catalog = Arc::new(
+            Catalog::restore(manifest.next_collection_id, manifest.collections.clone())
+                .map_err(|reason| StorageError::corrupt(key, reason))?,
+        );
         let segments = try_join_all(manifest.segments.iter().map(|meta| {
             let held = held.get(&meta.key).cloned();
+            let catalog = catalog.clone();
             async move {
                 if let Some(loaded) = held {
                     return Ok::<_, StorageError>(loaded);
                 }
-                let mut file: SegmentFile =
-                    decode(&meta.key, Kind::Segment, &self.fetch(&meta.key).await?)?;
+                let bytes = self.fetch(&meta.key).await?;
                 let vectors = match &meta.vectors {
-                    Some(key) => self.column(key, None).await?,
-                    None => Column::taken_from(&mut file.rows),
+                    Some(key) => Some(self.column(key, None).await?),
+                    None => None,
                 };
                 let stored = match &meta.index {
                     Some(index) => self.stored(index, &meta.key).await,
                     None => Stored::default(),
                 };
-                Ok(Loaded::fresh(file, vectors, stored))
+                let key = meta.key.clone();
+                blocking(move || {
+                    let mut file: SegmentFile = decode(&key, Kind::Segment, &bytes)?;
+                    let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
+                    Loaded::fresh(file, vectors, stored).indexed_now(&key, &catalog)
+                })
+                .await?
             }
         }))
         .await?;

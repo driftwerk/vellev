@@ -283,6 +283,16 @@ impl Loaded {
         }
     }
 
+    /// The segment with its indexes built, under the collections of
+    /// `catalog`, so that building them need not wait for other segments.
+    pub fn indexed_now(self, key: &str, catalog: &Catalog) -> Result<Self> {
+        let indexes = self.indexed(key, catalog)?;
+        Ok(Self {
+            indexes: Some(indexes),
+            ..self
+        })
+    }
+
     /// The segment's indexes, built from its column if they were not
     /// built already, once the column is seen to fit the rows.
     fn indexed(&self, key: &str, catalog: &Catalog) -> Result<Arc<Indexes>> {
