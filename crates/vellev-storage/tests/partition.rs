@@ -931,6 +931,7 @@ fn forger() -> Author {
 fn manifest_of(segments: Vec<SegmentMeta>) -> Manifest {
     Manifest {
         position: LogPosition(1),
+        prev: None,
         next_collection_id: 1,
         collections: vec![(CollectionId(0), schema("notes"))],
         segments,
@@ -1128,6 +1129,7 @@ enum Action {
     Commit(Vec<Change>),
     Rejected(Vec<Change>),
     Flush,
+    Merge,
     Restart,
     Takeover,
     Follow,
@@ -1272,6 +1274,7 @@ fn action() -> impl Strategy<Value = Action> {
         10 => changes().prop_map(Action::Commit),
         1 => changes().prop_map(Action::Rejected),
         4 => Just(Action::Flush),
+        2 => Just(Action::Merge),
         2 => Just(Action::Restart),
         2 => Just(Action::Takeover),
         3 => Just(Action::Follow),
@@ -1370,6 +1373,9 @@ async fn run(actions: Vec<Action>) {
             }
             Action::Flush => {
                 writer.flush().await.unwrap();
+            }
+            Action::Merge => {
+                writer.merge().await.unwrap();
             }
             Action::Restart => writer = cluster.writer().await,
             Action::Takeover => {

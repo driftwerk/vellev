@@ -45,6 +45,16 @@ impl Blobs for SlowBlobs {
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         self.inner.get(key).await
     }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
 }
 
 #[derive(Debug)]

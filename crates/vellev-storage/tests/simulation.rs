@@ -119,6 +119,16 @@ impl Blobs for SimBlobs {
         }
         self.clean.get(key).await
     }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        self.clean.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.clean.delete(key).await
+    }
 }
 
 /// A coordinator that fails on command, counts the commits it recorded, and
