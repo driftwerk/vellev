@@ -303,6 +303,7 @@ async fn forwarded(
 #[derive(utoipa::OpenApi)]
 #[openapi(
     info(title = "Vellev", description = "The vellev vector database's HTTP API."),
+    components(schemas(vellev_api::Consistency)),
     modifiers(&Keyed),
     security(("key" = []))
 )]

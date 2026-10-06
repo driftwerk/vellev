@@ -292,7 +292,10 @@ pub async fn changes(
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections",
-    params(("tenant" = TenantId, Path,)),
+    params(("x-vellev-after" = Option<String>, Header,
+            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
+        ("x-vellev-consistency" = Option<Consistency>, Header,
+            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,)),
     responses((status = OK, body = Collections), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -317,7 +320,10 @@ fn schema(state: &State, collection: &CollectionName) -> Result<Collection, ApiE
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections/{collection}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(("x-vellev-after" = Option<String>, Header,
+            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
+        ("x-vellev-consistency" = Option<Consistency>, Header,
+            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     responses((status = OK, body = Collection), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -399,7 +405,10 @@ pub async fn add_property(
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
+    params(("x-vellev-after" = Option<String>, Header,
+            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
+        ("x-vellev-consistency" = Option<Consistency>, Header,
+            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     responses((status = OK, body = Stored), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -528,7 +537,10 @@ fn fused(fused: Fused<'_>, vectors: bool) -> Found {
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/nearest",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(("x-vellev-after" = Option<String>, Header,
+            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
+        ("x-vellev-consistency" = Option<Consistency>, Header,
+            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Nearest,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -579,7 +591,10 @@ pub async fn nearest(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/keyword",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(("x-vellev-after" = Option<String>, Header,
+            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
+        ("x-vellev-consistency" = Option<Consistency>, Header,
+            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Keyword,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -618,7 +633,10 @@ pub async fn keyword(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/hybrid",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(("x-vellev-after" = Option<String>, Header,
+            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
+        ("x-vellev-consistency" = Option<Consistency>, Header,
+            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Hybrid,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -674,7 +692,10 @@ pub async fn hybrid(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/list",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(("x-vellev-after" = Option<String>, Header,
+            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
+        ("x-vellev-consistency" = Option<Consistency>, Header,
+            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Page,
     responses((status = OK, body = Objects), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -705,7 +726,10 @@ pub async fn list(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/count",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(("x-vellev-after" = Option<String>, Header,
+            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
+        ("x-vellev-consistency" = Option<Consistency>, Header,
+            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Counting,
     responses((status = OK, body = Counted), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)

@@ -646,6 +646,28 @@ async fn the_description_covers_every_route_that_needs_a_key() {
             "{method} {path}"
         );
     }
+    let mut refs = Vec::new();
+    collect_refs(&described, &mut refs);
+    for reference in refs {
+        let name = reference.trim_start_matches("#/components/schemas/");
+        assert!(
+            described["components"]["schemas"][name].is_object(),
+            "{reference} is described"
+        );
+    }
+    let searching = &described["paths"]["/v1/tenants/{tenant}/collections/{collection}/count"]
+        ["post"]["parameters"];
+    let headers: Vec<&Value> = searching
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|parameter| parameter["in"] == "header")
+        .map(|parameter| &parameter["name"])
+        .collect();
+    assert_eq!(
+        headers,
+        [&json!("x-vellev-after"), &json!("x-vellev-consistency")]
+    );
     let listing = &described["paths"]["/v1/tenants"]["get"];
     let located: Vec<(&Value, &Value)> = listing["parameters"]
         .as_array()
@@ -1049,4 +1071,94 @@ async fn creating_a_tenant_through_another_node_does_not_take_it() {
         third.ok(Method::PUT, &object(1), Some(fox)).await["position"],
         2
     );
+}
+
+#[tokio::test]
+async fn a_read_on_another_node_sees_the_callers_own_writes_and_deletions() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.serve().await, cluster.serve().await);
+    writing.with_notes(supplied()).await;
+    let read = |method: Method, path: String, body: Option<Value>, after: String| {
+        let reading = &reading;
+        async move {
+            reading
+                .call_headed(
+                    Some(KEY),
+                    method,
+                    &path,
+                    body,
+                    &[("x-vellev-after", &after)],
+                )
+                .await
+        }
+    };
+    let opened = reading.get(NOTES).await;
+    assert_eq!(opened.0, StatusCode::OK);
+
+    for n in 1..=20u64 {
+        let fox = json!({ "properties": { "title": "fox", "n": n }, "vector": [1.0, 0.0] });
+        let written = writing.ok(Method::PUT, &object(n), Some(fox)).await;
+        let after = format!("{}.{}", written["incarnation"], written["position"]);
+        let (status, found) = read(Method::GET, object(n), None, after.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "object {n} as soon as it is written"
+        );
+        assert_eq!(found["properties"]["n"], n);
+
+        let deleted = writing.ok(Method::DELETE, &object(n), None).await;
+        let after = format!("{}.{}", deleted["incarnation"], deleted["position"]);
+        let (_, listed) = read(
+            Method::POST,
+            format!("{NOTES}/list"),
+            Some(json!({ "limit": 50 })),
+            after.clone(),
+        )
+        .await;
+        assert_eq!(
+            listed["objects"],
+            json!([]),
+            "gone as soon as it is deleted"
+        );
+        let (status, _) = read(Method::GET, object(n), None, after).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    for (name, value) in [
+        ("x-vellev-after", "12"),
+        ("x-vellev-after", "a.b"),
+        ("x-vellev-consistency", "linear"),
+    ] {
+        let (status, body) = reading
+            .call_headed(Some(KEY), Method::GET, NOTES, None, &[(name, value)])
+            .await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "invalid"),
+            "{name}: {value}"
+        );
+    }
+    let (status, _) = reading
+        .call_headed(
+            Some(KEY),
+            Method::GET,
+            NOTES,
+            None,
+            &[("x-vellev-consistency", "strong")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Every `$ref` anywhere in `value`.
+fn collect_refs<'a>(value: &'a Value, refs: &mut Vec<&'a str>) {
+    match value {
+        Value::Object(fields) => fields.iter().for_each(|(name, field)| match field {
+            Value::String(reference) if name == "$ref" => refs.push(reference),
+            other => collect_refs(other, refs),
+        }),
+        Value::Array(items) => items.iter().for_each(|item| collect_refs(item, refs)),
+        _ => {}
+    }
 }

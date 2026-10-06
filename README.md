@@ -57,10 +57,17 @@ deleted, keeping everything that any commit of the last `VELLEV_GRACE_SECS`
 put back as it was at any moment and a slow reader still finds its files.
 
 Several nodes may run against the same Postgres and store. Each tenant is
-written by one node at a time; a request that reaches another node is sent
+written by one node at a time; a write that reaches another node is sent
 on to the holder, so set `VELLEV_ADVERTISE_URL` to each node's own address
 (never a load balancer's) wherever the default of this host's name and port
 would not reach it.
+
+Reads are answered by whichever node they reach, from a copy of the tenant
+it follows. A write answers with `incarnation` and `position`; send them
+back on a read as `x-vellev-after: incarnation.position` and the read waits
+until the node has caught up that far (the Rust client does this for you).
+`x-vellev-consistency: strong` waits for everything committed, and
+`eventual` answers with whatever the node has, at most about a second old.
 
 The API is described at `/openapi.json`, and by `vellev openapi` without a
 running node. Every route under `/v1` needs one of the configured keys. A
