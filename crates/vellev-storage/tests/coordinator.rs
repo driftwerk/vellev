@@ -7,7 +7,8 @@ use futures::future::join_all;
 use vellev_core::{NodeId, Partition, TenantId};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
-    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, PostgresCoordinator, MAX_TTL,
+    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, PostgresCoordinator, Versions,
+    MAX_TTL,
 };
 
 const TTL: Duration = Duration::from_secs(30);
@@ -446,6 +447,22 @@ async fn the_incarnation_stays_through_leases_and_grows_when_registered_again(h:
     assert!(incarnation().await > first);
 }
 
+async fn the_oldest_versions_are_the_least_of_the_nodes_seen_lately(h: &dyn Harness) {
+    let c = h.coordinator();
+    let at = |format, protocol| Versions { format, protocol };
+    c.announce(&node("a"), at(7, 9)).await.unwrap();
+    c.announce(&node("b"), at(6, 11)).await.unwrap();
+    assert_eq!(
+        c.oldest(Duration::from_secs(5)).await.unwrap(),
+        Some(at(6, 9))
+    );
+    assert_eq!(
+        c.oldest(Duration::ZERO).await.unwrap(),
+        None,
+        "a node not seen within the time does not count"
+    );
+}
+
 async fn removing_a_partition_makes_it_unknown(h: &dyn Harness) {
     let c = h.coordinator();
     let key = registered(h).await;
@@ -579,6 +596,7 @@ conformance! {
     a_commit_that_does_not_advance_is_refused,
     a_generation_is_never_reused_after_remove_and_register,
     the_incarnation_stays_through_leases_and_grows_when_registered_again,
+    the_oldest_versions_are_the_least_of_the_nodes_seen_lately,
     removing_a_partition_makes_it_unknown,
     concurrent_acquires_hand_out_exactly_one_lease,
     partitions_are_listed_in_key_order_a_page_at_a_time,

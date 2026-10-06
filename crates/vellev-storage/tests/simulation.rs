@@ -211,6 +211,19 @@ impl Coordinator for SimCoordinator {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.clean.ping().await
     }
+    async fn announce(
+        &self,
+        node: &NodeId,
+        versions: vellev_storage::coordinator::Versions,
+    ) -> Result<(), CoordinatorError> {
+        self.clean.announce(node, versions).await
+    }
+    async fn oldest(
+        &self,
+        within: Duration,
+    ) -> Result<Option<vellev_storage::coordinator::Versions>, CoordinatorError> {
+        self.clean.oldest(within).await
+    }
 }
 
 /// Which writer acts: the one the cluster would use, or any writer there

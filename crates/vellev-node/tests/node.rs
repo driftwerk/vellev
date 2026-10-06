@@ -20,7 +20,7 @@ use vellev_node::{Freshness, Node, NodeError, Reader, Settings};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, LogPosition, ManualClock,
-    MemoryCoordinator, PartitionKey,
+    MemoryCoordinator, PartitionKey, Versions,
 };
 use vellev_storage::{Mutation, State, StorageError};
 
@@ -826,6 +826,19 @@ impl Coordinator for Unrenewing {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.inner.ping().await
     }
+    async fn announce(
+        &self,
+        node: &NodeId,
+        versions: vellev_storage::coordinator::Versions,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.announce(node, versions).await
+    }
+    async fn oldest(
+        &self,
+        within: Duration,
+    ) -> Result<Option<vellev_storage::coordinator::Versions>, CoordinatorError> {
+        self.inner.oldest(within).await
+    }
 }
 
 #[tokio::test]
@@ -1226,4 +1239,36 @@ async fn a_strong_read_on_a_holder_of_a_tenant_since_recreated_reads_the_new_one
         .unwrap();
     assert!(matches!(strong, Reader::Follower(_)));
     assert!(strong.read(|state| state.collection(&notes()).is_none()));
+}
+
+#[tokio::test]
+async fn the_cluster_reads_what_its_oldest_node_lately_seen_reads() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let ours = node.versions();
+    assert_eq!(node.cluster().await.unwrap(), ours, "nobody else about");
+    node.announcing();
+    let older = Versions {
+        format: ours.format - 1,
+        protocol: ours.protocol,
+    };
+    cluster
+        .coordinator
+        .announce(&NodeId::generate("older"), older)
+        .await
+        .unwrap();
+    assert_eq!(node.cluster().await.unwrap(), older);
+    cluster.clock.advance(LEASE * 2);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        node.cluster().await.unwrap(),
+        ours,
+        "a node not seen for a lease is gone"
+    );
+
+    let pinned = cluster.node_from(Settings {
+        max_format: ours.format - 1,
+        ..cluster.settings()
+    });
+    assert_eq!(pinned.cluster().await.unwrap().format, ours.format - 1);
 }

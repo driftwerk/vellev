@@ -9,13 +9,14 @@ use vellev_core::{NodeId, Partition, TenantId};
 
 use super::{
     checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result,
+    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result, Versions,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../migrations/0001_partitions.sql")),
     (2, include_str!("../../migrations/0002_tenant_order.sql")),
     (3, include_str!("../../migrations/0003_incarnation.sql")),
+    (4, include_str!("../../migrations/0004_nodes.sql")),
 ];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
@@ -393,6 +394,43 @@ impl Coordinator for PostgresCoordinator {
     async fn ping(&self) -> Result<()> {
         sqlx::query("SELECT 1").fetch_one(&self.pool).await?;
         Ok(())
+    }
+
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO vellev.nodes (node, format, protocol, seen_at)
+             VALUES ($1, $2, $3, now())
+             ON CONFLICT (node) DO UPDATE
+             SET format = EXCLUDED.format, protocol = EXCLUDED.protocol, seen_at = now()",
+        )
+        .bind(node.as_str())
+        .bind(i32::from(versions.format))
+        .bind(i32::from(versions.protocol))
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM vellev.nodes WHERE seen_at < now() - interval '1 day'")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn oldest(&self, within: Duration) -> Result<Option<Versions>> {
+        let row: (Option<i32>, Option<i32>) = sqlx::query_as(
+            "SELECT min(format), min(protocol) FROM vellev.nodes
+             WHERE seen_at > now() - make_interval(secs => $1)",
+        )
+        .bind(within.as_secs_f64())
+        .fetch_one(&self.pool)
+        .await?;
+        let version =
+            |value: i32| u16::try_from(value).map_err(|error| invariant(error.to_string()));
+        match row {
+            (Some(format), Some(protocol)) => Ok(Some(Versions {
+                format: version(format)?,
+                protocol: version(protocol)?,
+            })),
+            _ => Ok(None),
+        }
     }
 }
 

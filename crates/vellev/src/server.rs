@@ -51,7 +51,8 @@ pub struct App {
     http: reqwest::Client,
 }
 
-/// Marks a request one node sent on to another, which goes no further.
+/// Marks a request one node sent on to another, which goes no further, and
+/// carries the protocol the sender speaks.
 const FORWARDED: &str = "x-vellev-forwarded";
 /// How long a node waits for the node it sent a request on to, and for a
 /// connection to it. Shorter than a client's usual patience, so that the
@@ -75,6 +76,7 @@ impl App {
 
     /// Serve from `node` from now on. Only the first node given is kept.
     pub fn start(&self, node: Arc<Node>) {
+        node.announcing();
         let _ = self.node.set(node);
     }
 
@@ -291,7 +293,7 @@ async fn forwarded(
         .http
         .request(parts.method, url)
         .headers(passed_on)
-        .header(FORWARDED, "1")
+        .header(FORWARDED, vellev_node::PROTOCOL.to_string())
         .body(body)
         .send()
         .await

@@ -13,8 +13,9 @@ use vellev_core::{CollectionName, Embedding, NodeId, Partition, TenantId};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
-    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey,
+    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, Versions,
 };
+use vellev_storage::format::FORMAT_VERSION;
 use vellev_storage::{
     Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
 };
@@ -22,6 +23,12 @@ use vellev_storage::{
 mod reading;
 
 pub use reading::{Freshness, Reader};
+
+/// The node-to-node protocol this release speaks: what a request one node
+/// sends on to another may hold. A release that lets requests hold
+/// something new raises it, and a node only sends that on once every node
+/// announces the new one.
+pub const PROTOCOL: u16 = 1;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -47,6 +54,10 @@ pub struct Settings {
     /// The most copies of tenants kept for reads at once; the least
     /// recently used go first.
     pub followers: usize,
+    /// The newest file format this node may write, whatever every node
+    /// reads. A release that adds a format keeps this at the one before,
+    /// so that rolling back stays possible until an operator raises it.
+    pub max_format: u16,
 }
 
 impl Settings {
@@ -61,6 +72,7 @@ impl Settings {
             follow_every: Duration::from_secs(1),
             follow_idle: Duration::from_secs(5 * 60),
             followers: 64,
+            max_format: FORMAT_VERSION,
         }
     }
 }
@@ -308,6 +320,49 @@ impl Node {
     /// Whether the node can reach what it needs to serve.
     pub async fn ready(&self) -> Result<()> {
         Ok(self.0.coordinator.ping().await?)
+    }
+
+    /// What this node reads.
+    pub fn versions(&self) -> Versions {
+        Versions {
+            format: FORMAT_VERSION,
+            protocol: PROTOCOL,
+        }
+    }
+
+    /// Tell the cluster what this node reads, now and every third of a
+    /// lease while the node is running, so that nothing newer is written
+    /// while it is about.
+    pub fn announcing(&self) {
+        let (inner, every) = (Arc::downgrade(&self.0), self.0.settings.lease / 3);
+        let versions = self.versions();
+        tokio::spawn(async move {
+            loop {
+                let Some(inner) = inner.upgrade() else { return };
+                if inner.opened().stopped {
+                    return;
+                }
+                let node = &inner.settings.node;
+                if let Err(error) = inner.coordinator.announce(node, versions).await {
+                    tracing::warn!(%error, "announcing the node failed");
+                }
+                drop(inner);
+                tokio::time::sleep(every).await;
+            }
+        });
+    }
+
+    /// What the cluster reads: for each version the oldest any node
+    /// announced within a lease, and never more than this node reads;
+    /// the file format no newer than [`Settings::max_format`] either.
+    pub async fn cluster(&self) -> Result<Versions> {
+        let ours = self.versions();
+        let oldest = self.0.coordinator.oldest(self.0.settings.lease).await?;
+        let least = oldest.map_or(ours, |oldest| oldest.least(ours));
+        Ok(Versions {
+            format: least.format.min(self.0.settings.max_format),
+            ..least
+        })
     }
 
     /// Creating a tenant that exists changes nothing.

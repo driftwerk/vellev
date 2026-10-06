@@ -102,6 +102,19 @@ impl Coordinator for SlowCoordinator {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.inner.ping().await
     }
+    async fn announce(
+        &self,
+        node: &NodeId,
+        versions: vellev_storage::coordinator::Versions,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.announce(node, versions).await
+    }
+    async fn oldest(
+        &self,
+        within: Duration,
+    ) -> Result<Option<vellev_storage::coordinator::Versions>, CoordinatorError> {
+        self.inner.oldest(within).await
+    }
 }
 
 fn collection(dimensions: u32) -> Collection {

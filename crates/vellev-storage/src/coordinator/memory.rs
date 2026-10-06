@@ -10,7 +10,7 @@ use vellev_core::NodeId;
 
 use super::{
     checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result,
+    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result, Versions,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -74,6 +74,7 @@ pub struct MemoryCoordinator {
     clock: Arc<dyn Clock>,
     generations: AtomicU64,
     rows: Mutex<HashMap<PartitionKey, Row>>,
+    nodes: Mutex<HashMap<NodeId, (Versions, DateTime<Utc>)>>,
 }
 
 impl Default for MemoryCoordinator {
@@ -88,6 +89,7 @@ impl MemoryCoordinator {
             clock,
             generations: AtomicU64::new(0),
             rows: Mutex::new(HashMap::new()),
+            nodes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -267,5 +269,28 @@ impl Coordinator for MemoryCoordinator {
 
     async fn ping(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()> {
+        let now = self.clock.now();
+        self.nodes
+            .lock()
+            .expect("coordinator lock")
+            .insert(node.clone(), (versions, now));
+        Ok(())
+    }
+
+    async fn oldest(&self, within: Duration) -> Result<Option<Versions>> {
+        let now = self.clock.now();
+        let within = chrono::Duration::from_std(within)
+            .map_err(|error| CoordinatorError::InvalidArgument(error.to_string()))?;
+        Ok(self
+            .nodes
+            .lock()
+            .expect("coordinator lock")
+            .values()
+            .filter(|(_, seen)| *seen > now - within)
+            .map(|(versions, _)| *versions)
+            .reduce(Versions::least))
     }
 }

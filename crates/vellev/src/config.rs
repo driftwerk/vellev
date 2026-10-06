@@ -16,6 +16,7 @@ use vellev_node::{Node, Settings};
 use crate::server::Limits;
 use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::PostgresCoordinator;
+use vellev_storage::format::FORMAT_VERSION;
 
 #[derive(Clone, clap::Args)]
 pub struct Config {
@@ -85,6 +86,12 @@ pub struct Config {
     /// seconds.
     #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 24 * 60 * 60)]
     pub grace_secs: u64,
+    /// The newest file format nodes may write, so that the release before
+    /// can still read everything if this one is rolled back. Raise it once
+    /// every node runs the release that reads it and rollback is no longer
+    /// wanted; see docs/compatibility.md.
+    #[arg(long, env = "VELLEV_MAX_FORMAT", default_value_t = FORMAT_VERSION)]
+    pub max_format: u16,
     /// How long requests in flight are given to finish once the node is
     /// told to stop, in seconds. Keep it under the platform's own grace
     /// period, so that the node lets go of its tenants before it is killed.
@@ -206,6 +213,7 @@ impl Config {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
             grace: Duration::from_secs(self.grace_secs),
+            max_format: self.max_format,
             ..Settings::new(NodeId::reachable_at(address.trim_end_matches('/'), &host))
         };
         Ok(Node::new(

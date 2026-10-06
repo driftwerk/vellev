@@ -208,4 +208,29 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
 
     /// Whether the coordinator can be reached.
     async fn ping(&self) -> Result<()>;
+
+    /// Record that `node` is running now and reads up to `versions`.
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()>;
+
+    /// The oldest file format and protocol among the nodes announced
+    /// within `within`, each the least of any node's; `None` if no node
+    /// has been.
+    async fn oldest(&self, within: Duration) -> Result<Option<Versions>>;
+}
+
+/// The newest file format and node-to-node protocol a node can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Versions {
+    pub format: u16,
+    pub protocol: u16,
+}
+
+impl Versions {
+    /// Each version the lesser of the two.
+    pub fn least(self, other: Versions) -> Versions {
+        Versions {
+            format: self.format.min(other.format),
+            protocol: self.protocol.min(other.protocol),
+        }
+    }
 }
