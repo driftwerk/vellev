@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Request, State as Shared};
 use axum::http::header::{self, HeaderMap, HeaderName, AUTHORIZATION};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -208,6 +208,17 @@ fn tenant_of(path: &str) -> Option<TenantId> {
         .flatten()
 }
 
+/// Whether a request only reads, and so is answered by whichever node it
+/// reaches: every GET, and the searches, listings and counts, which POST
+/// their query.
+fn reads(method: &Method, path: &str) -> bool {
+    *method == Method::GET
+        || (*method == Method::POST
+            && path.rsplit('/').next().is_some_and(|last| {
+                matches!(last, "nearest" | "keyword" | "hybrid" | "list" | "count")
+            }))
+}
+
 /// Whether a header is about one connection rather than the request, and
 /// so is not passed on.
 fn hop_by_hop(name: &HeaderName) -> bool {
@@ -233,6 +244,9 @@ async fn forwarded(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    if reads(request.method(), request.uri().path()) {
+        return Ok(next.run(request).await);
+    }
     let tenant = tenant_of(request.uri().path());
     let sent_on = request.headers().contains_key(FORWARDED);
     let (Some(tenant), false, Ok(node)) = (tenant, sent_on, app.node()) else {

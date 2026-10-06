@@ -108,13 +108,13 @@ async fn collections_are_created_read_extended_and_dropped() {
     let created = served.ok(Method::PUT, NOTES, Some(notes(supplied()))).await;
     assert_eq!(
         created,
-        json!({ "position": 1, "outcomes": [{ "outcome": "applied" }] })
+        json!({ "incarnation": 1, "position": 1, "outcomes": [{ "outcome": "applied" }] })
     );
 
     let again = served.ok(Method::PUT, NOTES, Some(notes(supplied()))).await;
     assert_eq!(
         again,
-        json!({ "position": 1, "outcomes": [{ "outcome": "unchanged" }] })
+        json!({ "incarnation": 1, "position": 1, "outcomes": [{ "outcome": "unchanged" }] })
     );
     let mut resized = notes(supplied());
     resized["embedding"]["dimensions"] = json!(3);
@@ -192,7 +192,7 @@ async fn an_object_is_stored_read_patched_and_deleted() {
     let stored = served.ok(Method::PUT, &object(1), Some(fox)).await;
     assert_eq!(
         stored,
-        json!({ "position": 2, "outcomes": [{ "outcome": "applied" }] })
+        json!({ "incarnation": 1, "position": 2, "outcomes": [{ "outcome": "applied" }] })
     );
     assert_eq!(
         served.get(&object(1)).await.1,
@@ -345,7 +345,10 @@ async fn changes_sent_together_are_applied_together_or_not_at_all() {
             Some(json!({ "changes": [] })),
         )
         .await;
-    assert_eq!(nothing, json!({ "position": 1, "outcomes": [] }));
+    assert_eq!(
+        nothing,
+        json!({ "incarnation": 1, "position": 1, "outcomes": [] })
+    );
 }
 
 async fn four_notes(served: &Served) {
@@ -569,24 +572,25 @@ async fn a_collection_is_listed_a_page_at_a_time_and_counted() {
 }
 
 #[tokio::test]
-async fn a_tenant_written_by_a_node_that_cannot_be_reached_is_unavailable_here() {
+async fn a_tenant_written_by_a_node_that_cannot_be_reached_is_read_here_but_not_written() {
     let cluster = Cluster::new();
     let (first, second) = (cluster.serve_advertising("").await, cluster.serve().await);
     first.with_notes(supplied()).await;
     for path in ["/v1/tenants/acme/collections", NOTES] {
-        let (status, body) = second.get(path).await;
-        assert_eq!(
-            (status, code(&body)),
-            (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-            "{path}"
-        );
+        assert_eq!(second.get(path).await.0, StatusCode::OK, "{path}");
     }
+    let fox = json!({ "properties": { "title": "a red fox", "n": 1 }, "vector": [1.0, 0.0] });
+    let (status, body) = second.put(&object(1), fox.clone()).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    );
     assert_eq!(
         second.get("/v1/tenants?limit=5").await.1,
         json!({ "tenants": ["acme"] })
     );
     first.node.shutdown().await;
-    assert_eq!(second.get(NOTES).await.0, StatusCode::OK);
+    assert_eq!(second.put(&object(1), fox).await.0, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -950,7 +954,7 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
 
     let once_only = second
         .http
-        .get(format!("{}{}", second.url, object(1)))
+        .delete(format!("{}{}", second.url, object(1)))
         .bearer_auth(KEY)
         .header("x-vellev-forwarded", "1")
         .send()
@@ -971,7 +975,12 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
             Some(notes(supplied())),
         )
         .await;
-    let (status, body) = second.get("/v1/tenants/other/collections").await;
+    let (status, body) = second
+        .put(
+            "/v1/tenants/other/collections/notes/objects/00000000-0000-0000-0000-000000000001",
+            json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] }),
+        )
+        .await;
     assert_eq!(
         (status, code(&body)),
         (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
@@ -999,7 +1008,12 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
         )
         .await;
     let started = std::time::Instant::now();
-    let (status, _) = second.get("/v1/tenants/dark/collections").await;
+    let (status, _) = second
+        .put(
+            "/v1/tenants/dark/collections/notes/objects/00000000-0000-0000-0000-000000000001",
+            json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] }),
+        )
+        .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(8),

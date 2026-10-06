@@ -19,6 +19,10 @@ use vellev_storage::{
     Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
 };
 
+mod reading;
+
+pub use reading::{Freshness, Reader};
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub node: NodeId,
@@ -36,6 +40,13 @@ pub struct Settings {
     /// deleted. Files are looked for about this often while a tenant is
     /// open, at most once a minute.
     pub grace: Duration,
+    /// How often a copy of a tenant kept for reads looks for new commits.
+    pub follow_every: Duration,
+    /// How long a copy of a tenant kept for reads is kept unused.
+    pub follow_idle: Duration,
+    /// The most copies of tenants kept for reads at once; the least
+    /// recently used go first.
+    pub followers: usize,
 }
 
 impl Settings {
@@ -47,6 +58,9 @@ impl Settings {
             queue: 1_024,
             flush_rows: 50_000,
             grace: Duration::from_secs(24 * 60 * 60),
+            follow_every: Duration::from_secs(1),
+            follow_idle: Duration::from_secs(5 * 60),
+            followers: 64,
         }
     }
 }
@@ -61,6 +75,8 @@ pub enum NodeError {
     Stopped,
     #[error("the hold on tenant {0} ran out while it was being opened")]
     Lost(TenantId),
+    #[error("this node has not caught up with tenant {0} as far as asked")]
+    Behind(TenantId),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -246,10 +262,7 @@ impl Tenant {
                 .map(|schema| schema.embedding.clone())
                 .ok_or_else(|| StorageError::UnknownCollection(collection.clone()))
         })?;
-        match self.embedders.embedder(&embedding)? {
-            Some(embedder) => Ok(embedder.query(text).await?),
-            None => Ok(None),
-        }
+        reading::query_vector(&self.embedders, &embedding, text).await
     }
 }
 
@@ -258,6 +271,7 @@ type Opening = Arc<OnceCell<Arc<Tenant>>>;
 #[derive(Debug, Default)]
 struct Open {
     tenants: HashMap<TenantId, Opening>,
+    followers: reading::Followers,
     stopped: bool,
 }
 
@@ -305,6 +319,7 @@ impl Node {
     /// lease.
     pub async fn drop_tenant(&self, tenant: &TenantId) -> Result<bool> {
         let existed = self.0.coordinator.remove(&key(tenant)).await?;
+        self.0.opened().followers.remove(tenant);
         let opening = self.0.opened().tenants.remove(tenant);
         if let Some(opened) = opening.as_ref().and_then(|opening| opening.get()) {
             opened.broken.store(true, Ordering::SeqCst);
@@ -373,6 +388,7 @@ impl Node {
         let openings: Vec<Opening> = {
             let mut open = self.0.opened();
             open.stopped = true;
+            open.followers.clear();
             open.tenants.drain().map(|(_, opening)| opening).collect()
         };
         for opening in openings {
@@ -459,6 +475,7 @@ impl Inner {
             deadline,
         });
         self.maintaining(&opened, wanted);
+        self.opened().followers.remove(tenant);
         Ok(opened)
     }
 
