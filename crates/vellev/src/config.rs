@@ -16,7 +16,7 @@ use vellev_node::{Node, Settings};
 use crate::server::Limits;
 use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::PostgresCoordinator;
-use vellev_storage::format::FORMAT_VERSION;
+use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 
 #[derive(Clone, clap::Args)]
 pub struct Config {
@@ -90,7 +90,12 @@ pub struct Config {
     /// can still read everything if this one is rolled back. Raise it once
     /// every node runs the release that reads it and rollback is no longer
     /// wanted; see docs/compatibility.md.
-    #[arg(long, env = "VELLEV_MAX_FORMAT", default_value_t = FORMAT_VERSION)]
+    #[arg(
+        long,
+        env = "VELLEV_MAX_FORMAT",
+        default_value_t = DEFAULT_MAX_FORMAT,
+        value_parser = clap::value_parser!(u16).range(1..=i64::from(FORMAT_VERSION))
+    )]
     pub max_format: u16,
     /// How long requests in flight are given to finish once the node is
     /// told to stop, in seconds. Keep it under the platform's own grace

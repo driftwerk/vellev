@@ -15,7 +15,7 @@ use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
     Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, Versions,
 };
-use vellev_storage::format::FORMAT_VERSION;
+use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
     Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
 };
@@ -72,7 +72,7 @@ impl Settings {
             follow_every: Duration::from_secs(1),
             follow_idle: Duration::from_secs(5 * 60),
             followers: 64,
-            max_format: FORMAT_VERSION,
+            max_format: DEFAULT_MAX_FORMAT,
         }
     }
 }
@@ -91,6 +91,8 @@ pub enum NodeError {
     Behind(TenantId),
     #[error("the point asked for is past anything committed to tenant {0}")]
     Ahead(TenantId),
+    #[error("the cluster writes file format {cluster}, and this release reads only up to {reads}")]
+    Outdated { cluster: u16, reads: u16 },
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -317,9 +319,17 @@ impl Node {
         }))
     }
 
-    /// Whether the node can reach what it needs to serve.
+    /// Whether the node can reach what it needs to serve and can read what
+    /// the cluster writes.
     pub async fn ready(&self) -> Result<()> {
-        Ok(self.0.coordinator.ping().await?)
+        let cluster = self.0.coordinator.format().await?;
+        match cluster <= FORMAT_VERSION {
+            true => Ok(()),
+            false => Err(NodeError::Outdated {
+                cluster,
+                reads: FORMAT_VERSION,
+            }),
+        }
     }
 
     /// What this node reads.
@@ -330,12 +340,14 @@ impl Node {
         }
     }
 
-    /// Tell the cluster what this node reads, now and every third of a
-    /// lease while the node is running, so that nothing newer is written
-    /// while it is about.
+    /// Register this node as running and reading what it reads, now and
+    /// every third of a lease until it stops, and each time raise the file
+    /// format the cluster writes as far as this node may write, which only
+    /// happens once every node registered reads it.
     pub fn announcing(&self) {
-        let (inner, every) = (Arc::downgrade(&self.0), self.0.settings.lease / 3);
-        let versions = self.versions();
+        let every = (self.0.settings.lease / 3).max(Duration::from_secs(1));
+        let (inner, versions) = (Arc::downgrade(&self.0), self.versions());
+        let writes = versions.format.min(self.0.settings.max_format);
         tokio::spawn(async move {
             loop {
                 let Some(inner) = inner.upgrade() else { return };
@@ -343,7 +355,11 @@ impl Node {
                     return;
                 }
                 let node = &inner.settings.node;
-                if let Err(error) = inner.coordinator.announce(node, versions).await {
+                let announced = async {
+                    inner.coordinator.announce(node, versions).await?;
+                    inner.coordinator.raise_format(writes).await
+                };
+                if let Err(error) = announced.await {
                     tracing::warn!(%error, "announcing the node failed");
                 }
                 drop(inner);
@@ -352,17 +368,17 @@ impl Node {
         });
     }
 
-    /// What the cluster reads: for each version the oldest any node
-    /// announced within a lease, and never more than this node reads;
-    /// the file format no newer than [`Settings::max_format`] either.
+    /// What the cluster reads and writes: the file format it writes, and
+    /// the oldest protocol any node registered speaks.
     pub async fn cluster(&self) -> Result<Versions> {
-        let ours = self.versions();
-        let oldest = self.0.coordinator.oldest(self.0.settings.lease).await?;
-        let least = oldest.map_or(ours, |oldest| oldest.least(ours));
-        Ok(Versions {
-            format: least.format.min(self.0.settings.max_format),
-            ..least
-        })
+        let format = self.0.coordinator.format().await?;
+        let protocol = self
+            .0
+            .coordinator
+            .oldest()
+            .await?
+            .map_or(PROTOCOL, |oldest| oldest.protocol.min(PROTOCOL));
+        Ok(Versions { format, protocol })
     }
 
     /// Creating a tenant that exists changes nothing.
@@ -457,6 +473,9 @@ impl Node {
                 tenant.broken.store(true, Ordering::SeqCst);
                 self.0.release(tenant.writer.lease()).await;
             }
+        }
+        if let Err(error) = self.0.coordinator.depart(&self.0.settings.node).await {
+            tracing::warn!(%error, "the node could not take itself off the register");
         }
     }
 }

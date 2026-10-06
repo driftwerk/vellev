@@ -158,6 +158,10 @@ fn pending<'a>(
     }
 }
 
+fn version(value: i32) -> Result<u16> {
+    u16::try_from(value).map_err(|error| invariant(error.to_string()))
+}
+
 #[derive(FromRow)]
 struct Snapshot {
     #[sqlx(try_from = "i64")]
@@ -437,16 +441,19 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
-    async fn oldest(&self, within: Duration) -> Result<Option<Versions>> {
-        let row: (Option<i32>, Option<i32>) = sqlx::query_as(
-            "SELECT min(format), min(protocol) FROM vellev.nodes
-             WHERE seen_at > now() - make_interval(secs => $1)",
-        )
-        .bind(within.as_secs_f64())
-        .fetch_one(&self.pool)
-        .await?;
-        let version =
-            |value: i32| u16::try_from(value).map_err(|error| invariant(error.to_string()));
+    async fn depart(&self, node: &NodeId) -> Result<()> {
+        sqlx::query("DELETE FROM vellev.nodes WHERE node = $1")
+            .bind(node.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn oldest(&self) -> Result<Option<Versions>> {
+        let row: (Option<i32>, Option<i32>) =
+            sqlx::query_as("SELECT min(format), min(protocol) FROM vellev.nodes")
+                .fetch_one(&self.pool)
+                .await?;
         match row {
             (Some(format), Some(protocol)) => Ok(Some(Versions {
                 format: version(format)?,
@@ -454,6 +461,25 @@ impl Coordinator for PostgresCoordinator {
             })),
             _ => Ok(None),
         }
+    }
+
+    async fn format(&self) -> Result<u16> {
+        let format: i32 = sqlx::query_scalar("SELECT format FROM vellev.cluster")
+            .fetch_one(&self.pool)
+            .await?;
+        version(format)
+    }
+
+    async fn raise_format(&self, format: u16) -> Result<u16> {
+        sqlx::query(
+            "UPDATE vellev.cluster SET format = $1
+             WHERE format < $1
+               AND NOT EXISTS (SELECT 1 FROM vellev.nodes WHERE format < $1)",
+        )
+        .bind(i32::from(format))
+        .execute(&self.pool)
+        .await?;
+        self.format().await
     }
 }
 

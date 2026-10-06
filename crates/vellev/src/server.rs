@@ -76,8 +76,9 @@ impl App {
 
     /// Serve from `node` from now on. Only the first node given is kept.
     pub fn start(&self, node: Arc<Node>) {
-        node.announcing();
-        let _ = self.node.set(node);
+        if self.node.set(node.clone()).is_ok() {
+            node.announcing();
+        }
     }
 
     /// The node being served from, once there is one.

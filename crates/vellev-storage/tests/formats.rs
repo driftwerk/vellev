@@ -1,8 +1,8 @@
 //! Files written by released formats, read by this one. A released
 //! format's fixtures are never written again: they stand for what is in
-//! object storage somewhere. `write_format_1` wrote `fixtures/format-1`
-//! and is kept to show how; run it only to make the fixtures of a format
-//! not yet released.
+//! object storage somewhere. `write_fixtures` writes those of the newest
+//! format, and only into a directory that does not exist yet, when
+//! `VELLEV_WRITE_FIXTURES` is set.
 
 mod common;
 
@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use object_store::local::LocalFileSystem;
-use vellev_storage::format::FORMAT_VERSION;
+use vellev_core::AccessRule;
+use vellev_storage::format::{SegmentIndex, FORMAT_VERSION};
 use vellev_storage::{Keywords, Merging, Query};
 
 const ROWS: u32 = 4_100;
@@ -32,14 +33,19 @@ fn vector(n: u32) -> Vec<f32> {
 }
 
 fn row(n: u32) -> Mutation {
+    let properties = json!({
+        "title": format!("row {n} {}", ["fox", "hen", "owl"][n as usize % 3]),
+        "n": n,
+        "score": f64::from(n) / 4.0,
+        "tags": [format!("t{}", n % 5), "all"],
+        "seen": format!("2026-10-{:02}T09:00:00Z", 1 + n % 28),
+        "team": format!("team:{}", n % 3),
+        "reviewed": n.is_multiple_of(2),
+    });
     Mutation::Upsert {
         collection: name("notes"),
         id: object(n),
-        properties:
-            json!({ "title": format!("row {n} {}", ["fox", "hen", "owl"][n as usize % 3]), "n": n })
-                .as_object()
-                .unwrap()
-                .clone(),
+        properties: properties.as_object().unwrap().clone(),
         vector: Some(vector(n)),
     }
 }
@@ -51,14 +57,44 @@ fn gone(n: u32) -> Mutation {
     }
 }
 
-/// A partition with every kind of file: a large segment with its vectors
-/// and clustered index, a later segment with tombstones and a manifest
-/// naming the one before, and commits in the log since.
+/// The schema the fixtures are written with: every kind of property, an
+/// access rule, and parameters other than the defaults.
+fn notes() -> Collection {
+    let base = schema("notes");
+    Collection {
+        properties: [
+            base.properties.clone(),
+            vec![
+                Property::new("seen", DataType::Date),
+                Property::new("team", DataType::Text),
+            ],
+        ]
+        .concat(),
+        distance: Distance::Dot,
+        bm25: Bm25 { k1: 1.5, b: 0.5 },
+        access_rule: Some(AccessRule {
+            owner: "title".into(),
+            team: Some("team".into()),
+            team_prefix: "team:".into(),
+        }),
+        ..base
+    }
+}
+
+/// A partition with every kind of file and op: a large segment with its
+/// vectors and clustered index, a later segment with tombstones under a
+/// manifest naming the one before, and commits in the log since.
 #[tokio::test]
-#[ignore = "writes the fixtures of a format not yet released"]
-async fn write_format_1() {
-    let dir = fixtures(1);
-    let _ = std::fs::remove_dir_all(&dir);
+async fn write_fixtures() {
+    if std::env::var_os("VELLEV_WRITE_FIXTURES").is_none() {
+        return;
+    }
+    let dir = fixtures(FORMAT_VERSION);
+    assert!(
+        !dir.exists(),
+        "{} exists; a released format's fixtures are never written again",
+        dir.display()
+    );
     std::fs::create_dir_all(&dir).unwrap();
     let mut cluster = Cluster::new().await;
     let store = LocalFileSystem::new_with_prefix(&dir).unwrap();
@@ -67,7 +103,20 @@ async fn write_format_1() {
         clustered_above: 4_000,
         ..Merging::default()
     });
-    writer.commit(vec![create("notes")]).await.unwrap();
+    writer
+        .commit(vec![
+            Mutation::CreateCollection(Box::new(notes())),
+            create("scratch"),
+        ])
+        .await
+        .unwrap();
+    writer
+        .commit(vec![Mutation::AddProperty {
+            collection: name("notes"),
+            property: Property::new("reviewed", DataType::Bool),
+        }])
+        .await
+        .unwrap();
     for rows in (0..ROWS).collect::<Vec<_>>().chunks(500) {
         writer
             .commit(rows.iter().map(|n| row(*n)).collect())
@@ -80,7 +129,14 @@ async fn write_format_1() {
         .await
         .unwrap();
     writer.flush().await.unwrap();
-    writer.commit(vec![gone(10), row(ROWS + 1)]).await.unwrap();
+    writer
+        .commit(vec![
+            gone(10),
+            row(ROWS + 1),
+            Mutation::DropCollection(name("scratch")),
+        ])
+        .await
+        .unwrap();
     writer
         .commit(vec![Mutation::Patch {
             collection: name("notes"),
@@ -133,47 +189,105 @@ async fn opened(format: u16) -> Follower {
 }
 
 #[tokio::test]
-async fn files_of_format_1_read_as_they_were_written() {
-    let follower = opened(1).await;
-    follower.partition().read(|state| {
-        let notes = name("notes");
-        assert_eq!(state.count(&notes), ROWS as usize + 2 - 11);
-        for n in 0..=10 {
-            assert!(state.get(&notes, object(n)).is_none(), "{n} was deleted");
-        }
-        let eleven = state.get(&notes, object(11)).unwrap();
-        assert_eq!(eleven.object.properties["n"], Value::Int(1_011));
-        assert_eq!(eleven.vector, Some(&vector(11)[..]));
-        for n in [12, 2_000, ROWS - 1, ROWS, ROWS + 1] {
-            let found = state.get(&notes, object(n)).unwrap();
-            assert_eq!(found.object.properties["n"], Value::Int(i64::from(n)));
-            assert_eq!(found.vector, Some(&vector(n)[..]), "{n}");
-        }
-        let segments: Vec<_> = state.segments().cloned().collect();
-        assert_eq!(segments.len(), 2);
-        assert!(segments[0].index.is_some() && segments[0].vectors.is_some());
-        assert!(segments[1].tombstones > 0);
+async fn the_fixtures_of_every_format_read_as_they_were_written() {
+    for format in 1..=FORMAT_VERSION {
+        let follower = opened(format).await;
+        follower.partition().read(|state| {
+            let notes = name("notes");
+            let mut schema = self::notes();
+            schema
+                .properties
+                .push(Property::new("reviewed", DataType::Bool));
+            assert_eq!(state.collection(&notes), Some(&schema));
+            assert!(state.collection(&name("scratch")).is_none());
+            assert_eq!(state.count(&notes), ROWS as usize + 2 - 11);
+            for n in 0..=10 {
+                assert!(state.get(&notes, object(n)).is_none(), "{n} was deleted");
+            }
+            let eleven = state.get(&notes, object(11)).unwrap();
+            assert_eq!(eleven.object.properties["n"], Value::Int(1_011));
+            assert_eq!(eleven.vector, Some(&vector(11)[..]));
+            for n in [12, 2_000, ROWS - 1, ROWS, ROWS + 1] {
+                let found = state.get(&notes, object(n)).unwrap();
+                assert_eq!(found.object.properties["n"], Value::Int(i64::from(n)));
+                assert_eq!(found.vector, Some(&vector(n)[..]), "{n}");
+            }
+            let twelve = &state.get(&notes, object(12)).unwrap().object.properties;
+            assert_eq!(
+                twelve["tags"],
+                Value::TextArray(vec!["t2".into(), "all".into()])
+            );
+            assert_eq!(twelve["reviewed"], Value::Bool(true));
+            let reviewed = Filter::Eq {
+                property: "reviewed".into(),
+                value: json!(true),
+            };
+            let even = (11..=ROWS + 1).filter(|n| n.is_multiple_of(2)).count();
+            assert_eq!(state.select(&notes, &reviewed).unwrap().len(), even);
 
-        let nearest = state
-            .search(&notes, &Query::nearest(&vector(2_003), 5))
-            .unwrap();
-        assert_eq!(nearest.len(), 5);
-        assert!(nearest.iter().all(|hit| hit.distance < 0.01), "{nearest:?}");
-        let words = state
-            .keyword(&notes, &Keywords::matching("owl", 3))
-            .unwrap();
-        assert_eq!(words.len(), 3);
-    });
+            let segments: Vec<_> = state.segments().cloned().collect();
+            assert_eq!(segments.len(), 2);
+            assert!(segments[0].index.is_some() && segments[0].vectors.is_some());
+            assert!(segments[1].tombstones > 0);
+            let nearest = state
+                .search(&notes, &Query::nearest(&vector(2_003), 5))
+                .unwrap();
+            assert_eq!(nearest.len(), 5);
+            let words = state
+                .keyword(&notes, &Keywords::matching("owl", 3))
+                .unwrap();
+            assert_eq!(words.len(), 3);
+        });
+    }
 }
 
+/// Every file of every format's fixtures decodes as its kind and is
+/// stamped with the format, and the manifests chain back through the
+/// checkpoint before.
 #[test]
-fn every_format_this_release_reads_has_fixtures() {
+fn every_fixture_file_decodes_as_what_it_is() {
     for format in 1..=FORMAT_VERSION {
-        let dir = fixtures(format);
-        assert!(
-            dir.join("committed.json").is_file(),
-            "{} holds no fixtures",
-            dir.display()
-        );
+        let partition = fixtures(format).join("tenant-a/0");
+        let mut manifests = Vec::new();
+        for kind in ["log", "manifest", "segment", "vectors", "index"] {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(partition.join(kind))
+                .unwrap_or_else(|_| panic!("format {format} has no {kind} files"))
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            files.sort();
+            assert!(!files.is_empty(), "format {format} has no {kind} files");
+            for path in files {
+                let name = path.file_name().unwrap().to_string_lossy();
+                let key = format!("tenant-a/0/{kind}/{name}");
+                let frame = std::fs::read(&path).unwrap();
+                assert_eq!(
+                    u16::from_le_bytes([frame[5], frame[6]]),
+                    format,
+                    "{key} is stamped with another format"
+                );
+                match kind {
+                    "log" => {
+                        format::decode::<LogSegment>(&key, Kind::Log, &frame).unwrap();
+                    }
+                    "manifest" => {
+                        let manifest: Manifest =
+                            format::decode(&key, Kind::Manifest, &frame).unwrap();
+                        manifests.push((key, manifest));
+                    }
+                    "segment" => {
+                        format::decode::<SegmentFile>(&key, Kind::Segment, &frame).unwrap();
+                    }
+                    "index" => {
+                        let index: SegmentIndex =
+                            format::decode(&key, Kind::Index, &frame).unwrap();
+                        assert!(!index.vectors.is_empty());
+                    }
+                    _ => format::verify(&key, &frame).unwrap(),
+                }
+            }
+        }
+        let (first, newest) = (&manifests[0], &manifests[manifests.len() - 1]);
+        assert_eq!(first.1.prev, None);
+        assert_eq!(newest.1.prev.as_deref(), Some(first.0.as_str()));
     }
 }

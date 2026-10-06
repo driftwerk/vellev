@@ -212,10 +212,19 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// Record that `node` is running now and reads up to `versions`.
     async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()>;
 
-    /// The oldest file format and protocol among the nodes announced
-    /// within `within`, each the least of any node's; `None` if no node
-    /// has been.
-    async fn oldest(&self, within: Duration) -> Result<Option<Versions>>;
+    /// Forget `node`, which has stopped.
+    async fn depart(&self, node: &NodeId) -> Result<()>;
+
+    /// The oldest file format and protocol among the nodes registered, each
+    /// the least of any node's; `None` if none is.
+    async fn oldest(&self) -> Result<Option<Versions>>;
+
+    /// The file format the cluster writes.
+    async fn format(&self) -> Result<u16>;
+
+    /// Raise the file format the cluster writes to `format`, if every node
+    /// registered reads it; it never falls. Returns the format after.
+    async fn raise_format(&self, format: u16) -> Result<u16>;
 }
 
 /// The newest file format and node-to-node protocol a node can read.

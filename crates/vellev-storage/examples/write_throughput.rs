@@ -19,7 +19,7 @@ use vellev_core::{
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, MemoryCoordinator,
-    PartitionKey,
+    PartitionKey, Versions,
 };
 use vellev_storage::{GroupCommitter, Mutation, Writer};
 
@@ -102,18 +102,20 @@ impl Coordinator for SlowCoordinator {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.inner.ping().await
     }
-    async fn announce(
-        &self,
-        node: &NodeId,
-        versions: vellev_storage::coordinator::Versions,
-    ) -> Result<(), CoordinatorError> {
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<(), CoordinatorError> {
         self.inner.announce(node, versions).await
     }
-    async fn oldest(
-        &self,
-        within: Duration,
-    ) -> Result<Option<vellev_storage::coordinator::Versions>, CoordinatorError> {
-        self.inner.oldest(within).await
+    async fn depart(&self, node: &NodeId) -> Result<(), CoordinatorError> {
+        self.inner.depart(node).await
+    }
+    async fn oldest(&self) -> Result<Option<Versions>, CoordinatorError> {
+        self.inner.oldest().await
+    }
+    async fn format(&self) -> Result<u16, CoordinatorError> {
+        self.inner.format().await
+    }
+    async fn raise_format(&self, format: u16) -> Result<u16, CoordinatorError> {
+        self.inner.raise_format(format).await
     }
 }
 

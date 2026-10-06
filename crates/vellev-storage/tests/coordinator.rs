@@ -447,20 +447,19 @@ async fn the_incarnation_stays_through_leases_and_grows_when_registered_again(h:
     assert!(incarnation().await > first);
 }
 
-async fn the_oldest_versions_are_the_least_of_the_nodes_seen_lately(h: &dyn Harness) {
+async fn the_oldest_versions_are_the_least_of_the_nodes_registered(h: &dyn Harness) {
     let c = h.coordinator();
     let at = |format, protocol| Versions { format, protocol };
-    c.announce(&node("a"), at(7, 9)).await.unwrap();
-    c.announce(&node("b"), at(6, 11)).await.unwrap();
-    assert_eq!(
-        c.oldest(Duration::from_secs(5)).await.unwrap(),
-        Some(at(6, 9))
-    );
-    assert_eq!(
-        c.oldest(Duration::ZERO).await.unwrap(),
-        None,
-        "a node not seen within the time does not count"
-    );
+    let (a, b) = (node("a"), node("b"));
+    c.announce(&a, at(7, 0)).await.unwrap();
+    c.announce(&b, at(0, 9)).await.unwrap();
+    let oldest = c.oldest().await.unwrap().unwrap();
+    assert_eq!(oldest, at(0, 0).least(oldest), "{oldest:?}");
+    c.announce(&b, at(6, 11)).await.unwrap();
+    c.depart(&a).await.unwrap();
+    c.depart(&b).await.unwrap();
+    assert_eq!(c.format().await.unwrap(), 1);
+    assert_eq!(c.raise_format(1).await.unwrap(), 1);
 }
 
 async fn removing_a_partition_makes_it_unknown(h: &dyn Harness) {
@@ -596,7 +595,7 @@ conformance! {
     a_commit_that_does_not_advance_is_refused,
     a_generation_is_never_reused_after_remove_and_register,
     the_incarnation_stays_through_leases_and_grows_when_registered_again,
-    the_oldest_versions_are_the_least_of_the_nodes_seen_lately,
+    the_oldest_versions_are_the_least_of_the_nodes_registered,
     removing_a_partition_makes_it_unknown,
     concurrent_acquires_hand_out_exactly_one_lease,
     partitions_are_listed_in_key_order_a_page_at_a_time,
@@ -661,4 +660,27 @@ async fn a_row_inserted_as_before_incarnations_gets_its_generation_as_one() {
     .unwrap();
     let committed = pg.coordinator.committed(&key).await.unwrap().unwrap();
     assert_eq!(committed.incarnation.0, committed.generation.0);
+}
+
+#[tokio::test]
+async fn the_written_format_rises_only_when_every_node_reads_it_and_never_falls() {
+    let c = MemoryCoordinator::default();
+    let at = |format| Versions {
+        format,
+        protocol: 1,
+    };
+    let (newer, older) = (node("newer"), node("older"));
+    c.announce(&newer, at(2)).await.unwrap();
+    c.announce(&older, at(1)).await.unwrap();
+    assert_eq!(
+        c.raise_format(2).await.unwrap(),
+        1,
+        "a node still reads only 1"
+    );
+    assert_eq!(c.oldest().await.unwrap(), Some(at(1)));
+    c.depart(&older).await.unwrap();
+    assert_eq!(c.raise_format(2).await.unwrap(), 2);
+    c.announce(&older, at(1)).await.unwrap();
+    assert_eq!(c.raise_format(1).await.unwrap(), 2, "it never falls");
+    assert_eq!(c.format().await.unwrap(), 2);
 }

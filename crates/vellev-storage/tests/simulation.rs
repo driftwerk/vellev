@@ -211,18 +211,20 @@ impl Coordinator for SimCoordinator {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.clean.ping().await
     }
-    async fn announce(
-        &self,
-        node: &NodeId,
-        versions: vellev_storage::coordinator::Versions,
-    ) -> Result<(), CoordinatorError> {
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<(), CoordinatorError> {
         self.clean.announce(node, versions).await
     }
-    async fn oldest(
-        &self,
-        within: Duration,
-    ) -> Result<Option<vellev_storage::coordinator::Versions>, CoordinatorError> {
-        self.clean.oldest(within).await
+    async fn depart(&self, node: &NodeId) -> Result<(), CoordinatorError> {
+        self.clean.depart(node).await
+    }
+    async fn oldest(&self) -> Result<Option<Versions>, CoordinatorError> {
+        self.clean.oldest().await
+    }
+    async fn format(&self) -> Result<u16, CoordinatorError> {
+        self.clean.format().await
+    }
+    async fn raise_format(&self, format: u16) -> Result<u16, CoordinatorError> {
+        self.clean.raise_format(format).await
     }
 }
 

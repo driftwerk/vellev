@@ -128,6 +128,7 @@ impl From<NodeError> for ApiError {
             NodeError::UnknownTenant(_) => Self::not_found(error.to_string()),
             NodeError::Ahead(_) => Self::invalid(error.to_string()),
             NodeError::Elsewhere { .. }
+            | NodeError::Outdated { .. }
             | NodeError::Stopped
             | NodeError::Lost(_)
             | NodeError::Behind(_) => Self::unavailable(error.to_string()),
