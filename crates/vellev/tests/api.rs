@@ -1067,6 +1067,38 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
         "gave up connecting in {:?}",
         started.elapsed()
     );
+
+    // A holder that takes the request and then cuts the connection may
+    // have made the write.
+    let cutting = {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket.read(&mut [0; 4096]).await;
+            }
+        });
+        url
+    };
+    let cut = cluster.serve_advertising(&cutting).await;
+    cut.ok(Method::PUT, "/v1/tenants/torn", None).await;
+    cut.ok(
+        Method::PUT,
+        "/v1/tenants/torn/collections/notes",
+        Some(notes(supplied())),
+    )
+    .await;
+    let (status, body) = second
+        .put(
+            "/v1/tenants/torn/collections/notes/objects/00000000-0000-0000-0000-000000000001",
+            json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] }),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::SERVICE_UNAVAILABLE, "uncertain")
+    );
 }
 
 #[tokio::test]
