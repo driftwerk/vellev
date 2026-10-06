@@ -132,10 +132,12 @@ impl<'a> Best<'a> {
     }
 }
 
-/// Whether a bound `reaches` the threshold, allowing for the bound being
-/// summed in another order than the score it bounds.
-fn reaches(bound: f32, threshold: Option<f32>) -> bool {
-    threshold.is_none_or(|threshold| bound * (1.0 + 8.0 * f32::EPSILON) >= threshold)
+/// Whether a bound, a sum of up to `terms` parts, `reaches` the threshold,
+/// allowing for the rounding of each part and for the sum being taken in
+/// another order than the score it bounds.
+fn reaches(bound: f32, threshold: Option<f32>, terms: usize) -> bool {
+    let slack = 1.0 + (2 * terms + 4) as f32 * f32::EPSILON;
+    threshold.is_none_or(|threshold| bound * slack >= threshold)
 }
 
 impl State {
@@ -153,6 +155,9 @@ impl State {
             .filter
             .map(|filter| filter.compile(schema))
             .transpose()?;
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
         let Some(corpus) = self.corpus(id) else {
             return Ok(Vec::new());
         };
@@ -181,15 +186,9 @@ impl State {
                         let cursor = clause.cursor(&index.text)?;
                         Some(match layer.deaths {
                             0 => cursor.len(),
-                            _ => {
-                                let live = |posting: &Posting| !layer.dead[posting.row as usize];
-                                index
-                                    .text
-                                    .field(clause.property)?
-                                    .holding(clause.token)
-                                    .filter(live)
-                                    .count()
-                            }
+                            _ => cursor
+                                .filter(|posting| !layer.dead[posting.row as usize])
+                                .count(),
                         })
                     })
                     .sum();
@@ -311,7 +310,7 @@ fn top<'a>(
         let mut reach = 0.0;
         let Some(pivot) = walks.iter().position(|walk| {
             reach += walk.bound;
-            reaches(reach, threshold)
+            reaches(reach, threshold, clauses.len())
         }) else {
             break;
         };
@@ -327,17 +326,20 @@ fn top<'a>(
                 .iter()
                 .take_while(|walk| walk.cursor.row() == Some(row))
                 .count();
-        let blocks: Vec<(u32, f32)> = walks[..=level]
-            .iter()
-            .filter_map(|walk| block_at(walk, row))
-            .collect();
+        let blocks: Vec<(u32, f32)> = match threshold {
+            Some(_) => walks[..=level]
+                .iter()
+                .filter_map(|walk| block_at(walk, row))
+                .collect(),
+            None => Vec::new(),
+        };
         let within: f32 = blocks.iter().map(|(_, bound)| bound).sum();
-        if !reaches(within, threshold) {
+        if !reaches(within, threshold, clauses.len()) {
             let past = blocks
                 .iter()
-                .map(|(end, _)| end + 1)
+                .map(|(end, _)| end.saturating_add(1))
                 .min()
-                .unwrap_or(row + 1);
+                .unwrap_or(row.saturating_add(1));
             let next = walks
                 .get(level + 1)
                 .and_then(|walk| walk.cursor.row())
@@ -361,12 +363,14 @@ fn top<'a>(
             .take_while(|walk| walk.cursor.row() == Some(row))
             .count();
         if wanted(row) {
-            let mut parts = vec![None; clauses.len()];
-            for walk in &walks[..at] {
-                let posting = walk.cursor.posting().expect("a walk at the row");
-                parts[walk.clause] = Some(clauses[walk.clause].score(parameters, posting));
-            }
-            let score = parts.into_iter().flatten().sum();
+            walks[..at].sort_by_key(|walk| walk.clause);
+            let score = walks[..at]
+                .iter()
+                .map(|walk| {
+                    let posting = walk.cursor.posting().expect("a walk at the row");
+                    clauses[walk.clause].score(parameters, posting)
+                })
+                .sum();
             let live = layer.live(row as usize);
             best.offer(Scored {
                 object: live.object,

@@ -89,7 +89,8 @@ impl Postings {
 }
 
 /// A walk forward along one token's postings in one field, by posting or
-/// by skipping to a row, with the bound of the block it is in.
+/// by skipping to a row, with the bound of the block it is in. As an
+/// iterator it yields the postings left.
 #[derive(Debug, Clone)]
 pub struct Cursor<'a> {
     field: &'a Field,
@@ -163,6 +164,16 @@ impl Cursor<'_> {
     }
 }
 
+impl Iterator for Cursor<'_> {
+    type Item = Posting;
+
+    fn next(&mut self) -> Option<Posting> {
+        let posting = self.posting()?;
+        self.advance();
+        Some(posting)
+    }
+}
+
 fn bound(parameters: Bm25, weight: f32, average: f32, block: &Block) -> f32 {
     score(
         parameters,
@@ -185,13 +196,7 @@ pub struct Field {
 impl Field {
     /// The rows holding `token`, ascending.
     pub fn holding<'a>(&'a self, token: &str) -> impl Iterator<Item = Posting> + 'a {
-        self.cursor(token).into_iter().flat_map(|mut cursor| {
-            std::iter::from_fn(move || {
-                let posting = cursor.posting()?;
-                cursor.advance();
-                Some(posting)
-            })
-        })
+        self.cursor(token).into_iter().flatten()
     }
 
     /// A walk along the rows holding `token`, if any does.
