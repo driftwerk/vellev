@@ -552,6 +552,79 @@ async fn partitions_are_listed_in_key_order_a_page_at_a_time(h: &dyn Harness) {
     assert_eq!(mine(listed(h, 3).await).len(), 4);
 }
 
+async fn a_key_reaches_its_tenant_until_revoked_or_the_tenant_goes(h: &dyn Harness) {
+    let c = h.coordinator();
+    let (tenant, other) = (key(), key());
+    let hash = |n: u8| [n; 32];
+    let secret = |n: u8| {
+        let mut hash = *uuid::Uuid::new_v4().as_bytes();
+        hash[0] = n;
+        [hash, hash].concat().try_into().unwrap()
+    };
+    let unregistered = c
+        .issue_key(&tenant.tenant, uuid::Uuid::new_v4(), &hash(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        unregistered, None,
+        "no key for a tenant that does not exist"
+    );
+
+    c.register(&tenant).await.unwrap();
+    c.register(&other).await.unwrap();
+    let (first, second, theirs): ([u8; 32], [u8; 32], [u8; 32]) = (secret(1), secret(2), secret(3));
+    let issued = c
+        .issue_key(&tenant.tenant, uuid::Uuid::new_v4(), &first)
+        .await
+        .unwrap()
+        .unwrap();
+    let later = c
+        .issue_key(&tenant.tenant, uuid::Uuid::new_v4(), &second)
+        .await
+        .unwrap()
+        .unwrap();
+    c.issue_key(&other.tenant, uuid::Uuid::new_v4(), &theirs)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        c.key_tenant(&first).await.unwrap(),
+        Some(tenant.tenant.clone())
+    );
+    assert_eq!(
+        c.key_tenant(&theirs).await.unwrap(),
+        Some(other.tenant.clone())
+    );
+    assert_eq!(c.key_tenant(&secret(4)).await.unwrap(), None);
+    let listed: Vec<uuid::Uuid> = c
+        .keys(&tenant.tenant)
+        .await
+        .unwrap()
+        .iter()
+        .map(|key| key.id)
+        .collect();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.contains(&issued.id) && listed.contains(&later.id));
+
+    assert!(
+        !c.revoke_key(&other.tenant, issued.id).await.unwrap(),
+        "only by its own tenant"
+    );
+    assert!(c.revoke_key(&tenant.tenant, issued.id).await.unwrap());
+    assert_eq!(c.key_tenant(&first).await.unwrap(), None);
+    assert!(!c.revoke_key(&tenant.tenant, issued.id).await.unwrap());
+
+    c.remove(&tenant).await.unwrap();
+    c.register(&tenant).await.unwrap();
+    assert_eq!(
+        c.key_tenant(&second).await.unwrap(),
+        None,
+        "a tenant made again under its id is not reached by its old keys"
+    );
+    assert_eq!(c.keys(&tenant.tenant).await.unwrap(), []);
+    assert_eq!(c.key_tenant(&theirs).await.unwrap(), Some(other.tenant));
+}
+
 async fn ping_succeeds(h: &dyn Harness) {
     h.coordinator().ping().await.unwrap();
 }
@@ -599,6 +672,7 @@ conformance! {
     removing_a_partition_makes_it_unknown,
     concurrent_acquires_hand_out_exactly_one_lease,
     partitions_are_listed_in_key_order_a_page_at_a_time,
+    a_key_reaches_its_tenant_until_revoked_or_the_tenant_goes,
     ping_succeeds,
 }
 

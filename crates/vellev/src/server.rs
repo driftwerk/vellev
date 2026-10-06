@@ -202,30 +202,56 @@ fn same(a: &str, b: &str) -> bool {
             == 0
 }
 
+/// The routes only an admin key reaches: the tenants themselves and their
+/// keys.
+const ADMIN_ONLY: [&str; 4] = [
+    "/v1/tenants",
+    "/v1/tenants/{tenant}",
+    "/v1/tenants/{tenant}/keys",
+    "/v1/tenants/{tenant}/keys/{id}",
+];
+
+/// Let a request through if its key reaches what it asks for. An admin key,
+/// from the node's configuration, reaches everything; a tenant's key, from
+/// the coordinator, reaches that tenant's data alone, and another tenant is
+/// to it as one that does not exist.
 async fn authorized(
     Shared(app): Shared<App>,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    let unauthorized = || ApiError::new(Code::Unauthorized, "a valid API key is required");
     let presented = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, key)| key);
-    let known = presented.is_some_and(|presented| {
-        app.keys
-            .iter()
-            .fold(false, |known, key| known | same(key, presented))
-    });
-    if known {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::new(
+        .map(|(_, key)| key)
+        .ok_or_else(unauthorized)?;
+    let admin = app
+        .keys
+        .iter()
+        .fold(false, |known, key| known | same(key, presented));
+    if admin {
+        return Ok(next.run(request).await);
+    }
+    let reaches = app
+        .node()?
+        .key_tenant(presented)
+        .await?
+        .ok_or_else(unauthorized)?;
+    let route = request.extensions().get::<MatchedPath>();
+    if route.is_some_and(|route| ADMIN_ONLY.contains(&route.as_str())) {
+        return Err(ApiError::new(
             Code::Unauthorized,
-            "a valid API key is required",
-        ))
+            "only an admin key may do this",
+        ));
+    }
+    match tenant_of(request.uri().path()) {
+        Some(tenant) if tenant == reaches => Ok(next.run(request).await),
+        Some(tenant) => Err(NodeError::UnknownTenant(tenant).into()),
+        None => Err(unauthorized()),
     }
 }
 
@@ -366,6 +392,8 @@ fn described() -> (Router<App>, OpenApi) {
     OpenApiRouter::with_openapi(Described::openapi())
         .routes(routes!(api::tenants))
         .routes(routes!(api::create_tenant, api::drop_tenant))
+        .routes(routes!(api::issue_key, api::tenant_keys))
+        .routes(routes!(api::revoke_key))
         .routes(routes!(api::changes))
         .routes(routes!(api::collections))
         .routes(routes!(

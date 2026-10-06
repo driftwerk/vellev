@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use vellev_core::{NodeId, Partition, TenantId};
 
 pub use memory::{Clock, ManualClock, MemoryCoordinator, SystemClock};
@@ -172,7 +173,9 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// existing partition changes nothing.
     async fn register(&self, key: &PartitionKey) -> Result<()>;
 
-    /// Delete the partition's row. Returns whether it existed.
+    /// Delete the partition's row. Returns whether it existed. With the
+    /// tenant's last partition go its keys, so that none reaches a tenant
+    /// made again under the same id.
     async fn remove(&self, key: &PartitionKey) -> Result<bool>;
 
     /// Take the lease if nobody holds it, the holder's lease has expired, or
@@ -225,6 +228,35 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// Raise the file format the cluster writes to `format`, if every node
     /// registered reads it; it never falls. Returns the format after.
     async fn raise_format(&self, format: u16) -> Result<u16>;
+
+    /// Keep a key that reaches `tenant`, by the hash of its secret. `None`
+    /// if there is no such tenant.
+    async fn issue_key(
+        &self,
+        tenant: &TenantId,
+        id: Uuid,
+        hash: &KeyHash,
+    ) -> Result<Option<TenantKey>>;
+
+    /// The keys that reach `tenant`, oldest first.
+    async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>>;
+
+    /// Forget one of `tenant`'s keys. Returns whether it was one.
+    async fn revoke_key(&self, tenant: &TenantId, id: Uuid) -> Result<bool>;
+
+    /// The tenant the key with this hash reaches, if any.
+    async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>>;
+}
+
+/// The SHA-256 of a key's secret: all the coordinator keeps of it.
+pub type KeyHash = [u8; 32];
+
+/// A key that reaches one tenant, as listed: when it was issued, and the
+/// id it is revoked by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantKey {
+    pub id: Uuid,
+    pub created: DateTime<Utc>,
 }
 
 /// The newest file format and node-to-node protocol a node can read.

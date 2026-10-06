@@ -46,6 +46,20 @@ export VELLEV_API_KEYS=dev-key
 cargo run -p vellev -- serve --listen 127.0.0.1:8080
 ```
 
+`VELLEV_API_KEYS` are admin keys: they reach every tenant, and only they
+create, drop and list tenants. Give each tenant's caller a key of its own,
+which reaches that tenant alone; to it every other tenant is as one that
+does not exist:
+
+```sh
+curl -sS -X POST -H 'authorization: Bearer dev-key' http://127.0.0.1:8080/v1/tenants/acme/keys
+# {"id":"…","key":"vlv_…","created":"…"}: the key is shown this once
+```
+
+Keys are listed with `GET` and revoked with `DELETE …/keys/{id}`; a revoked
+key stops working at once on the node that revoked it and within ten seconds
+on the others. Dropping a tenant takes its keys with it.
+
 `vellev serve --help` lists every setting. On SIGTERM a node reports not
 ready, keeps serving for `VELLEV_STOP_DELAY_SECS` (a few seconds on Docker
 Swarm; none is needed on ECS), finishes what is in flight within

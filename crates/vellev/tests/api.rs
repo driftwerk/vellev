@@ -637,7 +637,7 @@ async fn the_description_covers_every_route_that_needs_a_key() {
                 .map(move |method| (method.to_uppercase(), path.clone()))
         })
         .collect();
-    assert_eq!(operations.len(), 18, "{operations:?}");
+    assert_eq!(operations.len(), 21, "{operations:?}");
 
     served.with_notes(supplied()).await;
     for (method, path) in &operations {
@@ -1274,4 +1274,162 @@ async fn a_write_named_again_is_answered_as_it_was_and_made_once() {
     let (status, refused) = send("not-a-uuid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(code(&refused), "invalid");
+}
+
+async fn as_key(
+    node: &Served,
+    key: &str,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    node.call_as(Some(key), method, path, body).await
+}
+
+#[tokio::test]
+async fn a_tenant_key_reaches_its_tenant_alone_and_learns_nothing_of_others() {
+    let cluster = Cluster::new();
+    let (first, second) = (cluster.serve().await, cluster.serve().await);
+    first.with_notes(supplied()).await;
+    first.ok(Method::PUT, "/v1/tenants/beta", None).await;
+    let beta_notes = "/v1/tenants/beta/collections/notes";
+    first
+        .ok(Method::PUT, beta_notes, Some(notes(supplied())))
+        .await;
+    let issued = first.ok(Method::POST, "/v1/tenants/acme/keys", None).await;
+    let key = issued["key"].as_str().unwrap().to_string();
+    assert!(key.starts_with("vlv_"), "{key}");
+    let listed = first.ok(Method::GET, "/v1/tenants/acme/keys", None).await;
+    assert_eq!(listed["keys"][0]["id"], issued["id"]);
+    assert!(
+        listed["keys"][0].get("key").is_none(),
+        "a listed key has no secret"
+    );
+
+    let fox = json!({ "properties": { "title": "a red fox", "n": 1 }, "vector": [1.0, 0.0] });
+    for node in [&first, &second] {
+        assert_eq!(
+            as_key(node, &key, Method::PUT, &object(1), Some(fox.clone()))
+                .await
+                .0,
+            StatusCode::OK,
+            "a write to its own tenant, sent on or not"
+        );
+        assert_eq!(
+            as_key(node, &key, Method::GET, &object(1), None).await.0,
+            StatusCode::OK
+        );
+
+        let missing = as_key(
+            node,
+            &key,
+            Method::GET,
+            "/v1/tenants/gamma/collections",
+            None,
+        )
+        .await;
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        let beta = as_key(
+            node,
+            &key,
+            Method::GET,
+            "/v1/tenants/beta/collections",
+            None,
+        )
+        .await;
+        let beta_object = beta_notes.to_string() + "/objects/" + &id(1);
+        let written = as_key(node, &key, Method::PUT, &beta_object, Some(fox.clone())).await;
+        let missing_message = missing.1["error"]["message"]
+            .as_str()
+            .unwrap()
+            .replace("gamma", "beta");
+        for (status, body) in [beta, written] {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(
+                body["error"]["message"],
+                json!(missing_message),
+                "as if beta were not there"
+            );
+        }
+
+        for (method, path) in [
+            (Method::GET, "/v1/tenants"),
+            (Method::PUT, "/v1/tenants/acme"),
+            (Method::DELETE, "/v1/tenants/beta"),
+            (Method::POST, "/v1/tenants/acme/keys"),
+            (Method::GET, "/v1/tenants/acme/keys"),
+        ] {
+            let (status, body) = as_key(node, &key, method.clone(), path, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}: {body}");
+        }
+    }
+    let beta_count = first
+        .get(&(beta_notes.to_string() + "/objects/" + &id(1)))
+        .await;
+    assert_eq!(
+        beta_count.0,
+        StatusCode::NOT_FOUND,
+        "nothing was written to beta"
+    );
+
+    let guessed = format!("vlv_{}", "0".repeat(64));
+    for wrong in [guessed.as_str(), "not-a-key", ""] {
+        let (status, _) = first
+            .call_as(
+                Some(wrong),
+                Method::GET,
+                "/v1/tenants/acme/collections",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{wrong:?}");
+    }
+    let (status, _) = first
+        .call_as(None, Method::GET, "/v1/tenants/acme/collections", None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let id = issued["id"].as_str().unwrap();
+    first
+        .ok(Method::DELETE, &format!("/v1/tenants/acme/keys/{id}"), None)
+        .await;
+    let (status, _) = first
+        .call_as(
+            Some(&key),
+            Method::GET,
+            "/v1/tenants/acme/collections",
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a revoked key, at once where revoked"
+    );
+    assert_eq!(
+        first.delete(&format!("/v1/tenants/acme/keys/{id}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let other = first.ok(Method::POST, "/v1/tenants/acme/keys", None).await;
+    let other = other["key"].as_str().unwrap().to_string();
+    first.ok(Method::DELETE, "/v1/tenants/acme", None).await;
+    first.ok(Method::PUT, "/v1/tenants/acme", None).await;
+    let (status, _) = first
+        .call_as(
+            Some(&other),
+            Method::GET,
+            "/v1/tenants/acme/collections",
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a tenant made again is not reached by the keys of the one dropped"
+    );
+    assert_eq!(
+        first.post("/v1/tenants/gone/keys", json!(null)).await.0,
+        StatusCode::NOT_FOUND
+    );
 }

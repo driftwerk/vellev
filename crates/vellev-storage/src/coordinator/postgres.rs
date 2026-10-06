@@ -5,11 +5,13 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions};
 use sqlx::query::QueryAs;
 use sqlx::{Executor, FromRow, Postgres};
+use uuid::Uuid;
 use vellev_core::{NodeId, Partition, TenantId};
 
 use super::{
     checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result, Versions,
+    Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Result, TenantKey,
+    Versions,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -17,6 +19,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("../../migrations/0002_tenant_order.sql")),
     (3, include_str!("../../migrations/0003_incarnation.sql")),
     (4, include_str!("../../migrations/0004_nodes.sql")),
+    (5, include_str!("../../migrations/0005_tenant_keys.sql")),
 ];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
@@ -236,12 +239,21 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn remove(&self, key: &PartitionKey) -> Result<bool> {
+        let mut transaction = self.pool.begin().await?;
         let done =
             sqlx::query("DELETE FROM vellev.partitions WHERE tenant = $1 AND partition = $2")
                 .bind(key.tenant.as_str())
                 .bind(i64::from(key.partition.0))
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await?;
+        sqlx::query(
+            "DELETE FROM vellev.tenant_keys WHERE tenant = $1
+               AND NOT EXISTS (SELECT 1 FROM vellev.partitions WHERE tenant = $1)",
+        )
+        .bind(key.tenant.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
         Ok(done.rows_affected() > 0)
     }
 
@@ -480,6 +492,71 @@ impl Coordinator for PostgresCoordinator {
         .execute(&self.pool)
         .await?;
         self.format().await
+    }
+
+    async fn issue_key(
+        &self,
+        tenant: &TenantId,
+        id: Uuid,
+        hash: &KeyHash,
+    ) -> Result<Option<TenantKey>> {
+        // The tenant's rows are held while the key is kept, so a removal
+        // either comes first, and no key is kept, or waits and takes it.
+        let mut transaction = self.pool.begin().await?;
+        let registered: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM vellev.partitions WHERE tenant = $1 LIMIT 1 FOR SHARE",
+        )
+        .bind(tenant.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if registered.is_none() {
+            return Ok(None);
+        }
+        let created: DateTime<Utc> = sqlx::query_scalar(
+            "INSERT INTO vellev.tenant_keys (id, tenant, hash) VALUES ($1, $2, $3)
+             RETURNING created_at",
+        )
+        .bind(id)
+        .bind(tenant.as_str())
+        .bind(hash.as_slice())
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(TenantKey { id, created }))
+    }
+
+    async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>> {
+        let keys: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT id, created_at FROM vellev.tenant_keys WHERE tenant = $1
+             ORDER BY created_at, id",
+        )
+        .bind(tenant.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(keys
+            .into_iter()
+            .map(|(id, created)| TenantKey { id, created })
+            .collect())
+    }
+
+    async fn revoke_key(&self, tenant: &TenantId, id: Uuid) -> Result<bool> {
+        let done = sqlx::query("DELETE FROM vellev.tenant_keys WHERE tenant = $1 AND id = $2")
+            .bind(tenant.as_str())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>> {
+        let tenant: Option<String> =
+            sqlx::query_scalar("SELECT tenant FROM vellev.tenant_keys WHERE hash = $1")
+                .bind(hash.as_slice())
+                .fetch_optional(&self.pool)
+                .await?;
+        tenant
+            .map(|tenant| TenantId::new(tenant).map_err(|error| invariant(error.to_string())))
+            .transpose()
     }
 }
 

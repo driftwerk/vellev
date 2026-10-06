@@ -9,6 +9,7 @@
 mod common;
 
 use std::collections::VecDeque;
+use vellev_storage::coordinator::{KeyHash, TenantKey};
 
 use common::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
@@ -225,6 +226,31 @@ impl Coordinator for SimCoordinator {
     }
     async fn raise_format(&self, format: u16) -> Result<u16, CoordinatorError> {
         self.clean.raise_format(format).await
+    }
+
+    async fn issue_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        hash: &KeyHash,
+    ) -> Result<Option<TenantKey>, CoordinatorError> {
+        self.clean.issue_key(tenant, id, hash).await
+    }
+
+    async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>, CoordinatorError> {
+        self.clean.keys(tenant).await
+    }
+
+    async fn revoke_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+    ) -> Result<bool, CoordinatorError> {
+        self.clean.revoke_key(tenant, id).await
+    }
+
+    async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>, CoordinatorError> {
+        self.clean.key_tenant(hash).await
     }
 }
 

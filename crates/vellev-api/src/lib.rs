@@ -152,6 +152,31 @@ pub struct TenantPage {
     pub limit: u32,
 }
 
+/// A key that reaches one tenant, just issued. Its secret is shown this
+/// once; keep it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedKey {
+    pub id: uuid::Uuid,
+    /// What to send as the bearer key.
+    pub key: String,
+    pub created: chrono::DateTime<chrono::Utc>,
+}
+
+/// A key that reaches one tenant, without its secret.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantKey {
+    pub id: uuid::Uuid,
+    pub created: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantKeys {
+    pub keys: Vec<TenantKey>,
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tenants {

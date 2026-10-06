@@ -18,8 +18,8 @@ use vellev_core::{
 };
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
 use vellev_storage::coordinator::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, MemoryCoordinator,
-    PartitionKey, Versions,
+    Acquired, Commit, Committed, Coordinator, CoordinatorError, KeyHash, Lease, MemoryCoordinator,
+    PartitionKey, TenantKey, Versions,
 };
 use vellev_storage::{GroupCommitter, Mutation, Writer};
 
@@ -116,6 +116,31 @@ impl Coordinator for SlowCoordinator {
     }
     async fn raise_format(&self, format: u16) -> Result<u16, CoordinatorError> {
         self.inner.raise_format(format).await
+    }
+
+    async fn issue_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        hash: &KeyHash,
+    ) -> Result<Option<TenantKey>, CoordinatorError> {
+        self.inner.issue_key(tenant, id, hash).await
+    }
+
+    async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>, CoordinatorError> {
+        self.inner.keys(tenant).await
+    }
+
+    async fn revoke_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.revoke_key(tenant, id).await
+    }
+
+    async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>, CoordinatorError> {
+        self.inner.key_tenant(hash).await
     }
 }
 
