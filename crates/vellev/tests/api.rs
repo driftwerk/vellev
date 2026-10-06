@@ -1009,19 +1009,30 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
 }
 
 #[tokio::test]
-async fn creating_a_tenant_through_another_node_does_not_move_it() {
+async fn creating_a_tenant_through_another_node_does_not_take_it() {
     let cluster = Cluster::new();
-    let (first, second) = (cluster.serve().await, cluster.serve().await);
+    let (first, second, third) = (
+        cluster.serve().await,
+        cluster.serve().await,
+        cluster.serve().await,
+    );
     first.with_notes(supplied()).await;
+    first.node.shutdown().await;
     assert_eq!(
         second.call(Method::PUT, "/v1/tenants/acme", None).await.0,
         StatusCode::NO_CONTENT
     );
-    let fox = json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] });
-    let written = first.ok(Method::PUT, &object(1), Some(fox)).await;
-    assert_eq!(
-        written["position"], 2,
-        "the first node still holds the tenant"
+    assert!(
+        third
+            .node
+            .tenant(&vellev_core::TenantId::new("acme").unwrap())
+            .await
+            .is_ok(),
+        "nobody took the tenant by creating it again"
     );
-    assert_eq!(second.node.tenants(None, 5).await.unwrap().len(), 1);
+    let fox = json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] });
+    assert_eq!(
+        third.ok(Method::PUT, &object(1), Some(fox)).await["position"],
+        2
+    );
 }
