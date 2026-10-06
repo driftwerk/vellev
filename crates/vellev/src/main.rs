@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Notify;
@@ -64,6 +64,7 @@ struct ImportWeaviate {
     /// The Weaviate to copy from.
     #[arg(long)]
     from: String,
+    /// The Weaviate API key, if it needs one.
     #[arg(long, env = "VELLEV_IMPORT_FROM_KEY")]
     from_key: Option<String>,
     /// The Weaviate tenant to copy, for classes with multi-tenancy on.
@@ -72,6 +73,7 @@ struct ImportWeaviate {
     /// The vellev node to copy into.
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     to: String,
+    /// The vellev API key.
     #[arg(long, env = "VELLEV_API_KEY")]
     key: String,
     #[arg(long, value_parser = |id: &str| TenantId::new(id))]
@@ -83,6 +85,9 @@ struct ImportWeaviate {
     /// rather than copy its vectors.
     #[arg(long = "embedding", value_parser = class_embedding)]
     embeddings: Vec<(String, Embedding)>,
+    /// CLASS=NAME: copy the class's named vector NAME, where it has several.
+    #[arg(long = "vector", value_parser = class_vector)]
+    vectors: Vec<(String, String)>,
     /// A date property to hold each object's creation time in Weaviate.
     #[arg(long)]
     created_as: Option<String>,
@@ -96,6 +101,10 @@ struct ImportWeaviate {
     /// The most objects to copy a second.
     #[arg(long)]
     per_second: Option<f64>,
+    /// How far Weaviate's clock may be behind this machine's, in seconds:
+    /// a catch-up looks back this much further for changes.
+    #[arg(long, default_value_t = 300)]
+    skew_secs: u64,
     /// Where progress is kept; vellev-import-TENANT.json by default.
     #[arg(long)]
     state: Option<PathBuf>,
@@ -106,8 +115,17 @@ fn class_embedding(given: &str) -> Result<(String, Embedding)> {
     let (class, path) = given
         .split_once('=')
         .ok_or_else(|| eyre::eyre!("expected CLASS=FILE, got {given}"))?;
-    let embedding = serde_json::from_slice(&std::fs::read(path)?)?;
+    let read = || -> Result<Embedding> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) };
+    let embedding = read().wrap_err_with(|| format!("reading the embedding in {path}"))?;
     Ok((class.to_string(), embedding))
+}
+
+/// A class's name and the name after `=`.
+fn class_vector(given: &str) -> Result<(String, String)> {
+    let (class, vector) = given
+        .split_once('=')
+        .ok_or_else(|| eyre::eyre!("expected CLASS=NAME, got {given}"))?;
+    Ok((class.to_string(), vector.to_string()))
 }
 
 #[tokio::main]
@@ -161,10 +179,12 @@ async fn main() -> Result<ExitCode> {
                 tenant,
                 classes,
                 embeddings,
+                vectors,
                 created_as,
                 updated_as,
                 page,
                 per_second,
+                skew_secs,
                 state,
             } = *import;
             let source = vellev::import::Source {
@@ -175,18 +195,29 @@ async fn main() -> Result<ExitCode> {
             let options = vellev::import::Options {
                 classes,
                 embeddings: embeddings.into_iter().collect(),
+                vectors: vectors.into_iter().collect(),
                 created_as,
                 updated_as,
                 page,
                 per_second,
+                skew: Duration::from_secs(skew_secs),
                 state: state
                     .unwrap_or_else(|| PathBuf::from(format!("vellev-import-{tenant}.json"))),
             };
             let client = vellev_client::Client::connect(&[&to], &key, Default::default())?;
             let report =
                 vellev::import::weaviate(&source, &client.tenant(&tenant), &options).await?;
+            for (class, copied) in &report.classes {
+                for warning in &copied.warnings {
+                    eprintln!("{class}: {warning}");
+                }
+            }
             println!("{}", serde_json::to_string_pretty(&report)?);
-            Ok(ExitCode::SUCCESS)
+            if report.matched() {
+                return Ok(ExitCode::SUCCESS);
+            }
+            eprintln!("some classes hold a different number of objects in vellev than in Weaviate; run again to catch up");
+            Ok(ExitCode::FAILURE)
         }
         Command::Health { url, timeout_secs } => {
             let client = vellev_client::Client::new(&url, Duration::from_secs(timeout_secs))?;

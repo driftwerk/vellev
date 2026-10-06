@@ -53,8 +53,8 @@ impl Weaviate {
         serde_json::from_str(&text).unwrap_or(Value::Null)
     }
 
-    /// A class `class` holding `OBJECTS` notes.
-    async fn load(url: &str, class: &str) -> Self {
+    /// A class `class` holding notes `0..objects`.
+    async fn load(url: &str, class: &str, objects: u64) -> Self {
         let weaviate = Self {
             url: url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
@@ -81,20 +81,23 @@ impl Weaviate {
         weaviate
             .send(reqwest::Method::POST, "/v1/schema", Some(schema))
             .await;
-        for chunk in (0..OBJECTS).collect::<Vec<_>>().chunks(300) {
+        weaviate.add(class, 0..objects).await;
+        weaviate
+    }
+
+    async fn add(&self, class: &str, notes: std::ops::Range<u64>) {
+        for chunk in notes.collect::<Vec<_>>().chunks(300) {
             let objects: Vec<Value> = chunk
                 .iter()
                 .map(|n| json!({ "class": class, "id": uuid(*n), "properties": object(*n), "vector": vector(*n) }))
                 .collect();
-            weaviate
-                .send(
-                    reqwest::Method::POST,
-                    "/v1/batch/objects",
-                    Some(json!({ "objects": objects })),
-                )
-                .await;
+            self.send(
+                reqwest::Method::POST,
+                "/v1/batch/objects",
+                Some(json!({ "objects": objects })),
+            )
+            .await;
         }
-        weaviate
     }
 }
 
@@ -102,10 +105,12 @@ fn options(state: &std::path::Path) -> Options {
     Options {
         classes: vec![],
         embeddings: HashMap::new(),
+        vectors: HashMap::new(),
         created_as: Some("createdAt".into()),
         updated_as: None,
         page: 50,
         per_second: None,
+        skew: Duration::from_secs(1),
         state: state.to_path_buf(),
     }
 }
@@ -129,7 +134,7 @@ async fn a_weaviate_class_is_copied_whole_with_its_ids_vectors_and_settings() {
         return;
     };
     let class = "VellevImportWhole";
-    Weaviate::load(&url, class).await;
+    Weaviate::load(&url, class, OBJECTS).await;
     let served = Served::new().await;
     let tenant = tenant(&served, "imported").await;
     let dir = tempfile::tempdir().unwrap();
@@ -143,6 +148,7 @@ async fn a_weaviate_class_is_copied_whole_with_its_ids_vectors_and_settings() {
         tenant: None,
     };
     let report = import::weaviate(&source, &tenant, &options).await.unwrap();
+    assert!(report.matched());
     let copied = &report.classes[class];
     assert_eq!(
         (copied.stored, copied.weaviate, copied.vellev),
@@ -179,9 +185,11 @@ async fn a_weaviate_class_is_copied_whole_with_its_ids_vectors_and_settings() {
     assert_eq!(found.results.len(), 5);
 
     let again = import::weaviate(&source, &tenant, &options).await.unwrap();
+    let copied = &again.classes[class];
     assert_eq!(
-        again.classes[class].stored, 0,
-        "a finished import has nothing more to do"
+        (copied.stored, copied.changed, copied.deleted),
+        (0, 0, 0),
+        "a finished import, caught up, has nothing more to do"
     );
 }
 
@@ -191,61 +199,158 @@ async fn an_import_stopped_part_way_resumes_and_catches_up_with_what_changed_mea
         return;
     };
     let class = "VellevImportResumed";
-    let weaviate = Weaviate::load(&url, class).await;
+    let weaviate = Weaviate::load(&url, class, OBJECTS / 2).await;
     let served = Served::new().await;
     let tenant = tenant(&served, "resumed").await;
     let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.json");
     let options = Options {
         classes: vec![class.into()],
-        per_second: Some(2_000.0),
-        ..options(&dir.path().join("state.json"))
+        ..options(&state)
     };
     let source = Source {
         url,
         key: None,
         tenant: None,
     };
-    let stopped = tokio::time::timeout(
-        Duration::from_millis(250),
-        import::weaviate(&source, &tenant, &options),
-    )
-    .await;
-    assert!(stopped.is_err(), "the import was stopped part way");
+    import::weaviate(&source, &tenant, &options).await.unwrap();
 
+    // Weaviate goes on taking writes: to objects already copied, and past
+    // where the import, stopped as if part way, had reached.
+    weaviate.add(class, OBJECTS / 2..OBJECTS).await;
     let path = |n: u64| format!("/v1/objects/{class}/{}", uuid(n));
+    let changed = json!({ "class": class, "id": uuid(0), "properties": { "title": "changed", "n": 1_000_000 }, "vector": vector(0) });
     weaviate
-        .send(
-            reqwest::Method::PUT,
-            &path(0),
-            Some(json!({ "class": class, "id": uuid(0), "properties": { "title": "changed", "n": 1_000_000 }, "vector": vector(0) })),
-        )
+        .send(reqwest::Method::PUT, &path(0), Some(changed))
         .await;
     weaviate.send(reqwest::Method::DELETE, &path(1), None).await;
-    weaviate
-        .send(
-            reqwest::Method::POST,
-            "/v1/objects",
-            Some(json!({ "class": class, "id": uuid(OBJECTS + 5), "properties": object(OBJECTS + 5), "vector": vector(1) })),
-        )
-        .await;
-
-    let options = Options {
-        per_second: None,
-        ..options
-    };
-    let report = import::weaviate(&source, &tenant, &options).await.unwrap();
-    let copied = &report.classes[class];
-    assert!(
-        copied.stored < OBJECTS,
-        "resumed, stored {} again",
-        copied.stored
+    let mut progress: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert_eq!(
+        progress["classes"][class]["after"],
+        json!(uuid(OBJECTS / 2 - 1))
     );
-    assert_eq!(copied.deleted, 1);
-    assert!(copied.changed >= 1);
-    assert_eq!((copied.weaviate, copied.vellev), (OBJECTS, OBJECTS));
+    progress["classes"][class]["done"] = json!(false);
+    std::fs::write(&state, serde_json::to_vec(&progress).unwrap()).unwrap();
+
+    let report = import::weaviate(&source, &tenant, &options).await.unwrap();
+    assert!(report.matched());
+    let copied = &report.classes[class];
+    assert_eq!(copied.stored, OBJECTS / 2, "resumed past what was stored");
+    assert_eq!((copied.changed, copied.deleted), (1, 1));
+    assert_eq!((copied.weaviate, copied.vellev), (OBJECTS - 1, OBJECTS - 1));
     let records = tenant.collection(&CollectionName::new(class).unwrap());
     let changed = records.get(oid(0)).await.unwrap().unwrap();
     assert_eq!(changed.properties["n"], json!(1_000_000));
     assert!(records.get(oid(1)).await.unwrap().is_none());
-    assert!(records.get(oid(OBJECTS + 5)).await.unwrap().is_some());
+
+    let other = Source {
+        url: "http://elsewhere:8080".into(),
+        ..source.clone()
+    };
+    let refused = import::weaviate(&other, &tenant, &options)
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("is the state of an import from"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_named_vector_and_a_tenant_of_a_multi_tenant_class_are_copied_beside_a_plain_class() {
+    let Ok(url) = std::env::var("VELLEV_WEAVIATE_URL") else {
+        return;
+    };
+    let weaviate = Weaviate::load(&url, "VellevImportPlain", 10).await;
+    for class in ["VellevImportNamed", "VellevImportTenanted"] {
+        let _ = weaviate
+            .http
+            .delete(format!("{}/v1/schema/{class}", weaviate.url))
+            .send()
+            .await;
+    }
+    let named = json!({
+        "class": "VellevImportNamed",
+        "vectorConfig": { "default": {
+            "vectorizer": { "none": {} },
+            "vectorIndexType": "hnsw",
+            "vectorIndexConfig": { "distance": "dot" },
+        } },
+        "properties": [{ "name": "title", "dataType": ["text"] }],
+    });
+    let tenanted = json!({
+        "class": "VellevImportTenanted",
+        "vectorizer": "none",
+        "multiTenancyConfig": { "enabled": true },
+        "properties": [{ "name": "title", "dataType": ["text"] }],
+    });
+    for schema in [named, tenanted] {
+        weaviate
+            .send(reqwest::Method::POST, "/v1/schema", Some(schema))
+            .await;
+    }
+    weaviate
+        .send(
+            reqwest::Method::POST,
+            "/v1/schema/VellevImportTenanted/tenants",
+            Some(json!([{ "name": "t1" }, { "name": "t2" }])),
+        )
+        .await;
+    for n in 0..7 {
+        let named = json!({ "class": "VellevImportNamed", "id": uuid(n), "properties": { "title": "named" }, "vectors": { "default": vector(n) } });
+        weaviate
+            .send(reqwest::Method::POST, "/v1/objects", Some(named))
+            .await;
+        for (tenant, from) in [("t1", 0), ("t2", 100)] {
+            let tenanted = json!({ "class": "VellevImportTenanted", "tenant": tenant, "id": uuid(from + n), "properties": { "title": tenant }, "vector": vector(n) });
+            weaviate
+                .send(reqwest::Method::POST, "/v1/objects", Some(tenanted))
+                .await;
+        }
+    }
+
+    let served = Served::new().await;
+    let tenant = tenant(&served, "mixed").await;
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        classes: vec![
+            "VellevImportPlain".into(),
+            "VellevImportNamed".into(),
+            "VellevImportTenanted".into(),
+        ],
+        ..options(&dir.path().join("state.json"))
+    };
+    let untenanted = Source {
+        url: url.clone(),
+        key: None,
+        tenant: None,
+    };
+    let refused = import::weaviate(&untenanted, &tenant, &options)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("multi-tenancy"), "{refused}");
+
+    let source = Source {
+        tenant: Some("t1".into()),
+        ..untenanted
+    };
+    let report = import::weaviate(&source, &tenant, &options).await.unwrap();
+    assert!(report.matched(), "{report:?}");
+    let counts: Vec<u64> = report
+        .classes
+        .values()
+        .map(|copied| copied.vellev)
+        .collect();
+    assert_eq!(counts, [7, 10, 7]);
+    let named = tenant.collection(&CollectionName::new("VellevImportNamed").unwrap());
+    let schema = named.schema().await.unwrap().unwrap();
+    assert_eq!(schema.distance, vellev_core::Distance::Dot);
+    let stored = named.get(oid(3)).await.unwrap().unwrap();
+    assert_eq!(stored.vector, Some(vector(3)));
+    let tenanted = tenant.collection(&CollectionName::new("VellevImportTenanted").unwrap());
+    let stored = tenanted.get(oid(3)).await.unwrap().unwrap();
+    assert_eq!(stored.properties["title"], json!("t1"));
+    assert!(tenanted.get(oid(103)).await.unwrap().is_none());
 }
