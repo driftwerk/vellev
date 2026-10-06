@@ -27,6 +27,8 @@ use crate::{Result, StorageError};
 /// How many times a commit whose outcome is unknown is tried. Repeating is
 /// safe because the coordinator accepts an identical commit twice.
 const COMMIT_ATTEMPTS: u32 = 3;
+/// How many rows a flush copies from memory while commits wait.
+const COPIED_AT_ONCE: usize = 4_096;
 
 /// A segment built and ready to write: its file without the rows'
 /// vectors, which the column holds, its indexes, and the frames of the
@@ -653,6 +655,12 @@ impl Writer {
         let Some(mut snapshot) = self.partition.read(State::snapshot) else {
             return Ok(self.partition.read(State::position));
         };
+        while self
+            .partition
+            .read(|state| state.copy_rows(&mut snapshot, COPIED_AT_ONCE))
+        {
+            tokio::task::yield_now().await;
+        }
         let segment = match snapshot.rows.is_empty() && snapshot.tombstones.is_empty() {
             true => None,
             false => {
@@ -668,7 +676,7 @@ impl Writer {
                 let built = self.built(file, snapshot.catalog.clone()).await?;
                 let prepared = Self::prepared(names.meta(shape), built)?;
                 self.upload(&prepared).await?;
-                Some(prepared)
+                Some(self.loaded(prepared).await?)
             }
         };
         let mut ready = self.ready.lock().await;
@@ -677,17 +685,13 @@ impl Writer {
         }
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
-        let flushed = segment.as_ref().map(|prepared| prepared.meta.clone());
+        let flushed = segment.as_ref().map(|(meta, _)| meta.clone());
         let manifest = self
             .partition
             .read(|state| state.flushed_manifest(position, &snapshot, flushed));
         let frame = encode(Kind::Manifest, &manifest)?;
         attempt(&mut ready, async {
             self.publish(&key, frame, position).await?;
-            let segment = match segment {
-                Some(segment) => Some(self.loaded(segment).await?),
-                None => None,
-            };
             let mut state = self.partition.state.write().expect("partition lock");
             state.flushed(&key, position, snapshot, segment)
         })

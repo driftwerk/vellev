@@ -82,8 +82,9 @@ fn notes() -> Collection {
 }
 
 /// A partition with every kind of file and op: a large segment with its
-/// vectors and clustered index, a later segment with tombstones under a
-/// manifest naming the one before, and commits in the log since.
+/// vectors and clustered index, then a later segment with tombstones
+/// flushed while commits went on, under a manifest naming the checkpoint
+/// before and the logs to replay over it.
 #[tokio::test]
 async fn write_fixtures() {
     if std::env::var_os("VELLEV_WRITE_FIXTURES").is_none() {
@@ -99,10 +100,11 @@ async fn write_fixtures() {
     let mut cluster = Cluster::new().await;
     let store = LocalFileSystem::new_with_prefix(&dir).unwrap();
     cluster.blobs = Arc::new(ObjectBlobs::on_disk(Arc::new(store), &dir));
-    let writer = cluster.writer().await.merging_with(Merging {
+    let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
+    let writer = Arc::new(cluster.writer().await.merging_with(Merging {
         clustered_above: 4_000,
         ..Merging::default()
-    });
+    }));
     writer
         .commit(vec![
             Mutation::CreateCollection(Box::new(notes())),
@@ -128,7 +130,13 @@ async fn write_fixtures() {
         .commit((0..10).map(gone).chain([row(ROWS)]).collect())
         .await
         .unwrap();
-    writer.flush().await.unwrap();
+    paused.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    assert_eq!(stored.recv().await, Some("stored"));
+    paused.armed.store(false, Ordering::SeqCst);
     writer
         .commit(vec![
             gone(10),
@@ -147,6 +155,8 @@ async fn write_fixtures() {
         }])
         .await
         .unwrap();
+    paused.release.notify_one();
+    flushing.await.unwrap().unwrap();
 
     let committed = cluster.committed().await;
     let described = json!({
@@ -289,5 +299,15 @@ fn every_fixture_file_decodes_as_what_it_is() {
         let (first, newest) = (&manifests[0], &manifests[manifests.len() - 1]);
         assert_eq!(first.1.prev, None);
         assert_eq!(newest.1.prev.as_deref(), Some(first.0.as_str()));
+        assert_eq!(
+            newest.1.replay.len(),
+            2,
+            "logs committed while it was built"
+        );
+        for log in &newest.1.replay {
+            assert!(partition
+                .join(log.trim_start_matches("tenant-a/0/"))
+                .is_file());
+        }
     }
 }

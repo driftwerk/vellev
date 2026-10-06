@@ -1041,7 +1041,9 @@ impl State {
     }
 
     /// What a flush needs to build its segment without the writer, or
-    /// `None` when nothing was committed since the last checkpoint.
+    /// `None` when nothing was committed since the last checkpoint. Its
+    /// rows are left to be copied by [`Self::copy_rows`], a part at a time,
+    /// so that commits are not held up while all of them are.
     pub(crate) fn snapshot(&self) -> Option<Snapshot> {
         if self.since.is_empty() {
             return None;
@@ -1053,15 +1055,26 @@ impl State {
             position: self.position,
             checkpoint: self.checkpoint.clone(),
             catalog: self.catalog.clone(),
-            rows: at
-                .iter()
-                .map(|row| self.memtable.rows[*row].clone())
-                .collect(),
+            rows: Vec::with_capacity(at.len()),
             tombstones: self.memtable.tombstones.clone(),
             at,
             held: self.memtable.rows.len(),
             logs: self.since.len(),
         })
+    }
+
+    /// Copy into `snapshot` up to `most` more of its rows. A memtable row
+    /// never changes once written, and none goes until the flush that took
+    /// the snapshot is adopted, so they may be copied in parts while
+    /// commits go on. Returns whether any are left to copy.
+    pub(crate) fn copy_rows(&self, snapshot: &mut Snapshot, most: usize) -> bool {
+        let from = snapshot.rows.len();
+        let to = (from + most).min(snapshot.at.len());
+        let rows = &self.memtable.rows;
+        snapshot
+            .rows
+            .extend(snapshot.at[from..to].iter().map(|row| rows[*row].clone()));
+        to < snapshot.at.len()
     }
 
     /// The manifest a flush built from `snapshot` commits at `position`:

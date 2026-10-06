@@ -121,11 +121,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     else {
         return Err("the lease is held".into());
     };
-    let writer = Writer::open(blobs, coordinator.clone(), lease, &committed).await?;
+    let writer = Arc::new(Writer::open(blobs, coordinator.clone(), lease, &committed).await?);
     let schema = collection(dimensions as u32);
     let name = schema.name.clone();
+    let aside = Collection {
+        name: CollectionName::new("WrittenDuringFlushes").expect("valid name"),
+        ..schema.clone()
+    };
+    let during_flushes = aside.name.clone();
     writer
-        .commit(vec![Mutation::CreateCollection(Box::new(schema))])
+        .commit(vec![
+            Mutation::CreateCollection(Box::new(schema)),
+            Mutation::CreateCollection(Box::new(aside)),
+        ])
         .await?;
     println!("{objects} objects of {dimensions} dims in {groups} groups, {segments} segments");
 
@@ -152,11 +160,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             writer.commit(mutations).await?;
         }
+        // Commit one object at a time while the flush runs, to see how long
+        // a commit waits for it.
         let flushing = Instant::now();
-        writer.flush().await?;
+        let flush = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.flush().await }
+        });
+        let mut waited = Duration::ZERO;
+        let mut during = 0;
+        while !flush.is_finished() {
+            let n = objects + segment * 1_000_000 + during;
+            let commit = Instant::now();
+            writer
+                .commit(vec![Mutation::Upsert {
+                    collection: during_flushes.clone(),
+                    id: ObjectId::generate(),
+                    properties: json!({ "content": "during", "line": n as i64 })
+                        .as_object()
+                        .expect("an object")
+                        .clone(),
+                    vector: Some(vector(n, 7)),
+                }])
+                .await?;
+            waited = waited.max(commit.elapsed());
+            during += 1;
+        }
+        flush.await??;
         writer.clean(Duration::ZERO).await?;
         println!(
-            "segment {segment}: committed and flushed by {:.1?} (flush {:.1?}), rss {} MB",
+            "segment {segment}: committed and flushed by {:.1?} (flush {:.1?}, {during} commits during it, the longest {waited:.1?}), rss {} MB",
             started.elapsed(),
             flushing.elapsed(),
             resident_mb()
