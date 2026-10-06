@@ -2,6 +2,7 @@ mod common;
 
 use common::*;
 use vellev_core::Object;
+use vellev_storage::Merging;
 
 fn ids(objects: Vec<&Object>) -> Vec<ObjectId> {
     let mut ids: Vec<ObjectId> = objects.into_iter().map(|object| object.id).collect();
@@ -120,7 +121,7 @@ async fn small_segments_are_merged_into_one_and_reads_stay_the_same() {
 }
 
 #[tokio::test]
-async fn a_segment_mostly_dead_is_rewritten_alone_and_keeps_the_tombstones_older_rows_need() {
+async fn a_segment_half_dead_is_rewritten_alone_keeping_only_the_tombstones_older_rows_need() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
     let first = (0..10).map(|n| upsert("notes", n, 0));
@@ -134,10 +135,33 @@ async fn a_segment_mostly_dead_is_rewritten_alone_and_keeps_the_tombstones_older
         .chain((0..4).map(|n| delete("notes", n)));
     writer.commit(second.collect()).await.unwrap();
     writer.flush().await.unwrap();
-    assert_eq!(writer.merge().await.unwrap(), None, "nothing is stale yet");
+    assert_eq!(
+        writer.merge().await.unwrap(),
+        None,
+        "four of ten is not half"
+    );
+
+    writer.commit(vec![delete("notes", 4)]).await.unwrap();
+    writer.flush().await.unwrap();
+    writer
+        .merge()
+        .await
+        .unwrap()
+        .expect("half the first segment is dead");
+    let segments = segments_of(&cluster).await;
+    let shape: Vec<(u64, u64)> = segments
+        .iter()
+        .map(|segment| (segment.rows, segment.tombstones))
+        .collect();
+    assert_eq!(
+        shape,
+        [(5, 0), (10, 4), (0, 1)],
+        "nothing older for tombstones to act on"
+    );
+    assert!(segments[0].key.ends_with("-merged.segment"));
 
     writer
-        .commit((10..16).map(|n| delete("notes", n)).collect())
+        .commit((10..15).map(|n| delete("notes", n)).collect())
         .await
         .unwrap();
     writer.flush().await.unwrap();
@@ -145,24 +169,103 @@ async fn a_segment_mostly_dead_is_rewritten_alone_and_keeps_the_tombstones_older
         .merge()
         .await
         .unwrap()
-        .expect("the second segment is mostly dead");
+        .expect("half the second segment is dead");
     let segments = segments_of(&cluster).await;
-    assert_eq!(segments.len(), 3);
-    let rewritten = &segments[1];
-    assert!(rewritten.key.ends_with("-merged.segment"));
-    assert_eq!((rewritten.rows, rewritten.tombstones), (4, 4));
-    let file = segment(&cluster, &rewritten.key).await;
+    assert_eq!((segments[1].rows, segments[1].tombstones), (5, 4));
+    let file = segment(&cluster, &segments[1].key).await;
     assert_eq!(
         file.tombstones.len(),
         4,
         "still shadow the first segment's rows"
     );
 
-    cluster.open().await.partition().read(|state| {
-        let live = ids(state.scan(&name("notes")).collect());
-        let expected: Vec<ObjectId> = (4..10).chain(16..20).map(id).collect();
-        assert_eq!(live, expected);
+    let expected: Vec<ObjectId> = (5..10).chain(15..20).map(id).collect();
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| assert_eq!(ids(state.scan(&name("notes")).collect()), expected));
+    }
+}
+
+#[tokio::test]
+async fn a_merge_that_leaves_later_segments_keeps_every_row_where_it_is_found() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await.merging_with(Merging {
+        fanout: 2,
+        rows: 100,
+        ..Merging::default()
     });
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for (round, count) in [10u8, 10, 60, 10].into_iter().enumerate() {
+        let first = (round as u8) * 60;
+        let writes = (0..count).map(|n| upsert("notes", first + n, i64::from(round as u8)));
+        writer.commit(writes.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    writer
+        .merge()
+        .await
+        .unwrap()
+        .expect("the two small segments in front merge");
+    let shape: Vec<u64> = segments_of(&cluster)
+        .await
+        .iter()
+        .map(|segment| segment.rows)
+        .collect();
+    assert_eq!(
+        shape,
+        [20, 60, 10],
+        "the big segment and the one after stay"
+    );
+    assert_eq!(writer.merge().await.unwrap(), None);
+
+    writer
+        .commit(vec![
+            upsert("notes", 180, 8),
+            delete("notes", 181),
+            upsert("notes", 120, 7),
+        ])
+        .await
+        .unwrap();
+    let check = |state: &State| {
+        assert_eq!(state.count(&name("notes")), 89);
+        assert_eq!(n_of(state, "notes", 180), Some(8));
+        assert_eq!(n_of(state, "notes", 181), None);
+        assert_eq!(n_of(state, "notes", 182), Some(3));
+        assert_eq!(n_of(state, "notes", 120), Some(7));
+        assert_eq!(n_of(state, "notes", 121), Some(2));
+        assert_eq!(n_of(state, "notes", 61), Some(1));
+        assert_eq!(ids(state.scan(&name("notes")).collect()).len(), 89);
+    };
+    writer.partition().read(check);
+    writer.flush().await.unwrap();
+    cluster.open().await.partition().read(check);
+
+    writer
+        .commit((120..150).map(|n| delete("notes", n)).collect())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    writer
+        .merge()
+        .await
+        .unwrap()
+        .expect("half the big segment is dead");
+    let shape: Vec<(u64, u64)> = segments_of(&cluster)
+        .await
+        .iter()
+        .map(|segment| (segment.rows, segment.tombstones))
+        .collect();
+    assert_eq!(shape[1], (30, 0));
+    let check = |state: &State| {
+        assert_eq!(state.count(&name("notes")), 59);
+        assert_eq!(n_of(state, "notes", 180), Some(8));
+        assert_eq!(n_of(state, "notes", 150), Some(2));
+        assert_eq!(n_of(state, "notes", 149), None);
+    };
+    writer.partition().read(check);
+    cluster.open().await.partition().read(check);
 }
 
 #[tokio::test]
@@ -286,4 +389,73 @@ async fn a_commit_in_flight_while_cleaning_is_not_mistaken_for_an_orphan() {
         .await
         .partition()
         .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
+}
+
+#[tokio::test]
+async fn a_row_deleted_while_its_merge_is_built_stays_dead() {
+    let mut cluster = Cluster::new().await;
+    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let paused = Arc::new(Paused {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+        events,
+        release: tokio::sync::Notify::new(),
+    });
+    cluster.blobs = paused.clone();
+    let merging = Merging {
+        fanout: 2,
+        ..Merging::default()
+    };
+    let writer = Arc::new(cluster.writer().await.merging_with(merging));
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for round in 0..2u8 {
+        let writes = (0..10).map(|n| upsert("notes", round * 10 + n, 1));
+        writer.commit(writes.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    paused.armed.store(true, Ordering::SeqCst);
+
+    let deleting = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.commit(vec![delete("notes", 3)]).await }
+    });
+    assert_eq!(seen.recv().await, Some("stored"));
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    tokio::task::yield_now().await;
+    paused.release.notify_one();
+    deleting.await.unwrap().unwrap();
+    merging
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the two segments merge");
+
+    let check = |state: &State| {
+        assert_eq!(n_of(state, "notes", 3), None);
+        assert_eq!(state.count(&name("notes")), 19);
+        assert_eq!(ids(state.scan(&name("notes")).collect()).len(), 19);
+    };
+    writer.partition().read(check);
+    cluster.open().await.partition().read(check);
+
+    writer
+        .merge()
+        .await
+        .unwrap()
+        .expect("the merged segment and the flush merge again");
+    let shape: Vec<(u64, u64)> = segments_of(&cluster)
+        .await
+        .iter()
+        .map(|segment| (segment.rows, segment.tombstones))
+        .collect();
+    assert_eq!(
+        shape,
+        [(19, 0)],
+        "the row is left out rather than brought back"
+    );
+    writer.partition().read(check);
+    cluster.open().await.partition().read(check);
 }

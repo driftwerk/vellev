@@ -18,14 +18,29 @@ type RowKey = (CollectionId, ObjectId);
 /// any approximation used. Scoring this many takes well under a millisecond.
 pub(crate) const SHORTLIST_ABOVE: usize = 4_000;
 
-/// A segment with at least this share of its rows dead is rewritten on its
-/// own, to give the space back.
-const STALE: f64 = 0.5;
-/// How many adjacent small segments are merged into one.
-const FANOUT: usize = 4;
-/// The most live rows a merge produces, and a quarter of it the most a
-/// segment may hold to count as small.
-const MERGED_ROWS: usize = 1_000_000;
+/// When segments are merged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Merging {
+    /// A segment with at least this share of its rows dead is rewritten on
+    /// its own, to give the space back.
+    pub stale: f64,
+    /// How many adjacent small segments are merged into one. Fewer than two
+    /// is taken as two.
+    pub fanout: usize,
+    /// The most live rows a merge produces; a segment holding at most a
+    /// `fanout`th of it counts as small.
+    pub rows: usize,
+}
+
+impl Default for Merging {
+    fn default() -> Self {
+        Self {
+            stale: 0.5,
+            fanout: 4,
+            rows: 1_000_000,
+        }
+    }
+}
 
 /// A run of adjacent segments to be replaced by one holding their live rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,10 +549,10 @@ impl State {
         Ok(())
     }
 
-    /// The merge most worth doing, if any: a segment at least half dead on
-    /// its own, else the oldest run of [`FANOUT`] or more adjacent small
-    /// segments.
-    pub(crate) fn merge_plan(&self) -> Option<Merge> {
+    /// The merge most worth doing, if any: a stale segment on its own, else
+    /// the oldest run of enough adjacent small segments.
+    pub(crate) fn merge_plan(&self, merging: &Merging) -> Option<Merge> {
+        let fanout = merging.fanout.max(2);
         let live = |segment: &Segment| segment.dead.iter().filter(|dead| !**dead).count();
         let plan = |run: std::ops::Range<usize>| Merge {
             keys: self.segments[run.clone()]
@@ -548,7 +563,7 @@ impl State {
         };
         let stale = self.segments.iter().position(|segment| {
             let rows = segment.file.rows.len();
-            rows > 0 && (rows - live(segment)) as f64 >= rows as f64 * STALE
+            rows > 0 && (rows - live(segment)) as f64 >= rows as f64 * merging.stale
         });
         if let Some(at) = stale {
             return Some(plan(at..at + 1));
@@ -556,7 +571,7 @@ impl State {
         let small: Vec<bool> = self
             .segments
             .iter()
-            .map(|segment| live(segment) <= MERGED_ROWS / FANOUT)
+            .map(|segment| live(segment) <= merging.rows / fanout)
             .collect();
         let mut start = 0;
         while start < self.segments.len() {
@@ -564,13 +579,13 @@ impl State {
             let mut rows = 0;
             while end < self.segments.len() && small[end] {
                 let more = live(&self.segments[end]);
-                if rows + more > MERGED_ROWS {
+                if rows + more > merging.rows {
                     break;
                 }
                 rows += more;
                 end += 1;
             }
-            if end - start >= FANOUT {
+            if end - start >= fanout {
                 return Some(plan(start..end));
             }
             start = end.max(start + 1);

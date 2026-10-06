@@ -17,7 +17,7 @@ use crate::format::{
     decode, decode_head, encode, Head, Kind, LogSegment, Manifest, Op, SegmentMeta,
 };
 use crate::mutation::{Mutation, Receipt, Vectorize};
-use crate::state::{Loaded, State};
+use crate::state::{Loaded, Merging, State};
 use crate::{Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
@@ -246,6 +246,7 @@ pub struct Writer {
     lease: Lease,
     author: Author,
     vectorize: Option<Arc<dyn Vectorize>>,
+    merging: Merging,
     ready: Mutex<bool>,
 }
 
@@ -269,6 +270,7 @@ impl Writer {
             lease,
             author,
             vectorize: None,
+            merging: Merging::default(),
             ready: Mutex::new(true),
         })
     }
@@ -280,6 +282,11 @@ impl Writer {
             vectorize: Some(vectorize),
             ..self
         }
+    }
+
+    /// Merge segments as `merging` says, instead of as by default.
+    pub fn merging_with(self, merging: Merging) -> Self {
+        Self { merging, ..self }
     }
 
     pub fn partition(&self) -> &Arc<Partition> {
@@ -553,7 +560,7 @@ impl Writer {
     /// `None` when there was nothing to merge or the segments changed under
     /// the snapshot, in which case asking again is fine.
     pub async fn merge(&self) -> Result<Option<LogPosition>> {
-        let Some(merge) = self.partition.read(State::merge_plan) else {
+        let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
         let Some((file, indexes)) = self.partition.read(|state| {
