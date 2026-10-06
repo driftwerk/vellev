@@ -22,8 +22,9 @@ Design: https://claude.ai/code/artifact/4a8d0a03-c431-4595-8810-c2b8e64787b6
 ## Develop
 
 ```sh
-docker compose -f docker-compose.dev.yml up -d   # Postgres on 54329, S3 on 59090 (bucket vellev-dev)
+docker compose -f docker-compose.dev.yml up -d   # Postgres on 54329, S3 on 59090 (bucket vellev-dev), Weaviate on 58080
 export VELLEV_TEST_DATABASE_URL=postgres://vellev:vellev@127.0.0.1:54329/vellev
+export VELLEV_WEAVIATE_URL=http://127.0.0.1:58080   # the comparison with Weaviate
 cargo test --workspace                           # Postgres tests skip when the URL is unset
 cargo run -p vellev -- health --url http://127.0.0.1:8080
 ```
