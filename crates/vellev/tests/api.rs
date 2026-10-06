@@ -1360,7 +1360,7 @@ async fn a_tenant_key_reaches_its_tenant_alone_and_learns_nothing_of_others() {
             (Method::GET, "/v1/tenants/acme/keys"),
         ] {
             let (status, body) = as_key(node, &key, method.clone(), path, None).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}: {body}");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
         }
     }
     let beta_count = first
@@ -1389,11 +1389,67 @@ async fn a_tenant_key_reaches_its_tenant_alone_and_learns_nothing_of_others() {
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
+    // However the path is written, a key reaches no further than its tenant.
+    for path in [
+        "/v1/tenants/%62eta/collections",
+        "/v1/tenants/ACME/collections",
+        "/v1/tenants//acme/collections",
+        "/v1/tenants/beta%2Facme/collections",
+        "/v1/tenants/acme/../beta/collections",
+        "/v1/tenants/acme/collections/notes/../../../beta/collections",
+        "/v1/tenants/beta/keys",
+    ] {
+        let (status, body) = as_key(&first, &key, Method::GET, path, None).await;
+        assert!(
+            [
+                StatusCode::NOT_FOUND,
+                StatusCode::FORBIDDEN,
+                StatusCode::BAD_REQUEST
+            ]
+            .contains(&status),
+            "{path}: {status} {body}"
+        );
+        assert!(body.get("collections").is_none(), "{path}: {body}");
+    }
+    // Sent as written: an HTTP client would take the dots out first.
+    let raw = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let address = second.url.trim_start_matches("http://");
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "DELETE /v1/tenants/acme/collections/%2e%2e HTTP/1.1\r\nhost: {address}\r\nauthorization: Bearer {key}\r\nconnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        answer
+    };
+    assert!(
+        raw.starts_with("HTTP/1.1 400"),
+        "no dot segment is sent on: {raw}"
+    );
+    let (status, _) = second
+        .call_headed(
+            Some(&key),
+            Method::GET,
+            "/v1/tenants/beta/collections",
+            None,
+            &[("x-vellev-forwarded", "1")],
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nor by claiming to be sent on"
+    );
+
+    // Revoked through the node that does not hold the tenant, the key stops
+    // working on that node at once.
     let id = issued["id"].as_str().unwrap();
-    first
+    second
         .ok(Method::DELETE, &format!("/v1/tenants/acme/keys/{id}"), None)
         .await;
-    let (status, _) = first
+    let (status, _) = second
         .call_as(
             Some(&key),
             Method::GET,
@@ -1432,4 +1488,36 @@ async fn a_tenant_key_reaches_its_tenant_alone_and_learns_nothing_of_others() {
         first.post("/v1/tenants/gone/keys", json!(null)).await.0,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn every_route_is_either_for_admins_or_one_tenants() {
+    let described: Value = serde_json::to_value(vellev::server::openapi()).unwrap();
+    let mut routes: Vec<&str> = described["paths"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    routes.sort_unstable();
+    // A route added must be put in one list or the other, knowingly.
+    let tenants_own = [
+        "/v1/tenants/{tenant}/changes",
+        "/v1/tenants/{tenant}/collections",
+        "/v1/tenants/{tenant}/collections/{collection}",
+        "/v1/tenants/{tenant}/collections/{collection}/count",
+        "/v1/tenants/{tenant}/collections/{collection}/hybrid",
+        "/v1/tenants/{tenant}/collections/{collection}/keyword",
+        "/v1/tenants/{tenant}/collections/{collection}/list",
+        "/v1/tenants/{tenant}/collections/{collection}/nearest",
+        "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
+        "/v1/tenants/{tenant}/collections/{collection}/properties",
+    ];
+    let mut classified: Vec<&str> = vellev::server::ADMIN_ONLY
+        .iter()
+        .chain(&tenants_own)
+        .copied()
+        .collect();
+    classified.sort_unstable();
+    assert_eq!(routes, classified);
 }

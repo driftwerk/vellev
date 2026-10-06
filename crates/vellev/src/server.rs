@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State as Shared};
+use axum::extract::{
+    DefaultBodyLimit, FromRequestParts, MatchedPath, RawPathParams, Request, State as Shared,
+};
 use axum::http::header::{self, HeaderMap, HeaderName, AUTHORIZATION};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
@@ -11,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::openapi::OpenApi;
@@ -192,19 +195,19 @@ async fn closing(Shared(app): Shared<App>, request: Request, next: Next) -> Resp
     response
 }
 
-/// Whether two keys are the same, in time that does not depend on where
-/// they first differ.
+/// Whether two keys are the same, in time that depends on neither where
+/// they differ nor how long they are.
 fn same(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0, |differ, (x, y)| differ | (x ^ y))
-            == 0
+    let (a, b) = (Sha256::digest(a.as_bytes()), Sha256::digest(b.as_bytes()));
+    a.iter()
+        .zip(b.iter())
+        .fold(0, |differ, (x, y)| differ | (x ^ y))
+        == 0
 }
 
 /// The routes only an admin key reaches: the tenants themselves and their
-/// keys.
-const ADMIN_ONLY: [&str; 4] = [
+/// keys. Every other route that needs a key is one tenant's.
+pub const ADMIN_ONLY: [&str; 4] = [
     "/v1/tenants",
     "/v1/tenants/{tenant}",
     "/v1/tenants/{tenant}/keys",
@@ -221,6 +224,7 @@ async fn authorized(
     next: Next,
 ) -> Result<Response, ApiError> {
     let unauthorized = || ApiError::new(Code::Unauthorized, "a valid API key is required");
+    let forbidden = || ApiError::new(Code::Forbidden, "only an admin key may do this");
     let presented = request
         .headers()
         .get(AUTHORIZATION)
@@ -242,16 +246,28 @@ async fn authorized(
         .await?
         .ok_or_else(unauthorized)?;
     let route = request.extensions().get::<MatchedPath>();
-    if route.is_some_and(|route| ADMIN_ONLY.contains(&route.as_str())) {
-        return Err(ApiError::new(
-            Code::Unauthorized,
-            "only an admin key may do this",
-        ));
+    if route.is_none_or(|route| ADMIN_ONLY.contains(&route.as_str())) {
+        return Err(forbidden());
     }
-    match tenant_of(request.uri().path()) {
-        Some(tenant) if tenant == reaches => Ok(next.run(request).await),
-        Some(tenant) => Err(NodeError::UnknownTenant(tenant).into()),
-        None => Err(unauthorized()),
+    // The tenant as the router read it, which is what the handler is given.
+    let (mut parts, body) = request.into_parts();
+    let named = RawPathParams::from_request_parts(&mut parts, &app)
+        .await
+        .ok()
+        .and_then(|params| {
+            params
+                .iter()
+                .find(|(name, _)| *name == "tenant")
+                .map(|(_, tenant)| tenant.to_string())
+        });
+    match named {
+        Some(tenant) if tenant == reaches.as_str() => {
+            Ok(next.run(Request::from_parts(parts, body)).await)
+        }
+        Some(tenant) => Err(ApiError::not_found(format!(
+            "tenant {tenant} does not exist"
+        ))),
+        None => Err(forbidden()),
     }
 }
 
@@ -307,8 +323,20 @@ async fn forwarded(
     next: Next,
 ) -> Result<Response, ApiError> {
     let matched = request.extensions().get::<MatchedPath>();
-    if reads(request.method(), matched.map(MatchedPath::as_str)) {
+    // A tenant's keys are the coordinator's, and are changed where the
+    // request arrives, so that node forgets the old ones at once.
+    if reads(request.method(), matched.map(MatchedPath::as_str))
+        || matched.is_some_and(|route| ADMIN_ONLY.contains(&route.as_str()))
+    {
         return Ok(next.run(request).await);
+    }
+    let path = request.uri().path();
+    let dotted = path.to_ascii_lowercase().contains("%2e")
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..");
+    if dotted {
+        return Err(ApiError::invalid("a path may not hold dot segments"));
     }
     let tenant = tenant_of(request.uri().path());
     let sent_on = request.headers().contains_key(FORWARDED);

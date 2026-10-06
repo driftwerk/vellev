@@ -58,7 +58,10 @@ curl -sS -X POST -H 'authorization: Bearer dev-key' http://127.0.0.1:8080/v1/ten
 
 Keys are listed with `GET` and revoked with `DELETE …/keys/{id}`; a revoked
 key stops working at once on the node that revoked it and within ten seconds
-on the others. Dropping a tenant takes its keys with it.
+on the others. Dropping a tenant takes its keys with it, on the same terms: a
+tenant made again under the same id within those ten seconds may still be
+reached by an old key through another node. A key on an admin route is
+answered 403.
 
 `vellev serve --help` lists every setting. On SIGTERM a node reports not
 ready, keeps serving for `VELLEV_STOP_DELAY_SECS` (a few seconds on Docker

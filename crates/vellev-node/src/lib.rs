@@ -97,6 +97,8 @@ pub enum NodeError {
     Elsewhere { tenant: TenantId, holder: NodeId },
     #[error("the node is stopping")]
     Stopped,
+    #[error("the node is looking up too many keys at once")]
+    Busy,
     #[error("the hold on tenant {0} ran out while it was being opened")]
     Lost(TenantId),
     #[error("this node has not caught up with tenant {0} as far as asked")]

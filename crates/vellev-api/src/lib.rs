@@ -103,6 +103,8 @@ pub enum Code {
     /// The request is malformed or asks for something that cannot be.
     Invalid,
     Unauthorized,
+    /// The key is valid, and does not reach what the request asks for.
+    Forbidden,
     NotFound,
     /// The request disagrees with what is stored.
     Conflict,
@@ -155,12 +157,22 @@ pub struct TenantPage {
 /// A key that reaches one tenant, just issued. Its secret is shown this
 /// once; keep it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedKey {
     pub id: uuid::Uuid,
     /// What to send as the bearer key.
     pub key: String,
     pub created: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Debug for IssuedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedKey")
+            .field("id", &self.id)
+            .field("key", &"…")
+            .field("created", &self.created)
+            .finish()
+    }
 }
 
 /// A key that reaches one tenant, without its secret.
