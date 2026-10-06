@@ -386,10 +386,10 @@ impl Nearest {
         self.heap.len() >= self.count
     }
 
-    fn rows(self) -> Vec<u32> {
+    fn estimates(self) -> Vec<(f32, u32)> {
         self.heap
             .into_iter()
-            .map(|candidate| candidate.row)
+            .map(|candidate| (candidate.distance, candidate.row))
             .collect()
     }
 }
@@ -584,9 +584,9 @@ impl ClusteredIndex {
                         .unwrap_or(order.len())
                 };
                 nearest
-                    .rows()
+                    .estimates()
                     .into_iter()
-                    .map(move |row| rank_of(self.at[self.position(row).unwrap()].0))
+                    .map(move |(_, row)| rank_of(self.at[self.position(row).unwrap()].0))
             })
             .collect();
         if ranks.is_empty() {
@@ -629,32 +629,17 @@ impl ClusteredIndex {
         order
     }
 
-    fn position(&self, row: u32) -> Option<usize> {
-        self.rows.binary_search(&row).ok()
-    }
-
-    fn centroid(&self, cluster: usize) -> &[f32] {
-        &self.centroids[cluster * self.rotation.width..][..self.rotation.width]
-    }
-
-    fn code<'a>(&self, cluster: &'a Cluster, index: usize) -> &'a [u64] {
-        let words = self.rotation.width / 64;
-        &cluster.codes[index * words..][..words]
-    }
-}
-
-impl VectorIndex for ClusteredIndex {
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn shortlist(
+    /// Up to `count` rows likely to be nearest `query`, as for
+    /// [`VectorIndex::shortlist`], each with its estimated distance under
+    /// the index's metric: comparable with the estimates of other indexes
+    /// of vectors measured the same way.
+    pub fn estimates(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
-    ) -> Vec<u32> {
+    ) -> Vec<(f32, u32)> {
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
@@ -702,7 +687,39 @@ impl VectorIndex for ClusteredIndex {
                 }
             }
         }
-        nearest.rows()
+        nearest.estimates()
+    }
+
+    fn position(&self, row: u32) -> Option<usize> {
+        self.rows.binary_search(&row).ok()
+    }
+
+    fn centroid(&self, cluster: usize) -> &[f32] {
+        &self.centroids[cluster * self.rotation.width..][..self.rotation.width]
+    }
+
+    fn code<'a>(&self, cluster: &'a Cluster, index: usize) -> &'a [u64] {
+        let words = self.rotation.width / 64;
+        &cluster.codes[index * words..][..words]
+    }
+}
+
+impl VectorIndex for ClusteredIndex {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn shortlist(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+    ) -> Vec<u32> {
+        self.estimates(query, count, only, skipped)
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect()
     }
 }
 

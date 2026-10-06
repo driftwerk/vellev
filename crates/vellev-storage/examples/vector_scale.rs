@@ -107,13 +107,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coordinator = Arc::new(MemoryCoordinator::default());
     coordinator.register(&key).await?;
     let dir = tempfile::tempdir()?;
-    let memory = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
-    let blobs: Arc<dyn Blobs> = match std::env::var("STORE").as_deref() {
+    // Where the files are kept, and the store a node reads them through.
+    let (stored, blobs): (Arc<dyn Blobs>, Arc<dyn Blobs>) = match std::env::var("STORE").as_deref()
+    {
         Ok("file") => {
             let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path())?;
-            Arc::new(ObjectBlobs::on_disk(Arc::new(local), dir.path()))
+            let on_disk = Arc::new(ObjectBlobs::on_disk(Arc::new(local), dir.path()));
+            (on_disk.clone(), on_disk)
         }
-        _ => Arc::new(CachedBlobs::new(memory.clone(), dir.path())),
+        _ => {
+            let memory = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+            (
+                memory.clone(),
+                Arc::new(CachedBlobs::new(memory, dir.path())),
+            )
+        }
     };
     let Acquired::Lease { lease, committed } = coordinator
         .acquire(&key, &NodeId::generate("bench"), Duration::from_secs(3600))
@@ -274,7 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("unfiltered", None, &exact_all),
         ("filtered to half", Some(&half), &exact_half),
     ] {
-        for oversample in [16usize, 64] {
+        for oversample in [16usize, 64, 128, 256] {
             let mut latencies = Vec::with_capacity(queries);
             let mut found = 0;
             for (query, nearest) in probes.iter().zip(truth) {
@@ -294,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             latencies.sort();
             println!(
-                "{label:>16} oversample {oversample:>2}: recall@10 {:.3}, p50 {:.2?}, p99 {:.2?}",
+                "{label:>16} oversample {oversample:>3}: recall@10 {:.3}, p50 {:.2?}, p99 {:.2?}",
                 found as f64 / (queries * 10) as f64,
                 latencies[queries / 2],
                 latencies[queries * 99 / 100],
@@ -309,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("an empty cache", empty.path()),
         ("a warm cache", empty.path()),
     ] {
-        let cached = Arc::new(CachedBlobs::new(memory.clone(), cache));
+        let cached = Arc::new(CachedBlobs::new(stored.clone(), cache));
         let opening = Instant::now();
         let follower = Follower::open(key.clone(), cached, &committed).await?;
         let rows = follower.partition().read(|state| state.count(&name));

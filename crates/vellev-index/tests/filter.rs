@@ -421,3 +421,44 @@ proptest! {
         prop_assert_eq!(serde_json::from_value::<Filter>(json).unwrap(), filter);
     }
 }
+
+proptest! {
+    /// Over enough values for the index to summarise them, a range selects
+    /// what it selects unsummarised and what asking each object says,
+    /// whatever its bounds, at the edges of the runs or between them.
+    #[test]
+    fn a_summarised_index_selects_every_range_as_each_object_would(
+        counts in prop::collection::vec(0i64..5_000, 1_500..4_000),
+        a in -10i64..5_010,
+        b in -10i64..5_010,
+        bounds in prop::sample::select(vec![("gt", "lt"), ("gte", "lte"), ("gt", "lte"), ("gte", "lt")]),
+        open in prop::sample::select(vec![None, Some(true), Some(false)]),
+    ) {
+        let schema = collection();
+        let objects: Vec<Object> = counts
+            .iter()
+            .enumerate()
+            .map(|(n, count)| object(n as u32, json!({ "count": count })))
+            .collect();
+        let mut plain = RowIndex::default();
+        for (row, object) in objects.iter().enumerate() {
+            plain.insert(&schema, row as u32, object);
+        }
+        let mut summarised = plain.clone();
+        summarised.summarise();
+        let (low, high) = (a.min(b), a.max(b));
+        let lower = json!({ bounds.0: { "property": "count", "value": low } });
+        let upper = json!({ bounds.1: { "property": "count", "value": high } });
+        let json = match open {
+            None => json!({ "and": [lower, upper] }),
+            Some(true) => lower,
+            Some(false) => upper,
+        };
+        let predicate = filter(json).compile(&schema).unwrap();
+        let expected: Vec<u32> = (0..objects.len() as u32)
+            .filter(|row| predicate.matches(&objects[*row as usize]))
+            .collect();
+        prop_assert_eq!(predicate.select(&plain).iter().collect::<Vec<_>>(), expected.clone());
+        prop_assert_eq!(predicate.select(&summarised).iter().collect::<Vec<_>>(), expected);
+    }
+}

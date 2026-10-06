@@ -61,13 +61,19 @@ fn exact(vectors: &[Vec<f32>], query: &[f32]) -> Vec<ObjectId> {
         .collect()
 }
 
+/// How many times the limit is scored: few enough of these rows that an
+/// index which misleads shows in what is found.
+const OVERSAMPLE: usize = 64;
+
 fn found(state: &State, vectors: &[Vec<f32>]) -> (usize, usize) {
     let (mut hits, mut total) = (0, 0);
     for query in vectors.iter().step_by(vectors.len() / 25) {
         let nearest = exact(vectors, query);
-        let got = state
-            .search(&name("notes"), &Query::nearest(query, 10))
-            .unwrap();
+        let asked = Query {
+            oversample: OVERSAMPLE,
+            ..Query::nearest(query, 10)
+        };
+        let got = state.search(&name("notes"), &asked).unwrap();
         assert_eq!(got.len(), 10);
         hits += got
             .iter()
@@ -298,4 +304,45 @@ async fn a_segment_too_small_for_a_shortlist_gets_no_index_file() {
     }
     writer.flush().await.unwrap();
     assert_eq!(segments_of(&cluster).await[0].index, None);
+}
+
+#[tokio::test]
+async fn the_nearest_all_in_one_of_several_clustered_segments_are_all_found() {
+    let cluster = Cluster::new().await;
+    let mut random = Random(5);
+    let query = random.vector(DIMENSIONS);
+    let mut vectors: Vec<Vec<f32>> = (0..3 * ROWS).map(|_| random.vector(DIMENSIONS)).collect();
+    for n in 0..10 {
+        let jitter = random.vector(DIMENSIONS);
+        vectors[(2 * ROWS + 100 + n) as usize] = query
+            .iter()
+            .zip(jitter)
+            .map(|(q, j)| q + j * 0.01)
+            .collect();
+    }
+    let writer = written(&cluster, &vectors, 3).await;
+    let segments = segments_of(&cluster).await;
+    assert_eq!(segments.len(), 3);
+    assert!(segments.iter().all(|segment| segment.index.is_some()));
+
+    let mut nearest = exact(&vectors, &query);
+    nearest.sort();
+    // Budgets one segment alone resolves at these few dimensions; what is
+    // tested is that the other segments do not crowd them out.
+    for oversample in [8, 32] {
+        let asked = Query {
+            oversample,
+            ..Query::nearest(&query, 10)
+        };
+        let mut found: Vec<ObjectId> = writer.partition().read(|state| {
+            state
+                .search(&name("notes"), &asked)
+                .unwrap()
+                .iter()
+                .map(|hit| hit.object.id)
+                .collect()
+        });
+        found.sort();
+        assert_eq!(found, nearest, "oversample {oversample}");
+    }
 }
