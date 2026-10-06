@@ -29,7 +29,8 @@ pub struct Config {
     /// region, endpoint and credentials; `file:///path`; or `memory://`.
     #[arg(long, env = "VELLEV_STORE")]
     pub store: String,
-    /// A local directory to keep fetched data files in.
+    /// A local directory to keep fetched data files in. Vectors are read
+    /// in place from it; a node without one holds every vector in memory.
     #[arg(long, env = "VELLEV_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
     /// The keys callers may present, separated by commas.

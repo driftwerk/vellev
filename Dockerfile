@@ -19,6 +19,7 @@ RUN apt-get update \
     && install -d -o vellev -g vellev /var/lib/vellev/models /var/lib/vellev/cache
 COPY --from=build /usr/local/bin/vellev /usr/local/bin/vellev
 USER vellev
+ENV VELLEV_CACHE_DIR=/var/lib/vellev/cache VELLEV_MODEL_DIR=/var/lib/vellev/models
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD ["vellev", "health"]
 ENTRYPOINT ["tini", "--", "vellev"]

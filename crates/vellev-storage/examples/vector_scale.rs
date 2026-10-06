@@ -5,7 +5,8 @@
 //!   cargo run --release -p vellev-storage --example vector_scale
 //!
 //! Environment: OBJECTS (1000000), DIMS (768), SEGMENTS (4), QUERIES (50),
-//! GROUPS (1000).
+//! GROUPS (1000). The store is kept in memory with a local copy on disk,
+//! so vectors are read in place as a node would read them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use vellev_core::{
 };
 use vellev_index::filter::Filter;
 use vellev_index::vector::distance;
-use vellev_storage::blobs::ObjectBlobs;
+use vellev_storage::blobs::{CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Acquired, Coordinator, MemoryCoordinator, PartitionKey};
 use vellev_storage::{Mutation, Query, Writer};
 
@@ -98,7 +99,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let coordinator = Arc::new(MemoryCoordinator::default());
     coordinator.register(&key).await?;
-    let blobs = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let cache = tempfile::tempdir()?;
+    let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let blobs = Arc::new(CachedBlobs::new(store, cache.path()));
     let Acquired::Lease { lease, committed } = coordinator
         .acquire(&key, &NodeId::generate("bench"), Duration::from_secs(3600))
         .await?
