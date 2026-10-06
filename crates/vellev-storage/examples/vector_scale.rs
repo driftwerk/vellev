@@ -22,7 +22,7 @@ use vellev_index::filter::Filter;
 use vellev_index::vector::distance;
 use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Acquired, Coordinator, MemoryCoordinator, PartitionKey};
-use vellev_storage::{Mutation, Query, Writer};
+use vellev_storage::{Follower, Mutation, Query, Writer};
 
 fn setting(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -107,15 +107,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coordinator = Arc::new(MemoryCoordinator::default());
     coordinator.register(&key).await?;
     let dir = tempfile::tempdir()?;
+    let memory = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
     let blobs: Arc<dyn Blobs> = match std::env::var("STORE").as_deref() {
         Ok("file") => {
             let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path())?;
             Arc::new(ObjectBlobs::on_disk(Arc::new(local), dir.path()))
         }
-        _ => {
-            let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
-            Arc::new(CachedBlobs::new(store, dir.path()))
-        }
+        _ => Arc::new(CachedBlobs::new(memory.clone(), dir.path())),
     };
     let Acquired::Lease { lease, committed } = coordinator
         .acquire(&key, &NodeId::generate("bench"), Duration::from_secs(3600))
@@ -271,5 +269,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("rss {} MB", resident_mb());
+
+    let committed = coordinator.committed(&key).await?.ok_or("registered")?;
+    let empty = tempfile::tempdir()?;
+    for (label, cache) in [
+        ("an empty cache", empty.path()),
+        ("a warm cache", empty.path()),
+    ] {
+        let cached = Arc::new(CachedBlobs::new(memory.clone(), cache));
+        let opening = Instant::now();
+        let follower = Follower::open(key.clone(), cached, &committed).await?;
+        let rows = follower.partition().read(|state| state.count(&name));
+        println!(
+            "opened {rows} objects from {label} in {:.1?}",
+            opening.elapsed()
+        );
+    }
     Ok(())
 }

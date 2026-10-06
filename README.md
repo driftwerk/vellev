@@ -37,7 +37,11 @@ export VELLEV_API_KEYS=dev-key
 cargo run -p vellev -- serve --listen 127.0.0.1:8080
 ```
 
-`vellev serve --help` lists every setting. A node answers `/health/live` as
+`vellev serve --help` lists every setting. On SIGTERM a node reports not
+ready, keeps serving for `VELLEV_STOP_DELAY_SECS` (a few seconds on Docker
+Swarm; none is needed on ECS), finishes what is in flight within
+`VELLEV_DRAIN_SECS`, and lets go of its tenants; keep both under the
+platform's grace period. A node answers `/health/live` as
 soon as it is up and `/health/ready` once it has reached Postgres; until then
 the API answers 503.
 

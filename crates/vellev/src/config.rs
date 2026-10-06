@@ -97,9 +97,17 @@ pub struct Config {
         value_parser = clap::value_parser!(u16).range(1..=i64::from(FORMAT_VERSION))
     )]
     pub max_format: u16,
-    /// How long requests in flight are given to finish once the node is
-    /// told to stop, in seconds. Keep it under the platform's own grace
-    /// period, so that the node lets go of its tenants before it is killed.
+    /// How long a node told to stop keeps serving while it reports not
+    /// ready, in seconds, so that whatever routes requests to it stops
+    /// before it closes its port: Docker Swarm's routing mesh and load
+    /// balancers that check `/health/ready` need a few seconds. ECS stops
+    /// sending before it signals, so none is needed there.
+    #[arg(long, env = "VELLEV_STOP_DELAY_SECS", default_value_t = 0)]
+    pub stop_delay_secs: u64,
+    /// How long requests in flight are then given to finish, in seconds.
+    /// Keep the delay and this under the platform's own grace period (ECS
+    /// `stopTimeout`, Swarm `stop_grace_period`), so that the node lets go
+    /// of its tenants before it is killed.
     #[arg(long, env = "VELLEV_DRAIN_SECS", default_value_t = 20)]
     pub drain_secs: u64,
 }

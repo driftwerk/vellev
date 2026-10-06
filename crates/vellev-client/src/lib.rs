@@ -171,6 +171,12 @@ impl std::fmt::Debug for Client {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Read,
+    /// A write whose effect is the same however many times it is made:
+    /// sent again when its outcome is unknown, like a read. A try that
+    /// outlives the timeout may still land after the one sent again, which
+    /// undoes a later write of the caller's only if that try is slower
+    /// still.
+    Repeatable,
     Write,
 }
 
@@ -295,7 +301,7 @@ impl Client {
             let node = (first + attempt) % nodes.len();
             let after = match kind {
                 Kind::Read => tenant.and_then(|tenant| self.after(tenant)),
-                Kind::Write => None,
+                Kind::Repeatable | Kind::Write => None,
             };
             let failure = match self.once(node, &method, path, body, after).await {
                 Ok(answer) => {
@@ -305,7 +311,7 @@ impl Client {
                 Err(failure) => failure,
             };
             let again = match (kind, failure.fate()) {
-                (_, Fate::NoEffect) | (Kind::Read, Fate::Unknown) => true,
+                (_, Fate::NoEffect) | (Kind::Read | Kind::Repeatable, Fate::Unknown) => true,
                 (Kind::Write, Fate::Unknown) | (_, Fate::Final) => false,
             };
             if !again || attempt + 1 == options.attempts as usize {
@@ -400,6 +406,7 @@ impl Tenant {
     /// Send a write, and remember where it can be read from.
     async fn write(
         &self,
+        kind: Kind,
         method: Method,
         rest: &str,
         body: Option<&(impl Serialize + ?Sized)>,
@@ -407,7 +414,7 @@ impl Tenant {
         let path = self.path(rest);
         let written: Written = self
             .client
-            .ask(Kind::Write, method, &path, body, Some(&self.id))
+            .ask(kind, method, &path, body, Some(&self.id))
             .await?;
         let mut learnt = self.client.learnt();
         let known = learnt.entry(Some(self.id.clone())).or_default();
@@ -422,7 +429,13 @@ impl Tenant {
     pub async fn create(&self) -> Result<()> {
         let path = self.path("");
         self.client
-            .ask(Kind::Write, Method::PUT, &path, None::<&()>, Some(&self.id))
+            .ask(
+                Kind::Repeatable,
+                Method::PUT,
+                &path,
+                None::<&()>,
+                Some(&self.id),
+            )
             .await
     }
 
@@ -432,7 +445,7 @@ impl Tenant {
         let dropped: Result<()> = self
             .client
             .ask(
-                Kind::Write,
+                Kind::Repeatable,
                 Method::DELETE,
                 &path,
                 None::<&()>,
@@ -450,8 +463,13 @@ impl Tenant {
 
     /// Apply `changes` as one atomic step, each seeing those before it.
     pub async fn apply(&self, changes: Vec<Change>) -> Result<Written> {
+        self.batch(Kind::Write, changes).await
+    }
+
+    async fn batch(&self, kind: Kind, changes: Vec<Change>) -> Result<Written> {
         let batch = Batch { changes };
-        self.write(Method::POST, "/changes", Some(&batch)).await
+        self.write(kind, Method::POST, "/changes", Some(&batch))
+            .await
     }
 
     pub fn collection(&self, collection: &CollectionName) -> Records {
@@ -498,18 +516,26 @@ impl Records {
     /// Creating a collection that exists exactly so changes nothing.
     pub async fn create(&self, schema: &Collection) -> Result<Written> {
         let path = self.path("");
-        self.tenant.write(Method::PUT, &path, Some(schema)).await
+        self.tenant
+            .write(Kind::Repeatable, Method::PUT, &path, Some(schema))
+            .await
     }
 
+    /// Not sent again when its outcome is unknown: once made, making it
+    /// again is refused, as there is no collection to drop.
     pub async fn drop(&self) -> Result<Written> {
         let path = self.path("");
-        self.tenant.write(Method::DELETE, &path, None::<&()>).await
+        self.tenant
+            .write(Kind::Write, Method::DELETE, &path, None::<&()>)
+            .await
     }
 
     /// Adding a property that exists unchanged changes nothing.
     pub async fn add_property(&self, property: &Property) -> Result<Written> {
         let path = self.path("/properties");
-        self.tenant.write(Method::POST, &path, Some(property)).await
+        self.tenant
+            .write(Kind::Repeatable, Method::POST, &path, Some(property))
+            .await
     }
 
     pub async fn get(&self, id: ObjectId) -> Result<Option<Stored>> {
@@ -520,19 +546,25 @@ impl Records {
     /// Store the object whole, replacing any stored under its id.
     pub async fn put(&self, id: ObjectId, content: &Content) -> Result<Written> {
         let path = self.object(id);
-        self.tenant.write(Method::PUT, &path, Some(content)).await
+        self.tenant
+            .write(Kind::Repeatable, Method::PUT, &path, Some(content))
+            .await
     }
 
     /// Merge into a stored object: a property sent as null is removed.
     pub async fn patch(&self, id: ObjectId, changes: &Changes) -> Result<Written> {
         let path = self.object(id);
-        self.tenant.write(Method::PATCH, &path, Some(changes)).await
+        self.tenant
+            .write(Kind::Write, Method::PATCH, &path, Some(changes))
+            .await
     }
 
     /// Deleting an object that is not stored changes nothing.
     pub async fn delete(&self, id: ObjectId) -> Result<Written> {
         let path = self.object(id);
-        self.tenant.write(Method::DELETE, &path, None::<&()>).await
+        self.tenant
+            .write(Kind::Repeatable, Method::DELETE, &path, None::<&()>)
+            .await
     }
 
     /// Store every object whole, several to a request, each request one
@@ -565,15 +597,15 @@ impl Records {
             if full && !batch.is_empty() {
                 let sent = std::mem::take(&mut batch);
                 let count = sent.len();
-                let written = self
-                    .tenant
-                    .apply(sent)
-                    .await
-                    .map_err(|source| Error::Partial {
-                        stored,
-                        position,
-                        source: Box::new(source),
-                    })?;
+                let written =
+                    self.tenant
+                        .batch(Kind::Repeatable, sent)
+                        .await
+                        .map_err(|source| Error::Partial {
+                            stored,
+                            position,
+                            source: Box::new(source),
+                        })?;
                 stored += count;
                 position = Some(written.position);
                 bytes = 0;

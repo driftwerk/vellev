@@ -30,6 +30,14 @@ pub use reading::{Freshness, Reader};
 /// announces the new one.
 pub const PROTOCOL: u16 = 1;
 
+/// A key nothing is kept under, asked for to tell that object storage
+/// answers: that it is missing is the answer.
+const READINESS: &str = "vellev-readiness";
+
+/// How long object storage having answered counts for readiness, so that
+/// health checks do not ask it every few seconds.
+const STORE_ANSWERED: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub node: NodeId,
@@ -298,6 +306,8 @@ struct Inner {
     embedders: Arc<Embedders>,
     settings: Settings,
     open: Mutex<Open>,
+    /// When object storage last answered a readiness check.
+    store_answered: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,12 +326,14 @@ impl Node {
             embedders,
             settings,
             open: Mutex::default(),
+            store_answered: Mutex::default(),
         }))
     }
 
-    /// Whether the node can reach what it needs to serve and can read what
-    /// the cluster writes.
+    /// Whether the node can reach Postgres and object storage and can read
+    /// what the cluster writes.
     pub async fn ready(&self) -> Result<()> {
+        self.store_answers().await?;
         let cluster = self.0.coordinator.format().await?;
         match cluster <= FORMAT_VERSION {
             true => Ok(()),
@@ -329,6 +341,22 @@ impl Node {
                 cluster,
                 reads: FORMAT_VERSION,
             }),
+        }
+    }
+
+    /// Whether object storage answered within [`STORE_ANSWERED`], asking
+    /// it again if not.
+    async fn store_answers(&self) -> Result<()> {
+        let fresh = |at: &Option<Instant>| at.is_some_and(|at| at.elapsed() < STORE_ANSWERED);
+        if fresh(&self.0.store_answered.lock().expect("readiness lock")) {
+            return Ok(());
+        }
+        match self.0.blobs.get(READINESS).await {
+            Ok(_) | Err(StorageError::Missing { .. }) => {
+                *self.0.store_answered.lock().expect("readiness lock") = Some(Instant::now());
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
         }
     }
 

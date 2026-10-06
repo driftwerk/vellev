@@ -363,6 +363,42 @@ async fn a_request_is_sent_again_only_where_that_cannot_make_a_change_twice() {
         assert_eq!(asked(name, "GET"), sends, "a read of {name}: {failed}");
     }
 
+    let put = |name: &'static str| {
+        let notes = client.tenant(&tenant(name)).collection(&notes_named());
+        async move { notes.put(oid(1), &content("fox", 1, None)).await }
+    };
+    let patch = |name: &'static str| {
+        let notes = client.tenant(&tenant(name)).collection(&notes_named());
+        let changes = Changes {
+            properties: json!({ "n": 2 }).as_object().unwrap().clone(),
+            vector: None,
+            only_if: None,
+        };
+        async move { notes.patch(oid(1), &changes).await }
+    };
+    for (name, sends) in [("torn", 3), ("proxied", 3), ("garbled", 3), ("wrong", 1)] {
+        let failed = put(name).await.unwrap_err();
+        assert_eq!(
+            asked(name, "PUT"),
+            sends,
+            "a whole object put to {name}, made twice as once: {failed}"
+        );
+    }
+    patch("torn").await.unwrap_err();
+    assert_eq!(asked("torn", "PATCH"), 1, "a patch is not sent again");
+    let posted = asked("torn", "POST");
+    let stored = client
+        .tenant(&tenant("torn"))
+        .collection(&notes_named())
+        .store_all([(oid(1), content("fox", 1, None))])
+        .await;
+    assert!(matches!(stored, Err(Error::Partial { stored: 0, .. })));
+    assert_eq!(
+        asked("torn", "POST") - posted,
+        3,
+        "whole objects stored together are sent again"
+    );
+
     let proxied = write("proxied").await.unwrap_err();
     assert!(
         matches!(&proxied, Error::Status { status: StatusCode::BAD_GATEWAY, body } if body.contains("Bad Gateway")),
@@ -654,4 +690,89 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     );
     assert_eq!(failed.code(), Some(Code::Invalid));
     assert_eq!(by_count.count(None).await.unwrap(), 10);
+}
+
+#[tokio::test]
+async fn a_node_stopped_and_replaced_under_load_fails_no_request() {
+    let cluster = Cluster::new();
+    let (leaving, staying) = (cluster.serve().await, cluster.serve().await);
+    let replacement = cluster.unstarted(&[], None).await;
+    let nodes = [&leaving.url, &staying.url, &replacement.url];
+    let client = Client::connect(&nodes.map(String::as_str), KEY, Options::default()).unwrap();
+    let acme = client.tenant(&tenant("acme"));
+    acme.create().await.unwrap();
+    acme.collection(&notes_named())
+        .create(&schema())
+        .await
+        .unwrap();
+
+    const WORKERS: u64 = 8;
+    let (done, after_stop) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load: Vec<_> = (0..WORKERS)
+        .map(|worker| {
+            let notes = acme.collection(&notes_named());
+            let (done, after_stop, stopped) = (done.clone(), after_stop.clone(), stopped.clone());
+            tokio::spawn(async move {
+                let mut failures = Vec::new();
+                let mut n = worker;
+                while after_stop.load(Ordering::SeqCst) < 200 {
+                    n += WORKERS;
+                    let put = notes
+                        .put(oid(n), &content("fox", n, Some([1.0, 0.0])))
+                        .await;
+                    let read = notes.get(oid(n)).await;
+                    match (put, read) {
+                        (Ok(_), Ok(Some(_))) => {}
+                        other => failures.push((n, format!("{other:?}"))),
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                    if stopped.load(Ordering::SeqCst) {
+                        after_stop.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                failures
+            })
+        })
+        .collect();
+
+    while done.load(Ordering::SeqCst) < 100 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    leaving.app.stopping();
+    stopped.store(true, Ordering::SeqCst);
+    let (status, _) = leaving.get("/health/ready").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "not ready once stopping"
+    );
+    let live = leaving
+        .http
+        .get(format!("{}/health/live", leaving.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+    assert_eq!(
+        live.headers()
+            .get("connection")
+            .and_then(|value| value.to_str().ok()),
+        Some("close"),
+        "callers are asked to close the connection"
+    );
+    let node = leaving.node.clone();
+    leaving.stop().await;
+    node.shutdown().await;
+    replacement.app.start(replacement.node.clone());
+
+    let mut failures = Vec::new();
+    for worker in load {
+        failures.extend(worker.await.unwrap());
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    let written = done.load(Ordering::SeqCst);
+    let count = acme.collection(&notes_named()).count(None).await.unwrap();
+    assert_eq!(count, written as u64);
+    assert_eq!(replacement.get("/health/ready").await.0, StatusCode::OK);
 }
