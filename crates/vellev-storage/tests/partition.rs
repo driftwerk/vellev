@@ -954,6 +954,7 @@ fn manifest_of(segments: Vec<SegmentMeta>) -> Manifest {
         next_collection_id: 1,
         collections: vec![(CollectionId(0), schema("notes"))],
         segments,
+        replay: Vec::new(),
     }
 }
 

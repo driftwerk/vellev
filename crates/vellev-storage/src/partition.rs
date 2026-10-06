@@ -284,8 +284,34 @@ impl Partition {
             }
         }))
         .await?;
+        let replay = try_join_all(manifest.replay.iter().map(|key| async move {
+            let log: LogSegment = decode(key, Kind::Log, &self.fetch(key).await?)?;
+            Ok::<_, StorageError>((key.clone(), log))
+        }))
+        .await?;
         let key = key.to_string();
-        blocking(move || State::from_manifest(&key, manifest, segments)).await?
+        blocking(move || {
+            let position = manifest.position;
+            let state = State::from_manifest(&key, manifest, segments)?;
+            let Some((_, first)) = replay.first() else {
+                return Ok(state);
+            };
+            let start = first.position.0.checked_sub(1).ok_or_else(|| {
+                StorageError::corrupt(&key, "a replayed log is at the start of the log")
+            })?;
+            let mut state = state.before_replay(LogPosition(start), first.prev.clone());
+            for (log_key, log) in &replay {
+                state.apply(log_key, log)?;
+            }
+            match state.position().next() == Some(position) {
+                true => Ok(state.at_manifest(&key, position)),
+                false => Err(StorageError::corrupt(
+                    &key,
+                    "its replayed logs do not end just before it",
+                )),
+            }
+        })
+        .await?
     }
 
     /// The clustered indexes kept under `key` for the segment under
@@ -365,6 +391,9 @@ pub struct Writer {
     vectorize: Option<Arc<dyn Vectorize>>,
     merging: Merging,
     ready: Mutex<bool>,
+    /// Held while a flush or a merge builds its segment without `ready`,
+    /// so that one never builds on a state the other is about to replace.
+    building: Mutex<()>,
 }
 
 impl Writer {
@@ -389,6 +418,7 @@ impl Writer {
             vectorize: None,
             merging: Merging::default(),
             ready: Mutex::new(true),
+            building: Mutex::new(()),
         })
     }
 
@@ -629,43 +659,74 @@ impl Writer {
 
     /// Write a checkpoint: move the rows held in memory into a segment and
     /// commit a manifest, so recovery no longer needs the log before it.
+    /// The segment is built from the partition as it is now and written
+    /// while commits go on; the manifest then names the logs committed
+    /// meanwhile, which are replayed over it. Returns the position the
+    /// checkpoint was committed at, or the current one when nothing needed
+    /// flushing or a checkpoint made meanwhile left nothing to do.
     pub async fn flush(&self) -> Result<LogPosition> {
+        let _building = self.building.lock().await;
+        let Some(mut snapshot) = self.partition.read(State::snapshot) else {
+            return Ok(self.partition.read(State::position));
+        };
+        let segment = match snapshot.rows.is_empty() && snapshot.tombstones.is_empty() {
+            true => None,
+            false => {
+                let names = self.staged(snapshot.position);
+                let rows = std::mem::take(&mut snapshot.rows);
+                let above = self.merging.clustered_above;
+                let shape = Shape::of(&snapshot.catalog, &rows, snapshot.tombstones.len(), above);
+                let file = SegmentFile {
+                    position: snapshot.position,
+                    rows,
+                    tombstones: snapshot.tombstones.clone(),
+                };
+                let prepared = Self::prepared(names.meta(shape), self.built(file).await?)?;
+                self.upload(&prepared).await?;
+                Some(prepared)
+            }
+        };
         let mut ready = self.ready.lock().await;
         if !*ready {
             return Err(StorageError::Closed);
         }
-        let (position, pending) = self
+        let (current, follows) = self
             .partition
-            .read(|state| (state.position(), state.has_commits_since_checkpoint()));
-        if !pending {
-            return Ok(position);
+            .read(|state| (state.position(), state.follows(&snapshot)));
+        if !follows {
+            return Ok(current);
         }
-        let position = following(position)?;
-        let layout = Layout(&self.lease.key);
-        let names = self.names(position, false);
-        let key = layout.manifest(position, &self.author);
-        let (segment, manifest) = self
+        let position = following(current)?;
+        let key = Layout(&self.lease.key).manifest(position, &self.author);
+        let flushed = segment.as_ref().map(|prepared| prepared.meta.clone());
+        let manifest = self
             .partition
-            .read(|state| state.checkpoint(position, &names, self.merging.clustered_above));
-        let segment = match segment {
-            Some((meta, file)) => Some(Self::prepared(meta, self.built(file).await?)?),
-            None => None,
-        };
+            .read(|state| state.flushed_manifest(position, &snapshot, flushed));
         let frame = encode(Kind::Manifest, &manifest)?;
         attempt(&mut ready, async {
-            if let Some(segment) = &segment {
-                self.upload(segment).await?;
-            }
             self.publish(&key, frame, position).await?;
             let segment = match segment {
                 Some(segment) => Some(self.loaded(segment).await?),
                 None => None,
             };
             let mut state = self.partition.state.write().expect("partition lock");
-            state.checkpointed(&key, position, segment)
+            state.flushed(&key, position, snapshot, segment)
         })
         .await?;
         Ok(position)
+    }
+
+    /// Names for the files of a segment built from the partition as it was
+    /// at `position`, apart from those of any other build from there.
+    fn staged(&self, position: LogPosition) -> Names {
+        let layout = Layout(&self.lease.key);
+        let nonce = uuid::Uuid::new_v4().as_u64_pair().0;
+        let named = |kind| layout.staged(kind, position, &self.author, nonce);
+        Names {
+            segment: named("segment"),
+            index: named("index"),
+            vectors: named("vectors"),
+        }
     }
 
     fn names(&self, position: LogPosition, merged: bool) -> Names {
@@ -760,6 +821,7 @@ impl Writer {
     /// `None` when there was nothing to merge or the segments changed under
     /// the snapshot, in which case asking again is fine.
     pub async fn merge(&self) -> Result<Option<LogPosition>> {
+        let _building = self.building.lock().await;
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
@@ -879,6 +941,7 @@ impl Writer {
                     meta.vectors.as_deref(),
                 ]
             })
+            .chain(base.replay.iter().map(|key| Some(key.as_str())))
             .flatten()
             .collect();
         let orphans = files

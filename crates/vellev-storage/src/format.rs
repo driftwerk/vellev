@@ -136,6 +136,11 @@ pub struct SegmentIndex {
 
 /// A checkpoint: everything needed to rebuild the partition as of `position`
 /// without reading any log before it. Segments are listed oldest first.
+///
+/// A flush builds its segment from the partition as it was at an earlier
+/// position while commits go on; its manifest then lists, in `replay`, the
+/// logs committed since, which are applied after the segments, and the
+/// collections are those of that earlier position.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub position: LogPosition,
@@ -145,6 +150,9 @@ pub struct Manifest {
     pub next_collection_id: u64,
     pub collections: Vec<(CollectionId, Collection)>,
     pub segments: Vec<SegmentMeta>,
+    /// The logs to apply after the segments, oldest first.
+    #[serde(default)]
+    pub replay: Vec<String>,
 }
 
 /// A file a head reference can point at.
@@ -429,6 +437,7 @@ mod tests {
                 next_collection_id: 2,
                 collections: vec![(CollectionId(1), schema)],
                 segments: vec![],
+                replay: vec!["a/0/log/x.log".into()],
             };
             let frame = encode(Kind::Manifest, &manifest).unwrap();
             assert_eq!(

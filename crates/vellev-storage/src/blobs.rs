@@ -83,6 +83,12 @@ impl Layout<'_> {
         self.named("index", position, author, "-merged")
     }
 
+    /// A file of a segment a flush built from the partition as it was at
+    /// `position`, named apart by `nonce` from any other build from there.
+    pub fn staged(&self, kind: &str, position: LogPosition, author: &Author, nonce: u64) -> String {
+        self.named(kind, position, author, &format!("-{nonce:016x}"))
+    }
+
     /// The vectors file of the segment a flush at `position` writes.
     pub fn vectors(&self, position: LogPosition, author: &Author) -> String {
         self.key("vectors", position, author)
