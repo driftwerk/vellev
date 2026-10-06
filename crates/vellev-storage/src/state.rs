@@ -154,6 +154,8 @@ struct Memtable {
 pub struct State {
     position: LogPosition,
     head: Option<String>,
+    /// The latest checkpoint's key.
+    checkpoint: Option<String>,
     catalog: Catalog,
     segments: Vec<Segment>,
     memtable: Memtable,
@@ -397,6 +399,7 @@ impl State {
         let state = State {
             position: manifest.position,
             head: Some(key.to_string()),
+            checkpoint: Some(key.to_string()),
             catalog,
             ..State::default()
         };
@@ -736,6 +739,7 @@ impl State {
         let flushed = segment.iter().map(|(meta, _)| meta.clone());
         let manifest = Manifest {
             position,
+            prev: self.checkpoint.clone(),
             next_collection_id: self.catalog.next_id(),
             collections: self
                 .catalog
@@ -767,6 +771,7 @@ impl State {
         self.memtable = Memtable::default();
         self.position = position;
         self.head = Some(manifest_key.to_string());
+        self.checkpoint = Some(manifest_key.to_string());
         self.has_commits_since_checkpoint = false;
         Ok(())
     }

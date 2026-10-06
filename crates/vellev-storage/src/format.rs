@@ -103,6 +103,9 @@ pub struct SegmentMeta {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub position: LogPosition,
+    /// The checkpoint before this one, if any.
+    #[serde(default)]
+    pub prev: Option<String>,
     pub next_collection_id: u64,
     pub collections: Vec<(CollectionId, Collection)>,
     pub segments: Vec<SegmentMeta>,
@@ -363,6 +366,7 @@ mod tests {
             };
             let manifest = Manifest {
                 position: LogPosition(3),
+                prev: None,
                 next_collection_id: 2,
                 collections: vec![(CollectionId(1), schema)],
                 segments: vec![],

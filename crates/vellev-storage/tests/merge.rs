@@ -389,10 +389,25 @@ async fn files_a_recent_head_still_reaches_stay_until_that_head_is_old() {
     age().await;
     writer.commit(vec![upsert("notes", 9, 9)]).await.unwrap();
     writer.merge().await.unwrap().unwrap();
+    let position = writer.partition().read(State::position);
+    let bogus = Manifest {
+        position: LogPosition(position.0 - 1),
+        prev: None,
+        next_collection_id: 1,
+        collections: Vec::new(),
+        segments: Vec::new(),
+    };
+    let stale = format!(
+        "{}manifest/{:020}-00000000000000000000-lost.manifest",
+        Layout(&cluster.key).prefix(),
+        position.0 - 1
+    );
+    let frame = format::encode(Kind::Manifest, &bogus).unwrap();
+    cluster.blobs.put(&stale, frame).await.unwrap();
     let (logs, segments, manifests) = files(&cluster).await;
     assert_eq!(
         (logs.len(), segments.len(), manifests.len()),
-        (6, 6, 5),
+        (6, 6, 6),
         "the merge also flushed the write before it"
     );
 
@@ -401,7 +416,7 @@ async fn files_a_recent_head_still_reaches_stay_until_that_head_is_old() {
     let (logs, segments, manifests) = files(&cluster).await;
     assert_eq!(
         (logs.len(), segments.len(), manifests.len()),
-        (1, 6, 2),
+        (1, 6, 3),
         "the write just before the merge is recent, so what it saw stays"
     );
     let before = cluster.committed().await;
@@ -418,7 +433,11 @@ async fn files_a_recent_head_still_reaches_stay_until_that_head_is_old() {
         .read(|state| assert_eq!(state.count(&name("notes")), 5));
 
     age().await;
-    assert_eq!(writer.clean(grace).await.unwrap(), 1 + 4 + 1);
+    assert_eq!(
+        writer.clean(grace).await.unwrap(),
+        1 + 4 + 2,
+        "the log, the segments, the checkpoint and a stale writer's manifest"
+    );
     let (logs, segments, manifests) = files(&cluster).await;
     assert_eq!((logs.len(), segments.len(), manifests.len()), (0, 2, 1));
     cluster
@@ -670,4 +689,29 @@ async fn a_segment_with_nothing_dead_is_never_stale_however_low_the_bar() {
         .unwrap()
         .expect("one dead row is enough");
     assert_eq!(writer.merge().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_writer_opened_from_a_checkpoint_carries_the_chain_on() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for round in 0..2u8 {
+        writer
+            .commit(vec![upsert("notes", round, 1)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    let writer = cluster.writer().await;
+    writer.commit(vec![upsert("notes", 2, 1)]).await.unwrap();
+    writer.flush().await.unwrap();
+    let head = cluster.committed().await.manifest.unwrap().0;
+    let bytes = cluster.blobs.get(&head).await.unwrap();
+    let manifest: Manifest = format::decode(&head, Kind::Manifest, &bytes).unwrap();
+    let (_, _, manifests) = files(&cluster).await;
+    assert_eq!(manifest.prev.as_deref(), Some(manifests[1].as_str()));
+    assert_eq!(writer.clean(Duration::ZERO).await.unwrap(), 4 + 2);
+    let (logs, segments, manifests) = files(&cluster).await;
+    assert_eq!((logs.len(), segments.len(), manifests.len()), (0, 3, 1));
 }

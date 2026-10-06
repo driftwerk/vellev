@@ -11,7 +11,7 @@ use bytes::Bytes;
 use object_store::{ObjectStore, PutPayload};
 
 use crate::coordinator::{Generation, LogPosition, PartitionKey};
-use crate::format::{verify, Kind};
+use crate::format::verify;
 use crate::{Result, StorageError};
 
 #[async_trait]
@@ -81,18 +81,14 @@ impl Layout<'_> {
         )
     }
 
-    /// What kind of file a key under this partition names and the position
-    /// it was written at, or `None` for a key not laid out this way.
-    pub(crate) fn parse(&self, key: &str) -> Option<(Kind, LogPosition)> {
+    /// The position a file under this partition was written at, or `None`
+    /// for a key not laid out this way.
+    pub(crate) fn position(&self, key: &str) -> Option<LogPosition> {
         let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
-        let kind = match kind {
-            "log" => Kind::Log,
-            "segment" => Kind::Segment,
-            "manifest" => Kind::Manifest,
-            _ => return None,
-        };
-        let position = name.get(..20)?.parse().ok()?;
-        Some((kind, LogPosition(position)))
+        if !matches!(kind, "log" | "segment" | "manifest") {
+            return None;
+        }
+        name.get(..20)?.parse().ok().map(LogPosition)
     }
 }
 

@@ -634,24 +634,27 @@ impl Writer {
     /// checkpoints have replaced. Everything reached from any head written
     /// in the last `grace` stays, so that the partition can be put back as
     /// it was at any moment in that window and a reader that took the
-    /// committed position within it still finds its files. Nothing ahead
-    /// of this writer's position is touched, which keeps a newer writer's
-    /// uploads safe whatever the clocks say. Returns how many files were
-    /// deleted.
+    /// committed position within it still finds its files. Nothing at or
+    /// ahead of this writer's position is touched, which keeps a newer
+    /// writer's uploads safe whatever the clocks say. Returns how many
+    /// files were deleted.
     ///
-    /// The files are listed before the position is read, with the writer
-    /// held so that no commit is in flight: a file this writer uploaded and
-    /// had not yet published when the listing was taken is reached by then
-    /// or belongs to a commit that failed.
+    /// What is needed is decided by the committed chain alone: it is walked
+    /// back to the latest checkpoint at or before the oldest recent file,
+    /// and everything before that checkpoint which it does not list goes.
+    /// The files are listed before the head is read, with the writer held
+    /// so that no commit is in flight: a file this writer uploaded and had
+    /// not yet published when the listing was taken is reached by then or
+    /// belongs to a commit that failed.
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
         let layout = Layout(&self.lease.key);
         let listed = self.partition.blobs.list(&layout.prefix()).await?;
-        let position = {
+        let (position, head) = {
             let ready = self.ready.lock().await;
             if !*ready {
                 return Err(StorageError::Closed);
             }
-            self.partition.read(State::position)
+            self.partition.read(State::at)
         };
         let cutoff = chrono::Duration::from_std(grace)
             .ok()
@@ -659,40 +662,33 @@ impl Writer {
         let Some(cutoff) = cutoff else {
             return Ok(0);
         };
-        let files: Vec<(&Listed, Kind, LogPosition)> = listed
+        let files: Vec<(&Listed, LogPosition)> = listed
             .iter()
-            .filter_map(|file| {
-                let (kind, at) = layout.parse(&file.key)?;
-                Some((file, kind, at))
-            })
+            .filter_map(|file| Some((file, layout.position(&file.key)?)))
             .collect();
         let young = files
             .iter()
-            .filter(|(file, _, _)| file.modified >= cutoff)
-            .map(|(_, _, at)| *at);
+            .filter(|(file, _)| file.modified >= cutoff)
+            .map(|(_, at)| *at);
         let floor = young.fold(position, std::cmp::min);
-        let Some(base) = files
-            .iter()
-            .filter(|(_, kind, at)| *kind == Kind::Manifest && *at <= floor)
-            .map(|(_, _, at)| *at)
-            .max()
-        else {
+        let mut cursor = head;
+        let base = loop {
+            let Some(key) = cursor else { break None };
+            cursor = match decode_head(&key, &self.partition.fetch(&key).await?)? {
+                Head::Log(log) => log.prev,
+                Head::Manifest(manifest) if manifest.position <= floor => break Some(manifest),
+                Head::Manifest(manifest) => manifest.prev,
+            };
+        };
+        let Some(base) = base else {
             return Ok(0);
         };
-        let mut reachable = HashSet::new();
-        let manifests = files
-            .iter()
-            .filter(|(_, kind, at)| *kind == Kind::Manifest && (base..=position).contains(at));
-        for (file, _, _) in manifests {
-            let bytes = self.partition.fetch(&file.key).await?;
-            let manifest: Manifest = decode(&file.key, Kind::Manifest, &bytes)?;
-            reachable.extend(manifest.segments.into_iter().map(|meta| meta.key));
-        }
+        let kept: HashSet<&str> = base.segments.iter().map(|meta| meta.key.as_str()).collect();
         let orphans = files
             .iter()
-            .filter(|(file, _, at)| *at < base && !reachable.contains(&file.key));
+            .filter(|(file, at)| *at < base.position && !kept.contains(file.key.as_str()));
         let mut deleted = 0;
-        for (file, _, _) in orphans {
+        for (file, _) in orphans {
             self.partition.blobs.delete(&file.key).await?;
             deleted += 1;
         }
