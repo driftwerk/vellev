@@ -9,8 +9,8 @@ use crate::state::{Layer, State, Vectors, SHORTLIST_ABOVE};
 use crate::Result;
 
 /// How many times `limit` rows are scored exactly: those the clustered
-/// layers estimate nearest, taken together, and as many from each smaller
-/// layer. Higher finds more of the true nearest at more cost per query;
+/// layers estimate nearest, taken together, with at least `limit` of each,
+/// and as many from each smaller layer. Higher finds more of the true nearest at more cost per query;
 /// zero is taken as one.
 pub const DEFAULT_OVERSAMPLE: usize = 128;
 
@@ -66,19 +66,26 @@ impl State {
         let layers: Vec<Layer<'_>> = self.layers().collect();
         let mut exact = Vec::new();
         let mut estimated = Vec::new();
+        let mut floors = 0;
         for (at, layer) in layers.iter().enumerate() {
             match candidates(layer, id, predicate.as_ref(), query.vector, budget) {
                 Candidates::Exact(rows) => exact.extend(rows.into_iter().map(|row| (at, row))),
-                Candidates::Estimated(rows) => {
-                    estimated.extend(rows.into_iter().map(|(estimate, row)| (estimate, at, row)))
+                // Each layer's own nearest few are always scored: one whose
+                // estimates err more than others' would otherwise crowd
+                // them out with rows that only look near.
+                Candidates::Estimated(mut rows) => {
+                    let rest = nearest_estimated(&mut rows, query.limit);
+                    floors += rows.len();
+                    exact.extend(rows.into_iter().map(|(_, row)| (at, row)));
+                    estimated.extend(
+                        rest.into_iter()
+                            .map(|(estimate, row)| (estimate, (at, row))),
+                    );
                 }
             }
         }
-        if estimated.len() > budget {
-            estimated.select_nth_unstable_by(budget, |a, b| a.0.total_cmp(&b.0));
-            estimated.truncate(budget);
-        }
-        let estimated = estimated.into_iter().map(|(_, at, row)| (at, row));
+        nearest_estimated(&mut estimated, budget.saturating_sub(floors));
+        let estimated = estimated.into_iter().map(|(_, found)| found);
         let mut hits: Vec<Hit<'_>> = exact
             .into_iter()
             .chain(estimated)
@@ -147,6 +154,16 @@ fn candidates(
         }
         None => Candidates::Exact(live().collect()),
     }
+}
+
+/// Keep in `rows` the `count` with the nearest estimates, in no order,
+/// returning the others.
+fn nearest_estimated<T>(rows: &mut Vec<(f32, T)>, count: usize) -> Vec<(f32, T)> {
+    if rows.len() <= count {
+        return Vec::new();
+    }
+    rows.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0));
+    rows.split_off(count)
 }
 
 /// The layer's live `row` scored exactly, if it has a vector.

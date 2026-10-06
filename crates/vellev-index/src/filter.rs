@@ -364,30 +364,39 @@ const RUN: usize = 256;
 
 /// The rows of runs of consecutive values unioned ahead of time, so that a
 /// range over many values unions a few of these and the values at its
-/// edges. Level 0 unions [`RUN`] values, and each level above unions
-/// [`RUN`] runs of the level below.
+/// edges. Level 0 unions `run` values, and each level above unions `run`
+/// runs of the level below.
 #[derive(Debug, Clone)]
 struct Runs {
+    run: usize,
     /// The first value of each run of level 0.
     firsts: Vec<Key>,
     levels: Vec<Vec<RoaringBitmap>>,
 }
 
 impl Runs {
-    /// Of `values`, when there are enough for a range to gain by it.
-    fn of(values: &BTreeMap<Key, RoaringBitmap>) -> Option<Self> {
-        if values.len() < RUN * 4 {
+    /// Of `values`, when they can be ranged over and there are enough of
+    /// them for a range to gain by it.
+    fn of(values: &BTreeMap<Key, RoaringBitmap>, run: usize) -> Option<Self> {
+        let ordered = matches!(
+            values.keys().next(),
+            Some(Key::Int(_) | Key::Number(_) | Key::Date(_))
+        );
+        if !ordered || values.len() < run * 4 {
             return None;
         }
-        let keys: Vec<&Key> = values.keys().collect();
-        let firsts = keys.chunks(RUN).map(|run| run[0].clone()).collect();
+        let firsts = values.keys().step_by(run).cloned().collect();
         let bitmaps: Vec<&RoaringBitmap> = values.values().collect();
-        let mut levels = vec![unions(&bitmaps)];
-        while levels[levels.len() - 1].len() > RUN {
-            let below: Vec<&RoaringBitmap> = levels[levels.len() - 1].iter().collect();
-            levels.push(unions(&below));
+        let mut levels = vec![unions(&bitmaps, run)];
+        while let Some(top) = levels.last().filter(|top| top.len() > run) {
+            let below: Vec<&RoaringBitmap> = top.iter().collect();
+            levels.push(unions(&below, run));
         }
-        Some(Self { firsts, levels })
+        Some(Self {
+            run,
+            firsts,
+            levels,
+        })
     }
 
     /// The runs of level 0 lying wholly within the bounds, as `a..b`.
@@ -397,18 +406,15 @@ impl Runs {
             Bound::Excluded(lower) => key <= lower,
             Bound::Unbounded => false,
         };
-        let under = |key: &Key| match upper {
-            Bound::Included(upper) => key <= upper,
-            Bound::Excluded(upper) => key < upper,
-            Bound::Unbounded => true,
-        };
         let a = self.firsts.partition_point(below);
-        // The last run starting under the upper bound may run past it,
-        // unless it is the last of all and the bound is open.
-        let starting = self.firsts.partition_point(under);
+        // A run lies wholly under the upper bound when the next one starts
+        // at or under it, or when the range is open above.
         let b = match upper {
-            Bound::Unbounded => starting,
-            _ => starting.saturating_sub(1),
+            Bound::Unbounded => self.firsts.len(),
+            Bound::Included(upper) | Bound::Excluded(upper) => self
+                .firsts
+                .partition_point(|key| key <= upper)
+                .saturating_sub(1),
         };
         a..b.max(a)
     }
@@ -420,7 +426,7 @@ impl Runs {
             out.extend(&self.levels[0][a..b]);
             return;
         }
-        let size = RUN.pow(level as u32);
+        let size = self.run.pow(level as u32);
         let (first, last) = (a.div_ceil(size), b / size);
         if first < last {
             self.cover(level - 1, a, first * size, out);
@@ -432,40 +438,46 @@ impl Runs {
     }
 }
 
-/// The union of each run of [`RUN`] bitmaps.
-fn unions(bitmaps: &[&RoaringBitmap]) -> Vec<RoaringBitmap> {
+/// The union of each run of `run` bitmaps.
+fn unions(bitmaps: &[&RoaringBitmap], run: usize) -> Vec<RoaringBitmap> {
     bitmaps
-        .chunks(RUN)
-        .map(|run| run.iter().copied().union())
+        .chunks(run)
+        .map(|chunk| chunk.iter().copied().union())
         .collect()
+}
+
+/// Whether no value lies within the bounds, which a [`BTreeMap`] range
+/// refuses.
+fn inverted(lower: Bound<&Key>, upper: Bound<&Key>) -> bool {
+    match (lower, upper) {
+        (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+        (Bound::Included(lower) | Bound::Excluded(lower), Bound::Excluded(upper))
+        | (Bound::Excluded(lower), Bound::Included(upper)) => lower >= upper,
+        _ => false,
+    }
 }
 
 impl PropertyIndex {
     /// The rows holding a value within the bounds.
     fn range(&self, lower: Bound<&Key>, upper: Bound<&Key>) -> RoaringBitmap {
-        let Some(runs) = &self.runs else {
-            return self
-                .values
-                .range((lower, upper))
-                .map(|(_, rows)| rows)
-                .union();
-        };
-        let whole = runs.within(lower, upper);
-        if whole.is_empty() {
-            return self
-                .values
-                .range((lower, upper))
-                .map(|(_, rows)| rows)
-                .union();
+        if inverted(lower, upper) {
+            return RoaringBitmap::new();
         }
+        let values = |lower, upper| self.values.range((lower, upper)).map(|(_, rows)| rows);
+        let Some((runs, whole)) = self
+            .runs
+            .as_ref()
+            .map(|runs| (runs, runs.within(lower, upper)))
+            .filter(|(_, whole)| !whole.is_empty())
+        else {
+            return values(lower, upper).union();
+        };
         let mut parts = Vec::new();
         runs.cover(runs.levels.len() - 1, whole.start, whole.end, &mut parts);
-        let before = (lower, Bound::Excluded(&runs.firsts[whole.start]));
-        parts.extend(self.values.range(before).map(|(_, rows)| rows));
-        // Past the last run there is nothing when the range is open above.
+        parts.extend(values(lower, Bound::Excluded(&runs.firsts[whole.start])));
+        // `whole` ends at the last run only when the range is open above.
         if let Some(next) = runs.firsts.get(whole.end) {
-            let after = (Bound::Included(next), upper);
-            parts.extend(self.values.range(after).map(|(_, rows)| rows));
+            parts.extend(values(Bound::Included(next), upper));
         }
         parts.into_iter().union()
     }
@@ -493,7 +505,7 @@ impl RowIndex {
     /// takes no more rows: the next insert undoes it.
     pub fn summarise(&mut self) {
         for index in self.properties.values_mut() {
-            index.runs = Runs::of(&index.values);
+            index.runs = Runs::of(&index.values, RUN);
         }
     }
 
@@ -513,5 +525,70 @@ impl RowIndex {
                 index.values.entry(key).or_default().insert(row);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds(n: i64) -> Vec<Bound<Key>> {
+        (-1..=n)
+            .flat_map(|k| [Bound::Included(Key::Int(k)), Bound::Excluded(Key::Int(k))])
+            .chain([Bound::Unbounded])
+            .collect()
+    }
+
+    /// Small runs, so that every level, partial top runs, and bounds on
+    /// every run's first and last values are all reached.
+    #[test]
+    fn a_range_over_runs_selects_what_it_selects_value_by_value() {
+        for n in [16, 17, 63, 64, 65, 257] {
+            let values: BTreeMap<Key, RoaringBitmap> = (0..n)
+                .map(|k| {
+                    (
+                        Key::Int(k),
+                        RoaringBitmap::from_iter([k as u32, 1_000 + k as u32]),
+                    )
+                })
+                .collect();
+            let plain = PropertyIndex {
+                values: values.clone(),
+                ..PropertyIndex::default()
+            };
+            let summarised = PropertyIndex {
+                runs: Runs::of(&values, 4),
+                ..plain.clone()
+            };
+            assert!(summarised.runs.is_some());
+            for lower in bounds(n) {
+                for upper in bounds(n) {
+                    let (lower, upper) = (lower.as_ref(), upper.as_ref());
+                    let expected: RoaringBitmap = values
+                        .iter()
+                        .filter(|(key, _)| (lower, upper).contains(*key))
+                        .map(|(_, rows)| rows)
+                        .union();
+                    assert_eq!(
+                        plain.range(lower, upper),
+                        expected,
+                        "{n}: {lower:?}..{upper:?}"
+                    );
+                    assert_eq!(
+                        summarised.range(lower, upper),
+                        expected,
+                        "{n}: {lower:?}..{upper:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_values_that_can_be_ranged_over_are_summarised() {
+        let text: BTreeMap<Key, RoaringBitmap> = (0..2_000)
+            .map(|k| (Key::Text(format!("{k:05}")), RoaringBitmap::from_iter([k])))
+            .collect();
+        assert!(Runs::of(&text, RUN).is_none());
     }
 }
