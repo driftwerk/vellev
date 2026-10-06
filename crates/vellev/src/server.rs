@@ -45,8 +45,9 @@ pub struct Limits {
 #[derive(Clone)]
 pub struct App {
     node: Arc<OnceLock<Arc<Node>>>,
-    /// Set once the node has been told to stop, so that whatever routes
-    /// requests here stops sending new ones while those in flight finish.
+    /// Set once the node has been told to stop: it reports not ready, and
+    /// asks callers to close each connection after its answer, for as long
+    /// as it serves before it closes its port.
     stopping: Arc<AtomicBool>,
     /// The keys a caller may present; with none, nobody may call.
     keys: Arc<[String]>,
@@ -88,7 +89,7 @@ impl App {
 
     /// Report not ready from now on: the node is about to stop.
     pub fn stopping(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
+        self.stopping.store(true, Ordering::Relaxed);
     }
 
     /// The node being served from, once there is one.
@@ -170,7 +171,7 @@ async fn live() -> Json<Health> {
 }
 
 async fn ready(Shared(app): Shared<App>) -> Result<Json<Health>, ApiError> {
-    if app.stopping.load(Ordering::SeqCst) {
+    if app.stopping.load(Ordering::Relaxed) {
         return Err(ApiError::unavailable("the node is stopping"));
     }
     app.node()?.ready().await?;
@@ -182,7 +183,7 @@ async fn ready(Shared(app): Shared<App>) -> Result<Json<Health>, ApiError> {
 /// it as it closes leaves the caller not knowing whether it arrived.
 async fn closing(Shared(app): Shared<App>, request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    if app.stopping.load(Ordering::SeqCst) {
+    if app.stopping.load(Ordering::Relaxed) {
         response.headers_mut().insert(
             header::CONNECTION,
             header::HeaderValue::from_static("close"),

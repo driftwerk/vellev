@@ -1294,12 +1294,13 @@ async fn a_node_registers_while_it_runs_and_will_not_serve_a_format_it_cannot_re
 }
 
 #[tokio::test]
-async fn a_node_is_not_ready_while_object_storage_does_not_answer() {
+async fn a_node_is_not_ready_until_object_storage_answers_and_does_not_ask_it_every_time() {
     let cluster = Cluster::new();
     let node = cluster.node();
-    node.ready().await.unwrap();
     cluster.store.unreadable.store(true, Ordering::SeqCst);
     assert!(matches!(node.ready().await, Err(NodeError::Storage(_))));
     cluster.store.unreadable.store(false, Ordering::SeqCst);
+    node.ready().await.unwrap();
+    cluster.store.unreadable.store(true, Ordering::SeqCst);
     node.ready().await.unwrap();
 }

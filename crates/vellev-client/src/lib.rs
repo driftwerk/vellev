@@ -171,9 +171,11 @@ impl std::fmt::Debug for Client {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Read,
-    /// A write that leaves the same as it found once it has been made:
-    /// sent again when its outcome is unknown, since making it twice is
-    /// making it once.
+    /// A write whose effect is the same however many times it is made:
+    /// sent again when its outcome is unknown, like a read. A try that
+    /// outlives the timeout may still land after the one sent again, which
+    /// undoes a later write of the caller's only if that try is slower
+    /// still.
     Repeatable,
     Write,
 }
@@ -461,8 +463,12 @@ impl Tenant {
 
     /// Apply `changes` as one atomic step, each seeing those before it.
     pub async fn apply(&self, changes: Vec<Change>) -> Result<Written> {
+        self.batch(Kind::Write, changes).await
+    }
+
+    async fn batch(&self, kind: Kind, changes: Vec<Change>) -> Result<Written> {
         let batch = Batch { changes };
-        self.write(Kind::Write, Method::POST, "/changes", Some(&batch))
+        self.write(kind, Method::POST, "/changes", Some(&batch))
             .await
     }
 
@@ -591,15 +597,15 @@ impl Records {
             if full && !batch.is_empty() {
                 let sent = std::mem::take(&mut batch);
                 let count = sent.len();
-                let written = self
-                    .tenant
-                    .apply(sent)
-                    .await
-                    .map_err(|source| Error::Partial {
-                        stored,
-                        position,
-                        source: Box::new(source),
-                    })?;
+                let written =
+                    self.tenant
+                        .batch(Kind::Repeatable, sent)
+                        .await
+                        .map_err(|source| Error::Partial {
+                            stored,
+                            position,
+                            source: Box::new(source),
+                        })?;
                 stored += count;
                 position = Some(written.position);
                 bytes = 0;

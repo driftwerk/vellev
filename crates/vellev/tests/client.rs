@@ -684,7 +684,9 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
 async fn a_node_stopped_and_replaced_under_load_fails_no_request() {
     let cluster = Cluster::new();
     let (leaving, staying) = (cluster.serve().await, cluster.serve().await);
-    let client = Client::connect(&[&leaving.url, &staying.url], KEY, Options::default()).unwrap();
+    let replacement = cluster.unstarted(&[], None).await;
+    let nodes = [&leaving.url, &staying.url, &replacement.url];
+    let client = Client::connect(&nodes.map(String::as_str), KEY, Options::default()).unwrap();
     let acme = client.tenant(&tenant("acme"));
     acme.create().await.unwrap();
     acme.collection(&notes_named())
@@ -692,30 +694,41 @@ async fn a_node_stopped_and_replaced_under_load_fails_no_request() {
         .await
         .unwrap();
 
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let load = tokio::spawn({
-        let (acme, stop) = (acme.clone(), stop.clone());
-        async move {
+    const WORKERS: u64 = 8;
+    let (done, after_stop) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load: Vec<_> = (0..WORKERS)
+        .map(|worker| {
             let notes = acme.collection(&notes_named());
-            let mut failures = Vec::new();
-            let mut n = 0;
-            while !stop.load(Ordering::SeqCst) {
-                n += 1;
-                let put = notes
-                    .put(oid(n), &content("fox", n, Some([1.0, 0.0])))
-                    .await;
-                let read = notes.get(oid(n)).await;
-                match (put, read) {
-                    (Ok(_), Ok(Some(_))) => {}
-                    other => failures.push((n, format!("{other:?}"))),
+            let (done, after_stop, stopped) = (done.clone(), after_stop.clone(), stopped.clone());
+            tokio::spawn(async move {
+                let mut failures = Vec::new();
+                let mut n = worker;
+                while after_stop.load(Ordering::SeqCst) < 200 {
+                    n += WORKERS;
+                    let put = notes
+                        .put(oid(n), &content("fox", n, Some([1.0, 0.0])))
+                        .await;
+                    let read = notes.get(oid(n)).await;
+                    match (put, read) {
+                        (Ok(_), Ok(Some(_))) => {}
+                        other => failures.push((n, format!("{other:?}"))),
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                    if stopped.load(Ordering::SeqCst) {
+                        after_stop.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
-            }
-            (n, failures)
-        }
-    });
+                failures
+            })
+        })
+        .collect();
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    while done.load(Ordering::SeqCst) < 100 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     leaving.app.stopping();
+    stopped.store(true, Ordering::SeqCst);
     let (status, _) = leaving.get("/health/ready").await;
     assert_eq!(
         status,
@@ -739,18 +752,15 @@ async fn a_node_stopped_and_replaced_under_load_fails_no_request() {
     let node = leaving.node.clone();
     leaving.stop().await;
     node.shutdown().await;
-    let replacement = cluster.serve().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    stop.store(true, Ordering::SeqCst);
+    replacement.app.start(replacement.node.clone());
 
-    let (done, failures) = load.await.unwrap();
+    let mut failures = Vec::new();
+    for worker in load {
+        failures.extend(worker.await.unwrap());
+    }
     assert!(failures.is_empty(), "{failures:?}");
-    assert!(done > 20, "only {done} writes went through");
-    let count = client
-        .tenant(&tenant("acme"))
-        .collection(&notes_named())
-        .count(None)
-        .await;
-    assert_eq!(count.unwrap(), done);
+    let written = done.load(Ordering::SeqCst);
+    let count = acme.collection(&notes_named()).count(None).await.unwrap();
+    assert_eq!(count, written as u64);
     assert_eq!(replacement.get("/health/ready").await.0, StatusCode::OK);
 }
