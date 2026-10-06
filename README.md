@@ -67,6 +67,21 @@ running node. Every route under `/v1` needs one of the configured keys. A
 collection may only name an embedding endpoint listed in
 `VELLEV_EMBEDDING_URLS` or given a key in `VELLEV_EMBEDDING_KEYS`.
 
+## Vector search
+
+A layer with up to a few thousand vectors is scored exactly. Above that a
+query is shortlisted by one-bit codes and the shortlist rescored with the
+full vectors. A segment holding more than 200k vectors of a collection,
+which only a merge produces, gets a clustered index instead: k-means
+clusters of RaBitQ-style codes, scanning as few clusters as hold 97% of the
+true nearest ten of sample queries, built when the segment is written and
+kept in a file beside it. A filter is applied during the scan, so results
+are exact with respect to it.
+
+```sh
+cargo run --release -p vellev-index --example clustered_bench -- 200000 768
+```
+
 ## Simulation
 
 `crates/vellev-storage/tests/simulation.rs` drives random histories of writes,

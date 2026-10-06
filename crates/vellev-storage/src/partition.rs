@@ -200,7 +200,7 @@ impl Partition {
                 }
                 let file = decode(&meta.key, Kind::Segment, &self.fetch(&meta.key).await?)?;
                 let stored = match &meta.index {
-                    Some(index) => self.stored(index).await,
+                    Some(index) => self.stored(index, &meta.key).await,
                     None => Stored::default(),
                 };
                 Ok(Loaded::fresh(file, stored))
@@ -211,14 +211,22 @@ impl Partition {
         blocking(move || State::from_manifest(&key, manifest, segments)).await?
     }
 
-    /// The clustered indexes kept under `key`, or none if they cannot be
-    /// read, in which case they are built again.
-    async fn stored(&self, key: &str) -> Stored {
-        let read = async { decode::<SegmentIndex>(key, Kind::Index, &self.fetch(key).await?) };
+    /// The clustered indexes kept under `key` for the segment under
+    /// `segment`, or none if they cannot be read or are another segment's,
+    /// in which case the segment is searched by a scan of its codes until
+    /// it is next loaded.
+    async fn stored(&self, key: &str, segment: &str) -> Stored {
+        let read = async {
+            let index = decode::<SegmentIndex>(key, Kind::Index, &self.fetch(key).await?)?;
+            match index.segment == segment {
+                true => Ok(index),
+                false => Err(StorageError::corrupt(key, "it indexes another segment")),
+            }
+        };
         match read.await {
             Ok(index) => index.into(),
             Err(error) => {
-                tracing::warn!(key, %error, "building a segment's indexes afresh");
+                tracing::warn!(key, %error, "a segment's index file is not used");
                 Stored::default()
             }
         }
@@ -318,11 +326,6 @@ impl Writer {
 
     /// Merge and index segments as `merging` says, instead of as by default.
     pub fn merging_with(self, merging: Merging) -> Self {
-        self.partition
-            .state
-            .write()
-            .expect("partition lock")
-            .cluster_above(merging.clustered_above);
         Self { merging, ..self }
     }
 
@@ -560,11 +563,16 @@ impl Writer {
         let layout = Layout(&self.lease.key);
         let segment_key = layout.segment(position, &self.author);
         let key = layout.manifest(position, &self.author);
-        let (segment, manifest) = self
-            .partition
-            .read(|state| state.checkpoint(position, &segment_key, &layout.index(&segment_key)));
+        let (segment, manifest) = self.partition.read(|state| {
+            state.checkpoint(
+                position,
+                &segment_key,
+                &layout.index(position, &self.author),
+                self.merging.clustered_above,
+            )
+        });
         let segment = match segment {
-            Some((meta, file)) => Some(self.indexed(meta, file).await?),
+            Some((meta, file)) => Some(self.prepared(meta, file).await?),
             None => None,
         };
         let frame = encode(Kind::Manifest, &manifest)?;
@@ -587,23 +595,32 @@ impl Writer {
     /// Encode a segment and index its rows, off the async threads and before
     /// anything is written, so that readers are not held behind the write
     /// lock while a large segment is indexed. Returns the segment ready to
-    /// attach and the frames to upload: the segment's, and its index file's
-    /// if it has one.
-    async fn indexed(&self, meta: SegmentMeta, file: SegmentFile) -> Result<Indexed> {
-        let (catalog, above) = self
-            .partition
-            .read(|state| (state.catalog().clone(), state.clustered_above()));
-        let indexed = meta.index.is_some();
-        let (loaded, frames) = blocking(move || {
-            let segment = encode(Kind::Segment, &file)?;
+    /// attach and its frame.
+    async fn built(&self, file: SegmentFile) -> Result<(Loaded, Bytes)> {
+        let catalog = self.partition.read(|state| state.catalog().clone());
+        let above = Some(self.merging.clustered_above);
+        blocking(move || {
+            let frame = encode(Kind::Segment, &file)?;
             let indexes = state::indexed(&catalog, &file.rows, &Stored::default(), above);
-            let index = indexed
-                .then(|| encode(Kind::Index, &state::stored(&indexes)))
-                .transpose()?;
-            Ok::<_, StorageError>((Loaded::built(file, indexes), (segment, index)))
+            Ok((Loaded::built(file, indexes), frame))
         })
-        .await??;
-        Ok((meta, loaded, frames))
+        .await?
+    }
+
+    /// A built segment as `meta` names it, with the frames to upload: its
+    /// own and its index file's, if it has one.
+    fn named(meta: SegmentMeta, (loaded, frame): (Loaded, Bytes)) -> Result<Indexed> {
+        let indexes = loaded.indexes.as_deref().expect("built with its indexes");
+        let index = meta
+            .index
+            .is_some()
+            .then(|| encode(Kind::Index, &state::stored(&meta.key, indexes)))
+            .transpose()?;
+        Ok((meta, loaded, (frame, index)))
+    }
+
+    async fn prepared(&self, meta: SegmentMeta, file: SegmentFile) -> Result<Indexed> {
+        Self::named(meta, self.built(file).await?)
     }
 
     /// Upload a segment's files, the index first so that the segment never
@@ -626,40 +643,48 @@ impl Writer {
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
+        let above = self.merging.clustered_above;
         let Some((file, wants_index)) = self.partition.read(|state| {
             let file = state.merged(&merge, state.position())?;
-            let wants_index =
-                state::clustered(state.catalog(), &file.rows, state.clustered_above());
+            let wants_index = state::clustered(state.catalog(), &file.rows, above);
             Some((file, wants_index))
         }) else {
             return Ok(None);
         };
+        let (rows, tombstones) = (file.rows.len() as u64, file.tombstones.len() as u64);
+        let built = self.built(file).await?;
         let layout = Layout(&self.lease.key);
         let mut ready = self.ready.lock().await;
         if !*ready {
             return Err(StorageError::Closed);
         }
         let position = following(self.partition.read(State::position))?;
-        let merged_key = layout.merged(position, &self.author);
         let segment_key = layout.segment(position, &self.author);
         let key = layout.manifest(position, &self.author);
         let meta = SegmentMeta {
-            key: merged_key.clone(),
-            rows: file.rows.len() as u64,
-            tombstones: file.tombstones.len() as u64,
-            index: wants_index.then(|| layout.index(&merged_key)),
+            key: layout.merged(position, &self.author),
+            rows,
+            tombstones,
+            index: wants_index.then(|| layout.merged_index(position, &self.author)),
         };
         let Some((flushed, manifest)) = self.partition.read(|state| {
             state.unchanged(&merge).then(|| {
-                let index_key = layout.index(&segment_key);
-                state.compaction(position, &segment_key, &index_key, &merge, meta.clone())
+                let index_key = layout.index(position, &self.author);
+                state.compaction(
+                    position,
+                    &segment_key,
+                    &index_key,
+                    above,
+                    &merge,
+                    meta.clone(),
+                )
             })
         }) else {
             return Ok(None);
         };
-        let merged = self.indexed(meta, file).await?;
+        let merged = Self::named(meta, built)?;
         let flushed = match flushed {
-            Some((meta, file)) => Some(self.indexed(meta, file).await?),
+            Some((meta, file)) => Some(self.prepared(meta, file).await?),
             None => None,
         };
         if !self.partition.read(|state| state.unchanged(&merge)) {

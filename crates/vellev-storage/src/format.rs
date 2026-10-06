@@ -110,6 +110,8 @@ pub struct SegmentMeta {
 /// kept: one per collection with enough vectors in the segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentIndex {
+    /// The key of the segment the indexes are of.
+    pub segment: String,
     pub vectors: Vec<(CollectionId, Arc<ClusteredIndex>)>,
 }
 

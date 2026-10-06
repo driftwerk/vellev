@@ -67,15 +67,14 @@ impl Layout<'_> {
         self.named("segment", position, author, "-merged")
     }
 
-    /// The index file of the segment under `segment_key`, which must be a
-    /// segment key of this partition.
-    pub fn index(&self, segment_key: &str) -> String {
-        let name = segment_key
-            .strip_prefix(&self.prefix())
-            .and_then(|rest| rest.strip_prefix("segment/"))
-            .and_then(|name| name.strip_suffix(".segment"))
-            .expect("a segment key of this partition");
-        format!("{}index/{name}.index", self.prefix())
+    /// The index file of the segment a flush at `position` writes.
+    pub fn index(&self, position: LogPosition, author: &Author) -> String {
+        self.key("index", position, author)
+    }
+
+    /// The index file of the segment a merge at `position` writes.
+    pub fn merged_index(&self, position: LogPosition, author: &Author) -> String {
+        self.named("index", position, author, "-merged")
     }
 
     fn key(&self, kind: &str, position: LogPosition, author: &Author) -> String {

@@ -11,15 +11,16 @@
 //!
 //! How many clusters a query scans is settled when the index is built: the
 //! fewest that hold the true nearest ten of sample queries often enough.
-//! A query allowed only some rows scans further until it has its shortlist,
-//! or, when it is allowed few, visits just those rows.
+//! A query scans further for as long as its shortlist is not full, and one
+//! allowed few rows visits just those rows.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::fmt;
 
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use vellev_core::Distance;
 
 use crate::vector::{dot, squared_l2, Scorer, VectorIndex};
@@ -37,7 +38,8 @@ const MOST_CLUSTERS: usize = 4096;
 const TRAINING_PER_CLUSTER: usize = 64;
 
 /// Vectors clustered around centroids, each kept as a one-bit code.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(from = "Wire")]
 pub struct ClusteredIndex {
     metric: Distance,
     dimensions: usize,
@@ -46,17 +48,29 @@ pub struct ClusteredIndex {
     centroids: Vec<f32>,
     clusters: Vec<Cluster>,
     /// Every indexed row in ascending order, and for each its cluster and
-    /// its place in it.
+    /// its place in it; both follow from the clusters.
     rows: Vec<u32>,
     at: Vec<(u32, u32)>,
     /// How many clusters a query scans.
     probes: usize,
 }
 
+impl fmt::Debug for ClusteredIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusteredIndex")
+            .field("metric", &self.metric)
+            .field("dimensions", &self.dimensions)
+            .field("rows", &self.rows.len())
+            .field("clusters", &self.clusters.len())
+            .field("probes", &self.probes)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ClusterWire", into = "ClusterWire")]
 struct Cluster {
     rows: Vec<u32>,
-    #[serde(with = "words")]
     codes: Vec<u64>,
     factors: Vec<Factor>,
 }
@@ -65,11 +79,118 @@ struct Cluster {
 /// with centroid `c`: `o`'s distance from `c`, how well the code's unit
 /// vector aligns with the direction from `c` to `o`, and that direction's
 /// inner product with `c`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 struct Factor {
     norm: f32,
     align: f32,
     along: f32,
+}
+
+/// The index on the wire: what cannot be rebuilt from the rest.
+#[derive(Serialize, Deserialize)]
+struct Wire {
+    metric: Distance,
+    dimensions: usize,
+    rotation: Rotation,
+    centroids: Vec<f32>,
+    clusters: Vec<Cluster>,
+    probes: usize,
+}
+
+impl From<Wire> for ClusteredIndex {
+    fn from(wire: Wire) -> Self {
+        let mut rows: Vec<(u32, (u32, u32))> = wire
+            .clusters
+            .iter()
+            .enumerate()
+            .flat_map(|(cluster, members)| {
+                members
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, row)| (*row, (cluster as u32, index as u32)))
+            })
+            .collect();
+        rows.sort_unstable();
+        let (rows, at) = rows.into_iter().unzip();
+        Self {
+            metric: wire.metric,
+            dimensions: wire.dimensions,
+            rotation: wire.rotation,
+            centroids: wire.centroids,
+            clusters: wire.clusters,
+            rows,
+            at,
+            probes: wire.probes,
+        }
+    }
+}
+
+impl Serialize for ClusteredIndex {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Borrowed<'a> {
+            metric: Distance,
+            dimensions: usize,
+            rotation: &'a Rotation,
+            centroids: &'a [f32],
+            clusters: &'a [Cluster],
+            probes: usize,
+        }
+        Borrowed {
+            metric: self.metric,
+            dimensions: self.dimensions,
+            rotation: &self.rotation,
+            centroids: &self.centroids,
+            clusters: &self.clusters,
+            probes: self.probes,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// A cluster on the wire: each column as little-endian bytes.
+#[derive(Serialize, Deserialize)]
+struct ClusterWire {
+    #[serde(with = "le")]
+    rows: Vec<u32>,
+    #[serde(with = "le")]
+    codes: Vec<u64>,
+    #[serde(with = "le")]
+    norms: Vec<f32>,
+    #[serde(with = "le")]
+    aligns: Vec<f32>,
+    #[serde(with = "le")]
+    alongs: Vec<f32>,
+}
+
+impl From<Cluster> for ClusterWire {
+    fn from(cluster: Cluster) -> Self {
+        Self {
+            rows: cluster.rows,
+            codes: cluster.codes,
+            norms: cluster.factors.iter().map(|f| f.norm).collect(),
+            aligns: cluster.factors.iter().map(|f| f.align).collect(),
+            alongs: cluster.factors.iter().map(|f| f.along).collect(),
+        }
+    }
+}
+
+impl From<ClusterWire> for Cluster {
+    fn from(wire: ClusterWire) -> Self {
+        let factors = wire
+            .norms
+            .into_iter()
+            .zip(wire.aligns)
+            .zip(wire.alongs)
+            .map(|((norm, align), along)| Factor { norm, align, along })
+            .collect();
+        Self {
+            rows: wire.rows,
+            codes: wire.codes,
+            factors,
+        }
+    }
 }
 
 /// A random orthogonal rotation: random signs followed by a Walsh-Hadamard
@@ -196,8 +317,7 @@ impl Probe {
             })
             .sum();
         let set = self.lower * ones as f32 + self.delta * weighted as f32;
-        let unit = (2.0 * set - self.sum) * self.scale;
-        unit / factor.align
+        (2.0 * set - self.sum) * self.scale / factor.align
     }
 
     fn distance(&self, metric: Distance, code: &[u64], factor: &Factor) -> f32 {
@@ -302,10 +422,14 @@ fn nearest_centroid(centroids: &[f32], width: usize, vector: &[f32]) -> usize {
         .map_or(0, |(index, _)| index)
 }
 
-/// Lloyd's k-means over `training`, from a random choice of `k` of them.
+/// Lloyd's k-means over `training`, seeded with `k` of them spread evenly
+/// through the sample, which is in row order.
 fn kmeans(training: &[Vec<f32>], k: usize, width: usize, random: &mut Random) -> Vec<f32> {
-    let mut centroids: Vec<f32> = (0..k)
-        .flat_map(|_| training[random.below(training.len())].iter().copied())
+    let mut centroids: Vec<f32> = training
+        .iter()
+        .step_by(training.len() / k)
+        .take(k)
+        .flat_map(|vector| vector.iter().copied())
         .collect();
     let mut assigned = vec![usize::MAX; training.len()];
     for _ in 0..ITERATIONS {
@@ -350,7 +474,7 @@ impl ClusteredIndex {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
-        let mut random = Random(vectors.len() as u64 ^ (dimensions as u64) << 32);
+        let mut random = Random(vectors.len() as u64 ^ ((dimensions as u64) << 32));
         let rotation = Rotation::new(dimensions, random.next());
         let width = rotation.width;
         let rotated = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
@@ -431,6 +555,7 @@ impl ClusteredIndex {
         self.probes
     }
 
+    /// How many clusters the rows are grouped in.
     pub fn clusters(&self) -> usize {
         self.clusters.len()
     }
@@ -541,8 +666,9 @@ impl VectorIndex for ClusteredIndex {
             // Fewer rows allowed than a scan would visit: visit just those,
             // readying the query for each cluster met.
             Some(only) if (only.len() as usize) <= per_probe => {
-                let mut probes: Vec<Option<Probe>> =
-                    (0..self.clusters.len()).map(|_| None).collect();
+                let mut probes: Vec<Option<Probe>> = std::iter::repeat_with(|| None)
+                    .take(self.clusters.len())
+                    .collect();
                 for row in only.iter().filter(|row| kept(*row)) {
                     let Some(position) = self.position(row) else {
                         continue;
@@ -580,24 +706,48 @@ impl VectorIndex for ClusteredIndex {
     }
 }
 
-/// Codes on the wire as little-endian bytes.
-mod words {
+/// Columns on the wire as little-endian bytes.
+mod le {
     use serde::{Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(words: &[u64], serializer: S) -> Result<S::Ok, S::Error> {
-        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    pub trait Word: Sized {
+        const SIZE: usize;
+        fn to_le(self, out: &mut Vec<u8>);
+        fn from_le(bytes: &[u8]) -> Self;
+    }
+
+    macro_rules! word {
+        ($($t:ty),*) => {$(
+            impl Word for $t {
+                const SIZE: usize = std::mem::size_of::<$t>();
+                fn to_le(self, out: &mut Vec<u8>) {
+                    out.extend_from_slice(&self.to_le_bytes());
+                }
+                fn from_le(bytes: &[u8]) -> Self {
+                    <$t>::from_le_bytes(bytes.try_into().expect("a whole word"))
+                }
+            }
+        )*};
+    }
+    word!(u32, u64, f32);
+
+    pub fn serialize<T: Word + Copy, S: Serializer>(
+        words: &[T],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut bytes = Vec::with_capacity(words.len() * T::SIZE);
+        words.iter().for_each(|word| word.to_le(&mut bytes));
         serde_bytes::serialize(&bytes, serializer)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u64>, D::Error> {
+    pub fn deserialize<'de, T: Word, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<T>, D::Error> {
         let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
-        if !bytes.len().is_multiple_of(8) {
-            return Err(serde::de::Error::custom("codes are not whole words"));
+        if !bytes.len().is_multiple_of(T::SIZE) {
+            return Err(serde::de::Error::custom("a column is not whole words"));
         }
-        Ok(bytes
-            .chunks_exact(8)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("eight bytes")))
-            .collect())
+        Ok(bytes.chunks_exact(T::SIZE).map(T::from_le).collect())
     }
 }
 
@@ -690,6 +840,77 @@ mod tests {
             assert!((dot(&a, &a) - dot(&ra, &ra)).abs() < 1e-4);
         }
         assert_eq!(rotation.apply(&[1.0; 100]), rotation.apply(&[1.0; 100]));
+    }
+
+    /// Vectors with no group structure and lengths spread over a range.
+    fn scattered(seed: u64, count: usize, dimensions: usize) -> Vec<Vec<f32>> {
+        let mut noise = Noise(seed);
+        (0..count)
+            .map(|_| {
+                let scale = 0.5 + 1.5 * (noise.unit() + 0.5);
+                noise
+                    .vector(dimensions)
+                    .into_iter()
+                    .map(|x| x * scale)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_estimated_inner_product_is_unbiased_and_close() {
+        let vectors = scattered(8, 3000, 256);
+        let index = indexed(Distance::L2, &vectors);
+        let query = index.prepared(&scattered(9, 1, 256)[0]);
+        let (mut cross, mut square, mut error, mut scale) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (cluster, members) in index.clusters.iter().enumerate() {
+            let centroid = index.centroid(cluster);
+            let probe = Probe::new(&query, centroid);
+            let residual: Vec<f32> = query.iter().zip(centroid).map(|(q, c)| q - c).collect();
+            let reach = f64::from(dot(&residual, &residual));
+            for (i, row) in members.rows.iter().enumerate() {
+                let rotated = index.prepared(&vectors[*row as usize / 2]);
+                let from: Vec<f32> = rotated.iter().zip(centroid).map(|(v, c)| v - c).collect();
+                let norm = dot(&from, &from).sqrt();
+                if norm == 0.0 {
+                    continue;
+                }
+                let exact = f64::from(dot(&from, &residual) / norm);
+                let estimated = f64::from(probe.inner(index.code(members, i), &members.factors[i]));
+                cross += estimated * exact;
+                square += exact * exact;
+                error += (estimated - exact) * (estimated - exact);
+                scale += reach;
+            }
+        }
+        let slope = cross / square;
+        assert!((0.97..=1.03).contains(&slope), "slope {slope}");
+        // The inner product lies within plus or minus the query's distance
+        // from the centroid; the error is a small part of that range.
+        let spread = (error / scale).sqrt();
+        assert!(spread < 0.1, "error is {spread} of the range");
+    }
+
+    #[test]
+    fn a_shortlist_holds_the_true_neighbours_of_scattered_vectors() {
+        let vectors = scattered(5, 3000, 256);
+        for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
+            let index = indexed(metric, &vectors);
+            let (found, total) = recall(&index, metric, &vectors, 300);
+            assert!(
+                found * 100 >= total * 90,
+                "{metric:?}: {found} of {total} shortlisted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rotation_mixes_signs() {
+        let rotation = Rotation::new(64, 3);
+        let mut axis = vec![0.0; 64];
+        axis[5] = 1.0;
+        let rotated = rotation.apply(&axis);
+        assert!(rotated.iter().any(|v| *v > 0.0) && rotated.iter().any(|v| *v < 0.0));
     }
 
     #[test]

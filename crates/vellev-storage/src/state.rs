@@ -227,37 +227,18 @@ struct Memtable {
 /// written since the last checkpoint, and which row is the live one for each
 /// key. Liveness is derived on load and never stored; it is a function of the
 /// committed files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct State {
     position: LogPosition,
     head: Option<String>,
     /// The latest checkpoint's key.
     checkpoint: Option<String>,
-    /// See [`Merging::clustered_above`].
-    clustered_above: usize,
     catalog: Catalog,
     segments: Vec<Segment>,
     memtable: Memtable,
     live: HashMap<RowKey, Location>,
     corpora: HashMap<CollectionId, Corpus>,
     has_commits_since_checkpoint: bool,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            position: LogPosition::default(),
-            head: None,
-            checkpoint: None,
-            clustered_above: CLUSTERED_ABOVE,
-            catalog: Catalog::default(),
-            segments: Vec::new(),
-            memtable: Memtable::default(),
-            live: HashMap::new(),
-            corpora: HashMap::new(),
-            has_commits_since_checkpoint: false,
-        }
-    }
 }
 
 fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a Row> {
@@ -270,14 +251,16 @@ fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a 
 /// Index `rows` for filtering, keyword search and vector search, for the
 /// collections `catalog` knows, numbered as the rows lie. A clustered index
 /// in `stored` for a collection with as many vectors as it holds is used
-/// rather than built again. An index built under an older catalog stays
-/// right: a property never changes once added, and neither a property nor
-/// a collection added since has anything in an older layer.
+/// rather than built again; otherwise one is built for a collection with
+/// more vectors than `clustered_above`, when that is given, which only the
+/// writer does. An index built under an older catalog stays right: a
+/// property never changes once added, and neither a property nor a
+/// collection added since has anything in an older layer.
 pub(crate) fn indexed(
     catalog: &Catalog,
     rows: &[Row],
     stored: &Stored,
-    clustered_above: usize,
+    clustered_above: Option<usize>,
 ) -> Indexes {
     let mut indexes = Indexes::new();
     let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
@@ -303,7 +286,9 @@ pub(crate) fn indexed(
             .filter(|clustered| clustered.len() == vectors.len());
         index.vectors = match kept {
             Some(clustered) => Some(Vectors::Clustered(clustered.clone())),
-            None if vectors.len() > clustered_above => {
+            None if clustered_above
+                .is_some_and(|above| vectors.len() > above.max(SHORTLIST_ABOVE)) =>
+            {
                 ClusteredIndex::build(schema.distance, vectors)
                     .map(|clustered| Vectors::Clustered(Arc::new(clustered)))
             }
@@ -313,8 +298,8 @@ pub(crate) fn indexed(
     indexes
 }
 
-/// Whether indexing `rows` builds any clustered index, which is to say
-/// whether the segment has an index file.
+/// Whether indexing `rows` with `clustered_above` builds any clustered
+/// index, which is to say whether the segment has an index file.
 pub(crate) fn clustered(catalog: &Catalog, rows: &[Row], clustered_above: usize) -> bool {
     let mut counts: HashMap<CollectionId, usize> = HashMap::new();
     for Row { collection, object } in rows {
@@ -322,12 +307,14 @@ pub(crate) fn clustered(catalog: &Catalog, rows: &[Row], clustered_above: usize)
             *counts.entry(*collection).or_default() += 1;
         }
     }
-    counts.values().any(|count| *count > clustered_above)
+    counts
+        .values()
+        .any(|count| *count > clustered_above.max(SHORTLIST_ABOVE))
 }
 
-/// The clustered indexes among `indexes`, as a segment's index file keeps
-/// them.
-pub(crate) fn stored(indexes: &Indexes) -> SegmentIndex {
+/// The clustered indexes among `indexes`, as the index file of the segment
+/// under `segment` keeps them.
+pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
     let mut vectors: Vec<(CollectionId, Arc<ClusteredIndex>)> = indexes
         .iter()
         .filter_map(|(collection, index)| match &index.vectors {
@@ -336,7 +323,10 @@ pub(crate) fn stored(indexes: &Indexes) -> SegmentIndex {
         })
         .collect();
     vectors.sort_by_key(|(collection, _)| *collection);
-    SegmentIndex { vectors }
+    SegmentIndex {
+        segment: segment.to_string(),
+        vectors,
+    }
 }
 
 impl State {
@@ -475,14 +465,6 @@ impl State {
         &self.catalog
     }
 
-    pub(crate) fn clustered_above(&self) -> usize {
-        self.clustered_above
-    }
-
-    pub(crate) fn cluster_above(&mut self, rows: usize) {
-        self.clustered_above = rows;
-    }
-
     pub(crate) fn corpus(&self, collection: CollectionId) -> Option<&Corpus> {
         self.corpora.get(&collection)
     }
@@ -595,14 +577,8 @@ impl State {
         for key in &file.tombstones {
             self.forget(*key);
         }
-        let indexes = indexes.unwrap_or_else(|| {
-            Arc::new(indexed(
-                &self.catalog,
-                &file.rows,
-                &stored,
-                self.clustered_above,
-            ))
-        });
+        let indexes =
+            indexes.unwrap_or_else(|| Arc::new(indexed(&self.catalog, &file.rows, &stored, None)));
         let dead = file
             .rows
             .iter()
@@ -802,10 +778,12 @@ impl State {
         position: LogPosition,
         segment_key: &str,
         index_key: &str,
+        clustered_above: usize,
         merge: &Merge,
         merged: SegmentMeta,
     ) -> (Option<(SegmentMeta, SegmentFile)>, Manifest) {
-        let (flushed, mut manifest) = self.checkpoint(position, segment_key, index_key);
+        let (flushed, mut manifest) =
+            self.checkpoint(position, segment_key, index_key, clustered_above);
         manifest.segments.splice(merge.run.clone(), [merged]);
         (flushed, manifest)
     }
@@ -830,14 +808,8 @@ impl State {
                 stored,
             },
         ) = merged;
-        let indexes = indexes.unwrap_or_else(|| {
-            Arc::new(indexed(
-                &self.catalog,
-                &file.rows,
-                &stored,
-                self.clustered_above,
-            ))
-        });
+        let indexes =
+            indexes.unwrap_or_else(|| Arc::new(indexed(&self.catalog, &file.rows, &stored, None)));
         let run = merge.run.clone();
         let gone = run.len() - 1;
         let at_row: HashMap<RowKey, usize> = file
@@ -888,6 +860,7 @@ impl State {
         position: LogPosition,
         segment_key: &str,
         index_key: &str,
+        clustered_above: usize,
     ) -> (Option<(SegmentMeta, SegmentFile)>, Manifest) {
         let rows: Vec<Row> = live_rows(&self.memtable.rows, &self.memtable.dead)
             .cloned()
@@ -898,7 +871,7 @@ impl State {
                 key: segment_key.to_string(),
                 rows: rows.len() as u64,
                 tombstones: tombstones.len() as u64,
-                index: clustered(&self.catalog, &rows, self.clustered_above)
+                index: clustered(&self.catalog, &rows, clustered_above)
                     .then(|| index_key.to_string()),
             };
             (

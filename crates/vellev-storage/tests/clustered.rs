@@ -77,16 +77,16 @@ fn found(state: &State, vectors: &[Vec<f32>]) -> (usize, usize) {
     (hits, total)
 }
 
-/// Four segments' worth of rows, flushed and merged into one.
-async fn merged(cluster: &Cluster, vectors: &[Vec<f32>]) -> Writer {
+/// A writer with every row committed, in `segments` flushed segments.
+async fn written(cluster: &Cluster, vectors: &[Vec<f32>], segments: usize) -> Writer {
     let writer = cluster.writer().await.merging_with(Merging {
         clustered_above: 4_000,
         ..Merging::default()
     });
     writer.commit(vec![wide("notes")]).await.unwrap();
-    for (segment, chunk) in vectors.chunks(vectors.len() / 4).enumerate() {
+    for (segment, chunk) in vectors.chunks(vectors.len() / segments).enumerate() {
         for (batch, rows) in chunk.chunks(250).enumerate() {
-            let first = segment * (vectors.len() / 4) + batch * 250;
+            let first = segment * (vectors.len() / segments) + batch * 250;
             let writes = rows
                 .iter()
                 .enumerate()
@@ -95,8 +95,21 @@ async fn merged(cluster: &Cluster, vectors: &[Vec<f32>]) -> Writer {
         }
         writer.flush().await.unwrap();
     }
+    writer
+}
+
+/// Four segments' worth of rows, flushed and merged into one.
+async fn merged(cluster: &Cluster, vectors: &[Vec<f32>]) -> Writer {
+    let writer = written(cluster, vectors, 4).await;
     writer.merge().await.unwrap().expect("four segments merge");
     writer
+}
+
+async fn segments_of(cluster: &Cluster) -> Vec<SegmentMeta> {
+    let head = cluster.committed().await.manifest.unwrap().0;
+    let bytes = cluster.blobs.get(&head).await.unwrap();
+    let manifest: Manifest = format::decode(&head, Kind::Manifest, &bytes).unwrap();
+    manifest.segments
 }
 
 #[tokio::test]
@@ -107,11 +120,9 @@ async fn a_large_merged_segment_is_clustered_kept_in_a_file_and_loaded_from_it()
     let vectors = vectors();
     let writer = merged(&cluster, &vectors).await;
 
-    let head = cluster.committed().await.manifest.unwrap().0;
-    let bytes = cluster.blobs.get(&head).await.unwrap();
-    let manifest: Manifest = format::decode(&head, Kind::Manifest, &bytes).unwrap();
-    assert_eq!(manifest.segments.len(), 1);
-    let segment = &manifest.segments[0];
+    let segments = segments_of(&cluster).await;
+    assert_eq!(segments.len(), 1);
+    let segment = &segments[0];
     let index = segment
         .index
         .clone()
@@ -119,6 +130,7 @@ async fn a_large_merged_segment_is_clustered_kept_in_a_file_and_loaded_from_it()
     assert!(index.contains("/index/") && index.ends_with("-merged.index"));
     let frame = cluster.blobs.get(&index).await.unwrap();
     let stored: SegmentIndex = format::decode(&index, Kind::Index, &frame).unwrap();
+    assert_eq!(stored.segment, segment.key);
     assert_eq!(stored.vectors.len(), 1);
     assert_eq!(stored.vectors[0].1.len(), ROWS as usize);
 
@@ -171,4 +183,65 @@ async fn cleanup_keeps_an_index_file_with_its_segment() {
         .await
         .partition()
         .read(|state| assert_eq!(state.count(&name("notes")), ROWS as usize));
+}
+
+#[tokio::test]
+async fn a_large_flush_is_clustered_too_and_its_index_outlives_later_checkpoints() {
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = written(&cluster, &vectors, 1).await;
+    let segments = segments_of(&cluster).await;
+    let index = segments[0]
+        .index
+        .clone()
+        .expect("a large flush is clustered");
+    assert!(index.ends_with(".index") && !index.contains("merged"));
+
+    writer
+        .commit(vec![row("notes", ROWS, vectors[0].clone())])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let segments = segments_of(&cluster).await;
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[1].index, None, "a small flush is not");
+    writer.clean(Duration::ZERO).await.unwrap();
+    cluster
+        .blobs
+        .get(&index)
+        .await
+        .expect("the index of a segment still listed stays");
+    cluster
+        .open()
+        .await
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), ROWS as usize + 1));
+}
+
+#[tokio::test]
+async fn an_index_file_of_another_segment_is_not_used() {
+    let mut cluster = Cluster::new().await;
+    let observed = cluster.observed();
+    cluster.blobs = observed.clone();
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let segment = segments_of(&cluster).await.remove(0);
+    let index = segment.index.unwrap();
+    let frame = cluster.blobs.get(&index).await.unwrap();
+    let mut stored: SegmentIndex = format::decode(&index, Kind::Index, &frame).unwrap();
+    stored.segment = "another".into();
+    let frame = format::encode(Kind::Index, &stored).unwrap();
+    cluster.blobs.delete(&index).await.unwrap();
+    cluster.blobs.put(&index, frame).await.unwrap();
+
+    let on_writer = writer.partition().read(|state| found(state, &vectors));
+    observed.fetched();
+    let follower = cluster.open().await;
+    assert!(observed.fetched().contains(&index));
+    let (hits, total) = follower.partition().read(|state| found(state, &vectors));
+    assert!(
+        hits * 100 >= total * 97,
+        "{hits} of {total} by a scan instead"
+    );
+    assert_eq!(total, on_writer.1);
 }
