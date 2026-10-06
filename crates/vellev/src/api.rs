@@ -1,17 +1,17 @@
 //! The API's routes: what each takes, does and answers.
 
-use std::sync::Arc;
-
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, State as Shared};
+use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::Json;
 use vellev_api::{
-    Batch, Change, Changes, Collections, Content, Counted, Counting, Failure, Found, Hybrid,
-    Keyword, Nearest, Objects, OnlyIf, Outcome, Page, Results, Stored, TenantPage, Tenants,
-    Weighted, Written,
+    After, Batch, Change, Changes, Collections, Consistency, Content, Counted, Counting, Failure,
+    Found, Hybrid, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, Results, Stored, TenantPage,
+    Tenants, Weighted, Written, AFTER, CONSISTENCY,
 };
 use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, TenantId};
-use vellev_node::Tenant;
+use vellev_node::{Freshness, Reader};
+use vellev_storage::coordinator::{Incarnation, LogPosition};
 use vellev_storage::{
     Condition, Fused, Hit, Mutation, Query as VectorQuery, Receipt, Scored, State, DEFAULT_ALPHA,
 };
@@ -36,6 +36,61 @@ pub struct Named<T>(T);
 #[from_request(via(Query), rejection(ApiError))]
 pub struct Asked<T>(T);
 
+/// The headers that say how fresh a read must be.
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Header)]
+pub struct ReadHeaders {
+    /// `incarnation.position`, as a write of the caller's answered: the
+    /// read is answered at or past it, or refused.
+    #[param(rename = "x-vellev-after")]
+    after: Option<String>,
+    /// `session` (the default), `strong` or `eventual`.
+    #[param(rename = "x-vellev-consistency", value_type = Option<Consistency>)]
+    consistency: Option<String>,
+}
+
+/// How fresh a read must be, from its [`ReadHeaders`]. A session read
+/// without a point to reach is answered with what the node has.
+pub struct Fresh(Freshness);
+
+impl<S: Send + Sync> FromRequestParts<S> for Fresh {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, ApiError> {
+        let header = |name: &str| -> Result<Option<String>, ApiError> {
+            parts
+                .headers
+                .get(name)
+                .map(|value| {
+                    value
+                        .to_str()
+                        .map(str::to_string)
+                        .map_err(|_| ApiError::invalid(format!("{name} is not text")))
+                })
+                .transpose()
+        };
+        let asked = ReadHeaders {
+            after: header(AFTER)?,
+            consistency: header(CONSISTENCY)?,
+        };
+        let consistency = match asked.consistency {
+            Some(text) => text.parse().map_err(ApiError::invalid)?,
+            None => Consistency::default(),
+        };
+        let after = asked
+            .after
+            .map(|text| text.parse::<After>().map_err(ApiError::invalid))
+            .transpose()?;
+        Ok(Fresh(match (consistency, after) {
+            (Consistency::Strong, _) => Freshness::Strong,
+            (Consistency::Session, Some(after)) => {
+                Freshness::After(Incarnation(after.incarnation), LogPosition(after.position))
+            }
+            (Consistency::Session, None) | (Consistency::Eventual, _) => Freshness::Eventual,
+        }))
+    }
+}
+
 fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool) -> Stored {
     Stored {
         id: object.id,
@@ -47,6 +102,7 @@ fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool) -> Stored {
 fn written(receipt: Receipt) -> Written {
     use vellev_storage::Outcome as Did;
     Written {
+        incarnation: receipt.incarnation.0,
         position: receipt.position.0,
         outcomes: receipt
             .outcomes
@@ -154,10 +210,10 @@ async fn write(app: &App, tenant: &TenantId, mutations: Vec<Mutation>) -> Answer
 /// Read the tenant off the async runtime's threads: a search can take
 /// long enough to hold up other requests.
 async fn read<T: Send + 'static>(
-    tenant: Arc<Tenant>,
+    reader: Reader,
     f: impl FnOnce(&State) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(move || tenant.read(f))
+    tokio::task::spawn_blocking(move || reader.read(f))
         .await
         .map_err(|error| {
             tracing::error!(%error, "a read did not finish");
@@ -254,7 +310,7 @@ pub async fn changes(
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections",
-    params(("tenant" = TenantId, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,)),
     responses((status = OK, body = Collections), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -262,8 +318,9 @@ pub async fn changes(
 pub async fn collections(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
+    Fresh(fresh): Fresh,
 ) -> Answer<Collections> {
-    let tenant = app.node()?.tenant(&tenant).await?;
+    let tenant = app.node()?.reader(&tenant, fresh).await?;
     let collections = tenant.read(|state| state.collections().cloned().collect());
     Ok(Json(Collections { collections }))
 }
@@ -278,7 +335,7 @@ fn schema(state: &State, collection: &CollectionName) -> Result<Collection, ApiE
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections/{collection}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     responses((status = OK, body = Collection), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -286,8 +343,9 @@ fn schema(state: &State, collection: &CollectionName) -> Result<Collection, ApiE
 pub async fn collection(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Fresh(fresh): Fresh,
 ) -> Answer<Collection> {
-    let tenant = app.node()?.tenant(&tenant).await?;
+    let tenant = app.node()?.reader(&tenant, fresh).await?;
     Ok(Json(tenant.read(|state| schema(state, &collection))?))
 }
 
@@ -359,7 +417,7 @@ pub async fn add_property(
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     responses((status = OK, body = Stored), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -367,8 +425,9 @@ pub async fn add_property(
 pub async fn object(
     Shared(app): Shared<App>,
     Named((tenant, collection, id)): Named<(TenantId, CollectionName, ObjectId)>,
+    Fresh(fresh): Fresh,
 ) -> Answer<Stored> {
-    let tenant = app.node()?.tenant(&tenant).await?;
+    let tenant = app.node()?.reader(&tenant, fresh).await?;
     tenant
         .read(|state| {
             schema(state, &collection)?;
@@ -487,7 +546,7 @@ fn fused(fused: Fused<'_>, vectors: bool) -> Found {
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/nearest",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Nearest,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -496,11 +555,12 @@ fn fused(fused: Fused<'_>, vectors: bool) -> Found {
 pub async fn nearest(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Fresh(fresh): Fresh,
     Body(asked): Body<Nearest>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
     let oversample = app.oversample(asked.oversample)?;
-    let tenant = app.node()?.tenant(&tenant).await?;
+    let tenant = app.node()?.reader(&tenant, fresh).await?;
     let vector = match (asked.vector, &asked.text) {
         (Some(vector), None) => vector,
         (None, Some(text)) => tenant
@@ -537,7 +597,7 @@ pub async fn nearest(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/keyword",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Keyword,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -546,10 +606,11 @@ pub async fn nearest(
 pub async fn keyword(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Fresh(fresh): Fresh,
     Body(asked): Body<Keyword>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
-    let tenant = app.node()?.tenant(&tenant).await?;
+    let tenant = app.node()?.reader(&tenant, fresh).await?;
     let results = read(tenant, move |state| {
         let query = Keywords {
             text: &asked.text,
@@ -575,7 +636,7 @@ pub async fn keyword(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/hybrid",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Hybrid,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -584,13 +645,14 @@ pub async fn keyword(
 pub async fn hybrid(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Fresh(fresh): Fresh,
     Body(asked): Body<Hybrid>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
     let candidates = app.candidates(asked.candidates)?;
     let oversample = app.oversample(asked.oversample)?;
     let alpha = asked.alpha.unwrap_or(DEFAULT_ALPHA);
-    let tenant = app.node()?.tenant(&tenant).await?;
+    let tenant = app.node()?.reader(&tenant, fresh).await?;
     let weighs_meaning = alpha > 0.0 && alpha <= 1.0;
     let (vector, degraded) = match asked.vector {
         Some(vector) => (Some(vector), false),
@@ -630,7 +692,7 @@ pub async fn hybrid(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/list",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Page,
     responses((status = OK, body = Objects), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -639,10 +701,11 @@ pub async fn hybrid(
 pub async fn list(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Fresh(fresh): Fresh,
     Body(page): Body<Page>,
 ) -> Answer<Objects> {
     let limit = app.limit(page.limit)?;
-    let tenant = app.node()?.tenant(&tenant).await?;
+    let tenant = app.node()?.reader(&tenant, fresh).await?;
     read(tenant, move |state| {
         let found = state.list(&collection, page.filter.as_ref(), page.after, limit + 1)?;
         let next = (found.len() > limit).then(|| found[limit - 1].id());
@@ -660,7 +723,7 @@ pub async fn list(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/count",
-    params(("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Counting,
     responses((status = OK, body = Counted), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -669,9 +732,10 @@ pub async fn list(
 pub async fn count(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
+    Fresh(fresh): Fresh,
     Body(counting): Body<Counting>,
 ) -> Answer<Counted> {
-    let tenant = app.node()?.tenant(&tenant).await?;
+    let tenant = app.node()?.reader(&tenant, fresh).await?;
     read(tenant, move |state| {
         let count = match &counting.filter {
             Some(filter) => state.select(&collection, filter)?.len(),

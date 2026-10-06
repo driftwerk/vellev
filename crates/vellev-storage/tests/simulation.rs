@@ -182,6 +182,11 @@ impl Coordinator for SimCoordinator {
             Err(_) if self.canary == Some(Canary::AcknowledgesUnrecordedCommits) => {
                 return Ok(Committed {
                     generation: lease.generation,
+                    incarnation: self
+                        .clean
+                        .committed(&lease.key)
+                        .await?
+                        .map_or(Incarnation(0), |committed| committed.incarnation),
                     log_position: commit.log_position,
                     manifest: commit.manifest,
                 });

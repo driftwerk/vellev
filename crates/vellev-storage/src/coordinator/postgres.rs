@@ -8,13 +8,14 @@ use sqlx::{Executor, FromRow, Postgres};
 use vellev_core::{NodeId, Partition, TenantId};
 
 use super::{
-    checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease,
-    LogPosition, ManifestRef, PartitionKey, Result,
+    checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
+    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../migrations/0001_partitions.sql")),
     (2, include_str!("../../migrations/0002_tenant_order.sql")),
+    (3, include_str!("../../migrations/0003_incarnation.sql")),
 ];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
@@ -50,7 +51,7 @@ impl PostgresCoordinator {
 
     async fn row(&self, key: &PartitionKey) -> Result<Option<Snapshot>> {
         Ok(snapshot(
-            "SELECT generation, lease_holder, lease_expires_at, log_position, manifest
+            "SELECT generation, incarnation, lease_holder, lease_expires_at, log_position, manifest
              FROM vellev.partitions WHERE tenant = $1 AND partition = $2",
             key,
         )
@@ -132,6 +133,8 @@ async fn migrate(pool: &PgPool) -> Result<()> {
 struct Snapshot {
     #[sqlx(try_from = "i64")]
     generation: Generation,
+    #[sqlx(try_from = "i64")]
+    incarnation: Incarnation,
     lease_holder: Option<String>,
     lease_expires_at: Option<DateTime<Utc>>,
     #[sqlx(try_from = "i64")]
@@ -143,6 +146,7 @@ impl Snapshot {
     fn committed(&self) -> Committed {
         Committed {
             generation: self.generation,
+            incarnation: self.incarnation,
             log_position: self.log_position,
             manifest: self.manifest.clone().map(ManifestRef),
         }
@@ -160,6 +164,13 @@ impl TryFrom<i64> for Generation {
     type Error = std::num::TryFromIntError;
     fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
         u64::try_from(value).map(Generation)
+    }
+}
+
+impl TryFrom<i64> for Incarnation {
+    type Error = std::num::TryFromIntError;
+    fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
+        u64::try_from(value).map(Incarnation)
     }
 }
 
@@ -217,7 +228,7 @@ impl Coordinator for PostgresCoordinator {
                      lease_expires_at = now() + make_interval(secs => $4)
                  WHERE tenant = $1 AND partition = $2
                    AND (lease_expires_at IS NULL OR lease_expires_at <= now() OR lease_holder = $3)
-                 RETURNING generation, lease_holder, lease_expires_at, log_position, manifest",
+                 RETURNING generation, incarnation, lease_holder, lease_expires_at, log_position, manifest",
                 key,
             )
             .bind(holder.as_str())
@@ -307,7 +318,7 @@ impl Coordinator for PostgresCoordinator {
              SET log_position = $4, manifest = $5
              WHERE tenant = $1 AND partition = $2 AND generation = $3
                AND (log_position < $4 OR (log_position = $4 AND manifest IS NOT DISTINCT FROM $5))
-             RETURNING generation, lease_holder, lease_expires_at, log_position, manifest",
+             RETURNING generation, incarnation, lease_holder, lease_expires_at, log_position, manifest",
             &lease.key,
         )
         .bind(bigint(lease.generation.0)?)

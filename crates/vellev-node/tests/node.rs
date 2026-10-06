@@ -16,10 +16,10 @@ use vellev_core::{
     NodeId, ObjectId, Partition, Property, TenantId,
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
-use vellev_node::{Node, NodeError, Settings};
+use vellev_node::{Freshness, Node, NodeError, Reader, Settings};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, ManualClock,
+    Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, LogPosition, ManualClock,
     MemoryCoordinator, PartitionKey,
 };
 use vellev_storage::{Mutation, State, StorageError};
@@ -93,12 +93,30 @@ impl Cluster {
     }
 
     fn node_with(&self, flush_rows: usize) -> Node {
-        let settings = Settings {
-            lease: LEASE,
+        self.node_from(Settings {
             flush_rows,
+            ..self.settings()
+        })
+    }
+
+    fn settings(&self) -> Settings {
+        Settings {
+            lease: LEASE,
             grace: Duration::ZERO,
             ..Settings::new(NodeId::generate("node"))
-        };
+        }
+    }
+
+    /// A node whose copies of tenants look for new commits only when a
+    /// read asks them to.
+    fn reading_node(&self) -> Node {
+        self.node_from(Settings {
+            follow_every: Duration::from_secs(3_600),
+            ..self.settings()
+        })
+    }
+
+    fn node_from(&self, settings: Settings) -> Node {
         Node::new(
             self.coordinator.clone(),
             self.store.clone(),
@@ -908,4 +926,304 @@ async fn a_renewal_answered_slowly_still_keeps_the_hold() {
         Arc::ptr_eq(&acme, &same),
         "each renewal is timed from when it was asked for"
     );
+}
+
+fn after(receipt: &vellev_storage::Receipt) -> Freshness {
+    Freshness::After(receipt.incarnation, receipt.position)
+}
+
+fn counted(reader: &Reader) -> usize {
+    reader.read(count)
+}
+
+#[tokio::test]
+async fn another_node_answers_reads_as_fresh_as_asked_and_never_takes_the_tenant() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.node(), cluster.reading_node());
+    writing.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = writing.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    let first = reading
+        .reader(&tenant("acme"), Freshness::Eventual)
+        .await
+        .unwrap();
+    assert!(matches!(first, Reader::Follower(_)));
+    assert_eq!(
+        counted(&first),
+        1,
+        "a copy opened now has what is committed"
+    );
+
+    let receipt = acme.write(vec![note(2, "hen", None)]).await.unwrap();
+    let eventual = reading
+        .reader(&tenant("acme"), Freshness::Eventual)
+        .await
+        .unwrap();
+    assert_eq!(counted(&eventual), 1, "eventual answers with what it has");
+    let session = reading
+        .reader(&tenant("acme"), after(&receipt))
+        .await
+        .unwrap();
+    assert_eq!(counted(&session), 2, "session catches up to the write");
+
+    acme.write(vec![note(3, "owl", None)]).await.unwrap();
+    let older = reading
+        .reader(&tenant("acme"), after(&receipt))
+        .await
+        .unwrap();
+    assert_eq!(
+        counted(&older),
+        2,
+        "a point already reached asks nothing more"
+    );
+    let strong = reading
+        .reader(&tenant("acme"), Freshness::Strong)
+        .await
+        .unwrap();
+    assert_eq!(counted(&strong), 3, "strong has everything committed");
+
+    let own = writing
+        .reader(&tenant("acme"), Freshness::Strong)
+        .await
+        .unwrap();
+    assert!(matches!(own, Reader::Writer(_)), "the holder reads its own");
+    acme.write(vec![note(4, "elk", None)]).await.unwrap();
+    assert!(matches!(
+        reading.tenant(&tenant("acme")).await,
+        Err(NodeError::Elsewhere { .. })
+    ));
+    assert!(matches!(
+        reading.reader(&tenant("gone"), Freshness::Strong).await,
+        Err(NodeError::UnknownTenant(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_tenant_dropped_and_created_again_never_holds_a_read_up() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.node(), cluster.reading_node());
+    writing.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = writing.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    let mut old = acme.write(vec![note(1, "fox", None)]).await.unwrap();
+    for n in 2..6 {
+        old = acme.write(vec![note(n, "fox", None)]).await.unwrap();
+    }
+    let followed = reading.reader(&tenant("acme"), after(&old)).await.unwrap();
+    assert_eq!(counted(&followed), 5);
+
+    writing.drop_tenant(&tenant("acme")).await.unwrap();
+    writing.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = writing.tenant(&tenant("acme")).await.unwrap();
+    let new = acme
+        .write(vec![schema(EmbeddingProvider::None), note(9, "hen", None)])
+        .await
+        .unwrap();
+    assert!(new.incarnation > old.incarnation);
+    assert!(new.position < old.position);
+
+    let fresh = cluster.reading_node();
+    let answered = fresh.reader(&tenant("acme"), after(&old)).await.unwrap();
+    assert_eq!(
+        counted(&answered),
+        1,
+        "an older incarnation's point is behind the new one"
+    );
+    let moved = reading.reader(&tenant("acme"), after(&new)).await.unwrap();
+    assert_eq!(counted(&moved), 1, "a copy of the old tenant is let go");
+    assert!(moved.read(|state| state.get(&notes(), id(9)).is_some()));
+}
+
+#[tokio::test]
+async fn a_node_whose_hold_ran_out_answers_a_session_read_from_the_new_writer() {
+    let cluster = Cluster::new();
+    let (stale, taking) = (cluster.node(), cluster.node());
+    stale.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = stale.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    cluster.clock.advance(LEASE);
+    let taken = taking.tenant(&tenant("acme")).await.unwrap();
+    let receipt = taken.write(vec![note(2, "hen", None)]).await.unwrap();
+
+    let read = stale
+        .reader(&tenant("acme"), after(&receipt))
+        .await
+        .unwrap();
+    assert!(
+        matches!(read, Reader::Follower(_)),
+        "a writer behind the point is not trusted"
+    );
+    assert_eq!(counted(&read), 2);
+}
+
+#[tokio::test]
+async fn a_copy_left_unread_catches_up_through_merges_and_cleanup() {
+    let cluster = Cluster::new();
+    let writing = cluster.node_with(5);
+    let reading = cluster.reading_node();
+    writing.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = writing.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(0, "ant", None)])
+        .await
+        .unwrap();
+    acme.flush().await.unwrap();
+    let copy = reading
+        .reader(&tenant("acme"), Freshness::Eventual)
+        .await
+        .unwrap();
+    assert_eq!(counted(&copy), 1);
+
+    for n in 1..=40 {
+        acme.write(vec![note(n, "fox", None)]).await.unwrap();
+        if n % 5 == 0 {
+            acme.flush().await.unwrap();
+        }
+    }
+    acme.write(vec![Mutation::Delete {
+        collection: notes(),
+        id: id(0),
+    }])
+    .await
+    .unwrap();
+    acme.compact(Duration::ZERO).await.unwrap();
+
+    let strong = reading
+        .reader(&tenant("acme"), Freshness::Strong)
+        .await
+        .unwrap();
+    assert_eq!(counted(&strong), 40);
+    assert!(strong.read(|state| state.get(&notes(), id(0)).is_none()));
+}
+
+#[tokio::test]
+async fn a_point_past_anything_committed_is_refused_rather_than_waited_for() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.node(), cluster.reading_node());
+    writing.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = writing.tenant(&tenant("acme")).await.unwrap();
+    let receipt = acme
+        .write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    let beyond = Freshness::After(receipt.incarnation, LogPosition(receipt.position.0 + 5));
+    assert!(matches!(
+        reading.reader(&tenant("acme"), beyond).await,
+        Err(NodeError::Ahead(_))
+    ));
+    assert!(matches!(
+        writing.reader(&tenant("acme"), beyond).await,
+        Err(NodeError::Ahead(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_node_lets_its_copy_go_once_it_writes_the_tenant_itself() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.node(), cluster.reading_node());
+    writing.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = writing.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    reading
+        .reader(&tenant("acme"), Freshness::Eventual)
+        .await
+        .unwrap();
+    assert_eq!(reading.copies(), 1);
+    cluster.clock.advance(LEASE);
+    let taken = reading.tenant(&tenant("acme")).await.unwrap();
+    assert_eq!(reading.copies(), 0);
+    assert_eq!(taken.read(count), 1);
+    assert!(matches!(
+        reading.reader(&tenant("acme"), Freshness::Strong).await,
+        Ok(Reader::Writer(_))
+    ));
+}
+
+#[tokio::test]
+async fn copies_follow_on_their_own_and_are_let_go_when_idle_or_too_many() {
+    let cluster = Cluster::new();
+    let writing = cluster.node();
+    let reading = cluster.node_from(Settings {
+        follow_every: Duration::from_millis(10),
+        follow_idle: Duration::from_millis(300),
+        followers: 2,
+        ..cluster.settings()
+    });
+    for name in ["a", "b", "c"] {
+        writing.create_tenant(&tenant(name)).await.unwrap();
+        let opened = writing.tenant(&tenant(name)).await.unwrap();
+        opened
+            .write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+    }
+    let a = reading
+        .reader(&tenant("a"), Freshness::Eventual)
+        .await
+        .unwrap();
+    assert_eq!(counted(&a), 0);
+    writing
+        .tenant(&tenant("a"))
+        .await
+        .unwrap()
+        .write(vec![note(1, "fox", None)])
+        .await
+        .unwrap();
+    let mut waited = Duration::ZERO;
+    while counted(&a) == 0 && waited < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        waited += Duration::from_millis(10);
+    }
+    assert_eq!(
+        counted(&a),
+        1,
+        "an eventual read sees a commit without asking"
+    );
+
+    for name in ["b", "c"] {
+        reading
+            .reader(&tenant(name), Freshness::Eventual)
+            .await
+            .unwrap();
+    }
+    assert_eq!(reading.copies(), 2, "the least recently used goes first");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(reading.copies(), 0, "idle copies are let go");
+}
+
+#[tokio::test]
+async fn a_strong_read_on_a_holder_of_a_tenant_since_recreated_reads_the_new_one() {
+    let cluster = Cluster::new();
+    let (holding, other) = (cluster.node(), cluster.node());
+    holding.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = holding.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    other.drop_tenant(&tenant("acme")).await.unwrap();
+    other.create_tenant(&tenant("acme")).await.unwrap();
+    let eventual = holding
+        .reader(&tenant("acme"), Freshness::Eventual)
+        .await
+        .unwrap();
+    assert!(
+        matches!(eventual, Reader::Writer(_)),
+        "eventual takes what it has"
+    );
+    let strong = holding
+        .reader(&tenant("acme"), Freshness::Strong)
+        .await
+        .unwrap();
+    assert!(matches!(strong, Reader::Follower(_)));
+    assert!(strong.read(|state| state.collection(&notes()).is_none()));
 }

@@ -121,7 +121,22 @@ impl Served {
         path: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        self.call_headed(key, method, path, body, &[]).await
+    }
+
+    /// As [`Self::call_as`], with these headers too.
+    pub async fn call_headed(
+        &self,
+        key: Option<&str>,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
         let request = self.http.request(method, format!("{}{path}", self.url));
+        let request = headers.iter().fold(request, |request, (name, value)| {
+            request.header(*name, *value)
+        });
         let request = key
             .into_iter()
             .fold(request, |request, key| request.bearer_auth(key));

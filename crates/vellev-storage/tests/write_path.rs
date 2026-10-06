@@ -405,10 +405,12 @@ async fn a_group_commits_once_and_a_rejected_batch_leaves_no_trace() {
         .unwrap();
 
     let position = before.next().unwrap();
+    let before_incarnation = cluster.committed().await.incarnation;
     assert_eq!(cluster.committed().await.log_position, position);
     assert_eq!(
         results[0].as_ref().unwrap(),
         &Receipt {
+            incarnation: before_incarnation,
             position,
             outcomes: vec![Outcome::Value(Value::Int(11)), Outcome::Applied]
         }
@@ -424,6 +426,7 @@ async fn a_group_commits_once_and_a_rejected_batch_leaves_no_trace() {
     assert_eq!(
         results[3].as_ref().unwrap(),
         &Receipt {
+            incarnation: before_incarnation,
             position,
             outcomes: vec![]
         }

@@ -302,13 +302,14 @@ async fn releasing_moves_the_generation_and_a_stale_release_is_harmless(h: &dyn 
 async fn commits_advance_the_position_and_followers_see_them(h: &dyn Harness) {
     let c = h.coordinator();
     let key = registered(h).await;
-    let (lease, _) = lease(h, &key, &node("a")).await;
+    let (lease, leased) = lease(h, &key, &node("a")).await;
 
     let committed = c.commit(&lease, commit(10, "m10")).await.unwrap();
     assert_eq!(
         committed,
         Committed {
             generation: lease.generation,
+            incarnation: leased.incarnation,
             log_position: LogPosition(10),
             manifest: Some(ManifestRef("m10".into())),
         }
@@ -326,6 +327,7 @@ async fn commits_advance_the_position_and_followers_see_them(h: &dyn Harness) {
         c.committed(&key).await.unwrap(),
         Some(Committed {
             generation: lease.generation,
+            incarnation: leased.incarnation,
             log_position: LogPosition(11),
             manifest: None
         })
@@ -355,7 +357,8 @@ async fn repeating_a_commit_that_landed_succeeds(h: &dyn Harness) {
 async fn a_stalled_writer_is_fenced_and_changes_nothing(h: &dyn Harness) {
     let c = h.coordinator();
     let key = registered(h).await;
-    let (stalled, _) = lease(h, &key, &node("a")).await;
+    let (stalled, leased) = lease(h, &key, &node("a")).await;
+    let registered_as = leased.incarnation;
     c.commit(&stalled, commit(5, "m5")).await.unwrap();
 
     h.pass(&key, TTL).await;
@@ -372,6 +375,7 @@ async fn a_stalled_writer_is_fenced_and_changes_nothing(h: &dyn Harness) {
         c.committed(&key).await.unwrap(),
         Some(Committed {
             generation: successor.generation,
+            incarnation: registered_as,
             log_position: LogPosition(6),
             manifest: Some(ManifestRef("m6".into())),
         })
@@ -415,6 +419,31 @@ async fn a_generation_is_never_reused_after_remove_and_register(h: &dyn Harness)
         c.committed(&key).await.unwrap().unwrap().log_position,
         LogPosition(0)
     );
+}
+
+async fn the_incarnation_stays_through_leases_and_grows_when_registered_again(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let incarnation = || async { c.committed(&key).await.unwrap().unwrap().incarnation };
+    let first = incarnation().await;
+    let (held, committed) = lease(h, &key, &node("a")).await;
+    assert_eq!(committed.incarnation, first);
+    let landed = c.commit(&held, commit(1, "m1")).await.unwrap();
+    assert_eq!(landed.incarnation, first);
+    c.release(&held).await.unwrap();
+    let (_, committed) = lease(h, &key, &node("b")).await;
+    assert_eq!(committed.incarnation, first);
+    assert_eq!(incarnation().await, first);
+
+    c.register(&key).await.unwrap();
+    assert_eq!(
+        incarnation().await,
+        first,
+        "registering again changes nothing"
+    );
+    assert!(c.remove(&key).await.unwrap());
+    c.register(&key).await.unwrap();
+    assert!(incarnation().await > first);
 }
 
 async fn removing_a_partition_makes_it_unknown(h: &dyn Harness) {
@@ -549,6 +578,7 @@ conformance! {
     a_stalled_writer_is_fenced_and_changes_nothing,
     a_commit_that_does_not_advance_is_refused,
     a_generation_is_never_reused_after_remove_and_register,
+    the_incarnation_stays_through_leases_and_grows_when_registered_again,
     removing_a_partition_makes_it_unknown,
     concurrent_acquires_hand_out_exactly_one_lease,
     partitions_are_listed_in_key_order_a_page_at_a_time,
@@ -567,4 +597,26 @@ async fn postgres_migrations_are_idempotent_under_concurrent_starts() {
     for started in starts {
         started.await.unwrap().expect("concurrent migration");
     }
+}
+
+#[tokio::test]
+async fn a_row_inserted_as_before_incarnations_gets_its_generation_as_one() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let key = PartitionKey {
+        tenant: TenantId::new(format!("older-{}", uuid::Uuid::new_v4().simple())).unwrap(),
+        partition: Partition::DEFAULT,
+    };
+    sqlx::query(
+        "INSERT INTO vellev.partitions (tenant, partition, generation)
+         VALUES ($1, $2, nextval('vellev.generations'))",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+    let committed = pg.coordinator.committed(&key).await.unwrap().unwrap();
+    assert_eq!(committed.incarnation.0, committed.generation.0);
 }

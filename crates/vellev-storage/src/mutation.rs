@@ -3,7 +3,7 @@ use vellev_core::{Collection, CollectionName, Embedding, ObjectId, Property, Val
 
 use vellev_index::filter::Filter;
 
-use crate::coordinator::LogPosition;
+use crate::coordinator::{Incarnation, LogPosition};
 
 /// A change a caller asks for, by collection name. The writer resolves it
 /// against the schema and the current data into what the log records: a
@@ -109,6 +109,9 @@ pub enum Outcome {
 /// What one caller's batch did, and the position at which it is visible.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Receipt {
+    /// The partition as registered when the commit was made; with the
+    /// position, what a reader needs to have caught up to.
+    pub incarnation: Incarnation,
     pub position: LogPosition,
     pub outcomes: Vec<Outcome>,
 }

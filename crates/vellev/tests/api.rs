@@ -108,13 +108,13 @@ async fn collections_are_created_read_extended_and_dropped() {
     let created = served.ok(Method::PUT, NOTES, Some(notes(supplied()))).await;
     assert_eq!(
         created,
-        json!({ "position": 1, "outcomes": [{ "outcome": "applied" }] })
+        json!({ "incarnation": 1, "position": 1, "outcomes": [{ "outcome": "applied" }] })
     );
 
     let again = served.ok(Method::PUT, NOTES, Some(notes(supplied()))).await;
     assert_eq!(
         again,
-        json!({ "position": 1, "outcomes": [{ "outcome": "unchanged" }] })
+        json!({ "incarnation": 1, "position": 1, "outcomes": [{ "outcome": "unchanged" }] })
     );
     let mut resized = notes(supplied());
     resized["embedding"]["dimensions"] = json!(3);
@@ -192,7 +192,7 @@ async fn an_object_is_stored_read_patched_and_deleted() {
     let stored = served.ok(Method::PUT, &object(1), Some(fox)).await;
     assert_eq!(
         stored,
-        json!({ "position": 2, "outcomes": [{ "outcome": "applied" }] })
+        json!({ "incarnation": 1, "position": 2, "outcomes": [{ "outcome": "applied" }] })
     );
     assert_eq!(
         served.get(&object(1)).await.1,
@@ -345,7 +345,10 @@ async fn changes_sent_together_are_applied_together_or_not_at_all() {
             Some(json!({ "changes": [] })),
         )
         .await;
-    assert_eq!(nothing, json!({ "position": 1, "outcomes": [] }));
+    assert_eq!(
+        nothing,
+        json!({ "incarnation": 1, "position": 1, "outcomes": [] })
+    );
 }
 
 async fn four_notes(served: &Served) {
@@ -569,24 +572,25 @@ async fn a_collection_is_listed_a_page_at_a_time_and_counted() {
 }
 
 #[tokio::test]
-async fn a_tenant_written_by_a_node_that_cannot_be_reached_is_unavailable_here() {
+async fn a_tenant_written_by_a_node_that_cannot_be_reached_is_read_here_but_not_written() {
     let cluster = Cluster::new();
     let (first, second) = (cluster.serve_advertising("").await, cluster.serve().await);
     first.with_notes(supplied()).await;
     for path in ["/v1/tenants/acme/collections", NOTES] {
-        let (status, body) = second.get(path).await;
-        assert_eq!(
-            (status, code(&body)),
-            (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-            "{path}"
-        );
+        assert_eq!(second.get(path).await.0, StatusCode::OK, "{path}");
     }
+    let fox = json!({ "properties": { "title": "a red fox", "n": 1 }, "vector": [1.0, 0.0] });
+    let (status, body) = second.put(&object(1), fox.clone()).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    );
     assert_eq!(
         second.get("/v1/tenants?limit=5").await.1,
         json!({ "tenants": ["acme"] })
     );
     first.node.shutdown().await;
-    assert_eq!(second.get(NOTES).await.0, StatusCode::OK);
+    assert_eq!(second.put(&object(1), fox).await.0, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -642,6 +646,28 @@ async fn the_description_covers_every_route_that_needs_a_key() {
             "{method} {path}"
         );
     }
+    let mut refs = Vec::new();
+    collect_refs(&described, &mut refs);
+    for reference in refs {
+        let name = reference.trim_start_matches("#/components/schemas/");
+        assert!(
+            described["components"]["schemas"][name].is_object(),
+            "{reference} is described"
+        );
+    }
+    let searching = &described["paths"]["/v1/tenants/{tenant}/collections/{collection}/count"]
+        ["post"]["parameters"];
+    let headers: Vec<&Value> = searching
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|parameter| parameter["in"] == "header")
+        .map(|parameter| &parameter["name"])
+        .collect();
+    assert_eq!(
+        headers,
+        [&json!("x-vellev-after"), &json!("x-vellev-consistency")]
+    );
     let listing = &described["paths"]["/v1/tenants"]["get"];
     let located: Vec<(&Value, &Value)> = listing["parameters"]
         .as_array()
@@ -950,7 +976,7 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
 
     let once_only = second
         .http
-        .get(format!("{}{}", second.url, object(1)))
+        .delete(format!("{}{}", second.url, object(1)))
         .bearer_auth(KEY)
         .header("x-vellev-forwarded", "1")
         .send()
@@ -971,7 +997,12 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
             Some(notes(supplied())),
         )
         .await;
-    let (status, body) = second.get("/v1/tenants/other/collections").await;
+    let (status, body) = second
+        .put(
+            "/v1/tenants/other/collections/notes/objects/00000000-0000-0000-0000-000000000001",
+            json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] }),
+        )
+        .await;
     assert_eq!(
         (status, code(&body)),
         (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
@@ -980,6 +1011,11 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
         .as_str()
         .unwrap()
         .contains("could not be reached"));
+    assert_eq!(
+        second.get("/v1/tenants/other/collections").await.0,
+        StatusCode::OK,
+        "a read is answered here whoever holds the tenant"
+    );
     assert_eq!(
         second.call(Method::PUT, "/v1/tenants/other", None).await.0,
         StatusCode::NO_CONTENT
@@ -999,7 +1035,12 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
         )
         .await;
     let started = std::time::Instant::now();
-    let (status, _) = second.get("/v1/tenants/dark/collections").await;
+    let (status, _) = second
+        .put(
+            "/v1/tenants/dark/collections/notes/objects/00000000-0000-0000-0000-000000000001",
+            json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] }),
+        )
+        .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(8),
@@ -1035,4 +1076,100 @@ async fn creating_a_tenant_through_another_node_does_not_take_it() {
         third.ok(Method::PUT, &object(1), Some(fox)).await["position"],
         2
     );
+}
+
+#[tokio::test]
+async fn a_read_on_another_node_sees_the_callers_own_writes_and_deletions() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.serve().await, cluster.serve().await);
+    writing.with_notes(supplied()).await;
+    let read = |method: Method, path: String, body: Option<Value>, after: String| {
+        let reading = &reading;
+        async move {
+            reading
+                .call_headed(
+                    Some(KEY),
+                    method,
+                    &path,
+                    body,
+                    &[("x-vellev-after", &after)],
+                )
+                .await
+        }
+    };
+    let opened = reading.get(NOTES).await;
+    assert_eq!(opened.0, StatusCode::OK);
+
+    for n in 1..=20u64 {
+        let fox = json!({ "properties": { "title": "fox", "n": n }, "vector": [1.0, 0.0] });
+        let written = writing.ok(Method::PUT, &object(n), Some(fox)).await;
+        let after = format!("{}.{}", written["incarnation"], written["position"]);
+        let (status, found) = read(Method::GET, object(n), None, after.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "object {n} as soon as it is written"
+        );
+        assert_eq!(found["properties"]["n"], n);
+
+        let deleted = writing.ok(Method::DELETE, &object(n), None).await;
+        let after = format!("{}.{}", deleted["incarnation"], deleted["position"]);
+        let (_, listed) = read(
+            Method::POST,
+            format!("{NOTES}/list"),
+            Some(json!({ "limit": 50 })),
+            after.clone(),
+        )
+        .await;
+        assert_eq!(
+            listed["objects"],
+            json!([]),
+            "gone as soon as it is deleted"
+        );
+        let (status, _) = read(Method::GET, object(n), None, after).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    let (status, body) = read(Method::GET, NOTES.to_string(), None, "1.999".into()).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::BAD_REQUEST, "invalid"),
+        "a point past anything committed is refused"
+    );
+    for (name, value) in [
+        ("x-vellev-after", "12"),
+        ("x-vellev-after", "a.b"),
+        ("x-vellev-consistency", "linear"),
+    ] {
+        let (status, body) = reading
+            .call_headed(Some(KEY), Method::GET, NOTES, None, &[(name, value)])
+            .await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "invalid"),
+            "{name}: {value}"
+        );
+    }
+    let (status, _) = reading
+        .call_headed(
+            Some(KEY),
+            Method::GET,
+            NOTES,
+            None,
+            &[("x-vellev-consistency", "strong")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Every `$ref` anywhere in `value`.
+fn collect_refs<'a>(value: &'a Value, refs: &mut Vec<&'a str>) {
+    match value {
+        Value::Object(fields) => fields.iter().for_each(|(name, field)| match field {
+            Value::String(reference) if name == "$ref" => refs.push(reference),
+            other => collect_refs(other, refs),
+        }),
+        Value::Array(items) => items.iter().for_each(|item| collect_refs(item, refs)),
+        _ => {}
+    }
 }

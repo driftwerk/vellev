@@ -11,7 +11,8 @@ use vellev_core::Embedding;
 use crate::blobs::{is_plain, Author, Blobs, Layout, Listed};
 use crate::column::Column;
 use crate::coordinator::{
-    Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
+    Commit, Committed, Coordinator, Generation, Incarnation, Lease, LogPosition, ManifestRef,
+    PartitionKey,
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
@@ -57,6 +58,9 @@ pub type Embedded = HashMap<(Embedding, String), Vec<f32>>;
 #[derive(Debug)]
 pub struct Partition {
     key: PartitionKey,
+    /// The partition as registered when this copy was loaded; a copy never
+    /// follows it into another.
+    incarnation: Incarnation,
     blobs: Arc<dyn Blobs>,
     state: RwLock<State>,
     /// Serialises catch-up, and remembers the newest coordinator generation
@@ -77,6 +81,20 @@ impl Partition {
         &self.key
     }
 
+    pub fn incarnation(&self) -> Incarnation {
+        self.incarnation
+    }
+
+    /// Whether this copy has everything up to `position` of `incarnation`.
+    /// A later incarnation has every point of an earlier one behind it.
+    pub fn reached(&self, incarnation: Incarnation, position: LogPosition) -> bool {
+        match self.incarnation.cmp(&incarnation) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => self.read(State::position) >= position,
+        }
+    }
+
     /// Run `f` against a consistent view of the partition. The lock is a
     /// blocking one and is never held across an await.
     pub fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {
@@ -86,6 +104,7 @@ impl Partition {
     async fn load(key: PartitionKey, blobs: Arc<dyn Blobs>, committed: &Committed) -> Result<Self> {
         let partition = Self {
             key,
+            incarnation: committed.incarnation,
             blobs,
             state: RwLock::new(State::default()),
             seen: Mutex::new(Generation(0)),
@@ -153,6 +172,9 @@ impl Partition {
             || (committed.generation == *seen && committed.log_position < position);
         if stale {
             return Ok(position);
+        }
+        if committed.incarnation != self.incarnation {
+            return Err(StorageError::Diverged { head });
         }
         let lost = || match (&head, target) {
             (Some(_), _) => StorageError::Diverged { head: head.clone() },
@@ -525,7 +547,11 @@ impl Writer {
             .zip(unembedded)
             .map(|(outcomes, unembedded)| match unembedded {
                 Some((model, reason)) => Err(StorageError::Embedding { model, reason }),
-                None => outcomes.map(|outcomes| Receipt { position, outcomes }),
+                None => outcomes.map(|outcomes| Receipt {
+                    incarnation: self.partition.incarnation,
+                    position,
+                    outcomes,
+                }),
             })
             .collect())
     }

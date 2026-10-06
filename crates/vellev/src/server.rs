@@ -2,9 +2,9 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Request, State as Shared};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State as Shared};
 use axum::http::header::{self, HeaderMap, HeaderName, AUTHORIZATION};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -208,6 +208,22 @@ fn tenant_of(path: &str) -> Option<TenantId> {
         .flatten()
 }
 
+/// The routes that POST a query rather than a change.
+const QUERIES: [&str; 5] = [
+    "/v1/tenants/{tenant}/collections/{collection}/nearest",
+    "/v1/tenants/{tenant}/collections/{collection}/keyword",
+    "/v1/tenants/{tenant}/collections/{collection}/hybrid",
+    "/v1/tenants/{tenant}/collections/{collection}/list",
+    "/v1/tenants/{tenant}/collections/{collection}/count",
+];
+
+/// Whether a request to the route `matched` only reads, and so is answered
+/// by whichever node it reaches: every GET and HEAD, and the queries.
+fn reads(method: &Method, matched: Option<&str>) -> bool {
+    matches!(*method, Method::GET | Method::HEAD)
+        || (*method == Method::POST && matched.is_some_and(|route| QUERIES.contains(&route)))
+}
+
 /// Whether a header is about one connection rather than the request, and
 /// so is not passed on.
 fn hop_by_hop(name: &HeaderName) -> bool {
@@ -233,6 +249,10 @@ async fn forwarded(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    let matched = request.extensions().get::<MatchedPath>();
+    if reads(request.method(), matched.map(MatchedPath::as_str)) {
+        return Ok(next.run(request).await);
+    }
     let tenant = tenant_of(request.uri().path());
     let sent_on = request.headers().contains_key(FORWARDED);
     let (Some(tenant), false, Ok(node)) = (tenant, sent_on, app.node()) else {
@@ -289,6 +309,7 @@ async fn forwarded(
 #[derive(utoipa::OpenApi)]
 #[openapi(
     info(title = "Vellev", description = "The vellev vector database's HTTP API."),
+    components(schemas(vellev_api::Consistency)),
     modifiers(&Keyed),
     security(("key" = []))
 )]
@@ -374,4 +395,31 @@ pub async fn serve(
     axum::serve(listener, router(app))
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_queries_are_routes_that_post_and_nothing_else_that_posts_reads() {
+        let described = openapi();
+        let posting: Vec<&str> = described
+            .paths
+            .paths
+            .iter()
+            .filter(|(_, item)| item.post.is_some())
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert!(QUERIES.iter().all(|query| posting.contains(query)));
+        for path in posting {
+            let query = QUERIES.contains(&path);
+            assert_eq!(reads(&Method::POST, Some(path)), query, "{path}");
+        }
+        let named_count = "/v1/tenants/{tenant}/collections/{collection}";
+        assert!(!reads(&Method::PUT, Some(named_count)));
+        assert!(!reads(&Method::DELETE, Some(named_count)));
+        assert!(reads(&Method::HEAD, Some(named_count)));
+        assert!(!reads(&Method::POST, None));
+    }
 }
