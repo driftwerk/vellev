@@ -6,7 +6,8 @@
 //!
 //! Environment: OBJECTS (1000000), DIMS (768), SEGMENTS (4), QUERIES (50),
 //! GROUPS (1000). The store is kept in memory with a local copy on disk,
-//! so vectors are read in place as a node would read them.
+//! so vectors are read in place as a node would read them, or on disk
+//! alone with STORE=file, which is what a run too large for memory needs.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ use vellev_core::{
 };
 use vellev_index::filter::Filter;
 use vellev_index::vector::distance;
-use vellev_storage::blobs::{CachedBlobs, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Acquired, Coordinator, MemoryCoordinator, PartitionKey};
 use vellev_storage::{Mutation, Query, Writer};
 
@@ -99,9 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let coordinator = Arc::new(MemoryCoordinator::default());
     coordinator.register(&key).await?;
-    let cache = tempfile::tempdir()?;
-    let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
-    let blobs = Arc::new(CachedBlobs::new(store, cache.path()));
+    let dir = tempfile::tempdir()?;
+    let blobs: Arc<dyn Blobs> = match std::env::var("STORE").as_deref() {
+        Ok("file") => {
+            let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path())?;
+            Arc::new(ObjectBlobs::on_disk(Arc::new(local), dir.path()))
+        }
+        _ => {
+            let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+            Arc::new(CachedBlobs::new(store, dir.path()))
+        }
+    };
     let Acquired::Lease { lease, committed } = coordinator
         .acquire(&key, &NodeId::generate("bench"), Duration::from_secs(3600))
         .await?

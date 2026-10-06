@@ -128,3 +128,33 @@ async fn a_node_with_a_local_copy_reads_vectors_in_place_and_survives_a_damaged_
         .read(|state| assert_eq!(vector_of(state, 6), Some(vec![6.0, 0.5])));
     assert!(format::verify(&vectors, &std::fs::read(&copy).unwrap()).is_ok());
 }
+
+#[tokio::test]
+async fn a_store_on_local_disk_has_its_own_files_read_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new().await;
+    let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+    cluster.blobs = Arc::new(ObjectBlobs::on_disk(Arc::new(local), dir.path()));
+    let writer = cluster.writer().await;
+    let rows = (0..10).map(|n| upsert("notes", n, i64::from(n)));
+    writer
+        .commit([create("notes")].into_iter().chain(rows).collect())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let vectors = segments_of(&cluster).await.remove(0).vectors.unwrap();
+    assert_eq!(
+        cluster.blobs.local(&vectors).await.unwrap(),
+        Some(dir.path().join(&vectors))
+    );
+    assert_eq!(cluster.blobs.local("elsewhere").await.unwrap(), None);
+    assert_eq!(cluster.blobs.local("../etc").await.unwrap(), None);
+    writer
+        .partition()
+        .read(|state| assert_eq!(vector_of(state, 2), Some(vec![2.0, 0.5])));
+    cluster
+        .open()
+        .await
+        .partition()
+        .read(|state| assert_eq!(vector_of(state, 9), Some(vec![9.0, 0.5])));
+}

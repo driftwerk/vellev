@@ -126,11 +126,26 @@ pub(crate) fn is_plain(key: &str) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub struct ObjectBlobs(Arc<dyn ObjectStore>);
+pub struct ObjectBlobs {
+    store: Arc<dyn ObjectStore>,
+    /// Where the store keeps its files when it is a local directory, whose
+    /// files are then read in place.
+    root: Option<PathBuf>,
+}
 
 impl ObjectBlobs {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self(store)
+        Self { store, root: None }
+    }
+
+    /// A store that is the local directory `root`, which writes a file
+    /// whole under another name and renames it into place, as
+    /// `object_store`'s local file system does.
+    pub fn on_disk(store: Arc<dyn ObjectStore>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            store,
+            root: Some(root.into()),
+        }
     }
 }
 
@@ -149,7 +164,7 @@ fn blob_error(key: &str, error: object_store::Error) -> StorageError {
 #[async_trait]
 impl Blobs for ObjectBlobs {
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
-        self.0
+        self.store
             .put(
                 &object_store::path::Path::from(key),
                 PutPayload::from_bytes(bytes),
@@ -161,7 +176,7 @@ impl Blobs for ObjectBlobs {
 
     async fn get(&self, key: &str) -> Result<Bytes> {
         let found = self
-            .0
+            .store
             .get(&object_store::path::Path::from(key))
             .await
             .map_err(|e| blob_error(key, e))?;
@@ -171,7 +186,7 @@ impl Blobs for ObjectBlobs {
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
         use futures::TryStreamExt;
         let under = object_store::path::Path::from(prefix);
-        self.0
+        self.store
             .list(Some(&under))
             .map_ok(|meta| Listed {
                 key: meta.location.to_string(),
@@ -183,10 +198,22 @@ impl Blobs for ObjectBlobs {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        match self.0.delete(&object_store::path::Path::from(key)).await {
+        match self
+            .store
+            .delete(&object_store::path::Path::from(key))
+            .await
+        {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(blob_error(key, error)),
         }
+    }
+
+    async fn local(&self, key: &str) -> Result<Option<PathBuf>> {
+        let Some(path) = self.root.as_ref().filter(|_| is_plain(key)) else {
+            return Ok(None);
+        };
+        let path = path.join(key);
+        Ok(tokio::fs::metadata(&path).await.is_ok().then_some(path))
     }
 }
 

@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use eyre::Result;
-use object_store::ObjectStore;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Notify;
 use vellev::config::Config;
 use vellev::server::App;
+use vellev_storage::blobs::ObjectBlobs;
 
 #[derive(Parser)]
 #[command(name = "vellev", version, about = "Vellev vector database")]
@@ -99,7 +99,7 @@ async fn main() -> Result<ExitCode> {
 
 /// Reach Postgres, however long it takes, and then serve from the node.
 /// A node that gave up would be restarted into the same outage.
-async fn start(config: Config, store: Arc<dyn ObjectStore>, app: App, port: u16) {
+async fn start(config: Config, store: ObjectBlobs, app: App, port: u16) {
     let mut wait = Duration::from_secs(1);
     loop {
         match config.node(store.clone(), port).await {
