@@ -4,6 +4,9 @@ use axum::extract::{FromRequest, FromRequestParts, Path, Query, State as Shared}
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::Json;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::Value as Document;
 use vellev_api::{
     After, Batch, Change, Changes, Collections, Consistency, Content, Counted, Counting, Failure,
     Found, Hybrid, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, Results, Stored, TenantPage,
@@ -26,6 +29,80 @@ type Answer<T> = Result<Json<T>, ApiError>;
 #[derive(FromRequest)]
 #[from_request(via(Json), rejection(ApiError))]
 pub struct Body<T>(T);
+
+/// A JSON body that must hold nothing the API does not understand, at any
+/// depth. Schemas tolerate fields they do not know, so that what a newer
+/// release stores or answers still reads; a caller's misspelt field is
+/// refused here instead. What is understood is what reading the body and
+/// writing it back keeps, so a type read here may skip writing a field
+/// only when it is `None`, or a field sent with its default would be
+/// taken for one not understood.
+pub struct Strict<T>(T);
+
+impl<S: Send + Sync, T: DeserializeOwned + Serialize> FromRequest<S> for Strict<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(request: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
+        let Json(sent) = Json::<Document>::from_request(request, state).await?;
+        let read = T::deserialize(&sent).map_err(|error| ApiError::invalid(error.to_string()))?;
+        let understood =
+            serde_json::to_value(&read).map_err(|error| ApiError::invalid(error.to_string()))?;
+        match not_understood(&sent, &understood) {
+            Some(steps) => Err(ApiError::invalid(format!(
+                "unknown field `{}`",
+                path(&steps)
+            ))),
+            None => Ok(Strict(read)),
+        }
+    }
+}
+
+/// The first field of `sent` that reading it into `understood` dropped,
+/// as the steps to it from the outside in. A null is as good as absent.
+fn not_understood<'a>(sent: &'a Document, understood: &Document) -> Option<Vec<Step<'a>>> {
+    let deeper = |step: Step<'a>, mut rest: Vec<Step<'a>>| {
+        rest.insert(0, step);
+        rest
+    };
+    match (sent, understood) {
+        (Document::Object(sent), Document::Object(understood)) => {
+            sent.iter()
+                .find_map(|(name, value)| match understood.get(name) {
+                    Some(kept) => {
+                        not_understood(value, kept).map(|rest| deeper(Step::Field(name), rest))
+                    }
+                    None if value.is_null() => None,
+                    None => Some(vec![Step::Field(name)]),
+                })
+        }
+        (Document::Array(sent), Document::Array(understood)) => sent
+            .iter()
+            .zip(understood)
+            .enumerate()
+            .find_map(|(at, (value, kept))| {
+                not_understood(value, kept).map(|rest| deeper(Step::Item(at), rest))
+            }),
+        _ => None,
+    }
+}
+
+/// One step into a JSON document.
+enum Step<'a> {
+    Field(&'a str),
+    Item(usize),
+}
+
+/// Steps written as a path, `properties[0].searchable`.
+fn path(steps: &[Step<'_>]) -> String {
+    steps
+        .iter()
+        .enumerate()
+        .fold(String::new(), |path, (at, step)| match step {
+            Step::Field(name) if at == 0 => format!("{path}{name}"),
+            Step::Field(name) => format!("{path}.{name}"),
+            Step::Item(index) => format!("{path}[{index}]"),
+        })
+}
 
 /// What a route's path names, refused likewise.
 #[derive(FromRequestParts)]
@@ -297,7 +374,7 @@ pub async fn drop_tenant(
 pub async fn changes(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
-    Body(batch): Body<Batch>,
+    Strict(batch): Strict<Batch>,
 ) -> Answer<Written> {
     write(
         &app,
@@ -361,7 +438,7 @@ pub async fn collection(
 pub async fn create_collection(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
-    Body(schema): Body<Collection>,
+    Strict(schema): Strict<Collection>,
 ) -> Answer<Written> {
     if schema.name != collection {
         return Err(ApiError::invalid(format!(
@@ -405,7 +482,7 @@ pub async fn drop_collection(
 pub async fn add_property(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
-    Body(property): Body<Property>,
+    Strict(property): Strict<Property>,
 ) -> Answer<Written> {
     let added = Mutation::AddProperty {
         collection,

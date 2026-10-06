@@ -379,6 +379,21 @@ impl Coordinator for Unreliable {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.inner.ping().await
     }
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<(), CoordinatorError> {
+        self.inner.announce(node, versions).await
+    }
+    async fn depart(&self, node: &NodeId) -> Result<(), CoordinatorError> {
+        self.inner.depart(node).await
+    }
+    async fn oldest(&self) -> Result<Option<Versions>, CoordinatorError> {
+        self.inner.oldest().await
+    }
+    async fn format(&self) -> Result<u16, CoordinatorError> {
+        self.inner.format().await
+    }
+    async fn raise_format(&self, format: u16) -> Result<u16, CoordinatorError> {
+        self.inner.raise_format(format).await
+    }
 }
 
 #[tokio::test]

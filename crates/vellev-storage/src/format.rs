@@ -23,7 +23,15 @@ use crate::{Result, StorageError};
 
 const MAGIC: [u8; 4] = *b"VLLV";
 const HEADER: usize = 4 + 1 + 2 + 8 + 4;
+/// The newest format this release reads and can write. Every writer stamps
+/// the files it writes with it today; a release that adds a format must
+/// write the one the cluster writes instead (see docs/compatibility.md).
 pub const FORMAT_VERSION: u16 = 1;
+
+/// The newest format a node writes unless an operator allows a newer one:
+/// the format before the newest when a release adds one, so that the
+/// release before can read everything written while both run.
+pub const DEFAULT_MAX_FORMAT: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

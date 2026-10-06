@@ -10,7 +10,7 @@ use vellev_core::NodeId;
 
 use super::{
     checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result,
+    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result, Versions,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -74,6 +74,8 @@ pub struct MemoryCoordinator {
     clock: Arc<dyn Clock>,
     generations: AtomicU64,
     rows: Mutex<HashMap<PartitionKey, Row>>,
+    nodes: Mutex<HashMap<NodeId, Versions>>,
+    format: Mutex<u16>,
 }
 
 impl Default for MemoryCoordinator {
@@ -88,6 +90,8 @@ impl MemoryCoordinator {
             clock,
             generations: AtomicU64::new(0),
             rows: Mutex::new(HashMap::new()),
+            nodes: Mutex::new(HashMap::new()),
+            format: Mutex::new(1),
         }
     }
 
@@ -267,5 +271,41 @@ impl Coordinator for MemoryCoordinator {
 
     async fn ping(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()> {
+        self.nodes
+            .lock()
+            .expect("coordinator lock")
+            .insert(node.clone(), versions);
+        Ok(())
+    }
+
+    async fn depart(&self, node: &NodeId) -> Result<()> {
+        self.nodes.lock().expect("coordinator lock").remove(node);
+        Ok(())
+    }
+
+    async fn oldest(&self) -> Result<Option<Versions>> {
+        Ok(self
+            .nodes
+            .lock()
+            .expect("coordinator lock")
+            .values()
+            .copied()
+            .reduce(Versions::least))
+    }
+
+    async fn format(&self) -> Result<u16> {
+        Ok(*self.format.lock().expect("coordinator lock"))
+    }
+
+    async fn raise_format(&self, format: u16) -> Result<u16> {
+        let nodes = self.nodes.lock().expect("coordinator lock");
+        let mut current = self.format.lock().expect("coordinator lock");
+        if *current < format && nodes.values().all(|node| node.format >= format) {
+            *current = format;
+        }
+        Ok(*current)
     }
 }

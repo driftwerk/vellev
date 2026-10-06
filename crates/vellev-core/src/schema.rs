@@ -71,7 +71,6 @@ impl std::fmt::Display for DataType {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Property {
     pub name: String,
     pub data_type: DataType,
@@ -164,7 +163,6 @@ pub enum Distance {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Bm25 {
     pub k1: f32,
     pub b: f32,
@@ -180,7 +178,6 @@ impl Default for Bm25 {
 /// forgets to filter sees nothing extra.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AccessRule {
     /// A row is readable when this property equals the caller's identity id.
     pub owner: String,
@@ -430,6 +427,22 @@ pub(crate) mod tests {
             let json = serde_json::to_string(&c).unwrap();
             assert_eq!(serde_json::from_str::<Collection>(&json).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn a_schema_written_by_a_newer_release_reads_without_what_it_added() {
+        let newer = serde_json::json!({
+            "name": "notes",
+            "properties": [{ "name": "title", "data_type": "text", "searchable": true, "shown": false }],
+            "embedding": { "provider": "none", "model": "client", "dimensions": 2 },
+            "bm25": { "k1": 1.2, "b": 0.75, "boost": 2 },
+            "access_rule": { "owner": "owner", "audit": true },
+            "replicas": 3
+        });
+        let read: Collection = serde_json::from_value(newer).unwrap();
+        assert_eq!(read.properties[0].name, "title");
+        assert_eq!(read.bm25, Bm25::default());
+        assert_eq!(read.access_rule.unwrap().owner, "owner");
     }
 
     #[test]

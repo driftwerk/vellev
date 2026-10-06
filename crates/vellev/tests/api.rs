@@ -124,6 +124,25 @@ async fn collections_are_created_read_extended_and_dropped() {
     misspelt["properties"][0]["searchble"] = json!(true);
     let (status, body) = served.put(NOTES, misspelt).await;
     assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("properties[0].searchble"));
+    let mut nulled = notes(supplied());
+    nulled["access_rule"] = json!(null);
+    nulled["embedding"]["query_prefix"] = json!(null);
+    assert_eq!(
+        served.put(NOTES, nulled).await.0,
+        StatusCode::OK,
+        "null is absent"
+    );
+    let in_a_batch = json!({ "changes": [{
+        "op": "add_property",
+        "collection": "notes",
+        "property": { "name": "draft", "data_type": "bool", "filtrable": false },
+    }] });
+    let (status, body) = served.post("/v1/tenants/acme/changes", in_a_batch).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"));
     let (status, body) = served
         .put("/v1/tenants/acme/collections/other", notes(supplied()))
         .await;

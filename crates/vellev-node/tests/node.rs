@@ -20,7 +20,7 @@ use vellev_node::{Freshness, Node, NodeError, Reader, Settings};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, LogPosition, ManualClock,
-    MemoryCoordinator, PartitionKey,
+    MemoryCoordinator, PartitionKey, Versions,
 };
 use vellev_storage::{Mutation, State, StorageError};
 
@@ -826,6 +826,21 @@ impl Coordinator for Unrenewing {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.inner.ping().await
     }
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<(), CoordinatorError> {
+        self.inner.announce(node, versions).await
+    }
+    async fn depart(&self, node: &NodeId) -> Result<(), CoordinatorError> {
+        self.inner.depart(node).await
+    }
+    async fn oldest(&self) -> Result<Option<Versions>, CoordinatorError> {
+        self.inner.oldest().await
+    }
+    async fn format(&self) -> Result<u16, CoordinatorError> {
+        self.inner.format().await
+    }
+    async fn raise_format(&self, format: u16) -> Result<u16, CoordinatorError> {
+        self.inner.raise_format(format).await
+    }
 }
 
 #[tokio::test]
@@ -1226,4 +1241,48 @@ async fn a_strong_read_on_a_holder_of_a_tenant_since_recreated_reads_the_new_one
         .unwrap();
     assert!(matches!(strong, Reader::Follower(_)));
     assert!(strong.read(|state| state.collection(&notes()).is_none()));
+}
+
+#[tokio::test]
+async fn a_node_registers_while_it_runs_and_will_not_serve_a_format_it_cannot_read() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let ours = node.versions();
+    assert_eq!(node.cluster().await.unwrap(), ours);
+    node.ready().await.unwrap();
+
+    node.announcing();
+    let mut waited = Duration::ZERO;
+    while cluster.coordinator.oldest().await.unwrap().is_none() && waited < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        waited += Duration::from_millis(10);
+    }
+    assert_eq!(cluster.coordinator.oldest().await.unwrap(), Some(ours));
+    let older = Versions {
+        protocol: ours.protocol - 1,
+        ..ours
+    };
+    let other = NodeId::generate("older");
+    cluster.coordinator.announce(&other, older).await.unwrap();
+    assert_eq!(node.cluster().await.unwrap().protocol, older.protocol);
+    cluster.coordinator.depart(&other).await.unwrap();
+
+    node.shutdown().await;
+    assert_eq!(
+        cluster.coordinator.oldest().await.unwrap(),
+        None,
+        "a node that stops takes itself off"
+    );
+
+    let ahead = Cluster::new();
+    let newest = ahead
+        .coordinator
+        .raise_format(ours.format + 1)
+        .await
+        .unwrap();
+    assert_eq!(newest, ours.format + 1);
+    assert!(matches!(
+        ahead.node().ready().await,
+        Err(NodeError::Outdated { .. })
+    ));
 }
