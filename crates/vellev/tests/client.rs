@@ -414,7 +414,7 @@ async fn each_tenant_is_asked_of_the_node_that_last_answered_for_it() {
 
 #[tokio::test]
 async fn a_node_still_starting_is_waited_for() {
-    let served = Cluster::new().unstarted(&[]).await;
+    let served = Cluster::new().unstarted(&[], None).await;
     let patient = Options {
         backoff: Duration::from_millis(50),
         ..tries(8)

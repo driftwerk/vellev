@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -23,6 +23,7 @@ use vellev_storage::{
 pub struct Settings {
     pub node: NodeId,
     /// How long the node's hold on a tenant lasts without being renewed.
+    /// It is renewed every third of this while the tenant is open.
     pub lease: Duration,
     /// The most callers' writes that share one commit.
     pub group: usize,
@@ -53,6 +54,8 @@ pub enum NodeError {
     Elsewhere { tenant: TenantId, holder: NodeId },
     #[error("the node is stopping")]
     Stopped,
+    #[error("the hold on tenant {0} ran out while it was being opened")]
+    Lost(TenantId),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -113,11 +116,24 @@ pub struct Tenant {
     /// Set once the writer can no longer write, so that the node opens the
     /// tenant afresh for the next caller.
     broken: Arc<AtomicBool>,
+    /// When the hold on the tenant runs out unless renewed, by this node's
+    /// own clock.
+    deadline: Arc<Mutex<Instant>>,
 }
 
 impl Tenant {
     pub fn id(&self) -> &TenantId {
         &self.id
+    }
+
+    /// Whether this node still holds the tenant, as far as it can tell
+    /// without asking: its hold has not run out and nothing has failed.
+    fn held(&self) -> bool {
+        !self.broken.load(Ordering::SeqCst) && Instant::now() < *self.deadline()
+    }
+
+    fn deadline(&self) -> std::sync::MutexGuard<'_, Instant> {
+        self.deadline.lock().expect("deadline lock")
     }
 
     /// Run `f` against the tenant's data as of its last commit.
@@ -257,7 +273,9 @@ impl Node {
     }
 
     /// Forget the tenant. Returns whether it existed. Its files stay in
-    /// object storage, where nothing refers to them any more.
+    /// object storage, where nothing refers to them any more. A node that
+    /// holds the tenant notices at its next renewal, within a third of the
+    /// lease.
     pub async fn drop_tenant(&self, tenant: &TenantId) -> Result<bool> {
         let existed = self.0.coordinator.remove(&key(tenant)).await?;
         let opening = self.0.opened().tenants.remove(tenant);
@@ -293,7 +311,7 @@ impl Node {
                 .tenants
                 .get(tenant)
                 .and_then(|opening| opening.get())
-                .is_some_and(|tenant| tenant.broken.load(Ordering::SeqCst));
+                .is_some_and(|tenant| !tenant.held());
             if lost {
                 open.tenants.remove(tenant);
             }
@@ -372,6 +390,9 @@ impl Inner {
             }
             Err(error) => return Err(error.into()),
         };
+        let broken = Arc::new(AtomicBool::new(false));
+        let deadline = Arc::new(Mutex::new(lease.deadline()));
+        self.renewing(lease.clone(), broken.clone(), &deadline);
         let opened = Writer::open(
             self.blobs.clone(),
             self.coordinator.clone(),
@@ -379,16 +400,25 @@ impl Inner {
             &committed,
         )
         .await;
+        let still_held = !broken.load(Ordering::SeqCst)
+            && Instant::now() < *deadline.lock().expect("deadline lock");
         let writer = match opened {
-            Ok(writer) if !self.opened().stopped => {
+            Ok(writer) if !self.opened().stopped && still_held => {
                 Arc::new(writer.embedding_with(Arc::new(Documents(self.embedders.clone()))))
             }
-            unusable => {
+            Ok(_) if self.opened().stopped => {
                 self.release(&lease).await;
-                return Err(unusable.err().map_or(NodeError::Stopped, Into::into));
+                return Err(NodeError::Stopped);
+            }
+            Ok(_) => {
+                self.release(&lease).await;
+                return Err(NodeError::Lost(tenant.clone()));
+            }
+            Err(error) => {
+                self.release(&lease).await;
+                return Err(error.into());
             }
         };
-        let broken = Arc::new(AtomicBool::new(false));
         let (flushes, mut wanted) = mpsc::channel(1);
         let (flushing, failed, flushed, rows) =
             (writer.clone(), broken.clone(), tenant.clone(), *flush_rows);
@@ -411,6 +441,50 @@ impl Inner {
             flush_rows: *flush_rows,
             flushes,
             broken,
+            deadline,
         }))
+    }
+
+    /// Keep the hold the tenant was taken with for as long as `deadline`
+    /// is held, from the opening on, and note when the hold is lost. Each
+    /// renewal is timed from when the one before was asked for, so a slow
+    /// answer does not let the hold run out.
+    fn renewing(&self, lease: Lease, broken: Arc<AtomicBool>, deadline: &Arc<Mutex<Instant>>) {
+        let coordinator = self.coordinator.clone();
+        let ttl = self.settings.lease;
+        let every = ttl / 3;
+        let deadline = Arc::downgrade(deadline);
+        tokio::spawn(async move {
+            let mut next = lease.requested_at + every;
+            loop {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
+                let Some(deadline) = deadline.upgrade() else {
+                    return;
+                };
+                if broken.load(Ordering::SeqCst) {
+                    return;
+                }
+                let asked = Instant::now();
+                match tokio::time::timeout(every, coordinator.renew(&lease, ttl)).await {
+                    Ok(Ok(renewed)) => {
+                        *deadline.lock().expect("deadline lock") = renewed.deadline();
+                        next = renewed.requested_at + every;
+                    }
+                    Ok(Err(error)) if !error.is_retryable() => {
+                        tracing::warn!(partition = %lease.key, %error, "hold on the tenant lost");
+                        broken.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(partition = %lease.key, %error, "renewing the hold failed");
+                        next = asked + (every / 4);
+                    }
+                    Err(_) => {
+                        tracing::warn!(partition = %lease.key, "renewing the hold took too long");
+                        next = asked + (every / 4);
+                    }
+                }
+            }
+        });
     }
 }

@@ -1,11 +1,12 @@
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Request, State as Shared};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{self, HeaderMap, HeaderName, AUTHORIZATION};
 use axum::http::StatusCode;
 use axum::middleware::{from_fn_with_state, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
@@ -16,8 +17,8 @@ use utoipa::{Modify, OpenApi as _};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use vellev_api::Code;
-use vellev_core::{Collection, EmbeddingProvider};
-use vellev_node::Node;
+use vellev_core::{Collection, EmbeddingProvider, TenantId};
+use vellev_node::{Node, NodeError};
 use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE};
 
 use crate::api;
@@ -46,7 +47,17 @@ pub struct App {
     /// The keys a caller may present; with none, nobody may call.
     keys: Arc<[String]>,
     limits: Limits,
+    /// For sending a request on to the node that holds its tenant.
+    http: reqwest::Client,
 }
+
+/// Marks a request one node sent on to another, which goes no further.
+const FORWARDED: &str = "x-vellev-forwarded";
+/// How long a node waits for the node it sent a request on to, and for a
+/// connection to it. Shorter than a client's usual patience, so that the
+/// client hears `unavailable` and asks again rather than giving up.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(25);
+const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl App {
     pub fn new(keys: Arc<[String]>, limits: Limits) -> Self {
@@ -54,6 +65,11 @@ impl App {
             node: Arc::default(),
             keys,
             limits,
+            http: reqwest::Client::builder()
+                .connect_timeout(FORWARD_CONNECT_TIMEOUT)
+                .timeout(FORWARD_TIMEOUT)
+                .build()
+                .expect("an HTTP client with default settings"),
         }
     }
 
@@ -182,6 +198,94 @@ async fn authorized(
     }
 }
 
+/// The tenant whose data a request's path names: one with something after
+/// the tenant. Creating and dropping a tenant are the coordinator's and
+/// are done where the request arrives.
+fn tenant_of(path: &str) -> Option<TenantId> {
+    let (tenant, rest) = path.strip_prefix("/v1/tenants/")?.split_once('/')?;
+    (!rest.is_empty())
+        .then(|| TenantId::new(tenant).ok())
+        .flatten()
+}
+
+/// Whether a header is about one connection rather than the request, and
+/// so is not passed on.
+fn hop_by_hop(name: &HeaderName) -> bool {
+    [
+        header::CONNECTION,
+        header::CONTENT_LENGTH,
+        header::HOST,
+        header::TE,
+        header::TRAILER,
+        header::TRANSFER_ENCODING,
+        header::UPGRADE,
+    ]
+    .contains(name)
+        || name.as_str() == "keep-alive"
+        || name.as_str() == "proxy-connection"
+}
+
+/// Send a request for a tenant that another node holds on to that node,
+/// and answer with its answer. A request that has been sent on once goes
+/// no further: the node it reached answers for itself.
+async fn forwarded(
+    Shared(app): Shared<App>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let tenant = tenant_of(request.uri().path());
+    let sent_on = request.headers().contains_key(FORWARDED);
+    let (Some(tenant), false, Ok(node)) = (tenant, sent_on, app.node()) else {
+        return Ok(next.run(request).await);
+    };
+    let holder = match node.tenant(&tenant).await {
+        Err(NodeError::Elsewhere { holder, .. }) => holder,
+        _ => return Ok(next.run(request).await),
+    };
+    let Some(address) = holder.address() else {
+        return Ok(next.run(request).await);
+    };
+    let unreachable = |error: &dyn std::fmt::Display| {
+        tracing::warn!(%tenant, %holder, %error, "the node holding the tenant could not be reached");
+        ApiError::unavailable(format!(
+            "the node holding tenant {tenant} could not be reached"
+        ))
+    };
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, app.limits.body)
+        .await
+        .map_err(|error| ApiError::refused(StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
+    let url = format!(
+        "{address}{}",
+        parts.uri.path_and_query().map_or("", |pq| pq.as_str())
+    );
+    let passed_on = parts
+        .headers
+        .iter()
+        .filter(|(name, _)| !hop_by_hop(name))
+        .fold(HeaderMap::new(), |mut headers, (name, value)| {
+            headers.append(name, value.clone());
+            headers
+        });
+    let answer = app
+        .http
+        .request(parts.method, url)
+        .headers(passed_on)
+        .header(FORWARDED, "1")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| unreachable(&error))?;
+    let status = answer.status();
+    let answered = answer.headers().clone();
+    let bytes = answer.bytes().await.map_err(|error| unreachable(&error))?;
+    let mut response = (status, bytes).into_response();
+    for (name, value) in answered.iter().filter(|(name, _)| !hop_by_hop(name)) {
+        response.headers_mut().append(name, value.clone());
+    }
+    Ok(response)
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(
     info(title = "Vellev", description = "The vellev vector database's HTTP API."),
@@ -239,7 +343,11 @@ pub fn router(app: App) -> Router {
     let description = Arc::new(description);
     let body = DefaultBodyLimit::max(app.limits.body);
     Router::new()
-        .merge(keyed.route_layer(from_fn_with_state(app.clone(), authorized)))
+        .merge(
+            keyed
+                .route_layer(from_fn_with_state(app.clone(), forwarded))
+                .route_layer(from_fn_with_state(app.clone(), authorized)),
+        )
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route(

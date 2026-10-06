@@ -42,19 +42,29 @@ impl Cluster {
     /// As [`Self::serve`], with collections allowed to name these
     /// embedding endpoints.
     pub async fn serve_embedding_through(&self, urls: &[String]) -> Served {
-        let served = self.unstarted(urls).await;
+        let served = self.unstarted(urls, None).await;
+        served.app.start(served.node.clone());
+        served
+    }
+
+    /// A node that tells other nodes it can be reached at `address`
+    /// rather than where it listens.
+    pub async fn serve_advertising(&self, address: &str) -> Served {
+        let served = self.unstarted(&[], Some(address)).await;
         served.app.start(served.node.clone());
         served
     }
 
     /// A node that is listening but has not yet reached what it serves
     /// from.
-    pub async fn unstarted(&self, urls: &[String]) -> Served {
+    pub async fn unstarted(&self, urls: &[String], advertised: Option<&str>) -> Served {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
         let node = Arc::new(Node::new(
             self.coordinator.clone(),
             self.blobs.clone(),
             Arc::new(Embedders::new(Default::default())),
-            Settings::new(NodeId::generate("node")),
+            Settings::new(NodeId::reachable_at(advertised.unwrap_or(&url), "node")),
         ));
         let limits = Limits {
             results: MAX_LIMIT,
@@ -62,8 +72,6 @@ impl Cluster {
             embedding_urls: urls.into(),
         };
         let app = App::new([KEY.to_string(), "second-key".to_string()].into(), limits);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
         let (stop, stopped) = oneshot::channel::<()>();
         let served = tokio::spawn(vellev::server::serve(listener, app.clone(), async {
             stopped.await.ok();

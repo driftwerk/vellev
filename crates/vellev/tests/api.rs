@@ -569,9 +569,9 @@ async fn a_collection_is_listed_a_page_at_a_time_and_counted() {
 }
 
 #[tokio::test]
-async fn a_tenant_written_by_another_node_is_unavailable_here() {
+async fn a_tenant_written_by_a_node_that_cannot_be_reached_is_unavailable_here() {
     let cluster = Cluster::new();
-    let (first, second) = (cluster.serve().await, cluster.serve().await);
+    let (first, second) = (cluster.serve_advertising("").await, cluster.serve().await);
     first.with_notes(supplied()).await;
     for path in ["/v1/tenants/acme/collections", NOTES] {
         let (status, body) = second.get(path).await;
@@ -892,7 +892,7 @@ async fn what_a_caller_may_ask_is_bounded_and_refusals_keep_their_shape() {
 
 #[tokio::test]
 async fn a_node_still_starting_is_live_but_not_ready_and_serves_nothing_yet() {
-    let served = Cluster::new().unstarted(&[]).await;
+    let served = Cluster::new().unstarted(&[], None).await;
     let open = |path: &'static str| served.call_as(None, Method::GET, path, None);
     assert_eq!(open("/health/live").await.0, StatusCode::OK);
     let (status, body) = open("/health/ready").await;
@@ -913,4 +913,126 @@ async fn a_node_still_starting_is_live_but_not_ready_and_serves_nothing_yet() {
     served.app.start(served.node.clone());
     assert_eq!(open("/health/ready").await.0, StatusCode::OK);
     assert_eq!(served.get("/v1/tenants?limit=5").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
+    let cluster = Cluster::new();
+    let (first, second) = (cluster.serve().await, cluster.serve().await);
+    first.with_notes(supplied()).await;
+    let fox = json!({ "properties": { "title": "a red fox", "n": 1 }, "vector": [1.0, 0.0] });
+    let written = second.ok(Method::PUT, &object(1), Some(fox)).await;
+    assert_eq!(written["position"], 2);
+    assert_eq!(first.get(&object(1)).await.1["properties"]["n"], 1);
+    assert_eq!(second.get(&object(1)).await.1["properties"]["n"], 1);
+    let searched = second
+        .ok(
+            Method::POST,
+            &format!("{NOTES}/nearest"),
+            Some(json!({ "vector": [1.0, 0.0], "limit": 1 })),
+        )
+        .await;
+    assert_eq!(ids(&searched), [id(1)]);
+    let (status, body) = second
+        .put(&object(2), json!({ "properties": { "n": "no" } }))
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::BAD_REQUEST, "invalid"),
+        "the holder's answer comes back as is"
+    );
+    let (status, _) = second.call_as(None, Method::GET, &object(1), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a key is checked before anything is sent on"
+    );
+
+    let once_only = second
+        .http
+        .get(format!("{}{}", second.url, object(1)))
+        .bearer_auth(KEY)
+        .header("x-vellev-forwarded", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        once_only.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a request sent on goes no further"
+    );
+
+    let unreachable = cluster.serve_advertising("http://127.0.0.1:1").await;
+    unreachable.ok(Method::PUT, "/v1/tenants/other", None).await;
+    unreachable
+        .ok(
+            Method::PUT,
+            "/v1/tenants/other/collections/notes",
+            Some(notes(supplied())),
+        )
+        .await;
+    let (status, body) = second.get("/v1/tenants/other/collections").await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("could not be reached"));
+    assert_eq!(
+        second.call(Method::PUT, "/v1/tenants/other", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        second.delete("/v1/tenants/other").await.0,
+        StatusCode::NO_CONTENT
+    );
+
+    let blackhole = cluster.serve_advertising("http://10.255.255.1:9").await;
+    blackhole.ok(Method::PUT, "/v1/tenants/dark", None).await;
+    blackhole
+        .ok(
+            Method::PUT,
+            "/v1/tenants/dark/collections/notes",
+            Some(notes(supplied())),
+        )
+        .await;
+    let started = std::time::Instant::now();
+    let (status, _) = second.get("/v1/tenants/dark/collections").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "gave up connecting in {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn creating_a_tenant_through_another_node_does_not_take_it() {
+    let cluster = Cluster::new();
+    let (first, second, third) = (
+        cluster.serve().await,
+        cluster.serve().await,
+        cluster.serve().await,
+    );
+    first.with_notes(supplied()).await;
+    first.node.shutdown().await;
+    assert_eq!(
+        second.call(Method::PUT, "/v1/tenants/acme", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        third
+            .node
+            .tenant(&vellev_core::TenantId::new("acme").unwrap())
+            .await
+            .is_ok(),
+        "nobody took the tenant by creating it again"
+    );
+    let fox = json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] });
+    assert_eq!(
+        third.ok(Method::PUT, &object(1), Some(fox)).await["position"],
+        2
+    );
 }

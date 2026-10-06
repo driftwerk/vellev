@@ -67,8 +67,14 @@ pub struct Config {
         value_delimiter = ','
     )]
     pub embedding_keys: Vec<String>,
+    /// Where other nodes can reach this one, so that a request for a tenant
+    /// this node holds can be sent on to it: this node's own address, never
+    /// a load balancer's. By default this host's name and the port
+    /// listened on.
+    #[arg(long, env = "VELLEV_ADVERTISE_URL")]
+    pub advertise_url: Option<String>,
     /// How long the node's hold on a tenant lasts, in seconds.
-    #[arg(long, env = "VELLEV_LEASE_SECS", default_value_t = 30)]
+    #[arg(long, env = "VELLEV_LEASE_SECS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub lease_secs: u64,
     /// A tenant with this many rows written since its last checkpoint is
     /// flushed.
@@ -149,6 +155,17 @@ impl Config {
             .filter(|url| !url.is_empty())
             .chain(keyed.into_keys())
             .collect();
+        if let Some(url) = &self.advertise_url {
+            let parsed = reqwest::Url::parse(url).ok();
+            let usable = parsed.is_some_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host().is_some()
+                    && url.path() == "/"
+            });
+            if !usable {
+                bail!("{url} is not an http(s) address other nodes could reach this one at");
+            }
+        }
         let limits = Limits {
             results: self.max_limit as usize,
             body: self.max_body_bytes,
@@ -157,8 +174,9 @@ impl Config {
         Ok((limits, store(&self.store)?))
     }
 
-    /// A node over `store`, once Postgres can be reached.
-    pub async fn node(&self, store: Arc<dyn ObjectStore>) -> Result<Node> {
+    /// A node over `store`, once Postgres can be reached, reachable by
+    /// other nodes at `advertise_url` or else at this host on `port`.
+    pub async fn node(&self, store: Arc<dyn ObjectStore>, port: u16) -> Result<Node> {
         let coordinator =
             PostgresCoordinator::connect(&self.database_url, self.database_connections)
                 .await
@@ -173,10 +191,14 @@ impl Config {
             keys: self.embedding_keys()?,
         });
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "vellev".into());
+        let address = self
+            .advertise_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{host}:{port}"));
         let settings = Settings {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
-            ..Settings::new(NodeId::generate(&host))
+            ..Settings::new(NodeId::reachable_at(address.trim_end_matches('/'), &host))
         };
         Ok(Node::new(
             Arc::new(coordinator),
