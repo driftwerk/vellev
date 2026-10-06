@@ -664,9 +664,10 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     let whole = notes_of(tries(1));
     assert_eq!(
         whole.store_all(objects()).await.unwrap(),
-        Some(start + 3),
-        "storing the same again changes nothing"
+        Some(start + 4),
+        "storing the same again changes nothing, but is remembered as asked"
     );
+    assert_eq!(whole.count(None).await.unwrap(), 25);
 
     served.ok(reqwest::Method::DELETE, NOTES, None).await;
     served
@@ -678,7 +679,7 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     });
     assert_eq!(
         one_each.store_all(objects()).await.unwrap(),
-        Some(start + 3 + 2 + 25)
+        Some(start + 4 + 2 + 25)
     );
 
     served.ok(reqwest::Method::DELETE, NOTES, None).await;
