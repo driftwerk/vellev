@@ -240,6 +240,8 @@ impl Live<'_> {
 pub(crate) struct Layer<'a> {
     pub rows: &'a [Row],
     pub dead: &'a [bool],
+    /// How many of the rows are dead.
+    pub deaths: usize,
     pub indexes: &'a Indexes,
     pub vectors: Option<&'a Column>,
 }
@@ -318,12 +320,14 @@ struct Segment {
     vectors: Arc<Column>,
     indexes: Arc<Indexes>,
     dead: Vec<bool>,
+    deaths: usize,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Memtable {
     rows: Vec<Row>,
     dead: Vec<bool>,
+    deaths: usize,
     tombstones: Vec<RowKey>,
     indexes: Indexes,
 }
@@ -539,6 +543,7 @@ impl State {
         let memtable = Layer {
             rows: &self.memtable.rows,
             dead: &self.memtable.dead,
+            deaths: self.memtable.deaths,
             indexes: &self.memtable.indexes,
             vectors: None,
         };
@@ -547,6 +552,7 @@ impl State {
             .map(|segment| Layer {
                 rows: &segment.file.rows,
                 dead: &segment.dead,
+                deaths: segment.deaths,
                 indexes: &segment.indexes,
                 vectors: Some(&segment.vectors),
             })
@@ -600,26 +606,31 @@ impl State {
     }
 
     fn mark_dead(&mut self, location: Location) {
-        let (rows, dead, indexes, row) = match location {
+        let (rows, dead, deaths, indexes, row) = match location {
             Location::Memtable(row) => {
                 let Memtable {
                     rows,
                     dead,
+                    deaths,
                     indexes,
                     ..
                 } = &mut self.memtable;
-                (rows.as_slice(), dead, &*indexes, row)
+                (rows.as_slice(), dead, deaths, &*indexes, row)
             }
             Location::Segment(segment, row) => {
                 let segment = &mut self.segments[segment];
                 (
                     segment.file.rows.as_slice(),
                     &mut segment.dead,
+                    &mut segment.deaths,
                     &*segment.indexes,
                     row,
                 )
             }
         };
+        if !dead[row] {
+            *deaths += 1;
+        }
         dead[row] = true;
         let collection = rows[row].collection;
         if let Some(corpus) = self.corpora.get_mut(&collection) {
@@ -688,7 +699,7 @@ impl State {
         for key in &file.tombstones {
             self.forget(*key);
         }
-        let dead = file
+        let dead: Vec<bool> = file
             .rows
             .iter()
             .enumerate()
@@ -713,6 +724,7 @@ impl State {
             file,
             vectors,
             indexes,
+            deaths: dead.iter().filter(|dead| **dead).count(),
             dead,
         });
         Ok(())
@@ -954,6 +966,7 @@ impl State {
                 file,
                 vectors,
                 indexes,
+                deaths: dead.iter().filter(|dead| **dead).count(),
                 dead,
             }],
         );

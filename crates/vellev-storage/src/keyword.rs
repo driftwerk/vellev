@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 
 use vellev_core::{Bm25, Collection, CollectionName, Object};
 use vellev_index::filter::Filter;
-use vellev_index::text::{self, Posting, TextIndex};
+use vellev_index::text::{self, Cursor, Posting, TextIndex};
 
 use crate::state::{Layer, LayerIndex, State};
 use crate::{Result, StorageError};
@@ -93,12 +93,51 @@ struct Clause<'a> {
 }
 
 impl Clause<'_> {
-    fn holding<'a>(&'a self, index: &'a TextIndex) -> impl Iterator<Item = Posting> + 'a {
-        index
-            .field(self.property)
-            .into_iter()
-            .flat_map(|field| field.holding(self.token))
+    fn cursor<'a>(&self, index: &'a TextIndex) -> Option<Cursor<'a>> {
+        index.field(self.property)?.cursor(self.token)
     }
+
+    fn score(&self, parameters: Bm25, posting: Posting) -> f32 {
+        text::score(
+            parameters,
+            self.weight,
+            posting.frequency as f32,
+            posting.length as f32,
+            self.average,
+        )
+    }
+}
+
+/// The best matches so far, the worst of them on top.
+struct Best<'a> {
+    limit: usize,
+    heap: BinaryHeap<Worst<'a>>,
+}
+
+impl<'a> Best<'a> {
+    /// The score a match must reach to be worth considering, once the list
+    /// is full: a match scoring the same may still rank above the worst by
+    /// id, so it is not ruled out.
+    fn threshold(&self) -> Option<f32> {
+        (self.heap.len() >= self.limit)
+            .then(|| self.heap.peek().map(|worst| worst.0.score))
+            .flatten()
+    }
+
+    fn offer(&mut self, scored: Scored<'a>) {
+        self.heap.push(Worst(scored));
+        if self.heap.len() > self.limit {
+            self.heap.pop();
+        }
+    }
+}
+
+/// Whether a bound, a sum of up to `terms` parts, `reaches` the threshold,
+/// allowing for the rounding of each part and for the sum being taken in
+/// another order than the score it bounds.
+fn reaches(bound: f32, threshold: Option<f32>, terms: usize) -> bool {
+    let slack = 1.0 + (2 * terms + 4) as f32 * f32::EPSILON;
+    threshold.is_none_or(|threshold| bound * slack >= threshold)
 }
 
 impl State {
@@ -116,6 +155,9 @@ impl State {
             .filter
             .map(|filter| filter.compile(schema))
             .transpose()?;
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
         let Some(corpus) = self.corpus(id) else {
             return Ok(Vec::new());
         };
@@ -140,9 +182,14 @@ impl State {
                 };
                 let holding: usize = layers
                     .iter()
-                    .map(|(layer, index)| {
-                        let live = |posting: &Posting| !layer.dead[posting.row as usize];
-                        clause.holding(&index.text).filter(live).count()
+                    .filter_map(|(layer, index)| {
+                        let cursor = clause.cursor(&index.text)?;
+                        Some(match layer.deaths {
+                            0 => cursor.len(),
+                            _ => cursor
+                                .filter(|posting| !layer.dead[posting.row as usize])
+                                .count(),
+                        })
                     })
                     .sum();
                 (holding > 0).then(|| Clause {
@@ -154,27 +201,21 @@ impl State {
         if clauses.is_empty() {
             return Ok(Vec::new());
         }
-        let mut best = BinaryHeap::new();
+        let mut best = Best {
+            limit: query.limit,
+            heap: BinaryHeap::new(),
+        };
         for (layer, index) in &layers {
             let allowed = predicate
                 .as_ref()
                 .map(|predicate| predicate.select(&index.rows));
-            scores(schema.bm25, &index.text, &clauses)
-                .filter(|(row, _)| !layer.dead[*row as usize])
-                .filter(|(row, _)| allowed.as_ref().is_none_or(|rows| rows.contains(*row)))
-                .for_each(|(row, score)| {
-                    let found = layer.live(row as usize);
-                    best.push(Worst(Scored {
-                        object: found.object,
-                        vector: found.vector,
-                        score,
-                    }));
-                    if best.len() > query.limit {
-                        best.pop();
-                    }
-                });
+            let wanted = |row: u32| {
+                !layer.dead[row as usize] && allowed.as_ref().is_none_or(|rows| rows.contains(row))
+            };
+            top(schema.bm25, &index.text, &clauses, wanted, &mut best, layer);
         }
         Ok(best
+            .heap
             .into_sorted_vec()
             .into_iter()
             .map(|worst| worst.0)
@@ -223,35 +264,122 @@ pub(crate) fn searched<'a>(
         .collect()
 }
 
-/// Every row of a layer that matches a clause, ascending, with its score:
-/// the clauses' rows merged, each row's contributions added in clause order.
-fn scores<'a>(
-    bm25: Bm25,
+/// One clause's walk along a layer's postings, with the most any of them
+/// can score.
+struct Walk<'a> {
+    clause: usize,
+    cursor: Cursor<'a>,
+    bound: f32,
+}
+
+/// Offer `best` every wanted row of a layer that can reach it, scored as
+/// the exhaustive search would score it: the clauses' contributions added
+/// in clause order. Rows that cannot reach the worst of the best, by the
+/// bounds of the postings they are in, are passed over unscored, a block
+/// at a time where the blocks allow (block-max WAND).
+fn top<'a>(
+    parameters: Bm25,
     index: &'a TextIndex,
-    clauses: &'a [Clause<'a>],
-) -> impl Iterator<Item = (u32, f32)> + 'a {
-    let mut cursors: Vec<_> = clauses
+    clauses: &[Clause<'_>],
+    wanted: impl Fn(u32) -> bool,
+    best: &mut Best<'a>,
+    layer: &Layer<'a>,
+) {
+    let mut walks: Vec<Walk<'a>> = clauses
         .iter()
-        .map(|clause| (clause, clause.holding(index).peekable()))
-        .collect();
-    std::iter::from_fn(move || {
-        let row = cursors
-            .iter_mut()
-            .filter_map(|(_, cursor)| cursor.peek().map(|posting| posting.row))
-            .min()?;
-        let score = cursors
-            .iter_mut()
-            .filter_map(|(clause, cursor)| {
-                let posting = cursor.next_if(|posting| posting.row == row)?;
-                Some(text::score(
-                    bm25,
-                    clause.weight,
-                    posting.frequency as f32,
-                    posting.length as f32,
-                    clause.average,
-                ))
+        .enumerate()
+        .filter_map(|(at, clause)| {
+            let cursor = clause.cursor(index)?;
+            let bound = cursor.bound(parameters, clause.weight, clause.average);
+            Some(Walk {
+                clause: at,
+                cursor,
+                bound,
             })
-            .sum();
-        Some((row, score))
-    })
+        })
+        .collect();
+    let block_at = |walk: &Walk<'a>, row: u32| {
+        let clause = &clauses[walk.clause];
+        walk.cursor
+            .block_at(row, parameters, clause.weight, clause.average)
+    };
+    loop {
+        walks.retain(|walk| walk.cursor.row().is_some());
+        walks.sort_by_key(|walk| walk.cursor.row());
+        let threshold = best.threshold();
+        let mut reach = 0.0;
+        let Some(pivot) = walks.iter().position(|walk| {
+            reach += walk.bound;
+            reaches(reach, threshold, clauses.len())
+        }) else {
+            break;
+        };
+        let row = walks[pivot]
+            .cursor
+            .row()
+            .expect("a walk with postings left");
+        // Every walk at the pivot's row counts toward it, however far along
+        // the bounds it comes, so that a skip past the row passes over all
+        // that the row could score.
+        let level = pivot
+            + walks[pivot + 1..]
+                .iter()
+                .take_while(|walk| walk.cursor.row() == Some(row))
+                .count();
+        let blocks: Vec<(u32, f32)> = match threshold {
+            Some(_) => walks[..=level]
+                .iter()
+                .filter_map(|walk| block_at(walk, row))
+                .collect(),
+            None => Vec::new(),
+        };
+        let within: f32 = blocks.iter().map(|(_, bound)| bound).sum();
+        if !reaches(within, threshold, clauses.len()) {
+            let past = blocks
+                .iter()
+                .map(|(end, _)| end.saturating_add(1))
+                .min()
+                .unwrap_or(row.saturating_add(1));
+            let next = walks
+                .get(level + 1)
+                .and_then(|walk| walk.cursor.row())
+                .map_or(past, |beyond| past.min(beyond));
+            walks[..=level]
+                .iter_mut()
+                .for_each(|walk| walk.cursor.seek(next));
+            continue;
+        }
+        if walks[0].cursor.row() != Some(row) {
+            let behind = walks[..pivot]
+                .iter_mut()
+                .filter(|walk| walk.cursor.row() < Some(row))
+                .max_by(|a, b| a.bound.total_cmp(&b.bound))
+                .expect("a walk short of the pivot");
+            behind.cursor.seek(row);
+            continue;
+        }
+        let at = walks
+            .iter()
+            .take_while(|walk| walk.cursor.row() == Some(row))
+            .count();
+        if wanted(row) {
+            walks[..at].sort_by_key(|walk| walk.clause);
+            let score = walks[..at]
+                .iter()
+                .map(|walk| {
+                    let posting = walk.cursor.posting().expect("a walk at the row");
+                    clauses[walk.clause].score(parameters, posting)
+                })
+                .sum();
+            let live = layer.live(row as usize);
+            best.offer(Scored {
+                object: live.object,
+                vector: live.vector,
+                score,
+            });
+        }
+        walks[..at]
+            .iter_mut()
+            .for_each(|walk| walk.cursor.advance());
+    }
 }

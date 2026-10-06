@@ -294,6 +294,151 @@ async fn search_matches_the_long_way_across_layers_updates_and_deletes() {
     }
 }
 
+/// Words drawn so that a few are in most rows and most are rare, so that
+/// common query words share rows and posting lists run to many blocks.
+fn sentence(random: &mut Random, words: usize) -> String {
+    (0..words)
+        .map(|_| {
+            let skew = (random.unit() + 0.5).powi(4);
+            format!("w{}", (skew * 400.0) as u32)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[tokio::test]
+async fn the_best_few_are_the_head_of_the_whole_ranking_over_many_blocks() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer.commit(vec![notes(Bm25::default())]).await.unwrap();
+    let mut random = Random(5);
+    for (layer, rows) in [(0u32..2_500), (2_500..3_000)].into_iter().enumerate() {
+        let mutations = rows
+            .map(|n| Mutation::Upsert {
+                collection: name(NOTES),
+                id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+                properties: json!({
+                    "title": sentence(&mut random, 4),
+                    "body": sentence(&mut random, 4 + (n as usize % 40)),
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                vector: None,
+            })
+            .collect::<Vec<_>>();
+        for batch in mutations.chunks(500) {
+            writer.commit(batch.to_vec()).await.unwrap();
+        }
+        if layer == 0 {
+            writer.flush().await.unwrap();
+        }
+    }
+    let deleted = (0..3_000u32).step_by(7).map(|n| Mutation::Delete {
+        collection: name(NOTES),
+        id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+    });
+    writer.commit(deleted.collect()).await.unwrap();
+
+    writer.partition().read(|state| {
+        let mut asking = Random(9);
+        for _ in 0..60 {
+            let words = 1 + asking.0 as usize % 4;
+            let text = sentence(&mut asking, words);
+            let whole = search(state, &Keywords::matching(&text, usize::MAX));
+            for limit in [1, 5, 10, 50] {
+                let best = search(state, &Keywords::matching(&text, limit));
+                assert_eq!(
+                    ranked(&best),
+                    ranked(&whole[..limit.min(whole.len())]),
+                    "{text:?} limited to {limit}"
+                );
+            }
+        }
+    });
+}
+
+#[tokio::test]
+async fn ties_many_clauses_weights_and_filters_keep_the_best_few_exact() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![notes(Bm25 { k1: 0.0, b: 0.75 })])
+        .await
+        .unwrap();
+    let mut random = Random(11);
+    let mutations: Vec<Mutation> = (0..1_500u32)
+        .map(|n| {
+            let (title, body) = match n % 5 {
+                0 => (
+                    "fox hen owl".to_string(),
+                    "the same words again".to_string(),
+                ),
+                _ => (sentence(&mut random, 5), sentence(&mut random, 12)),
+            };
+            Mutation::Upsert {
+                collection: name(NOTES),
+                id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+                properties: json!({
+                    "title": title,
+                    "body": body,
+                    "labels": [sentence(&mut random, 2)],
+                    "n": i64::from(n % 3),
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                vector: None,
+            }
+        })
+        .collect();
+    for batch in mutations.chunks(500) {
+        writer.commit(batch.to_vec()).await.unwrap();
+    }
+    writer.flush().await.unwrap();
+    let weighted = [("title", 3.0), ("body", 0.5), ("labels", 1.7)];
+    let kept = Filter::Eq {
+        property: "n".into(),
+        value: json!(1),
+    };
+    let mut asking = Random(13);
+    let texts: Vec<String> = ["fox hen owl same words again".to_string()]
+        .into_iter()
+        .chain((0..20).map(|_| sentence(&mut asking, 6)))
+        .collect();
+    writer.partition().read(|state| {
+        for text in &texts {
+            for (properties, filter) in [
+                (&weighted[..], None),
+                (&weighted[..], Some(&kept)),
+                (&EVERY[..], Some(&kept)),
+            ] {
+                let asked = Keywords::matching(text, usize::MAX).within(properties);
+                let asked = match filter {
+                    Some(filter) => asked.filtered(filter),
+                    None => asked,
+                };
+                let whole = search(state, &asked);
+                for limit in [1, 7, 150, 301] {
+                    let best = search(
+                        state,
+                        &Keywords {
+                            limit,
+                            ..asked.clone()
+                        },
+                    );
+                    assert_eq!(
+                        ranked(&best),
+                        ranked(&whole[..limit.min(whole.len())]),
+                        "{text:?} in {properties:?}, filtered {}, limited to {limit}",
+                        filter.is_some()
+                    );
+                }
+            }
+        }
+    });
+}
+
 #[tokio::test]
 async fn a_query_with_nothing_to_find_finds_nothing() {
     let cluster = Cluster::new().await;

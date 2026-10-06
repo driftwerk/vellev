@@ -50,11 +50,138 @@ pub struct Posting {
     pub length: u32,
 }
 
-/// The rows holding one token, as positions in the field's `rows`.
+/// How many postings share one upper bound. A scan skips a whole block
+/// when nothing in it can reach the score it needs.
+pub const BLOCK: usize = 128;
+
+/// The most any posting in a block of them can contribute: the highest
+/// frequency and the shortest row in the block, which together bound the
+/// score of every posting in it, whatever the average length and weight.
+#[derive(Debug, Clone, Copy)]
+struct Block {
+    max_frequency: u32,
+    min_length: u32,
+}
+
+/// The rows holding one token, as positions in the field's `rows`, with a
+/// bound per [`BLOCK`] of them.
 #[derive(Debug, Clone, Default)]
 struct Postings {
     holders: Vec<u32>,
     frequencies: Vec<u32>,
+    blocks: Vec<Block>,
+}
+
+impl Postings {
+    fn push(&mut self, holder: u32, frequency: u32, length: u32) {
+        if self.holders.len().is_multiple_of(BLOCK) {
+            self.blocks.push(Block {
+                max_frequency: frequency,
+                min_length: length,
+            });
+        } else if let Some(block) = self.blocks.last_mut() {
+            block.max_frequency = block.max_frequency.max(frequency);
+            block.min_length = block.min_length.min(length);
+        }
+        self.holders.push(holder);
+        self.frequencies.push(frequency);
+    }
+}
+
+/// A walk forward along one token's postings in one field, by posting or
+/// by skipping to a row, with the bound of the block it is in. As an
+/// iterator it yields the postings left.
+#[derive(Debug, Clone)]
+pub struct Cursor<'a> {
+    field: &'a Field,
+    postings: &'a Postings,
+    at: usize,
+}
+
+impl Cursor<'_> {
+    /// How many postings the token has in all.
+    pub fn len(&self) -> usize {
+        self.postings.holders.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.postings.holders.is_empty()
+    }
+
+    /// The posting the cursor is at, if any is left.
+    pub fn posting(&self) -> Option<Posting> {
+        let holder = *self.postings.holders.get(self.at)?;
+        Some(Posting {
+            row: self.field.rows[holder as usize],
+            frequency: self.postings.frequencies[self.at],
+            length: self.field.lengths[holder as usize],
+        })
+    }
+
+    pub fn row(&self) -> Option<u32> {
+        let holder = *self.postings.holders.get(self.at)?;
+        Some(self.field.rows[holder as usize])
+    }
+
+    pub fn advance(&mut self) {
+        self.at += 1;
+    }
+
+    /// Move to the first posting at or past `row`.
+    pub fn seek(&mut self, row: u32) {
+        let rest = &self.postings.holders[self.at.min(self.len())..];
+        self.at += rest.partition_point(|holder| self.field.rows[*holder as usize] < row);
+    }
+
+    /// The block holding the first posting at or past `row`, without moving
+    /// there: the last row in it, and the most any posting in it can score
+    /// with `weight`. `None` once no posting is left that far on.
+    pub fn block_at(
+        &self,
+        row: u32,
+        parameters: Bm25,
+        weight: f32,
+        average: f32,
+    ) -> Option<(u32, f32)> {
+        let rest = &self.postings.holders[self.at.min(self.len())..];
+        let at = self.at + rest.partition_point(|holder| self.field.rows[*holder as usize] < row);
+        if at >= self.len() {
+            return None;
+        }
+        let block = &self.postings.blocks[at / BLOCK];
+        let last = ((at / BLOCK + 1) * BLOCK).min(self.len()) - 1;
+        let end = self.field.rows[self.postings.holders[last] as usize];
+        Some((end, bound(parameters, weight, average, block)))
+    }
+
+    /// The most any posting of the token can score with `weight`.
+    pub fn bound(&self, parameters: Bm25, weight: f32, average: f32) -> f32 {
+        self.postings
+            .blocks
+            .iter()
+            .map(|block| bound(parameters, weight, average, block))
+            .fold(0.0, f32::max)
+    }
+}
+
+impl Iterator for Cursor<'_> {
+    type Item = Posting;
+
+    fn next(&mut self) -> Option<Posting> {
+        let posting = self.posting()?;
+        self.advance();
+        Some(posting)
+    }
+}
+
+fn bound(parameters: Bm25, weight: f32, average: f32, block: &Block) -> f32 {
+    score(
+        parameters,
+        weight,
+        block.max_frequency as f32,
+        block.min_length as f32,
+        average,
+    )
 }
 
 /// One property's text: the rows that have it, ascending, with their
@@ -69,16 +196,16 @@ pub struct Field {
 impl Field {
     /// The rows holding `token`, ascending.
     pub fn holding<'a>(&'a self, token: &str) -> impl Iterator<Item = Posting> + 'a {
-        self.postings.get(token).into_iter().flat_map(|postings| {
-            postings
-                .holders
-                .iter()
-                .zip(&postings.frequencies)
-                .map(|(holder, frequency)| Posting {
-                    row: self.rows[*holder as usize],
-                    frequency: *frequency,
-                    length: self.lengths[*holder as usize],
-                })
+        self.cursor(token).into_iter().flatten()
+    }
+
+    /// A walk along the rows holding `token`, if any does.
+    pub fn cursor(&self, token: &str) -> Option<Cursor<'_>> {
+        let postings = self.postings.get(token)?;
+        Some(Cursor {
+            field: self,
+            postings,
+            at: 0,
         })
     }
 
@@ -125,9 +252,11 @@ impl TextIndex {
             field.rows.push(row);
             field.lengths.push(length);
             for (token, frequency) in frequencies {
-                let postings = field.postings.entry(token).or_default();
-                postings.holders.push(holder);
-                postings.frequencies.push(frequency);
+                field
+                    .postings
+                    .entry(token)
+                    .or_default()
+                    .push(holder, frequency, length);
             }
         }
     }
@@ -202,6 +331,76 @@ mod tests {
         assert_eq!(terms("The cat AND the hat"), ["cat", "hat"]);
         assert_eq!(terms("to be or not to be"), [] as [&str; 0]);
         assert_eq!(terms("there their theremin"), ["theremin"]);
+    }
+
+    fn indexed(texts: &[&str]) -> TextIndex {
+        use vellev_core::{CollectionName, DataType, Embedding, EmbeddingProvider, Property};
+        let collection = Collection {
+            name: CollectionName::new("notes").unwrap(),
+            properties: vec![Property::new("body", DataType::Text).searchable()],
+            embedding: Embedding {
+                provider: EmbeddingProvider::None,
+                model: "none".into(),
+                dimensions: 2,
+                query_prefix: None,
+                document_prefix: None,
+                properties: vec![],
+            },
+            distance: Default::default(),
+            bm25: Bm25::default(),
+            access_rule: None,
+        };
+        let mut index = TextIndex::default();
+        for (row, text) in texts.iter().enumerate() {
+            let object = Object {
+                id: vellev_core::ObjectId::generate(),
+                properties: [("body".to_string(), Value::Text(text.to_string()))].into(),
+                vector: None,
+            };
+            index.insert(&collection, row as u32 * 3, &object);
+        }
+        index
+    }
+
+    #[test]
+    fn a_cursor_walks_seeks_and_bounds_its_blocks() {
+        let texts: Vec<String> = (0..300)
+            .map(|n| match n % 3 {
+                0 => "fox fox fox".to_string(),
+                1 => "fox and a hen in a den".to_string(),
+                _ => "hen".to_string(),
+            })
+            .collect();
+        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let index = indexed(&borrowed);
+        let field = index.field("body").unwrap();
+        let mut cursor = field.cursor("fox").unwrap();
+        assert_eq!(cursor.len(), 200);
+        assert_eq!(cursor.row(), Some(0));
+        cursor.advance();
+        assert_eq!(cursor.row(), Some(3));
+        cursor.seek(10);
+        assert_eq!(cursor.row(), Some(12), "row 10 holds no fox");
+        assert_eq!(
+            cursor.posting(),
+            Some(Posting {
+                row: 12,
+                frequency: 1,
+                length: 7
+            })
+        );
+        let bm25 = Bm25::default();
+        let best = score(bm25, 2.0, 3.0, 3.0, 5.0);
+        let end = field.rows[cursor.postings.holders[BLOCK - 1] as usize];
+        assert_eq!(cursor.block_at(12, bm25, 2.0, 5.0), Some((end, best)));
+        assert_eq!(cursor.block_at(end + 1, bm25, 2.0, 5.0).unwrap().1, best);
+        assert!(cursor.block_at(end + 1, bm25, 2.0, 5.0).unwrap().0 > end);
+        assert_eq!(cursor.bound(bm25, 2.0, 5.0), best);
+        cursor.seek(u32::MAX);
+        assert_eq!(cursor.row(), None);
+        assert_eq!(cursor.block_at(0, bm25, 2.0, 5.0), None);
+        assert!(field.cursor("owl").is_none());
+        assert!(field.cursor("hen").is_some_and(|hen| hen.len() == 200));
     }
 
     #[test]
