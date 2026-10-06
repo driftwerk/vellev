@@ -118,14 +118,19 @@ impl NodeId {
     /// address comes first and a URL has no spaces, so it reads back.
     pub fn reachable_at(address: &str, host: &str) -> Self {
         match address.trim() {
-            "" => Self::generate(host),
-            address => Self(format!("{address} {}", Self::generate(host).0)),
+            address if address.starts_with("http") && !address.contains(char::is_whitespace) => {
+                Self(format!("{address} {}", Self::generate(host).0))
+            }
+            _ => Self::generate(host),
         }
     }
 
     /// Where the node said it can be reached, if it did.
     pub fn address(&self) -> Option<&str> {
-        self.0.split_once(' ').map(|(address, _)| address)
+        self.0
+            .split_once(' ')
+            .map(|(address, _)| address)
+            .filter(|address| address.starts_with("http://") || address.starts_with("https://"))
     }
 
     pub fn as_str(&self) -> &str {
@@ -198,5 +203,23 @@ mod tests {
             serde_json::from_str::<TenantId>("\"wf-a\"").unwrap(),
             TenantId::new("wf-a").unwrap()
         );
+    }
+
+    #[test]
+    fn a_node_id_carries_an_address_only_when_given_a_usable_one() {
+        let reachable = NodeId::reachable_at(" https://10.0.1.5:8080/ ", "host");
+        assert_eq!(reachable.address(), Some("https://10.0.1.5:8080/"));
+        for unusable in ["", "   ", "10.0.1.5:8080", "http://a b", "ftp://x"] {
+            assert_eq!(
+                NodeId::reachable_at(unusable, "host").address(),
+                None,
+                "{unusable:?}"
+            );
+        }
+        assert_eq!(
+            NodeId::from("odd host name-1234".to_string()).address(),
+            None
+        );
+        assert_eq!(NodeId::generate("host").address(), None);
     }
 }

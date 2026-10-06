@@ -980,4 +980,48 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
         .as_str()
         .unwrap()
         .contains("could not be reached"));
+    assert_eq!(
+        second.call(Method::PUT, "/v1/tenants/other", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        second.delete("/v1/tenants/other").await.0,
+        StatusCode::NO_CONTENT
+    );
+
+    let blackhole = cluster.serve_advertising("http://10.255.255.1:9").await;
+    blackhole.ok(Method::PUT, "/v1/tenants/dark", None).await;
+    blackhole
+        .ok(
+            Method::PUT,
+            "/v1/tenants/dark/collections/notes",
+            Some(notes(supplied())),
+        )
+        .await;
+    let started = std::time::Instant::now();
+    let (status, _) = second.get("/v1/tenants/dark/collections").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "gave up connecting in {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn creating_a_tenant_through_another_node_does_not_move_it() {
+    let cluster = Cluster::new();
+    let (first, second) = (cluster.serve().await, cluster.serve().await);
+    first.with_notes(supplied()).await;
+    assert_eq!(
+        second.call(Method::PUT, "/v1/tenants/acme", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let fox = json!({ "properties": { "n": 1 }, "vector": [1.0, 0.0] });
+    let written = first.ok(Method::PUT, &object(1), Some(fox)).await;
+    assert_eq!(
+        written["position"], 2,
+        "the first node still holds the tenant"
+    );
+    assert_eq!(second.node.tenants(None, 5).await.unwrap().len(), 1);
 }

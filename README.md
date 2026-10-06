@@ -50,6 +50,12 @@ call -X PUT "$notes/objects/00000000-0000-0000-0000-000000000001" -d '{"properti
 call -X POST "$notes/hybrid" -d '{"text":"fox","vector":[1,0],"limit":5}'
 ```
 
+Several nodes may run against the same Postgres and store. Each tenant is
+written by one node at a time; a request that reaches another node is sent
+on to the holder, so set `VELLEV_ADVERTISE_URL` to each node's own address
+(never a load balancer's) wherever the default of this host's name and port
+would not reach it.
+
 The API is described at `/openapi.json`, and by `vellev openapi` without a
 running node. Every route under `/v1` needs one of the configured keys. A
 collection may only name an embedding endpoint listed in

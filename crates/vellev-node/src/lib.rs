@@ -54,6 +54,8 @@ pub enum NodeError {
     Elsewhere { tenant: TenantId, holder: NodeId },
     #[error("the node is stopping")]
     Stopped,
+    #[error("the hold on tenant {0} ran out while it was being opened")]
+    Lost(TenantId),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -271,7 +273,9 @@ impl Node {
     }
 
     /// Forget the tenant. Returns whether it existed. Its files stay in
-    /// object storage, where nothing refers to them any more.
+    /// object storage, where nothing refers to them any more. A node that
+    /// holds the tenant notices at its next renewal, within a third of the
+    /// lease.
     pub async fn drop_tenant(&self, tenant: &TenantId) -> Result<bool> {
         let existed = self.0.coordinator.remove(&key(tenant)).await?;
         let opening = self.0.opened().tenants.remove(tenant);
@@ -386,6 +390,9 @@ impl Inner {
             }
             Err(error) => return Err(error.into()),
         };
+        let broken = Arc::new(AtomicBool::new(false));
+        let deadline = Arc::new(Mutex::new(lease.deadline()));
+        self.renewing(lease.clone(), broken.clone(), &deadline);
         let opened = Writer::open(
             self.blobs.clone(),
             self.coordinator.clone(),
@@ -393,18 +400,25 @@ impl Inner {
             &committed,
         )
         .await;
+        let still_held = !broken.load(Ordering::SeqCst)
+            && Instant::now() < *deadline.lock().expect("deadline lock");
         let writer = match opened {
-            Ok(writer) if !self.opened().stopped => {
+            Ok(writer) if !self.opened().stopped && still_held => {
                 Arc::new(writer.embedding_with(Arc::new(Documents(self.embedders.clone()))))
             }
-            unusable => {
+            Ok(_) if self.opened().stopped => {
                 self.release(&lease).await;
-                return Err(unusable.err().map_or(NodeError::Stopped, Into::into));
+                return Err(NodeError::Stopped);
+            }
+            Ok(_) => {
+                self.release(&lease).await;
+                return Err(NodeError::Lost(tenant.clone()));
+            }
+            Err(error) => {
+                self.release(&lease).await;
+                return Err(error.into());
             }
         };
-        let broken = Arc::new(AtomicBool::new(false));
-        let deadline = Arc::new(Mutex::new(lease.deadline()));
-        self.renewing(writer.clone(), broken.clone(), deadline.clone());
         let (flushes, mut wanted) = mpsc::channel(1);
         let (flushing, failed, flushed, rows) =
             (writer.clone(), broken.clone(), tenant.clone(), *flush_rows);
@@ -431,38 +445,43 @@ impl Inner {
         }))
     }
 
-    /// Keep the hold on `writer`'s tenant for as long as the writer lives,
-    /// and note when it is lost.
-    fn renewing(
-        &self,
-        writer: Arc<Writer>,
-        broken: Arc<AtomicBool>,
-        deadline: Arc<Mutex<Instant>>,
-    ) {
+    /// Keep the hold the tenant was taken with for as long as `deadline`
+    /// is held, from the opening on, and note when the hold is lost. Each
+    /// renewal is timed from when the one before was asked for, so a slow
+    /// answer does not let the hold run out.
+    fn renewing(&self, lease: Lease, broken: Arc<AtomicBool>, deadline: &Arc<Mutex<Instant>>) {
         let coordinator = self.coordinator.clone();
         let ttl = self.settings.lease;
-        let writer = Arc::downgrade(&writer);
+        let every = ttl / 3;
+        let deadline = Arc::downgrade(deadline);
         tokio::spawn(async move {
-            let mut every = tokio::time::interval(ttl / 3);
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            every.tick().await;
+            let mut next = lease.requested_at + every;
             loop {
-                every.tick().await;
-                let Some(writer) = writer.upgrade() else {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
+                let Some(deadline) = deadline.upgrade() else {
                     return;
                 };
                 if broken.load(Ordering::SeqCst) {
                     return;
                 }
-                match coordinator.renew(writer.lease(), ttl).await {
-                    Ok(renewed) => *deadline.lock().expect("deadline lock") = renewed.deadline(),
-                    Err(error) => {
-                        if !error.is_retryable() {
-                            tracing::warn!(partition = %writer.lease().key, %error, "hold on the tenant lost");
-                            broken.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                        tracing::warn!(partition = %writer.lease().key, %error, "renewing the hold failed");
+                let asked = Instant::now();
+                match tokio::time::timeout(every, coordinator.renew(&lease, ttl)).await {
+                    Ok(Ok(renewed)) => {
+                        *deadline.lock().expect("deadline lock") = renewed.deadline();
+                        next = renewed.requested_at + every;
+                    }
+                    Ok(Err(error)) if !error.is_retryable() => {
+                        tracing::warn!(partition = %lease.key, %error, "hold on the tenant lost");
+                        broken.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(partition = %lease.key, %error, "renewing the hold failed");
+                        next = asked + (every / 4);
+                    }
+                    Err(_) => {
+                        tracing::warn!(partition = %lease.key, "renewing the hold took too long");
+                        next = asked + (every / 4);
                     }
                 }
             }

@@ -125,7 +125,7 @@ impl From<NodeError> for ApiError {
     fn from(error: NodeError) -> Self {
         match error {
             NodeError::UnknownTenant(_) => Self::not_found(error.to_string()),
-            NodeError::Elsewhere { .. } | NodeError::Stopped => {
+            NodeError::Elsewhere { .. } | NodeError::Stopped | NodeError::Lost(_) => {
                 Self::unavailable(error.to_string())
             }
             NodeError::Embed(error) => Self::unembedded(error),

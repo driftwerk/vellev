@@ -32,6 +32,8 @@ struct Store {
     inner: ObjectBlobs,
     failing: AtomicBool,
     unreadable: AtomicBool,
+    /// How long each read takes, when reads are to be slow.
+    slow: std::sync::Mutex<Option<Duration>>,
 }
 
 #[async_trait]
@@ -46,6 +48,10 @@ impl Blobs for Store {
         self.inner.put(key, bytes).await
     }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        let delay = *self.slow.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if self.unreadable.load(Ordering::SeqCst) {
             return Err(StorageError::Blob {
                 key: key.into(),
@@ -75,6 +81,7 @@ impl Cluster {
                 inner: ObjectBlobs::new(Arc::new(InMemory::new())),
                 failing: AtomicBool::new(false),
                 unreadable: AtomicBool::new(false),
+                slow: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -682,6 +689,8 @@ async fn a_node_notices_that_another_took_its_tenant() {
 struct Unrenewing {
     inner: Arc<MemoryCoordinator>,
     failing: AtomicBool,
+    /// How long each renewal takes to be answered.
+    slowly: Duration,
 }
 
 #[async_trait]
@@ -704,6 +713,7 @@ impl Coordinator for Unrenewing {
         if self.failing.load(Ordering::SeqCst) {
             return Err(CoordinatorError::Backend("connection reset".into()));
         }
+        tokio::time::sleep(self.slowly).await;
         self.inner.renew(lease, ttl).await
     }
     async fn release(&self, lease: &Lease) -> Result<(), CoordinatorError> {
@@ -734,6 +744,7 @@ async fn a_tenant_whose_hold_could_not_be_renewed_in_time_is_opened_afresh() {
     let coordinator = Arc::new(Unrenewing {
         inner: cluster.coordinator.clone(),
         failing: AtomicBool::new(false),
+        slowly: Duration::ZERO,
     });
     let node = Node::new(
         coordinator.clone(),
@@ -761,4 +772,67 @@ async fn a_tenant_whose_hold_could_not_be_renewed_in_time_is_opened_afresh() {
         "its hold ran out, so it was opened again"
     );
     assert_eq!(afresh.read(count), 1);
+}
+
+fn node_leasing(cluster: &Cluster, coordinator: Arc<dyn Coordinator>, lease: Duration) -> Node {
+    Node::new(
+        coordinator,
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            lease,
+            ..Settings::new(NodeId::generate("node"))
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_tenant_slow_to_load_is_held_throughout_and_not_handed_out_once_lost() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_millis(300);
+    let first = node_leasing(&cluster, cluster.coordinator.clone(), lease);
+    first.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = first.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    acme.flush().await.unwrap();
+    first.shutdown().await;
+
+    *cluster.store.slow.lock().unwrap() = Some(lease / 2);
+    let second = node_leasing(&cluster, cluster.coordinator.clone(), lease);
+    let opened = second.tenant(&tenant("acme")).await.unwrap();
+    assert_eq!(opened.read(count), 1);
+    let third = node_leasing(&cluster, cluster.coordinator.clone(), lease);
+    assert!(
+        matches!(
+            third.tenant(&tenant("acme")).await,
+            Err(NodeError::Elsewhere { .. })
+        ),
+        "renewed while it loaded, so still held"
+    );
+    assert!(Arc::ptr_eq(
+        &opened,
+        &second.tenant(&tenant("acme")).await.unwrap()
+    ));
+}
+
+#[tokio::test]
+async fn a_renewal_answered_slowly_still_keeps_the_hold() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_millis(600);
+    let coordinator = Arc::new(Unrenewing {
+        inner: cluster.coordinator.clone(),
+        failing: AtomicBool::new(false),
+        slowly: lease / 3,
+    });
+    let node = node_leasing(&cluster, coordinator, lease);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    tokio::time::sleep(lease * 2).await;
+    let same = node.tenant(&tenant("acme")).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&acme, &same),
+        "each renewal is timed from when it was asked for"
+    );
 }

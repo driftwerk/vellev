@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Request, State as Shared};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{self, HeaderMap, HeaderName, AUTHORIZATION};
 use axum::http::StatusCode;
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
@@ -53,8 +53,11 @@ pub struct App {
 
 /// Marks a request one node sent on to another, which goes no further.
 const FORWARDED: &str = "x-vellev-forwarded";
-/// How long a node waits for the node it sent a request on to.
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a node waits for the node it sent a request on to, and for a
+/// connection to it. Shorter than a client's usual patience, so that the
+/// client hears `unavailable` and asks again rather than giving up.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(25);
+const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl App {
     pub fn new(keys: Arc<[String]>, limits: Limits) -> Self {
@@ -63,6 +66,7 @@ impl App {
             keys,
             limits,
             http: reqwest::Client::builder()
+                .connect_timeout(FORWARD_CONNECT_TIMEOUT)
                 .timeout(FORWARD_TIMEOUT)
                 .build()
                 .expect("an HTTP client with default settings"),
@@ -194,10 +198,31 @@ async fn authorized(
     }
 }
 
-/// The tenant a request's path names, if it names one.
+/// The tenant whose data a request's path names: one with something after
+/// the tenant. Creating and dropping a tenant are the coordinator's and
+/// are done where the request arrives.
 fn tenant_of(path: &str) -> Option<TenantId> {
-    let rest = path.strip_prefix("/v1/tenants/")?;
-    TenantId::new(rest.split('/').next()?).ok()
+    let (tenant, rest) = path.strip_prefix("/v1/tenants/")?.split_once('/')?;
+    (!rest.is_empty())
+        .then(|| TenantId::new(tenant).ok())
+        .flatten()
+}
+
+/// Whether a header is about one connection rather than the request, and
+/// so is not passed on.
+fn hop_by_hop(name: &HeaderName) -> bool {
+    [
+        header::CONNECTION,
+        header::CONTENT_LENGTH,
+        header::HOST,
+        header::TE,
+        header::TRAILER,
+        header::TRANSFER_ENCODING,
+        header::UPGRADE,
+    ]
+    .contains(name)
+        || name.as_str() == "keep-alive"
+        || name.as_str() == "proxy-connection"
 }
 
 /// Send a request for a tenant that another node holds on to that node,
@@ -234,23 +259,29 @@ async fn forwarded(
         "{address}{}",
         parts.uri.path_and_query().map_or("", |pq| pq.as_str())
     );
-    let mut sent = app
+    let passed_on = parts
+        .headers
+        .iter()
+        .filter(|(name, _)| !hop_by_hop(name))
+        .fold(HeaderMap::new(), |mut headers, (name, value)| {
+            headers.append(name, value.clone());
+            headers
+        });
+    let answer = app
         .http
         .request(parts.method, url)
+        .headers(passed_on)
         .header(FORWARDED, "1")
-        .body(body);
-    for name in [AUTHORIZATION, CONTENT_TYPE] {
-        if let Some(value) = parts.headers.get(&name) {
-            sent = sent.header(name, value);
-        }
-    }
-    let answer = sent.send().await.map_err(|error| unreachable(&error))?;
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| unreachable(&error))?;
     let status = answer.status();
-    let content_type = answer.headers().get(CONTENT_TYPE).cloned();
+    let answered = answer.headers().clone();
     let bytes = answer.bytes().await.map_err(|error| unreachable(&error))?;
     let mut response = (status, bytes).into_response();
-    if let Some(content_type) = content_type {
-        response.headers_mut().insert(CONTENT_TYPE, content_type);
+    for (name, value) in answered.iter().filter(|(name, _)| !hop_by_hop(name)) {
+        response.headers_mut().append(name, value.clone());
     }
     Ok(response)
 }
