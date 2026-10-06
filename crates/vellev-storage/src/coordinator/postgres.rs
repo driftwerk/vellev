@@ -107,9 +107,14 @@ async fn migrate(pool: &PgPool) -> Result<()> {
         sqlx::query_as("SELECT version, sql FROM vellev.schema_version ORDER BY version")
             .fetch_all(&mut *tx)
             .await?;
+    let newest_known = MIGRATIONS.last().map_or(0, |(version, _)| *version);
     for (version, sql) in &applied {
         match MIGRATIONS.iter().find(|(v, _)| v == version) {
             Some((_, expected)) if expected == sql => {}
+            // Applied by a newer release, which leaves this one working:
+            // the database is ahead during a rolling deploy and after a
+            // rollback.
+            None if *version > newest_known => {}
             _ => {
                 return Err(invariant(format!(
                     "migration {version} differs from the one applied; recreate the database"

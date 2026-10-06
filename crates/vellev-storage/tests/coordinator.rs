@@ -600,6 +600,30 @@ async fn postgres_migrations_are_idempotent_under_concurrent_starts() {
 }
 
 #[tokio::test]
+async fn a_node_starts_on_a_database_a_newer_release_has_migrated() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let ahead = 1_000_000 + i64::from(rand_suffix());
+    sqlx::query("INSERT INTO vellev.schema_version (version, sql) VALUES ($1, 'SELECT 1')")
+        .bind(ahead)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    let started = PostgresCoordinator::connect(&database_url().unwrap(), 2).await;
+    sqlx::query("DELETE FROM vellev.schema_version WHERE version = $1")
+        .bind(ahead)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    started.expect("a node of the older release starts");
+}
+
+fn rand_suffix() -> u16 {
+    uuid::Uuid::new_v4().as_u128() as u16
+}
+
+#[tokio::test]
 async fn a_row_inserted_as_before_incarnations_gets_its_generation_as_one() {
     let Some(pg) = Pg::connect().await else {
         return;
