@@ -17,7 +17,7 @@ use vellev_storage::coordinator::{
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
-    Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
+    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
 };
 
 mod reading;
@@ -213,13 +213,15 @@ impl Tenant {
             .collect()
     }
 
-    /// Commit `mutations` as one atomic step, sharing the commit with
-    /// whoever else is writing.
-    pub async fn write(&self, mutations: Vec<Mutation>) -> Result<Receipt> {
-        let made = self.embedded(&mutations).await;
+    /// Commit a batch as one atomic step, sharing the commit with whoever
+    /// else is writing. A batch naming a request answered lately is
+    /// answered as it was, and not made again.
+    pub async fn write(&self, batch: impl Into<Batch>) -> Result<Receipt> {
+        let batch = batch.into();
+        let made = self.embedded(&batch.mutations).await;
         let receipt = self
             .commits
-            .submit_with(mutations, made)
+            .submit_batch(batch, made)
             .await
             .map_err(|error| self.lost(error))?;
         if self.read(State::unflushed) >= self.flush_rows {

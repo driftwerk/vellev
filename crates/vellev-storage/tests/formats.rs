@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use common::*;
 use object_store::local::LocalFileSystem;
 use vellev_core::AccessRule;
+use vellev_core::RequestId;
 use vellev_storage::format::{SegmentIndex, FORMAT_VERSION};
-use vellev_storage::{Keywords, Merging, Query};
+use vellev_storage::{Batch, Embedded, Keywords, Merging, Query};
 
 const ROWS: u32 = 4_100;
 
@@ -84,7 +85,8 @@ fn notes() -> Collection {
 /// A partition with every kind of file and op: a large segment with its
 /// vectors and clustered index, then a later segment with tombstones
 /// flushed while commits went on, under a manifest naming the checkpoint
-/// before and the logs to replay over it.
+/// before and the logs to replay over it, and requests answered both before
+/// the manifest and in a log it replays.
 #[tokio::test]
 async fn write_fixtures() {
     if std::env::var_os("VELLEV_WRITE_FIXTURES").is_none() {
@@ -126,10 +128,18 @@ async fn write_fixtures() {
             .unwrap();
     }
     writer.flush().await.unwrap();
-    writer
-        .commit((0..10).map(gone).chain([row(ROWS)]).collect())
+    let named = |n: u128, mutations| Batch {
+        request: Some(RequestId(uuid::Uuid::from_u128(n))),
+        mutations,
+    };
+    let made = writer
+        .commit_batches(
+            vec![named(1, (0..10).map(gone).chain([row(ROWS)]).collect())],
+            Embedded::new(),
+        )
         .await
         .unwrap();
+    assert!(made.iter().all(Result::is_ok));
     paused.armed.store(true, Ordering::SeqCst);
     let flushing = tokio::spawn({
         let writer = writer.clone();
@@ -145,16 +155,18 @@ async fn write_fixtures() {
         ])
         .await
         .unwrap();
-    writer
-        .commit(vec![Mutation::Patch {
-            collection: name("notes"),
-            id: object(11),
-            properties: json!({ "n": 1_011 }).as_object().unwrap().clone(),
-            vector: None,
-            only_if: None,
-        }])
+    let patch = Mutation::Patch {
+        collection: name("notes"),
+        id: object(11),
+        properties: json!({ "n": 1_011 }).as_object().unwrap().clone(),
+        vector: None,
+        only_if: None,
+    };
+    let made = writer
+        .commit_batches(vec![named(2, vec![patch])], Embedded::new())
         .await
         .unwrap();
+    assert!(made.iter().all(Result::is_ok));
     paused.release.notify_one();
     flushing.await.unwrap().unwrap();
 
@@ -309,5 +321,21 @@ fn every_fixture_file_decodes_as_what_it_is() {
                 .join(log.trim_start_matches("tenant-a/0/"))
                 .is_file());
         }
+        let request = |n: u128| RequestId(uuid::Uuid::from_u128(n));
+        let kept: Vec<RequestId> = newest
+            .1
+            .answered
+            .iter()
+            .map(|(_, answered)| answered.request)
+            .collect();
+        assert!(kept.contains(&request(1)), "{kept:?}");
+        let replayed = newest.1.replay.last().unwrap();
+        let log: LogSegment = format::decode(
+            replayed,
+            Kind::Log,
+            &std::fs::read(partition.join(replayed.trim_start_matches("tenant-a/0/"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(log.answered[0].request, request(2));
     }
 }

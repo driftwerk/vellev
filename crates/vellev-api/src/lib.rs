@@ -18,6 +18,11 @@ pub const AFTER: &str = "x-vellev-after";
 /// A request header choosing a read's [`Consistency`].
 pub const CONSISTENCY: &str = "x-vellev-consistency";
 
+/// A request header naming a write with a UUID, the same on every try of
+/// it, so that a try made after the first was answered is answered as it
+/// was rather than made again.
+pub const REQUEST: &str = "x-vellev-request";
+
 /// A point in a tenant's history: its incarnation, which a tenant dropped
 /// and created again does not share, and a position in it. Written as
 /// `incarnation.position`.

@@ -3,6 +3,7 @@ mod common;
 use common::*;
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
+use vellev_api::REQUEST;
 
 #[tokio::test]
 async fn every_route_but_health_and_the_description_needs_a_key() {
@@ -1191,4 +1192,54 @@ fn collect_refs<'a>(value: &'a Value, refs: &mut Vec<&'a str>) {
         Value::Array(items) => items.iter().for_each(|item| collect_refs(item, refs)),
         _ => {}
     }
+}
+
+#[tokio::test]
+async fn a_write_named_again_is_answered_as_it_was_and_made_once() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    let object = object(1);
+    served
+        .ok(
+            Method::PUT,
+            &object,
+            Some(json!({ "properties": { "n": 1 }, "vector": [1, 0] })),
+        )
+        .await;
+    let named = "6f1c2b9e-1d0a-4c55-9a3e-2f6c4d8b7a10";
+    let increment = json!({ "changes": [{
+        "op": "increment", "collection": "notes", "id": id(1), "property": "n", "by": 5
+    }] });
+    let changes = "/v1/tenants/acme/changes";
+    let (served, increment) = (&served, &increment);
+    let send = |name: &'static str| async move {
+        let headers = [(REQUEST, name)];
+        served
+            .call_headed(
+                Some(KEY),
+                Method::POST,
+                changes,
+                Some(increment.clone()),
+                &headers,
+            )
+            .await
+    };
+    let (status, first) = send(named).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    served
+        .ok(
+            Method::PUT,
+            &object,
+            Some(json!({ "properties": { "n": 100 }, "vector": [1, 0] })),
+        )
+        .await;
+    let (status, again) = send(named).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again, first);
+    let stored = served.ok(Method::GET, &object, None).await;
+    assert_eq!(stored["properties"]["n"], json!(100));
+
+    let (status, refused) = send("not-a-uuid").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code(&refused), "invalid");
 }
