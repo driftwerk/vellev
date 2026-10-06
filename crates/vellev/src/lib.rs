@@ -2,5 +2,6 @@
 
 mod api;
 pub mod config;
+pub mod import;
 mod problem;
 pub mod server;

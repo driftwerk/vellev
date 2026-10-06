@@ -29,6 +29,14 @@ cargo test --workspace                           # Postgres tests skip when the 
 cargo run -p vellev -- health --url http://127.0.0.1:8080
 ```
 
+## Import from Weaviate
+
+```sh
+vellev import weaviate --from http://weaviate:8080 --to http://vellev:8080 --tenant acme
+```
+
+Copies every class (or each `--class`) into a collection of the same name, with ids and vectors, keeping progress in `vellev-import-TENANT.json` so a run that stops resumes. A class vellev should embed itself instead takes `--embedding CLASS=embedding.json`. Writes made in Weaviate during the import are caught up at the end, and counts are checked against Weaviate's. `--created-as` and `--updated-as` keep Weaviate's object times as date properties; `--per-second` limits the load on the source.
+
 ## Run
 
 ```sh
