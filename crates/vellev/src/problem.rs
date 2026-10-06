@@ -104,7 +104,8 @@ fn code(error: &StorageError) -> Code {
         | E::Corrupt { .. }
         | E::UnsupportedVersion { .. }
         | E::Exhausted(_)
-        | E::Encode(_) => Code::Internal,
+        | E::Encode(_)
+        | E::Indexing(_) => Code::Internal,
     }
 }
 

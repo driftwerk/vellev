@@ -1020,6 +1020,7 @@ async fn a_checkpoint_that_contradicts_itself_is_refused() {
                 key: key.into(),
                 rows,
                 tombstones: 0,
+                index: None,
             }]),
         )
         .unwrap()

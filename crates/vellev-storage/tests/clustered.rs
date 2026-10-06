@@ -1,0 +1,174 @@
+mod common;
+
+use common::*;
+use vellev_index::vector::VectorIndex;
+use vellev_storage::{Merging, Query};
+
+const DIMENSIONS: usize = 8;
+const ROWS: u32 = 4_500;
+
+fn wide(collection: &str) -> Mutation {
+    let mut schema = schema(collection);
+    schema.embedding.dimensions = DIMENSIONS as u32;
+    Mutation::CreateCollection(Box::new(schema))
+}
+
+fn row(collection: &str, n: u32, vector: Vec<f32>) -> Mutation {
+    Mutation::Upsert {
+        collection: name(collection),
+        id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+        properties: json!({ "title": format!("row {n}"), "n": n })
+            .as_object()
+            .unwrap()
+            .clone(),
+        vector: Some(vector),
+    }
+}
+
+/// Vectors in twenty loose groups, one per row.
+fn vectors() -> Vec<Vec<f32>> {
+    let mut random = Random(17);
+    let centres: Vec<Vec<f32>> = (0..20).map(|_| random.vector(DIMENSIONS)).collect();
+    (0..ROWS)
+        .map(|n| {
+            let jitter = random.vector(DIMENSIONS);
+            centres[n as usize % 20]
+                .iter()
+                .zip(jitter)
+                .map(|(c, e)| c + 0.3 * e)
+                .collect()
+        })
+        .collect()
+}
+
+/// The ids of the true nearest ten of `query` by cosine distance.
+fn exact(vectors: &[Vec<f32>], query: &[f32]) -> Vec<ObjectId> {
+    let mut all: Vec<(f32, u32)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(n, v)| {
+            (
+                vellev_index::vector::distance(Distance::Cosine, query, v),
+                n as u32,
+            )
+        })
+        .collect();
+    all.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    all[..10]
+        .iter()
+        .map(|(_, n)| ObjectId(uuid::Uuid::from_u128(u128::from(*n))))
+        .collect()
+}
+
+fn found(state: &State, vectors: &[Vec<f32>]) -> (usize, usize) {
+    let (mut hits, mut total) = (0, 0);
+    for query in vectors.iter().step_by(vectors.len() / 25) {
+        let nearest = exact(vectors, query);
+        let got = state
+            .search(&name("notes"), &Query::nearest(query, 10))
+            .unwrap();
+        assert_eq!(got.len(), 10);
+        hits += got
+            .iter()
+            .filter(|hit| nearest.contains(&hit.object.id))
+            .count();
+        total += 10;
+    }
+    (hits, total)
+}
+
+/// Four segments' worth of rows, flushed and merged into one.
+async fn merged(cluster: &Cluster, vectors: &[Vec<f32>]) -> Writer {
+    let writer = cluster.writer().await.merging_with(Merging {
+        clustered_above: 4_000,
+        ..Merging::default()
+    });
+    writer.commit(vec![wide("notes")]).await.unwrap();
+    for (segment, chunk) in vectors.chunks(vectors.len() / 4).enumerate() {
+        for (batch, rows) in chunk.chunks(250).enumerate() {
+            let first = segment * (vectors.len() / 4) + batch * 250;
+            let writes = rows
+                .iter()
+                .enumerate()
+                .map(|(i, vector)| row("notes", (first + i) as u32, vector.clone()));
+            writer.commit(writes.collect()).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+    }
+    writer.merge().await.unwrap().expect("four segments merge");
+    writer
+}
+
+#[tokio::test]
+async fn a_large_merged_segment_is_clustered_kept_in_a_file_and_loaded_from_it() {
+    let mut cluster = Cluster::new().await;
+    let observed = cluster.observed();
+    cluster.blobs = observed.clone();
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+
+    let head = cluster.committed().await.manifest.unwrap().0;
+    let bytes = cluster.blobs.get(&head).await.unwrap();
+    let manifest: Manifest = format::decode(&head, Kind::Manifest, &bytes).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    let segment = &manifest.segments[0];
+    let index = segment
+        .index
+        .clone()
+        .expect("a clustered segment has an index file");
+    assert!(index.contains("/index/") && index.ends_with("-merged.index"));
+    let frame = cluster.blobs.get(&index).await.unwrap();
+    let stored: SegmentIndex = format::decode(&index, Kind::Index, &frame).unwrap();
+    assert_eq!(stored.vectors.len(), 1);
+    assert_eq!(stored.vectors[0].1.len(), ROWS as usize);
+
+    let (hits, total) = writer.partition().read(|state| found(state, &vectors));
+    assert!(hits * 100 >= total * 97, "{hits} of {total} on the writer");
+
+    observed.fetched();
+    let follower = cluster.open().await;
+    let fetched = observed.fetched();
+    assert!(
+        fetched.contains(&index),
+        "the follower reads the index file"
+    );
+    let on_follower = follower.partition().read(|state| found(state, &vectors));
+    assert_eq!(
+        on_follower,
+        (hits, total),
+        "the same index gives the same hits"
+    );
+
+    cluster.blobs.delete(&index).await.unwrap();
+    let rebuilt = cluster.open().await;
+    let (hits, total) = rebuilt.partition().read(|state| found(state, &vectors));
+    assert!(
+        hits * 100 >= total * 97,
+        "{hits} of {total} after rebuilding"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_keeps_an_index_file_with_its_segment() {
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let deleted = writer.clean(Duration::ZERO).await.unwrap();
+    assert!(deleted > 0);
+    let listed = cluster
+        .blobs
+        .list(&Layout(&cluster.key).prefix())
+        .await
+        .unwrap();
+    let mut kinds: Vec<&str> = listed
+        .iter()
+        .map(|listed| listed.key.rsplit('.').next().unwrap())
+        .collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["index", "manifest", "segment"]);
+    cluster
+        .open()
+        .await
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), ROWS as usize));
+}

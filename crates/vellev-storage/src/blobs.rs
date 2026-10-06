@@ -67,6 +67,17 @@ impl Layout<'_> {
         self.named("segment", position, author, "-merged")
     }
 
+    /// The index file of the segment under `segment_key`, which must be a
+    /// segment key of this partition.
+    pub fn index(&self, segment_key: &str) -> String {
+        let name = segment_key
+            .strip_prefix(&self.prefix())
+            .and_then(|rest| rest.strip_prefix("segment/"))
+            .and_then(|name| name.strip_suffix(".segment"))
+            .expect("a segment key of this partition");
+        format!("{}index/{name}.index", self.prefix())
+    }
+
     fn key(&self, kind: &str, position: LogPosition, author: &Author) -> String {
         self.named(kind, position, author, "")
     }
@@ -85,7 +96,7 @@ impl Layout<'_> {
     /// for a key not laid out this way.
     pub(crate) fn position(&self, key: &str) -> Option<LogPosition> {
         let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
-        if !matches!(kind, "log" | "segment" | "manifest") {
+        if !matches!(kind, "log" | "segment" | "manifest" | "index") {
             return None;
         }
         name.get(..20)?.parse().ok().map(LogPosition)

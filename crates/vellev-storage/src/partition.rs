@@ -14,15 +14,21 @@ use crate::coordinator::{
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
-    decode, decode_head, encode, Head, Kind, LogSegment, Manifest, Op, SegmentMeta,
+    decode, decode_head, encode, Head, Kind, LogSegment, Manifest, Op, SegmentFile, SegmentIndex,
+    SegmentMeta,
 };
 use crate::mutation::{Mutation, Receipt, Vectorize};
-use crate::state::{self, Loaded, Merging, State};
+use crate::state::{self, Loaded, Merging, State, Stored};
 use crate::{Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
 /// safe because the coordinator accepts an identical commit twice.
 const COMMIT_ATTEMPTS: u32 = 3;
+
+/// A segment's frame and its index file's.
+type Frames = (Bytes, Option<Bytes>);
+/// A segment ready to be written and attached.
+type Indexed = (SegmentMeta, Loaded, Frames);
 const COMMIT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// How long a commit waits for the vectors it needs made.
@@ -189,16 +195,42 @@ impl Partition {
         let segments = try_join_all(manifest.segments.iter().map(|meta| {
             let held = held.get(&meta.key).cloned();
             async move {
-                match held {
-                    Some(loaded) => Ok(loaded),
-                    None => decode(&meta.key, Kind::Segment, &self.fetch(&meta.key).await?)
-                        .map(|file| (Arc::new(file), None)),
+                if let Some(loaded) = held {
+                    return Ok::<_, StorageError>(loaded);
                 }
+                let file = decode(&meta.key, Kind::Segment, &self.fetch(&meta.key).await?)?;
+                let stored = match &meta.index {
+                    Some(index) => self.stored(index).await,
+                    None => Stored::default(),
+                };
+                Ok(Loaded::fresh(file, stored))
             }
         }))
         .await?;
-        State::from_manifest(key, manifest, segments)
+        let key = key.to_string();
+        blocking(move || State::from_manifest(&key, manifest, segments)).await?
     }
+
+    /// The clustered indexes kept under `key`, or none if they cannot be
+    /// read, in which case they are built again.
+    async fn stored(&self, key: &str) -> Stored {
+        let read = async { decode::<SegmentIndex>(key, Kind::Index, &self.fetch(key).await?) };
+        match read.await {
+            Ok(index) => index.into(),
+            Err(error) => {
+                tracing::warn!(key, %error, "building a segment's indexes afresh");
+                Stored::default()
+            }
+        }
+    }
+}
+
+/// Run `work`, which takes long enough to hold up the async threads, on
+/// one of its own.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| StorageError::Indexing(error.to_string()))
 }
 
 /// A read-only copy of a partition that follows what the writer commits.
@@ -284,8 +316,13 @@ impl Writer {
         }
     }
 
-    /// Merge segments as `merging` says, instead of as by default.
+    /// Merge and index segments as `merging` says, instead of as by default.
     pub fn merging_with(self, merging: Merging) -> Self {
+        self.partition
+            .state
+            .write()
+            .expect("partition lock")
+            .cluster_above(merging.clustered_above);
         Self { merging, ..self }
     }
 
@@ -525,31 +562,57 @@ impl Writer {
         let key = layout.manifest(position, &self.author);
         let (segment, manifest) = self
             .partition
-            .read(|state| state.checkpoint(position, &segment_key));
-        let segment_frame = segment
-            .as_ref()
-            .map(|(_, file)| encode(Kind::Segment, file))
-            .transpose()?;
-        // Indexed here, before the attempt, so that readers are not held
-        // behind the write lock while a large segment is indexed.
-        let segment = segment.map(|(meta, file)| {
-            let indexes = self.partition.read(|state| state.indexed(&file.rows));
-            (meta, (Arc::new(file), Some(Arc::new(indexes))))
-        });
+            .read(|state| state.checkpoint(position, &segment_key, &layout.index(&segment_key)));
+        let segment = match segment {
+            Some((meta, file)) => Some(self.indexed(meta, file).await?),
+            None => None,
+        };
         let frame = encode(Kind::Manifest, &manifest)?;
         attempt(&mut ready, async {
-            if let Some(segment_frame) = segment_frame {
-                self.partition
-                    .blobs
-                    .put(&segment_key, segment_frame)
-                    .await?;
+            if let Some((meta, _, files)) = &segment {
+                self.upload(meta, files).await?;
             }
             self.publish(&key, frame, position).await?;
             let mut state = self.partition.state.write().expect("partition lock");
-            state.checkpointed(&key, position, segment)
+            state.checkpointed(
+                &key,
+                position,
+                segment.map(|(meta, loaded, _)| (meta, loaded)),
+            )
         })
         .await?;
         Ok(position)
+    }
+
+    /// Encode a segment and index its rows, off the async threads and before
+    /// anything is written, so that readers are not held behind the write
+    /// lock while a large segment is indexed. Returns the segment ready to
+    /// attach and the frames to upload: the segment's, and its index file's
+    /// if it has one.
+    async fn indexed(&self, meta: SegmentMeta, file: SegmentFile) -> Result<Indexed> {
+        let (catalog, above) = self
+            .partition
+            .read(|state| (state.catalog().clone(), state.clustered_above()));
+        let indexed = meta.index.is_some();
+        let (loaded, frames) = blocking(move || {
+            let segment = encode(Kind::Segment, &file)?;
+            let indexes = state::indexed(&catalog, &file.rows, &Stored::default(), above);
+            let index = indexed
+                .then(|| encode(Kind::Index, &state::stored(&indexes)))
+                .transpose()?;
+            Ok::<_, StorageError>((Loaded::built(file, indexes), (segment, index)))
+        })
+        .await??;
+        Ok((meta, loaded, frames))
+    }
+
+    /// Upload a segment's files, the index first so that the segment never
+    /// sits in the store without it.
+    async fn upload(&self, meta: &SegmentMeta, (segment, index): &Frames) -> Result<()> {
+        if let Some((key, frame)) = meta.index.as_deref().zip(index.clone()) {
+            self.partition.blobs.put(key, frame).await?;
+        }
+        self.partition.blobs.put(&meta.key, segment.clone()).await
     }
 
     /// Carry out the merge the partition most needs, if any: replace a run
@@ -563,18 +626,12 @@ impl Writer {
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
-        let Some((file, catalog)) = self.partition.read(|state| {
+        let Some((file, wants_index)) = self.partition.read(|state| {
             let file = state.merged(&merge, state.position())?;
-            Some((file, state.catalog().clone()))
+            let wants_index =
+                state::clustered(state.catalog(), &file.rows, state.clustered_above());
+            Some((file, wants_index))
         }) else {
-            return Ok(None);
-        };
-        let indexed = tokio::task::spawn_blocking(move || {
-            let indexes = state::indexed(&catalog, &file.rows);
-            (file, indexes)
-        });
-        let Ok((file, indexes)) = indexed.await else {
-            tracing::error!(partition = %self.lease.key, "indexing the merged rows did not finish");
             return Ok(None);
         };
         let layout = Layout(&self.lease.key);
@@ -590,40 +647,39 @@ impl Writer {
             key: merged_key.clone(),
             rows: file.rows.len() as u64,
             tombstones: file.tombstones.len() as u64,
+            index: wants_index.then(|| layout.index(&merged_key)),
         };
         let Some((flushed, manifest)) = self.partition.read(|state| {
             state.unchanged(&merge).then(|| {
-                let (flushed, manifest) =
-                    state.compaction(position, &segment_key, &merge, meta.clone());
-                let flushed = flushed.map(|(meta, file)| {
-                    let indexes = state.indexed(&file.rows);
-                    (meta, file, indexes)
-                });
-                (flushed, manifest)
+                let index_key = layout.index(&segment_key);
+                state.compaction(position, &segment_key, &index_key, &merge, meta.clone())
             })
         }) else {
             return Ok(None);
         };
-        let merged_frame = encode(Kind::Segment, &file)?;
-        let flushed_frame = flushed
-            .as_ref()
-            .map(|(_, file, _)| encode(Kind::Segment, file))
-            .transpose()?;
-        let flushed =
-            flushed.map(|(meta, file, indexes)| (meta, (Arc::new(file), Some(Arc::new(indexes)))));
+        let merged = self.indexed(meta, file).await?;
+        let flushed = match flushed {
+            Some((meta, file)) => Some(self.indexed(meta, file).await?),
+            None => None,
+        };
+        if !self.partition.read(|state| state.unchanged(&merge)) {
+            return Ok(None);
+        }
         let frame = encode(Kind::Manifest, &manifest)?;
-        let merged = (meta, (Arc::new(file), Some(Arc::new(indexes))));
         attempt(&mut ready, async {
-            self.partition.blobs.put(&merged_key, merged_frame).await?;
-            if let Some(flushed_frame) = flushed_frame {
-                self.partition
-                    .blobs
-                    .put(&segment_key, flushed_frame)
-                    .await?;
+            self.upload(&merged.0, &merged.2).await?;
+            if let Some((meta, _, files)) = &flushed {
+                self.upload(meta, files).await?;
             }
             self.publish(&key, frame, position).await?;
             let mut state = self.partition.state.write().expect("partition lock");
-            state.compacted(&key, position, flushed, &merge, merged)
+            state.compacted(
+                &key,
+                position,
+                flushed.map(|(meta, loaded, _)| (meta, loaded)),
+                &merge,
+                (merged.0, merged.1),
+            )
         })
         .await?;
         Ok(Some(position))
@@ -683,7 +739,12 @@ impl Writer {
         let Some(base) = base else {
             return Ok(0);
         };
-        let kept: HashSet<&str> = base.segments.iter().map(|meta| meta.key.as_str()).collect();
+        let kept: HashSet<&str> = base
+            .segments
+            .iter()
+            .flat_map(|meta| [Some(meta.key.as_str()), meta.index.as_deref()])
+            .flatten()
+            .collect();
         let orphans = files
             .iter()
             .filter(|(file, at)| *at < base.position && !kept.contains(file.key.as_str()));
