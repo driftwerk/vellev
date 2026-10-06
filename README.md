@@ -79,7 +79,8 @@ kept in a file beside it. A filter is applied during the scan, so results
 are exact with respect to it.
 
 ```sh
-cargo run --release -p vellev-index --example clustered_bench -- 200000 768
+cargo run --release -p vellev-index --example clustered_bench -- 200000 768   # the index alone
+OBJECTS=1000000 cargo run --release -p vellev-storage --example vector_scale  # commit, flush, merge, search
 ```
 
 ## Simulation
