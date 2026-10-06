@@ -1012,6 +1012,11 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
         .unwrap()
         .contains("could not be reached"));
     assert_eq!(
+        second.get("/v1/tenants/other/collections").await.0,
+        StatusCode::OK,
+        "a read is answered here whoever holds the tenant"
+    );
+    assert_eq!(
         second.call(Method::PUT, "/v1/tenants/other", None).await.0,
         StatusCode::NO_CONTENT
     );
@@ -1125,6 +1130,12 @@ async fn a_read_on_another_node_sees_the_callers_own_writes_and_deletions() {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    let (status, body) = read(Method::GET, NOTES.to_string(), None, "1.999".into()).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::BAD_REQUEST, "invalid"),
+        "a point past anything committed is refused"
+    );
     for (name, value) in [
         ("x-vellev-after", "12"),
         ("x-vellev-after", "a.b"),

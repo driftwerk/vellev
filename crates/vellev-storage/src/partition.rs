@@ -85,6 +85,16 @@ impl Partition {
         self.incarnation
     }
 
+    /// Whether this copy has everything up to `position` of `incarnation`.
+    /// A later incarnation has every point of an earlier one behind it.
+    pub fn reached(&self, incarnation: Incarnation, position: LogPosition) -> bool {
+        match self.incarnation.cmp(&incarnation) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => self.read(State::position) >= position,
+        }
+    }
+
     /// Run `f` against a consistent view of the partition. The lock is a
     /// blocking one and is never held across an await.
     pub fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {

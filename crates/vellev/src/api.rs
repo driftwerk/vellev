@@ -36,31 +36,49 @@ pub struct Named<T>(T);
 #[from_request(via(Query), rejection(ApiError))]
 pub struct Asked<T>(T);
 
-/// How fresh a read must be, from its [`AFTER`] and [`CONSISTENCY`]
-/// headers. A session read without a point to reach is answered with what
-/// the node has.
+/// The headers that say how fresh a read must be.
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Header)]
+pub struct ReadHeaders {
+    /// `incarnation.position`, as a write of the caller's answered: the
+    /// read is answered at or past it, or refused.
+    #[param(rename = "x-vellev-after")]
+    after: Option<String>,
+    /// `session` (the default), `strong` or `eventual`.
+    #[param(rename = "x-vellev-consistency", value_type = Option<Consistency>)]
+    consistency: Option<String>,
+}
+
+/// How fresh a read must be, from its [`ReadHeaders`]. A session read
+/// without a point to reach is answered with what the node has.
 pub struct Fresh(Freshness);
 
 impl<S: Send + Sync> FromRequestParts<S> for Fresh {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, ApiError> {
-        let header = |name: &str| -> Result<Option<&str>, ApiError> {
+        let header = |name: &str| -> Result<Option<String>, ApiError> {
             parts
                 .headers
                 .get(name)
                 .map(|value| {
                     value
                         .to_str()
+                        .map(str::to_string)
                         .map_err(|_| ApiError::invalid(format!("{name} is not text")))
                 })
                 .transpose()
         };
-        let consistency = match header(CONSISTENCY)? {
+        let asked = ReadHeaders {
+            after: header(AFTER)?,
+            consistency: header(CONSISTENCY)?,
+        };
+        let consistency = match asked.consistency {
             Some(text) => text.parse().map_err(ApiError::invalid)?,
             None => Consistency::default(),
         };
-        let after = header(AFTER)?
+        let after = asked
+            .after
             .map(|text| text.parse::<After>().map_err(ApiError::invalid))
             .transpose()?;
         Ok(Fresh(match (consistency, after) {
@@ -292,10 +310,7 @@ pub async fn changes(
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections",
-    params(("x-vellev-after" = Option<String>, Header,
-            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
-        ("x-vellev-consistency" = Option<Consistency>, Header,
-            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,)),
     responses((status = OK, body = Collections), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -320,10 +335,7 @@ fn schema(state: &State, collection: &CollectionName) -> Result<Collection, ApiE
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections/{collection}",
-    params(("x-vellev-after" = Option<String>, Header,
-            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
-        ("x-vellev-consistency" = Option<Consistency>, Header,
-            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     responses((status = OK, body = Collection), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -405,10 +417,7 @@ pub async fn add_property(
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
-    params(("x-vellev-after" = Option<String>, Header,
-            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
-        ("x-vellev-consistency" = Option<Consistency>, Header,
-            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     responses((status = OK, body = Stored), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -537,10 +546,7 @@ fn fused(fused: Fused<'_>, vectors: bool) -> Found {
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/nearest",
-    params(("x-vellev-after" = Option<String>, Header,
-            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
-        ("x-vellev-consistency" = Option<Consistency>, Header,
-            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Nearest,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -591,10 +597,7 @@ pub async fn nearest(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/keyword",
-    params(("x-vellev-after" = Option<String>, Header,
-            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
-        ("x-vellev-consistency" = Option<Consistency>, Header,
-            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Keyword,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -633,10 +636,7 @@ pub async fn keyword(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/hybrid",
-    params(("x-vellev-after" = Option<String>, Header,
-            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
-        ("x-vellev-consistency" = Option<Consistency>, Header,
-            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Hybrid,
     responses((status = OK, body = Results), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -692,10 +692,7 @@ pub async fn hybrid(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/list",
-    params(("x-vellev-after" = Option<String>, Header,
-            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
-        ("x-vellev-consistency" = Option<Consistency>, Header,
-            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Page,
     responses((status = OK, body = Objects), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -726,10 +723,7 @@ pub async fn list(
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/count",
-    params(("x-vellev-after" = Option<String>, Header,
-            description = "incarnation.position a write of the caller's answered with; the read waits for it"),
-        ("x-vellev-consistency" = Option<Consistency>, Header,
-            description = "session (the default), strong or eventual"), ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
+    params(ReadHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,)),
     request_body = Counting,
     responses((status = OK, body = Counted), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)

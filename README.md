@@ -64,8 +64,8 @@ would not reach it.
 
 Reads are answered by whichever node they reach, from a copy of the tenant
 it follows. A write answers with `incarnation` and `position`; send them
-back on a read as `x-vellev-after: incarnation.position` and the read waits
-until the node has caught up that far (the Rust client does this for you).
+back on a read as `x-vellev-after: incarnation.position` and the node
+catches up that far before it answers (the Rust client does this for you).
 `x-vellev-consistency: strong` waits for everything committed, and
 `eventual` answers with whatever the node has, at most about a second old.
 

@@ -191,8 +191,8 @@ impl From<sqlx::Error> for CoordinatorError {
 impl Coordinator for PostgresCoordinator {
     async fn register(&self, key: &PartitionKey) -> Result<()> {
         sqlx::query(
-            "INSERT INTO vellev.partitions (tenant, partition, generation, incarnation)
-             VALUES ($1, $2, nextval('vellev.generations'), currval('vellev.generations'))
+            "INSERT INTO vellev.partitions (tenant, partition, generation)
+             VALUES ($1, $2, nextval('vellev.generations'))
              ON CONFLICT DO NOTHING",
         )
         .bind(key.tenant.as_str())

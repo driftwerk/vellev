@@ -357,7 +357,8 @@ async fn repeating_a_commit_that_landed_succeeds(h: &dyn Harness) {
 async fn a_stalled_writer_is_fenced_and_changes_nothing(h: &dyn Harness) {
     let c = h.coordinator();
     let key = registered(h).await;
-    let (stalled, _) = lease(h, &key, &node("a")).await;
+    let (stalled, leased) = lease(h, &key, &node("a")).await;
+    let registered_as = leased.incarnation;
     c.commit(&stalled, commit(5, "m5")).await.unwrap();
 
     h.pass(&key, TTL).await;
@@ -374,7 +375,7 @@ async fn a_stalled_writer_is_fenced_and_changes_nothing(h: &dyn Harness) {
         c.committed(&key).await.unwrap(),
         Some(Committed {
             generation: successor.generation,
-            incarnation: c.committed(&key).await.unwrap().unwrap().incarnation,
+            incarnation: registered_as,
             log_position: LogPosition(6),
             manifest: Some(ManifestRef("m6".into())),
         })
@@ -596,4 +597,26 @@ async fn postgres_migrations_are_idempotent_under_concurrent_starts() {
     for started in starts {
         started.await.unwrap().expect("concurrent migration");
     }
+}
+
+#[tokio::test]
+async fn a_row_inserted_as_before_incarnations_gets_its_generation_as_one() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let key = PartitionKey {
+        tenant: TenantId::new(format!("older-{}", uuid::Uuid::new_v4().simple())).unwrap(),
+        partition: Partition::DEFAULT,
+    };
+    sqlx::query(
+        "INSERT INTO vellev.partitions (tenant, partition, generation)
+         VALUES ($1, $2, nextval('vellev.generations'))",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+    let committed = pg.coordinator.committed(&key).await.unwrap().unwrap();
+    assert_eq!(committed.incarnation.0, committed.generation.0);
 }

@@ -1452,3 +1452,33 @@ proptest! {
             .block_on(run(actions));
     }
 }
+
+#[tokio::test]
+async fn a_copy_never_follows_into_a_tenant_registered_again_even_past_where_it_was() {
+    let cluster = Cluster::new().await;
+    let removed = cluster.writer().await;
+    removed
+        .commit(vec![create("old"), upsert("old", 1, 1)])
+        .await
+        .unwrap();
+    let holding_old = cluster.open().await;
+
+    cluster.coordinator.remove(&cluster.key).await.unwrap();
+    cluster.coordinator.register(&cluster.key).await.unwrap();
+    let writer = cluster.writer().await;
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for n in 0..4 {
+        writer.commit(vec![upsert("notes", n, 1)]).await.unwrap();
+    }
+    writer.flush().await.unwrap();
+    let registered = cluster.committed().await;
+    assert!(registered.log_position > holding_old.partition().read(State::position));
+
+    assert!(matches!(
+        holding_old.catch_up(&registered).await,
+        Err(StorageError::Diverged { .. })
+    ));
+    holding_old
+        .partition()
+        .read(|state| assert!(state.collection(&name("notes")).is_none()));
+}

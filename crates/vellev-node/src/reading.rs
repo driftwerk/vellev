@@ -8,7 +8,7 @@ use std::time::Instant;
 use tokio::sync::OnceCell;
 use vellev_core::{CollectionName, TenantId};
 use vellev_embed::Embedders;
-use vellev_storage::coordinator::{CoordinatorError, Incarnation, LogPosition};
+use vellev_storage::coordinator::{Committed, CoordinatorError, Incarnation, LogPosition};
 use vellev_storage::{Follower, State, StorageError};
 
 use crate::{key, Inner, Node, NodeError, Result, Tenant};
@@ -96,15 +96,8 @@ impl Followed {
         self.used.lock().expect("use lock").elapsed()
     }
 
-    /// Whether the copy has caught up to `incarnation` and `position`. A
-    /// later incarnation has every point of an earlier one behind it.
     fn reached(&self, incarnation: Incarnation, position: LogPosition) -> bool {
-        let partition = self.follower.partition();
-        match partition.incarnation().cmp(&incarnation) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => partition.read(State::position) >= position,
-        }
+        self.follower.partition().reached(incarnation, position)
     }
 }
 
@@ -123,39 +116,57 @@ impl Node {
     /// as `fresh` asks. A read never takes the tenant's lease.
     pub async fn reader(&self, tenant: &TenantId, fresh: Freshness) -> Result<Reader> {
         if let Some(writer) = self.0.held(tenant) {
+            let partition = writer.writer.partition();
             let current = match fresh {
-                Freshness::After(incarnation, position) => {
-                    let partition = writer.writer.partition();
-                    (partition.incarnation(), partition.read(State::position))
-                        >= (incarnation, position)
+                Freshness::Eventual => true,
+                Freshness::After(incarnation, position) => partition.reached(incarnation, position),
+                Freshness::Strong => {
+                    self.committed(tenant).await?.incarnation == partition.incarnation()
                 }
-                Freshness::Eventual | Freshness::Strong => true,
             };
             if current {
                 return Ok(Reader::Writer(writer));
             }
         }
-        let followed = self.followed(tenant).await?;
-        let caught_up = match fresh {
+        let followed = self.copy_of(tenant).await?;
+        let (incarnation, position) = match fresh {
             Freshness::Eventual => return Ok(Reader::Follower(followed)),
-            Freshness::After(incarnation, position) if followed.reached(incarnation, position) => {
-                return Ok(Reader::Follower(followed))
+            Freshness::Strong => {
+                let (caught_up, _) = self.caught_up(tenant, followed).await?;
+                return Ok(Reader::Follower(caught_up));
             }
-            Freshness::After(..) | Freshness::Strong => self.caught_up(tenant, followed).await?,
+            Freshness::After(incarnation, position) => (incarnation, position),
         };
-        match fresh {
-            Freshness::After(incarnation, position)
-                if !caught_up.reached(incarnation, position) =>
-            {
-                Err(NodeError::Behind(tenant.clone()))
-            }
-            _ => Ok(Reader::Follower(caught_up)),
+        if followed.reached(incarnation, position) {
+            return Ok(Reader::Follower(followed));
+        }
+        let (caught_up, committed) = self.caught_up(tenant, followed).await?;
+        if caught_up.reached(incarnation, position) {
+            Ok(Reader::Follower(caught_up))
+        } else if committed.incarnation == incarnation {
+            Err(NodeError::Ahead(tenant.clone()))
+        } else {
+            Err(NodeError::Behind(tenant.clone()))
         }
     }
 
+    /// How many tenants this node keeps copies of for reads.
+    pub fn copies(&self) -> usize {
+        self.0.opened().followers.len()
+    }
+
+    async fn committed(&self, tenant: &TenantId) -> Result<Committed> {
+        self.0
+            .coordinator
+            .committed(&key(tenant))
+            .await?
+            .ok_or_else(|| NodeError::UnknownTenant(tenant.clone()))
+    }
+
     /// The copy of `tenant` this node follows, opened if this is the first
-    /// read of it. Callers arriving together share one opening.
-    async fn followed(&self, tenant: &TenantId) -> Result<Arc<Followed>> {
+    /// read of it. Callers arriving together share one opening, which runs
+    /// to its end and cleans up after itself even if they all stop waiting.
+    async fn copy_of(&self, tenant: &TenantId) -> Result<Arc<Followed>> {
         let following = {
             let mut open = self.0.opened();
             if open.stopped {
@@ -163,44 +174,37 @@ impl Node {
             }
             open.followers.entry(tenant.clone()).or_default().clone()
         };
-        let (inner, id, shared) = (self.0.clone(), tenant.clone(), following.clone());
-        let opened = tokio::spawn(async move {
-            shared
-                .get_or_try_init(|| inner.following(&id))
-                .await
-                .cloned()
+        let (inner, id) = (self.0.clone(), tenant.clone());
+        let followed = tokio::spawn(async move {
+            let opened = following.get_or_try_init(|| inner.following(&id)).await;
+            if opened.is_err() {
+                inner.unfollow(&id, &following);
+            }
+            opened.cloned()
         })
         .await
         .unwrap_or_else(|stopped| match stopped.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
             Err(_) => Err(NodeError::Stopped),
-        });
-        match opened {
-            Ok(followed) => {
-                followed.touch();
-                Ok(followed)
-            }
-            Err(error) => {
-                self.0.unfollow(tenant, &following);
-                Err(error)
-            }
-        }
+        })?;
+        followed.touch();
+        Ok(followed)
     }
 
     /// `followed` brought up to what is committed now, or a copy opened
-    /// afresh when it cannot follow there.
-    async fn caught_up(&self, tenant: &TenantId, followed: Arc<Followed>) -> Result<Arc<Followed>> {
-        let committed = self
-            .0
-            .coordinator
-            .committed(&key(tenant))
-            .await?
-            .ok_or_else(|| NodeError::UnknownTenant(tenant.clone()))?;
+    /// afresh when it cannot follow there, with the committed state it
+    /// was brought to.
+    async fn caught_up(
+        &self,
+        tenant: &TenantId,
+        followed: Arc<Followed>,
+    ) -> Result<(Arc<Followed>, Committed)> {
+        let committed = self.committed(tenant).await?;
         match followed.follower.catch_up(&committed).await {
-            Ok(_) => Ok(followed),
+            Ok(_) => Ok((followed, committed)),
             Err(error) if outgrown(&error) => {
                 self.0.forget_follower(tenant, &followed);
-                self.followed(tenant).await
+                Ok((self.copy_of(tenant).await?, committed))
             }
             Err(error) => Err(error.into()),
         }
@@ -235,15 +239,18 @@ impl Inner {
     /// Keep `followed` current while it is used, and let it go once it has
     /// been idle for the configured time.
     fn polling(self: &Arc<Self>, tenant: TenantId, followed: Weak<Followed>) {
+        let (every, idle) = (self.settings.follow_every, self.settings.follow_idle);
         let inner = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
-                let Some(inner) = inner.upgrade() else { return };
-                tokio::time::sleep(inner.settings.follow_every).await;
-                let Some(copy) = followed.upgrade() else {
+                tokio::time::sleep(every).await;
+                let (Some(inner), Some(copy)) = (inner.upgrade(), followed.upgrade()) else {
                     return;
                 };
-                if copy.idle() > inner.settings.follow_idle {
+                if !inner.follows(&tenant, &copy) {
+                    return;
+                }
+                if copy.idle() > idle {
                     inner.forget_follower(&tenant, &copy);
                     return;
                 }
@@ -254,7 +261,7 @@ impl Inner {
                         return;
                     }
                     Err(error) => {
-                        tracing::debug!(%tenant, %error, "reading the committed state failed");
+                        tracing::warn!(%tenant, %error, "reading the committed state failed");
                         continue;
                     }
                 };
@@ -272,17 +279,20 @@ impl Inner {
         });
     }
 
-    /// Let go of the copy of `tenant` if it is still `followed`, so that the
-    /// next read opens one afresh.
-    pub(crate) fn forget_follower(&self, tenant: &TenantId, followed: &Arc<Followed>) {
-        let mut open = self.opened();
-        let current = open
+    /// Whether `followed` is still the copy of `tenant` the node keeps.
+    fn follows(&self, tenant: &TenantId, followed: &Arc<Followed>) -> bool {
+        self.opened()
             .followers
             .get(tenant)
             .and_then(|following| following.get())
-            .is_some_and(|held| Arc::ptr_eq(held, followed));
-        if current {
-            open.followers.remove(tenant);
+            .is_some_and(|held| Arc::ptr_eq(held, followed))
+    }
+
+    /// Let go of the copy of `tenant` if it is still `followed`, so that the
+    /// next read opens one afresh.
+    pub(crate) fn forget_follower(&self, tenant: &TenantId, followed: &Arc<Followed>) {
+        if self.follows(tenant, followed) {
+            self.opened().followers.remove(tenant);
         }
     }
 

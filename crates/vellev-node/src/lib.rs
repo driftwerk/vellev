@@ -77,6 +77,8 @@ pub enum NodeError {
     Lost(TenantId),
     #[error("this node has not caught up with tenant {0} as far as asked")]
     Behind(TenantId),
+    #[error("the point asked for is past anything committed to tenant {0}")]
+    Ahead(TenantId),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -362,6 +364,9 @@ impl Node {
         let (inner, id, shared) = (self.0.clone(), tenant.clone(), opening.clone());
         let opened = tokio::spawn(async move {
             let opened = shared.get_or_try_init(|| inner.opening(&id)).await;
+            if opened.is_ok() {
+                inner.opened().followers.remove(&id);
+            }
             opened.cloned()
         })
         .await
@@ -475,7 +480,6 @@ impl Inner {
             deadline,
         });
         self.maintaining(&opened, wanted);
-        self.opened().followers.remove(tenant);
         Ok(opened)
     }
 

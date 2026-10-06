@@ -320,7 +320,9 @@ pub enum Outcome {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Written {
-    /// The tenant's incarnation the write was made in; see [`After`].
+    /// The tenant's incarnation the write was made in; see [`After`]. Zero
+    /// from a node too old to say, which a read treats as reached.
+    #[serde(default)]
     pub incarnation: u64,
     pub position: u64,
     pub outcomes: Vec<Outcome>,
