@@ -722,7 +722,20 @@ async fn a_node_stopped_and_replaced_under_load_fails_no_request() {
         StatusCode::SERVICE_UNAVAILABLE,
         "not ready once stopping"
     );
-    assert_eq!(leaving.get("/health/live").await.0, StatusCode::OK);
+    let live = leaving
+        .http
+        .get(format!("{}/health/live", leaving.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+    assert_eq!(
+        live.headers()
+            .get("connection")
+            .and_then(|value| value.to_str().ok()),
+        Some("close"),
+        "callers are asked to close the connection"
+    );
     let node = leaving.node.clone();
     leaving.stop().await;
     node.shutdown().await;
