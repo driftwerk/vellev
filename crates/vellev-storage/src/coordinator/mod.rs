@@ -43,6 +43,13 @@ impl fmt::Display for PartitionKey {
 #[serde(transparent)]
 pub struct Generation(pub u64);
 
+/// What a partition is from its registration to its removal: a partition
+/// removed and registered again has a greater one, and its positions start
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Incarnation(pub u64);
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
@@ -65,6 +72,7 @@ pub struct Committed {
     /// The partition's generation when this was read. It moves with every
     /// lease taken or released, not only with commits.
     pub generation: Generation,
+    pub incarnation: Incarnation,
     pub log_position: LogPosition,
     pub manifest: Option<ManifestRef>,
 }

@@ -302,13 +302,14 @@ async fn releasing_moves_the_generation_and_a_stale_release_is_harmless(h: &dyn 
 async fn commits_advance_the_position_and_followers_see_them(h: &dyn Harness) {
     let c = h.coordinator();
     let key = registered(h).await;
-    let (lease, _) = lease(h, &key, &node("a")).await;
+    let (lease, leased) = lease(h, &key, &node("a")).await;
 
     let committed = c.commit(&lease, commit(10, "m10")).await.unwrap();
     assert_eq!(
         committed,
         Committed {
             generation: lease.generation,
+            incarnation: leased.incarnation,
             log_position: LogPosition(10),
             manifest: Some(ManifestRef("m10".into())),
         }
@@ -326,6 +327,7 @@ async fn commits_advance_the_position_and_followers_see_them(h: &dyn Harness) {
         c.committed(&key).await.unwrap(),
         Some(Committed {
             generation: lease.generation,
+            incarnation: leased.incarnation,
             log_position: LogPosition(11),
             manifest: None
         })
@@ -372,6 +374,7 @@ async fn a_stalled_writer_is_fenced_and_changes_nothing(h: &dyn Harness) {
         c.committed(&key).await.unwrap(),
         Some(Committed {
             generation: successor.generation,
+            incarnation: c.committed(&key).await.unwrap().unwrap().incarnation,
             log_position: LogPosition(6),
             manifest: Some(ManifestRef("m6".into())),
         })
@@ -415,6 +418,31 @@ async fn a_generation_is_never_reused_after_remove_and_register(h: &dyn Harness)
         c.committed(&key).await.unwrap().unwrap().log_position,
         LogPosition(0)
     );
+}
+
+async fn the_incarnation_stays_through_leases_and_grows_when_registered_again(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let incarnation = || async { c.committed(&key).await.unwrap().unwrap().incarnation };
+    let first = incarnation().await;
+    let (held, committed) = lease(h, &key, &node("a")).await;
+    assert_eq!(committed.incarnation, first);
+    let landed = c.commit(&held, commit(1, "m1")).await.unwrap();
+    assert_eq!(landed.incarnation, first);
+    c.release(&held).await.unwrap();
+    let (_, committed) = lease(h, &key, &node("b")).await;
+    assert_eq!(committed.incarnation, first);
+    assert_eq!(incarnation().await, first);
+
+    c.register(&key).await.unwrap();
+    assert_eq!(
+        incarnation().await,
+        first,
+        "registering again changes nothing"
+    );
+    assert!(c.remove(&key).await.unwrap());
+    c.register(&key).await.unwrap();
+    assert!(incarnation().await > first);
 }
 
 async fn removing_a_partition_makes_it_unknown(h: &dyn Harness) {
@@ -549,6 +577,7 @@ conformance! {
     a_stalled_writer_is_fenced_and_changes_nothing,
     a_commit_that_does_not_advance_is_refused,
     a_generation_is_never_reused_after_remove_and_register,
+    the_incarnation_stays_through_leases_and_grows_when_registered_again,
     removing_a_partition_makes_it_unknown,
     concurrent_acquires_hand_out_exactly_one_lease,
     partitions_are_listed_in_key_order_a_page_at_a_time,

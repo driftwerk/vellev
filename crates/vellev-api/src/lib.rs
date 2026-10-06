@@ -10,11 +10,86 @@ use vellev_index::fusion::Fusion;
 /// The path every versioned route starts with.
 pub const ROOT: &str = "/v1";
 
-/// A request header naming the position a tenant's data must have reached
-/// before a read is answered: what a write of the caller's own answered
-/// with. The node that writes a tenant is always there, and today only it
-/// answers for the tenant.
-pub const MIN_POSITION: &str = "x-vellev-min-position";
+/// A request header naming what a tenant's data must have reached before a
+/// read is answered, as [`After`] writes it: what a write of the caller's
+/// own answered with.
+pub const AFTER: &str = "x-vellev-after";
+
+/// A request header choosing a read's [`Consistency`].
+pub const CONSISTENCY: &str = "x-vellev-consistency";
+
+/// A point in a tenant's history: its incarnation, which a tenant dropped
+/// and created again does not share, and a position in it. Written as
+/// `incarnation.position`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct After {
+    pub incarnation: u64,
+    pub position: u64,
+}
+
+impl After {
+    /// The later of two points: within one incarnation the greater
+    /// position, otherwise the later incarnation, whose history replaces
+    /// the other's.
+    pub fn later(self, other: After) -> After {
+        match self.incarnation.cmp(&other.incarnation) {
+            std::cmp::Ordering::Less => other,
+            std::cmp::Ordering::Greater => self,
+            std::cmp::Ordering::Equal if other.position > self.position => other,
+            std::cmp::Ordering::Equal => self,
+        }
+    }
+}
+
+impl std::fmt::Display for After {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.incarnation, self.position)
+    }
+}
+
+impl std::str::FromStr for After {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let malformed = || format!("{text:?} is not incarnation.position");
+        let (incarnation, position) = text.split_once('.').ok_or_else(malformed)?;
+        Ok(After {
+            incarnation: incarnation.parse().map_err(|_| malformed())?,
+            position: position.parse().map_err(|_| malformed())?,
+        })
+    }
+}
+
+/// How fresh a read must be. A node that writes the tenant always answers
+/// with everything committed, whatever is asked.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Consistency {
+    /// At least as far as [`AFTER`] says, when it is sent; otherwise as
+    /// [`Consistency::Eventual`].
+    #[default]
+    Session,
+    /// Everything committed when the read arrived.
+    Strong,
+    /// Whatever the node has, at most about a second behind.
+    Eventual,
+}
+
+impl std::str::FromStr for Consistency {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "session" => Ok(Consistency::Session),
+            "strong" => Ok(Consistency::Strong),
+            "eventual" => Ok(Consistency::Eventual),
+            other => Err(format!(
+                "{other:?} is not a consistency: session, strong or eventual"
+            )),
+        }
+    }
+}
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,8 +320,20 @@ pub enum Outcome {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Written {
+    /// The tenant's incarnation the write was made in; see [`After`].
+    pub incarnation: u64,
     pub position: u64,
     pub outcomes: Vec<Outcome>,
+}
+
+impl Written {
+    /// What a read must have caught up to for this write to be in it.
+    pub fn after(&self) -> After {
+        After {
+            incarnation: self.incarnation,
+            position: self.position,
+        }
+    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -400,6 +487,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_point_in_a_tenants_history_is_written_and_read_back_and_a_new_incarnation_wins() {
+        let at = |incarnation, position| After {
+            incarnation,
+            position,
+        };
+        assert_eq!(at(7, 42).to_string(), "7.42");
+        assert_eq!("7.42".parse::<After>(), Ok(at(7, 42)));
+        for bad in ["", "7", "7.", ".42", "7.42.1", "-1.2", "a.b", "7 .42"] {
+            assert!(bad.parse::<After>().is_err(), "{bad:?}");
+        }
+        assert_eq!(at(7, 42).later(at(7, 3)), at(7, 42));
+        assert_eq!(at(7, 3).later(at(7, 42)), at(7, 42));
+        assert_eq!(at(7, 42).later(at(9, 1)), at(9, 1), "positions start again");
+        assert_eq!(at(9, 1).later(at(7, 42)), at(9, 1));
+        assert_eq!("strong".parse(), Ok(Consistency::Strong));
+        assert!("Strong".parse::<Consistency>().is_err());
+        assert_eq!(Consistency::default(), Consistency::Session);
+    }
 
     #[test]
     fn a_change_is_named_by_its_op_and_refuses_what_it_does_not_know() {

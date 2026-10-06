@@ -14,8 +14,8 @@ use reqwest::{Method, StatusCode};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Serialize;
 use vellev_api::{
-    Batch, Change, Changes, Code, Collections, Content, Counted, Failure, Hybrid, Keyword, Nearest,
-    Objects, Page, Results, Stored, Tenants, Written, MIN_POSITION, ROOT,
+    After, Batch, Change, Changes, Code, Collections, Content, Counted, Failure, Hybrid, Keyword,
+    Nearest, Objects, Page, Results, Stored, Tenants, Written, AFTER, ROOT,
 };
 use vellev_core::{Collection, CollectionName, ObjectId, Property, TenantId};
 use vellev_index::filter::Filter;
@@ -139,8 +139,8 @@ impl Default for Options {
 struct Known {
     /// The node that last answered for it.
     node: usize,
-    /// The position of this client's last write to it.
-    position: Option<u64>,
+    /// Where this client's last write to it left it.
+    after: Option<After>,
 }
 
 struct Inner {
@@ -260,9 +260,10 @@ impl Client {
         }
     }
 
-    /// The position of this client's last write to `tenant`.
-    pub fn position(&self, tenant: &TenantId) -> Option<u64> {
-        self.known(Some(tenant)).position
+    /// Where this client's last write to `tenant` left it: what a read of
+    /// the tenant through this client is answered at or past.
+    pub fn after(&self, tenant: &TenantId) -> Option<After> {
+        self.known(Some(tenant)).after
     }
 
     fn learnt(&self) -> std::sync::MutexGuard<'_, HashMap<Option<TenantId>, Known>> {
@@ -292,11 +293,11 @@ impl Client {
         let mut backoff = options.backoff;
         for attempt in 0..options.attempts as usize {
             let node = (first + attempt) % nodes.len();
-            let position = match kind {
-                Kind::Read => tenant.and_then(|tenant| self.position(tenant)),
+            let after = match kind {
+                Kind::Read => tenant.and_then(|tenant| self.after(tenant)),
                 Kind::Write => None,
             };
-            let failure = match self.once(node, &method, path, body, position).await {
+            let failure = match self.once(node, &method, path, body, after).await {
                 Ok(answer) => {
                     self.learnt().entry(tenant.cloned()).or_default().node = node;
                     return Ok(answer);
@@ -324,7 +325,7 @@ impl Client {
         method: &Method,
         path: &str,
         body: Option<&(impl Serialize + ?Sized)>,
-        position: Option<u64>,
+        after: Option<After>,
     ) -> Result<T> {
         let Inner {
             nodes, key, http, ..
@@ -336,8 +337,8 @@ impl Client {
             Some(key) => request.bearer_auth(key),
             None => request,
         };
-        let request = match position {
-            Some(position) => request.header(MIN_POSITION, position),
+        let request = match after {
+            Some(after) => request.header(AFTER, after.to_string()),
             None => request,
         };
         let request = match body {
@@ -410,7 +411,10 @@ impl Tenant {
             .await?;
         let mut learnt = self.client.learnt();
         let known = learnt.entry(Some(self.id.clone())).or_default();
-        known.position = known.position.max(Some(written.position));
+        known.after = Some(match known.after {
+            Some(known) => known.later(written.after()),
+            None => written.after(),
+        });
         Ok(written)
     }
 

@@ -47,6 +47,7 @@ fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool) -> Stored {
 fn written(receipt: Receipt) -> Written {
     use vellev_storage::Outcome as Did;
     Written {
+        incarnation: receipt.incarnation.0,
         position: receipt.position.0,
         outcomes: receipt
             .outcomes

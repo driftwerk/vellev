@@ -9,8 +9,9 @@ use common::*;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use vellev_api::{
-    Change, Changes, Code, Content, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, MIN_POSITION,
+    Change, Changes, Code, Content, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, AFTER,
 };
+use vellev_client::api::After;
 use vellev_client::{Client, Error, Options};
 use vellev_core::{Collection, CollectionName, ObjectId, Property, TenantId};
 use vellev_index::filter::Filter;
@@ -81,25 +82,30 @@ struct Stub {
 /// A request's method and path, and the freshness it asked for.
 type Request = (String, Option<String>);
 
-type Answer = fn(&Asked, &str) -> (u16, Value);
-
 impl Stub {
-    async fn answering(answer: Answer) -> Self {
+    async fn answering(
+        answer: impl Fn(&Asked, &str) -> (u16, Value) + Send + Sync + 'static,
+    ) -> Self {
+        let answer = Arc::new(answer);
         let asked = Arc::new(Mutex::new(Vec::new()));
         let seen = asked.clone();
         let router = axum::Router::new().fallback(
-            move |method: Asked, uri: Uri, headers: axum::http::HeaderMap| async move {
-                let fresh = headers
-                    .get(MIN_POSITION)
-                    .map(|value| value.to_str().unwrap().to_string());
-                seen.lock()
-                    .unwrap()
-                    .push((format!("{method} {}", uri.path()), fresh));
-                let (status, body) = answer(&method, uri.path());
-                let status = Answered::from_u16(status).unwrap();
-                match body {
-                    Value::String(text) => (status, text).into_response(),
-                    body => (status, axum::Json(body)).into_response(),
+            move |method: Asked, uri: Uri, headers: axum::http::HeaderMap| {
+                let answer = answer.clone();
+                let seen = seen.clone();
+                async move {
+                    let fresh = headers
+                        .get(AFTER)
+                        .map(|value| value.to_str().unwrap().to_string());
+                    seen.lock()
+                        .unwrap()
+                        .push((format!("{method} {}", uri.path()), fresh));
+                    let (status, body) = answer(&method, uri.path());
+                    let status = Answered::from_u16(status).unwrap();
+                    match body {
+                        Value::String(text) => (status, text).into_response(),
+                        body => (status, axum::Json(body)).into_response(),
+                    }
                 }
             },
         );
@@ -140,7 +146,7 @@ fn by_tenant(_: &Asked, path: &str) -> (u16, Value) {
         () if named("garbled") => (200, json!("not what was asked for")),
         () => (
             200,
-            json!({ "position": 7, "outcomes": [{ "outcome": "from the future" }] }),
+            json!({ "incarnation": 3, "position": 7, "outcomes": [{ "outcome": "from the future" }] }),
         ),
     }
 }
@@ -216,7 +222,7 @@ async fn the_whole_api_is_reached_through_the_client() {
         changed.outcomes,
         [Outcome::Value { value: json!(6) }, Outcome::Unchanged]
     );
-    assert_eq!(client.position(&tenant("acme")), Some(changed.position));
+    assert_eq!(client.after(&tenant("acme")), Some(changed.after()));
 
     let nearest = Nearest {
         vector: Some(vec![1.0, 0.0]),
@@ -281,7 +287,7 @@ async fn the_whole_api_is_reached_through_the_client() {
     assert!(notes.count(None).await.unwrap_err().is_not_found());
     assert!(acme.drop().await.unwrap());
     assert!(!acme.drop().await.unwrap());
-    assert_eq!(client.position(&tenant("acme")), None);
+    assert_eq!(client.after(&tenant("acme")), None);
 
     let stranger = Client::connect(&[&served.url], "not-a-key", quick(3)).unwrap();
     let refused = stranger.tenants(None, 5).await.unwrap_err();
@@ -520,25 +526,32 @@ async fn a_request_cut_off_or_left_unanswered_is_only_read_again_never_written_a
 
 #[tokio::test]
 async fn a_read_asks_to_be_as_fresh_as_the_clients_own_last_write() {
-    let stub = Stub::answering(|method, _| match *method {
-        Asked::GET => (200, json!({ "collections": [] })),
-        _ => (
-            200,
-            json!({ "position": 7, "outcomes": [{ "outcome": "applied" }] }),
-        ),
-    })
-    .await;
+    let written = Arc::new(Mutex::new(vec![(3, 9), (3, 7), (5, 1)].into_iter()));
+    let stub = {
+        let written = written.clone();
+        Stub::answering(move |method, _| match *method {
+            Asked::GET => (200, json!({ "collections": [] })),
+            _ => {
+                let (incarnation, position) = written.lock().unwrap().next().unwrap();
+                let answer = json!({
+                    "incarnation": incarnation,
+                    "position": position,
+                    "outcomes": [{ "outcome": "applied" }],
+                });
+                (200, answer)
+            }
+        })
+        .await
+    };
     let client = Client::connect(&[&stub.url], KEY, tries(1)).unwrap();
     let acme = client.tenant(&tenant("acme"));
+    let notes = acme.collection(&notes_named());
     acme.collections().await.unwrap();
-    acme.collection(&notes_named())
-        .put(oid(1), &content("fox", 1, None))
-        .await
-        .unwrap();
-    acme.collection(&notes_named())
-        .put(oid(2), &content("hen", 2, None))
-        .await
-        .unwrap();
+    notes.put(oid(1), &content("fox", 1, None)).await.unwrap();
+    acme.collections().await.unwrap();
+    notes.put(oid(2), &content("hen", 2, None)).await.unwrap();
+    acme.collections().await.unwrap();
+    notes.put(oid(3), &content("owl", 3, None)).await.unwrap();
     acme.collections().await.unwrap();
     client.tenant(&tenant("other")).collections().await.unwrap();
     let fresh: Vec<Option<String>> = stub
@@ -546,11 +559,23 @@ async fn a_read_asks_to_be_as_fresh_as_the_clients_own_last_write() {
         .lock()
         .unwrap()
         .iter()
+        .filter(|(asked, _)| asked.starts_with("GET "))
         .map(|(_, fresh)| fresh.clone())
         .collect();
-    assert_eq!(fresh, [None, None, None, Some("7".to_string()), None]);
-    assert_eq!(client.position(&tenant("acme")), Some(7));
-    assert_eq!(client.position(&tenant("other")), None);
+    let at = |text: &str| Some(text.to_string());
+    assert_eq!(
+        fresh,
+        [None, at("3.9"), at("3.9"), at("5.1"), None],
+        "an older position is kept; a new incarnation replaces it"
+    );
+    assert_eq!(
+        client.after(&tenant("acme")),
+        Some(After {
+            incarnation: 5,
+            position: 1
+        })
+    );
+    assert_eq!(client.after(&tenant("other")), None);
 }
 
 #[tokio::test]

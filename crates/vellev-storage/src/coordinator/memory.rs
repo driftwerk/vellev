@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use vellev_core::NodeId;
 
 use super::{
-    checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease,
-    LogPosition, ManifestRef, PartitionKey, Result,
+    checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
+    Incarnation, Lease, LogPosition, ManifestRef, PartitionKey, Result,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -50,6 +50,7 @@ impl Clock for ManualClock {
 #[derive(Debug, Clone)]
 struct Row {
     generation: Generation,
+    incarnation: Incarnation,
     lease: Option<(NodeId, DateTime<Utc>)>,
     log_position: LogPosition,
     manifest: Option<ManifestRef>,
@@ -59,6 +60,7 @@ impl Row {
     fn committed(&self) -> Committed {
         Committed {
             generation: self.generation,
+            incarnation: self.incarnation,
             log_position: self.log_position,
             manifest: self.manifest.clone(),
         }
@@ -135,8 +137,10 @@ impl Coordinator for MemoryCoordinator {
     async fn register(&self, key: &PartitionKey) -> Result<()> {
         let mut rows = self.rows.lock().expect("coordinator lock");
         if !rows.contains_key(key) {
+            let generation = self.next_generation();
             let row = Row {
-                generation: self.next_generation(),
+                generation,
+                incarnation: Incarnation(generation.0),
                 lease: None,
                 log_position: LogPosition(0),
                 manifest: None,

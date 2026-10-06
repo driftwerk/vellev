@@ -18,8 +18,8 @@ pub use vellev_core::{
 };
 pub use vellev_storage::blobs::{Author, Blobs, CachedBlobs, Layout, Listed, ObjectBlobs};
 pub use vellev_storage::coordinator::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
-    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey,
+    Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation, Lease,
+    LogPosition, ManifestRef, ManualClock, MemoryCoordinator, PartitionKey,
 };
 pub use vellev_storage::format::{
     self, CollectionId, Kind, LogSegment, Manifest, Row, SegmentFile, SegmentIndex, SegmentMeta,
