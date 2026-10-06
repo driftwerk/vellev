@@ -203,3 +203,47 @@ async fn a_flush_waiting_on_another_finds_nothing_more_to_flush() {
         .partition()
         .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
 }
+
+#[tokio::test]
+async fn a_manifest_whose_replay_does_not_start_where_its_segments_end_is_refused() {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
+    let writer = Arc::new(cluster.writer().await);
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    paused.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    assert_eq!(stored.recv().await, Some("stored"));
+    paused.armed.store(false, Ordering::SeqCst);
+    writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+    writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
+    paused.release.notify_one();
+    flushing.await.unwrap().unwrap();
+
+    let committed = cluster.committed().await;
+    let head = committed.manifest.clone().unwrap().0;
+    let mut manifest: Manifest = format::decode(
+        &head,
+        Kind::Manifest,
+        &cluster.blobs.get(&head).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.replay.len(), 2);
+    manifest.replay.remove(0);
+    let tampered = head.replace(".manifest", "-tampered.manifest");
+    let frame = format::encode(Kind::Manifest, &manifest).unwrap();
+    cluster.blobs.put(&tampered, frame).await.unwrap();
+    let pointed = Committed {
+        manifest: Some(ManifestRef(tampered)),
+        ..committed
+    };
+    assert!(matches!(
+        Follower::open(cluster.key.clone(), cluster.blobs.clone(), &pointed).await,
+        Err(StorageError::Corrupt { .. })
+    ));
+}
