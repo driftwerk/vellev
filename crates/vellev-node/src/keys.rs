@@ -195,8 +195,11 @@ mod tests {
         tenant
     }
 
-    #[test]
-    fn only_a_key_of_the_issued_form_is_looked_up() {
+    #[tokio::test]
+    async fn only_a_key_of_the_issued_form_is_looked_up() {
+        let (coordinator, keys) = (MemoryCoordinator::default(), Keys::default());
+        assert_eq!(keys.tenant(&coordinator, "dev-key").await.unwrap(), None);
+        assert!(keys.remembered().unknown.is_empty(), "not even remembered");
         let random = || Uuid::new_v4().simple().to_string();
         assert!(well_formed(&format!("{PREFIX}{}{}", random(), random())));
         for not in [
