@@ -4,6 +4,9 @@ use axum::extract::{FromRequest, FromRequestParts, Path, Query, State as Shared}
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::Json;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::Value as Document;
 use vellev_api::{
     After, Batch, Change, Changes, Collections, Consistency, Content, Counted, Counting, Failure,
     Found, Hybrid, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, Results, Stored, TenantPage,
@@ -26,6 +29,55 @@ type Answer<T> = Result<Json<T>, ApiError>;
 #[derive(FromRequest)]
 #[from_request(via(Json), rejection(ApiError))]
 pub struct Body<T>(T);
+
+/// A JSON body that must hold nothing the API does not understand, at any
+/// depth. Schemas tolerate fields they do not know, so that what a newer
+/// release stores or answers still reads; a caller's misspelt field is
+/// refused here instead.
+pub struct Strict<T>(T);
+
+impl<S: Send + Sync, T: DeserializeOwned + Serialize> FromRequest<S> for Strict<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(request: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
+        let Json(sent) = Json::<Document>::from_request(request, state).await?;
+        let read: T = serde_json::from_value(sent.clone())
+            .map_err(|error| ApiError::invalid(error.to_string()))?;
+        let understood =
+            serde_json::to_value(&read).map_err(|error| ApiError::invalid(error.to_string()))?;
+        match not_understood(&sent, &understood, String::new()) {
+            Some(field) => Err(ApiError::invalid(format!("unknown field `{field}`"))),
+            None => Ok(Strict(read)),
+        }
+    }
+}
+
+/// The first field of `sent` that reading it into `understood` dropped. A
+/// null is as good as absent.
+fn not_understood(sent: &Document, understood: &Document, at: String) -> Option<String> {
+    let within = |name: &dyn std::fmt::Display| match at.is_empty() {
+        true => name.to_string(),
+        false => format!("{at}.{name}"),
+    };
+    match (sent, understood) {
+        (Document::Object(sent), Document::Object(understood)) => {
+            sent.iter()
+                .find_map(|(name, value)| match understood.get(name) {
+                    Some(kept) => not_understood(value, kept, within(name)),
+                    None if value.is_null() => None,
+                    None => Some(within(name)),
+                })
+        }
+        (Document::Array(sent), Document::Array(understood)) => sent
+            .iter()
+            .zip(understood)
+            .enumerate()
+            .find_map(|(at_index, (value, kept))| {
+                not_understood(value, kept, format!("{at}[{at_index}]"))
+            }),
+        _ => None,
+    }
+}
 
 /// What a route's path names, refused likewise.
 #[derive(FromRequestParts)]
@@ -297,7 +349,7 @@ pub async fn drop_tenant(
 pub async fn changes(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
-    Body(batch): Body<Batch>,
+    Strict(batch): Strict<Batch>,
 ) -> Answer<Written> {
     write(
         &app,
@@ -361,7 +413,7 @@ pub async fn collection(
 pub async fn create_collection(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
-    Body(schema): Body<Collection>,
+    Strict(schema): Strict<Collection>,
 ) -> Answer<Written> {
     if schema.name != collection {
         return Err(ApiError::invalid(format!(
@@ -405,7 +457,7 @@ pub async fn drop_collection(
 pub async fn add_property(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
-    Body(property): Body<Property>,
+    Strict(property): Strict<Property>,
 ) -> Answer<Written> {
     let added = Mutation::AddProperty {
         collection,
