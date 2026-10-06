@@ -30,6 +30,10 @@ pub use reading::{Freshness, Reader};
 /// announces the new one.
 pub const PROTOCOL: u16 = 1;
 
+/// A prefix nothing is kept under, listed to tell that object storage
+/// answers.
+const READINESS: &str = "vellev-readiness/";
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub node: NodeId,
@@ -319,9 +323,10 @@ impl Node {
         }))
     }
 
-    /// Whether the node can reach what it needs to serve and can read what
-    /// the cluster writes.
+    /// Whether the node can reach Postgres and object storage and can read
+    /// what the cluster writes.
     pub async fn ready(&self) -> Result<()> {
+        self.0.blobs.list(READINESS).await?;
         let cluster = self.0.coordinator.format().await?;
         match cluster <= FORMAT_VERSION {
             true => Ok(()),

@@ -62,8 +62,10 @@ async fn main() -> Result<ExitCode> {
 
             let told = Arc::new(Notify::new());
             let stop = told.clone();
+            let stopping = app.clone();
             let served = vellev::server::serve(listener, app.clone(), async move {
                 shutdown_signal().await;
+                stopping.stopping();
                 stop.notify_one();
             });
             let drain = Duration::from_secs(config.drain_secs);

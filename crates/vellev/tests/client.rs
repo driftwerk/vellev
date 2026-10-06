@@ -363,6 +363,30 @@ async fn a_request_is_sent_again_only_where_that_cannot_make_a_change_twice() {
         assert_eq!(asked(name, "GET"), sends, "a read of {name}: {failed}");
     }
 
+    let put = |name: &'static str| {
+        let notes = client.tenant(&tenant(name)).collection(&notes_named());
+        async move { notes.put(oid(1), &content("fox", 1, None)).await }
+    };
+    let patch = |name: &'static str| {
+        let notes = client.tenant(&tenant(name)).collection(&notes_named());
+        let changes = Changes {
+            properties: json!({ "n": 2 }).as_object().unwrap().clone(),
+            vector: None,
+            only_if: None,
+        };
+        async move { notes.patch(oid(1), &changes).await }
+    };
+    for (name, sends) in [("torn", 3), ("proxied", 3), ("garbled", 3), ("wrong", 1)] {
+        let failed = put(name).await.unwrap_err();
+        assert_eq!(
+            asked(name, "PUT"),
+            sends,
+            "a whole object put to {name}, made twice as once: {failed}"
+        );
+    }
+    patch("torn").await.unwrap_err();
+    assert_eq!(asked("torn", "PATCH"), 1, "a patch is not sent again");
+
     let proxied = write("proxied").await.unwrap_err();
     assert!(
         matches!(&proxied, Error::Status { status: StatusCode::BAD_GATEWAY, body } if body.contains("Bad Gateway")),
@@ -654,4 +678,66 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     );
     assert_eq!(failed.code(), Some(Code::Invalid));
     assert_eq!(by_count.count(None).await.unwrap(), 10);
+}
+
+#[tokio::test]
+async fn a_node_stopped_and_replaced_under_load_fails_no_request() {
+    let cluster = Cluster::new();
+    let (leaving, staying) = (cluster.serve().await, cluster.serve().await);
+    let client = Client::connect(&[&leaving.url, &staying.url], KEY, Options::default()).unwrap();
+    let acme = client.tenant(&tenant("acme"));
+    acme.create().await.unwrap();
+    acme.collection(&notes_named())
+        .create(&schema())
+        .await
+        .unwrap();
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load = tokio::spawn({
+        let (acme, stop) = (acme.clone(), stop.clone());
+        async move {
+            let notes = acme.collection(&notes_named());
+            let mut failures = Vec::new();
+            let mut n = 0;
+            while !stop.load(Ordering::SeqCst) {
+                n += 1;
+                let put = notes
+                    .put(oid(n), &content("fox", n, Some([1.0, 0.0])))
+                    .await;
+                let read = notes.get(oid(n)).await;
+                match (put, read) {
+                    (Ok(_), Ok(Some(_))) => {}
+                    other => failures.push((n, format!("{other:?}"))),
+                }
+            }
+            (n, failures)
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    leaving.app.stopping();
+    let (status, _) = leaving.get("/health/ready").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "not ready once stopping"
+    );
+    assert_eq!(leaving.get("/health/live").await.0, StatusCode::OK);
+    let node = leaving.node.clone();
+    leaving.stop().await;
+    node.shutdown().await;
+    let replacement = cluster.serve().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, Ordering::SeqCst);
+
+    let (done, failures) = load.await.unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(done > 20, "only {done} writes went through");
+    let count = client
+        .tenant(&tenant("acme"))
+        .collection(&notes_named())
+        .count(None)
+        .await;
+    assert_eq!(count.unwrap(), done);
+    assert_eq!(replacement.get("/health/ready").await.0, StatusCode::OK);
 }

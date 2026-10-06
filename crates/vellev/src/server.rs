@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -44,6 +45,9 @@ pub struct Limits {
 #[derive(Clone)]
 pub struct App {
     node: Arc<OnceLock<Arc<Node>>>,
+    /// Set once the node has been told to stop, so that whatever routes
+    /// requests here stops sending new ones while those in flight finish.
+    stopping: Arc<AtomicBool>,
     /// The keys a caller may present; with none, nobody may call.
     keys: Arc<[String]>,
     limits: Limits,
@@ -64,6 +68,7 @@ impl App {
     pub fn new(keys: Arc<[String]>, limits: Limits) -> Self {
         Self {
             node: Arc::default(),
+            stopping: Arc::default(),
             keys,
             limits,
             http: reqwest::Client::builder()
@@ -79,6 +84,11 @@ impl App {
         if self.node.set(node.clone()).is_ok() {
             node.announcing();
         }
+    }
+
+    /// Report not ready from now on: the node is about to stop.
+    pub fn stopping(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
     }
 
     /// The node being served from, once there is one.
@@ -160,8 +170,25 @@ async fn live() -> Json<Health> {
 }
 
 async fn ready(Shared(app): Shared<App>) -> Result<Json<Health>, ApiError> {
+    if app.stopping.load(Ordering::SeqCst) {
+        return Err(ApiError::unavailable("the node is stopping"));
+    }
     app.node()?.ready().await?;
     Ok(Json(OK))
+}
+
+/// Once the node is stopping, ask callers not to send anything more on the
+/// connection an answer goes back on: one closed under a request sent on
+/// it as it closes leaves the caller not knowing whether it arrived.
+async fn closing(Shared(app): Shared<App>, request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if app.stopping.load(Ordering::SeqCst) {
+        response.headers_mut().insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
+    }
+    response
 }
 
 /// Whether two keys are the same, in time that does not depend on where
@@ -386,6 +413,7 @@ pub fn router(app: App) -> Router {
             )
         })
         .layer(body)
+        .layer(from_fn_with_state(app.clone(), closing))
         .with_state(app)
 }
 
