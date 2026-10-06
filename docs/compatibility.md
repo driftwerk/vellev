@@ -19,7 +19,7 @@ The formats so far:
 
 | Format | Release | What it added |
 | --- | --- | --- |
-| 1 | first | logs, manifests (naming the checkpoint before), segments, vectors files, clustered index files |
+| 1 | first | logs, manifests (naming the checkpoint before, and the logs committed while a flush built to replay over its segments), segments, vectors files, clustered index files |
 
 A release may, without a new format:
 
