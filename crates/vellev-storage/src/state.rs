@@ -1208,7 +1208,8 @@ impl State {
     /// The state rebuilt from a manifest's segments, brought through the
     /// manifest's replayed logs to the manifest itself, under `key` at
     /// `position`. The logs must start just after `after`, the position
-    /// the segments hold, and end just before the manifest.
+    /// the segments hold, as applying them checks, and end just before
+    /// the manifest.
     pub(crate) fn replayed(
         self,
         key: &str,
@@ -1219,12 +1220,6 @@ impl State {
         let Some((_, first)) = logs.first() else {
             return Ok(self);
         };
-        let corrupt = |reason: &str| StorageError::corrupt(key, reason);
-        if after.next() != Some(first.position) {
-            return Err(corrupt(
-                "its replayed logs do not start where its segments end",
-            ));
-        }
         let mut state = State {
             position: after,
             head: first.prev.clone(),
@@ -1234,7 +1229,10 @@ impl State {
             state.apply(log_key, log)?;
         }
         if state.position.next() != Some(position) {
-            return Err(corrupt("its replayed logs do not end just before it"));
+            return Err(StorageError::corrupt(
+                key,
+                "its replayed logs do not end just before it",
+            ));
         }
         Ok(State {
             position,
