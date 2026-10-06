@@ -1155,6 +1155,8 @@ enum Action {
     Commit(Vec<Change>),
     Rejected(Vec<Change>),
     Flush,
+    /// A flush with a commit made while it builds.
+    FlushWhile(Vec<Change>),
     Merge,
     Restart,
     Takeover,
@@ -1300,6 +1302,7 @@ fn action() -> impl Strategy<Value = Action> {
         10 => changes().prop_map(Action::Commit),
         1 => changes().prop_map(Action::Rejected),
         4 => Just(Action::Flush),
+        3 => changes().prop_map(Action::FlushWhile),
         2 => Just(Action::Merge),
         2 => Just(Action::Restart),
         2 => Just(Action::Takeover),
@@ -1382,6 +1385,15 @@ async fn run(actions: Vec<Action>) {
                     .commit(batch.iter().map(Change::mutation).collect())
                     .await;
                 assert_eq!(receipt.unwrap().position, expected, "{context}");
+            }
+            Action::FlushWhile(changes) => {
+                let (batch, _) = valid_batch(changes, &mut model);
+                let (flushed, committed) = tokio::join!(
+                    writer.flush(),
+                    writer.commit(batch.iter().map(Change::mutation).collect())
+                );
+                flushed.unwrap();
+                committed.unwrap();
             }
             Action::Rejected(changes) => {
                 let (batch, _) = valid_batch(changes, &mut model.clone());
