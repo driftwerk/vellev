@@ -905,12 +905,15 @@ mod tests {
     }
 
     #[test]
-    fn the_rotation_mixes_signs() {
+    fn the_rotation_spreads_a_direction_over_every_coordinate() {
         let rotation = Rotation::new(64, 3);
-        let mut axis = vec![0.0; 64];
-        axis[5] = 1.0;
-        let rotated = rotation.apply(&axis);
-        assert!(rotated.iter().any(|v| *v > 0.0) && rotated.iter().any(|v| *v < 0.0));
+        let rotated = rotation.apply(&[1.0; 64]);
+        let largest = rotated.iter().fold(0.0f32, |most, v| most.max(v.abs()));
+        let length = dot(&rotated, &rotated).sqrt();
+        assert!(
+            largest < 0.5 * length,
+            "{largest} of {length} in one coordinate"
+        );
     }
 
     #[test]

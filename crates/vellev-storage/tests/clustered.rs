@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use vellev_index::clustered::ClusteredIndex;
 use vellev_index::vector::VectorIndex;
 use vellev_storage::{Merging, Query};
 
@@ -218,8 +219,22 @@ async fn a_large_flush_is_clustered_too_and_its_index_outlives_later_checkpoints
         .read(|state| assert_eq!(state.count(&name("notes")), ROWS as usize + 1));
 }
 
+/// Replace the index file under `key` with one holding `index` for
+/// `segment`.
+async fn replace_index(cluster: &Cluster, key: &str, segment: &str, index: ClusteredIndex) {
+    let frame = cluster.blobs.get(key).await.unwrap();
+    let stored: SegmentIndex = format::decode(key, Kind::Index, &frame).unwrap();
+    let tampered = SegmentIndex {
+        segment: segment.to_string(),
+        vectors: vec![(stored.vectors[0].0, Arc::new(index))],
+    };
+    let frame = format::encode(Kind::Index, &tampered).unwrap();
+    cluster.blobs.delete(key).await.unwrap();
+    cluster.blobs.put(key, frame).await.unwrap();
+}
+
 #[tokio::test]
-async fn an_index_file_of_another_segment_is_not_used() {
+async fn an_index_file_of_another_segment_or_of_other_rows_is_not_used() {
     let mut cluster = Cluster::new().await;
     let observed = cluster.observed();
     cluster.blobs = observed.clone();
@@ -227,21 +242,60 @@ async fn an_index_file_of_another_segment_is_not_used() {
     let writer = merged(&cluster, &vectors).await;
     let segment = segments_of(&cluster).await.remove(0);
     let index = segment.index.unwrap();
-    let frame = cluster.blobs.get(&index).await.unwrap();
-    let mut stored: SegmentIndex = format::decode(&index, Kind::Index, &frame).unwrap();
-    stored.segment = "another".into();
-    let frame = format::encode(Kind::Index, &stored).unwrap();
-    cluster.blobs.delete(&index).await.unwrap();
-    cluster.blobs.put(&index, frame).await.unwrap();
-
     let on_writer = writer.partition().read(|state| found(state, &vectors));
+
+    let backwards: Vec<(u32, &[f32])> = vectors
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(row, vector)| (row as u32, vector.as_slice()))
+        .collect();
+    let wrong = ClusteredIndex::build(Distance::Cosine, &backwards).unwrap();
+    replace_index(&cluster, &index, "another", wrong.clone()).await;
     observed.fetched();
     let follower = cluster.open().await;
     assert!(observed.fetched().contains(&index));
+    let (hits, total) = follower.partition().read(|state| found(state, &vectors));
+    assert_eq!(total, on_writer.1);
+    assert!(
+        hits * 100 >= total * 97,
+        "{hits} of {total} by a scan instead"
+    );
+
+    let fewer = ClusteredIndex::build(Distance::Cosine, &backwards[..100]).unwrap();
+    replace_index(&cluster, &index, &segment.key, fewer).await;
+    let follower = cluster.open().await;
     let (hits, total) = follower.partition().read(|state| found(state, &vectors));
     assert!(
         hits * 100 >= total * 97,
         "{hits} of {total} by a scan instead"
     );
-    assert_eq!(total, on_writer.1);
+
+    replace_index(&cluster, &index, &segment.key, wrong).await;
+    let misled = cluster.open().await;
+    let (hits, total) = misled.partition().read(|state| found(state, &vectors));
+    assert!(
+        hits * 100 < total * 50,
+        "{hits} of {total}: the check is what tells"
+    );
+}
+
+#[tokio::test]
+async fn a_segment_too_small_for_a_shortlist_gets_no_index_file() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await.merging_with(Merging {
+        clustered_above: 100,
+        ..Merging::default()
+    });
+    writer.commit(vec![wide("notes")]).await.unwrap();
+    let vectors = vectors();
+    for rows in vectors[..3_000].chunks(250) {
+        let writes = rows
+            .iter()
+            .enumerate()
+            .map(|(i, vector)| row("notes", i as u32, vector.clone()));
+        writer.commit(writes.collect()).await.unwrap();
+    }
+    writer.flush().await.unwrap();
+    assert_eq!(segments_of(&cluster).await[0].index, None);
 }
