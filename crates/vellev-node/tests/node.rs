@@ -17,7 +17,7 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{Node, NodeError, Settings};
-use vellev_storage::blobs::{Blobs, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Lease, ManualClock,
     MemoryCoordinator, PartitionKey,
@@ -60,6 +60,12 @@ impl Blobs for Store {
         }
         self.inner.get(key).await
     }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
 }
 
 /// What nodes of one cluster share.
@@ -90,6 +96,7 @@ impl Cluster {
         let settings = Settings {
             lease: LEASE,
             flush_rows,
+            grace: Duration::ZERO,
             ..Settings::new(NodeId::generate("node"))
         };
         Node::new(
@@ -390,6 +397,43 @@ async fn a_tenant_is_flushed_once_enough_has_been_written() {
     assert_eq!(acme.read(State::unflushed), 1);
     acme.flush().await.unwrap();
     assert_eq!(acme.read(State::unflushed), 0);
+}
+
+#[tokio::test]
+async fn small_segments_are_merged_after_a_flush_and_the_old_files_cleaned_up() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    for n in 0..40 {
+        acme.write(vec![note(n, "fox", None)]).await.unwrap();
+    }
+    let stored = || async {
+        let listed = cluster.store.list("acme/").await.unwrap();
+        listed
+            .into_iter()
+            .filter(|listed| listed.key.ends_with(".segment"))
+            .count()
+    };
+    for _ in 0..500 {
+        if acme.read(|state| state.segments().count()) == 1 && stored().await == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let merged: Vec<(u64, u64)> = acme.read(|state| {
+        state
+            .segments()
+            .map(|segment| (segment.rows, segment.tombstones))
+            .collect()
+    });
+    assert_eq!(merged, vec![(40, 0)]);
+    assert_eq!(stored().await, 1, "the merged segments are gone");
+    assert_eq!(acme.read(count), 40);
+    assert!(acme.read(|state| state.get(&notes(), id(7)).is_some()));
 }
 
 /// A stand-in embedding server. Under `/lengths` a text's vector is its

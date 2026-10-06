@@ -18,6 +18,24 @@ type RowKey = (CollectionId, ObjectId);
 /// any approximation used. Scoring this many takes well under a millisecond.
 pub(crate) const SHORTLIST_ABOVE: usize = 4_000;
 
+/// A segment with at least this share of its rows dead is rewritten on its
+/// own, to give the space back.
+const STALE: f64 = 0.5;
+/// How many adjacent small segments are merged into one.
+const FANOUT: usize = 4;
+/// The most live rows a merge produces, and a quarter of it the most a
+/// segment may hold to count as small.
+const MERGED_ROWS: usize = 1_000_000;
+
+/// A run of adjacent segments to be replaced by one holding their live rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Merge {
+    /// The segments' places in the list, oldest first.
+    pub run: std::ops::Range<usize>,
+    /// Their files' keys, to tell at commit time that the list is as it was.
+    pub keys: Vec<String>,
+}
+
 /// What is indexed about one collection's rows in a layer: their filterable
 /// values, their searchable text and, once there are too many to score one
 /// by one, their vectors.
@@ -149,6 +167,11 @@ impl State {
 
     pub fn head(&self) -> Option<&str> {
         self.head.as_deref()
+    }
+
+    /// The segments the flushed data is in, oldest first.
+    pub fn segments(&self) -> impl Iterator<Item = &SegmentMeta> {
+        self.segments.iter().map(|segment| &segment.meta)
     }
 
     pub(crate) fn at(&self) -> (LogPosition, Option<String>) {
@@ -509,6 +532,159 @@ impl State {
         self.head = Some(key.to_string());
         self.has_commits_since_checkpoint = true;
         Ok(())
+    }
+
+    /// The merge most worth doing, if any: a segment at least half dead on
+    /// its own, else the oldest run of [`FANOUT`] or more adjacent small
+    /// segments.
+    pub(crate) fn merge_plan(&self) -> Option<Merge> {
+        let live = |segment: &Segment| segment.dead.iter().filter(|dead| !**dead).count();
+        let plan = |run: std::ops::Range<usize>| Merge {
+            keys: self.segments[run.clone()]
+                .iter()
+                .map(|segment| segment.meta.key.clone())
+                .collect(),
+            run,
+        };
+        let stale = self.segments.iter().position(|segment| {
+            let rows = segment.file.rows.len();
+            rows > 0 && (rows - live(segment)) as f64 >= rows as f64 * STALE
+        });
+        if let Some(at) = stale {
+            return Some(plan(at..at + 1));
+        }
+        let small: Vec<bool> = self
+            .segments
+            .iter()
+            .map(|segment| live(segment) <= MERGED_ROWS / FANOUT)
+            .collect();
+        let mut start = 0;
+        while start < self.segments.len() {
+            let mut end = start;
+            let mut rows = 0;
+            while end < self.segments.len() && small[end] {
+                let more = live(&self.segments[end]);
+                if rows + more > MERGED_ROWS {
+                    break;
+                }
+                rows += more;
+                end += 1;
+            }
+            if end - start >= FANOUT {
+                return Some(plan(start..end));
+            }
+            start = end.max(start + 1);
+        }
+        None
+    }
+
+    /// The segment that replaces `merge`'s run: their live rows, oldest
+    /// first, and their tombstones if there is anything older left for the
+    /// tombstones to act on. `position` is the one the rows are taken at.
+    pub(crate) fn merged(&self, merge: &Merge, position: LogPosition) -> Option<SegmentFile> {
+        if !self.unchanged(merge) {
+            return None;
+        }
+        let run = &self.segments[merge.run.clone()];
+        let rows: Vec<Row> = run
+            .iter()
+            .flat_map(|segment| live_rows(&segment.file.rows, &segment.dead))
+            .cloned()
+            .collect();
+        let tombstones: Vec<RowKey> = match merge.run.start {
+            0 => Vec::new(),
+            _ => {
+                let mut seen = HashSet::new();
+                run.iter()
+                    .flat_map(|segment| segment.file.tombstones.iter().copied())
+                    .filter(|key| seen.insert(*key))
+                    .collect()
+            }
+        };
+        Some(SegmentFile {
+            position,
+            rows,
+            tombstones,
+        })
+    }
+
+    /// Whether the run `merge` was planned over is still the same
+    /// segments, so that a file built from them still describes it.
+    pub(crate) fn unchanged(&self, merge: &Merge) -> bool {
+        self.segments.get(merge.run.clone()).is_some_and(|run| {
+            run.iter()
+                .map(|segment| segment.meta.key.as_str())
+                .eq(merge.keys.iter().map(String::as_str))
+        })
+    }
+
+    /// What a checkpoint at `position` that also carries out `merge`
+    /// writes: as [`Self::checkpoint`], with the run replaced by `merged`.
+    pub(crate) fn compaction(
+        &self,
+        position: LogPosition,
+        segment_key: &str,
+        merge: &Merge,
+        merged: SegmentMeta,
+    ) -> (Option<(SegmentMeta, SegmentFile)>, Manifest) {
+        let (flushed, mut manifest) = self.checkpoint(position, segment_key);
+        manifest.segments.splice(merge.run.clone(), [merged]);
+        (flushed, manifest)
+    }
+
+    /// Adopt a committed compaction made from this state by
+    /// [`Self::compaction`]: the run's segments go, and the merged one takes
+    /// their place. A row of the run that died since the merged file was
+    /// made is dead in it too.
+    pub(crate) fn compacted(
+        &mut self,
+        manifest_key: &str,
+        position: LogPosition,
+        flushed: Option<(SegmentMeta, Loaded)>,
+        merge: &Merge,
+        merged: (SegmentMeta, Loaded),
+    ) -> Result<()> {
+        let (meta, (file, indexes)) = merged;
+        let indexes = indexes.unwrap_or_else(|| Arc::new(self.indexed(&file.rows)));
+        let run = merge.run.clone();
+        let gone = run.len() - 1;
+        let at_row: HashMap<RowKey, usize> = file
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(row, Row { collection, object })| ((*collection, object.id), row))
+            .collect();
+        let dead: Vec<bool> = file
+            .rows
+            .iter()
+            .map(|Row { collection, object }| {
+                !matches!(
+                    self.live.get(&(*collection, object.id)),
+                    Some(Location::Segment(segment, _)) if run.contains(segment)
+                )
+            })
+            .collect();
+        for location in self.live.values_mut() {
+            if let Location::Segment(segment, row) = location {
+                if run.contains(segment) {
+                    let key = &self.segments[*segment].file.rows[*row];
+                    *location =
+                        Location::Segment(run.start, at_row[&(key.collection, key.object.id)]);
+                } else if *segment >= run.end {
+                    *location = Location::Segment(*segment - gone, *row);
+                }
+            }
+        }
+        self.segments.splice(
+            run.clone(),
+            [Segment {
+                meta,
+                file,
+                indexes,
+                dead,
+            }],
+        );
+        self.checkpointed(manifest_key, position, flushed)
     }
 
     /// What a checkpoint at `position` writes: a segment under `segment_key`

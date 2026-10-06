@@ -32,6 +32,10 @@ pub struct Settings {
     /// A tenant with this many rows written since its last checkpoint is
     /// flushed.
     pub flush_rows: usize,
+    /// How long a file nothing reaches any more is kept before it is
+    /// deleted. Files are looked for about this often while a tenant is
+    /// open, at most once a minute.
+    pub grace: Duration,
 }
 
 impl Settings {
@@ -42,6 +46,7 @@ impl Settings {
             group: 64,
             queue: 1_024,
             flush_rows: 50_000,
+            grace: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -185,10 +190,33 @@ impl Tenant {
 
     /// Move what has been written since the last checkpoint out of memory.
     pub async fn flush(&self) -> Result<LogPosition> {
-        self.writer.flush().await.map_err(|error| {
-            self.broken.store(true, Ordering::SeqCst);
-            error.into()
-        })
+        self.writer
+            .flush()
+            .await
+            .map_err(|error| self.failed(error))
+    }
+
+    /// Merge segments until the tenant's data needs no merge, and then
+    /// delete the files nothing reaches any more that are older than
+    /// `grace`.
+    pub async fn compact(&self, grace: Duration) -> Result<usize> {
+        while self
+            .writer
+            .merge()
+            .await
+            .map_err(|error| self.failed(error))?
+            .is_some()
+        {}
+        self.writer
+            .clean(grace)
+            .await
+            .map_err(|error| self.failed(error))
+    }
+
+    /// Note that the writer failed at something that leaves it closed.
+    fn failed(&self, error: StorageError) -> NodeError {
+        self.broken.store(true, Ordering::SeqCst);
+        error.into()
     }
 
     /// A write's failure as its caller should see it. A failure of the
@@ -376,6 +404,7 @@ impl Inner {
             group,
             queue,
             flush_rows,
+            ..
         } = &self.settings;
         let (lease, committed) = match self.coordinator.acquire(&key(tenant), node, *lease).await {
             Ok(Acquired::Lease { lease, committed }) => (lease, committed),
@@ -419,21 +448,8 @@ impl Inner {
                 return Err(error.into());
             }
         };
-        let (flushes, mut wanted) = mpsc::channel(1);
-        let (flushing, failed, flushed, rows) =
-            (writer.clone(), broken.clone(), tenant.clone(), *flush_rows);
-        tokio::spawn(async move {
-            while wanted.recv().await.is_some() {
-                if flushing.partition().read(State::unflushed) < rows {
-                    continue;
-                }
-                if let Err(error) = flushing.flush().await {
-                    tracing::warn!(tenant = %flushed, %error, "flush failed");
-                    failed.store(true, Ordering::SeqCst);
-                }
-            }
-        });
-        Ok(Arc::new(Tenant {
+        let (flushes, wanted) = mpsc::channel(1);
+        let opened = Arc::new(Tenant {
             id: tenant.clone(),
             commits: GroupCommitter::spawn(writer.clone(), *group, *queue),
             writer,
@@ -442,7 +458,42 @@ impl Inner {
             flushes,
             broken,
             deadline,
-        }))
+        });
+        self.maintaining(&opened, wanted);
+        Ok(opened)
+    }
+
+    /// Flush the tenant when asked to and it is still due, and merge and
+    /// clean up its files after each flush and now and then regardless,
+    /// for as long as the tenant is open. The task holds no reference of
+    /// its own, so dropping the tenant ends it.
+    fn maintaining(&self, tenant: &Arc<Tenant>, mut wanted: mpsc::Receiver<()>) {
+        let grace = self.settings.grace;
+        let every = (grace / 24).max(Duration::from_secs(60));
+        let tenant = Arc::downgrade(tenant);
+        tokio::spawn(async move {
+            loop {
+                let flush = match tokio::time::timeout(every, wanted.recv()).await {
+                    Ok(Some(())) => true,
+                    Ok(None) => return,
+                    Err(_) => false,
+                };
+                let Some(tenant) = tenant.upgrade() else {
+                    return;
+                };
+                if flush && tenant.read(State::unflushed) >= tenant.flush_rows {
+                    if let Err(error) = tenant.flush().await {
+                        tracing::warn!(tenant = %tenant.id, %error, "flush failed");
+                        continue;
+                    }
+                }
+                match tenant.compact(grace).await {
+                    Ok(0) => {}
+                    Ok(deleted) => tracing::info!(tenant = %tenant.id, deleted, "cleaned up"),
+                    Err(error) => tracing::warn!(tenant = %tenant.id, %error, "compaction failed"),
+                }
+            }
+        });
     }
 
     /// Keep the hold the tenant was taken with for as long as `deadline`

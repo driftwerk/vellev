@@ -16,7 +16,7 @@ pub use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, NodeId,
     ObjectId, Partition as PartitionNumber, Property, TenantId, Value,
 };
-pub use vellev_storage::blobs::{Author, Blobs, CachedBlobs, Layout, ObjectBlobs};
+pub use vellev_storage::blobs::{Author, Blobs, CachedBlobs, Layout, Listed, ObjectBlobs};
 pub use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
     ManifestRef, ManualClock, MemoryCoordinator, PartitionKey,
@@ -118,6 +118,12 @@ impl Blobs for Observed {
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         self.gets.lock().unwrap().push(key.to_string());
         self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
     }
 }
 

@@ -80,6 +80,11 @@ pub struct Config {
     /// flushed.
     #[arg(long, env = "VELLEV_FLUSH_ROWS", default_value_t = 50_000)]
     pub flush_rows: usize,
+    /// How long a tenant's files that nothing reaches any more, such as
+    /// segments a merge replaced, are kept before they are deleted, in
+    /// seconds.
+    #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 24 * 60 * 60)]
+    pub grace_secs: u64,
     /// How long requests in flight are given to finish once the node is
     /// told to stop, in seconds. Keep it under the platform's own grace
     /// period, so that the node lets go of its tenants before it is killed.
@@ -198,6 +203,7 @@ impl Config {
         let settings = Settings {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
+            grace: Duration::from_secs(self.grace_secs),
             ..Settings::new(NodeId::reachable_at(address.trim_end_matches('/'), &host))
         };
         Ok(Node::new(

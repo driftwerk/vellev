@@ -491,6 +491,16 @@ impl Blobs for Slow {
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         self.0.get(key).await
     }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        self.0.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.0.delete(key).await
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -13,7 +13,9 @@ use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
 };
 use crate::draft::{Draft, Wanted};
-use crate::format::{decode, decode_head, encode, Head, Kind, LogSegment, Manifest, Op};
+use crate::format::{
+    decode, decode_head, encode, Head, Kind, LogSegment, Manifest, Op, SegmentMeta,
+};
 use crate::mutation::{Mutation, Receipt, Vectorize};
 use crate::state::{Loaded, State};
 use crate::{Result, StorageError};
@@ -541,6 +543,108 @@ impl Writer {
         })
         .await?;
         Ok(position)
+    }
+
+    /// Carry out the merge the partition most needs, if any: replace a run
+    /// of segments with one holding their live rows, in a checkpoint that
+    /// also flushes whatever is unflushed. The merged file is built from a
+    /// snapshot, without holding the writer; a row that dies meanwhile is
+    /// dead in the new segment too. Returns the checkpoint's position, or
+    /// `None` when there was nothing to merge or the segments changed under
+    /// the snapshot, in which case asking again is fine.
+    pub async fn merge(&self) -> Result<Option<LogPosition>> {
+        let Some(merge) = self.partition.read(State::merge_plan) else {
+            return Ok(None);
+        };
+        let Some((file, indexes)) = self.partition.read(|state| {
+            let file = state.merged(&merge, state.position())?;
+            let indexes = state.indexed(&file.rows);
+            Some((file, indexes))
+        }) else {
+            return Ok(None);
+        };
+        let layout = Layout(&self.lease.key);
+        let mut ready = self.ready.lock().await;
+        if !*ready {
+            return Err(StorageError::Closed);
+        }
+        let position = following(self.partition.read(State::position))?;
+        let merged_key = layout.merged(position, &self.author);
+        let segment_key = layout.segment(position, &self.author);
+        let key = layout.manifest(position, &self.author);
+        let meta = SegmentMeta {
+            key: merged_key.clone(),
+            rows: file.rows.len() as u64,
+            tombstones: file.tombstones.len() as u64,
+        };
+        let Some((flushed, manifest)) = self.partition.read(|state| {
+            state
+                .unchanged(&merge)
+                .then(|| state.compaction(position, &segment_key, &merge, meta.clone()))
+        }) else {
+            return Ok(None);
+        };
+        let merged_frame = encode(Kind::Segment, &file)?;
+        let flushed_frame = flushed
+            .as_ref()
+            .map(|(_, file)| encode(Kind::Segment, file))
+            .transpose()?;
+        let flushed = flushed.map(|(meta, file)| {
+            let indexes = self.partition.read(|state| state.indexed(&file.rows));
+            (meta, (Arc::new(file), Some(Arc::new(indexes))))
+        });
+        let frame = encode(Kind::Manifest, &manifest)?;
+        let merged = (meta, (Arc::new(file), Some(Arc::new(indexes))));
+        attempt(&mut ready, async {
+            self.partition.blobs.put(&merged_key, merged_frame).await?;
+            if let Some(flushed_frame) = flushed_frame {
+                self.partition
+                    .blobs
+                    .put(&segment_key, flushed_frame)
+                    .await?;
+            }
+            self.publish(&key, frame, position).await?;
+            let mut state = self.partition.state.write().expect("partition lock");
+            state.compacted(&key, position, flushed, &merge, merged)
+        })
+        .await?;
+        Ok(Some(position))
+    }
+
+    /// Delete the partition's files that the committed head does not reach
+    /// and that are older than `grace`: a stale writer's uploads, and the
+    /// segments and manifests that merges and checkpoints have replaced.
+    /// Within `grace` everything stays, so that the partition can be put
+    /// back as it was at any moment in that window. Returns how many files
+    /// were deleted.
+    pub async fn clean(&self, grace: Duration) -> Result<usize> {
+        let blobs = &self.partition.blobs;
+        let (position, head) = self.partition.read(State::at);
+        let mut reachable = HashSet::new();
+        let mut cursor = head;
+        while let Some(key) = cursor {
+            reachable.insert(key.clone());
+            cursor = match decode_head(&key, &self.partition.fetch(&key).await?)? {
+                Head::Log(log) => log.prev,
+                Head::Manifest(manifest) => {
+                    reachable.extend(manifest.segments.into_iter().map(|meta| meta.key));
+                    None
+                }
+            };
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(grace).unwrap_or_default();
+        let orphans = blobs
+            .list(&Layout(&self.lease.key).prefix())
+            .await?
+            .into_iter()
+            .filter(|listed| listed.modified < cutoff && !reachable.contains(&listed.key));
+        let mut deleted = 0;
+        for orphan in orphans {
+            blobs.delete(&orphan.key).await?;
+            deleted += 1;
+        }
+        tracing::debug!(partition = %self.lease.key, ?position, deleted, "cleaned");
+        Ok(deleted)
     }
 
     async fn publish(&self, key: &str, frame: Bytes, position: LogPosition) -> Result<()> {

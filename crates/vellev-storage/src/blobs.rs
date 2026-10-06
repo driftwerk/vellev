@@ -18,6 +18,17 @@ use crate::{Result, StorageError};
 pub trait Blobs: fmt::Debug + Send + Sync {
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Bytes>;
+    /// Every file whose key starts with `prefix`.
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>>;
+    /// Remove a file; one that is not there is no error.
+    async fn delete(&self, key: &str) -> Result<()>;
+}
+
+/// A file as a listing shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub key: String,
+    pub modified: chrono::DateTime<chrono::Utc>,
 }
 
 /// Who wrote a file: the lease's generation and the writer instance. Two
@@ -48,6 +59,13 @@ impl Layout<'_> {
 
     pub fn manifest(&self, position: LogPosition, author: &Author) -> String {
         self.key("manifest", position, author)
+    }
+
+    /// A segment made by merging others at `position`, named apart from the
+    /// one a flush at the same position writes.
+    pub fn merged(&self, position: LogPosition, author: &Author) -> String {
+        self.key("segment", position, author)
+            .replace(".segment", "-merged.segment")
     }
 
     fn key(&self, kind: &str, position: LogPosition, author: &Author) -> String {
@@ -109,6 +127,27 @@ impl Blobs for ObjectBlobs {
             .await
             .map_err(|e| blob_error(key, e))?;
         found.bytes().await.map_err(|e| blob_error(key, e))
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        use futures::TryStreamExt;
+        let under = object_store::path::Path::from(prefix);
+        self.0
+            .list(Some(&under))
+            .map_ok(|meta| Listed {
+                key: meta.location.to_string(),
+                modified: meta.last_modified,
+            })
+            .try_collect()
+            .await
+            .map_err(|e| blob_error(prefix, e))
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        match self.0.delete(&object_store::path::Path::from(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(blob_error(key, error)),
+        }
     }
 }
 
@@ -194,5 +233,17 @@ impl Blobs for CachedBlobs {
         let bytes = self.inner.get(key).await?;
         self.remember(key, &bytes).await;
         Ok(bytes)
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await?;
+        if let Some(path) = self.path(key) {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        Ok(())
     }
 }
