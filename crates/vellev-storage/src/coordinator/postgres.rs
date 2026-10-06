@@ -108,23 +108,7 @@ async fn migrate(pool: &PgPool) -> Result<()> {
         sqlx::query_as("SELECT version, sql FROM vellev.schema_version ORDER BY version")
             .fetch_all(&mut *tx)
             .await?;
-    let newest_known = MIGRATIONS.last().map_or(0, |(version, _)| *version);
-    for (version, sql) in &applied {
-        match MIGRATIONS.iter().find(|(v, _)| v == version) {
-            Some((_, expected)) if expected == sql => {}
-            // Applied by a newer release, which leaves this one working:
-            // the database is ahead during a rolling deploy and after a
-            // rollback.
-            None if *version > newest_known => {}
-            _ => {
-                return Err(invariant(format!(
-                    "migration {version} differs from the one applied; recreate the database"
-                )))
-            }
-        }
-    }
-    let latest = applied.last().map_or(0, |(version, _)| *version);
-    for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version > latest) {
+    for (version, sql) in pending(MIGRATIONS, &applied).map_err(invariant)? {
         tx.execute(sqlx::raw_sql(sql)).await?;
         sqlx::query("INSERT INTO vellev.schema_version (version, sql) VALUES ($1, $2)")
             .bind(version)
@@ -133,6 +117,45 @@ async fn migrate(pool: &PgPool) -> Result<()> {
             .await?;
     }
     Ok(tx.commit().await?)
+}
+
+/// The migrations of `known` still to apply over `applied`, oldest first.
+/// Every applied migration this release knows must be as it knows it; one
+/// it does not know must be newer than all it knows, applied by a newer
+/// release, which leaves this one working (the database is ahead during a
+/// rolling deploy and after a rollback); and none still to apply may be
+/// older than one applied, or it would be skipped for good.
+fn pending<'a>(
+    known: &'a [(i64, &'a str)],
+    applied: &[(i64, String)],
+) -> std::result::Result<Vec<&'a (i64, &'a str)>, String> {
+    let newest_known = known.last().map_or(0, |(version, _)| *version);
+    for (version, sql) in applied {
+        match known.iter().find(|(v, _)| v == version) {
+            Some((_, expected)) if expected == sql => {}
+            None if *version > newest_known => {}
+            _ => {
+                return Err(format!(
+                    "migration {version} differs from the one applied; recreate the database"
+                ))
+            }
+        }
+    }
+    let newest_applied = applied
+        .iter()
+        .map(|(version, _)| *version)
+        .max()
+        .unwrap_or(0);
+    let pending: Vec<_> = known
+        .iter()
+        .filter(|(version, _)| applied.iter().all(|(done, _)| done != version))
+        .collect();
+    match pending.first() {
+        Some((version, _)) if *version < newest_applied => Err(format!(
+            "migration {version} was never applied, though {newest_applied} was"
+        )),
+        _ => Ok(pending),
+    }
 }
 
 #[derive(FromRow)]
@@ -436,7 +459,41 @@ impl Coordinator for PostgresCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::MIGRATIONS;
+    use super::{pending, MIGRATIONS};
+
+    #[test]
+    fn migrations_newer_than_known_are_left_alone_and_none_is_skipped() {
+        let known = [(1, "a"), (2, "b"), (3, "c")];
+        let applied = |done: &[(i64, &str)]| -> Vec<(i64, String)> {
+            done.iter().map(|(v, sql)| (*v, sql.to_string())).collect()
+        };
+        let versions = |pending: Vec<&(i64, &str)>| -> Vec<i64> {
+            pending.into_iter().map(|(v, _)| *v).collect()
+        };
+        assert_eq!(versions(pending(&known, &[]).unwrap()), [1, 2, 3]);
+        assert_eq!(
+            versions(pending(&known, &applied(&[(1, "a")])).unwrap()),
+            [2, 3]
+        );
+        assert_eq!(
+            versions(pending(&known, &applied(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")])).unwrap()),
+            [] as [i64; 0],
+            "a newer release's migration is left alone"
+        );
+        assert!(pending(&known, &applied(&[(1, "x")])).is_err(), "changed");
+        assert!(
+            pending(&known, &applied(&[(1, "a"), (2, "b"), (5, "e")])).is_err(),
+            "3 would never be applied"
+        );
+        assert!(
+            pending(&known, &applied(&[(1, "a"), (3, "c")])).is_err(),
+            "2 was skipped"
+        );
+        assert!(
+            pending(&[(1, "a"), (3, "c")], &applied(&[(1, "a"), (2, "b")])).is_err(),
+            "2 is unknown but older than what is known"
+        );
+    }
 
     #[test]
     fn migrations_are_in_strictly_increasing_order() {
