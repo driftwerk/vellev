@@ -915,6 +915,7 @@ async fn a_log_that_reuses_a_dropped_collection_id_is_refused() {
             id: CollectionId(0),
             schema: Box::new(schema("notes")),
         }],
+        answered: Vec::new(),
     };
     let forgery = vec![(key.clone(), format::encode(Kind::Log, &reusing).unwrap())];
     assert!(matches!(
@@ -956,6 +957,7 @@ fn manifest_of(segments: Vec<SegmentMeta>) -> Manifest {
         segments,
         replay: Vec::new(),
         replay_after: LogPosition(0),
+        answered: Vec::new(),
     }
 }
 
@@ -970,6 +972,7 @@ async fn a_history_that_loops_or_skips_a_position_is_refused() {
                 position: LogPosition(position),
                 prev,
                 ops: vec![],
+                answered: Vec::new(),
             },
         )
         .unwrap()

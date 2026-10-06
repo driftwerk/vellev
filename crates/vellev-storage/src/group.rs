@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::mutation::{Mutation, Receipt};
+use crate::mutation::{Batch, Mutation, Receipt};
 use crate::partition::{Embedded, Writer};
 use crate::{Result, StorageError};
 
 struct Request {
-    mutations: Vec<Mutation>,
+    batch: Batch,
     made: Embedded,
     reply: oneshot::Sender<Result<Receipt>>,
 }
@@ -47,10 +47,10 @@ impl GroupCommitter {
                     .filter(|request| !request.reply.is_closed())
                     .map(|request| {
                         made.extend(request.made);
-                        (request.mutations, request.reply)
+                        (request.batch, request.reply)
                     })
                     .unzip();
-                let results = match writer.commit_group_with(batches, made).await {
+                let results = match writer.commit_batches(batches, made).await {
                     Ok(results) => results,
                     Err(StorageError::Closed) => {
                         replies.iter().map(|_| Err(StorageError::Closed)).collect()
@@ -76,7 +76,8 @@ impl GroupCommitter {
     /// A caller that stops waiting before its batch is taken into a commit is
     /// skipped. One that stops waiting after that point cannot be: its batch
     /// is committed all the same, so a caller that retries after a timeout
-    /// must use mutations that are safe to repeat. A failure of the shared
+    /// must name its request (see [`Self::submit_batch`]) or use mutations
+    /// that are safe to repeat. A failure of the shared
     /// commit arrives as [`StorageError::Shared`]; see [`StorageError::root`].
     pub async fn submit(&self, mutations: Vec<Mutation>) -> Result<Receipt> {
         self.submit_with(mutations, Embedded::new()).await
@@ -85,12 +86,14 @@ impl GroupCommitter {
     /// As [`Self::submit`], with vectors made ahead for the commit to use;
     /// see [`Writer::commit_group_with`].
     pub async fn submit_with(&self, mutations: Vec<Mutation>, made: Embedded) -> Result<Receipt> {
+        self.submit_batch(mutations.into(), made).await
+    }
+
+    /// As [`Self::submit_with`], for a batch that may name its request: see
+    /// [`Writer::commit_batches`].
+    pub async fn submit_batch(&self, batch: Batch, made: Embedded) -> Result<Receipt> {
         let (reply, outcome) = oneshot::channel();
-        let request = Request {
-            mutations,
-            made,
-            reply,
-        };
+        let request = Request { batch, made, reply };
         self.queue
             .send(request)
             .await

@@ -168,6 +168,34 @@ impl fmt::Display for ObjectId {
     }
 }
 
+/// Names one logical write, the same on every try of it, so that a writer
+/// which has already made it answers a try again with what it answered
+/// then rather than making it twice.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RequestId(pub Uuid);
+
+impl RequestId {
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::str::FromStr for RequestId {
+    type Err = uuid::Error;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        text.parse().map(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

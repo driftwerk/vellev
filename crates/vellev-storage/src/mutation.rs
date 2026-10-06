@@ -1,5 +1,5 @@
 use serde_json::{Map, Value as Json};
-use vellev_core::{Collection, CollectionName, Embedding, ObjectId, Property, Value};
+use vellev_core::{Collection, CollectionName, Embedding, ObjectId, Property, RequestId, Value};
 
 use vellev_index::filter::Filter;
 
@@ -95,7 +95,7 @@ pub struct Condition {
     pub equals: Json,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Outcome {
     Applied,
     /// The mutation was valid and changed nothing, so nothing was logged.
@@ -104,6 +104,24 @@ pub enum Outcome {
     Value(Value),
     /// How many objects a [`Mutation::DeleteWhere`] deleted.
     Deleted(u64),
+}
+
+/// One caller's mutations, made as one atomic step, with the request they
+/// came in if the caller named it: a request already answered is answered
+/// again as it was, and made no second time.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Batch {
+    pub request: Option<RequestId>,
+    pub mutations: Vec<Mutation>,
+}
+
+impl From<Vec<Mutation>> for Batch {
+    fn from(mutations: Vec<Mutation>) -> Self {
+        Self {
+            request: None,
+            mutations,
+        }
+    }
 }
 
 /// What one caller's batch did, and the position at which it is visible.

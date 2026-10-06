@@ -15,10 +15,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use vellev_core::{Collection, Object, ObjectId, Property};
+use vellev_core::{Collection, Object, ObjectId, Property, RequestId};
 use vellev_index::clustered::ClusteredIndex;
 
 use crate::coordinator::LogPosition;
+use crate::mutation::Outcome;
 use crate::{Result, StorageError};
 
 const MAGIC: [u8; 4] = *b"VLLV";
@@ -93,6 +94,19 @@ pub struct LogSegment {
     pub position: LogPosition,
     pub prev: Option<String>,
     pub ops: Vec<Op>,
+    /// The requests, named by their callers, whose changes this commit
+    /// made.
+    #[serde(default)]
+    pub answered: Vec<Answered>,
+}
+
+/// A request a commit answered: what it did, and when the commit was made,
+/// in milliseconds since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Answered {
+    pub request: RequestId,
+    pub at: u64,
+    pub outcomes: Vec<Outcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -157,6 +171,10 @@ pub struct Manifest {
     /// replay; unused when there is none.
     #[serde(default)]
     pub replay_after: LogPosition,
+    /// The requests answered lately, oldest first, each with the position
+    /// it became visible at.
+    #[serde(default)]
+    pub answered: Vec<(LogPosition, Answered)>,
 }
 
 /// A file a head reference can point at.
@@ -293,6 +311,16 @@ mod tests {
                 collection: CollectionId(1),
                 id: ObjectId(uuid::Uuid::from_u128(7)),
             }],
+            answered: vec![Answered {
+                request: RequestId(uuid::Uuid::from_u128(9)),
+                at: 1_791_300_000_000,
+                outcomes: vec![
+                    Outcome::Applied,
+                    Outcome::Unchanged,
+                    Outcome::Value(vellev_core::Value::Int(3)),
+                    Outcome::Deleted(2),
+                ],
+            }],
         }
     }
 
@@ -378,17 +406,20 @@ mod tests {
             position: LogPosition,
             prev: Option<String>,
             ops: Vec<Op>,
+            answered: Vec<Answered>,
             written_by: String,
         }
         let LogSegment {
             position,
             prev,
             ops,
+            answered,
         } = log();
         let newer = NewerLogSegment {
             position,
             prev,
             ops,
+            answered,
             written_by: "vellev 9".into(),
         };
         let body = rmp_serde::to_vec_named(&newer).unwrap();
@@ -443,6 +474,7 @@ mod tests {
                 segments: vec![],
                 replay: vec!["a/0/log/x.log".into()],
                 replay_after: LogPosition(2),
+                answered: Vec::new(),
             };
             let frame = encode(Kind::Manifest, &manifest).unwrap();
             assert_eq!(

@@ -402,6 +402,7 @@ async fn files_a_recent_head_still_reaches_stay_until_that_head_is_old() {
         segments: Vec::new(),
         replay: Vec::new(),
         replay_after: LogPosition(0),
+        answered: Vec::new(),
     };
     let stale = format!(
         "{}manifest/{:020}-00000000000000000000-lost.manifest",
