@@ -110,7 +110,9 @@ fn options(state: &std::path::Path) -> Options {
         updated_as: None,
         page: 50,
         per_second: None,
-        skew: Duration::from_secs(1),
+        // Weaviate runs on this machine's clock; a margin would store
+        // again whatever was written just before a catch-up.
+        skew: Duration::ZERO,
         state: state.to_path_buf(),
     }
 }
