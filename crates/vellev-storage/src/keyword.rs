@@ -319,7 +319,15 @@ fn top<'a>(
             .cursor
             .row()
             .expect("a walk with postings left");
-        let blocks: Vec<(u32, f32)> = walks[..=pivot]
+        // Every walk at the pivot's row counts toward it, however far along
+        // the bounds it comes, so that a skip past the row passes over all
+        // that the row could score.
+        let level = pivot
+            + walks[pivot + 1..]
+                .iter()
+                .take_while(|walk| walk.cursor.row() == Some(row))
+                .count();
+        let blocks: Vec<(u32, f32)> = walks[..=level]
             .iter()
             .filter_map(|walk| block_at(walk, row))
             .collect();
@@ -331,10 +339,10 @@ fn top<'a>(
                 .min()
                 .unwrap_or(row + 1);
             let next = walks
-                .get(pivot + 1)
+                .get(level + 1)
                 .and_then(|walk| walk.cursor.row())
                 .map_or(past, |beyond| past.min(beyond));
-            walks[..=pivot]
+            walks[..=level]
                 .iter_mut()
                 .for_each(|walk| walk.cursor.seek(next));
             continue;
