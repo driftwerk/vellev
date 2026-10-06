@@ -410,6 +410,15 @@ async fn small_segments_are_merged_after_a_flush_and_the_old_files_cleaned_up() 
         .unwrap();
     for n in 0..40 {
         acme.write(vec![note(n, "fox", None)]).await.unwrap();
+        if n % 10 == 9 {
+            for _ in 0..500 {
+                if acme.read(State::unflushed) == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(acme.read(State::unflushed), 0, "flushed ten at a time");
+        }
     }
     let stored = || async {
         let listed = cluster.store.list("acme/").await.unwrap();

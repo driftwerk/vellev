@@ -169,6 +169,31 @@ fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a 
         .map(|(row, _)| row)
 }
 
+/// The indexes of `rows` for the collections `catalog` knows, numbered as
+/// the rows lie.
+pub(crate) fn indexed(catalog: &Catalog, rows: &[Row]) -> Indexes {
+    let mut indexes = Indexes::new();
+    let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
+    for (row, Row { collection, object }) in rows.iter().enumerate() {
+        if let Some(schema) = catalog.schema(*collection) {
+            let index = indexes.entry(*collection).or_default();
+            index.insert(schema, row as u32, object);
+            if let Some(vector) = &object.vector {
+                vectors
+                    .entry(*collection)
+                    .or_default()
+                    .push((row as u32, vector));
+            }
+        }
+    }
+    for (collection, vectors) in vectors.iter().filter(|(_, v)| v.len() > SHORTLIST_ABOVE) {
+        if let Some(index) = indexes.get_mut(collection) {
+            index.vectors = BinaryIndex::build(vectors);
+        }
+    }
+    indexes
+}
+
 impl State {
     pub fn position(&self) -> LogPosition {
         self.position
@@ -446,26 +471,7 @@ impl State {
     /// changes once added, and neither a property nor a collection added
     /// since has anything in an older layer.
     pub(crate) fn indexed(&self, rows: &[Row]) -> Indexes {
-        let mut indexes = Indexes::new();
-        let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
-        for (row, Row { collection, object }) in rows.iter().enumerate() {
-            if let Some(schema) = self.catalog.schema(*collection) {
-                let index = indexes.entry(*collection).or_default();
-                index.insert(schema, row as u32, object);
-                if let Some(vector) = &object.vector {
-                    vectors
-                        .entry(*collection)
-                        .or_default()
-                        .push((row as u32, vector));
-                }
-            }
-        }
-        for (collection, vectors) in vectors.iter().filter(|(_, v)| v.len() > SHORTLIST_ABOVE) {
-            if let Some(index) = indexes.get_mut(collection) {
-                index.vectors = BinaryIndex::build(vectors);
-            }
-        }
-        indexes
+        indexed(&self.catalog, rows)
     }
 
     /// Apply one committed log segment, which must be the commit made
@@ -553,7 +559,11 @@ impl State {
     /// the oldest run of enough adjacent small segments.
     pub(crate) fn merge_plan(&self, merging: &Merging) -> Option<Merge> {
         let fanout = merging.fanout.max(2);
-        let live = |segment: &Segment| segment.dead.iter().filter(|dead| !**dead).count();
+        let live: Vec<usize> = self
+            .segments
+            .iter()
+            .map(|segment| segment.dead.iter().filter(|dead| !**dead).count())
+            .collect();
         let plan = |run: std::ops::Range<usize>| Merge {
             keys: self.segments[run.clone()]
                 .iter()
@@ -561,28 +571,22 @@ impl State {
                 .collect(),
             run,
         };
-        let stale = self.segments.iter().position(|segment| {
-            let rows = segment.file.rows.len();
-            rows > 0 && (rows - live(segment)) as f64 >= rows as f64 * merging.stale
+        let stale = self.segments.iter().zip(&live).position(|(segment, live)| {
+            let dead = segment.file.rows.len() - live;
+            dead > 0 && dead as f64 >= segment.file.rows.len() as f64 * merging.stale
         });
         if let Some(at) = stale {
             return Some(plan(at..at + 1));
         }
-        let small: Vec<bool> = self
-            .segments
-            .iter()
-            .map(|segment| live(segment) <= merging.rows / fanout)
-            .collect();
         let mut start = 0;
-        while start < self.segments.len() {
+        while start < live.len() {
             let mut end = start;
             let mut rows = 0;
-            while end < self.segments.len() && small[end] {
-                let more = live(&self.segments[end]);
-                if rows + more > merging.rows {
+            while end < live.len() && live[end] <= merging.rows / fanout {
+                if rows + live[end] > merging.rows {
                     break;
                 }
-                rows += more;
+                rows += live[end];
                 end += 1;
             }
             if end - start >= fanout {

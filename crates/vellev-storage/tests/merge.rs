@@ -269,7 +269,7 @@ async fn a_merge_that_leaves_later_segments_keeps_every_row_where_it_is_found() 
 }
 
 #[tokio::test]
-async fn files_nothing_reaches_are_deleted_once_old_and_never_before() {
+async fn files_nothing_reaches_are_deleted_but_never_those_ahead_of_the_writer() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
     writer.commit(vec![create("notes")]).await.unwrap();
@@ -282,35 +282,39 @@ async fn files_nothing_reaches_are_deleted_once_old_and_never_before() {
     }
     writer.merge().await.unwrap().unwrap();
     writer.commit(vec![upsert("notes", 9, 9)]).await.unwrap();
-    let stray = format!(
-        "{}log/00000000000000000099-stale-writer.log",
-        Layout(&cluster.key).prefix()
-    );
-    cluster
-        .blobs
-        .put(&stray, Bytes::from_static(b"not committed"))
-        .await
-        .unwrap();
+    let prefix = Layout(&cluster.key).prefix();
+    let stale = format!("{prefix}log/00000000000000000002-00000000000000000000-gone.log");
+    let ahead = format!("{prefix}log/00000000000000000099-00000000000000000009-next.log");
+    for stray in [&stale, &ahead] {
+        cluster
+            .blobs
+            .put(stray, Bytes::from_static(b"not committed"))
+            .await
+            .unwrap();
+    }
     let (logs, segments, manifests) = files(&cluster).await;
     assert_eq!((segments.len(), manifests.len()), (5, 5));
-    assert!(logs.contains(&stray));
     let before = logs.len() + segments.len() + manifests.len();
 
     assert_eq!(
         writer.clean(Duration::from_secs(3_600)).await.unwrap(),
         0,
-        "all too young"
+        "every head is young"
     );
     let deleted = writer.clean(Duration::ZERO).await.unwrap();
     let (logs, segments, manifests) = files(&cluster).await;
     assert_eq!((segments.len(), manifests.len()), (1, 1));
-    assert!(!logs.contains(&stray));
+    assert!(!logs.contains(&stale));
     assert_eq!(
-        logs.len(),
+        logs.iter().filter(|log| **log != ahead).count(),
         1,
         "the commit since the checkpoint is reached from the head"
     );
-    assert_eq!(deleted, before - 3);
+    assert!(
+        logs.contains(&ahead),
+        "a newer writer's upload is not touched"
+    );
+    assert_eq!(deleted, before - 4);
 
     let follower = cluster.open().await;
     follower
@@ -318,6 +322,110 @@ async fn files_nothing_reaches_are_deleted_once_old_and_never_before() {
         .read(|state| assert_eq!(state.count(&name("notes")), 5));
     writer.commit(vec![upsert("notes", 10, 1)]).await.unwrap();
     assert_eq!(writer.clean(Duration::ZERO).await.unwrap(), 0);
+}
+
+/// Blobs that list the files named in `old` as written long ago.
+#[derive(Debug)]
+struct Aged {
+    inner: Arc<dyn Blobs>,
+    old: Mutex<BTreeSet<String>>,
+}
+
+#[async_trait]
+impl Blobs for Aged {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        let listed = self.inner.list(prefix).await?;
+        let old = self.old.lock().unwrap();
+        Ok(listed
+            .into_iter()
+            .map(|listed| match old.contains(&listed.key) {
+                true => Listed {
+                    modified: Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap(),
+                    ..listed
+                },
+                false => listed,
+            })
+            .collect())
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn files_a_recent_head_still_reaches_stay_until_that_head_is_old() {
+    let mut cluster = Cluster::new().await;
+    let aged = Arc::new(Aged {
+        inner: cluster.blobs.clone(),
+        old: Mutex::default(),
+    });
+    cluster.blobs = aged.clone();
+    let writer = cluster.writer().await;
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for round in 0..4u8 {
+        writer
+            .commit(vec![upsert("notes", round, 1)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    let age = || async {
+        let listed = aged
+            .inner
+            .list(&Layout(&cluster.key).prefix())
+            .await
+            .unwrap();
+        aged.old
+            .lock()
+            .unwrap()
+            .extend(listed.into_iter().map(|listed| listed.key));
+    };
+    age().await;
+    writer.commit(vec![upsert("notes", 9, 9)]).await.unwrap();
+    writer.merge().await.unwrap().unwrap();
+    let (logs, segments, manifests) = files(&cluster).await;
+    assert_eq!(
+        (logs.len(), segments.len(), manifests.len()),
+        (6, 6, 5),
+        "the merge also flushed the write before it"
+    );
+
+    let grace = Duration::from_secs(3_600);
+    assert_eq!(writer.clean(grace).await.unwrap(), 5 + 3);
+    let (logs, segments, manifests) = files(&cluster).await;
+    assert_eq!(
+        (logs.len(), segments.len(), manifests.len()),
+        (1, 6, 2),
+        "the write just before the merge is recent, so what it saw stays"
+    );
+    let before = cluster.committed().await;
+    let was = Committed {
+        log_position: LogPosition(before.log_position.0 - 1),
+        manifest: Some(ManifestRef(logs[0].clone())),
+        ..before
+    };
+    let follower = Follower::open(cluster.key.clone(), cluster.blobs.clone(), &was)
+        .await
+        .unwrap();
+    follower
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), 5));
+
+    age().await;
+    assert_eq!(writer.clean(grace).await.unwrap(), 1 + 4 + 1);
+    let (logs, segments, manifests) = files(&cluster).await;
+    assert_eq!((logs.len(), segments.len(), manifests.len()), (0, 2, 1));
+    cluster
+        .open()
+        .await
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), 5));
 }
 
 /// Blobs that, once armed, report each file of one kind they have stored
@@ -538,4 +646,28 @@ async fn a_run_stops_where_the_rows_a_merge_may_hold_run_out() {
     assert_eq!(shape(segments_of(&cluster).await), [80, 40]);
     assert_eq!(writer.merge().await.unwrap(), None, "a third would not fit");
     assert_eq!(shape(segments_of(&cluster).await), [80, 40]);
+}
+
+#[tokio::test]
+async fn a_segment_with_nothing_dead_is_never_stale_however_low_the_bar() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await.merging_with(Merging {
+        stale: 0.0,
+        ..Merging::default()
+    });
+    let rows = (0..10).map(|n| upsert("notes", n, 1));
+    writer
+        .commit([create("notes")].into_iter().chain(rows).collect())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    assert_eq!(writer.merge().await.unwrap(), None);
+    writer.commit(vec![delete("notes", 1)]).await.unwrap();
+    writer.flush().await.unwrap();
+    writer
+        .merge()
+        .await
+        .unwrap()
+        .expect("one dead row is enough");
+    assert_eq!(writer.merge().await.unwrap(), None);
 }

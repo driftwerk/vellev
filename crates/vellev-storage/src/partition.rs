@@ -8,7 +8,7 @@ use futures::future::{join_all, try_join_all};
 use tokio::sync::Mutex;
 use vellev_core::Embedding;
 
-use crate::blobs::{is_plain, Author, Blobs, Layout};
+use crate::blobs::{is_plain, Author, Blobs, Layout, Listed};
 use crate::coordinator::{
     Commit, Committed, Coordinator, Generation, Lease, LogPosition, ManifestRef, PartitionKey,
 };
@@ -17,7 +17,7 @@ use crate::format::{
     decode, decode_head, encode, Head, Kind, LogSegment, Manifest, Op, SegmentMeta,
 };
 use crate::mutation::{Mutation, Receipt, Vectorize};
-use crate::state::{Loaded, Merging, State};
+use crate::state::{self, Loaded, Merging, State};
 use crate::{Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
@@ -563,11 +563,18 @@ impl Writer {
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
-        let Some((file, indexes)) = self.partition.read(|state| {
+        let Some((file, catalog)) = self.partition.read(|state| {
             let file = state.merged(&merge, state.position())?;
-            let indexes = state.indexed(&file.rows);
-            Some((file, indexes))
+            Some((file, state.catalog().clone()))
         }) else {
+            return Ok(None);
+        };
+        let indexed = tokio::task::spawn_blocking(move || {
+            let indexes = state::indexed(&catalog, &file.rows);
+            (file, indexes)
+        });
+        let Ok((file, indexes)) = indexed.await else {
+            tracing::error!(partition = %self.lease.key, "indexing the merged rows did not finish");
             return Ok(None);
         };
         let layout = Layout(&self.lease.key);
@@ -585,21 +592,25 @@ impl Writer {
             tombstones: file.tombstones.len() as u64,
         };
         let Some((flushed, manifest)) = self.partition.read(|state| {
-            state
-                .unchanged(&merge)
-                .then(|| state.compaction(position, &segment_key, &merge, meta.clone()))
+            state.unchanged(&merge).then(|| {
+                let (flushed, manifest) =
+                    state.compaction(position, &segment_key, &merge, meta.clone());
+                let flushed = flushed.map(|(meta, file)| {
+                    let indexes = state.indexed(&file.rows);
+                    (meta, file, indexes)
+                });
+                (flushed, manifest)
+            })
         }) else {
             return Ok(None);
         };
         let merged_frame = encode(Kind::Segment, &file)?;
         let flushed_frame = flushed
             .as_ref()
-            .map(|(_, file)| encode(Kind::Segment, file))
+            .map(|(_, file, _)| encode(Kind::Segment, file))
             .transpose()?;
-        let flushed = flushed.map(|(meta, file)| {
-            let indexes = self.partition.read(|state| state.indexed(&file.rows));
-            (meta, (Arc::new(file), Some(Arc::new(indexes))))
-        });
+        let flushed =
+            flushed.map(|(meta, file, indexes)| (meta, (Arc::new(file), Some(Arc::new(indexes)))));
         let frame = encode(Kind::Manifest, &manifest)?;
         let merged = (meta, (Arc::new(file), Some(Arc::new(indexes))));
         attempt(&mut ready, async {
@@ -618,46 +629,71 @@ impl Writer {
         Ok(Some(position))
     }
 
-    /// Delete the partition's files that the committed head does not reach
-    /// and that are older than `grace`: a stale writer's uploads, and the
-    /// segments and manifests that merges and checkpoints have replaced.
-    /// Within `grace` everything stays, so that the partition can be put
-    /// back as it was at any moment in that window. Returns how many files
-    /// were deleted.
+    /// Delete the partition's files that nothing needs any more: a stale
+    /// writer's uploads, and the segments and manifests that merges and
+    /// checkpoints have replaced. Everything reached from any head written
+    /// in the last `grace` stays, so that the partition can be put back as
+    /// it was at any moment in that window and a reader that took the
+    /// committed position within it still finds its files. Nothing ahead
+    /// of this writer's position is touched, which keeps a newer writer's
+    /// uploads safe whatever the clocks say. Returns how many files were
+    /// deleted.
     ///
-    /// The files are listed before the head is read, with the writer held
-    /// so that no commit is in flight: a file this writer uploaded and had
-    /// not yet published when the listing was taken is reached by then or
-    /// belongs to a commit that failed.
+    /// The files are listed before the position is read, with the writer
+    /// held so that no commit is in flight: a file this writer uploaded and
+    /// had not yet published when the listing was taken is reached by then
+    /// or belongs to a commit that failed.
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
-        let blobs = &self.partition.blobs;
-        let listed = blobs.list(&Layout(&self.lease.key).prefix()).await?;
-        let (position, head) = {
+        let layout = Layout(&self.lease.key);
+        let listed = self.partition.blobs.list(&layout.prefix()).await?;
+        let position = {
             let ready = self.ready.lock().await;
             if !*ready {
                 return Err(StorageError::Closed);
             }
-            self.partition.read(State::at)
+            self.partition.read(State::position)
+        };
+        let cutoff = chrono::Duration::from_std(grace)
+            .ok()
+            .and_then(|grace| chrono::Utc::now().checked_sub_signed(grace));
+        let Some(cutoff) = cutoff else {
+            return Ok(0);
+        };
+        let files: Vec<(&Listed, Kind, LogPosition)> = listed
+            .iter()
+            .filter_map(|file| {
+                let (kind, at) = layout.parse(&file.key)?;
+                Some((file, kind, at))
+            })
+            .collect();
+        let young = files
+            .iter()
+            .filter(|(file, _, _)| file.modified >= cutoff)
+            .map(|(_, _, at)| *at);
+        let floor = young.fold(position, std::cmp::min);
+        let Some(base) = files
+            .iter()
+            .filter(|(_, kind, at)| *kind == Kind::Manifest && *at <= floor)
+            .map(|(_, _, at)| *at)
+            .max()
+        else {
+            return Ok(0);
         };
         let mut reachable = HashSet::new();
-        let mut cursor = head;
-        while let Some(key) = cursor {
-            reachable.insert(key.clone());
-            cursor = match decode_head(&key, &self.partition.fetch(&key).await?)? {
-                Head::Log(log) => log.prev,
-                Head::Manifest(manifest) => {
-                    reachable.extend(manifest.segments.into_iter().map(|meta| meta.key));
-                    None
-                }
-            };
+        let manifests = files
+            .iter()
+            .filter(|(_, kind, at)| *kind == Kind::Manifest && (base..=position).contains(at));
+        for (file, _, _) in manifests {
+            let bytes = self.partition.fetch(&file.key).await?;
+            let manifest: Manifest = decode(&file.key, Kind::Manifest, &bytes)?;
+            reachable.extend(manifest.segments.into_iter().map(|meta| meta.key));
         }
-        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(grace).unwrap_or_default();
-        let orphans = listed
-            .into_iter()
-            .filter(|listed| listed.modified < cutoff && !reachable.contains(&listed.key));
+        let orphans = files
+            .iter()
+            .filter(|(file, _, at)| *at < base && !reachable.contains(&file.key));
         let mut deleted = 0;
-        for orphan in orphans {
-            blobs.delete(&orphan.key).await?;
+        for (file, _, _) in orphans {
+            self.partition.blobs.delete(&file.key).await?;
             deleted += 1;
         }
         tracing::debug!(partition = %self.lease.key, ?position, deleted, "cleaned");

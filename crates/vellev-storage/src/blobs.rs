@@ -11,7 +11,7 @@ use bytes::Bytes;
 use object_store::{ObjectStore, PutPayload};
 
 use crate::coordinator::{Generation, LogPosition, PartitionKey};
-use crate::format::verify;
+use crate::format::{verify, Kind};
 use crate::{Result, StorageError};
 
 #[async_trait]
@@ -64,18 +64,35 @@ impl Layout<'_> {
     /// A segment made by merging others at `position`, named apart from the
     /// one a flush at the same position writes.
     pub fn merged(&self, position: LogPosition, author: &Author) -> String {
-        self.key("segment", position, author)
-            .replace(".segment", "-merged.segment")
+        self.named("segment", position, author, "-merged")
     }
 
     fn key(&self, kind: &str, position: LogPosition, author: &Author) -> String {
+        self.named(kind, position, author, "")
+    }
+
+    fn named(&self, kind: &str, position: LogPosition, author: &Author, suffix: &str) -> String {
         format!(
-            "{}{kind}/{:020}-{:020}-{}.{kind}",
+            "{}{kind}/{:020}-{:020}-{}{suffix}.{kind}",
             self.prefix(),
             position.0,
             author.generation.0,
             author.writer.simple()
         )
+    }
+
+    /// What kind of file a key under this partition names and the position
+    /// it was written at, or `None` for a key not laid out this way.
+    pub(crate) fn parse(&self, key: &str) -> Option<(Kind, LogPosition)> {
+        let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
+        let kind = match kind {
+            "log" => Kind::Log,
+            "segment" => Kind::Segment,
+            "manifest" => Kind::Manifest,
+            _ => return None,
+        };
+        let position = name.get(..20)?.parse().ok()?;
+        Some((kind, LogPosition(position)))
     }
 }
 

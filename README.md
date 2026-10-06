@@ -51,9 +51,10 @@ call -X POST "$notes/hybrid" -d '{"text":"fox","vector":[1,0],"limit":5}'
 ```
 
 A tenant's segments are merged in the background once enough small ones
-have piled up or one is mostly deleted rows, and files nothing reaches any
-more are deleted after `VELLEV_GRACE_SECS` (a day by default), within which
-the tenant can still be put back as it was at any moment.
+have piled up or one is half deleted rows. Files nothing needs any more are
+deleted, keeping everything that any commit of the last `VELLEV_GRACE_SECS`
+(a day by default) reached, so that within that window the tenant can be
+put back as it was at any moment and a slow reader still finds its files.
 
 Several nodes may run against the same Postgres and store. Each tenant is
 written by one node at a time; a request that reaches another node is sent

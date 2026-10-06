@@ -196,9 +196,8 @@ impl Tenant {
             .map_err(|error| self.failed(error))
     }
 
-    /// Merge segments until the tenant's data needs no merge, and then
-    /// delete the files nothing reaches any more that are older than
-    /// `grace`.
+    /// Merge segments until a merge finds nothing to do, and then delete
+    /// the files nothing needs any more, as [`Writer::clean`] with `grace`.
     pub async fn compact(&self, grace: Duration) -> Result<usize> {
         while self
             .writer
@@ -207,10 +206,10 @@ impl Tenant {
             .map_err(|error| self.failed(error))?
             .is_some()
         {}
-        self.writer
-            .clean(grace)
-            .await
-            .map_err(|error| self.failed(error))
+        self.writer.clean(grace).await.map_err(|error| match error {
+            StorageError::Closed => self.failed(error),
+            other => other.into(),
+        })
     }
 
     /// Note that the writer failed at something that leaves it closed.
@@ -465,8 +464,8 @@ impl Inner {
 
     /// Flush the tenant when asked to and it is still due, and merge and
     /// clean up its files after each flush and now and then regardless,
-    /// for as long as the tenant is open. The task holds no reference of
-    /// its own, so dropping the tenant ends it.
+    /// for as long as the tenant is open and held. The task holds no
+    /// reference of its own, so dropping the tenant ends it.
     fn maintaining(&self, tenant: &Arc<Tenant>, mut wanted: mpsc::Receiver<()>) {
         let grace = self.settings.grace;
         let every = (grace / 24).max(Duration::from_secs(60));
@@ -481,6 +480,9 @@ impl Inner {
                 let Some(tenant) = tenant.upgrade() else {
                     return;
                 };
+                if !tenant.held() {
+                    return;
+                }
                 if flush && tenant.read(State::unflushed) >= tenant.flush_rows {
                     if let Err(error) = tenant.flush().await {
                         tracing::warn!(tenant = %tenant.id, %error, "flush failed");
