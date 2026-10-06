@@ -337,12 +337,7 @@ impl Node {
                 lower,
                 upper,
             } => property(name)
-                .map(|p| {
-                    p.values
-                        .range((lower.as_ref(), upper.as_ref()))
-                        .map(|(_, rows)| rows)
-                        .union()
-                })
+                .map(|p| p.range(lower.as_ref(), upper.as_ref()))
                 .unwrap_or_default(),
             Node::IsNull(name) => match property(name) {
                 Some(p) => &index.rows - &p.present,
@@ -361,6 +356,119 @@ impl Node {
 struct PropertyIndex {
     values: BTreeMap<Key, RoaringBitmap>,
     present: RoaringBitmap,
+    runs: Option<Runs>,
+}
+
+/// How many values, or runs of them, each run of a [`Runs`] level unions.
+const RUN: usize = 256;
+
+/// The rows of runs of consecutive values unioned ahead of time, so that a
+/// range over many values unions a few of these and the values at its
+/// edges. Level 0 unions [`RUN`] values, and each level above unions
+/// [`RUN`] runs of the level below.
+#[derive(Debug, Clone)]
+struct Runs {
+    /// The first value of each run of level 0.
+    firsts: Vec<Key>,
+    levels: Vec<Vec<RoaringBitmap>>,
+}
+
+impl Runs {
+    /// Of `values`, when there are enough for a range to gain by it.
+    fn of(values: &BTreeMap<Key, RoaringBitmap>) -> Option<Self> {
+        if values.len() < RUN * 4 {
+            return None;
+        }
+        let keys: Vec<&Key> = values.keys().collect();
+        let firsts = keys.chunks(RUN).map(|run| run[0].clone()).collect();
+        let bitmaps: Vec<&RoaringBitmap> = values.values().collect();
+        let mut levels = vec![unions(&bitmaps)];
+        while levels[levels.len() - 1].len() > RUN {
+            let below: Vec<&RoaringBitmap> = levels[levels.len() - 1].iter().collect();
+            levels.push(unions(&below));
+        }
+        Some(Self { firsts, levels })
+    }
+
+    /// The runs of level 0 lying wholly within the bounds, as `a..b`.
+    fn within(&self, lower: Bound<&Key>, upper: Bound<&Key>) -> std::ops::Range<usize> {
+        let below = |key: &Key| match lower {
+            Bound::Included(lower) => key < lower,
+            Bound::Excluded(lower) => key <= lower,
+            Bound::Unbounded => false,
+        };
+        let under = |key: &Key| match upper {
+            Bound::Included(upper) => key <= upper,
+            Bound::Excluded(upper) => key < upper,
+            Bound::Unbounded => true,
+        };
+        let a = self.firsts.partition_point(below);
+        // The last run starting under the upper bound may run past it,
+        // unless it is the last of all and the bound is open.
+        let starting = self.firsts.partition_point(under);
+        let b = match upper {
+            Bound::Unbounded => starting,
+            _ => starting.saturating_sub(1),
+        };
+        a..b.max(a)
+    }
+
+    /// The bitmaps that together hold the rows of level 0 runs `a..b`, the
+    /// fewest the levels allow.
+    fn cover<'a>(&'a self, level: usize, a: usize, b: usize, out: &mut Vec<&'a RoaringBitmap>) {
+        if level == 0 {
+            out.extend(&self.levels[0][a..b]);
+            return;
+        }
+        let size = RUN.pow(level as u32);
+        let (first, last) = (a.div_ceil(size), b / size);
+        if first < last {
+            self.cover(level - 1, a, first * size, out);
+            out.extend(&self.levels[level][first..last]);
+            self.cover(level - 1, last * size, b, out);
+        } else {
+            self.cover(level - 1, a, b, out);
+        }
+    }
+}
+
+/// The union of each run of [`RUN`] bitmaps.
+fn unions(bitmaps: &[&RoaringBitmap]) -> Vec<RoaringBitmap> {
+    bitmaps
+        .chunks(RUN)
+        .map(|run| run.iter().copied().union())
+        .collect()
+}
+
+impl PropertyIndex {
+    /// The rows holding a value within the bounds.
+    fn range(&self, lower: Bound<&Key>, upper: Bound<&Key>) -> RoaringBitmap {
+        let Some(runs) = &self.runs else {
+            return self
+                .values
+                .range((lower, upper))
+                .map(|(_, rows)| rows)
+                .union();
+        };
+        let whole = runs.within(lower, upper);
+        if whole.is_empty() {
+            return self
+                .values
+                .range((lower, upper))
+                .map(|(_, rows)| rows)
+                .union();
+        }
+        let mut parts = Vec::new();
+        runs.cover(runs.levels.len() - 1, whole.start, whole.end, &mut parts);
+        let before = (lower, Bound::Excluded(&runs.firsts[whole.start]));
+        parts.extend(self.values.range(before).map(|(_, rows)| rows));
+        // Past the last run there is nothing when the range is open above.
+        if let Some(next) = runs.firsts.get(whole.end) {
+            let after = (Bound::Included(next), upper);
+            parts.extend(self.values.range(after).map(|(_, rows)| rows));
+        }
+        parts.into_iter().union()
+    }
 }
 
 /// Which rows hold which value, for each filterable property of one
@@ -381,6 +489,14 @@ impl RowIndex {
         &self.rows
     }
 
+    /// Ready the index for ranges over many values, as for an index that
+    /// takes no more rows: the next insert undoes it.
+    pub fn summarise(&mut self) {
+        for index in self.properties.values_mut() {
+            index.runs = Runs::of(&index.values);
+        }
+    }
+
     /// Record `object` as row `row`, indexing its filterable properties.
     pub fn insert(&mut self, collection: &Collection, row: u32, object: &Object) {
         self.rows.insert(row);
@@ -391,6 +507,7 @@ impl RowIndex {
         });
         for (name, value) in filterable {
             let index = self.properties.entry(name.clone()).or_default();
+            index.runs = None;
             index.present.insert(row);
             for key in Key::of(value) {
                 index.values.entry(key).or_default().insert(row);

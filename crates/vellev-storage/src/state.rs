@@ -390,7 +390,8 @@ fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a 
 /// in `stored` for a collection with as many vectors as it holds is used
 /// rather than built again; otherwise one is built for a collection with
 /// more vectors than `clustered_above`, when that is given, which only the
-/// writer does. An index built under an older catalog stays right: a
+/// writer does. The filter indexes are summarised, the rows being all
+/// there will be. An index built under an older catalog stays right: a
 /// property never changes once added, and neither a property nor a
 /// collection added since has anything in an older layer.
 pub(crate) fn indexed<'a>(
@@ -432,6 +433,9 @@ pub(crate) fn indexed<'a>(
             }
             None => BinaryIndex::build(vectors).map(Vectors::Binary),
         };
+    }
+    for index in indexes.values_mut() {
+        index.rows.summarise();
     }
     indexes
 }
