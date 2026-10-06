@@ -10,10 +10,13 @@
 //! may both ignore it and drop it when it rewrites the file; anything else,
 //! and any new enum variant, needs a new `FORMAT_VERSION`.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use vellev_core::{Collection, Object, ObjectId, Property};
+use vellev_index::clustered::ClusteredIndex;
 
 use crate::coordinator::LogPosition;
 use crate::{Result, StorageError};
@@ -28,11 +31,12 @@ pub enum Kind {
     Log = 1,
     Manifest = 2,
     Segment = 3,
+    Index = 4,
 }
 
 impl Kind {
     fn from_byte(byte: u8) -> Option<Self> {
-        [Kind::Log, Kind::Manifest, Kind::Segment]
+        [Kind::Log, Kind::Manifest, Kind::Segment, Kind::Index]
             .into_iter()
             .find(|kind| *kind as u8 == byte)
     }
@@ -96,6 +100,19 @@ pub struct SegmentMeta {
     pub key: String,
     pub rows: u64,
     pub tombstones: u64,
+    /// The file holding the segment's clustered vector indexes, if it is
+    /// large enough to have any.
+    #[serde(default)]
+    pub index: Option<String>,
+}
+
+/// The vector indexes of a segment that took long enough to build to be
+/// kept: one per collection with enough vectors in the segment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentIndex {
+    /// The key of the segment the indexes are of.
+    pub segment: String,
+    pub vectors: Vec<(CollectionId, Arc<ClusteredIndex>)>,
 }
 
 /// A checkpoint: everything needed to rebuild the partition as of `position`
@@ -150,7 +167,10 @@ pub fn decode_head(key: &str, frame: &[u8]) -> Result<Head> {
     match open(key, frame)? {
         (Kind::Log, body) => parse(key, body).map(Head::Log),
         (Kind::Manifest, body) => parse(key, body).map(Head::Manifest),
-        (Kind::Segment, _) => Err(StorageError::corrupt(key, "a segment cannot be a head")),
+        (Kind::Segment | Kind::Index, _) => Err(StorageError::corrupt(
+            key,
+            "only a log or a manifest can be a head",
+        )),
     }
 }
 

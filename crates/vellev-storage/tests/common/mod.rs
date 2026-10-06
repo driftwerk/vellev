@@ -22,7 +22,7 @@ pub use vellev_storage::coordinator::{
     ManifestRef, ManualClock, MemoryCoordinator, PartitionKey,
 };
 pub use vellev_storage::format::{
-    self, CollectionId, Kind, LogSegment, Manifest, Row, SegmentFile, SegmentMeta,
+    self, CollectionId, Kind, LogSegment, Manifest, Row, SegmentFile, SegmentIndex, SegmentMeta,
 };
 pub use vellev_storage::{Filter, Follower, Mutation, State, StorageError, Writer};
 

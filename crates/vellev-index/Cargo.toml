@@ -12,12 +12,15 @@ openapi = ["dep:utoipa", "vellev-core/openapi"]
 vellev-core.workspace = true
 
 chrono.workspace = true
+rayon.workspace = true
 roaring.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
+rmp-serde.workspace = true
 uuid.workspace = true
