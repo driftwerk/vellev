@@ -216,3 +216,74 @@ async fn files_nothing_reaches_are_deleted_once_old_and_never_before() {
     writer.commit(vec![upsert("notes", 10, 1)]).await.unwrap();
     assert_eq!(writer.clean(Duration::ZERO).await.unwrap(), 0);
 }
+
+/// Blobs that, once armed, report each log file they have stored and then
+/// hold the upload until released, and report each listing taken.
+#[derive(Debug)]
+struct Paused {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Blobs for Paused {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await?;
+        if self.armed.load(Ordering::SeqCst) && key.contains("/log/") {
+            self.events.send("stored").unwrap();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        let listed = self.inner.list(prefix).await?;
+        self.events.send("listed").unwrap();
+        Ok(listed)
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_commit_in_flight_while_cleaning_is_not_mistaken_for_an_orphan() {
+    let mut cluster = Cluster::new().await;
+    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let paused = Arc::new(Paused {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+        events,
+        release: tokio::sync::Notify::new(),
+    });
+    cluster.blobs = paused.clone();
+    let writer = Arc::new(cluster.writer().await);
+    writer.commit(vec![create("notes")]).await.unwrap();
+    paused.armed.store(true, Ordering::SeqCst);
+
+    let committing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.commit(vec![upsert("notes", 1, 1)]).await }
+    });
+    assert_eq!(seen.recv().await, Some("stored"));
+    let cleaning = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.clean(Duration::ZERO).await }
+    });
+    assert_eq!(seen.recv().await, Some("listed"));
+    paused.release.notify_one();
+    committing.await.unwrap().unwrap();
+    assert_eq!(cleaning.await.unwrap().unwrap(), 0);
+
+    let (logs, _, _) = files(&cluster).await;
+    assert_eq!(logs.len(), 2);
+    cluster
+        .open()
+        .await
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
+}

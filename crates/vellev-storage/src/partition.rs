@@ -617,9 +617,21 @@ impl Writer {
     /// Within `grace` everything stays, so that the partition can be put
     /// back as it was at any moment in that window. Returns how many files
     /// were deleted.
+    ///
+    /// The files are listed before the head is read, with the writer held
+    /// so that no commit is in flight: a file this writer uploaded and had
+    /// not yet published when the listing was taken is reached by then or
+    /// belongs to a commit that failed.
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
         let blobs = &self.partition.blobs;
-        let (position, head) = self.partition.read(State::at);
+        let listed = blobs.list(&Layout(&self.lease.key).prefix()).await?;
+        let (position, head) = {
+            let ready = self.ready.lock().await;
+            if !*ready {
+                return Err(StorageError::Closed);
+            }
+            self.partition.read(State::at)
+        };
         let mut reachable = HashSet::new();
         let mut cursor = head;
         while let Some(key) = cursor {
@@ -633,9 +645,7 @@ impl Writer {
             };
         }
         let cutoff = chrono::Utc::now() - chrono::Duration::from_std(grace).unwrap_or_default();
-        let orphans = blobs
-            .list(&Layout(&self.lease.key).prefix())
-            .await?
+        let orphans = listed
             .into_iter()
             .filter(|listed| listed.modified < cutoff && !reachable.contains(&listed.key));
         let mut deleted = 0;
