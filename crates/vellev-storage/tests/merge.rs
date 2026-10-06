@@ -320,21 +320,43 @@ async fn files_nothing_reaches_are_deleted_once_old_and_never_before() {
     assert_eq!(writer.clean(Duration::ZERO).await.unwrap(), 0);
 }
 
-/// Blobs that, once armed, report each log file they have stored and then
-/// hold the upload until released, and report each listing taken.
+/// Blobs that, once armed, report each file of one kind they have stored
+/// and then hold the upload until released, and report each listing taken.
 #[derive(Debug)]
 struct Paused {
     inner: Arc<dyn Blobs>,
+    kind: &'static str,
     armed: AtomicBool,
     events: tokio::sync::mpsc::UnboundedSender<&'static str>,
     release: tokio::sync::Notify,
+}
+
+impl Paused {
+    fn new(
+        cluster: &mut Cluster,
+        kind: &'static str,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    ) {
+        let (events, seen) = tokio::sync::mpsc::unbounded_channel();
+        let paused = Arc::new(Self {
+            inner: cluster.blobs.clone(),
+            kind,
+            armed: AtomicBool::new(false),
+            events,
+            release: tokio::sync::Notify::new(),
+        });
+        cluster.blobs = paused.clone();
+        (paused, seen)
+    }
 }
 
 #[async_trait]
 impl Blobs for Paused {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         self.inner.put(key, bytes).await?;
-        if self.armed.load(Ordering::SeqCst) && key.contains("/log/") {
+        if self.armed.load(Ordering::SeqCst) && key.contains(self.kind) {
             self.events.send("stored").unwrap();
             self.release.notified().await;
         }
@@ -356,14 +378,7 @@ impl Blobs for Paused {
 #[tokio::test]
 async fn a_commit_in_flight_while_cleaning_is_not_mistaken_for_an_orphan() {
     let mut cluster = Cluster::new().await;
-    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
-    let paused = Arc::new(Paused {
-        inner: cluster.blobs.clone(),
-        armed: AtomicBool::new(false),
-        events,
-        release: tokio::sync::Notify::new(),
-    });
-    cluster.blobs = paused.clone();
+    let (paused, mut seen) = Paused::new(&mut cluster, "/log/");
     let writer = Arc::new(cluster.writer().await);
     writer.commit(vec![create("notes")]).await.unwrap();
     paused.armed.store(true, Ordering::SeqCst);
@@ -394,14 +409,7 @@ async fn a_commit_in_flight_while_cleaning_is_not_mistaken_for_an_orphan() {
 #[tokio::test]
 async fn a_row_deleted_while_its_merge_is_built_stays_dead() {
     let mut cluster = Cluster::new().await;
-    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
-    let paused = Arc::new(Paused {
-        inner: cluster.blobs.clone(),
-        armed: AtomicBool::new(false),
-        events,
-        release: tokio::sync::Notify::new(),
-    });
-    cluster.blobs = paused.clone();
+    let (paused, mut seen) = Paused::new(&mut cluster, "/log/");
     let merging = Merging {
         fanout: 2,
         ..Merging::default()
@@ -458,4 +466,76 @@ async fn a_row_deleted_while_its_merge_is_built_stays_dead() {
     );
     writer.partition().read(check);
     cluster.open().await.partition().read(check);
+}
+
+#[tokio::test]
+async fn a_merge_planned_over_segments_another_replaced_meanwhile_does_nothing() {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut seen) = Paused::new(&mut cluster, "/segment/");
+    let merging = Merging {
+        fanout: 2,
+        ..Merging::default()
+    };
+    let writer = Arc::new(cluster.writer().await.merging_with(merging));
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for round in 0..2u8 {
+        let writes = (0..10).map(|n| upsert("notes", round * 10 + n, 1));
+        writer.commit(writes.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    paused.armed.store(true, Ordering::SeqCst);
+
+    let first = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    assert_eq!(seen.recv().await, Some("stored"));
+    let second = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    tokio::task::yield_now().await;
+    paused.release.notify_one();
+    first
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the first merge goes ahead");
+    assert_eq!(second.await.unwrap().unwrap(), None);
+
+    let shape: Vec<u64> = segments_of(&cluster)
+        .await
+        .iter()
+        .map(|segment| segment.rows)
+        .collect();
+    assert_eq!(shape, [20]);
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| assert_eq!(state.count(&name("notes")), 20));
+    }
+}
+
+#[tokio::test]
+async fn a_run_stops_where_the_rows_a_merge_may_hold_run_out() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await.merging_with(Merging {
+        fanout: 2,
+        rows: 100,
+        ..Merging::default()
+    });
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for round in 0..3u8 {
+        let writes = (0..40).map(|n| upsert("notes", round * 40 + n, 1));
+        writer.commit(writes.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    writer.merge().await.unwrap().expect("two segments fit");
+    let shape = |segments: Vec<SegmentMeta>| -> Vec<u64> {
+        segments.iter().map(|segment| segment.rows).collect()
+    };
+    assert_eq!(shape(segments_of(&cluster).await), [80, 40]);
+    assert_eq!(writer.merge().await.unwrap(), None, "a third would not fit");
+    assert_eq!(shape(segments_of(&cluster).await), [80, 40]);
 }
