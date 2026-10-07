@@ -204,6 +204,16 @@ rollback. What a release may change to keep that working, for files,
 Postgres, the API and between nodes, is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## Licence
+
+The client crates, `vellev-core`, `vellev-index`, `vellev-api` and
+`vellev-client`, are MIT OR Apache-2.0: use them anywhere. The server,
+`vellev`, `vellev-node`, `vellev-storage` and `vellev-embed`, is under the
+[Functional Source License 1.1](LICENSE.md) with Apache-2.0 as its future
+licence: anyone may use, change and run it, for themselves or for their
+customers, but not offer it as a service that competes with vellev's own;
+two years after each release, that release is Apache-2.0.
+
 ## Releases
 
 The client crates, `vellev-core`, `vellev-index`, `vellev-api` and
