@@ -37,23 +37,48 @@ impl Signer {
     /// A token for `identity` in `teams`, of `tenant`, expiring `in_secs`
     /// from now (or before, if negative).
     fn token(&self, tenant: &str, identity: &str, teams: &[&str], in_secs: i64) -> String {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let claims = json!({
-            "tenant": tenant,
-            "identity_id": identity,
-            "teams": teams,
-            "iat": now,
-            "exp": now + in_secs,
-        });
+        self.signed(&claims(tenant, identity, teams, in_secs))
+    }
+
+    fn signed(&self, claims: &Value) -> String {
         let header = Header {
             kid: Some(self.kid.clone()),
             ..Header::new(Algorithm::EdDSA)
         };
-        jsonwebtoken::encode(&header, &claims, &self.key).unwrap()
+        jsonwebtoken::encode(&header, claims, &self.key).unwrap()
     }
+}
+
+fn claims(tenant: &str, identity: &str, teams: &[&str], in_secs: i64) -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    json!({
+        "aud": "vellev",
+        "tenant": tenant,
+        "identity_id": identity,
+        "teams": teams,
+        "iat": now,
+        "exp": now + in_secs,
+    })
+}
+
+fn without(mut claims: Value, claim: &str) -> Value {
+    claims.as_object_mut().unwrap().remove(claim);
+    claims
+}
+
+async fn count(served: &Served, key: &str, collection: &str, token: &str) -> (StatusCode, Value) {
+    served
+        .call_headed(
+            Some(key),
+            Method::POST,
+            &format!("/v1/tenants/acme/collections/{collection}/count"),
+            Some(json!({})),
+            &[(IDENTITY, token)],
+        )
+        .await
 }
 
 fn memories() -> Value {
@@ -225,8 +250,31 @@ async fn a_filter_cannot_widen_what_the_rule_allows() {
 async fn a_token_not_trusted_not_current_or_not_for_this_tenant_is_refused() {
     let (signer, stranger) = (Signer::new("hub-1"), Signer::new("hub-1"));
     let (served, key) = ruled(std::slice::from_ref(&signer.trusted)).await;
+    let many: Vec<String> = (0..257).map(|n| n.to_string()).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let mut wrong_audience = claims("acme", "ada", &[], 300);
+    wrong_audience["aud"] = json!("another-service");
     for (why, token) in [
         ("expired", signer.token("acme", "ada", &[], -120)),
+        (
+            "never expiring",
+            signer.signed(&without(claims("acme", "ada", &[], 300), "exp")),
+        ),
+        (
+            "for no audience",
+            signer.signed(&without(claims("acme", "ada", &[], 300), "aud")),
+        ),
+        ("for another audience", signer.signed(&wrong_audience)),
+        ("naming no identity", signer.token("acme", "", &[], 300)),
+        (
+            "naming an empty team",
+            signer.token("acme", "ada", &[""], 300),
+        ),
+        (
+            "naming too many teams",
+            signer.token("acme", "ada", &many, 300),
+        ),
+        ("too long", format!("{}.e30.e30", "e".repeat(9000))),
         ("for another tenant", signer.token("beta", "ada", &[], 300)),
         (
             "signed by another key of the same id",
@@ -238,15 +286,7 @@ async fn a_token_not_trusted_not_current_or_not_for_this_tenant_is_refused() {
         ),
         ("not a token", "not.a.token".to_string()),
     ] {
-        let (status, body) = served
-            .call_headed(
-                Some(&key),
-                Method::POST,
-                &format!("{MEMORIES}/count"),
-                Some(json!({})),
-                &[(IDENTITY, &token)],
-            )
-            .await;
+        let (status, body) = count(&served, &key, "memories", &token).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{why}: {body}");
         assert_eq!(code(&body), "unauthorized", "{why}");
     }
@@ -258,18 +298,93 @@ async fn a_key_is_rotated_by_trusting_the_new_one_beside_the_old() {
     let (served, key) = ruled(&[old.trusted.clone(), new.trusted.clone()]).await;
     for signer in [&old, &new] {
         let token = signer.token("acme", "ada", &[], 300);
-        let (status, counted) = served
-            .call_headed(
-                Some(&key),
-                Method::POST,
-                &format!("{MEMORIES}/count"),
-                Some(json!({})),
-                &[(IDENTITY, &token)],
-            )
-            .await;
+        let (status, counted) = count(&served, &key, "memories", &token).await;
         assert_eq!(
             (status, counted["count"].clone()),
             (StatusCode::OK, json!(1))
         );
     }
+}
+
+#[tokio::test]
+async fn the_rule_chooses_the_rows_before_the_best_are_taken() {
+    let signer = Signer::new("hub-1");
+    let (served, key) = ruled(std::slice::from_ref(&signer.trusted)).await;
+    for n in 10..30 {
+        let object = json!({
+            "properties": { "title": "bob's nearer note", "owner": "bob", "visibility": "private" },
+            "vector": [1.0, 0.0],
+        });
+        served
+            .ok(
+                Method::PUT,
+                &format!("{MEMORIES}/objects/{}", id(n)),
+                Some(object),
+            )
+            .await;
+    }
+    let ada = signer.token("acme", "ada", &[], 300);
+    for (read, body, field) in [
+        (
+            "nearest",
+            json!({ "vector": [1.0, 0.0], "limit": 1 }),
+            "results",
+        ),
+        ("keyword", json!({ "text": "note", "limit": 1 }), "results"),
+        (
+            "hybrid",
+            json!({ "text": "note", "vector": [1.0, 0.0], "limit": 1 }),
+            "results",
+        ),
+        ("list", json!({ "limit": 1 }), "objects"),
+    ] {
+        let (status, found) = served
+            .call_headed(
+                Some(&key),
+                Method::POST,
+                &format!("{MEMORIES}/{read}"),
+                Some(body),
+                &[(IDENTITY, &ada)],
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{read}: {found}");
+        assert_eq!(
+            found[field][0]["properties"]["title"],
+            json!("ada's own note"),
+            "{read}: {found}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_collection_without_a_rule_and_an_admin_key_are_not_narrowed() {
+    let signer = Signer::new("hub-1");
+    let (served, key) = ruled(std::slice::from_ref(&signer.trusted)).await;
+    let mut open = memories();
+    open["name"] = json!("open");
+    open.as_object_mut().unwrap().remove("access_rule");
+    served
+        .ok(Method::PUT, "/v1/tenants/acme/collections/open", Some(open))
+        .await;
+    let object =
+        json!({ "properties": { "title": "anyone's", "owner": "bob" }, "vector": [1.0, 0.0] });
+    served
+        .ok(
+            Method::PUT,
+            &format!("/v1/tenants/acme/collections/open/objects/{}", id(1)),
+            Some(object),
+        )
+        .await;
+    let ada = signer.token("acme", "ada", &[], 300);
+    let (status, counted) = count(&served, &key, "open", &ada).await;
+    assert_eq!(
+        (status, counted["count"].clone()),
+        (StatusCode::OK, json!(1))
+    );
+    let (status, counted) = count(&served, KEY, "memories", "not.a.token").await;
+    assert_eq!(
+        (status, counted["count"].clone()),
+        (StatusCode::OK, json!(4)),
+        "an admin key reads all whatever token comes with it"
+    );
 }
