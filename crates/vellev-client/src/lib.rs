@@ -15,9 +15,9 @@ use reqwest::{Method, StatusCode};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Serialize;
 use vellev_api::{
-    After, Batch, Change, Changes, Code, Collections, Content, Counted, Failure, Hybrid, IssuedKey,
-    Keyword, Nearest, Objects, Page, Results, Stored, TenantKey, TenantKeys, Tenants, Written,
-    AFTER, REQUEST, ROOT,
+    After, Backup, Backups, Batch, Change, Changes, Code, Collections, Content, Counted, Failure,
+    Hybrid, IssuedKey, Keyword, Nearest, Objects, Page, RestorePoints, RestoreTo, RestoreWindow,
+    Restored, Results, Stored, TenantKey, TenantKeys, Tenants, Written, AFTER, REQUEST, ROOT,
 };
 use vellev_core::{Collection, CollectionName, ObjectId, Property, RequestId, TenantId};
 use vellev_index::filter::Filter;
@@ -463,18 +463,22 @@ impl Tenant {
         Ok(written)
     }
 
+    /// Send a request that may be sent again whatever came of it.
+    async fn repeated<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        rest: &str,
+        body: Option<&(impl Serialize + ?Sized)>,
+    ) -> Result<T> {
+        let path = self.path(rest);
+        self.client
+            .ask(Kind::Repeatable, method, &path, body, Some(&self.id))
+            .await
+    }
+
     /// Creating a tenant that exists changes nothing.
     pub async fn create(&self) -> Result<()> {
-        let path = self.path("");
-        self.client
-            .ask(
-                Kind::Repeatable,
-                Method::PUT,
-                &path,
-                None::<&()>,
-                Some(&self.id),
-            )
-            .await
+        self.repeated(Method::PUT, "", None::<&()>).await
     }
 
     /// Forget the tenant and everything in it. Returns whether it existed.
@@ -498,15 +502,39 @@ impl Tenant {
     /// try sent again after its answer was lost issues another key, whose
     /// secret nobody learns; revoke it from [`Self::keys`].
     pub async fn issue_key(&self) -> Result<IssuedKey> {
-        let path = self.path("/keys");
-        self.client
-            .ask(
-                Kind::Repeatable,
-                Method::POST,
-                &path,
-                None::<&()>,
-                Some(&self.id),
-            )
+        self.repeated(Method::POST, "/keys", None::<&()>).await
+    }
+
+    /// Back this tenant up now; needs an admin key, and a node with a
+    /// backup store.
+    pub async fn back_up(&self) -> Result<Backup> {
+        self.repeated(Method::POST, "/backups", None::<&()>).await
+    }
+
+    /// This tenant's backups, oldest first; needs an admin key.
+    pub async fn backups(&self) -> Result<Vec<Backup>> {
+        let listed: Backups = self.read(Method::GET, "/backups", None::<&()>).await?;
+        Ok(listed.backups)
+    }
+
+    /// How far back this tenant may be restored, and the earliest and
+    /// latest states it may go to; needs an admin key.
+    pub async fn restore_points(&self) -> Result<RestorePoints> {
+        self.read(Method::GET, "/restore-points", None::<&()>).await
+    }
+
+    /// Put this tenant back as it was; needs an admin key. Restoring a
+    /// large tenant takes a while: give the client time with
+    /// [`Client::within`]. A restore sent again goes back to the same place.
+    pub async fn restore(&self, to: RestoreTo) -> Result<Restored> {
+        self.repeated(Method::POST, "/restore", Some(&to)).await
+    }
+
+    /// Set how far back this tenant may be restored, in seconds, or with
+    /// none go back to the default; needs an admin key.
+    pub async fn set_restore_window(&self, secs: Option<u64>) -> Result<()> {
+        let window = RestoreWindow { secs };
+        self.repeated(Method::PUT, "/restore-window", Some(&window))
             .await
     }
 

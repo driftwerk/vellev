@@ -11,6 +11,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Notify;
 use vellev::config::Config;
 use vellev::server::App;
+use vellev_api::RestoreTo;
 use vellev_core::{Embedding, TenantId};
 use vellev_storage::blobs::ObjectBlobs;
 
@@ -50,7 +51,53 @@ enum Command {
     /// Copy data from elsewhere into a tenant.
     #[command(subcommand)]
     Import(Import),
+    /// Back a tenant up, and put it back as it was; needs an admin key.
+    Backup(Box<Backup>),
 }
+
+#[derive(clap::Args)]
+struct Backup {
+    /// A vellev node of the cluster.
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    node: String,
+    /// An admin key.
+    #[arg(long, env = "VELLEV_API_KEY")]
+    key: String,
+    #[arg(long, value_parser = |id: &str| TenantId::new(id))]
+    tenant: TenantId,
+    #[command(subcommand)]
+    action: BackupAction,
+}
+
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Back the tenant up now.
+    Take,
+    /// List the tenant's backups.
+    List,
+    /// Show how far back the tenant may be restored.
+    Points,
+    /// Put the tenant back as it stood at a moment, a commit, or a backup.
+    Restore {
+        /// A moment in its restore window, as RFC 3339.
+        #[arg(long, group = "to")]
+        at: Option<chrono::DateTime<chrono::Utc>>,
+        /// The position of a commit in its restore window.
+        #[arg(long, group = "to")]
+        position: Option<u64>,
+        /// The id of one of its backups.
+        #[arg(long, group = "to")]
+        backup: Option<uuid::Uuid>,
+    },
+    /// Set how far back the tenant may be restored.
+    Window {
+        /// Seconds; with none, the cluster's default.
+        secs: Option<u64>,
+    },
+}
+
+/// How long a restore through the command line may take.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Subcommand)]
 enum Import {
@@ -178,6 +225,41 @@ async fn main() -> Result<ExitCode> {
         }
         Command::Openapi => {
             println!("{}", vellev::server::openapi().to_pretty_json()?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Backup(backup) => {
+            let Backup {
+                node,
+                key,
+                tenant,
+                action,
+            } = *backup;
+            let client = vellev_client::Client::connect(&[&node], &key, Default::default())?;
+            let tenant = client.tenant(&tenant);
+            let answer = match action {
+                BackupAction::Take => serde_json::to_value(tenant.back_up().await?)?,
+                BackupAction::List => serde_json::to_value(tenant.backups().await?)?,
+                BackupAction::Points => serde_json::to_value(tenant.restore_points().await?)?,
+                BackupAction::Restore {
+                    at,
+                    position,
+                    backup,
+                } => {
+                    let to = match (at, position, backup) {
+                        (Some(at), None, None) => RestoreTo::At(at),
+                        (None, Some(position), None) => RestoreTo::Position(position),
+                        (None, None, Some(backup)) => RestoreTo::Backup(backup),
+                        _ => eyre::bail!("restore to one of --at, --position or --backup"),
+                    };
+                    let tenant = client.within(RESTORE_TIMEOUT).tenant(tenant.id());
+                    serde_json::to_value(tenant.restore(to).await?)?
+                }
+                BackupAction::Window { secs } => {
+                    tenant.set_restore_window(secs).await?;
+                    serde_json::to_value(tenant.restore_points().await?)?
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&answer)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Import(Import::Weaviate(import)) => {
