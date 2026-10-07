@@ -118,6 +118,21 @@ call -X POST "http://127.0.0.1:8080/v1/tenants/acme/restore" -d '{"position":42}
 call -X PUT "http://127.0.0.1:8080/v1/tenants/acme/restore-window" -d '{"secs":2592000}'   # null for the default
 ```
 
+With `VELLEV_BACKUP_STORE` set, each tenant is also backed up once a day
+(`VELLEV_BACKUP_EVERY_SECS`), whether or not any node holds it, and backups
+are kept 35 days (`VELLEV_BACKUPS_KEPT_SECS`), the newest always. A backup
+copies only the files no earlier one has, so keeping many costs little more
+than keeping one. Everything of a tenant lies under its own prefix of the
+one bucket, `{tenant}/`. A tenant is put back from a backup in its own
+cluster, keeping the keys it has now, or in a new one that lost it, which
+gets back its keys and restore window too:
+
+```sh
+call -X POST "http://127.0.0.1:8080/v1/tenants/acme/backups"              # back up now
+call "http://127.0.0.1:8080/v1/tenants/acme/backups"                      # list them
+call -X POST "http://127.0.0.1:8080/v1/tenants/acme/restore" -d '{"backup":"<id>"}'
+```
+
 Several nodes may run against the same Postgres and store. Each tenant is
 written by one node at a time; a write that reaches another node is sent
 on to the holder, so set `VELLEV_ADVERTISE_URL` to each node's own address
