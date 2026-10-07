@@ -258,6 +258,13 @@ pub trait VectorIndex {
         ties: Ties<'_>,
     ) -> Vec<(f32, u32)>;
 
+    /// The rows the index holds but has no estimate for, as their vectors
+    /// are too long to measure: only a vector stored before lengths were
+    /// limited can be. They are never among the estimates, so they never
+    /// take a place a measured row could have; a caller scores them
+    /// exactly, taken from `only` and `skipped` as estimates are.
+    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32>;
+
     /// The rows of [`VectorIndex::estimates`], without their estimates.
     fn shortlist(
         &self,
@@ -319,12 +326,14 @@ pub struct BinaryIndex {
     /// `m`, rotated as the vectors are.
     centre: Vec<f32>,
     words: usize,
-    /// The indexed rows in ascending order; a row's code is at its position.
+    /// The coded rows in ascending order; a row's code is at its position.
     rows: Vec<u32>,
     codes: Vec<u64>,
     /// Each row's own term of the distance, `|o - m|²` for L2 and
     /// `-m · (o - m)` for the inner products, and its `|o - m|`.
     factors: Vec<(f32, f32)>,
+    /// The rows too long to code, in ascending order.
+    unmeasured: Vec<u32>,
     /// By Hamming distance, the cosine of the angle a row is ranked by.
     cosines: Vec<f32>,
 }
@@ -338,44 +347,41 @@ impl BinaryIndex {
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
         let rotation = Rotation::new(dimensions, ROTATION_SEED);
-        let prepared = |vector: &[f32]| {
-            let rotated = rotation.apply(&normalised(metric, vector));
-            measurable(&rotated).then_some(rotated)
-        };
-        let sampled: Vec<(usize, Option<Vec<f32>>)> = Random(ROTATION_SEED)
-            .sample(vectors.len(), CENTRE_SAMPLE)
+        let prepared = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
+        let (measured, unmeasured): (Vec<&(u32, &[f32])>, _) = vectors
+            .iter()
+            .partition(|(_, vector)| measurable(metric, vector));
+        let sampled: Vec<(usize, Vec<f32>)> = Random(ROTATION_SEED)
+            .sample(measured.len(), CENTRE_SAMPLE)
             .into_par_iter()
-            .map(|at| (at, prepared(vectors[at].1)))
+            .map(|at| (at, prepared(measured[at].1)))
             .collect();
         let centre = median(
             rotation.width,
-            sampled.iter().filter_map(|(_, vector)| vector.as_deref()),
+            sampled.iter().map(|(_, vector)| vector.as_slice()),
         );
         let words = rotation.width / 64;
-        let coded: Vec<(Vec<u64>, (f32, f32))> = vectors
-            .par_iter()
+        let mut codes = vec![0u64; measured.len() * words];
+        let factors = codes
+            .par_chunks_mut(words)
+            .zip(measured.par_iter())
             .enumerate()
-            .map(|(at, (_, vector))| {
+            .map(|(at, (code, (_, vector)))| {
                 let vector = match sampled.binary_search_by_key(&at, |(sampled, _)| *sampled) {
-                    Ok(found) => sampled[found].1.clone(),
-                    Err(_) => prepared(vector),
+                    Ok(found) => Cow::Borrowed(sampled[found].1.as_slice()),
+                    Err(_) => Cow::Owned(prepared(vector)),
                 };
-                // A vector stored before lengths were limited may be too long
-                // for its code to say anything. It is ranked first, to be
-                // placed by its exact distance, which may still be finite.
-                let Some(vector) = vector else {
-                    return (vec![0; words], (f32::NEG_INFINITY, 0.0));
-                };
+                code.iter_mut()
+                    .zip(encode(&centre, &vector))
+                    .for_each(|(slot, word)| *slot = word);
                 let (squared, along) = residual(&centre, &vector);
                 let term = match metric {
                     Distance::L2 => squared,
                     Distance::Dot | Distance::Cosine => -along,
                 };
-                (encode(&centre, &vector).collect(), (term, squared.sqrt()))
+                (term, squared.sqrt())
             })
             .collect();
-        let (codes, factors): (Vec<Vec<u64>>, Vec<(f32, f32)>) = coded.into_iter().unzip();
-        let codes = codes.concat();
         let bits = rotation.width;
         Some(Self {
             metric,
@@ -383,9 +389,10 @@ impl BinaryIndex {
             rotation,
             centre,
             words,
-            rows: vectors.iter().map(|(row, _)| *row).collect(),
+            rows: measured.iter().map(|(row, _)| *row).collect(),
             codes,
             factors,
+            unmeasured: unmeasured.iter().map(|(row, _)| *row).collect(),
             cosines: (0..=bits)
                 .map(|hamming| ranked_cosine(hamming, bits))
                 .collect(),
@@ -401,10 +408,29 @@ impl BinaryIndex {
     }
 }
 
-/// Whether `vector` is as short as a collection accepts, so that every
-/// distance worked out from it fits in an `f32`.
-fn measurable(vector: &[f32]) -> bool {
-    dot(vector, vector) < SQUARED_LENGTH_UNDER
+/// Over how much more than [`SQUARED_LENGTH_UNDER`] a vector's squared
+/// length may come out and the vector still be measured. A write sums the
+/// squares in one order, the index in another; the two differ by at most
+/// the dimensions times an `f32`'s precision, under 2^-10 of the sum, so a
+/// sixteenth is ample and every vector a write accepts is measured.
+const MEASURABLE_UNDER: f32 = SQUARED_LENGTH_UNDER * (1.0 + 1.0 / 16.0);
+
+/// Whether an index can measure `vector` under `metric`: always under
+/// cosine, where only its direction counts, and otherwise when it is no
+/// longer than a collection accepts. Only a vector stored before lengths
+/// were limited can be longer.
+pub(crate) fn measurable(metric: Distance, vector: &[f32]) -> bool {
+    metric == Distance::Cosine || dot(vector, vector) < MEASURABLE_UNDER
+}
+
+/// Of `rows`, in ascending order, those in `only` when it is given and not
+/// flagged in `skipped`.
+pub(crate) fn allowed(rows: &[u32], only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+    rows.iter()
+        .copied()
+        .filter(|row| !skipped.get(*row as usize).copied().unwrap_or(false))
+        .filter(|row| only.is_none_or(|only| only.contains(*row)))
+        .collect()
 }
 
 /// The median of `vectors` in each of their `width` coordinates, or the
@@ -470,7 +496,11 @@ fn encode<'a>(centre: &'a [f32], vector: &'a [f32]) -> impl Iterator<Item = u64>
 
 impl VectorIndex for BinaryIndex {
     fn len(&self) -> usize {
-        self.rows.len()
+        self.rows.len() + self.unmeasured.len()
+    }
+
+    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+        allowed(&self.unmeasured, only, skipped)
     }
 
     fn estimates(
@@ -643,11 +673,14 @@ mod tests {
                     .map(|(row, v)| (distance(metric, &query, v), row as u32 * 2))
                     .collect();
                 exact.select_nth_unstable_by(9, |a, b| a.0.total_cmp(&b.0));
-                let shortlist = index.shortlist(&query, count, None, &[], &in_row_order);
-                assert_eq!(shortlist.len(), count.min(vectors.len()));
+                // What a caller scores: the shortlist, and the rows the index
+                // has no estimate for.
+                let mut scored = index.shortlist(&query, count, None, &[], &in_row_order);
+                assert_eq!(scored.len(), count.min(index.rows.len()));
+                scored.extend(index.unmeasured(None, &[]));
                 exact[..10]
                     .iter()
-                    .filter(|(_, row)| shortlist.contains(row))
+                    .filter(|(_, row)| scored.contains(row))
                     .count()
             })
             .sum();
@@ -796,19 +829,37 @@ mod tests {
         }
     }
 
-    /// A vector longer than a collection accepts, though its squared length
-    /// is just finite, has no code to rank it by: it is shortlisted always,
-    /// to be placed by its exact distance.
+    /// Vectors longer than a collection accepts, though their squared
+    /// lengths are just finite, have no code to rank them by. However many
+    /// there are, they take no place in a shortlist; they are left for the
+    /// caller to score exactly, and the rest are found as ever.
     #[test]
-    fn a_vector_too_long_to_measure_is_always_shortlisted() {
+    fn vectors_too_long_to_measure_are_left_to_be_scored_exactly() {
         let mut random = Random(17);
-        let mut vectors = grouped(&mut random, 1000, 64, 0.3);
-        vectors.push(vec![2.3e18; 64]);
+        let mut vectors = grouped(&mut random, 2000, 64, 0.3);
+        let queries = vectors.clone();
+        vectors.extend(std::iter::repeat_n(vec![2.3e18; 64], 500));
+        let long: Vec<u32> = (2000..2500u32).map(|row| row * 2).collect();
         for metric in [Distance::Dot, Distance::L2] {
             let index = indexed(metric, &vectors);
-            let shortlist = index.shortlist(&vectors[0], 5, None, &[], &in_row_order);
-            assert!(shortlist.contains(&2000), "{metric:?}");
+            assert_eq!(index.len(), 2500);
+            assert_eq!(index.unmeasured(None, &[]), long, "{metric:?}");
+            let only: RoaringBitmap = [0u32, 4000, 4002, 4998].into_iter().collect();
+            let mut skipped = vec![false; 5000];
+            skipped[4002] = true;
+            assert_eq!(index.unmeasured(Some(&only), &skipped), [4000, 4998]);
+            let shortlist = index.shortlist(&queries[0], 160, None, &[], &in_row_order);
+            assert!(
+                shortlist.iter().all(|row| *row < 4000),
+                "{metric:?}: a row with no estimate shortlisted"
+            );
+            let share = recall(metric, &vectors, &queries, 100, 160);
+            assert!(share >= 0.9, "{metric:?}: {share} of the true neighbours");
         }
+        // Under cosine only a direction counts, and every such vector has one.
+        assert!(indexed(Distance::Cosine, &vectors)
+            .unmeasured(None, &[])
+            .is_empty());
     }
 
     /// Under cosine only a direction counts, and a vector too long to

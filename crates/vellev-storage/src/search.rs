@@ -74,22 +74,21 @@ impl State {
         let mut estimated = Vec::new();
         let mut floors = 0;
         for (at, layer) in layers.iter().enumerate() {
-            match candidates(layer, id, predicate.as_ref(), query.vector, budget) {
-                Candidates::Exact(rows) => exact.extend(rows.into_iter().map(|row| (at, row))),
-                // Each layer's own nearest few are always scored: one whose
-                // estimates err more than others' would otherwise crowd
-                // them out with rows that only look near.
-                Candidates::Estimated(mut rows) => {
-                    let rest = nearest(&mut rows, query.limit, |a, b| {
-                        layer.id(*a).cmp(&layer.id(*b))
-                    });
-                    floors += rows.len();
-                    exact.extend(rows.into_iter().map(|(_, row)| (at, row)));
-                    estimated.extend(
-                        rest.into_iter()
-                            .map(|(estimate, row)| (estimate, (at, row))),
-                    );
-                }
+            let offered = candidates(layer, id, predicate.as_ref(), query.vector, budget);
+            exact.extend(offered.exact.into_iter().map(|row| (at, row)));
+            // Each layer's own nearest few are always scored: one whose
+            // estimates err more than others' would otherwise crowd them
+            // out with rows that only look near.
+            if let Some(mut rows) = offered.estimated {
+                let rest = nearest(&mut rows, query.limit, |a, b| {
+                    layer.id(*a).cmp(&layer.id(*b))
+                });
+                floors += rows.len();
+                exact.extend(rows.into_iter().map(|(_, row)| (at, row)));
+                estimated.extend(
+                    rest.into_iter()
+                        .map(|(estimate, row)| (estimate, (at, row))),
+                );
             }
         }
         nearest(
@@ -114,16 +113,18 @@ impl State {
 }
 
 /// What a layer offers a query.
-enum Candidates {
+#[derive(Default)]
+struct Candidates {
     /// Rows to score exactly.
-    Exact(Vec<u32>),
+    exact: Vec<u32>,
     /// Rows its clustered index estimates nearest, with their estimated
     /// distances, to be scored only if among the nearest of every layer.
-    Estimated(Vec<(f32, u32)>),
+    estimated: Option<Vec<(f32, u32)>>,
 }
 
 /// The layer's candidates: every allowed live row when there are few,
-/// otherwise up to `count` its vector index picks.
+/// otherwise up to `count` its vector index picks, and besides them every
+/// allowed row it has no estimate for.
 fn candidates(
     layer: &Layer<'_>,
     collection: CollectionId,
@@ -132,7 +133,7 @@ fn candidates(
     count: usize,
 ) -> Candidates {
     let Some(index) = layer.indexes.get(&collection) else {
-        return Candidates::Exact(Vec::new());
+        return Candidates::default();
     };
     let only = predicate.map(|predicate| predicate.select(&index.rows));
     let allowed = only.as_ref().unwrap_or(index.rows.rows());
@@ -141,19 +142,27 @@ fn candidates(
         .vectors
         .as_ref()
         .filter(|_| many_are_live(allowed.len(), layer, live));
+    let Some(vectors) = shortlist else {
+        return Candidates {
+            exact: live().collect(),
+            estimated: None,
+        };
+    };
     let ties = |a, b| layer.id(a).cmp(&layer.id(b));
-    match shortlist {
-        Some(Vectors::Clustered(clustered)) => Candidates::Estimated(clustered.estimates(
-            vector,
-            count,
-            only.as_ref(),
-            layer.dead,
-            &ties,
-        )),
-        Some(binary) => {
-            Candidates::Exact(binary.shortlist(vector, count, only.as_ref(), layer.dead, &ties))
-        }
-        None => Candidates::Exact(live().collect()),
+    let unmeasured = vectors.unmeasured(only.as_ref(), layer.dead);
+    match vectors {
+        Vectors::Clustered(clustered) => Candidates {
+            exact: unmeasured,
+            estimated: Some(clustered.estimates(vector, count, only.as_ref(), layer.dead, &ties)),
+        },
+        Vectors::Binary(binary) => Candidates {
+            exact: binary
+                .shortlist(vector, count, only.as_ref(), layer.dead, &ties)
+                .into_iter()
+                .chain(unmeasured)
+                .collect(),
+            estimated: None,
+        },
     }
 }
 

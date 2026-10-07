@@ -92,6 +92,13 @@ impl VectorIndex for Vectors {
         }
     }
 
+    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+        match self {
+            Vectors::Binary(index) => index.unmeasured(only, skipped),
+            Vectors::Clustered(index) => index.unmeasured(only, skipped),
+        }
+    }
+
     fn estimates(
         &self,
         query: &[f32],

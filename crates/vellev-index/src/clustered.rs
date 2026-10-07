@@ -25,8 +25,8 @@ use vellev_core::Distance;
 
 use crate::rotation::{Random, Rotation};
 use crate::vector::{
-    directionless, dot, in_row_order, nearest, normalised, or_farthest, squared_l2, Scorer, Ties,
-    VectorIndex,
+    allowed, directionless, dot, in_row_order, measurable, nearest, normalised, or_farthest,
+    squared_l2, Scorer, Ties, VectorIndex,
 };
 
 /// The share of the true nearest ten that the clusters scanned must hold,
@@ -55,6 +55,9 @@ pub struct ClusteredIndex {
     /// its place in it; both follow from the clusters.
     rows: Vec<u32>,
     at: Vec<(u32, u32)>,
+    /// The rows with no estimate, in ascending order; they follow from the
+    /// clusters too.
+    unmeasured: Vec<u32>,
     /// How many clusters a query scans.
     probes: usize,
 }
@@ -90,6 +93,39 @@ struct Factor {
     along: f32,
 }
 
+impl Factor {
+    /// What a row too long to measure is kept with: a distance from its
+    /// centroid that is not finite, which marks it as having no estimate.
+    /// A row an index built before lengths were limited could not measure
+    /// came out the same way, so reads the same.
+    const UNMEASURED: Self = Self {
+        norm: f32::INFINITY,
+        align: 1.0,
+        along: 0.0,
+    };
+
+    fn measured(&self) -> bool {
+        self.norm.is_finite()
+    }
+}
+
+/// The rows of `clusters` with no estimate, in ascending order.
+fn unmeasured(clusters: &[Cluster]) -> Vec<u32> {
+    let mut rows: Vec<u32> = clusters
+        .iter()
+        .flat_map(|members| {
+            members
+                .rows
+                .iter()
+                .zip(&members.factors)
+                .filter(|(_, factor)| !factor.measured())
+                .map(|(row, _)| *row)
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
 /// The index on the wire: what cannot be rebuilt from the rest.
 #[derive(Serialize, Deserialize)]
 struct Wire {
@@ -122,6 +158,7 @@ impl From<Wire> for ClusteredIndex {
             dimensions: wire.dimensions,
             rotation: wire.rotation,
             centroids: wire.centroids,
+            unmeasured: unmeasured(&wire.clusters),
             clusters: wire.clusters,
             rows,
             at,
@@ -456,18 +493,29 @@ impl ClusteredIndex {
         let width = rotation.width;
         let rotated = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
 
-        let k = clusters_for(vectors.len());
-        let training: Vec<Vec<f32>> = random
-            .sample(vectors.len(), k * TRAINING_PER_CLUSTER)
-            .into_par_iter()
-            .map(|at| rotated(vectors[at].1))
+        // Clusters are drawn from the rows that can be measured; any other,
+        // stored before lengths were limited, would drag them far away.
+        let measured: Vec<usize> = (0..vectors.len())
+            .filter(|at| measurable(metric, vectors[*at].1))
             .collect();
-        let centroids = kmeans(&training, k, width, &mut random);
+        let k = clusters_for(measured.len().max(1));
+        let training: Vec<Vec<f32>> = random
+            .sample(measured.len(), k * TRAINING_PER_CLUSTER)
+            .into_par_iter()
+            .map(|at| rotated(vectors[measured[at]].1))
+            .collect();
+        let centroids = match training.is_empty() {
+            true => vec![0.0; k * width],
+            false => kmeans(&training, k, width, &mut random),
+        };
 
         let scale = 1.0 / (width as f32).sqrt();
         let coded: Vec<(usize, Vec<u64>, Factor)> = vectors
             .par_iter()
             .map(|(_, vector)| {
+                if !measurable(metric, vector) {
+                    return (0, vec![0; width / 64], Factor::UNMEASURED);
+                }
                 let rotated = rotated(vector);
                 let cluster = nearest_centroid(&centroids, width, &rotated);
                 let centroid = &centroids[cluster * width..][..width];
@@ -517,6 +565,7 @@ impl ClusteredIndex {
             dimensions,
             rotation,
             centroids,
+            unmeasured: unmeasured(&clusters),
             clusters,
             rows: vectors.iter().map(|(row, _)| *row).collect(),
             at,
@@ -629,6 +678,10 @@ impl VectorIndex for ClusteredIndex {
         self.rows.len()
     }
 
+    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+        allowed(&self.unmeasured, only, skipped)
+    }
+
     /// Each estimate is a distance under the index's metric, comparable
     /// with the estimates of other clustered indexes of vectors measured
     /// the same way.
@@ -643,7 +696,11 @@ impl VectorIndex for ClusteredIndex {
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
-        let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
+        // A row with no estimate is never offered: the caller scores it.
+        let kept = |row: u32| {
+            !skipped.get(row as usize).copied().unwrap_or(false)
+                && self.unmeasured.binary_search(&row).is_err()
+        };
         let mut nearest = Nearest::new(count, ties);
         // A query as far from every row is estimated alike for each, in
         // whatever cluster, and the caller's order decides.
@@ -1044,6 +1101,41 @@ mod tests {
         assert_eq!(rows, [0, 2, 4, 6, 8]);
         let one = ClusteredIndex::build(Distance::Cosine, &[(3, &[0.0, 0.0])]).unwrap();
         assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[], &in_row_order), [3]);
+    }
+
+    /// Vectors longer than a collection accepts have no estimate: they draw
+    /// no centroid to them, take no place in a shortlist, and are left for
+    /// the caller to score exactly, read back from the wire as they were.
+    #[test]
+    fn vectors_too_long_to_measure_are_left_to_be_scored_exactly() {
+        let mut vectors = grouped(23, 3000, 32, 10, 0.4);
+        vectors.extend(std::iter::repeat_n(vec![2.3e18; 32], 300));
+        let long: Vec<u32> = (3000..3300u32).map(|row| row * 2).collect();
+        for metric in [Distance::Dot, Distance::L2] {
+            let index = indexed(metric, &vectors);
+            assert_eq!(index.len(), 3300);
+            assert_eq!(index.unmeasured(None, &[]), long, "{metric:?}");
+            let mut found = 0;
+            for query in vectors[..3000].iter().step_by(300) {
+                let shortlist = index.shortlist(query, 100, None, &[], &in_row_order);
+                assert_eq!(shortlist.len(), 100);
+                assert!(shortlist.iter().all(|row| *row < 6000), "{metric:?}");
+                let mut exact: Vec<(f32, u32)> = vectors[..3000]
+                    .iter()
+                    .enumerate()
+                    .map(|(row, v)| (distance(metric, query, v), row as u32 * 2))
+                    .collect();
+                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+                found += exact[..10]
+                    .iter()
+                    .filter(|(_, row)| shortlist.contains(row))
+                    .count();
+            }
+            assert!(found >= 90, "{metric:?}: {found} of 100 true neighbours");
+            let bytes = rmp_serde::to_vec_named(&index).unwrap();
+            let back: ClusteredIndex = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.unmeasured(None, &[]), long);
+        }
     }
 
     /// A flood of rows at one distance, as of copies of one vector, holds

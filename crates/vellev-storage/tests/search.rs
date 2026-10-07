@@ -577,6 +577,86 @@ async fn a_query_too_short_to_square_finds_the_vector_it_points_along() {
     }
 }
 
+/// Rows longer than a collection accepts, as were stored before lengths
+/// were limited, forged into the log as no write can make them now. However
+/// many there are, a shortlisted segment of either kind scores them exactly
+/// beside its shortlist: they are found where they are nearest, and crowd
+/// out nothing where they are not.
+#[tokio::test]
+async fn rows_too_long_to_measure_are_scored_exactly_beside_the_shortlist() {
+    for merging in index_kinds() {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let mut random = Random(43);
+        // Three plainly nearest the query that points away from the long rows.
+        let measured = (1..=SHORTLISTED)
+            .map(|n| put(n, 0, Some(random.vector(8))))
+            .chain((7_001..=7_003).map(|n| put(n, 0, Some(vec![-5.0; 8]))));
+        writer
+            .commit(
+                [collection(8, Distance::Dot)]
+                    .into_iter()
+                    .chain(measured)
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let head = cluster.committed().await;
+        let position = head.log_position.next().unwrap();
+        let key = Layout(&cluster.key).log(position, writer.author());
+        let long = (9_001..=9_600).map(|n| format::Op::Upsert {
+            collection: CollectionId(0),
+            object: Object {
+                id: row(n),
+                properties: BTreeMap::from([("n".to_string(), Value::Int(0))]),
+                vector: Some(vec![2.3e18; 8]),
+            },
+        });
+        let log = LogSegment {
+            position,
+            prev: head.manifest.map(|manifest| manifest.0),
+            ops: long.collect(),
+            answered: Vec::new(),
+        };
+        cluster
+            .blobs
+            .put(&key, format::encode(Kind::Log, &log).unwrap())
+            .await
+            .unwrap();
+        cluster
+            .coordinator
+            .commit(
+                writer.lease(),
+                Commit {
+                    log_position: position,
+                    manifest: Some(ManifestRef(key)),
+                },
+            )
+            .await
+            .unwrap();
+        let writer = cluster.writer().await.merging_with(merging);
+        writer.flush().await.unwrap();
+        for copy in [
+            writer.partition().clone(),
+            cluster.open().await.partition().clone(),
+        ] {
+            copy.read(|state| {
+                assert_eq!(state.count(&name(VECTORS)), 5_603);
+                for query in [[1.0; 8], [-1.0; 8]] {
+                    let hits = state
+                        .search(&name(VECTORS), &Query::nearest(&query, 3))
+                        .unwrap();
+                    assert_eq!(
+                        ids(&hits),
+                        brute_force(state, Distance::Dot, &query, 3, |_| true),
+                        "{merging:?} {query:?}"
+                    );
+                }
+            });
+        }
+    }
+}
+
 /// Copies of one vector in two clustered segments, each written in
 /// descending id order, searched scoring no more than each segment's own
 /// nearest few: those few are its lowest ids, so the lowest of all are
