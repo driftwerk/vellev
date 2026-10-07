@@ -300,19 +300,32 @@ impl PartialOrd for Candidate {
 
 /// The `count` nearest candidates offered, farthest on top, and those
 /// offered as far as the farthest of them that did not fit: which of the
-/// candidates at that distance are kept is for the caller to say.
-struct Nearest {
+/// candidates at that distance are kept is for `ties` to say.
+struct Nearest<'a> {
     count: usize,
     heap: BinaryHeap<Candidate>,
+    /// Never more than twice `count`: past that, only the first `count` by
+    /// `ties` can be kept, and the rest are let go.
     tied: Vec<u32>,
+    ties: Ties<'a>,
 }
 
-impl Nearest {
-    fn new(count: usize) -> Self {
+impl<'a> Nearest<'a> {
+    fn new(count: usize, ties: Ties<'a>) -> Self {
         Self {
             count,
             heap: BinaryHeap::with_capacity(count + 1),
             tied: Vec::new(),
+            ties,
+        }
+    }
+
+    fn tie(&mut self, row: u32) {
+        self.tied.push(row);
+        if self.tied.len() > 2 * self.count {
+            self.tied
+                .select_nth_unstable_by(self.count, |a, b| (self.ties)(*a, *b));
+            self.tied.truncate(self.count);
         }
     }
 
@@ -327,14 +340,15 @@ impl Nearest {
         };
         match distance.total_cmp(&worst.distance) {
             Ordering::Greater => {}
-            Ordering::Equal => self.tied.push(row),
+            Ordering::Equal => {
+                drop(worst);
+                self.tie(row);
+            }
             Ordering::Less => {
                 let out = std::mem::replace(&mut *worst, Candidate { distance, row });
                 drop(worst);
                 match self.heap.peek().map(|worst| worst.distance) {
-                    Some(worst) if worst.total_cmp(&out.distance).is_eq() => {
-                        self.tied.push(out.row)
-                    }
+                    Some(worst) if worst.total_cmp(&out.distance).is_eq() => self.tie(out.row),
                     _ => self.tied.clear(),
                 }
             }
@@ -347,8 +361,13 @@ impl Nearest {
 
     /// The nearest `count`, those as far as the farthest of them taken in
     /// `ties` order.
-    fn estimates(self, ties: Ties<'_>) -> Vec<(f32, u32)> {
-        let Self { count, heap, tied } = self;
+    fn estimates(self) -> Vec<(f32, u32)> {
+        let Self {
+            count,
+            heap,
+            tied,
+            ties,
+        } = self;
         let farthest = heap.peek().map(|worst| worst.distance);
         let mut estimates: Vec<(f32, u32)> = heap
             .into_iter()
@@ -526,7 +545,7 @@ impl ClusteredIndex {
             .map(|at| &vectors[at])
             .flat_map_iter(|(row, query)| {
                 let scorer = Scorer::new(self.metric, query);
-                let mut nearest = Nearest::new(TUNING_NEIGHBOURS);
+                let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
                 for (other, vector) in vectors {
                     if other != row {
                         nearest.offer(scorer.distance(vector), *other);
@@ -540,7 +559,7 @@ impl ClusteredIndex {
                         .unwrap_or(order.len())
                 };
                 nearest
-                    .estimates(&in_row_order)
+                    .estimates()
                     .into_iter()
                     .map(move |(_, row)| rank_of(self.at[self.position(row).unwrap()].0))
             })
@@ -625,7 +644,7 @@ impl VectorIndex for ClusteredIndex {
         }
         let query = self.prepared(query);
         let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
-        let mut nearest = Nearest::new(count);
+        let mut nearest = Nearest::new(count, ties);
         let per_probe = self.rows.len().div_ceil(self.clusters.len()) * self.probes;
         match only {
             // Fewer rows allowed than a scan would visit: visit just those,
@@ -667,7 +686,7 @@ impl VectorIndex for ClusteredIndex {
                 }
             }
         }
-        nearest.estimates(ties)
+        nearest.estimates()
     }
 }
 
@@ -1006,6 +1025,26 @@ mod tests {
         assert_eq!(rows, [0, 2, 4, 6, 8]);
         let one = ClusteredIndex::build(Distance::Cosine, &[(3, &[0.0, 0.0])]).unwrap();
         assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[], &in_row_order), [3]);
+    }
+
+    /// A flood of rows at one distance, as of copies of one vector, holds
+    /// no more than twice the count while scanned, and keeps the first of
+    /// them by the caller's order.
+    #[test]
+    fn a_flood_of_ties_is_held_to_twice_the_count() {
+        let backwards = |a: u32, b: u32| b.cmp(&a);
+        let mut nearest = Nearest::new(3, &backwards);
+        for row in 0..10_000 {
+            nearest.offer(1.0, row);
+            assert!(nearest.tied.len() <= 6, "{} tied", nearest.tied.len());
+        }
+        let mut rows: Vec<u32> = nearest
+            .estimates()
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(rows, [9997, 9998, 9999]);
     }
 
     #[test]
