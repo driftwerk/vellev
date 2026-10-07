@@ -831,6 +831,7 @@ mod le {
 mod tests {
     use super::*;
     use crate::vector::distance;
+    use vellev_core::SQUARED_LENGTH_UNDER;
 
     struct Noise(u64);
 
@@ -1117,6 +1118,42 @@ mod tests {
         assert_eq!(rows, [0, 2, 4, 6, 8]);
         let one = ClusteredIndex::build(Distance::Cosine, &[(3, &[0.0, 0.0])]).unwrap();
         assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[], &in_row_order), [3]);
+    }
+
+    /// What a row's factors say of its squared length is what it is: for
+    /// rows at an everyday length, and for rows leaning far one way near
+    /// the length limit, where each lies far along its centroid.
+    #[test]
+    fn a_rows_squared_length_is_worked_out_again_from_its_factors() {
+        let everyday = scattered(41, 2000, 48);
+        let mut noise = Noise(43);
+        let lean = noise.vector(48);
+        let far: Vec<Vec<f32>> = (0..2000)
+            .map(|_| {
+                let vector: Vec<f32> = lean.iter().map(|l| l + 0.3 * noise.unit()).collect();
+                let scale = (0.9 * SQUARED_LENGTH_UNDER / dot(&vector, &vector)).sqrt();
+                vector.into_iter().map(|v| v * scale).collect()
+            })
+            .collect();
+        for vectors in [everyday, far] {
+            for metric in [Distance::Dot, Distance::L2] {
+                let index = indexed(metric, &vectors);
+                assert!(index.unmeasured(None, &[]).is_empty());
+                for (at, vector) in vectors.iter().enumerate().step_by(7) {
+                    let (cluster, place) = index.at[index.position(at as u32 * 2).unwrap()];
+                    let centroid = index.centroid(cluster as usize);
+                    let centroid: f64 = centroid.iter().map(|v| f64::from(*v).powi(2)).sum();
+                    let factor = index.clusters[cluster as usize].factors[place as usize];
+                    let rotated = index.prepared(vector);
+                    let exact: f64 = rotated.iter().map(|v| f64::from(*v).powi(2)).sum();
+                    let worked = factor.squared(centroid);
+                    assert!(
+                        (worked - exact).abs() <= 1e-4 * exact,
+                        "{metric:?}: {worked} against {exact}"
+                    );
+                }
+            }
+        }
     }
 
     /// Indexes built by the release before, which knew nothing of rows too
