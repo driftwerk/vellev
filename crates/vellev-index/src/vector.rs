@@ -139,17 +139,30 @@ pub fn certainty(metric: Distance, distance: f32) -> Option<f32> {
 }
 
 /// `vector` as an index measures it: scaled to unit length for cosine, so
-/// that only its direction counts, and as it is otherwise. A zero vector, or
-/// one whose length cannot be worked out, is left as it is.
+/// that only its direction counts, and as it is otherwise. A vector too
+/// long to square, as one stored before lengths were limited may be, is
+/// scaled down by its largest value first. A zero vector, or one with a
+/// value that is not finite, is left as it is.
 pub(crate) fn normalised(metric: Distance, vector: &[f32]) -> Cow<'_, [f32]> {
+    let unit = |vector: &[f32]| {
+        let norm = dot(vector, vector).sqrt();
+        (norm > 0.0 && norm.is_finite()).then(|| {
+            vector
+                .iter()
+                .map(|value| value / norm)
+                .collect::<Vec<f32>>()
+        })
+    };
     match metric {
-        Distance::Cosine => {
-            let norm = dot(vector, vector).sqrt();
-            match norm > 0.0 && norm.is_finite() {
-                true => vector.iter().map(|value| value / norm).collect(),
-                false => Cow::Borrowed(vector),
-            }
-        }
+        Distance::Cosine => unit(vector)
+            .or_else(|| {
+                let largest = vector
+                    .iter()
+                    .fold(0.0f32, |most, value| most.max(value.abs()));
+                let scaled: Vec<f32> = vector.iter().map(|value| value / largest).collect();
+                unit(&scaled)
+            })
+            .map_or(Cow::Borrowed(vector), Cow::Owned),
         Distance::Dot | Distance::L2 => Cow::Borrowed(vector),
     }
 }
@@ -750,6 +763,29 @@ mod tests {
             let shortlist = index.shortlist(&vectors[0], 5, None, &[], &in_row_order);
             assert!(shortlist.contains(&2000), "{metric:?}");
         }
+    }
+
+    /// Under cosine only a direction counts, and a vector too long to
+    /// square still has one: coded by it, one pointing away from the query
+    /// is not shortlisted.
+    #[test]
+    fn a_vector_too_long_to_square_keeps_its_direction_under_cosine() {
+        let unit = normalised(Distance::Cosine, &[3e30, -4e30, 0.0]);
+        assert!(
+            unit.iter()
+                .zip([0.6, -0.8, 0.0])
+                .all(|(value, expected)| (value - expected).abs() < 1e-6),
+            "{unit:?}"
+        );
+        assert_eq!(&*normalised(Distance::Cosine, &[0.0, 0.0]), [0.0, 0.0]);
+        assert_eq!(&*normalised(Distance::Dot, &[3e30]), [3e30]);
+
+        let mut random = Random(19);
+        let mut vectors = grouped(&mut random, 1000, 64, 0.3);
+        vectors.push(vectors[0].iter().map(|value| -1e30 * value).collect());
+        let index = indexed(Distance::Cosine, &vectors);
+        let shortlist = index.shortlist(&vectors[0], 5, None, &[], &in_row_order);
+        assert!(!shortlist.contains(&2000));
     }
 
     #[test]
