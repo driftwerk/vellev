@@ -314,6 +314,14 @@ const CENTRE_SAMPLE: usize = 4096;
 /// coordinate of the rotation is coded, the dimensions padded to a power of
 /// two, as the padding's bits buy more recall than they cost.
 ///
+/// None of this is free. Against codes along the axes about the mean, over
+/// 100,000 rows of 384 dimensions a query takes about 40% longer, 0.70 to
+/// 0.73 ms against 0.50 to 0.53, for the padding to 512 bits and each row's
+/// factors to load, and the index 31 to 41 ms to build against 19 to 25.
+/// It buys recall: on driftwerk's embeddings an oversample of 4 finds 0.990
+/// of the true nearest ten, where codes along the axes find 0.881 even at
+/// an oversample of 32.
+///
 /// A row's code says on which side of a centre `m` each coordinate of its
 /// rotated vector `o` lies, and the query's code the same of the query `q`.
 /// The share of bits on which they differ estimates the angle between
