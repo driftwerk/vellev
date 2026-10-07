@@ -52,7 +52,11 @@ fn lanes(a: &[f32], b: &[f32], term: impl Fn(f32, f32) -> f32) -> f32 {
 }
 
 /// The dot product of `a` and `b` together with `b`'s squared length, in one
-/// pass over `b`.
+/// pass over `b`. Both are summed in the same order, so that of a vector
+/// against itself they agree to the last bit; it is not the order [`dot`]
+/// sums in. Any shape of the final sum but this one makes the loop several
+/// times slower, so a squared length to set beside these must be taken
+/// from here too.
 fn dot_and_norm(a: &[f32], b: &[f32]) -> (f32, f32) {
     let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
     let tail = a_chunks
@@ -127,8 +131,8 @@ pub struct Scorer<'q> {
 
 #[derive(Debug, Clone)]
 enum Measure {
-    /// The query's length, whose square is a normal `f32`.
-    Length(f32),
+    /// The query's squared length, a normal `f32`.
+    Squared(f32),
     /// The query scaled to unit length, as its square is not.
     Unit(Vec<f32>),
     /// The query has no direction.
@@ -137,9 +141,11 @@ enum Measure {
 
 impl<'q> Scorer<'q> {
     pub fn new(metric: Distance, query: &'q [f32]) -> Self {
-        let squared = dot(query, query);
+        // Summed as each row's squared length is, so that against itself
+        // the query's inner product is its squared length to the bit.
+        let (_, squared) = dot_and_norm(query, query);
         let measure = match squared.is_normal() {
-            true => Measure::Length(squared.sqrt()),
+            true => Measure::Squared(squared),
             false => unit(query).map_or(Measure::Directionless, Measure::Unit),
         };
         Self {
@@ -156,10 +162,15 @@ impl<'q> Scorer<'q> {
                 // are, straight from them; otherwise from both directions.
                 let directions = |query: &[f32]| unit(vector).map(|vector| dot(query, &vector));
                 let cosine = match &self.measure {
-                    Measure::Length(length) => {
+                    Measure::Squared(query) => {
                         let (along, squared) = dot_and_norm(self.query, vector);
+                        // In `f64` the product of the squares is exact and
+                        // its root correctly rounded, so a vector against
+                        // itself, whose `along` is its squared length to the
+                        // bit, has a cosine of exactly one.
+                        let lengths = (f64::from(*query) * f64::from(squared)).sqrt();
                         match squared.is_normal() {
-                            true => Some(along / (length * squared.sqrt())),
+                            true => Some((f64::from(along) / lengths) as f32),
                             false => unit(self.query).and_then(|query| directions(&query)),
                         }
                     }
@@ -985,6 +996,56 @@ mod tests {
             let mut rows = index.shortlist(&same, 3, None, &[], &in_row_order);
             rows.sort_unstable();
             assert_eq!(rows, [1000, 1002, 1004], "{metric:?}");
+        }
+    }
+
+    /// Scoring a vector by cosine reads it once, as the inner product does,
+    /// and costs little more: a shape of its sums that defeats the
+    /// compiler's vectorising has made it three times as slow before. Each
+    /// is timed at its fastest of several rounds, which whatever else the
+    /// machine is doing slows least. Timings mean nothing unoptimised, so
+    /// this runs only in a release build.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timings mean nothing unoptimised")]
+    fn scoring_by_cosine_costs_little_more_than_by_inner_product() {
+        let mut random = Random(59);
+        let vectors: Vec<Vec<f32>> = (0..20_000).map(|_| random.vector(768)).collect();
+        let query = random.vector(768);
+        let fastest = |metric: Distance| {
+            let scorer = Scorer::new(metric, &query);
+            (0..15)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    for vector in &vectors {
+                        std::hint::black_box(scorer.distance(std::hint::black_box(vector)));
+                    }
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let (cosine, inner) = (fastest(Distance::Cosine), fastest(Distance::Dot));
+        assert!(
+            cosine < inner * 2,
+            "cosine took {cosine:?} against {inner:?} for the inner product"
+        );
+    }
+
+    /// A vector is at no cosine distance from itself, and so of certainty
+    /// exactly one, at every length and over every number of dimensions.
+    #[test]
+    fn a_vector_against_itself_is_at_no_cosine_distance_exactly() {
+        let mut random = Random(53);
+        for dimensions in 3..=1536 {
+            let scale = 10f32.powi(dimensions as i32 % 13 - 6);
+            let vector: Vec<f32> = random
+                .vector(dimensions)
+                .into_iter()
+                .map(|value| value * scale)
+                .collect();
+            let distance = distance(Distance::Cosine, &vector, &vector);
+            assert_eq!(distance, 0.0, "{dimensions} dimensions");
+            assert_eq!(certainty(Distance::Cosine, distance), Some(1.0));
         }
     }
 
