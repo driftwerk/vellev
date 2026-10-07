@@ -1047,6 +1047,25 @@ mod tests {
         assert_eq!(rows, [9997, 9998, 9999]);
     }
 
+    /// A row put out of the nearest by a nearer one, when the farthest left
+    /// is as far as it was, is still tied with it, and the caller's order
+    /// may yet prefer it.
+    #[test]
+    fn a_row_put_out_by_a_nearer_one_stays_tied_with_the_farthest() {
+        let backwards = |a: u32, b: u32| b.cmp(&a);
+        let mut nearest = Nearest::new(2, &backwards);
+        nearest.offer(1.0, 5);
+        nearest.offer(1.0, 7);
+        nearest.offer(0.5, 9);
+        let mut rows: Vec<u32> = nearest
+            .estimates()
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(rows, [7, 9]);
+    }
+
     #[test]
     fn an_index_survives_the_wire() {
         let vectors = grouped(21, 1000, 48, 8, 0.4);
