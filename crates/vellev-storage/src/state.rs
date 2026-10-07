@@ -1188,6 +1188,23 @@ impl State {
         }
     }
 
+    /// A manifest at `position` that puts the partition back as `target`,
+    /// with its rows in memory written as `flushed`: the next checkpoint
+    /// after this state's, keeping the requests this state answered lately,
+    /// which were answered whatever is restored.
+    pub(crate) fn restored_manifest(
+        &self,
+        position: LogPosition,
+        target: &State,
+        flushed: Option<SegmentMeta>,
+    ) -> Manifest {
+        Manifest {
+            prev: self.checkpoint.clone(),
+            answered: self.answers.kept(),
+            ..target.manifest(position, &target.catalog, flushed)
+        }
+    }
+
     /// A manifest at `position` of the segments there are, then `flushed`,
     /// with the collections of `catalog` and nothing to replay.
     fn manifest(
