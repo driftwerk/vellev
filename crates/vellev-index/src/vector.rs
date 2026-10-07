@@ -85,37 +85,88 @@ pub(crate) fn or_farthest(distance: f32) -> f32 {
     }
 }
 
+/// `vector` scaled to unit length, or `None` when it has no direction:
+/// when every value is zero, or one is not finite. A vector whose squared
+/// length an `f32` cannot hold in full, being too long or too short, is
+/// scaled by its largest value first, so that every other vector has a
+/// direction, whatever its length.
+pub(crate) fn unit(vector: &[f32]) -> Option<Vec<f32>> {
+    let scaled = |vector: &[f32]| {
+        let squared = dot(vector, vector);
+        squared.is_normal().then(|| {
+            let norm = squared.sqrt();
+            vector.iter().map(|value| value / norm).collect()
+        })
+    };
+    scaled(vector).or_else(|| {
+        let largest = vector
+            .iter()
+            .fold(0.0f32, |most, value| most.max(value.abs()));
+        (largest > 0.0 && largest.is_finite())
+            .then(|| {
+                vector
+                    .iter()
+                    .map(|value| value / largest)
+                    .collect::<Vec<f32>>()
+            })
+            .and_then(|vector| scaled(&vector))
+    })
+}
+
 /// Measures how far vectors are from one query; smaller is nearer. Cosine
-/// distance is one minus the cosine, and one for a zero vector, which has no
-/// direction. A distance that is not a number is taken as the farthest;
-/// vectors no longer than a collection accepts never produce one.
+/// distance is one minus the cosine, and one for a vector with no direction
+/// (see [`unit`]). A distance that is not a number is taken as the
+/// farthest; vectors no longer than a collection accepts never produce one.
 #[derive(Debug, Clone)]
 pub struct Scorer<'q> {
     metric: Distance,
     query: &'q [f32],
-    query_norm: f32,
+    /// What a cosine is worked out from on the query's side.
+    measure: Measure,
+}
+
+#[derive(Debug, Clone)]
+enum Measure {
+    /// The query's length, whose square is a normal `f32`.
+    Length(f32),
+    /// The query scaled to unit length, as its square is not.
+    Unit(Vec<f32>),
+    /// The query has no direction.
+    Directionless,
 }
 
 impl<'q> Scorer<'q> {
     pub fn new(metric: Distance, query: &'q [f32]) -> Self {
+        let squared = dot(query, query);
+        let measure = match squared.is_normal() {
+            true => Measure::Length(squared.sqrt()),
+            false => unit(query).map_or(Measure::Directionless, Measure::Unit),
+        };
         Self {
             metric,
             query,
-            query_norm: dot(query, query).sqrt(),
+            measure,
         }
     }
 
     pub fn distance(&self, vector: &[f32]) -> f32 {
         match self.metric {
             Distance::Cosine => {
-                let (dot, norm) = dot_and_norm(self.query, vector);
-                // Not finite for a zero vector, or when a length overflows.
-                let cosine = dot / (self.query_norm * norm.sqrt());
-                if cosine.is_finite() {
-                    1.0 - cosine.clamp(-1.0, 1.0)
-                } else {
-                    1.0
-                }
+                // As both lengths' squares are normal, as nearly every pair's
+                // are, straight from them; otherwise from both directions.
+                let directions = |query: &[f32]| unit(vector).map(|vector| dot(query, &vector));
+                let cosine = match &self.measure {
+                    Measure::Length(length) => {
+                        let (along, squared) = dot_and_norm(self.query, vector);
+                        match squared.is_normal() {
+                            true => Some(along / (length * squared.sqrt())),
+                            false => unit(self.query).and_then(|query| directions(&query)),
+                        }
+                    }
+                    Measure::Unit(query) => directions(query),
+                    Measure::Directionless => None,
+                };
+                cosine.map_or(1.0, |cosine| 1.0 - cosine.clamp(-1.0, 1.0))
             }
             Distance::Dot => or_farthest(-dot(self.query, vector)),
             Distance::L2 => or_farthest(squared_l2(self.query, vector)),
@@ -140,32 +191,19 @@ pub fn certainty(metric: Distance, distance: f32) -> Option<f32> {
 }
 
 /// `vector` as an index measures it: scaled to unit length for cosine, so
-/// that only its direction counts, and as it is otherwise. A vector too
-/// long to square, as one stored before lengths were limited may be, is
-/// scaled down by its largest value first. A zero vector, or one with a
-/// value that is not finite, is left as it is.
+/// that only its direction counts, and as it is otherwise. A vector with no
+/// direction is left as it is.
 pub(crate) fn normalised(metric: Distance, vector: &[f32]) -> Cow<'_, [f32]> {
-    let unit = |vector: &[f32]| {
-        let norm = dot(vector, vector).sqrt();
-        (norm > 0.0 && norm.is_finite()).then(|| {
-            vector
-                .iter()
-                .map(|value| value / norm)
-                .collect::<Vec<f32>>()
-        })
-    };
     match metric {
-        Distance::Cosine => unit(vector)
-            .or_else(|| {
-                let largest = vector
-                    .iter()
-                    .fold(0.0f32, |most, value| most.max(value.abs()));
-                let scaled: Vec<f32> = vector.iter().map(|value| value / largest).collect();
-                unit(&scaled)
-            })
-            .map_or(Cow::Borrowed(vector), Cow::Owned),
+        Distance::Cosine => unit(vector).map_or(Cow::Borrowed(vector), Cow::Owned),
         Distance::Dot | Distance::L2 => Cow::Borrowed(vector),
     }
+}
+
+/// Whether `query`, measured by `metric`, is as far from every vector,
+/// being a cosine query with no direction.
+pub(crate) fn directionless(metric: Distance, query: &[f32]) -> bool {
+    metric == Distance::Cosine && unit(query).is_none()
 }
 
 /// How to order two rows whose estimated distances are equal.
@@ -446,10 +484,9 @@ impl VectorIndex for BinaryIndex {
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
-        // Under cosine a query with no direction is as far from every row,
-        // so every row is estimated alike and the caller's order decides.
-        let directionless =
-            self.metric == Distance::Cosine && query.iter().all(|value| *value == 0.0);
+        // A query as far from every row is estimated alike for each, and
+        // the caller's order decides.
+        let directionless = directionless(self.metric, query);
         let query = self.rotation.apply(&normalised(self.metric, query));
         let code: Vec<u64> = encode(&self.centre, &query).collect();
         let reach = residual(&self.centre, &query).0.sqrt()
@@ -831,10 +868,38 @@ mod tests {
     }
 
     #[test]
-    fn lengths_that_overflow_or_vanish_give_a_finite_cosine_distance() {
-        for vector in [[1e30f32, 0.0], [1e-30, 0.0], [0.0, 0.0]] {
-            let distance = distance(Distance::Cosine, &vector, &vector);
-            assert!(distance.is_finite(), "{vector:?} gave {distance}");
+    fn a_vector_has_a_direction_whatever_its_length_unless_it_is_zero() {
+        let east = [1.0, 0.0];
+        for vector in [[1e30f32, 0.0], [1e-30, 0.0], [1e-40, 0.0], [3e19, 1e-30]] {
+            assert!(
+                distance(Distance::Cosine, &vector, &vector) < 1e-6,
+                "{vector:?} against itself"
+            );
+            assert!(
+                distance(Distance::Cosine, &east, &vector) < 1e-6,
+                "east against {vector:?}"
+            );
+            assert!(
+                distance(Distance::Cosine, &vector, &east) < 1e-6,
+                "{vector:?} against east"
+            );
+        }
+        let north_ish = [1e-30, 1e-30];
+        assert!(
+            (distance(Distance::Cosine, &east, &north_ish) - (1.0 - 0.5f32.sqrt())).abs() < 1e-6
+        );
+        for vector in [[0.0f32, 0.0], [f32::INFINITY, 0.0], [f32::NAN, 1.0]] {
+            assert_eq!(
+                distance(Distance::Cosine, &east, &vector),
+                1.0,
+                "{vector:?}"
+            );
+            assert_eq!(
+                distance(Distance::Cosine, &vector, &east),
+                1.0,
+                "{vector:?}"
+            );
+            assert!(unit(&vector).is_none(), "{vector:?}");
         }
     }
 

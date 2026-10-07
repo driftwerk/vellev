@@ -395,6 +395,16 @@ async fn a_shortlisted_segment_gives_way_to_newer_layers() {
 /// flushed to is searched through its vector index.
 const SHORTLISTED: u64 = 5_000;
 
+/// What gives a flushed segment of [`SHORTLISTED`] rows each kind of vector
+/// index: a scan of every code, and clusters of them.
+fn index_kinds() -> [Merging; 2] {
+    let clustered = Merging {
+        clustered_above: 4_000,
+        ..Merging::default()
+    };
+    [Merging::default(), clustered]
+}
+
 /// Write `vectors`, by id, to a collection of their length measured by
 /// `metric`, and flush them to one segment.
 async fn flushed(writer: &Writer, metric: Distance, vectors: Vec<(u64, Vec<f32>)>) {
@@ -489,11 +499,7 @@ async fn a_shortlisted_segment_finds_a_long_vector_with_the_largest_inner_produc
 /// through either kind of index.
 #[tokio::test]
 async fn rows_of_one_vector_come_back_in_id_order_from_a_shortlisted_segment() {
-    let clustered = Merging {
-        clustered_above: 4_000,
-        ..Merging::default()
-    };
-    for merging in [Merging::default(), clustered] {
+    for merging in index_kinds() {
         let cluster = Cluster::new().await;
         let writer = cluster.writer().await.merging_with(merging);
         let same = vec![0.5; 8];
@@ -523,21 +529,51 @@ async fn rows_of_one_vector_come_back_in_id_order_from_a_shortlisted_segment() {
 /// every row would.
 #[tokio::test]
 async fn a_query_with_no_direction_finds_the_lowest_ids_in_a_shortlisted_segment() {
-    let cluster = Cluster::new().await;
-    let writer = cluster.writer().await;
-    let mut random = Random(37);
-    let backwards = (1..=SHORTLISTED).rev().map(|n| (n, random.vector(8)));
-    flushed(&writer, Distance::Cosine, backwards.collect()).await;
-    for copy in [
-        writer.partition().clone(),
-        cluster.open().await.partition().clone(),
-    ] {
-        copy.read(|state| {
-            let hits = state
-                .search(&name(VECTORS), &Query::nearest(&[0.0; 8], 3))
-                .unwrap();
-            assert_eq!(ids(&hits), [row(1), row(2), row(3)]);
-        });
+    for merging in index_kinds() {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let mut random = Random(37);
+        let backwards = (1..=SHORTLISTED).rev().map(|n| (n, random.vector(8)));
+        flushed(&writer, Distance::Cosine, backwards.collect()).await;
+        for copy in [
+            writer.partition().clone(),
+            cluster.open().await.partition().clone(),
+        ] {
+            copy.read(|state| {
+                let hits = state
+                    .search(&name(VECTORS), &Query::nearest(&[0.0; 8], 3))
+                    .unwrap();
+                assert_eq!(ids(&hits), [row(1), row(2), row(3)], "{merging:?}");
+            });
+        }
+    }
+}
+
+/// A query so short that its squared length underflows an `f32` still has
+/// a direction, which both the index and the exact score see: it finds
+/// the vector it points along, at no distance.
+#[tokio::test]
+async fn a_query_too_short_to_square_finds_the_vector_it_points_along() {
+    for merging in index_kinds() {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let mut random = Random(41);
+        let vectors: Vec<(u64, Vec<f32>)> =
+            (1..=SHORTLISTED).map(|n| (n, random.vector(8))).collect();
+        let query: Vec<f32> = vectors[1233].1.iter().map(|value| 1e-30 * value).collect();
+        flushed(&writer, Distance::Cosine, vectors).await;
+        for copy in [
+            writer.partition().clone(),
+            cluster.open().await.partition().clone(),
+        ] {
+            copy.read(|state| {
+                let hits = state
+                    .search(&name(VECTORS), &Query::nearest(&query, 1))
+                    .unwrap();
+                assert_eq!(ids(&hits), [row(1234)], "{merging:?}");
+                assert!(hits[0].distance < 1e-6, "{merging:?}: {}", hits[0].distance);
+            });
+        }
     }
 }
 
