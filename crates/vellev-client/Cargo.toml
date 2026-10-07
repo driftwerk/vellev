@@ -3,7 +3,11 @@ name = "vellev-client"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-publish.workspace = true
+license = "MIT OR Apache-2.0"
+publish = true
+description = "A client for the vellev vector database's HTTP API"
+keywords = ["vector", "database", "search", "embeddings"]
+categories = ["database"]
 
 [dependencies]
 vellev-api.workspace = true

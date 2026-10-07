@@ -5,6 +5,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # A release is checked by the same gates first.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -28,6 +30,24 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: cargo fmt --all --check
+
+  # The crates published to crates.io package on their own, against one
+  # another as crates.io will serve them.
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package --locked -p vellev-core -p vellev-index -p vellev-api -p vellev-client
+
+  # The release's publish script, against a crates.io served from fixtures.
+  publish-script:
+    name: Publish script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: .github/scripts/publish-crate.test.sh
 
   clippy:
     name: Clippy

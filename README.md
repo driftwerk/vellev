@@ -204,6 +204,16 @@ rollback. What a release may change to keep that working, for files,
 Postgres, the API and between nodes, is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## Releases
+
+The client crates, `vellev-core`, `vellev-index`, `vellev-api` and
+`vellev-client`, are published to crates.io under MIT OR Apache-2.0 by
+CI: bump the workspace version, then push a tag `v<version>`. The release
+runs every CI gate first, refuses to start if any of the crates' versions is
+on crates.io from another commit, and publishes them in dependency order. It
+needs a `CARGO_REGISTRY_TOKEN` secret allowed to publish new crates. The
+server's crates are not published.
+
 ## Simulation
 
 `crates/vellev-storage/tests/simulation.rs` drives random histories of writes,
