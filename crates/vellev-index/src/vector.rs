@@ -68,9 +68,20 @@ fn dot_and_norm(a: &[f32], b: &[f32]) -> (f32, f32) {
         .fold(tail, |(dot, norm), (d, n)| (dot + d, norm + n))
 }
 
+/// `distance`, or the farthest there is when it is not a number: a sort
+/// cannot be trusted to put a NaN last, as the sign it comes with varies.
+pub(crate) fn or_farthest(distance: f32) -> f32 {
+    if distance.is_nan() {
+        f32::INFINITY
+    } else {
+        distance
+    }
+}
+
 /// Measures how far vectors are from one query; smaller is nearer. Cosine
 /// distance is one minus the cosine, and one for a zero vector, which has no
-/// direction.
+/// direction. A distance that is not a number is taken as the farthest;
+/// vectors no longer than a collection accepts never produce one.
 #[derive(Debug, Clone)]
 pub struct Scorer<'q> {
     metric: Distance,
@@ -99,8 +110,8 @@ impl<'q> Scorer<'q> {
                     1.0
                 }
             }
-            Distance::Dot => -dot(self.query, vector),
-            Distance::L2 => squared_l2(self.query, vector),
+            Distance::Dot => or_farthest(-dot(self.query, vector)),
+            Distance::L2 => or_farthest(squared_l2(self.query, vector)),
         }
     }
 
@@ -399,6 +410,19 @@ mod tests {
             let distance = distance(Distance::Cosine, &vector, &vector);
             assert!(distance.is_finite(), "{vector:?} gave {distance}");
         }
+    }
+
+    #[test]
+    fn a_distance_that_is_not_a_number_is_the_farthest() {
+        let huge = [1e30f32, 1e30];
+        assert_eq!(
+            distance(Distance::Dot, &huge, &[1e30, -1e30]),
+            f32::INFINITY
+        );
+        assert_eq!(
+            distance(Distance::L2, &[f32::INFINITY], &[f32::INFINITY]),
+            f32::INFINITY
+        );
     }
 
     #[test]

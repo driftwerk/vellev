@@ -7,7 +7,7 @@ use vellev_index::filter::Filter;
 use vellev_index::fusion::Fusion;
 
 use crate::keyword::{searched, Keywords};
-use crate::search::{comparable, Query, DEFAULT_OVERSAMPLE};
+use crate::search::{Query, DEFAULT_OVERSAMPLE};
 use crate::state::State;
 use crate::{Result, StorageError};
 
@@ -106,7 +106,7 @@ impl State {
         searched(schema, query.properties)?;
         query
             .vector
-            .map_or(Ok(()), |vector| comparable(schema, vector))?;
+            .map_or(Ok(()), |vector| schema.embedding.check(vector))?;
         let alpha = query.vector.map_or(0.0, |_| query.alpha);
         let candidates = query.candidates.max(query.limit);
         let nearest = match query.vector {

@@ -332,6 +332,10 @@ async fn a_query_the_collection_cannot_answer_is_refused() {
             })
         ));
         assert!(matches!(
+            refused(fox(Some(&[1e20, 0.0]))),
+            StorageError::Object(ObjectError::VectorTooLong)
+        ));
+        assert!(matches!(
             refused(Hybrid {
                 properties: &[("n", 1.0)],
                 ..fox(Some(&EAST))
@@ -427,7 +431,8 @@ async fn distances_of_any_size_fuse_to_scores_that_are_numbers() {
             Mutation::CreateCollection(Box::new(schema)),
             note(1, "fox", 0, Some([1.0, 0.0])),
             note(2, "fox den", 0, Some([0.0, 2.0])),
-            note(3, "hen", 0, Some([-3e19, 0.0])),
+            // As long as a vector may be.
+            note(3, "hen", 0, Some([-4.6e18, 0.0])),
         ])
         .await
         .unwrap();
@@ -438,7 +443,9 @@ async fn distances_of_any_size_fuse_to_scores_that_are_numbers() {
     writer.partition().read(|state| {
         let fused = hybrid(state, &fox(Some(&EAST)));
         assert_eq!(ids(&fused), [id(1), id(4), id(3)]);
-        assert_eq!(fused[2].distance, Some(f32::INFINITY));
+        assert!(fused[2]
+            .distance
+            .is_some_and(|distance| distance > 2e37 && distance.is_finite()));
         let scores: Vec<f32> = fused.iter().map(|fused| fused.score).collect();
         assert_eq!((scores[0], scores[2]), (1.0, 0.0));
         assert!(scores[1] > 0.74 && scores[1] <= 0.75);

@@ -390,3 +390,53 @@ async fn a_shortlisted_segment_gives_way_to_newer_layers() {
         });
     }
 }
+
+/// Values each finite but large enough that a distance overflows: the
+/// inner product of the first two with the third is not a number, the
+/// cosine of the first against [1, 0] comes out as a right angle, and the
+/// last two are infinitely far from their opposites.
+#[tokio::test]
+async fn vectors_too_long_to_measure_are_refused_on_write_and_on_query() {
+    let too_long = [
+        vec![1e30, -1e30],
+        vec![1e30, 1e30],
+        vec![1e20, 0.0],
+        vec![1.3e19, 0.0],
+        vec![-1.3e19, 0.0],
+    ];
+    for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await;
+        writer
+            .commit(vec![collection(2, metric), put(1, 0, Some(vec![1.0, 1.0]))])
+            .await
+            .unwrap();
+        for vector in &too_long {
+            let error = writer
+                .commit(vec![put(2, 0, Some(vector.clone()))])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, StorageError::Object(ObjectError::VectorTooLong)),
+                "{metric:?} {vector:?}: {error:?}"
+            );
+            writer.partition().read(|state| {
+                let error = state
+                    .search(&name(VECTORS), &Query::nearest(vector, 3))
+                    .unwrap_err();
+                assert!(
+                    matches!(error, StorageError::Object(ObjectError::VectorTooLong)),
+                    "{metric:?} {vector:?}: {error:?}"
+                );
+            });
+        }
+        writer.partition().read(|state| {
+            assert_eq!(
+                ids(&state
+                    .search(&name(VECTORS), &Query::nearest(&[4e18, 0.0], 3))
+                    .unwrap()),
+                [row(1)]
+            );
+        });
+    }
+}
