@@ -7,8 +7,8 @@ use futures::future::join_all;
 use vellev_core::{NodeId, Partition, TenantId};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
-    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, PostgresCoordinator, Versions,
-    MAX_TTL,
+    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, Point, PostgresCoordinator,
+    RestorePoint, Versions, MAX_TTL,
 };
 
 const TTL: Duration = Duration::from_secs(30);
@@ -90,6 +90,17 @@ impl Harness for Pg {
         .execute(&self.pool)
         .await
         .expect("rewind lease");
+        sqlx::query(
+            "UPDATE vellev.commits
+             SET committed_at = committed_at - make_interval(secs => $3)
+             WHERE tenant = $1 AND partition = $2",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(duration.as_secs_f64())
+        .execute(&self.pool)
+        .await
+        .expect("rewind history");
     }
 }
 
@@ -625,6 +636,148 @@ async fn a_key_reaches_its_tenant_until_revoked_or_the_tenant_goes(h: &dyn Harne
     assert_eq!(c.key_tenant(&theirs).await.unwrap(), Some(other.tenant));
 }
 
+const HOUR: Duration = Duration::from_secs(60 * 60);
+
+/// The positions of the earliest and latest states a restore reaching back
+/// `window` may go to.
+async fn reach(h: &dyn Harness, key: &PartitionKey, window: Duration) -> Option<(u64, u64)> {
+    h.coordinator()
+        .restore_points(key, window)
+        .await
+        .unwrap()
+        .map(|(earliest, latest)| (earliest.position.0, latest.position.0))
+}
+
+async fn point(
+    h: &dyn Harness,
+    key: &PartitionKey,
+    point: Point,
+    window: Duration,
+) -> Option<RestorePoint> {
+    h.coordinator()
+        .restore_point(key, point, window)
+        .await
+        .unwrap()
+}
+
+async fn every_commit_is_a_restore_point_once(h: &dyn Harness) {
+    let key = registered(h).await;
+    assert_eq!(reach(h, &key, HOUR).await, None, "nothing is committed yet");
+    let (lease, _) = lease(h, &key, &node("a")).await;
+    for position in 1..=3 {
+        let head = format!("head-{position}");
+        h.coordinator()
+            .commit(&lease, commit(position, &head))
+            .await
+            .unwrap();
+    }
+    h.coordinator()
+        .commit(&lease, commit(3, "head-3"))
+        .await
+        .unwrap();
+    assert_eq!(reach(h, &key, HOUR).await, Some((1, 3)));
+    let second = point(h, &key, Point::Position(LogPosition(2)), HOUR).await;
+    assert_eq!(second.unwrap().head, ManifestRef("head-2".into()));
+    assert_eq!(
+        point(h, &key, Point::Position(LogPosition(4)), HOUR).await,
+        None
+    );
+    assert_eq!(reach(h, &registered(h).await, HOUR).await, None);
+}
+
+async fn a_restore_reaches_back_through_its_window_and_to_how_it_then_stood(h: &dyn Harness) {
+    let key = registered(h).await;
+    let (lease, _) = lease(h, &key, &node("a")).await;
+    for position in 1..=3 {
+        h.coordinator()
+            .commit(&lease, commit(position, &format!("head-{position}")))
+            .await
+            .unwrap();
+        h.pass(&key, 10 * HOUR).await;
+    }
+    // Committed 30, 20 and 10 hours ago.
+    assert_eq!(reach(h, &key, 25 * HOUR).await, Some((1, 3)));
+    assert_eq!(
+        reach(h, &key, 15 * HOUR).await,
+        Some((2, 3)),
+        "the last commit before the window is how it stood when the window began"
+    );
+    let window = 15 * HOUR;
+    let second = point(h, &key, Point::Position(LogPosition(2)), window)
+        .await
+        .unwrap();
+    let third = point(h, &key, Point::Position(LogPosition(3)), window)
+        .await
+        .unwrap();
+    assert_eq!(
+        point(h, &key, Point::Position(LogPosition(1)), window).await,
+        None
+    );
+    let later = |by: Duration| second.at + chrono::Duration::from_std(by).unwrap();
+    for (at, expected) in [
+        (later(6 * HOUR), Some(&second)),
+        (later(11 * HOUR), Some(&third)),
+        (later(19 * HOUR), Some(&third)),
+        (later(4 * HOUR), None),
+        (later(21 * HOUR), None),
+    ] {
+        assert_eq!(
+            point(h, &key, Point::At(at), window).await.as_ref(),
+            expected,
+            "{at}"
+        );
+    }
+    assert_eq!(
+        h.coordinator().forget_history(&key, window).await.unwrap(),
+        1
+    );
+    assert_eq!(reach(h, &key, 25 * HOUR).await, Some((2, 3)));
+    assert_eq!(
+        h.coordinator().forget_history(&key, window).await.unwrap(),
+        0
+    );
+}
+
+async fn removing_a_partition_forgets_its_history(h: &dyn Harness) {
+    let key = registered(h).await;
+    let (lease, _) = lease(h, &key, &node("a")).await;
+    h.coordinator()
+        .commit(&lease, commit(1, "head-1"))
+        .await
+        .unwrap();
+    h.coordinator().remove(&key).await.unwrap();
+    assert_eq!(reach(h, &key, HOUR).await, None);
+    h.coordinator().register(&key).await.unwrap();
+    assert_eq!(
+        reach(h, &key, HOUR).await,
+        None,
+        "nothing of before reaches the tenant made again"
+    );
+    assert_eq!(h.coordinator().forget_history(&key, HOUR).await.unwrap(), 0);
+}
+
+async fn a_tenant_keeps_its_own_restore_window_until_told_otherwise(h: &dyn Harness) {
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let coordinator = h.coordinator();
+    assert_eq!(coordinator.restore_window(tenant).await.unwrap(), None);
+    assert!(coordinator
+        .set_restore_window(tenant, Some(3 * 24 * HOUR))
+        .await
+        .unwrap());
+    assert_eq!(
+        coordinator.restore_window(tenant).await.unwrap(),
+        Some(3 * 24 * HOUR)
+    );
+    assert!(coordinator.set_restore_window(tenant, None).await.unwrap());
+    assert_eq!(coordinator.restore_window(tenant).await.unwrap(), None);
+    let absent = self::key().tenant;
+    assert!(!coordinator
+        .set_restore_window(&absent, Some(HOUR))
+        .await
+        .unwrap());
+}
+
 async fn ping_succeeds(h: &dyn Harness) {
     h.coordinator().ping().await.unwrap();
 }
@@ -673,6 +826,10 @@ conformance! {
     concurrent_acquires_hand_out_exactly_one_lease,
     partitions_are_listed_in_key_order_a_page_at_a_time,
     a_key_reaches_its_tenant_until_revoked_or_the_tenant_goes,
+    every_commit_is_a_restore_point_once,
+    a_restore_reaches_back_through_its_window_and_to_how_it_then_stood,
+    removing_a_partition_forgets_its_history,
+    a_tenant_keeps_its_own_restore_window_until_told_otherwise,
     ping_succeeds,
 }
 

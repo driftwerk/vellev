@@ -10,8 +10,8 @@ use vellev_core::{NodeId, Partition, TenantId};
 
 use super::{
     checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Result, TenantKey,
-    Versions,
+    Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Point, RestorePoint,
+    Result, TenantKey, Versions,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -20,6 +20,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("../../migrations/0003_incarnation.sql")),
     (4, include_str!("../../migrations/0004_nodes.sql")),
     (5, include_str!("../../migrations/0005_tenant_keys.sql")),
+    (6, include_str!("../../migrations/0006_commits.sql")),
 ];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
@@ -165,6 +166,41 @@ fn version(value: i32) -> Result<u16> {
     u16::try_from(value).map_err(|error| invariant(error.to_string()))
 }
 
+/// The commits of the partition as it is now that a restore reaching back
+/// `$3` seconds may go to: those within the window, and the last before
+/// it.
+const REACHABLE: &str = "WITH current AS (
+         SELECT incarnation, now() - make_interval(secs => $3) AS start
+         FROM vellev.partitions WHERE tenant = $1 AND partition = $2
+     ), history AS (
+         SELECT c.position, c.head, c.committed_at, c.incarnation, current.start
+         FROM vellev.commits c JOIN current USING (incarnation)
+         WHERE c.tenant = $1 AND c.partition = $2
+     ), reachable AS (
+         SELECT * FROM history
+         WHERE committed_at >= start
+            OR position = (SELECT max(position) FROM history WHERE committed_at < start)
+     )";
+
+#[derive(FromRow)]
+struct Noted {
+    position: i64,
+    head: String,
+    committed_at: DateTime<Utc>,
+}
+
+impl Noted {
+    fn point(self) -> Result<RestorePoint> {
+        let position = u64::try_from(self.position)
+            .map_err(|_| invariant(format!("a commit is at position {}", self.position)))?;
+        Ok(RestorePoint {
+            position: LogPosition(position),
+            head: ManifestRef(self.head),
+            at: self.committed_at,
+        })
+    }
+}
+
 #[derive(FromRow)]
 struct Snapshot {
     #[sqlx(try_from = "i64")]
@@ -253,6 +289,11 @@ impl Coordinator for PostgresCoordinator {
         .bind(key.tenant.as_str())
         .execute(&mut *transaction)
         .await?;
+        sqlx::query("DELETE FROM vellev.commits WHERE tenant = $1 AND partition = $2")
+            .bind(key.tenant.as_str())
+            .bind(i64::from(key.partition.0))
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         Ok(done.rows_affected() > 0)
     }
@@ -359,11 +400,19 @@ impl Coordinator for PostgresCoordinator {
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
         let done = snapshot(
-            "UPDATE vellev.partitions
-             SET log_position = $4, manifest = $5
-             WHERE tenant = $1 AND partition = $2 AND generation = $3
-               AND (log_position < $4 OR (log_position = $4 AND manifest IS NOT DISTINCT FROM $5))
-             RETURNING generation, incarnation, lease_holder, lease_expires_at, log_position, manifest",
+            "WITH done AS (
+                 UPDATE vellev.partitions
+                 SET log_position = $4, manifest = $5
+                 WHERE tenant = $1 AND partition = $2 AND generation = $3
+                   AND (log_position < $4 OR (log_position = $4 AND manifest IS NOT DISTINCT FROM $5))
+                 RETURNING generation, incarnation, lease_holder, lease_expires_at, log_position, manifest
+             ), noted AS (
+                 INSERT INTO vellev.commits (tenant, partition, incarnation, position, head)
+                 SELECT $1, $2, incarnation, log_position, manifest FROM done
+                 WHERE manifest IS NOT NULL
+                 ON CONFLICT DO NOTHING
+             )
+             SELECT * FROM done",
             &lease.key,
         )
         .bind(bigint(lease.generation.0)?)
@@ -557,6 +606,100 @@ impl Coordinator for PostgresCoordinator {
         tenant
             .map(|tenant| TenantId::new(tenant).map_err(|error| invariant(error.to_string())))
             .transpose()
+    }
+
+    async fn restore_point(
+        &self,
+        key: &PartitionKey,
+        point: Point,
+        window: Duration,
+    ) -> Result<Option<RestorePoint>> {
+        let (at, position) = match point {
+            Point::At(at) => (Some(at), None),
+            Point::Position(position) => (None, Some(bigint(position.0)?)),
+        };
+        let found: Option<Noted> = sqlx::query_as(&format!(
+            "{REACHABLE}
+             SELECT position, head, committed_at FROM reachable
+             WHERE ($4::timestamptz IS NULL
+                    OR ($4 <= now() AND $4 >= now() - make_interval(secs => $3)
+                        AND committed_at <= $4))
+               AND ($5::bigint IS NULL OR position = $5)
+             ORDER BY position DESC LIMIT 1"
+        ))
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(window.as_secs_f64())
+        .bind(at)
+        .bind(position)
+        .fetch_optional(&self.pool)
+        .await?;
+        found.map(Noted::point).transpose()
+    }
+
+    async fn restore_points(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<Option<(RestorePoint, RestorePoint)>> {
+        let found: Vec<Noted> = sqlx::query_as(&format!(
+            "{REACHABLE}
+             (SELECT position, head, committed_at FROM reachable ORDER BY position LIMIT 1)
+             UNION ALL
+             (SELECT position, head, committed_at FROM reachable ORDER BY position DESC LIMIT 1)"
+        ))
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(window.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut found = found.into_iter().map(Noted::point);
+        Ok(found.next().transpose()?.zip(found.next().transpose()?))
+    }
+
+    async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64> {
+        let done = sqlx::query(&format!(
+            "{REACHABLE}
+             DELETE FROM vellev.commits c
+             WHERE c.tenant = $1 AND c.partition = $2
+               AND NOT EXISTS (SELECT 1 FROM reachable r
+                               WHERE r.position = c.position AND r.incarnation = c.incarnation)"
+        ))
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(window.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
+    async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>> {
+        let secs: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT restore_window_secs FROM vellev.partitions WHERE tenant = $1 LIMIT 1",
+        )
+        .bind(tenant.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(secs
+            .flatten()
+            .map(|secs| Duration::from_secs(secs.unsigned_abs())))
+    }
+
+    async fn set_restore_window(
+        &self,
+        tenant: &TenantId,
+        window: Option<Duration>,
+    ) -> Result<bool> {
+        let secs = window
+            .map(|window| bigint(window.as_secs().max(1)))
+            .transpose()?;
+        let done =
+            sqlx::query("UPDATE vellev.partitions SET restore_window_secs = $2 WHERE tenant = $1")
+                .bind(tenant.as_str())
+                .bind(secs)
+                .execute(&self.pool)
+                .await?;
+        Ok(done.rows_affected() > 0)
     }
 }
 

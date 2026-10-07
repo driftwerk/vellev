@@ -19,7 +19,7 @@ use vellev_core::{
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, KeyHash, Lease, MemoryCoordinator,
-    PartitionKey, TenantKey, Versions,
+    PartitionKey, Point, RestorePoint, TenantKey, Versions,
 };
 use vellev_storage::{GroupCommitter, Mutation, Writer};
 
@@ -141,6 +141,46 @@ impl Coordinator for SlowCoordinator {
 
     async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>, CoordinatorError> {
         self.inner.key_tenant(hash).await
+    }
+
+    async fn restore_point(
+        &self,
+        key: &PartitionKey,
+        point: Point,
+        window: Duration,
+    ) -> Result<Option<RestorePoint>, CoordinatorError> {
+        self.inner.restore_point(key, point, window).await
+    }
+
+    async fn restore_points(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<Option<(RestorePoint, RestorePoint)>, CoordinatorError> {
+        self.inner.restore_points(key, window).await
+    }
+
+    async fn forget_history(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<u64, CoordinatorError> {
+        self.inner.forget_history(key, window).await
+    }
+
+    async fn restore_window(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Duration>, CoordinatorError> {
+        self.inner.restore_window(tenant).await
+    }
+
+    async fn set_restore_window(
+        &self,
+        tenant: &TenantId,
+        window: Option<Duration>,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.set_restore_window(tenant, window).await
     }
 }
 

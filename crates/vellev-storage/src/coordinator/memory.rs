@@ -10,9 +10,9 @@ use uuid::Uuid;
 use vellev_core::{NodeId, TenantId};
 
 use super::{
-    checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Result, TenantKey,
-    Versions,
+    checked_ttl, window_start, Acquired, Commit, Committed, Coordinator, CoordinatorError,
+    Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Point,
+    RestorePoint, Result, TenantKey, Versions,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -56,6 +56,9 @@ struct Row {
     lease: Option<(NodeId, DateTime<Utc>)>,
     log_position: LogPosition,
     manifest: Option<ManifestRef>,
+    /// Every commit since the partition was registered, oldest first.
+    history: Vec<RestorePoint>,
+    restore_window: Option<Duration>,
 }
 
 impl Row {
@@ -66,6 +69,12 @@ impl Row {
             log_position: self.log_position,
             manifest: self.manifest.clone(),
         }
+    }
+
+    /// The commits a restore reaching back from `start` may go to.
+    fn reachable(&self, start: DateTime<Utc>) -> &[RestorePoint] {
+        let within = self.history.partition_point(|commit| commit.at < start);
+        &self.history[within.saturating_sub(1)..]
     }
 }
 
@@ -131,6 +140,13 @@ impl MemoryCoordinator {
     }
 }
 
+fn unknown_is_none<T>(error: CoordinatorError) -> Result<Option<T>> {
+    match error {
+        CoordinatorError::UnknownPartition(_) => Ok(None),
+        other => Err(other),
+    }
+}
+
 fn expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
     chrono::Duration::from_std(ttl)
         .ok()
@@ -152,6 +168,8 @@ impl Coordinator for MemoryCoordinator {
                 lease: None,
                 log_position: LogPosition(0),
                 manifest: None,
+                history: Vec::new(),
+                restore_window: None,
             };
             rows.insert(key.clone(), row);
         }
@@ -234,7 +252,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
-        self.with_current(lease, |row, _| {
+        self.with_current(lease, |row, now| {
             let advances = commit.log_position > row.log_position;
             let repeats =
                 commit.log_position == row.log_position && commit.manifest == row.manifest;
@@ -243,6 +261,13 @@ impl Coordinator for MemoryCoordinator {
                     key: lease.key.clone(),
                     committed: row.log_position,
                     attempted: commit.log_position,
+                });
+            }
+            if let (true, Some(head)) = (advances, &commit.manifest) {
+                row.history.push(RestorePoint {
+                    position: commit.log_position,
+                    head: head.clone(),
+                    at: now,
                 });
             }
             row.log_position = commit.log_position;
@@ -369,5 +394,71 @@ impl Coordinator for MemoryCoordinator {
             .iter()
             .find(|(_, kept, _)| kept == hash)
             .map(|(tenant, ..)| tenant.clone()))
+    }
+
+    async fn restore_point(
+        &self,
+        key: &PartitionKey,
+        point: Point,
+        window: Duration,
+    ) -> Result<Option<RestorePoint>> {
+        self.with_row(key, |row, now| {
+            let reachable = row.reachable(window_start(now, window)?);
+            Ok(match point {
+                Point::At(at) if at > now || at < window_start(now, window)? => None,
+                Point::At(at) => reachable.iter().rev().find(|commit| commit.at <= at),
+                Point::Position(position) => {
+                    reachable.iter().find(|commit| commit.position == position)
+                }
+            }
+            .cloned())
+        })
+        .or_else(unknown_is_none)
+    }
+
+    async fn restore_points(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<Option<(RestorePoint, RestorePoint)>> {
+        self.with_row(key, |row, now| {
+            let reachable = row.reachable(window_start(now, window)?);
+            Ok(reachable.first().cloned().zip(reachable.last().cloned()))
+        })
+        .or_else(unknown_is_none)
+    }
+
+    async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64> {
+        self.with_row(key, |row, now| {
+            let start = window_start(now, window)?;
+            let forgotten = row.history.len() - row.reachable(start).len();
+            row.history.drain(..forgotten);
+            Ok(forgotten as u64)
+        })
+        .or_else(|error| unknown_is_none::<()>(error).map(|_| 0))
+    }
+
+    async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>> {
+        Ok(self
+            .rows
+            .lock()
+            .expect("coordinator lock")
+            .iter()
+            .find(|(key, _)| &key.tenant == tenant)
+            .and_then(|(_, row)| row.restore_window))
+    }
+
+    async fn set_restore_window(
+        &self,
+        tenant: &TenantId,
+        window: Option<Duration>,
+    ) -> Result<bool> {
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        let mut found = false;
+        for (_, row) in rows.iter_mut().filter(|(key, _)| &key.tenant == tenant) {
+            row.restore_window = window;
+            found = true;
+        }
+        Ok(found)
     }
 }

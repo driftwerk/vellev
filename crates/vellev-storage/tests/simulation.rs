@@ -9,7 +9,7 @@
 mod common;
 
 use std::collections::VecDeque;
-use vellev_storage::coordinator::{KeyHash, TenantKey};
+use vellev_storage::coordinator::{KeyHash, Point, RestorePoint, TenantKey};
 
 use common::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
@@ -251,6 +251,46 @@ impl Coordinator for SimCoordinator {
 
     async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>, CoordinatorError> {
         self.clean.key_tenant(hash).await
+    }
+
+    async fn restore_point(
+        &self,
+        key: &PartitionKey,
+        point: Point,
+        window: Duration,
+    ) -> Result<Option<RestorePoint>, CoordinatorError> {
+        self.clean.restore_point(key, point, window).await
+    }
+
+    async fn restore_points(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<Option<(RestorePoint, RestorePoint)>, CoordinatorError> {
+        self.clean.restore_points(key, window).await
+    }
+
+    async fn forget_history(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<u64, CoordinatorError> {
+        self.clean.forget_history(key, window).await
+    }
+
+    async fn restore_window(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Duration>, CoordinatorError> {
+        self.clean.restore_window(tenant).await
+    }
+
+    async fn set_restore_window(
+        &self,
+        tenant: &TenantId,
+        window: Option<Duration>,
+    ) -> Result<bool, CoordinatorError> {
+        self.clean.set_restore_window(tenant, window).await
     }
 }
 
