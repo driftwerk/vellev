@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use crate::format::{
     SegmentFile, SegmentIndex, SegmentMeta,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Vectorize};
-use crate::state::{self, Indexes, Loaded, Merging, Names, Shape, State, Stored};
+use crate::state::{self, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored};
 use crate::{Refusal, Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
@@ -105,6 +106,17 @@ impl Partition {
     }
 
     async fn load(key: PartitionKey, blobs: Arc<dyn Blobs>, committed: &Committed) -> Result<Self> {
+        Self::load_reusing(key, blobs, committed, None).await
+    }
+
+    /// Load the partition as committed, taking the segments `donor` has
+    /// loaded already rather than reading them again.
+    async fn load_reusing(
+        key: PartitionKey,
+        blobs: Arc<dyn Blobs>,
+        committed: &Committed,
+        donor: Option<&Partition>,
+    ) -> Result<Self> {
         let partition = Self {
             key,
             incarnation: committed.incarnation,
@@ -112,8 +124,18 @@ impl Partition {
             state: RwLock::new(State::default()),
             seen: Mutex::new(Generation(0)),
         };
-        partition.advance(committed).await?;
+        partition.advance_reusing(committed, donor).await?;
         Ok(partition)
+    }
+
+    /// The segments loaded, by key.
+    fn held(&self) -> HashMap<String, Loaded> {
+        self.read(|state| {
+            state
+                .loaded_segments()
+                .map(|(key, loaded)| (key.to_string(), loaded))
+                .collect()
+        })
     }
 
     /// Fetch a file named by data rather than built by [`Layout`], which must
@@ -168,6 +190,16 @@ impl Partition {
     /// lower position from the same generation. A reading that is not ahead
     /// and not stale means the history this copy holds was replaced.
     async fn advance(&self, committed: &Committed) -> Result<LogPosition> {
+        self.advance_reusing(committed, None).await
+    }
+
+    /// As [`Self::advance`], taking the segments a checkpoint lists from
+    /// `donor` where it holds them, rather than only from this copy.
+    async fn advance_reusing(
+        &self,
+        committed: &Committed,
+        donor: Option<&Partition>,
+    ) -> Result<LogPosition> {
         let mut seen = self.seen.lock().await;
         let (position, head) = self.read(State::at);
         let target = committed.manifest.as_ref().map(|head| head.0.as_str());
@@ -203,7 +235,8 @@ impl Partition {
         *seen = committed.generation;
         match tail.checkpoint {
             Some((key, manifest)) => {
-                let mut state = self.restore(&key, manifest).await?;
+                let held = donor.unwrap_or(self).held();
+                let mut state = self.restore(&key, manifest, held).await?;
                 tail.logs
                     .iter()
                     .try_for_each(|(key, log)| state.apply(key, log))?;
@@ -260,13 +293,12 @@ impl Partition {
         Ok(Some(Tail { checkpoint, logs }))
     }
 
-    async fn restore(&self, key: &str, manifest: Manifest) -> Result<State> {
-        let held: HashMap<String, Loaded> = self.read(|state| {
-            state
-                .loaded_segments()
-                .map(|(key, loaded)| (key.to_string(), loaded))
-                .collect()
-        });
+    async fn restore(
+        &self,
+        key: &str,
+        manifest: Manifest,
+        held: HashMap<String, Loaded>,
+    ) -> Result<State> {
         // Each segment is decoded and indexed on a thread of its own as it
         // arrives, rather than all of them in turn once every one has.
         let catalog = Arc::new(
@@ -402,6 +434,8 @@ pub struct Writer {
     /// Held while a flush or a merge builds its segment without `ready`,
     /// so that one never builds on a state the other is about to replace.
     building: Mutex<()>,
+    /// Set while a restore runs, when writes are refused.
+    restoring: AtomicBool,
 }
 
 impl Writer {
@@ -427,6 +461,7 @@ impl Writer {
             merging: Merging::default(),
             ready: Mutex::new(true),
             building: Mutex::new(()),
+            restoring: AtomicBool::new(false),
         })
     }
 
@@ -523,6 +558,9 @@ impl Writer {
         let mut ready = self.ready.lock().await;
         if !*ready {
             return Err(StorageError::Closed);
+        }
+        if self.restoring.load(Ordering::SeqCst) {
+            return Err(StorageError::Restoring);
         }
         let receipt = |position, outcomes| Receipt {
             incarnation: self.partition.incarnation,
@@ -783,23 +821,10 @@ impl Writer {
         {
             tokio::task::yield_now().await;
         }
-        let segment = match snapshot.rows.is_empty() && snapshot.tombstones.is_empty() {
-            true => None,
-            false => {
-                let names = self.staged(snapshot.position);
-                let rows = std::mem::take(&mut snapshot.rows);
-                let above = self.merging.clustered_above;
-                let shape = Shape::of(&snapshot.catalog, &rows, snapshot.tombstones.len(), above);
-                let file = SegmentFile {
-                    position: snapshot.position,
-                    rows,
-                    tombstones: snapshot.tombstones.clone(),
-                };
-                let built = self.built(file, snapshot.catalog.clone()).await?;
-                let prepared = Self::prepared(names.meta(shape), built)?;
-                self.upload(&prepared).await?;
-                Some(self.loaded(prepared).await?)
-            }
+        let named_at = snapshot.position;
+        let segment = match self.uploaded(&mut snapshot, named_at).await? {
+            Some(prepared) => Some(self.loaded(prepared).await?),
+            None => None,
         };
         let mut ready = self.ready.lock().await;
         if !*ready {
@@ -821,6 +846,100 @@ impl Writer {
         drop(ready);
         blocking(move || drop(discarded)).await?;
         Ok(position)
+    }
+
+    /// Put the partition back as it stood when `head`, committed at
+    /// `position` since the partition was last registered, was its head.
+    /// Nothing is rewound: the state then becomes a checkpoint after the
+    /// partition's position and the target's both, of the segments it had
+    /// and the rows it held in memory, written as one segment. Every state
+    /// before stays as restorable as it was, and the requests answered
+    /// lately stay answered. Writes are refused while it runs, so that none
+    /// is answered only to be undone. Returns the checkpoint's position.
+    ///
+    /// It holds the building lock throughout, as cleaning up does, so the
+    /// target's files are not deleted while it is read, and the segment,
+    /// named at the position the partition is at, stays until committed.
+    pub async fn restore(&self, head: &ManifestRef, position: LogPosition) -> Result<LogPosition> {
+        let _building = self.building.lock().await;
+        let _refusing = Refusing::writes(self).await;
+        let at = Committed {
+            generation: self.lease.generation,
+            incarnation: self.partition.incarnation,
+            log_position: position,
+            manifest: Some(head.clone()),
+        };
+        let target = Partition::load_reusing(
+            self.lease.key.clone(),
+            self.partition.blobs.clone(),
+            &at,
+            Some(&self.partition),
+        )
+        .await?;
+        let mut held = target.held();
+        let segment = match target.read(State::snapshot) {
+            Some(mut snapshot) => {
+                target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
+                let named_at = self.partition.read(State::position);
+                match self.uploaded(&mut snapshot, named_at).await? {
+                    Some(prepared) => {
+                        let (meta, loaded) = self.loaded(prepared).await?;
+                        held.insert(meta.key.clone(), loaded);
+                        Some(meta)
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        let mut ready = self.ready.lock().await;
+        if !*ready {
+            return Err(StorageError::Closed);
+        }
+        let restored = following(self.partition.read(State::position).max(position))?;
+        let key = Layout(&self.lease.key).manifest(restored, &self.author);
+        let manifest = self.partition.read(|current| {
+            target.read(|target| current.restored_manifest(restored, target, segment))
+        });
+        let frame = encode(Kind::Manifest, &manifest)?;
+        let state = target.restore(&key, manifest, held).await?;
+        let replaced = attempt(&mut ready, async {
+            self.publish(&key, frame, restored).await?;
+            Ok(std::mem::replace(
+                &mut *self.partition.state.write().expect("partition lock"),
+                state,
+            ))
+        })
+        .await?;
+        drop(ready);
+        blocking(move || drop((replaced, target))).await?;
+        Ok(restored)
+    }
+
+    /// Build and upload a segment of the rows taken out of `snapshot` and
+    /// its tombstones, its files named at `named_at`; none if it has
+    /// neither.
+    async fn uploaded(
+        &self,
+        snapshot: &mut Snapshot,
+        named_at: LogPosition,
+    ) -> Result<Option<Prepared>> {
+        if snapshot.rows.is_empty() && snapshot.tombstones.is_empty() {
+            return Ok(None);
+        }
+        let names = self.staged(named_at);
+        let rows = std::mem::take(&mut snapshot.rows);
+        let above = self.merging.clustered_above;
+        let shape = Shape::of(&snapshot.catalog, &rows, snapshot.tombstones.len(), above);
+        let file = SegmentFile {
+            position: snapshot.position,
+            rows,
+            tombstones: snapshot.tombstones.clone(),
+        };
+        let built = self.built(file, snapshot.catalog.clone()).await?;
+        let prepared = Self::prepared(names.meta(shape), built)?;
+        self.upload(&prepared).await?;
+        Ok(Some(prepared))
     }
 
     /// Names for the files of a segment built from the partition as it was
@@ -980,16 +1099,19 @@ impl Writer {
     /// Delete the partition's files that nothing needs any more: a stale
     /// writer's uploads, and the segments and manifests that merges and
     /// checkpoints have replaced. Everything reached from any head written
-    /// in the last `grace` stays, so that the partition can be put back as
-    /// it was at any moment in that window and a reader that took the
-    /// committed position within it still finds its files. Nothing at or
-    /// ahead of this writer's position is touched, which keeps a newer
-    /// writer's uploads safe whatever the clocks say. Returns how many
-    /// files were deleted.
+    /// in the last `grace` stays, and from the head just before the oldest
+    /// of them, so that the partition can be put back as it was at any
+    /// moment in that window and as it stood when the window began, and a
+    /// reader that took the committed position within it still finds its
+    /// files. Nothing at or ahead of this writer's position is touched,
+    /// which keeps a newer writer's uploads safe whatever the clocks say.
+    /// Returns how many files were deleted.
     ///
     /// What is needed is decided by the committed chain alone: it is walked
-    /// back to the latest checkpoint at or before the oldest recent file,
-    /// and everything before that checkpoint which it does not list goes.
+    /// back to the latest checkpoint before the oldest recent file, and
+    /// everything before that checkpoint which no checkpoint on the way
+    /// lists goes. A restore's checkpoint lists segments far older than
+    /// itself, which stay for as long as it is on the way.
     /// The files are listed before the head is read, with the writer held
     /// so that no commit is in flight: a file this writer uploaded and had
     /// not yet published when the listing was taken is reached by then or
@@ -998,6 +1120,7 @@ impl Writer {
     /// from, which is past the latest checkpoint and so past anything this
     /// deletes until a checkpoint after it has been committed.
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
+        let _building = self.building.lock().await;
         let layout = Layout(&self.lease.key);
         let listed = self.partition.blobs.list(&layout.prefix()).await?;
         let (position, head) = {
@@ -1021,30 +1144,42 @@ impl Writer {
             .iter()
             .filter(|(file, _)| file.modified >= cutoff)
             .map(|(_, at)| *at);
-        let floor = young.fold(position, std::cmp::min);
+        let floor = young
+            .map(|at| LogPosition(at.0.saturating_sub(1)))
+            .fold(position, std::cmp::min);
         let mut cursor = head;
+        let mut checkpoints = Vec::new();
         let base = loop {
             let Some(key) = cursor else { break None };
             cursor = match decode_head(&key, &self.partition.fetch(&key).await?)? {
                 Head::Log(log) => log.prev,
                 Head::Manifest(manifest) if manifest.position <= floor => break Some(manifest),
-                Head::Manifest(manifest) => manifest.prev,
+                Head::Manifest(manifest) => {
+                    let prev = manifest.prev.clone();
+                    checkpoints.push(manifest);
+                    prev
+                }
             };
         };
         let Some(base) = base else {
             return Ok(0);
         };
-        let kept: HashSet<&str> = base
-            .segments
+        let kept: HashSet<&str> = checkpoints
             .iter()
-            .flat_map(|meta| {
-                [
-                    Some(meta.key.as_str()),
-                    meta.index.as_deref(),
-                    meta.vectors.as_deref(),
-                ]
+            .chain([&base])
+            .flat_map(|checkpoint| {
+                checkpoint
+                    .segments
+                    .iter()
+                    .flat_map(|meta| {
+                        [
+                            Some(meta.key.as_str()),
+                            meta.index.as_deref(),
+                            meta.vectors.as_deref(),
+                        ]
+                    })
+                    .chain(checkpoint.replay.iter().map(|key| Some(key.as_str())))
             })
-            .chain(base.replay.iter().map(|key| Some(key.as_str())))
             .flatten()
             .collect();
         let orphans = files
@@ -1091,4 +1226,23 @@ async fn attempt<T>(ready: &mut bool, work: impl Future<Output = Result<T>>) -> 
     let done = work.await?;
     *ready = true;
     Ok(done)
+}
+
+/// Writes refused for as long as this lives.
+struct Refusing<'a>(&'a AtomicBool);
+
+impl<'a> Refusing<'a> {
+    /// Refuse `writer`'s writes from now on, once any commit under way has
+    /// been made.
+    async fn writes(writer: &'a Writer) -> Refusing<'a> {
+        writer.restoring.store(true, Ordering::SeqCst);
+        drop(writer.ready.lock().await);
+        Refusing(&writer.restoring)
+    }
+}
+
+impl Drop for Refusing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }

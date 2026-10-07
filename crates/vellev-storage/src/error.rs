@@ -62,6 +62,8 @@ pub enum StorageError {
     Diverged { head: Option<String> },
     #[error("the writer closed after a write whose outcome is unknown; open a new writer")]
     Closed,
+    #[error("the partition is being restored; nothing was written, try again shortly")]
+    Restoring,
     #[error("{0} are exhausted")]
     Exhausted(&'static str),
     #[error("encoding failed: {0}")]

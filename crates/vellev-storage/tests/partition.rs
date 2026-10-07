@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use vellev_storage::coordinator::{KeyHash, TenantKey};
+use vellev_storage::coordinator::{KeyHash, Point, RestorePoint, TenantKey};
 
 #[tokio::test]
 async fn data_survives_a_restart_with_nothing_held_locally() {
@@ -419,6 +419,46 @@ impl Coordinator for Unreliable {
 
     async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>, CoordinatorError> {
         self.inner.key_tenant(hash).await
+    }
+
+    async fn restore_point(
+        &self,
+        key: &PartitionKey,
+        point: Point,
+        window: Duration,
+    ) -> Result<Option<RestorePoint>, CoordinatorError> {
+        self.inner.restore_point(key, point, window).await
+    }
+
+    async fn restore_points(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<Option<(RestorePoint, RestorePoint)>, CoordinatorError> {
+        self.inner.restore_points(key, window).await
+    }
+
+    async fn forget_history(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<u64, CoordinatorError> {
+        self.inner.forget_history(key, window).await
+    }
+
+    async fn restore_window(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Duration>, CoordinatorError> {
+        self.inner.restore_window(tenant).await
+    }
+
+    async fn set_restore_window(
+        &self,
+        tenant: &TenantId,
+        window: Option<Duration>,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.set_restore_window(tenant, window).await
     }
 }
 

@@ -102,9 +102,21 @@ call -X POST "$notes/hybrid" -d '{"text":"fox","vector":[1,0],"limit":5}'
 
 A tenant's segments are merged in the background once enough small ones
 have piled up or one is half deleted rows. Files nothing needs any more are
-deleted, keeping everything that any commit of the last `VELLEV_GRACE_SECS`
-(a day by default) reached, so that within that window the tenant can be
-put back as it was at any moment and a slow reader still finds its files.
+deleted once no restore within the tenant's window can need them, and
+`VELLEV_GRACE_SECS` (an hour) later.
+
+A tenant can be put back as it stood at any moment of its restore window:
+14 days unless `VELLEV_RESTORE_WINDOW_SECS` or the tenant says otherwise.
+Every commit is a restore point, kept in Postgres. A restore is a commit of
+its own, so nothing is lost by it and it can be undone by restoring to just
+before it; requests answered before it stay answered. With an admin key:
+
+```sh
+call "http://127.0.0.1:8080/v1/tenants/acme/restore-points"            # the window, earliest and latest
+call -X POST "http://127.0.0.1:8080/v1/tenants/acme/restore" -d '{"at":"2026-10-07T08:00:00Z"}'
+call -X POST "http://127.0.0.1:8080/v1/tenants/acme/restore" -d '{"position":42}'
+call -X PUT "http://127.0.0.1:8080/v1/tenants/acme/restore-window" -d '{"secs":2592000}'   # null for the default
+```
 
 Several nodes may run against the same Postgres and store. Each tenant is
 written by one node at a time; a write that reaches another node is sent

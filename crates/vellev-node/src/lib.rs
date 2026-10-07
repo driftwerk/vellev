@@ -13,7 +13,8 @@ use vellev_core::{CollectionName, Embedding, NodeId, Partition, TenantId};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
-    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, TenantKey, Versions,
+    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, Point, RestorePoint,
+    TenantKey, Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
@@ -58,9 +59,14 @@ pub struct Settings {
     /// A tenant with this many rows written since its last checkpoint is
     /// flushed.
     pub flush_rows: usize,
-    /// How long a file nothing reaches any more is kept before it is
-    /// deleted. Files are looked for about this often while a tenant is
-    /// open, at most once a minute.
+    /// How far back a tenant may be restored, unless it says otherwise; at
+    /// most [`MAX_RESTORE_WINDOW`]. What a restore that far back needs is
+    /// kept, every log among it. A tenant open here is looked after every
+    /// 24th of this, at least hourly and at most once a minute.
+    pub restore_window: Duration,
+    /// How much longer than its restore window a file nothing reaches any
+    /// more is kept: files are written a little before they are committed,
+    /// and a reader that took a committed position still finds its files.
     pub grace: Duration,
     /// How often a copy of a tenant kept for reads looks for new commits.
     pub follow_every: Duration,
@@ -95,7 +101,8 @@ impl Settings {
             group: 64,
             queue: 1_024,
             flush_rows: 50_000,
-            grace: Duration::from_secs(24 * 60 * 60),
+            restore_window: Duration::from_secs(14 * 24 * 60 * 60),
+            grace: Duration::from_secs(60 * 60),
             follow_every: Duration::from_secs(1),
             follow_idle: Duration::from_secs(5 * 60),
             followers: 64,
@@ -126,6 +133,8 @@ pub enum NodeError {
     Behind(TenantId),
     #[error("the point asked for is past anything committed to tenant {0}")]
     Ahead(TenantId),
+    #[error("tenant {0} has no state to go back to at that point")]
+    NoRestorePoint(TenantId),
     #[error("the cluster writes file format {cluster}, and this release reads only up to {reads}")]
     Outdated { cluster: u16, reads: u16 },
     #[error(transparent)]
@@ -147,6 +156,20 @@ fn key(tenant: &TenantId) -> PartitionKey {
         tenant: tenant.clone(),
         partition: Partition::DEFAULT,
     }
+}
+
+/// How far back `tenant` may be restored: `default` unless it says
+/// otherwise.
+async fn restore_window(
+    coordinator: &dyn Coordinator,
+    tenant: &TenantId,
+    default: Duration,
+) -> Result<Duration> {
+    Ok(coordinator
+        .restore_window(tenant)
+        .await?
+        .unwrap_or(default)
+        .min(MAX_RESTORE_WINDOW))
 }
 
 /// The node's embedders, as a writer asks for vectors.
@@ -298,10 +321,33 @@ impl Tenant {
             .map_err(|error| self.failed(error))?
             .is_some()
         {}
-        self.writer.clean(grace).await.map_err(|error| match error {
+        self.writer
+            .clean(grace)
+            .await
+            .map_err(|error| self.closed(error))
+    }
+
+    /// Forget the commits the tenant can no longer go back to, then merge
+    /// its segments and delete the files no restore within its window
+    /// needs, kept `grace` longer. Returns how many files were deleted.
+    async fn maintained(
+        &self,
+        coordinator: &dyn Coordinator,
+        default_window: Duration,
+        grace: Duration,
+    ) -> Result<usize> {
+        let window = restore_window(coordinator, &self.id, default_window).await?;
+        coordinator.forget_history(&key(&self.id), window).await?;
+        self.compact(window.saturating_add(grace)).await
+    }
+
+    /// An error from something that leaves the writer open unless it says
+    /// it is closed.
+    fn closed(&self, error: StorageError) -> NodeError {
+        match error {
             StorageError::Closed => self.failed(error),
             other => other.into(),
-        })
+        }
     }
 
     /// Note that the writer failed at something that leaves it closed.
@@ -564,6 +610,72 @@ impl Node {
             opened.broken.store(true, Ordering::SeqCst);
         }
         Ok(existed)
+    }
+
+    /// Put `tenant` back as it stood at `point`, which must lie within its
+    /// restore window, as a new commit. Returns the state gone back to and
+    /// the position of the commit that restored it. The restore runs to its
+    /// end even if the caller stops waiting for it.
+    pub async fn restore(
+        &self,
+        tenant: &TenantId,
+        point: Point,
+    ) -> Result<(RestorePoint, LogPosition)> {
+        let opened = self.tenant(tenant).await?;
+        let window = self.0.restore_window(tenant).await?;
+        let target = self
+            .0
+            .coordinator
+            .restore_point(&key(tenant), point, window)
+            .await?
+            .ok_or_else(|| NodeError::NoRestorePoint(tenant.clone()))?;
+        let restoring = {
+            let (opened, target) = (opened.clone(), target.clone());
+            tokio::spawn(async move {
+                opened
+                    .writer
+                    .restore(&target.head, target.position)
+                    .await
+                    .map_err(|error| opened.closed(error))
+            })
+        };
+        let restored = restoring
+            .await
+            .map_err(|error| StorageError::Background(error.to_string()))??;
+        tracing::info!(%tenant, from = ?target.position, at = %target.at, ?restored, "restored");
+        Ok((target, restored))
+    }
+
+    /// The earliest and the latest state `tenant` may be restored to, with
+    /// how far back it may go; `None` if it does not exist.
+    pub async fn restore_points(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<(Duration, Option<(RestorePoint, RestorePoint)>)>> {
+        if self.0.coordinator.committed(&key(tenant)).await?.is_none() {
+            return Ok(None);
+        }
+        let window = self.0.restore_window(tenant).await?;
+        let points = self
+            .0
+            .coordinator
+            .restore_points(&key(tenant), window)
+            .await?;
+        Ok(Some((window, points)))
+    }
+
+    /// Set how far back `tenant` may be restored, or with `None` go back to
+    /// the node's default. Returns whether there is such a tenant.
+    pub async fn set_restore_window(
+        &self,
+        tenant: &TenantId,
+        window: Option<Duration>,
+    ) -> Result<bool> {
+        Ok(self
+            .0
+            .coordinator
+            .set_restore_window(tenant, window)
+            .await?)
     }
 
     /// Up to `limit` tenants after `after`, in id order; fewer where a
@@ -857,8 +969,14 @@ impl Inner {
     /// for as long as the tenant is open and held. The task holds no
     /// reference of its own, so dropping the tenant ends it.
     fn maintaining(&self, tenant: &Arc<Tenant>, mut wanted: mpsc::Receiver<()>) {
-        let grace = self.settings.grace;
-        let every = (grace / 24).max(Duration::from_secs(60));
+        let Settings {
+            restore_window,
+            grace,
+            ..
+        } = self.settings;
+        let every =
+            (restore_window / 24).clamp(Duration::from_secs(60), Duration::from_secs(60 * 60));
+        let coordinator = self.coordinator.clone();
         let tenant = Arc::downgrade(tenant);
         tokio::spawn(async move {
             loop {
@@ -879,13 +997,24 @@ impl Inner {
                         continue;
                     }
                 }
-                match tenant.compact(grace).await {
+                let maintained = tenant.maintained(coordinator.as_ref(), restore_window, grace);
+                match maintained.await {
                     Ok(0) => {}
                     Ok(deleted) => tracing::info!(tenant = %tenant.id, deleted, "cleaned up"),
                     Err(error) => tracing::warn!(tenant = %tenant.id, %error, "compaction failed"),
                 }
             }
         });
+    }
+
+    /// How far back `tenant` may be restored.
+    async fn restore_window(&self, tenant: &TenantId) -> Result<Duration> {
+        restore_window(
+            self.coordinator.as_ref(),
+            tenant,
+            self.settings.restore_window,
+        )
+        .await
     }
 
     /// Keep the hold the tenant was taken with for as long as `deadline`

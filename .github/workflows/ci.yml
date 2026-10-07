@@ -16,6 +16,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Full debug info for every test binary and example fills the runner's
+  # disk; line tables are enough for a backtrace.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RUST_BACKTRACE: 1
 
 jobs:

@@ -110,7 +110,9 @@ fn code(error: &StorageError) -> Code {
         | E::Blob { .. }
         | E::Embedding { .. }
         | E::Closed
+        | E::Restoring
         | E::Diverged { .. } => Code::Unavailable,
+        E::Shared(shared) if matches!(**shared, E::Restoring) => Code::Unavailable,
         E::Shared(_) => Code::Uncertain,
         E::Refused(refusal) => match refusal.kind {
             Refused::NotFound => Code::NotFound,
@@ -142,7 +144,9 @@ impl From<StorageError> for ApiError {
 impl From<NodeError> for ApiError {
     fn from(error: NodeError) -> Self {
         match error {
-            NodeError::UnknownTenant(_) => Self::not_found(error.to_string()),
+            NodeError::UnknownTenant(_) | NodeError::NoRestorePoint(_) => {
+                Self::not_found(error.to_string())
+            }
             NodeError::Ahead(_) => Self::invalid(error.to_string()),
             NodeError::Elsewhere { .. }
             | NodeError::Outdated { .. }

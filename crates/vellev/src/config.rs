@@ -89,10 +89,14 @@ pub struct Config {
     /// flushed.
     #[arg(long, env = "VELLEV_FLUSH_ROWS", default_value_t = 50_000)]
     pub flush_rows: usize,
-    /// How long a tenant's files that nothing reaches any more, such as
-    /// segments a merge replaced, are kept before they are deleted, in
-    /// seconds.
-    #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 24 * 60 * 60)]
+    /// How far back a tenant may be restored unless it is set otherwise for
+    /// it, in seconds. What a restore that far back needs is kept.
+    #[arg(long, env = "VELLEV_RESTORE_WINDOW_SECS", default_value_t = 14 * 24 * 60 * 60)]
+    pub restore_window_secs: u64,
+    /// How much longer than a tenant's restore window its files that
+    /// nothing reaches any more, such as segments a merge replaced, are
+    /// kept before they are deleted, in seconds.
+    #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 60 * 60)]
     pub grace_secs: u64,
     /// How long a tenant this node writes for may go unused before it is
     /// let go, its memory given back, in seconds.
@@ -251,6 +255,7 @@ impl Config {
         let settings = Settings {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
+            restore_window: Duration::from_secs(self.restore_window_secs),
             grace: Duration::from_secs(self.grace_secs),
             max_format: self.max_format,
             tenant_idle: Duration::from_secs(self.tenant_idle_secs),

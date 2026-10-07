@@ -246,6 +246,81 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
 
     /// The tenant the key with this hash reaches, if any.
     async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>>;
+
+    /// The state of the partition as it is now, since it was last
+    /// registered, that `point` names, if a restore reaching back `window`
+    /// may go to it: one committed within the window, or the last committed
+    /// before it, which is how the partition stood when the window began.
+    /// A moment must itself lie in the window and not after now.
+    async fn restore_point(
+        &self,
+        key: &PartitionKey,
+        point: Point,
+        window: Duration,
+    ) -> Result<Option<RestorePoint>>;
+
+    /// The earliest and the latest state a restore reaching back `window`
+    /// may go to, if any.
+    async fn restore_points(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<Option<(RestorePoint, RestorePoint)>>;
+
+    /// Forget the commits a restore reaching back `window` can no longer go
+    /// to. Returns how many.
+    async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64>;
+
+    /// How far back `tenant` may be restored, if it is not the default.
+    async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>>;
+
+    /// Set how far back `tenant` may be restored, or with `None` go back to
+    /// the default; at most [`MAX_RESTORE_WINDOW`]. Returns whether there is
+    /// such a tenant.
+    async fn set_restore_window(&self, tenant: &TenantId, window: Option<Duration>)
+        -> Result<bool>;
+}
+
+/// The longest a restore window may be.
+pub const MAX_RESTORE_WINDOW: Duration = Duration::from_secs(10 * 366 * 24 * 60 * 60);
+
+/// `window`, unless it is longer than any restore window may be.
+fn checked_window(window: Duration) -> Result<Duration> {
+    (window <= MAX_RESTORE_WINDOW)
+        .then_some(window)
+        .ok_or_else(|| {
+            CoordinatorError::InvalidArgument(format!(
+                "a restore window of {window:?} exceeds {MAX_RESTORE_WINDOW:?}"
+            ))
+        })
+}
+
+/// The moment a window reaching back `window` from `now` begins.
+fn window_start(now: DateTime<Utc>, window: Duration) -> Result<DateTime<Utc>> {
+    chrono::Duration::from_std(window)
+        .ok()
+        .and_then(|window| now.checked_sub_signed(window))
+        .ok_or_else(|| {
+            CoordinatorError::InvalidArgument(format!("a window of {window:?} is too long"))
+        })
+}
+
+/// A commit as the history keeps it: a state the partition can be put
+/// back to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePoint {
+    pub position: LogPosition,
+    pub head: ManifestRef,
+    pub at: DateTime<Utc>,
+}
+
+/// Which state of a partition to go back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Point {
+    /// The one committed last at or before a moment in the window.
+    At(DateTime<Utc>),
+    /// The one committed at a position.
+    Position(LogPosition),
 }
 
 /// The SHA-256 of a key's secret: all the coordinator keeps of it.
