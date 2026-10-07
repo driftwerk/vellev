@@ -194,6 +194,33 @@ mod tests {
         assert_eq!(random.sample(100, 5), [3, 5, 74, 82, 98]);
     }
 
+    /// An FNV-1a hash of `values`' bits, to hold a wide rotation's every
+    /// output bit to a golden value in a few characters.
+    fn fingerprint(values: &[f32]) -> u64 {
+        values
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .fold(0xCBF2_9CE4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3)
+            })
+    }
+
+    /// At a width of 512, whose root is not exact, the final scale rounds;
+    /// at 1,024 the transform runs ten stages. Both give the same bits
+    /// forever too.
+    #[test]
+    fn wide_rotations_give_the_same_bits_forever() {
+        for (dimensions, golden) in [(500, 11927336186241100382), (1000, 893120748369387992)] {
+            let input: Vec<f32> = (0..dimensions).map(|i| (i as f32 - 200.0) / 13.0).collect();
+            let rotation = Rotation::new(dimensions, 1234);
+            let rotated = rotation.apply(&input);
+            assert_eq!(
+                (rotated.len(), fingerprint(&rotated)),
+                (rotation.width, golden)
+            );
+        }
+    }
+
     /// The signs are kept, not stored: a rotation read back is the same.
     #[test]
     fn a_rotation_survives_the_wire_as_its_width_and_seed() {
