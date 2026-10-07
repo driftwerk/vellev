@@ -148,11 +148,14 @@ whoever can write to the store can shape what a restore brings back. A
 restore into a cluster that lost a tenant brings back every key the backup
 held, including any revoked since.
 
-Removing a tenant removes everything kept of it: `VELLEV_PURGE_AFTER_SECS`
-(ten minutes) later, once any node still writing it has let go, its files,
-its backups and every node's cached copies are deleted, and its restore
-points are gone at once. It cannot be made again under the same id until
-then, and it cannot be restored afterwards: removal is final.
+Removing a tenant removes everything kept of it. Its restore points go at
+once; `VELLEV_PURGE_AFTER_SECS` (ten minutes, at least two leases) later,
+once any node that held it has stopped committing, one node deletes its
+files and its backups, and every node drops its cached copies. A file a
+stopped writer was still uploading may outlive the purge, but none can
+belong to a tenant made later under the same id, which is refused until the
+purge is done. A backup finishing after the removal discards itself. Removal
+is final: a removed tenant cannot be restored.
 
 Several nodes may run against the same Postgres and store. Each tenant is
 written by one node at a time; a write that reaches another node is sent
