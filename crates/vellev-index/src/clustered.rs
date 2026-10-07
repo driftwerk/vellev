@@ -251,6 +251,23 @@ impl Random {
     fn below(&mut self, bound: usize) -> usize {
         (self.next() % bound as u64) as usize
     }
+
+    /// `count` of the positions `0..len`, or all of them if there are no
+    /// more, in ascending order. Chosen at random rather than evenly
+    /// spaced: rows written in a repeating pattern would otherwise be
+    /// sampled in step with it, and whole kinds of vector left out.
+    fn sample(&mut self, len: usize, count: usize) -> Vec<usize> {
+        if count >= len {
+            return (0..len).collect();
+        }
+        let mut chosen = std::collections::HashSet::with_capacity(count);
+        while chosen.len() < count {
+            chosen.insert(self.below(len));
+        }
+        let mut chosen: Vec<usize> = chosen.into_iter().collect();
+        chosen.sort_unstable();
+        chosen
+    }
 }
 
 /// A query made ready for one cluster: its difference from the centroid,
@@ -480,11 +497,10 @@ impl ClusteredIndex {
         let rotated = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
 
         let k = clusters_for(vectors.len());
-        let stride = (vectors.len() / (k * TRAINING_PER_CLUSTER)).max(1);
-        let training: Vec<Vec<f32>> = vectors
-            .par_iter()
-            .step_by(stride)
-            .map(|(_, vector)| rotated(vector))
+        let training: Vec<Vec<f32>> = random
+            .sample(vectors.len(), k * TRAINING_PER_CLUSTER)
+            .into_par_iter()
+            .map(|at| rotated(vectors[at].1))
             .collect();
         let centroids = kmeans(&training, k, width, &mut random);
 
@@ -546,7 +562,7 @@ impl ClusteredIndex {
             at,
             probes: 1,
         };
-        index.probes = index.tuned(vectors);
+        index.probes = index.tuned(vectors, &mut random);
         Some(index)
     }
 
@@ -561,13 +577,13 @@ impl ClusteredIndex {
     }
 
     /// The fewest clusters whose scan holds [`RECALL_FLOOR`] of the true
-    /// nearest [`TUNING_NEIGHBOURS`] of sample queries drawn from the
-    /// vectors themselves, each left out of its own neighbours.
-    fn tuned(&self, vectors: &[(u32, &[f32])]) -> usize {
-        let stride = (vectors.len() / TUNING_QUERIES).max(1);
-        let ranks: Vec<usize> = vectors
-            .par_iter()
-            .step_by(stride)
+    /// nearest [`TUNING_NEIGHBOURS`] of sample queries drawn at random from
+    /// the vectors themselves, each left out of its own neighbours.
+    fn tuned(&self, vectors: &[(u32, &[f32])], random: &mut Random) -> usize {
+        let ranks: Vec<usize> = random
+            .sample(vectors.len(), TUNING_QUERIES)
+            .into_par_iter()
+            .map(|at| &vectors[at])
             .flat_map_iter(|(row, query)| {
                 let scorer = Scorer::new(self.metric, query);
                 let mut nearest = Nearest::new(TUNING_NEIGHBOURS);
@@ -618,9 +634,14 @@ impl ClusteredIndex {
             .chunks_exact(self.rotation.width)
             .enumerate()
             .map(|(cluster, centroid)| {
+                // As rows were assigned to clusters: by how far the
+                // centroid is, not by how aligned, so that a cluster whose
+                // members lie in several directions, and so whose centroid
+                // is short, is not passed over. Only for dot products,
+                // where length is the point, is alignment the measure.
                 let distance = match self.metric {
-                    Distance::L2 => squared_l2(query, centroid),
-                    Distance::Dot | Distance::Cosine => -dot(query, centroid),
+                    Distance::L2 | Distance::Cosine => squared_l2(query, centroid),
+                    Distance::Dot => -dot(query, centroid),
                 };
                 (distance, cluster)
             })
@@ -808,6 +829,44 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Rows written in a repeating pattern, group after group, must not be
+    /// sampled in step with it: a group the sample left out would have no
+    /// cluster of its own, and a query near it would find none of it. Nor
+    /// may a cluster that holds several groups be passed over for its
+    /// shorter centroid.
+    #[test]
+    fn every_group_of_rows_written_in_turn_is_found() {
+        let count = 40_000;
+        let k = clusters_for(count);
+        let stride = count / (k * TRAINING_PER_CLUSTER);
+        // More groups than clusters, as many as a multiple of the spacing
+        // an evenly spaced sample would have: it would visit only some.
+        for groups in [stride * 100, stride * 128] {
+            let vectors = grouped(11, count, 32, groups, 0.3);
+            let index = indexed(Distance::Cosine, &vectors);
+            let (mut found_all, mut all) = (0, 0);
+            for (group, query) in vectors.iter().take(groups).enumerate() {
+                // As `indexed` numbers them.
+                let members: Vec<u32> = (group..count)
+                    .step_by(groups)
+                    .map(|at| at as u32 * 2)
+                    .collect();
+                let shortlist = index.shortlist(query, members.len() * 2, None, &[]);
+                let found = members.iter().filter(|row| shortlist.contains(row)).count();
+                assert!(
+                    found * 2 >= members.len(),
+                    "{groups} groups: group {group} found {found} of {}",
+                    members.len()
+                );
+                (found_all, all) = (found_all + found, all + members.len());
+            }
+            assert!(
+                found_all * 100 >= all * 95,
+                "{groups} groups: found {found_all} of {all}"
+            );
+        }
     }
 
     fn indexed(metric: Distance, vectors: &[Vec<f32>]) -> ClusteredIndex {
