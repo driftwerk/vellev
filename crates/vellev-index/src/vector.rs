@@ -829,6 +829,32 @@ mod tests {
         }
     }
 
+    /// A write sums a vector's squares one after another, the index in
+    /// lanes: at the limit the two can fall either side of it, and every
+    /// vector a write accepts must still be measured.
+    #[test]
+    fn every_vector_a_write_accepts_is_measured() {
+        let mut random = Random(29);
+        let accepted: Vec<Vec<f32>> = (0..2000)
+            .map(|_| {
+                let vector = random.vector(768);
+                let squared: f32 = vector.iter().map(|v| v * v).sum();
+                let scale = (SQUARED_LENGTH_UNDER / squared).sqrt();
+                vector.into_iter().map(|v| v * scale).collect::<Vec<f32>>()
+            })
+            .filter(|vector| vector.iter().map(|v| v * v).sum::<f32>() < SQUARED_LENGTH_UNDER)
+            .collect();
+        assert!(
+            accepted
+                .iter()
+                .any(|vector| dot(vector, vector) >= SQUARED_LENGTH_UNDER),
+            "no vector here sums past the limit in lanes"
+        );
+        assert!(accepted
+            .iter()
+            .all(|vector| measurable(Distance::Dot, vector)));
+    }
+
     /// Vectors longer than a collection accepts, though their squared
     /// lengths are just finite, have no code to rank them by. However many
     /// there are, they take no place in a shortlist; they are left for the
