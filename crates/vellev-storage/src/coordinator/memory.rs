@@ -10,9 +10,9 @@ use uuid::Uuid;
 use vellev_core::{NodeId, TenantId};
 
 use super::{
-    checked_ttl, window_start, Acquired, Commit, Committed, Coordinator, CoordinatorError,
-    Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Point,
-    RestorePoint, Result, TenantKey, Versions,
+    checked_ttl, checked_window, window_start, Acquired, Commit, Committed, Coordinator,
+    CoordinatorError, Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef,
+    PartitionKey, Point, RestorePoint, Result, TenantKey, Versions,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -403,9 +403,10 @@ impl Coordinator for MemoryCoordinator {
         window: Duration,
     ) -> Result<Option<RestorePoint>> {
         self.with_row(key, |row, now| {
-            let reachable = row.reachable(window_start(now, window)?);
+            let start = window_start(now, window)?;
+            let reachable = row.reachable(start);
             Ok(match point {
-                Point::At(at) if at > now || at < window_start(now, window)? => None,
+                Point::At(at) if at > now || at < start => None,
                 Point::At(at) => reachable.iter().rev().find(|commit| commit.at <= at),
                 Point::Position(position) => {
                     reachable.iter().find(|commit| commit.position == position)
@@ -453,6 +454,7 @@ impl Coordinator for MemoryCoordinator {
         tenant: &TenantId,
         window: Option<Duration>,
     ) -> Result<bool> {
+        let window = window.map(checked_window).transpose()?;
         let mut rows = self.rows.lock().expect("coordinator lock");
         let mut found = false;
         for (_, row) in rows.iter_mut().filter(|(key, _)| &key.tenant == tenant) {

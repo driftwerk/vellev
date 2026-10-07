@@ -304,3 +304,100 @@ async fn how_a_partition_stood_when_its_window_began_stays_restorable() {
         [Some(10)]
     );
 }
+
+#[tokio::test]
+async fn writes_are_refused_and_cleaning_up_waits_while_a_restore_runs() {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut seen) = Paused::new(&mut cluster, "segment");
+    let writer = Arc::new(writer(&cluster).await);
+    let (head, position) = history(&cluster, &writer).await;
+
+    paused.armed.store(true, Ordering::SeqCst);
+    let restoring = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.restore(&head, position).await }
+    });
+    assert_eq!(seen.recv().await, Some("stored"));
+    paused.armed.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        writer.commit(vec![upsert("notes", 4, 4)]).await,
+        Err(StorageError::Restoring)
+    ));
+    let cleaning = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.clean(Duration::ZERO).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!cleaning.is_finished(), "cleaning up waits for the restore");
+
+    paused.release.notify_one();
+    restoring.await.unwrap().unwrap();
+    cleaning.await.unwrap().unwrap();
+    writer.commit(vec![upsert("notes", 4, 4)]).await.unwrap();
+    assert_eq!(
+        cluster
+            .open()
+            .await
+            .partition()
+            .read(|state| ns(state, &[1, 2, 3, 4])),
+        [Some(1), Some(20), Some(3), Some(4)]
+    );
+}
+
+#[tokio::test]
+async fn a_restore_that_fails_before_it_commits_leaves_the_writer_writing() {
+    let cluster = Cluster::new().await;
+    let writer = writer(&cluster).await;
+    let (_, position) = history(&cluster, &writer).await;
+    let nowhere = ManifestRef(format!(
+        "{}manifest/missing.manifest",
+        Layout(&cluster.key).prefix()
+    ));
+    assert!(writer.restore(&nowhere, position).await.is_err());
+    writer.commit(vec![upsert("notes", 4, 4)]).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_restore_whose_commit_fails_closes_the_writer() {
+    let mut cluster = Cluster::new().await;
+    let observed = cluster.observed();
+    cluster.blobs = observed.clone();
+    let writer = writer(&cluster).await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let (head, position) = now(&cluster).await;
+    writer.commit(vec![upsert("notes", 1, 10)]).await.unwrap();
+
+    observed.fail_puts.store(true, Ordering::SeqCst);
+    assert!(writer.restore(&head, position).await.is_err());
+    observed.fail_puts.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        writer.commit(vec![upsert("notes", 2, 2)]).await,
+        Err(StorageError::Closed)
+    ));
+    let reopened = cluster.writer().await;
+    assert_eq!(
+        reopened.partition().read(|state| ns(state, &[1])),
+        [Some(10)]
+    );
+}
+
+#[tokio::test]
+async fn restoring_to_where_a_partition_is_changes_nothing_in_it() {
+    let cluster = Cluster::new().await;
+    let writer = writer(&cluster).await;
+    history(&cluster, &writer).await;
+    let (head, position) = now(&cluster).await;
+    let before = writer.partition().read(|state| ns(state, &[1, 2, 3]));
+    assert_eq!(
+        writer.restore(&head, position).await.unwrap(),
+        position.next().unwrap()
+    );
+    assert_eq!(
+        writer.partition().read(|state| ns(state, &[1, 2, 3])),
+        before
+    );
+}

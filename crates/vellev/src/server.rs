@@ -69,6 +69,9 @@ const FORWARDED: &str = "x-vellev-forwarded";
 /// connection to it. Shorter than a client's usual patience, so that the
 /// client hears `unavailable` and asks again rather than giving up.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long a node waits for the node it sent a restore on to, which
+/// loads and writes a whole tenant.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl App {
@@ -390,6 +393,10 @@ async fn forwarded(
             false => ApiError::new(Code::Uncertain, message),
         }
     };
+    let timeout = match matched {
+        Some(route) if route.as_str() == "/v1/tenants/{tenant}/restore" => RESTORE_TIMEOUT,
+        _ => FORWARD_TIMEOUT,
+    };
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, app.limits.body)
         .await
@@ -409,6 +416,7 @@ async fn forwarded(
     let answer = app
         .http
         .request(parts.method, url)
+        .timeout(timeout)
         .headers(passed_on)
         .header(FORWARDED, vellev_node::PROTOCOL.to_string())
         .body(body)

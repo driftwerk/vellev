@@ -91,8 +91,10 @@ async fn a_point_out_of_reach_is_not_found_and_the_window_is_set_per_tenant() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let points = served.ok(Method::GET, POINTS, None).await;
     assert_eq!(points["window_secs"], json!(3_600));
-    let (status, _) = served.put(window, json!({ "secs": 0 })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for secs in [0_u64, 1_000_000_000_000] {
+        let (status, _) = served.put(window, json!({ "secs": secs })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{secs}");
+    }
     let (status, _) = served.put(window, json!({ "secs": null })).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let points = served.ok(Method::GET, POINTS, None).await;

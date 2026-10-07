@@ -14,7 +14,7 @@ use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
     Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, Point, RestorePoint,
-    TenantKey, Versions,
+    TenantKey, Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
@@ -59,10 +59,10 @@ pub struct Settings {
     /// A tenant with this many rows written since its last checkpoint is
     /// flushed.
     pub flush_rows: usize,
-    /// How far back a tenant may be restored, unless it says otherwise.
-    /// What a restore that far back needs is kept, and a tenant open here
-    /// is looked after a 24th as often, at least hourly and at most once a
-    /// minute.
+    /// How far back a tenant may be restored, unless it says otherwise; at
+    /// most [`MAX_RESTORE_WINDOW`]. What a restore that far back needs is
+    /// kept, every log among it. A tenant open here is looked after every
+    /// 24th of this, at least hourly and at most once a minute.
     pub restore_window: Duration,
     /// How much longer than its restore window a file nothing reaches any
     /// more is kept: files are written a little before they are committed,
@@ -165,7 +165,11 @@ async fn restore_window(
     tenant: &TenantId,
     default: Duration,
 ) -> Result<Duration> {
-    Ok(coordinator.restore_window(tenant).await?.unwrap_or(default))
+    Ok(coordinator
+        .restore_window(tenant)
+        .await?
+        .unwrap_or(default)
+        .min(MAX_RESTORE_WINDOW))
 }
 
 /// The node's embedders, as a writer asks for vectors.
@@ -323,9 +327,9 @@ impl Tenant {
             .map_err(|error| self.closed(error))
     }
 
-    /// Merge the tenant's segments, delete the files no restore within its
-    /// window needs, kept `grace` longer, and forget the commits it can no
-    /// longer go back to. Returns how many files were deleted.
+    /// Forget the commits the tenant can no longer go back to, then merge
+    /// its segments and delete the files no restore within its window
+    /// needs, kept `grace` longer. Returns how many files were deleted.
     async fn maintained(
         &self,
         coordinator: &dyn Coordinator,
@@ -333,9 +337,8 @@ impl Tenant {
         grace: Duration,
     ) -> Result<usize> {
         let window = restore_window(coordinator, &self.id, default_window).await?;
-        let deleted = self.compact(window.saturating_add(grace)).await?;
         coordinator.forget_history(&key(&self.id), window).await?;
-        Ok(deleted)
+        self.compact(window.saturating_add(grace)).await
     }
 
     /// An error from something that leaves the writer open unless it says
@@ -611,7 +614,8 @@ impl Node {
 
     /// Put `tenant` back as it stood at `point`, which must lie within its
     /// restore window, as a new commit. Returns the state gone back to and
-    /// the position of the commit that restored it.
+    /// the position of the commit that restored it. The restore runs to its
+    /// end even if the caller stops waiting for it.
     pub async fn restore(
         &self,
         tenant: &TenantId,
@@ -625,11 +629,19 @@ impl Node {
             .restore_point(&key(tenant), point, window)
             .await?
             .ok_or_else(|| NodeError::NoRestorePoint(tenant.clone()))?;
-        let restored = opened
-            .writer
-            .restore(&target.head, target.position)
+        let restoring = {
+            let (opened, target) = (opened.clone(), target.clone());
+            tokio::spawn(async move {
+                opened
+                    .writer
+                    .restore(&target.head, target.position)
+                    .await
+                    .map_err(|error| opened.closed(error))
+            })
+        };
+        let restored = restoring
             .await
-            .map_err(|error| opened.closed(error))?;
+            .map_err(|error| StorageError::Background(error.to_string()))??;
         tracing::info!(%tenant, from = ?target.position, at = %target.at, ?restored, "restored");
         Ok((target, restored))
     }

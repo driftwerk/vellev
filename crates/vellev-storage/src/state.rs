@@ -1200,6 +1200,7 @@ impl State {
     ) -> Manifest {
         Manifest {
             prev: self.checkpoint.clone(),
+            next_collection_id: self.catalog.next_id().max(target.catalog.next_id()),
             answered: self.answers.kept(),
             ..target.manifest(position, &target.catalog, flushed)
         }

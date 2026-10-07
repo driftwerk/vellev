@@ -275,9 +275,24 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>>;
 
     /// Set how far back `tenant` may be restored, or with `None` go back to
-    /// the default. Returns whether there is such a tenant.
+    /// the default; at most [`MAX_RESTORE_WINDOW`]. Returns whether there is
+    /// such a tenant.
     async fn set_restore_window(&self, tenant: &TenantId, window: Option<Duration>)
         -> Result<bool>;
+}
+
+/// The longest a restore window may be.
+pub const MAX_RESTORE_WINDOW: Duration = Duration::from_secs(10 * 366 * 24 * 60 * 60);
+
+/// `window`, unless it is longer than any restore window may be.
+fn checked_window(window: Duration) -> Result<Duration> {
+    (window <= MAX_RESTORE_WINDOW)
+        .then_some(window)
+        .ok_or_else(|| {
+            CoordinatorError::InvalidArgument(format!(
+                "a restore window of {window:?} exceeds {MAX_RESTORE_WINDOW:?}"
+            ))
+        })
 }
 
 /// The moment a window reaching back `window` from `now` begins.

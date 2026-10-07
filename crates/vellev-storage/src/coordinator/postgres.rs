@@ -9,9 +9,9 @@ use uuid::Uuid;
 use vellev_core::{NodeId, Partition, TenantId};
 
 use super::{
-    checked_ttl, Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Point, RestorePoint,
-    Result, TenantKey, Versions,
+    checked_ttl, checked_window, Acquired, Commit, Committed, Coordinator, CoordinatorError,
+    Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Point,
+    RestorePoint, Result, TenantKey, Versions,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -168,18 +168,22 @@ fn version(value: i32) -> Result<u16> {
 
 /// The commits of the partition as it is now that a restore reaching back
 /// `$3` seconds may go to: those within the window, and the last before
-/// it.
+/// it, found by time and then taken by position, which grows with it.
 const REACHABLE: &str = "WITH current AS (
          SELECT incarnation, now() - make_interval(secs => $3) AS start
          FROM vellev.partitions WHERE tenant = $1 AND partition = $2
-     ), history AS (
-         SELECT c.position, c.head, c.committed_at, c.incarnation, current.start
-         FROM vellev.commits c JOIN current USING (incarnation)
-         WHERE c.tenant = $1 AND c.partition = $2
+     ), boundary AS (
+         SELECT current.incarnation, COALESCE((
+             SELECT c.position FROM vellev.commits c
+             WHERE c.tenant = $1 AND c.partition = $2 AND c.incarnation = current.incarnation
+               AND c.committed_at < current.start
+             ORDER BY c.committed_at DESC LIMIT 1
+         ), 0) AS position
+         FROM current
      ), reachable AS (
-         SELECT * FROM history
-         WHERE committed_at >= start
-            OR position = (SELECT max(position) FROM history WHERE committed_at < start)
+         SELECT c.position, c.head, c.committed_at, c.incarnation
+         FROM vellev.commits c JOIN boundary USING (incarnation)
+         WHERE c.tenant = $1 AND c.partition = $2 AND c.position >= boundary.position
      )";
 
 #[derive(FromRow)]
@@ -662,8 +666,8 @@ impl Coordinator for PostgresCoordinator {
             "{REACHABLE}
              DELETE FROM vellev.commits c
              WHERE c.tenant = $1 AND c.partition = $2
-               AND NOT EXISTS (SELECT 1 FROM reachable r
-                               WHERE r.position = c.position AND r.incarnation = c.incarnation)"
+               AND NOT EXISTS (SELECT 1 FROM boundary b
+                               WHERE b.incarnation = c.incarnation AND c.position >= b.position)"
         ))
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
@@ -674,15 +678,18 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>> {
-        let secs: Option<Option<i64>> = sqlx::query_scalar(
-            "SELECT restore_window_secs FROM vellev.partitions WHERE tenant = $1 LIMIT 1",
+        let secs: Option<i64> = sqlx::query_scalar(
+            "SELECT max(restore_window_secs) FROM vellev.partitions WHERE tenant = $1",
         )
         .bind(tenant.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(secs
-            .flatten()
-            .map(|secs| Duration::from_secs(secs.unsigned_abs())))
+        secs.map(|secs| {
+            u64::try_from(secs)
+                .map(Duration::from_secs)
+                .map_err(|_| invariant(format!("a restore window of {secs} seconds")))
+        })
+        .transpose()
     }
 
     async fn set_restore_window(
@@ -691,7 +698,7 @@ impl Coordinator for PostgresCoordinator {
         window: Option<Duration>,
     ) -> Result<bool> {
         let secs = window
-            .map(|window| bigint(window.as_secs().max(1)))
+            .map(|window| bigint(checked_window(window)?.as_secs().max(1)))
             .transpose()?;
         let done =
             sqlx::query("UPDATE vellev.partitions SET restore_window_secs = $2 WHERE tenant = $1")

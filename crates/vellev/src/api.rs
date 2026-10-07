@@ -17,7 +17,7 @@ use vellev_api::{
 };
 use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, RequestId, TenantId};
 use vellev_node::{Freshness, Reader};
-use vellev_storage::coordinator::{Incarnation, LogPosition, Point};
+use vellev_storage::coordinator::{Incarnation, LogPosition, Point, MAX_RESTORE_WINDOW};
 use vellev_storage::{Batch as Writes, Hybrid as HybridQuery, Keywords};
 use vellev_storage::{
     Condition, Fused, Hit, Mutation, Query as VectorQuery, Receipt, Scored, State, DEFAULT_ALPHA,
@@ -406,14 +406,17 @@ pub async fn restore_points(
     let (earliest, latest) = points.unzip();
     Ok(Json(RestorePoints {
         window_secs: window.as_secs(),
-        earliest: earliest.map(restore_point),
-        latest: latest.map(restore_point),
+        earliest: earliest.map(described),
+        latest: latest.map(described),
     }))
 }
 
 /// Put the tenant back as it stood at a moment or a commit within its
-/// restore window. Nothing is lost: the restore is a commit of its own,
-/// and the states before it can be gone back to as before.
+/// restore window; a point out of reach, or a moment to come, is not
+/// found. Nothing is lost: the restore is a commit of its own, and the
+/// states before it can be gone back to as before. Writes are refused as
+/// unavailable while it runs, and requests answered before it stay
+/// answered. A restore runs to its end even if the caller stops waiting.
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/restore",
@@ -434,7 +437,7 @@ pub async fn restore(
     };
     let (from, position) = app.node()?.restore(&tenant, point).await?;
     Ok(Json(Restored {
-        from: restore_point(from),
+        from: described(from),
         position: position.0,
     }))
 }
@@ -455,8 +458,11 @@ pub async fn set_restore_window(
     Named(tenant): Named<TenantId>,
     Body(window): Body<RestoreWindow>,
 ) -> Result<StatusCode, ApiError> {
-    if window.secs == Some(0) {
-        return Err(ApiError::invalid("a restore window is at least a second"));
+    let most = MAX_RESTORE_WINDOW.as_secs();
+    if window.secs.is_some_and(|secs| secs == 0 || secs > most) {
+        return Err(ApiError::invalid(format!(
+            "a restore window is from 1 to {most} seconds"
+        )));
     }
     let set = app
         .node()?
@@ -470,7 +476,8 @@ pub async fn set_restore_window(
     }
 }
 
-fn restore_point(point: vellev_storage::coordinator::RestorePoint) -> RestorePoint {
+/// A restore point as the API describes it.
+fn described(point: vellev_storage::coordinator::RestorePoint) -> RestorePoint {
     RestorePoint {
         position: point.position.0,
         at: point.at,

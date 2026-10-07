@@ -12,6 +12,7 @@ CREATE TABLE vellev.commits (
     committed_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant, partition, incarnation, position)
 );
+CREATE INDEX commits_by_time ON vellev.commits (tenant, partition, incarnation, committed_at);
 
 -- How far back a tenant may be restored, where it is not the default.
 ALTER TABLE vellev.partitions ADD COLUMN restore_window_secs bigint

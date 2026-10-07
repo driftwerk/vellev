@@ -110,7 +110,9 @@ fn code(error: &StorageError) -> Code {
         | E::Blob { .. }
         | E::Embedding { .. }
         | E::Closed
+        | E::Restoring
         | E::Diverged { .. } => Code::Unavailable,
+        E::Shared(shared) if matches!(**shared, E::Restoring) => Code::Unavailable,
         E::Shared(_) => Code::Uncertain,
         E::Refused(refusal) => match refusal.kind {
             Refused::NotFound => Code::NotFound,

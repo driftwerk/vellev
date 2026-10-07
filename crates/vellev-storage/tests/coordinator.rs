@@ -8,7 +8,7 @@ use vellev_core::{NodeId, Partition, TenantId};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
     ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, Point, PostgresCoordinator,
-    RestorePoint, Versions, MAX_TTL,
+    RestorePoint, Versions, MAX_RESTORE_WINDOW, MAX_TTL,
 };
 
 const TTL: Duration = Duration::from_secs(30);
@@ -771,6 +771,12 @@ async fn a_tenant_keeps_its_own_restore_window_until_told_otherwise(h: &dyn Harn
     );
     assert!(coordinator.set_restore_window(tenant, None).await.unwrap());
     assert_eq!(coordinator.restore_window(tenant).await.unwrap(), None);
+    assert!(matches!(
+        coordinator
+            .set_restore_window(tenant, Some(MAX_RESTORE_WINDOW + HOUR))
+            .await,
+        Err(CoordinatorError::InvalidArgument(_))
+    ));
     let absent = self::key().tenant;
     assert!(!coordinator
         .set_restore_window(&absent, Some(HOUR))
