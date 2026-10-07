@@ -524,6 +524,42 @@ async fn rows_of_one_vector_come_back_in_id_order_from_a_shortlisted_segment() {
     }
 }
 
+/// The objects a filter keeps include those with no vector, which no
+/// vector index holds. Searched by a zero query, as far from every row,
+/// with no more rows scored than asked for, a shortlisted segment still
+/// answers with the lowest ids of those that have a vector.
+#[tokio::test]
+async fn a_zero_query_passes_over_the_objects_with_no_vector() {
+    for merging in index_kinds() {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let mut random = Random(47);
+        let unvectored = (1..=10).map(|n| put(n, 0, None));
+        let vectored = (11..=SHORTLISTED + 10).map(|n| put(n, 0, Some(random.vector(8))));
+        writer
+            .commit(
+                [collection(8, Distance::Cosine)]
+                    .into_iter()
+                    .chain(unvectored)
+                    .chain(vectored)
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let everything = group_is(0);
+        writer.partition().read(|state| {
+            let asked = Query {
+                oversample: 1,
+                ..Query::nearest(&[0.0; 8], 3)
+            }
+            .filtered(&everything);
+            let hits = state.search(&name(VECTORS), &asked).unwrap();
+            assert_eq!(ids(&hits), [row(11), row(12), row(13)], "{merging:?}");
+        });
+    }
+}
+
 /// A zero query is as far from every row, at cosine distance one or at an
 /// inner product of zero, so a shortlisted segment answers with the lowest
 /// ids, as scoring every row would.
