@@ -102,3 +102,23 @@ async fn a_point_out_of_reach_is_not_found_and_the_window_is_set_per_tenant() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn only_an_admin_key_restores_a_tenant_even_its_own_key() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    let issued = served.ok(Method::POST, "/v1/tenants/acme/keys", None).await;
+    let key = issued["key"].as_str().unwrap();
+    for (method, path, body) in [
+        (Method::GET, POINTS, None),
+        (Method::POST, RESTORE, Some(json!({ "position": 1 }))),
+        (
+            Method::PUT,
+            "/v1/tenants/acme/restore-window",
+            Some(json!({ "secs": 60 })),
+        ),
+    ] {
+        let (status, answer) = served.call_as(Some(key), method.clone(), path, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {answer}");
+    }
+}
