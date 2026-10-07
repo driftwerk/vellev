@@ -518,6 +518,46 @@ async fn rows_of_one_vector_come_back_in_id_order_from_a_shortlisted_segment() {
     }
 }
 
+/// Copies of one vector in two clustered segments, each written in
+/// descending id order, searched scoring no more than each segment's own
+/// nearest few: those few are its lowest ids, so the lowest of all are
+/// found.
+#[tokio::test]
+async fn each_clustered_segments_own_nearest_few_are_its_lowest_ids() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await.merging_with(Merging {
+        clustered_above: 4_000,
+        ..Merging::default()
+    });
+    writer
+        .commit(vec![collection(8, Distance::L2)])
+        .await
+        .unwrap();
+    let same = vec![0.5; 8];
+    for first in [1, SHORTLISTED + 1] {
+        let backwards = (first..first + SHORTLISTED).rev();
+        writer
+            .commit(backwards.map(|n| put(n, 0, Some(same.clone()))).collect())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            // Six rows scored, three from each segment.
+            let asked = Query {
+                oversample: 2,
+                ..Query::nearest(&same, 3)
+            };
+            let hits = state.search(&name(VECTORS), &asked).unwrap();
+            assert_eq!(ids(&hits), [row(1), row(2), row(3)]);
+        });
+    }
+}
+
 /// Values each finite but large enough that a distance overflows: the
 /// inner product of the first two with the third is not a number, the
 /// cosine of the first against [1, 0] comes out as a right angle, and the
