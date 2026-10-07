@@ -829,8 +829,8 @@ impl Writer {
             log_position: position,
             manifest: Some(head.clone()),
         };
-        let target = Partition::load(self.lease.key.clone(), self.partition.blobs.clone(), &at)
-            .await?;
+        let target =
+            Partition::load(self.lease.key.clone(), self.partition.blobs.clone(), &at).await?;
         let segment = match target.read(State::snapshot) {
             Some(mut snapshot) => {
                 while target.read(|state| state.copy_rows(&mut snapshot, usize::MAX)) {}
