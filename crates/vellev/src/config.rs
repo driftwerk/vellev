@@ -103,6 +103,10 @@ pub struct Config {
     /// How long a backup is kept, in seconds; a tenant's newest always is.
     #[arg(long, env = "VELLEV_BACKUPS_KEPT_SECS", default_value_t = 35 * 24 * 60 * 60)]
     pub backups_kept_secs: u64,
+    /// How long after a tenant is removed its files, backups and cached
+    /// copies are deleted, in seconds; it cannot be made again until then.
+    #[arg(long, env = "VELLEV_PURGE_AFTER_SECS", default_value_t = 10 * 60)]
+    pub purge_after_secs: u64,
     /// How much longer than a tenant's restore window its files that
     /// nothing reaches any more, such as segments a merge replaced, are
     /// kept before they are deleted, in seconds.
@@ -278,6 +282,7 @@ impl Config {
                 .map(|store| Arc::new(store) as Arc<dyn Blobs>),
             backup_every: Duration::from_secs(self.backup_every_secs),
             backups_kept: Duration::from_secs(self.backups_kept_secs),
+            purge_after: Duration::from_secs(self.purge_after_secs),
             grace: Duration::from_secs(self.grace_secs),
             max_format: self.max_format,
             tenant_idle: Duration::from_secs(self.tenant_idle_secs),

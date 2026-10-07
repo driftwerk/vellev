@@ -28,6 +28,11 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     async fn local(&self, _key: &str) -> Result<Option<PathBuf>> {
         Ok(None)
     }
+    /// Drop whatever copies of files under `prefix` the store keeps on
+    /// local disk, leaving the files themselves be.
+    async fn forget_local(&self, _prefix: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A file as a listing shows it.
@@ -328,5 +333,18 @@ impl Blobs for CachedBlobs {
         }
         self.get(key).await?;
         Ok(tokio::fs::metadata(&path).await.is_ok().then_some(path))
+    }
+
+    async fn forget_local(&self, prefix: &str) -> Result<()> {
+        let Some(path) = self.path(prefix.trim_end_matches('/')) else {
+            return Ok(());
+        };
+        match tokio::fs::remove_dir_all(&path).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!(prefix, %error, "could not drop cached files");
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }

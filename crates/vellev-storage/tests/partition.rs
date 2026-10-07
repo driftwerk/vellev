@@ -453,6 +453,22 @@ impl Coordinator for Unreliable {
         self.inner.restore_window(tenant).await
     }
 
+    async fn purges(
+        &self,
+        due: Duration,
+        lately: Duration,
+    ) -> Result<vellev_storage::coordinator::Purges, CoordinatorError> {
+        self.inner.purges(due, lately).await
+    }
+
+    async fn purged(
+        &self,
+        tenant: &TenantId,
+        forget_after: Duration,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.purged(tenant, forget_after).await
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,
@@ -725,6 +741,11 @@ async fn a_follower_of_a_replaced_partition_is_told_to_reopen() {
     let follower = cluster.open().await;
 
     cluster.coordinator.remove(&cluster.key).await.unwrap();
+    cluster
+        .coordinator
+        .purged(&cluster.key.tenant, Duration::ZERO)
+        .await
+        .unwrap();
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let replacement = cluster.writer().await;
     assert!(matches!(
@@ -921,6 +942,11 @@ async fn a_reading_from_a_removed_history_is_ignored_even_when_it_is_further_alo
     let old = cluster.committed().await;
 
     cluster.coordinator.remove(&cluster.key).await.unwrap();
+    cluster
+        .coordinator
+        .purged(&cluster.key.tenant, Duration::ZERO)
+        .await
+        .unwrap();
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let writer = cluster.writer().await;
     let position = writer.commit(vec![create("notes")]).await.unwrap().position;
@@ -959,6 +985,11 @@ async fn a_removed_history_is_never_adopted_before_anyone_takes_a_new_lease() {
     let holding_old = cluster.open().await;
 
     cluster.coordinator.remove(&cluster.key).await.unwrap();
+    cluster
+        .coordinator
+        .purged(&cluster.key.tenant, Duration::ZERO)
+        .await
+        .unwrap();
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let registered = cluster.committed().await;
     assert!(registered.generation > old.generation);
@@ -1580,6 +1611,11 @@ async fn a_copy_never_follows_into_a_tenant_registered_again_even_past_where_it_
     let holding_old = cluster.open().await;
 
     cluster.coordinator.remove(&cluster.key).await.unwrap();
+    cluster
+        .coordinator
+        .purged(&cluster.key.tenant, Duration::ZERO)
+        .await
+        .unwrap();
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let writer = cluster.writer().await;
     writer.commit(vec![create("notes")]).await.unwrap();
@@ -1597,4 +1633,32 @@ async fn a_copy_never_follows_into_a_tenant_registered_again_even_past_where_it_
     holding_old
         .partition()
         .read(|state| assert!(state.collection(&name("notes")).is_none()));
+}
+
+#[tokio::test]
+async fn the_cache_forgets_a_tenant_whole_and_nothing_else() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cached = CachedBlobs::new(cluster.blobs.clone(), dir.path());
+    let listed = cluster.blobs.list("tenant-a/").await.unwrap();
+    for file in &listed {
+        cached.get(&file.key).await.unwrap();
+    }
+    let other = dir.path().join("tenant-b/kept");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, b"kept").unwrap();
+
+    cached.forget_local("tenant-a/").await.unwrap();
+    assert!(!dir.path().join("tenant-a").exists());
+    assert!(other.exists(), "another tenant's copies stay");
+    for file in &listed {
+        cached.get(&file.key).await.unwrap();
+    }
+    cached.forget_local("../").await.unwrap();
+    assert!(dir.path().exists(), "nothing outside is touched");
 }

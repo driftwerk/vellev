@@ -110,6 +110,7 @@ impl Cluster {
             lease: LEASE,
             restore_window: Duration::ZERO,
             grace: Duration::ZERO,
+            purge_after: Duration::ZERO,
             ..Settings::new(NodeId::generate("node"))
         }
     }
@@ -252,6 +253,15 @@ async fn tenants_are_created_listed_a_page_at_a_time_and_dropped() {
         "unopened tenants are not kept"
     );
 
+    assert!(
+        matches!(
+            node.create_tenant(&tenant("acme")).await,
+            Err(NodeError::Storage(_))
+        ),
+        "not made again until what was kept of it is purged"
+    );
+    node.purge_due().await.unwrap();
+    assert!(cluster.store.list("acme/").await.unwrap().is_empty());
     node.create_tenant(&tenant("acme")).await.unwrap();
     let anew = node.tenant(&tenant("acme")).await.unwrap();
     assert!(anew.read(|state| state.collection(&notes()).is_none()));
@@ -906,6 +916,22 @@ impl Coordinator for Unrenewing {
         self.inner.restore_window(tenant).await
     }
 
+    async fn purges(
+        &self,
+        due: Duration,
+        lately: Duration,
+    ) -> Result<vellev_storage::coordinator::Purges, CoordinatorError> {
+        self.inner.purges(due, lately).await
+    }
+
+    async fn purged(
+        &self,
+        tenant: &TenantId,
+        forget_after: Duration,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.purged(tenant, forget_after).await
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,
@@ -1123,6 +1149,7 @@ async fn a_tenant_dropped_and_created_again_never_holds_a_read_up() {
     assert_eq!(counted(&followed), 5);
 
     writing.drop_tenant(&tenant("acme")).await.unwrap();
+    writing.purge_due().await.unwrap();
     writing.create_tenant(&tenant("acme")).await.unwrap();
     let acme = writing.tenant(&tenant("acme")).await.unwrap();
     let new = acme
@@ -1316,6 +1343,7 @@ async fn a_strong_read_on_a_holder_of_a_tenant_since_recreated_reads_the_new_one
         .unwrap();
 
     other.drop_tenant(&tenant("acme")).await.unwrap();
+    other.purge_due().await.unwrap();
     other.create_tenant(&tenant("acme")).await.unwrap();
     let eventual = holding
         .reader(&tenant("acme"), Freshness::Eventual)

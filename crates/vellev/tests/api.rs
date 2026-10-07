@@ -1470,6 +1470,7 @@ async fn a_tenant_key_reaches_its_tenant_alone_and_learns_nothing_of_others() {
     let other = first.ok(Method::POST, "/v1/tenants/acme/keys", None).await;
     let other = other["key"].as_str().unwrap().to_string();
     first.ok(Method::DELETE, "/v1/tenants/acme", None).await;
+    first.node.purge_due().await.unwrap();
     first.ok(Method::PUT, "/v1/tenants/acme", None).await;
     let (status, _) = first
         .call_as(

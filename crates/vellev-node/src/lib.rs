@@ -24,6 +24,7 @@ use vellev_storage::{
 mod backing;
 mod keys;
 mod limits;
+mod purging;
 mod reading;
 
 use keys::Keys;
@@ -98,6 +99,9 @@ pub struct Settings {
     pub backup_every: Duration,
     /// How long a backup is kept; the newest of a tenant always is.
     pub backups_kept: Duration,
+    /// How long after a tenant is removed everything kept of it is
+    /// deleted: long enough for any node still writing it to notice.
+    pub purge_after: Duration,
 }
 
 impl Settings {
@@ -121,6 +125,7 @@ impl Settings {
             backups: None,
             backup_every: Duration::from_secs(24 * 60 * 60),
             backups_kept: Duration::from_secs(35 * 24 * 60 * 60),
+            purge_after: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -461,6 +466,8 @@ struct Inner {
     store_answered: Mutex<Option<Instant>>,
     keys: Keys,
     limits: Arc<Limits>,
+    /// The tenants purged lately whose cached files this node has dropped.
+    dropped: Mutex<std::collections::HashSet<TenantId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -480,6 +487,7 @@ impl Node {
             open: Mutex::default(),
             store_answered: Mutex::default(),
             keys: Keys::default(),
+            dropped: Mutex::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,

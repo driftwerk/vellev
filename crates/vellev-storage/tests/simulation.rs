@@ -285,6 +285,22 @@ impl Coordinator for SimCoordinator {
         self.clean.restore_window(tenant).await
     }
 
+    async fn purges(
+        &self,
+        due: Duration,
+        lately: Duration,
+    ) -> Result<vellev_storage::coordinator::Purges, CoordinatorError> {
+        self.clean.purges(due, lately).await
+    }
+
+    async fn purged(
+        &self,
+        tenant: &TenantId,
+        forget_after: Duration,
+    ) -> Result<(), CoordinatorError> {
+        self.clean.purged(tenant, forget_after).await
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,

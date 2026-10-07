@@ -242,3 +242,32 @@ async fn the_command_line_backs_up_and_restores() {
         .unwrap_err();
     assert!(refused.contains("cannot be used with"), "{refused}");
 }
+
+#[tokio::test]
+async fn removing_a_tenant_purges_its_files_backups_and_restore_points() {
+    let store = memory();
+    let cluster = Cluster::new();
+    let served = cluster.serve_backing_up_to(store.clone()).await;
+    served.with_notes(supplied()).await;
+    served.ok(Method::PUT, &object(1), Some(titled(1))).await;
+    served.ok(Method::POST, BACKUPS, None).await;
+    served.ok(Method::DELETE, "/v1/tenants/acme", None).await;
+
+    let (status, body) = served.put("/v1/tenants/acme", json!(null)).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::CONFLICT, "conflict"),
+        "not made again before it is purged"
+    );
+    served.node.purge_due().await.unwrap();
+    assert!(store.list("_backups/acme/").await.unwrap().is_empty());
+    assert!(cluster.blobs().list("acme/").await.unwrap().is_empty());
+
+    served.ok(Method::PUT, "/v1/tenants/acme", None).await;
+    let points = served
+        .ok(Method::GET, "/v1/tenants/acme/restore-points", None)
+        .await;
+    assert_eq!(points["earliest"], json!(null), "no restore point is left");
+    let listed = served.ok(Method::GET, BACKUPS, None).await;
+    assert_eq!(listed["backups"], json!([]), "nor any backup");
+}

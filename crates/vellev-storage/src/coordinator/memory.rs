@@ -12,7 +12,7 @@ use vellev_core::{NodeId, TenantId};
 use super::{
     checked_hold, checked_ttl, checked_window, window_start, Acquired, Commit, Committed,
     Coordinator, CoordinatorError, Generation, Incarnation, KeyHash, Lease, LogPosition,
-    ManifestRef, PartitionKey, Point, RestorePoint, Result, TenantKey, Versions,
+    ManifestRef, PartitionKey, Point, Purges, RestorePoint, Result, TenantKey, Versions,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -81,6 +81,9 @@ impl Row {
     }
 }
 
+/// When a tenant was removed, and when its files were purged.
+type Purge = (DateTime<Utc>, Option<DateTime<Utc>>);
+
 /// The coordinator's rules without a database: the same fencing, driven by an
 /// injectable clock.
 #[derive(Debug)]
@@ -91,6 +94,7 @@ pub struct MemoryCoordinator {
     nodes: Mutex<HashMap<NodeId, Versions>>,
     format: Mutex<u16>,
     keys: Mutex<Vec<(TenantId, KeyHash, TenantKey)>>,
+    purges: Mutex<HashMap<TenantId, Purge>>,
 }
 
 impl Default for MemoryCoordinator {
@@ -108,6 +112,7 @@ impl MemoryCoordinator {
             nodes: Mutex::new(HashMap::new()),
             format: Mutex::new(1),
             keys: Mutex::new(Vec::new()),
+            purges: Mutex::default(),
         }
     }
 
@@ -162,6 +167,13 @@ fn expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
 #[async_trait]
 impl Coordinator for MemoryCoordinator {
     async fn register(&self, key: &PartitionKey) -> Result<()> {
+        let purging = self.purges.lock().expect("coordinator lock");
+        if purging
+            .get(&key.tenant)
+            .is_some_and(|(_, purged)| purged.is_none())
+        {
+            return Err(CoordinatorError::Purging(key.tenant.clone()));
+        }
         let mut rows = self.rows.lock().expect("coordinator lock");
         if !rows.contains_key(key) {
             let generation = self.next_generation();
@@ -189,6 +201,12 @@ impl Coordinator for MemoryCoordinator {
                 .lock()
                 .expect("coordinator lock")
                 .retain(|(tenant, ..)| tenant != &key.tenant);
+            if existed {
+                self.purges
+                    .lock()
+                    .expect("coordinator lock")
+                    .insert(key.tenant.clone(), (self.clock.now(), None));
+            }
         }
         Ok(existed)
     }
@@ -443,6 +461,34 @@ impl Coordinator for MemoryCoordinator {
             Ok(forgotten as u64)
         })
         .or_else(|error| unknown_is_none::<()>(error).map(|_| 0))
+    }
+
+    async fn purges(&self, due: Duration, lately: Duration) -> Result<Purges> {
+        let now = self.clock.now();
+        let (due, lately) = (window_start(now, due)?, window_start(now, lately)?);
+        let purges = self.purges.lock().expect("coordinator lock");
+        let mut found = Purges::default();
+        for (tenant, (requested, purged)) in purges.iter() {
+            match purged {
+                None if *requested <= due => found.due.push(tenant.clone()),
+                Some(purged) if *purged >= lately => found.lately.push(tenant.clone()),
+                _ => {}
+            }
+        }
+        found.due.sort();
+        found.lately.sort();
+        Ok(found)
+    }
+
+    async fn purged(&self, tenant: &TenantId, forget_after: Duration) -> Result<()> {
+        let now = self.clock.now();
+        let forgotten = window_start(now, forget_after)?;
+        let mut purges = self.purges.lock().expect("coordinator lock");
+        if let Some((_, purged)) = purges.get_mut(tenant) {
+            *purged = Some(now);
+        }
+        purges.retain(|_, (_, purged)| purged.is_none_or(|purged| purged >= forgotten));
+        Ok(())
     }
 
     async fn claim_backup(

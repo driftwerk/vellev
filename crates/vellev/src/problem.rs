@@ -106,6 +106,7 @@ fn code(error: &StorageError) -> Code {
             Code::Invalid
         }
         E::Coordinator(CoordinatorError::InvalidArgument(_)) => Code::Internal,
+        E::Coordinator(CoordinatorError::Purging(_)) => Code::Conflict,
         E::Coordinator(_)
         | E::Blob { .. }
         | E::Embedding { .. }
