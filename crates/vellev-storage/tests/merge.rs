@@ -620,6 +620,36 @@ async fn a_run_stops_where_the_rows_a_merge_may_hold_run_out() {
 }
 
 #[tokio::test]
+async fn flushes_a_little_over_a_fanouts_share_are_merged_as_far_as_they_fit() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await.merging_with(Merging {
+        fanout: 4,
+        rows: 100,
+        ..Merging::default()
+    });
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for round in 0..8u8 {
+        let writes = (0..27).map(|n| upsert("notes", round * 27 + n, 1));
+        writer.commit(writes.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    while writer.merge().await.unwrap().is_some() {}
+    let shape: Vec<u64> = segments_of(&cluster)
+        .await
+        .iter()
+        .map(|segment| segment.rows)
+        .collect();
+    assert_eq!(
+        shape,
+        [81, 81, 54],
+        "three of 27 fill a merge, and the last two together reach half of one"
+    );
+    writer
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), 8 * 27));
+}
+
+#[tokio::test]
 async fn a_segment_with_nothing_dead_is_never_stale_however_low_the_bar() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await.merging_with(Merging {

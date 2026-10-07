@@ -38,8 +38,8 @@ pub struct Merging {
     /// How many adjacent small segments are merged into one. Fewer than two
     /// is taken as two.
     pub fanout: usize,
-    /// The most live rows a merge produces; a segment holding at most a
-    /// `fanout`th of it counts as small.
+    /// The most live rows a merge produces; a segment holding under half
+    /// of it counts as small.
     pub rows: usize,
     /// A collection with more vectors than this in one segment gets a
     /// clustered index.
@@ -895,18 +895,22 @@ impl State {
         if let Some(at) = stale {
             return Some(plan(at..at + 1));
         }
+        // A segment is small while it holds under half a merge's worth of
+        // rows. A run of small ones is merged once it is `fanout` long, or
+        // once it is as large as it can grow, the next being too many to
+        // add: flushes take in what is written while they build, so they
+        // do not come out a neat fraction of a merge.
+        let small = |live: usize| live < merging.rows / 2;
         let mut start = 0;
         while start < live.len() {
             let mut end = start;
             let mut rows = 0;
-            while end < live.len() && live[end] <= merging.rows / fanout {
-                if rows + live[end] > merging.rows {
-                    break;
-                }
+            while end < live.len() && small(live[end]) && rows + live[end] <= merging.rows {
                 rows += live[end];
                 end += 1;
             }
-            if end - start >= fanout {
+            let full = end < live.len() && small(live[end]) || rows >= merging.rows / 2;
+            if end - start >= fanout || end - start >= 2 && full {
                 return Some(plan(start..end));
             }
             start = end.max(start + 1);
