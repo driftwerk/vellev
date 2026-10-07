@@ -68,7 +68,7 @@ async fn a_partition_is_put_back_as_it_stood_and_goes_on_from_there() {
     let (head, position) = history(&cluster, &writer).await;
     let before = writer.partition().read(State::position);
 
-    let restored = writer.restore(&head, position).await.unwrap();
+    let restored = writer.restore(Some(&head), position).await.unwrap();
     assert_eq!(restored, before.next().unwrap(), "past where it was");
     let read = |state: &State| ns(state, &[1, 2, 3]);
     assert_eq!(writer.partition().read(read), [Some(1), Some(20), Some(3)]);
@@ -91,7 +91,7 @@ async fn a_follower_catches_up_through_a_restore() {
     let follower = cluster.open().await;
     assert_eq!(follower.partition().read(|state| ns(state, &[1])), [None]);
 
-    writer.restore(&head, position).await.unwrap();
+    writer.restore(Some(&head), position).await.unwrap();
     writer.commit(vec![upsert("notes", 3, 30)]).await.unwrap();
     let committed = cluster.committed().await;
     assert_eq!(
@@ -111,8 +111,8 @@ async fn a_restore_can_be_undone_by_restoring_to_before_it() {
     let (head, position) = history(&cluster, &writer).await;
     let (latest, latest_at) = now(&cluster).await;
 
-    writer.restore(&head, position).await.unwrap();
-    writer.restore(&latest, latest_at).await.unwrap();
+    writer.restore(Some(&head), position).await.unwrap();
+    writer.restore(Some(&latest), latest_at).await.unwrap();
     assert_eq!(
         writer.partition().read(|state| ns(state, &[1, 2, 3])),
         [None, Some(200), Some(300)]
@@ -134,7 +134,7 @@ async fn requests_answered_before_a_restore_stay_answered() {
         .await
         .unwrap();
 
-    writer.restore(&head, position).await.unwrap();
+    writer.restore(Some(&head), position).await.unwrap();
     assert!(writer.partition().read(|state| state.answered(request)));
     writer
         .commit_batches(vec![batch()], Embedded::new())
@@ -152,7 +152,7 @@ async fn cleaning_up_keeps_what_a_restore_needs_however_old() {
     let cluster = Cluster::new().await;
     let writer = writer(&cluster).await;
     let (head, position) = history(&cluster, &writer).await;
-    writer.restore(&head, position).await.unwrap();
+    writer.restore(Some(&head), position).await.unwrap();
 
     let deleted = writer.clean(Duration::ZERO).await.unwrap();
     assert!(deleted > 0, "what nothing needs goes");
@@ -233,7 +233,7 @@ async fn a_restore_keeps_its_old_segments_once_its_target_has_aged_out() {
     let writer = writer(&cluster).await;
     let (head, position) = history(&cluster, &writer).await;
     let (latest, latest_at) = now(&cluster).await;
-    let restored = writer.restore(&head, position).await.unwrap();
+    let restored = writer.restore(Some(&head), position).await.unwrap();
     writer.commit(vec![upsert("notes", 4, 4)]).await.unwrap();
 
     // Only the restore and what came after is recent: the latest
@@ -260,7 +260,7 @@ async fn a_restore_keeps_its_old_segments_once_its_target_has_aged_out() {
         .filter(|listed| listed.key.ends_with(".manifest"))
         .count();
     assert_eq!(checkpoints, 2);
-    writer.restore(&latest, latest_at).await.unwrap();
+    writer.restore(Some(&latest), latest_at).await.unwrap();
     assert_eq!(
         writer.partition().read(|state| ns(state, &[1, 2, 3])),
         [None, Some(200), Some(300)],
@@ -294,7 +294,7 @@ async fn how_a_partition_stood_when_its_window_began_stays_restorable() {
     aged.young_from
         .store(position.next().unwrap().0 as usize, Ordering::SeqCst);
     writer.clean(Duration::from_secs(60 * 60)).await.unwrap();
-    writer.restore(&head, position).await.unwrap();
+    writer.restore(Some(&head), position).await.unwrap();
     assert_eq!(
         cluster
             .open()
@@ -315,7 +315,7 @@ async fn writes_are_refused_and_cleaning_up_waits_while_a_restore_runs() {
     paused.armed.store(true, Ordering::SeqCst);
     let restoring = tokio::spawn({
         let writer = writer.clone();
-        async move { writer.restore(&head, position).await }
+        async move { writer.restore(Some(&head), position).await }
     });
     assert_eq!(seen.recv().await, Some("stored"));
     paused.armed.store(false, Ordering::SeqCst);
@@ -353,7 +353,7 @@ async fn a_restore_that_fails_before_it_commits_leaves_the_writer_writing() {
         "{}manifest/missing.manifest",
         Layout(&cluster.key).prefix()
     ));
-    assert!(writer.restore(&nowhere, position).await.is_err());
+    assert!(writer.restore(Some(&nowhere), position).await.is_err());
     writer.commit(vec![upsert("notes", 4, 4)]).await.unwrap();
 }
 
@@ -372,7 +372,7 @@ async fn a_restore_whose_commit_fails_closes_the_writer() {
     writer.commit(vec![upsert("notes", 1, 10)]).await.unwrap();
 
     observed.fail_puts.store(true, Ordering::SeqCst);
-    assert!(writer.restore(&head, position).await.is_err());
+    assert!(writer.restore(Some(&head), position).await.is_err());
     observed.fail_puts.store(false, Ordering::SeqCst);
     assert!(matches!(
         writer.commit(vec![upsert("notes", 2, 2)]).await,
@@ -393,7 +393,7 @@ async fn restoring_to_where_a_partition_is_changes_nothing_in_it() {
     let (head, position) = now(&cluster).await;
     let before = writer.partition().read(|state| ns(state, &[1, 2, 3]));
     assert_eq!(
-        writer.restore(&head, position).await.unwrap(),
+        writer.restore(Some(&head), position).await.unwrap(),
         position.next().unwrap()
     );
     assert_eq!(

@@ -879,7 +879,8 @@ impl Writer {
     }
 
     /// Put the partition back as it stood when `head`, committed at
-    /// `position` since the partition was last registered, was its head.
+    /// `position`, was its head; with none, as it was before anything was
+    /// committed.
     /// Nothing is rewound: the state then becomes a checkpoint after the
     /// partition's position and the target's both, of the segments it had
     /// and the rows it held in memory, written as one segment. Every state
@@ -890,14 +891,18 @@ impl Writer {
     /// It holds the building lock throughout, as cleaning up does, so the
     /// target's files are not deleted while it is read, and the segment,
     /// named at the position the partition is at, stays until committed.
-    pub async fn restore(&self, head: &ManifestRef, position: LogPosition) -> Result<LogPosition> {
+    pub async fn restore(
+        &self,
+        head: Option<&ManifestRef>,
+        position: LogPosition,
+    ) -> Result<LogPosition> {
         let _building = self.building.lock().await;
         let _refusing = Refusing::writes(self).await;
         let at = Committed {
             generation: self.lease.generation,
             incarnation: self.partition.incarnation,
             log_position: position,
-            manifest: Some(head.clone()),
+            manifest: head.cloned(),
         };
         let target = Partition::load_reusing(
             self.lease.key.clone(),

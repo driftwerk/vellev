@@ -1689,3 +1689,39 @@ async fn a_tenant_is_restored_to_a_point_in_its_window_and_readers_follow() {
         None
     );
 }
+
+#[tokio::test]
+async fn every_tenant_is_backed_up_once_a_day_held_or_not() {
+    let cluster = Cluster::new();
+    let store: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let node = cluster.node_from(Settings {
+        backups: Some(store),
+        ..cluster.settings()
+    });
+    for name in ["acme", "beta"] {
+        node.create_tenant(&tenant(name)).await.unwrap();
+    }
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    let counts = || async {
+        let mut counts = Vec::new();
+        for name in ["acme", "beta"] {
+            counts.push(node.backups(&tenant(name)).await.unwrap().len());
+        }
+        counts
+    };
+
+    node.back_up_due().await.unwrap();
+    assert_eq!(counts().await, [1, 1], "beta, never opened, too");
+    node.back_up_due().await.unwrap();
+    assert_eq!(counts().await, [1, 1], "not due again yet");
+    cluster.clock.advance(Duration::from_secs(25 * 60 * 60));
+    node.back_up_due().await.unwrap();
+    assert_eq!(counts().await, [2, 2]);
+    assert!(matches!(
+        cluster.node().back_up(&tenant("acme")).await,
+        Err(NodeError::NoBackups)
+    ));
+}

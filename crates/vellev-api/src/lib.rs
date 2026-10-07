@@ -224,6 +224,27 @@ pub enum RestoreTo {
     At(chrono::DateTime<chrono::Utc>),
     /// As the commit at this position left it.
     Position(u64),
+    /// As the backup with this id took it.
+    Backup(uuid::Uuid),
+}
+
+/// A copy of a tenant kept in the backup store.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backup {
+    pub id: uuid::Uuid,
+    pub taken_at: chrono::DateTime<chrono::Utc>,
+    /// The position of the tenant's last commit then.
+    pub position: u64,
+    /// How many files it is kept as, each shared with the backups that
+    /// need it too.
+    pub files: usize,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backups {
+    pub backups: Vec<Backup>,
 }
 
 /// A restore done: the state gone back to, and the position of the commit

@@ -49,6 +49,13 @@ pub struct Backup {
     pub restore_window: Option<Duration>,
 }
 
+impl Backup {
+    /// The files every partition it took is loaded from.
+    pub fn files(&self) -> impl Iterator<Item = &String> {
+        self.partitions.iter().flat_map(|taken| &taken.files)
+    }
+}
+
 /// One partition as a backup took it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Taken {
@@ -117,16 +124,15 @@ impl Backups {
     async fn copied(&self, primary: &Arc<dyn Blobs>, backup: &Backup) -> Result<()> {
         let prefix = &files(&backup.tenant);
         let held = self.keys(prefix).await?;
-        let wanted = backup
-            .partitions
-            .iter()
-            .flat_map(|taken| &taken.files)
-            .filter(|key| !held.contains(&format!("{prefix}{key}")));
-        stream::iter(wanted)
-            .map(|key| async move {
-                let bytes = primary.get(key).await?;
-                self.store.put(&format!("{prefix}{key}"), bytes).await
-            })
+        let wanted: Vec<(String, String)> = backup
+            .files()
+            .map(|key| (key.to_string(), format!("{prefix}{key}")))
+            .filter(|(_, copied)| !held.contains(copied))
+            .collect();
+        let copies = wanted
+            .into_iter()
+            .map(|(key, copied)| copy(primary.as_ref(), key, self.store.as_ref(), copied));
+        stream::iter(copies)
             .buffer_unordered(COPIED_AT_ONCE)
             .try_collect()
             .await
@@ -155,13 +161,10 @@ impl Backups {
     /// Every record of `tenant`'s backups, by key, oldest first.
     async fn records(&self, tenant: &TenantId) -> Result<Vec<(String, Backup)>> {
         let listed = self.store.list(&records(tenant)).await?;
-        let mut records: Vec<(String, Backup)> = stream::iter(listed)
-            .map(|listed| async move {
-                let bytes = self.store.get(&listed.key).await?;
-                let backup = serde_json::from_slice(&bytes)
-                    .map_err(|error| StorageError::corrupt(&listed.key, error.to_string()))?;
-                Ok::<_, StorageError>((listed.key, backup))
-            })
+        let reads = listed
+            .into_iter()
+            .map(|listed| read(self.store.as_ref(), listed.key));
+        let mut records: Vec<(String, Backup)> = stream::iter(reads)
             .buffer_unordered(COPIED_AT_ONCE)
             .try_collect()
             .await?;
@@ -204,8 +207,7 @@ impl Backups {
         let prefix = files(tenant);
         let listed: HashSet<String> = kept
             .iter()
-            .flat_map(|(_, (_, backup))| &backup.partitions)
-            .flat_map(|taken| &taken.files)
+            .flat_map(|(_, (_, backup))| backup.files())
             .map(|key| format!("{prefix}{key}"))
             .collect();
         for key in self.keys(&prefix).await?.difference(&listed) {
@@ -229,18 +231,16 @@ impl Backups {
                     .map(|listed| listed.key),
             );
         }
-        let wanted: Vec<&String> = backup
-            .partitions
-            .iter()
-            .flat_map(|taken| &taken.files)
+        let wanted: Vec<(String, String)> = backup
+            .files()
             .filter(|key| !held.contains(*key))
+            .map(|key| (format!("{prefix}{key}"), key.to_string()))
             .collect();
         let copied = wanted.len();
-        stream::iter(wanted)
-            .map(|key| async move {
-                let bytes = self.store.get(&format!("{prefix}{key}")).await?;
-                primary.put(key, bytes).await
-            })
+        let copies = wanted
+            .into_iter()
+            .map(|(kept, key)| copy(self.store.as_ref(), kept, primary.as_ref(), key));
+        stream::iter(copies)
             .buffer_unordered(COPIED_AT_ONCE)
             .try_collect::<()>()
             .await?;
@@ -296,6 +296,17 @@ async fn taken(
         keys: coordinator.keys(tenant).await?,
         restore_window: coordinator.restore_window(tenant).await?,
     })
+}
+
+async fn copy(from: &dyn Blobs, key: String, to: &dyn Blobs, copied: String) -> Result<()> {
+    to.put(&copied, from.get(&key).await?).await
+}
+
+async fn read(store: &dyn Blobs, key: String) -> Result<(String, Backup)> {
+    let bytes = store.get(&key).await?;
+    let backup = serde_json::from_slice(&bytes)
+        .map_err(|error| StorageError::corrupt(&key, error.to_string()))?;
+    Ok((key, backup))
 }
 
 fn files(tenant: &TenantId) -> String {

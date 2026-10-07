@@ -144,10 +144,11 @@ impl From<StorageError> for ApiError {
 impl From<NodeError> for ApiError {
     fn from(error: NodeError) -> Self {
         match error {
-            NodeError::UnknownTenant(_) | NodeError::NoRestorePoint(_) => {
-                Self::not_found(error.to_string())
-            }
-            NodeError::Ahead(_) => Self::invalid(error.to_string()),
+            NodeError::UnknownTenant(_)
+            | NodeError::NoRestorePoint(_)
+            | NodeError::UnknownBackup(..) => Self::not_found(error.to_string()),
+            NodeError::Ahead(_) | NodeError::NoBackups => Self::invalid(error.to_string()),
+            NodeError::BackingUp(_) => Self::new(Code::Conflict, error.to_string()),
             NodeError::Elsewhere { .. }
             | NodeError::Outdated { .. }
             | NodeError::Stopped

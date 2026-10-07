@@ -10,10 +10,10 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value as Document;
 use vellev_api::{
-    After, Batch, Change, Changes, Collections, Consistency, Content, Counted, Counting, Failure,
-    Found, Hybrid, IssuedKey, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, RestorePoint,
-    RestorePoints, RestoreTo, RestoreWindow, Restored, Results, Stored, TenantKey, TenantKeys,
-    TenantPage, Tenants, Weighted, Written, AFTER, CONSISTENCY, REQUEST,
+    After, Backup, Backups, Batch, Change, Changes, Collections, Consistency, Content, Counted,
+    Counting, Failure, Found, Hybrid, IssuedKey, Keyword, Nearest, Objects, OnlyIf, Outcome, Page,
+    RestorePoint, RestorePoints, RestoreTo, RestoreWindow, Restored, Results, Stored, TenantKey,
+    TenantKeys, TenantPage, Tenants, Weighted, Written, AFTER, CONSISTENCY, REQUEST,
 };
 use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, RequestId, TenantId};
 use vellev_node::{Freshness, Reader};
@@ -431,15 +431,76 @@ pub async fn restore(
     Named(tenant): Named<TenantId>,
     Body(to): Body<RestoreTo>,
 ) -> Answer<Restored> {
+    let node = app.node()?;
     let point = match to {
         RestoreTo::At(at) => Point::At(at),
         RestoreTo::Position(position) => Point::Position(LogPosition(position)),
+        RestoreTo::Backup(id) => {
+            let (backup, position) = node.restore_backup(&tenant, id).await?;
+            let taken = backup
+                .partitions
+                .first()
+                .map_or(0, |taken| taken.position.0);
+            return Ok(Json(Restored {
+                from: RestorePoint {
+                    position: taken,
+                    at: backup.taken_at,
+                },
+                position: position.0,
+            }));
+        }
     };
-    let (from, position) = app.node()?.restore(&tenant, point).await?;
+    let (from, position) = node.restore(&tenant, point).await?;
     Ok(Json(Restored {
         from: described(from),
         position: position.0,
     }))
+}
+
+/// Back the tenant up now, whenever it was last backed up.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant}/backups",
+    params(("tenant" = TenantId, Path,)),
+    responses((status = CREATED, body = Backup), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn back_up(
+    Shared(app): Shared<App>,
+    Named(tenant): Named<TenantId>,
+) -> Result<(StatusCode, Json<Backup>), ApiError> {
+    let backup = app.node()?.back_up(&tenant).await?;
+    Ok((StatusCode::CREATED, Json(kept(backup))))
+}
+
+/// The tenant's backups, oldest first.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant}/backups",
+    params(("tenant" = TenantId, Path,)),
+    responses((status = OK, body = Backups), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn backups(Shared(app): Shared<App>, Named(tenant): Named<TenantId>) -> Answer<Backups> {
+    let backups = app.node()?.backups(&tenant).await?;
+    Ok(Json(Backups {
+        backups: backups.into_iter().map(kept).collect(),
+    }))
+}
+
+/// A backup as the API describes it.
+fn kept(backup: vellev_storage::backups::Backup) -> Backup {
+    Backup {
+        id: backup.id,
+        taken_at: backup.taken_at,
+        position: backup
+            .partitions
+            .first()
+            .map_or(0, |taken| taken.position.0),
+        files: backup.files().count(),
+    }
 }
 
 /// Set how far back the tenant may be restored, or with none go back to

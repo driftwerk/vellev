@@ -21,6 +21,7 @@ use vellev_storage::{
     Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
 };
 
+mod backing;
 mod keys;
 mod limits;
 mod reading;
@@ -91,6 +92,12 @@ pub struct Settings {
     /// copied for reads, may take in memory together, if there is a bound.
     /// Past it the least recently used that nobody is using go first.
     pub memory: Option<usize>,
+    /// Where tenants are backed up to, if anywhere.
+    pub backups: Option<Arc<dyn Blobs>>,
+    /// How often each tenant is backed up.
+    pub backup_every: Duration,
+    /// How long a backup is kept; the newest of a tenant always is.
+    pub backups_kept: Duration,
 }
 
 impl Settings {
@@ -111,6 +118,9 @@ impl Settings {
             queries_per_second: None,
             writes_per_second: None,
             memory: None,
+            backups: None,
+            backup_every: Duration::from_secs(24 * 60 * 60),
+            backups_kept: Duration::from_secs(35 * 24 * 60 * 60),
         }
     }
 }
@@ -135,6 +145,12 @@ pub enum NodeError {
     Ahead(TenantId),
     #[error("tenant {0} has no state to go back to at that point")]
     NoRestorePoint(TenantId),
+    #[error("no backup store is configured")]
+    NoBackups,
+    #[error("tenant {0} is being backed up or restored from a backup already")]
+    BackingUp(TenantId),
+    #[error("tenant {0} has no backup {1}")]
+    UnknownBackup(TenantId, uuid::Uuid),
     #[error("the cluster writes file format {cluster}, and this release reads only up to {reads}")]
     Outdated { cluster: u16, reads: u16 },
     #[error(transparent)]
@@ -634,7 +650,7 @@ impl Node {
             tokio::spawn(async move {
                 opened
                     .writer
-                    .restore(&target.head, target.position)
+                    .restore(Some(&target.head), target.position)
                     .await
                     .map_err(|error| opened.closed(error))
             })
