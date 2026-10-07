@@ -197,6 +197,52 @@ pub struct TenantKeys {
     pub keys: Vec<TenantKey>,
 }
 
+/// A state a tenant can be put back to: the commit that made it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestorePoint {
+    pub position: u64,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+/// How far back a tenant may be restored, and the earliest and latest
+/// states it may be put back to, if it has any.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestorePoints {
+    pub window_secs: u64,
+    pub earliest: Option<RestorePoint>,
+    pub latest: Option<RestorePoint>,
+}
+
+/// Which state to put a tenant back to.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreTo {
+    /// As it stood at this moment.
+    At(chrono::DateTime<chrono::Utc>),
+    /// As the commit at this position left it.
+    Position(u64),
+}
+
+/// A restore done: the state gone back to, and the position of the commit
+/// that put it back.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restored {
+    pub from: RestorePoint,
+    pub position: u64,
+}
+
+/// How far back a tenant may be restored, in seconds; with none, the
+/// node's default.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreWindow {
+    pub secs: Option<u64>,
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tenants {

@@ -1,5 +1,7 @@
 //! The API's routes: what each takes, does and answers.
 
+use std::time::Duration;
+
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, State as Shared};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
@@ -9,12 +11,13 @@ use serde::Serialize;
 use serde_json::Value as Document;
 use vellev_api::{
     After, Batch, Change, Changes, Collections, Consistency, Content, Counted, Counting, Failure,
-    Found, Hybrid, IssuedKey, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, Results, Stored,
-    TenantKey, TenantKeys, TenantPage, Tenants, Weighted, Written, AFTER, CONSISTENCY, REQUEST,
+    Found, Hybrid, IssuedKey, Keyword, Nearest, Objects, OnlyIf, Outcome, Page, RestorePoint,
+    RestorePoints, RestoreTo, RestoreWindow, Restored, Results, Stored, TenantKey, TenantKeys,
+    TenantPage, Tenants, Weighted, Written, AFTER, CONSISTENCY, REQUEST,
 };
 use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, RequestId, TenantId};
 use vellev_node::{Freshness, Reader};
-use vellev_storage::coordinator::{Incarnation, LogPosition};
+use vellev_storage::coordinator::{Incarnation, LogPosition, Point};
 use vellev_storage::{Batch as Writes, Hybrid as HybridQuery, Keywords};
 use vellev_storage::{
     Condition, Fused, Hit, Mutation, Query as VectorQuery, Receipt, Scored, State, DEFAULT_ALPHA,
@@ -379,6 +382,99 @@ pub async fn create_tenant(
 ) -> Result<StatusCode, ApiError> {
     app.node()?.create_tenant(&tenant).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// How far back the tenant may be restored, and the earliest and latest
+/// states it may be put back to.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant}/restore-points",
+    params(("tenant" = TenantId, Path,)),
+    responses((status = OK, body = RestorePoints), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn restore_points(
+    Shared(app): Shared<App>,
+    Named(tenant): Named<TenantId>,
+) -> Answer<RestorePoints> {
+    let (window, points) = app
+        .node()?
+        .restore_points(&tenant)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("tenant {tenant} does not exist")))?;
+    let (earliest, latest) = points.unzip();
+    Ok(Json(RestorePoints {
+        window_secs: window.as_secs(),
+        earliest: earliest.map(restore_point),
+        latest: latest.map(restore_point),
+    }))
+}
+
+/// Put the tenant back as it stood at a moment or a commit within its
+/// restore window. Nothing is lost: the restore is a commit of its own,
+/// and the states before it can be gone back to as before.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant}/restore",
+    params(("tenant" = TenantId, Path,)),
+    request_body = RestoreTo,
+    responses((status = OK, body = Restored), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn restore(
+    Shared(app): Shared<App>,
+    Named(tenant): Named<TenantId>,
+    Body(to): Body<RestoreTo>,
+) -> Answer<Restored> {
+    let point = match to {
+        RestoreTo::At(at) => Point::At(at),
+        RestoreTo::Position(position) => Point::Position(LogPosition(position)),
+    };
+    let (from, position) = app.node()?.restore(&tenant, point).await?;
+    Ok(Json(Restored {
+        from: restore_point(from),
+        position: position.0,
+    }))
+}
+
+/// Set how far back the tenant may be restored, or with none go back to
+/// the default.
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{tenant}/restore-window",
+    params(("tenant" = TenantId, Path,)),
+    request_body = RestoreWindow,
+    responses((status = NO_CONTENT), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn set_restore_window(
+    Shared(app): Shared<App>,
+    Named(tenant): Named<TenantId>,
+    Body(window): Body<RestoreWindow>,
+) -> Result<StatusCode, ApiError> {
+    if window.secs == Some(0) {
+        return Err(ApiError::invalid("a restore window is at least a second"));
+    }
+    let set = app
+        .node()?
+        .set_restore_window(&tenant, window.secs.map(Duration::from_secs))
+        .await?;
+    match set {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::not_found(format!(
+            "tenant {tenant} does not exist"
+        ))),
+    }
+}
+
+fn restore_point(point: vellev_storage::coordinator::RestorePoint) -> RestorePoint {
+    RestorePoint {
+        position: point.position.0,
+        at: point.at,
+    }
 }
 
 /// Issue a key that reaches this tenant alone. Only an admin key may.

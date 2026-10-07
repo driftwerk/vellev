@@ -218,13 +218,29 @@ fn same(a: &str, b: &str) -> bool {
         == 0
 }
 
-/// The routes only an admin key reaches: the tenants themselves and their
-/// keys. Every other route that needs a key is one tenant's.
-pub const ADMIN_ONLY: [&str; 4] = [
+/// The routes only an admin key reaches: the tenants themselves, their
+/// keys, and putting them back as they were. Every other route that needs
+/// a key is one tenant's.
+pub const ADMIN_ONLY: [&str; 7] = [
     "/v1/tenants",
     "/v1/tenants/{tenant}",
     "/v1/tenants/{tenant}/keys",
     "/v1/tenants/{tenant}/keys/{id}",
+    "/v1/tenants/{tenant}/restore-points",
+    "/v1/tenants/{tenant}/restore-window",
+    "/v1/tenants/{tenant}/restore",
+];
+
+/// The admin routes that are the coordinator's alone, done where the
+/// request arrives; a restore is sent on to the node that writes the
+/// tenant, as its writes are.
+const COORDINATED: [&str; 6] = [
+    "/v1/tenants",
+    "/v1/tenants/{tenant}",
+    "/v1/tenants/{tenant}/keys",
+    "/v1/tenants/{tenant}/keys/{id}",
+    "/v1/tenants/{tenant}/restore-points",
+    "/v1/tenants/{tenant}/restore-window",
 ];
 
 /// Let a request through if its key reaches what it asks for. An admin key,
@@ -341,7 +357,7 @@ async fn forwarded(
     // A tenant's keys are the coordinator's, and are changed where the
     // request arrives, so that node forgets the old ones at once.
     if reads(request.method(), matched.map(MatchedPath::as_str))
-        || matched.is_some_and(|route| ADMIN_ONLY.contains(&route.as_str()))
+        || matched.is_some_and(|route| COORDINATED.contains(&route.as_str()))
     {
         return Ok(next.run(request).await);
     }
@@ -436,6 +452,9 @@ fn described() -> (Router<App>, OpenApi) {
         .routes(routes!(api::tenants))
         .routes(routes!(api::create_tenant, api::drop_tenant))
         .routes(routes!(api::issue_key, api::tenant_keys))
+        .routes(routes!(api::restore_points))
+        .routes(routes!(api::restore))
+        .routes(routes!(api::set_restore_window))
         .routes(routes!(api::revoke_key))
         .routes(routes!(api::changes))
         .routes(routes!(api::collections))
