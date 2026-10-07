@@ -175,6 +175,24 @@ impl Coordinator for SlowCoordinator {
         self.inner.restore_window(tenant).await
     }
 
+    async fn claim_backup(
+        &self,
+        tenant: &TenantId,
+        due: Option<Duration>,
+        hold: Duration,
+    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
+        self.inner.claim_backup(tenant, due, hold).await
+    }
+
+    async fn release_backup(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        made: bool,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.release_backup(tenant, claim, made).await
+    }
+
     async fn set_restore_window(
         &self,
         tenant: &TenantId,

@@ -117,15 +117,45 @@ impl Partition {
         committed: &Committed,
         donor: Option<&Partition>,
     ) -> Result<Self> {
-        let partition = Self {
+        let partition = Self::empty(key, blobs, committed.incarnation);
+        partition.advance_reusing(committed, donor).await?;
+        Ok(partition)
+    }
+
+    fn empty(key: PartitionKey, blobs: Arc<dyn Blobs>, incarnation: Incarnation) -> Self {
+        Self {
             key,
-            incarnation: committed.incarnation,
+            incarnation,
             blobs,
             state: RwLock::new(State::default()),
             seen: Mutex::new(Generation(0)),
-        };
-        partition.advance_reusing(committed, donor).await?;
-        Ok(partition)
+        }
+    }
+
+    /// The files the partition as `committed` is loaded from: the logs back
+    /// to its latest checkpoint, the checkpoint, and what that lists.
+    pub async fn files(
+        key: PartitionKey,
+        blobs: Arc<dyn Blobs>,
+        committed: &Committed,
+    ) -> Result<Vec<String>> {
+        let partition = Self::empty(key, blobs, committed.incarnation);
+        let Tail { checkpoint, logs } = partition
+            .tail(committed, LogPosition::default(), None)
+            .await?
+            .ok_or_else(|| {
+                StorageError::corrupt(
+                    &Layout(&partition.key).prefix(),
+                    "its history reaches neither a checkpoint nor the start",
+                )
+            })?;
+        let checkpoint = checkpoint
+            .iter()
+            .flat_map(|(key, manifest)| std::iter::once(key.as_str()).chain(listed_by(manifest)));
+        Ok(checkpoint
+            .map(str::to_string)
+            .chain(logs.into_iter().map(|(key, _)| key))
+            .collect())
     }
 
     /// The segments loaded, by key.
@@ -1167,20 +1197,7 @@ impl Writer {
         let kept: HashSet<&str> = checkpoints
             .iter()
             .chain([&base])
-            .flat_map(|checkpoint| {
-                checkpoint
-                    .segments
-                    .iter()
-                    .flat_map(|meta| {
-                        [
-                            Some(meta.key.as_str()),
-                            meta.index.as_deref(),
-                            meta.vectors.as_deref(),
-                        ]
-                    })
-                    .chain(checkpoint.replay.iter().map(|key| Some(key.as_str())))
-            })
-            .flatten()
+            .flat_map(listed_by)
             .collect();
         let orphans = files
             .iter()
@@ -1211,6 +1228,22 @@ impl Writer {
             }
         }
     }
+}
+
+/// The files a checkpoint lists: its segments' and the logs it replays.
+fn listed_by(checkpoint: &Manifest) -> impl Iterator<Item = &str> {
+    checkpoint
+        .segments
+        .iter()
+        .flat_map(|meta| {
+            [
+                Some(meta.key.as_str()),
+                meta.index.as_deref(),
+                meta.vectors.as_deref(),
+            ]
+        })
+        .flatten()
+        .chain(checkpoint.replay.iter().map(String::as_str))
 }
 
 fn following(position: LogPosition) -> Result<LogPosition> {

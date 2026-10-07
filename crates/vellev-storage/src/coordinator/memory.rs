@@ -10,9 +10,9 @@ use uuid::Uuid;
 use vellev_core::{NodeId, TenantId};
 
 use super::{
-    checked_ttl, checked_window, window_start, Acquired, Commit, Committed, Coordinator,
-    CoordinatorError, Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef,
-    PartitionKey, Point, RestorePoint, Result, TenantKey, Versions,
+    checked_hold, checked_ttl, checked_window, window_start, Acquired, Commit, Committed,
+    Coordinator, CoordinatorError, Generation, Incarnation, KeyHash, Lease, LogPosition,
+    ManifestRef, PartitionKey, Point, RestorePoint, Result, TenantKey, Versions,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -59,6 +59,9 @@ struct Row {
     /// Every commit since the partition was registered, oldest first.
     history: Vec<RestorePoint>,
     restore_window: Option<Duration>,
+    backed_up_at: Option<DateTime<Utc>>,
+    /// Who holds the right to back the tenant up, and until when.
+    backup_claim: Option<(Uuid, DateTime<Utc>)>,
 }
 
 impl Row {
@@ -170,6 +173,8 @@ impl Coordinator for MemoryCoordinator {
                 manifest: None,
                 history: Vec::new(),
                 restore_window: None,
+                backed_up_at: None,
+                backup_claim: None,
             };
             rows.insert(key.clone(), row);
         }
@@ -354,6 +359,7 @@ impl Coordinator for MemoryCoordinator {
         let issued = TenantKey {
             id,
             created: self.clock.now(),
+            hash: *hash,
         };
         let mut keys = self.keys.lock().expect("coordinator lock");
         if keys
@@ -437,6 +443,50 @@ impl Coordinator for MemoryCoordinator {
             Ok(forgotten as u64)
         })
         .or_else(|error| unknown_is_none::<()>(error).map(|_| 0))
+    }
+
+    async fn claim_backup(
+        &self,
+        tenant: &TenantId,
+        due: Option<Duration>,
+        hold: Duration,
+    ) -> Result<Option<Uuid>> {
+        let now = self.clock.now();
+        let until = expiry(now, checked_hold(hold)?)?;
+        let since = due.map(|due| window_start(now, due)).transpose()?;
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        let mut rows: Vec<&mut Row> = rows
+            .iter_mut()
+            .filter(|(key, _)| &key.tenant == tenant)
+            .map(|(_, row)| row)
+            .collect();
+        let free = |row: &&mut Row| {
+            row.backup_claim.is_none_or(|(_, until)| until < now)
+                && since.is_none_or(|since| row.backed_up_at.is_none_or(|at| at <= since))
+        };
+        if rows.is_empty() || !rows.iter().all(free) {
+            return Ok(None);
+        }
+        let claim = Uuid::new_v4();
+        for row in &mut rows {
+            row.backup_claim = Some((claim, until));
+        }
+        Ok(Some(claim))
+    }
+
+    async fn release_backup(&self, tenant: &TenantId, claim: Uuid, made: bool) -> Result<()> {
+        let now = self.clock.now();
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        let held = rows.iter_mut().filter(|(key, row)| {
+            &key.tenant == tenant && row.backup_claim.is_some_and(|(held, _)| held == claim)
+        });
+        for (_, row) in held {
+            row.backup_claim = None;
+            if made {
+                row.backed_up_at = Some(now);
+            }
+        }
+        Ok(())
     }
 
     async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>> {

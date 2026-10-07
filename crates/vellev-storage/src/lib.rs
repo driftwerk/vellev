@@ -1,6 +1,7 @@
 //! Log segments, segments and manifests on object storage, and the commit coordinator.
 
 mod answers;
+pub mod backups;
 pub mod blobs;
 mod catalog;
 mod column;
