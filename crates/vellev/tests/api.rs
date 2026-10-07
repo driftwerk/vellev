@@ -1010,6 +1010,24 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
         ),
         "a body too large to send on is refused where it arrives"
     );
+    let garbled = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let address = second.url.trim_start_matches("http://");
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "PUT {} HTTP/1.1\r\nhost: {address}\r\nauthorization: Bearer {KEY}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\nnot a chunk\r\n\r\n",
+            object(3)
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        answer
+    };
+    assert!(
+        garbled.starts_with("HTTP/1.1 400"),
+        "a body that cannot be read is invalid, not too large: {garbled}"
+    );
+    assert!(!garbled.contains("\"limit\""), "{garbled}");
     let (status, _) = second.call_as(None, Method::GET, &object(1), None).await;
     assert_eq!(
         status,

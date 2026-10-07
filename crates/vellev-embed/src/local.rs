@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io::ErrorKind;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
@@ -18,7 +19,7 @@ const WAITING: usize = 256;
 
 /// A loaded model: a vector for each text, or why not.
 type Model = Box<dyn FnMut(Vec<&str>) -> std::result::Result<Vec<Vec<f32>>, String>>;
-type Load = Box<dyn FnMut() -> std::result::Result<Model, String> + Send>;
+type Load = Box<dyn FnMut() -> Result<Model> + Send>;
 
 struct Job {
     texts: Vec<String>,
@@ -49,6 +50,7 @@ impl Local {
         let known = known(model, dimensions)?;
         let cache = cache.to_path_buf();
         let threads = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+        let name = model.to_string();
         Self::spawn(
             model,
             Box::new(move || {
@@ -57,7 +59,7 @@ impl Local {
                     .with_intra_threads(threads.saturating_sub(1).max(1))
                     .with_show_download_progress(false);
                 let mut session =
-                    TextEmbedding::try_new(options).map_err(|error| format!("{error:#}"))?;
+                    TextEmbedding::try_new(options).map_err(|error| unloaded(&name, &error))?;
                 Ok(Box::new(move |texts: Vec<&str>| {
                     let together = texts.len();
                     session
@@ -82,6 +84,38 @@ impl Local {
             model: model.to_string(),
             jobs,
         })
+    }
+}
+
+/// Why `model` could not be loaded. A cache directory the node may not
+/// write, where the model is fetched to, keeps it from ever loading until
+/// the node is set up otherwise. Anything else, such as a network the
+/// model cannot be fetched over just now, may pass.
+fn unloaded(model: &str, error: &fastembed::Error) -> EmbedError {
+    let barred = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|cause| {
+            matches!(
+                cause.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            )
+        });
+    let reason = format!("{error:#}");
+    match barred {
+        true => EmbedError::Unusable {
+            model: model.to_string(),
+            reason,
+        },
+        false => failure(model, reason),
+    }
+}
+
+/// A failure of `model` that may pass.
+fn failure(model: &str, reason: impl Into<String>) -> EmbedError {
+    EmbedError::Failed {
+        model: model.to_string(),
+        reason: reason.into(),
     }
 }
 
@@ -161,15 +195,18 @@ fn advance(name: &str, load: &mut Load, model: &mut Option<Model>, queue: &mut V
             Some(model) => model,
             None => model.insert(load()?),
         };
-        model(texts)
+        model(texts).map_err(|reason| failure(name, reason))
     }));
     let vectors = match ran {
         Ok(Ok(vectors)) if vectors.len() == asked => Ok(vectors),
-        Ok(Ok(vectors)) => Err(format!("{} vectors for {asked} texts", vectors.len())),
-        Ok(Err(reason)) => Err(reason),
+        Ok(Ok(vectors)) => Err(failure(
+            name,
+            format!("{} vectors for {asked} texts", vectors.len()),
+        )),
+        Ok(Err(error)) => Err(error),
         Err(_) => {
             *model = None;
-            Err("the model panicked".to_string())
+            Err(failure(name, "the model panicked"))
         }
     };
     match vectors {
@@ -187,11 +224,8 @@ fn advance(name: &str, load: &mut Load, model: &mut Option<Model>, queue: &mut V
                 }
             }
         }
-        Err(reason) => queue.drain(..taken.len()).for_each(|work| {
-            let _ = work.job.reply.send(Err(EmbedError::Failed {
-                model: name.to_string(),
-                reason: reason.clone(),
-            }));
+        Err(error) => queue.drain(..taken.len()).for_each(|work| {
+            let _ = work.job.reply.send(Err(error.clone()));
         }),
     }
 }
@@ -202,10 +236,7 @@ impl Provider for Local {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let stopped = || EmbedError::Failed {
-            model: self.model.clone(),
-            reason: "the model's thread has stopped".into(),
-        };
+        let stopped = || failure(&self.model, "the model's thread has stopped");
         let (reply, answer) = oneshot::channel();
         let job = Job {
             texts,
@@ -259,7 +290,7 @@ mod tests {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if failing > 0 {
                 failing -= 1;
-                return Err("no model to be had".to_string());
+                return Err(failed("no model to be had"));
             }
             let (report, gate) = (report.clone(), gate.clone());
             Ok(Box::new(move |texts: Vec<&str>| {
@@ -398,6 +429,56 @@ mod tests {
         drop(local);
         let ended = runs.ran.recv_timeout(Duration::from_secs(10));
         assert_eq!(ended, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_that_can_never_load_says_so_each_time_it_is_tried() {
+        let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tried = tries.clone();
+        let barred = || EmbedError::Unusable {
+            model: "stand-in".into(),
+            reason: "its cache may not be written".into(),
+        };
+        let load: Load = Box::new(move || {
+            tried.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(barred())
+        });
+        let local = Local::spawn("stand-in", load).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                local.embed(vec!["fox".into()], Purpose::Query).await,
+                Err(barred())
+            );
+        }
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_cache_the_node_may_not_write_keeps_a_model_from_loading_and_a_network_does_not() {
+        let fetching = |cause: std::io::Error| {
+            fastembed::Error::new(cause).context("Failed to retrieve model.onnx")
+        };
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::ReadOnlyFilesystem] {
+            let error = fetching(kind.into());
+            assert_eq!(
+                unloaded("m", &error),
+                EmbedError::Unusable {
+                    model: "m".into(),
+                    reason: format!("{error:#}")
+                },
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+            ErrorKind::StorageFull,
+        ] {
+            let error = fetching(kind.into());
+            assert!(!unloaded("m", &error).lasting(), "{kind:?}");
+        }
+        let unreached = fastembed::Error::msg("request error: dns failed");
+        assert!(!unloaded("m", &unreached).lasting());
     }
 
     #[test]
