@@ -20,7 +20,7 @@ use vellev_node::{Freshness, Node, NodeError, Reader, Settings};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, KeyHash, Lease, LogPosition,
-    ManualClock, MemoryCoordinator, PartitionKey, TenantKey, Versions,
+    ManualClock, MemoryCoordinator, PartitionKey, Point, RestorePoint, TenantKey, Versions,
 };
 use vellev_storage::{Mutation, State, StorageError};
 
@@ -108,6 +108,7 @@ impl Cluster {
     fn settings(&self) -> Settings {
         Settings {
             lease: LEASE,
+            restore_window: Duration::ZERO,
             grace: Duration::ZERO,
             ..Settings::new(NodeId::generate("node"))
         }
@@ -872,6 +873,46 @@ impl Coordinator for Unrenewing {
     async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>, CoordinatorError> {
         self.inner.key_tenant(hash).await
     }
+
+    async fn restore_point(
+        &self,
+        key: &PartitionKey,
+        point: Point,
+        window: Duration,
+    ) -> Result<Option<RestorePoint>, CoordinatorError> {
+        self.inner.restore_point(key, point, window).await
+    }
+
+    async fn restore_points(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<Option<(RestorePoint, RestorePoint)>, CoordinatorError> {
+        self.inner.restore_points(key, window).await
+    }
+
+    async fn forget_history(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<u64, CoordinatorError> {
+        self.inner.forget_history(key, window).await
+    }
+
+    async fn restore_window(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Duration>, CoordinatorError> {
+        self.inner.restore_window(tenant).await
+    }
+
+    async fn set_restore_window(
+        &self,
+        tenant: &TenantId,
+        window: Option<Duration>,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.set_restore_window(tenant, window).await
+    }
 }
 
 #[tokio::test]
@@ -1553,5 +1594,80 @@ async fn a_tenant_flooding_a_node_is_turned_away_while_a_quiet_one_is_answered()
     assert!(
         answered.iter().all(|ok| *ok),
         "the quiet tenant is answered"
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_is_restored_to_a_point_in_its_window_and_readers_follow() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.node(), cluster.reading_node());
+    let acme = tenant("acme");
+    writing.create_tenant(&acme).await.unwrap();
+    let day = Duration::from_secs(24 * 60 * 60);
+    assert!(writing.set_restore_window(&acme, Some(day)).await.unwrap());
+    let opened = writing.tenant(&acme).await.unwrap();
+    opened
+        .write(vec![
+            schema(EmbeddingProvider::None),
+            note(1, "fox", None),
+            note(2, "hen", None),
+        ])
+        .await
+        .unwrap();
+    let (window, points) = writing.restore_points(&acme).await.unwrap().unwrap();
+    let (_, kept) = points.unwrap();
+    assert_eq!(window, day);
+
+    cluster.clock.advance(Duration::from_secs(60 * 60));
+    let removed = opened
+        .write(vec![Mutation::Delete {
+            collection: notes(),
+            id: id(1),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(opened.read(count), 1);
+
+    let half_an_hour_on = kept.at + chrono::Duration::minutes(30);
+    let (target, restored) = writing
+        .restore(&acme, Point::At(half_an_hour_on))
+        .await
+        .unwrap();
+    assert_eq!(target, kept);
+    assert!(restored > removed.position);
+    assert_eq!(opened.read(count), 2);
+    let followed = reading
+        .reader(&acme, Freshness::After(removed.incarnation, restored))
+        .await
+        .unwrap();
+    assert_eq!(
+        counted(&followed),
+        2,
+        "a copy elsewhere follows the restore"
+    );
+
+    cluster.clock.advance(2 * day);
+    assert!(matches!(
+        writing.restore(&acme, Point::At(half_an_hour_on)).await,
+        Err(NodeError::NoRestorePoint(_))
+    ));
+    let (_, latest) = writing
+        .restore_points(&acme)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .unwrap();
+    let (back_to, _) = writing
+        .restore(&acme, Point::Position(latest.position))
+        .await
+        .unwrap();
+    assert_eq!(
+        back_to, latest,
+        "how it stood when the window began is in reach"
+    );
+    assert_eq!(
+        writing.restore_points(&tenant("nobody")).await.unwrap(),
+        None
     );
 }
