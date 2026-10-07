@@ -265,15 +265,25 @@ impl BinaryIndex {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
-        let count = vectors.len() as f32;
-        let mean = vectors
-            .iter()
-            .fold(vec![0.0f32; dimensions], |mut sum, (_, vector)| {
+        // A vector stored before lengths were limited may be too long to
+        // square. Left out of the mean, it spoils no other row's estimate.
+        let (sum, measured) = vectors.iter().fold(
+            (vec![0.0f32; dimensions], 0usize),
+            |(mut sum, measured), (_, vector)| {
+                let vector = normalised(metric, vector);
+                if !dot(&vector, &vector).is_finite() {
+                    return (sum, measured);
+                }
                 sum.iter_mut()
-                    .zip(normalised(metric, vector).iter())
-                    .for_each(|(sum, value)| *sum += value / count);
-                sum
-            });
+                    .zip(vector.iter())
+                    .for_each(|(sum, value)| *sum += value);
+                (sum, measured + 1)
+            },
+        );
+        let mean: Vec<f32> = sum
+            .into_iter()
+            .map(|sum| sum / measured.max(1) as f32)
+            .collect();
         let words = dimensions.div_ceil(64);
         let mut codes = Vec::with_capacity(vectors.len() * words);
         let (lengths, terms) = vectors
@@ -592,6 +602,19 @@ mod tests {
             .filter(|row| shortlist.contains(&(row * 2)))
             .count();
         assert_eq!(found, 20);
+    }
+
+    /// A vector too long to square, as one stored before lengths were
+    /// limited may be, leaves the other rows' shortlist as it was.
+    #[test]
+    fn a_vector_too_long_to_square_spoils_no_other_rows_estimate() {
+        let mut random = Random(13);
+        let mut vectors = grouped(&mut random, 4000, 64, 0.3);
+        vectors.push(vec![1e30; 64]);
+        for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
+            let share = recall(metric, &vectors, 200, 160);
+            assert!(share >= 0.9, "{metric:?}: {share} of the true neighbours");
+        }
     }
 
     #[test]
