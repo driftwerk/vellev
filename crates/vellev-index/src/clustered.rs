@@ -488,21 +488,26 @@ impl ClusteredIndex {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
-        let mut random = Random(vectors.len() as u64 ^ ((dimensions as u64) << 32));
+        // Clusters, and how many a query scans, are drawn from the rows that
+        // can be measured alone; any other, stored before lengths were
+        // limited, would drag them far away. The rows that can are all the
+        // index is shaped by, so it comes out the same with or without the
+        // others.
+        let measured: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .copied()
+            .filter(|(_, vector)| measurable(metric, vector))
+            .collect();
+        let mut random = Random(measured.len() as u64 ^ ((dimensions as u64) << 32));
         let rotation = Rotation::new(dimensions, random.next());
         let width = rotation.width;
         let rotated = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
 
-        // Clusters are drawn from the rows that can be measured; any other,
-        // stored before lengths were limited, would drag them far away.
-        let measured: Vec<usize> = (0..vectors.len())
-            .filter(|at| measurable(metric, vectors[*at].1))
-            .collect();
         let k = clusters_for(measured.len().max(1));
         let training: Vec<Vec<f32>> = random
             .sample(measured.len(), k * TRAINING_PER_CLUSTER)
             .into_par_iter()
-            .map(|at| rotated(vectors[measured[at]].1))
+            .map(|at| rotated(measured[at].1))
             .collect();
         let centroids = match training.is_empty() {
             true => vec![0.0; k * width],
@@ -571,7 +576,7 @@ impl ClusteredIndex {
             at,
             probes: 1,
         };
-        index.probes = index.tuned(vectors, &mut random);
+        index.probes = index.tuned(&measured, &mut random);
         Some(index)
     }
 
@@ -587,7 +592,8 @@ impl ClusteredIndex {
 
     /// The fewest clusters whose scan holds [`RECALL_FLOOR`] of the true
     /// nearest [`TUNING_NEIGHBOURS`] of sample queries drawn at random from
-    /// the vectors themselves, each left out of its own neighbours.
+    /// `vectors` themselves, each left out of its own neighbours: the rows
+    /// that can be measured, as no other is ever offered.
     fn tuned(&self, vectors: &[(u32, &[f32])], random: &mut Random) -> usize {
         let ranks: Vec<usize> = random
             .sample(vectors.len(), TUNING_QUERIES)
@@ -1101,6 +1107,34 @@ mod tests {
         assert_eq!(rows, [0, 2, 4, 6, 8]);
         let one = ClusteredIndex::build(Distance::Cosine, &[(3, &[0.0, 0.0])]).unwrap();
         assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[], &in_row_order), [3]);
+    }
+
+    /// Rows that cannot be measured shape nothing: the clusters, and how
+    /// many a query scans, which is kept with the index and paid by every
+    /// query, come out as without them.
+    #[test]
+    fn rows_too_long_to_measure_leave_the_index_as_it_would_be() {
+        let measured = grouped(29, 3000, 32, 10, 0.4);
+        let with_long: Vec<Vec<f32>> = measured
+            .iter()
+            .enumerate()
+            .flat_map(|(at, vector)| {
+                let long = (at % 50 == 0)
+                    .then(|| vec![2.3e18 * if at % 100 == 0 { 1.0 } else { -1.0 }; 32]);
+                std::iter::once(vector.clone()).chain(long)
+            })
+            .collect();
+        assert_eq!(with_long.len(), 3060);
+        for metric in [Distance::Dot, Distance::L2] {
+            let (without, with) = (indexed(metric, &measured), indexed(metric, &with_long));
+            assert_eq!(with.unmeasured(None, &[]).len(), 60);
+            assert_eq!(
+                (with.clusters(), with.probes()),
+                (without.clusters(), without.probes()),
+                "{metric:?}"
+            );
+            assert_eq!(with.centroids, without.centroids, "{metric:?}");
+        }
     }
 
     /// Vectors longer than a collection accepts have no estimate: they draw
