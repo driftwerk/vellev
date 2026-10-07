@@ -225,7 +225,25 @@ impl FromRequestParts<App> for Viewer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::server::Limits;
+
+    #[tokio::test]
+    async fn a_read_whose_caller_is_not_known_is_refused() {
+        let app = App::new(
+            Arc::from([]),
+            Limits {
+                results: 10,
+                body: 1024,
+                embedding_urls: Arc::from([]),
+            },
+        );
+        let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+        let refused = Viewer::from_request_parts(&mut parts, &app).await;
+        assert!(refused.is_err());
+    }
 
     const X: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
 

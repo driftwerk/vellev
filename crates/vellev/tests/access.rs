@@ -274,7 +274,11 @@ async fn a_token_not_trusted_not_current_or_not_for_this_tenant_is_refused() {
             "naming too many teams",
             signer.token("acme", "ada", &many, 300),
         ),
-        ("too long", format!("{}.e30.e30", "e".repeat(9000))),
+        ("too long", {
+            let mut padded = claims("acme", "ada", &[], 300);
+            padded["padding"] = json!("p".repeat(9000));
+            signer.signed(&padded)
+        }),
         ("for another tenant", signer.token("beta", "ada", &[], 300)),
         (
             "signed by another key of the same id",
