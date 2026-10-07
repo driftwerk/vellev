@@ -637,7 +637,7 @@ async fn the_description_covers_every_route_that_needs_a_key() {
                 .map(move |method| (method.to_uppercase(), path.clone()))
         })
         .collect();
-    assert_eq!(operations.len(), 21, "{operations:?}");
+    assert_eq!(operations.len(), 24, "{operations:?}");
 
     served.with_notes(supplied()).await;
     for (method, path) in &operations {
