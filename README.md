@@ -63,6 +63,14 @@ tenant made again under the same id within those ten seconds may still be
 reached by an old key through another node. A key on an admin route is
 answered 403.
 
+A node lets go of a tenant nobody has used for `VELLEV_TENANT_IDLE_SECS`
+(15 minutes), flushing it first, so any node can take it. `VELLEV_MEMORY_MB`
+bounds what the tenants a node holds may take in memory together; past it
+the least recently used are let go. `VELLEV_TENANT_QUERIES_PER_SECOND` and
+`VELLEV_TENANT_WRITES_PER_SECOND` (objects) bound what one tenant may ask of
+a node; a tenant asking more is answered 429 with `Retry-After`, and the
+client waits and asks again.
+
 `vellev serve --help` lists every setting. On SIGTERM a node reports not
 ready, keeps serving for `VELLEV_STOP_DELAY_SECS` (a few seconds on Docker
 Swarm; none is needed on ECS), finishes what is in flight within

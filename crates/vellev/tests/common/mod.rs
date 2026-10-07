@@ -55,16 +55,41 @@ impl Cluster {
         served
     }
 
+    /// A node limited to `queries` a second for each tenant.
+    pub async fn serve_limited(&self, queries: f64) -> Served {
+        let served = self
+            .unstarted_with(&[], None, |settings| Settings {
+                queries_per_second: Some(queries),
+                ..settings
+            })
+            .await;
+        served.app.start(served.node.clone());
+        served
+    }
+
     /// A node that is listening but has not yet reached what it serves
     /// from.
     pub async fn unstarted(&self, urls: &[String], advertised: Option<&str>) -> Served {
+        self.unstarted_with(urls, advertised, |settings| settings)
+            .await
+    }
+
+    async fn unstarted_with(
+        &self,
+        urls: &[String],
+        advertised: Option<&str>,
+        adjusted: impl FnOnce(Settings) -> Settings,
+    ) -> Served {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let node = Arc::new(Node::new(
             self.coordinator.clone(),
             self.blobs.clone(),
             Arc::new(Embedders::new(Default::default())),
-            Settings::new(NodeId::reachable_at(advertised.unwrap_or(&url), "node")),
+            adjusted(Settings::new(NodeId::reachable_at(
+                advertised.unwrap_or(&url),
+                "node",
+            ))),
         ));
         let limits = Limits {
             results: MAX_LIMIT,

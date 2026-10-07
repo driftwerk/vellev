@@ -1521,3 +1521,38 @@ async fn every_route_is_either_for_admins_or_one_tenants() {
     classified.sort_unstable();
     assert_eq!(routes, classified);
 }
+
+#[tokio::test]
+async fn a_tenant_asking_too_much_is_answered_429_with_when_to_ask_again() {
+    let served = Cluster::new().serve_limited(3.0).await;
+    served.with_notes(supplied()).await;
+    served.ok(Method::PUT, "/v1/tenants/beta", None).await;
+    let mut statuses = Vec::new();
+    for _ in 0..5 {
+        let answer = served
+            .http
+            .get(format!("{}/v1/tenants/acme/collections", served.url))
+            .bearer_auth(KEY)
+            .send()
+            .await
+            .unwrap();
+        let retry_after = answer.headers().get("retry-after").cloned();
+        let status = answer.status();
+        let body: Value = answer.json().await.unwrap();
+        statuses.push(status);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(code(&body), "limited");
+            assert_eq!(retry_after.unwrap().to_str().unwrap(), "1");
+        }
+    }
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        3,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        served.get("/v1/tenants/beta/collections").await.0,
+        StatusCode::OK,
+        "another tenant is not held up"
+    );
+}

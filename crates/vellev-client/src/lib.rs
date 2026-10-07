@@ -96,7 +96,7 @@ impl Error {
             Self::Http(error) if error.is_connect() => Fate::NoEffect,
             Self::Http(_) | Self::Decode(_) => Fate::Unknown,
             Self::Api { code, .. } => match code {
-                Code::Unavailable => Fate::NoEffect,
+                Code::Unavailable | Code::Limited => Fate::NoEffect,
                 Code::Uncertain => Fate::Unknown,
                 _ => Fate::Final,
             },

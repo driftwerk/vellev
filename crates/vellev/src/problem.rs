@@ -1,7 +1,7 @@
 //! Failures as the API reports them.
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::http::header::WWW_AUTHENTICATE;
+use axum::http::header::{RETRY_AFTER, WWW_AUTHENTICATE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -15,6 +15,8 @@ pub struct ApiError {
     status: StatusCode,
     code: Code,
     message: String,
+    /// How long to wait before asking again, for a request turned away.
+    retry_after: Option<std::time::Duration>,
 }
 
 impl ApiError {
@@ -25,6 +27,7 @@ impl ApiError {
             Code::Forbidden => StatusCode::FORBIDDEN,
             Code::NotFound => StatusCode::NOT_FOUND,
             Code::Conflict => StatusCode::CONFLICT,
+            Code::Limited => StatusCode::TOO_MANY_REQUESTS,
             Code::Unavailable | Code::Uncertain => StatusCode::SERVICE_UNAVAILABLE,
             Code::Internal | Code::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -32,6 +35,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            retry_after: None,
         }
     }
 
@@ -70,11 +74,18 @@ impl IntoResponse for ApiError {
             status,
             code,
             message,
+            retry_after,
         } = self;
         let body = Json(Failure::new(code, message));
-        match code {
-            Code::Unauthorized => (status, [(WWW_AUTHENTICATE, "Bearer")], body).into_response(),
-            _ => (status, body).into_response(),
+        match (code, retry_after) {
+            (Code::Unauthorized, _) => {
+                (status, [(WWW_AUTHENTICATE, "Bearer")], body).into_response()
+            }
+            (_, Some(wait)) => {
+                let seconds = wait.as_secs_f64().ceil().max(1.0).to_string();
+                (status, [(RETRY_AFTER, seconds)], body).into_response()
+            }
+            (_, None) => (status, body).into_response(),
         }
     }
 }
@@ -140,6 +151,10 @@ impl From<NodeError> for ApiError {
             | NodeError::Lost(_)
             | NodeError::Behind(_) => Self::unavailable(error.to_string()),
             NodeError::Embed(error) => Self::unembedded(error),
+            NodeError::Limited { wait, .. } => Self {
+                retry_after: Some(wait),
+                ..Self::new(Code::Limited, error.to_string())
+            },
             NodeError::Storage(error) => error.into(),
         }
     }

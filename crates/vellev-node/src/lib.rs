@@ -21,9 +21,12 @@ use vellev_storage::{
 };
 
 mod keys;
+mod limits;
 mod reading;
 
 use keys::Keys;
+pub use limits::Asked;
+use limits::Limits;
 
 pub use keys::{Issued, REMEMBERED_FOR as KEYS_REMEMBERED_FOR};
 pub use reading::{Freshness, Reader};
@@ -70,6 +73,18 @@ pub struct Settings {
     /// reads. A release that adds a format keeps this at the one before,
     /// so that rolling back stays possible until an operator raises it.
     pub max_format: u16,
+    /// How long a tenant this node writes for is kept unused before it is
+    /// let go, its memory given back and its lease left for any node.
+    pub tenant_idle: Duration,
+    /// The most queries a second one tenant may ask of this node, if any.
+    pub queries_per_second: Option<f64>,
+    /// The most objects a second one tenant may write through this node,
+    /// if any.
+    pub writes_per_second: Option<f64>,
+    /// About how many bytes the tenants this node holds, written for or
+    /// copied for reads, may take in memory together, if there is a bound.
+    /// Past it the least recently used that nobody is using go first.
+    pub memory: Option<usize>,
 }
 
 impl Settings {
@@ -85,6 +100,10 @@ impl Settings {
             follow_idle: Duration::from_secs(5 * 60),
             followers: 64,
             max_format: DEFAULT_MAX_FORMAT,
+            tenant_idle: Duration::from_secs(15 * 60),
+            queries_per_second: None,
+            writes_per_second: None,
+            memory: None,
         }
     }
 }
@@ -99,6 +118,8 @@ pub enum NodeError {
     Stopped,
     #[error("the node is looking up too many keys at once")]
     Busy,
+    #[error("tenant {tenant} is asking too much of this node; try again in {wait:?}")]
+    Limited { tenant: TenantId, wait: Duration },
     #[error("the hold on tenant {0} ran out while it was being opened")]
     Lost(TenantId),
     #[error("this node has not caught up with tenant {0} as far as asked")]
@@ -170,6 +191,9 @@ pub struct Tenant {
     /// When the hold on the tenant runs out unless renewed, by this node's
     /// own clock.
     deadline: Arc<Mutex<Instant>>,
+    /// When the tenant was last asked for.
+    used: Mutex<Instant>,
+    limits: Arc<Limits>,
 }
 
 impl Tenant {
@@ -185,6 +209,14 @@ impl Tenant {
 
     fn deadline(&self) -> std::sync::MutexGuard<'_, Instant> {
         self.deadline.lock().expect("deadline lock")
+    }
+
+    fn touch(&self) {
+        *self.used.lock().expect("used lock") = Instant::now();
+    }
+
+    fn unused_for(&self) -> Duration {
+        self.used.lock().expect("used lock").elapsed()
     }
 
     /// Run `f` against the tenant's data as of its last commit.
@@ -224,6 +256,12 @@ impl Tenant {
     /// answered as it was, and not made again.
     pub async fn write(&self, batch: impl Into<Batch>) -> Result<Receipt> {
         let batch = batch.into();
+        self.limits
+            .admit(&self.id, Asked::Write, batch.mutations.len())
+            .map_err(|wait| NodeError::Limited {
+                tenant: self.id.clone(),
+                wait,
+            })?;
         // A request answered already is answered without its vectors.
         let answered = batch
             .request
@@ -324,6 +362,7 @@ struct Inner {
     /// When object storage last answered a readiness check.
     store_answered: Mutex<Option<Instant>>,
     keys: Keys,
+    limits: Arc<Limits>,
 }
 
 #[derive(Debug, Clone)]
@@ -340,10 +379,14 @@ impl Node {
             coordinator,
             blobs,
             embedders,
-            settings,
             open: Mutex::default(),
             store_answered: Mutex::default(),
             keys: Keys::default(),
+            limits: Arc::new(Limits::new(
+                settings.queries_per_second,
+                settings.writes_per_second,
+            )),
+            settings,
         }))
     }
 
@@ -409,6 +452,41 @@ impl Node {
                 }
                 drop(inner);
                 tokio::time::sleep(every).await;
+            }
+        });
+    }
+
+    /// Let go, now and then, of each tenant unused for longer than
+    /// [`Settings::tenant_idle`] that nobody is using now, and of the least
+    /// recently used beyond [`Settings::memory`]: flush what it holds in
+    /// memory, so that whoever opens it next need not read its log, and
+    /// release its lease.
+    pub fn sweeping(&self) {
+        let idle = self.0.settings.tenant_idle;
+        let every = (idle / 4).clamp(Duration::from_secs(1), Duration::from_secs(10));
+        let inner = Arc::downgrade(&self.0);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(inner) = inner.upgrade() else { return };
+                if inner.opened().stopped {
+                    return;
+                }
+                inner.limits.forget_idle();
+                let mut going = inner.idle(idle);
+                if let Some(budget) = inner.settings.memory {
+                    going.extend(inner.over(budget));
+                }
+                for tenant in going {
+                    if tenant.read(State::unflushed) > 0 {
+                        if let Err(error) = tenant.flush().await {
+                            tracing::warn!(tenant = %tenant.id, %error, "flush before letting go failed");
+                        }
+                    }
+                    tenant.broken.store(true, Ordering::SeqCst);
+                    inner.release(tenant.writer.lease()).await;
+                    tracing::info!(tenant = %tenant.id, "let go of an idle tenant");
+                }
             }
         });
     }
@@ -516,6 +594,9 @@ impl Node {
             Ok(panic) => std::panic::resume_unwind(panic),
             Err(_) => Err(NodeError::Stopped),
         });
+        if let Ok(tenant) = &opened {
+            tenant.touch();
+        }
         if opened.is_err() {
             let mut open = self.0.opened();
             let unopened = open
@@ -554,6 +635,84 @@ impl Node {
 impl Inner {
     fn opened(&self) -> std::sync::MutexGuard<'_, Open> {
         self.open.lock().expect("tenants lock")
+    }
+
+    /// Take out of the open tenants those unused for `idle` that nobody
+    /// holds a reference to but this node.
+    fn idle(&self, idle: Duration) -> Vec<Arc<Tenant>> {
+        let mut open = self.opened();
+        let unused: Vec<TenantId> = open
+            .tenants
+            .iter()
+            .filter_map(|(id, opening)| {
+                let tenant = opening.get()?;
+                (Arc::strong_count(tenant) == 1 && tenant.unused_for() >= idle).then(|| id.clone())
+            })
+            .collect();
+        unused
+            .iter()
+            .filter_map(|id| open.tenants.remove(id)?.get().cloned())
+            .collect()
+    }
+
+    /// Take out of the open tenants and copies the least recently used
+    /// that nobody holds a reference to but this node, until what is left
+    /// takes no more than `budget` bytes, as far as that can be done.
+    /// Returns the tenants written for, which are still to be let go; the
+    /// copies need nothing more.
+    fn over(&self, budget: usize) -> Vec<Arc<Tenant>> {
+        enum Held {
+            Writer(Arc<Tenant>),
+            Copy(Arc<reading::Followed>),
+        }
+        let mut open = self.opened();
+        let writers = open.tenants.iter().filter_map(|(id, opening)| {
+            let tenant = opening.get()?.clone();
+            let size = tenant.read(State::resident);
+            Some((id.clone(), tenant.unused_for(), size, Held::Writer(tenant)))
+        });
+        let copies = open.followers.iter().filter_map(|(id, following)| {
+            let copy = following.get()?.clone();
+            Some((id.clone(), copy.idle(), copy.resident(), Held::Copy(copy)))
+        });
+        let mut held: Vec<_> = writers.chain(copies).collect();
+        let mut total: usize = held.iter().map(|(.., size, _)| size).sum();
+        held.sort_by_key(|(_, unused, ..)| std::cmp::Reverse(*unused));
+        let mut going = Vec::new();
+        for (id, _, size, kept) in held {
+            if total <= budget {
+                break;
+            }
+            // Ours, and the reference just taken: nobody else's.
+            let free = match &kept {
+                Held::Writer(tenant) => Arc::strong_count(tenant) == 2,
+                Held::Copy(copy) => Arc::strong_count(copy) == 2,
+            };
+            if !free {
+                continue;
+            }
+            match kept {
+                Held::Writer(tenant) => {
+                    open.tenants.remove(&id);
+                    going.push(tenant);
+                }
+                Held::Copy(_) => {
+                    open.followers.remove(&id);
+                }
+            }
+            total -= size;
+        }
+        going
+    }
+
+    /// Take `cost` of what `tenant` may ask for now.
+    fn admit(&self, tenant: &TenantId, asked: Asked, cost: usize) -> Result<()> {
+        self.limits
+            .admit(tenant, asked, cost)
+            .map_err(|wait| NodeError::Limited {
+                tenant: tenant.clone(),
+                wait,
+            })
     }
 
     async fn release(&self, lease: &Lease) {
@@ -623,6 +782,8 @@ impl Inner {
             flushes,
             broken,
             deadline,
+            used: Mutex::new(Instant::now()),
+            limits: self.limits.clone(),
         });
         self.maintaining(&opened, wanted);
         Ok(opened)

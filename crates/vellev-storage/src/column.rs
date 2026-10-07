@@ -57,6 +57,16 @@ impl Column {
         self.offsets.len() - 1
     }
 
+    /// About how many bytes the column holds in memory: its vectors if
+    /// they are not read in place from a local file, and where each starts.
+    pub fn resident(&self) -> usize {
+        let values = match &self.values {
+            Values::Memory(values) => values.len() * 4,
+            Values::Mapped(..) => 0,
+        };
+        values + self.offsets.len() * 8
+    }
+
     pub fn get(&self, row: usize) -> Option<&[f32]> {
         let (start, end) = (
             *self.offsets.get(row)? as usize,

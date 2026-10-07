@@ -87,6 +87,7 @@ impl App {
     pub fn start(&self, node: Arc<Node>) {
         if self.node.set(node.clone()).is_ok() {
             node.announcing();
+            node.sweeping();
         }
     }
 

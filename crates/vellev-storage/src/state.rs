@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use roaring::RoaringBitmap;
-use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId};
+use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value};
 use vellev_index::clustered::ClusteredIndex;
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
@@ -332,6 +332,28 @@ struct Segment {
     indexes: Arc<Indexes>,
     dead: Vec<bool>,
     deaths: usize,
+    /// About how much memory the segment takes, worked out when first
+    /// asked: it never changes.
+    resident: OnceLock<usize>,
+}
+
+/// About how many bytes a row, and what indexes it, take in memory.
+fn row_bytes(Row { object, .. }: &Row) -> usize {
+    const ROW: usize = 160;
+    let properties: usize = object
+        .properties
+        .iter()
+        .map(|(name, value)| {
+            name.len()
+                + 48
+                + match value {
+                    Value::Text(text) => text.len(),
+                    Value::TextArray(texts) => texts.iter().map(|text| text.len() + 24).sum(),
+                    _ => 0,
+                }
+        })
+        .sum();
+    ROW + properties + object.vector.as_ref().map_or(0, |vector| vector.len() * 4)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -486,6 +508,23 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
 impl State {
     pub fn position(&self) -> LogPosition {
         self.position
+    }
+
+    /// About how many bytes the state takes in memory: its rows, their
+    /// indexes, and whatever vectors are held in memory rather than read
+    /// in place from local files.
+    pub fn resident(&self) -> usize {
+        let segments: usize = self
+            .segments
+            .iter()
+            .map(|segment| {
+                *segment.resident.get_or_init(|| {
+                    segment.file.rows.iter().map(row_bytes).sum::<usize>()
+                        + segment.vectors.resident()
+                })
+            })
+            .sum();
+        segments + self.memtable.rows.iter().map(row_bytes).sum::<usize>()
     }
 
     /// How many rows have been written since the last checkpoint, counting
@@ -766,6 +805,7 @@ impl State {
             indexes,
             deaths: dead.iter().filter(|dead| **dead).count(),
             dead,
+            resident: OnceLock::new(),
         });
         Ok(())
     }
@@ -1033,6 +1073,7 @@ impl State {
                 indexes,
                 deaths: dead.iter().filter(|dead| **dead).count(),
                 dead,
+                resident: OnceLock::new(),
             }],
         );
         self.checkpointed(manifest_key, position, flushed)
@@ -1212,6 +1253,7 @@ impl State {
                 indexes,
                 deaths: dead.iter().filter(|dead| **dead).count(),
                 dead,
+                resident: OnceLock::new(),
             });
         }
         let flushed: HashSet<RowKey> = snapshot.tombstones.into_iter().collect();
