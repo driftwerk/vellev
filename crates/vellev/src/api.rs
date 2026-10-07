@@ -20,6 +20,7 @@ use vellev_storage::{
     Condition, Fused, Hit, Mutation, Query as VectorQuery, Receipt, Scored, State, DEFAULT_ALPHA,
 };
 
+use crate::identity::Viewer;
 use crate::problem::ApiError;
 use crate::server::App;
 
@@ -627,13 +628,15 @@ pub async fn object(
     Shared(app): Shared<App>,
     Named((tenant, collection, id)): Named<(TenantId, CollectionName, ObjectId)>,
     Fresh(fresh): Fresh,
+    viewer: Viewer,
 ) -> Answer<Stored> {
     let tenant = app.node()?.reader(&tenant, fresh).await?;
     tenant
         .read(|state| {
-            schema(state, &collection)?;
+            let schema = schema(state, &collection)?;
             let found = state
                 .get(&collection, id)
+                .filter(|found| viewer.sees(&schema, found.object))
                 .map(|found| stored(found.object, found.vector, true));
             found.ok_or_else(|| {
                 ApiError::not_found(format!("object {id} does not exist in {collection}"))
@@ -766,6 +769,7 @@ pub async fn nearest(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
     Fresh(fresh): Fresh,
+    viewer: Viewer,
     Body(asked): Body<Nearest>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
@@ -784,10 +788,11 @@ pub async fn nearest(
         _ => return Err(ApiError::invalid("send either a vector or a text")),
     };
     let results = read(tenant, move |state| {
+        let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = VectorQuery {
             vector: &vector,
             limit,
-            filter: asked.filter.as_ref(),
+            filter: filter.as_ref(),
             oversample,
         };
         let hits = state.search(&collection, &query)?;
@@ -817,16 +822,18 @@ pub async fn keyword(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
     Fresh(fresh): Fresh,
+    viewer: Viewer,
     Body(asked): Body<Keyword>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
     let tenant = app.node()?.reader(&tenant, fresh).await?;
     let results = read(tenant, move |state| {
+        let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = Keywords {
             text: &asked.text,
             properties: &weights(&asked.properties),
             limit,
-            filter: asked.filter.as_ref(),
+            filter: filter.as_ref(),
         };
         let found = state.keyword(&collection, &query)?;
         Ok(found
@@ -856,6 +863,7 @@ pub async fn hybrid(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
     Fresh(fresh): Fresh,
+    viewer: Viewer,
     Body(asked): Body<Hybrid>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
@@ -877,6 +885,7 @@ pub async fn hybrid(
         },
     };
     let results = read(tenant, move |state| {
+        let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = HybridQuery {
             text: &asked.text,
             vector: vector.as_deref(),
@@ -885,7 +894,7 @@ pub async fn hybrid(
             properties: &weights(&asked.properties),
             limit,
             candidates,
-            filter: asked.filter.as_ref(),
+            filter: filter.as_ref(),
             oversample,
         };
         let found = state.hybrid(&collection, &query)?;
@@ -912,12 +921,14 @@ pub async fn list(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
     Fresh(fresh): Fresh,
+    viewer: Viewer,
     Body(page): Body<Page>,
 ) -> Answer<Objects> {
     let limit = app.limit(page.limit)?;
     let tenant = app.node()?.reader(&tenant, fresh).await?;
     read(tenant, move |state| {
-        let found = state.list(&collection, page.filter.as_ref(), page.after, limit + 1)?;
+        let filter = viewer.narrowed(&schema(state, &collection)?, page.filter);
+        let found = state.list(&collection, filter.as_ref(), page.after, limit + 1)?;
         let next = (found.len() > limit).then(|| found[limit - 1].id());
         let objects = found
             .into_iter()
@@ -943,16 +954,15 @@ pub async fn count(
     Shared(app): Shared<App>,
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
     Fresh(fresh): Fresh,
+    viewer: Viewer,
     Body(counting): Body<Counting>,
 ) -> Answer<Counted> {
     let tenant = app.node()?.reader(&tenant, fresh).await?;
     read(tenant, move |state| {
-        let count = match &counting.filter {
+        let filter = viewer.narrowed(&schema(state, &collection)?, counting.filter);
+        let count = match &filter {
             Some(filter) => state.select(&collection, filter)?.len(),
-            None => {
-                schema(state, &collection)?;
-                state.count(&collection)
-            }
+            None => state.count(&collection),
         };
         Ok(Json(Counted {
             count: count as u64,

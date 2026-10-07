@@ -18,6 +18,11 @@ pub const AFTER: &str = "x-vellev-after";
 /// A request header choosing a read's [`Consistency`].
 pub const CONSISTENCY: &str = "x-vellev-consistency";
 
+/// A request header naming the person a read is for, inside a tenant: a
+/// JWT signed with Ed25519 by a key the node trusts, naming the tenant, the
+/// person's `identity_id` and `teams`, and when it expires (`exp`).
+pub const IDENTITY: &str = "x-vellev-identity";
+
 /// A request header naming a write with a UUID, the same on every try of
 /// it, so that a try made after the first was answered is answered as it
 /// was rather than made again.

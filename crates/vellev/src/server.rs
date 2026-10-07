@@ -26,6 +26,7 @@ use vellev_node::{Node, NodeError};
 use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE};
 
 use crate::api;
+use crate::identity::{Caller, IdentityKeys};
 use crate::problem::ApiError;
 
 /// The most candidates per result a search may ask to have scored exactly.
@@ -54,6 +55,8 @@ pub struct App {
     stopping: Arc<AtomicBool>,
     /// The keys a caller may present; with none, nobody may call.
     keys: Arc<[String]>,
+    /// The keys whose identity tokens are trusted.
+    pub(crate) identity_keys: Arc<IdentityKeys>,
     limits: Limits,
     /// For sending a request on to the node that holds its tenant.
     http: reqwest::Client,
@@ -74,12 +77,21 @@ impl App {
             node: Arc::default(),
             stopping: Arc::default(),
             keys,
+            identity_keys: Arc::default(),
             limits,
             http: reqwest::Client::builder()
                 .connect_timeout(FORWARD_CONNECT_TIMEOUT)
                 .timeout(FORWARD_TIMEOUT)
                 .build()
                 .expect("an HTTP client with default settings"),
+        }
+    }
+
+    /// Trust identity tokens signed by `keys`.
+    pub fn trusting(self, keys: IdentityKeys) -> Self {
+        Self {
+            identity_keys: Arc::new(keys),
+            ..self
         }
     }
 
@@ -221,7 +233,7 @@ pub const ADMIN_ONLY: [&str; 4] = [
 /// to it as one that does not exist.
 async fn authorized(
     Shared(app): Shared<App>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let unauthorized = || ApiError::new(Code::Unauthorized, "a valid API key is required");
@@ -239,6 +251,7 @@ async fn authorized(
         .iter()
         .fold(false, |known, key| known | same(key, presented));
     if admin {
+        request.extensions_mut().insert(Caller::Admin);
         return Ok(next.run(request).await);
     }
     let reaches = app
@@ -263,6 +276,7 @@ async fn authorized(
         });
     match named {
         Some(tenant) if tenant == reaches.as_str() => {
+            parts.extensions.insert(Caller::Tenant(reaches));
             Ok(next.run(Request::from_parts(parts, body)).await)
         }
         Some(tenant) => Err(ApiError::not_found(format!(
