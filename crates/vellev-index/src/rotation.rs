@@ -2,32 +2,67 @@
 //! vector indexes. A one-bit code taken after a random rotation is a code
 //! along random directions, each of which meets every axis: a vector that
 //! lies along a few axes is coded as faithfully as one spread over all.
+//!
+//! A clustered index is stored with only its rotation's width and seed, and
+//! its codes were taken from what [`Rotation::apply`] gave when it was built.
+//! Both the rotation and [`Random`] must therefore give the same bits for
+//! the same width, seed and input forever: any change to either makes
+//! every stored index answer wrongly. The golden tests below hold them to it.
 
 use serde::{Deserialize, Serialize};
 
 /// A random orthogonal rotation: random signs followed by a Walsh-Hadamard
-/// transform, over the dimensions padded to a power of two.
+/// transform, over the dimensions padded to a power of two. Stored as its
+/// width and seed alone; the signs follow from the seed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "Spec", into = "Spec")]
 pub(crate) struct Rotation {
     pub width: usize,
     seed: u64,
+    signs: Vec<f32>,
+}
+
+/// What a rotation is stored as.
+#[derive(Serialize, Deserialize)]
+struct Spec {
+    width: usize,
+    seed: u64,
+}
+
+impl From<Spec> for Rotation {
+    fn from(Spec { width, seed }: Spec) -> Self {
+        let mut random = Random(seed);
+        let signs = (0..width)
+            .map(|_| if random.next() & 1 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        Self { width, seed, signs }
+    }
+}
+
+impl From<Rotation> for Spec {
+    fn from(rotation: Rotation) -> Self {
+        Self {
+            width: rotation.width,
+            seed: rotation.seed,
+        }
+    }
 }
 
 impl Rotation {
     pub fn new(dimensions: usize, seed: u64) -> Self {
-        Self {
+        Spec {
             width: dimensions.next_power_of_two().max(64),
             seed,
         }
+        .into()
     }
 
     pub fn apply(&self, vector: &[f32]) -> Vec<f32> {
-        let mut random = Random(self.seed);
-        let mut rotated: Vec<f32> = (0..self.width)
-            .map(|i| {
-                let sign = if random.next() & 1 == 0 { 1.0 } else { -1.0 };
-                vector.get(i).copied().unwrap_or(0.0) * sign
-            })
+        let mut rotated: Vec<f32> = self
+            .signs
+            .iter()
+            .enumerate()
+            .map(|(i, sign)| vector.get(i).copied().unwrap_or(0.0) * sign)
             .collect();
         let mut half = 1;
         while half < self.width {
@@ -107,15 +142,67 @@ mod tests {
         assert_eq!(rotation.apply(&[1.0; 100]), rotation.apply(&[1.0; 100]));
     }
 
+    /// Along one axis, the rotation spreads a vector over every coordinate
+    /// equally: each is one over the square root of the width.
     #[test]
-    fn the_rotation_spreads_a_direction_over_every_coordinate() {
+    fn the_rotation_spreads_an_axis_over_every_coordinate_equally() {
         let rotation = Rotation::new(64, 3);
-        let rotated = rotation.apply(&[1.0; 64]);
-        let largest = rotated.iter().fold(0.0f32, |most, v| most.max(v.abs()));
-        let length = dot(&rotated, &rotated).sqrt();
+        let mut axis = vec![0.0; 64];
+        axis[5] = 1.0;
+        let rotated = rotation.apply(&axis);
         assert!(
-            largest < 0.5 * length,
-            "{largest} of {length} in one coordinate"
+            rotated
+                .iter()
+                .all(|value| (value.abs() - 0.125).abs() < 1e-7),
+            "{rotated:?}"
         );
+    }
+
+    /// Stored clustered indexes were coded from exactly these bits.
+    #[test]
+    fn the_rotation_and_the_generator_give_the_same_bits_forever() {
+        let input: Vec<f32> = (0..50).map(|i| (i as f32 - 20.0) / 7.0).collect();
+        let bits: Vec<u32> = Rotation::new(50, 42)
+            .apply(&input)
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(
+            bits,
+            [
+                3218079745, 1078160823, 1050373558, 3216581779, 1057264203, 1078760009, 1082167881,
+                1077262043, 3187671048, 3208342970, 1035393888, 1070596095, 1016219936, 3224895489,
+                1079508992, 3209541341, 3205946224, 1066701386, 1044980876, 3230625207, 3163703584,
+                1016220064, 1077561636, 1068498944, 3214784220, 3226842844, 3202650700, 1060859318,
+                3200253951, 3229239589, 1082991762, 3226543250, 3207144594, 3215682998, 1071195282,
+                1066701385, 1071794468, 3211338900, 1057863384, 3218678930, 1060260130, 1067899759,
+                1070596096, 3226842842, 1066401792, 3213885438, 3194861280, 1070895690, 1050373559,
+                1062656876, 1069697316, 1074565704, 1066701384, 3163703648, 3206545408, 1063855248,
+                3203849072, 1076962450, 1065503013, 3190067782, 1059660946, 1072992842, 1060859320,
+                1079059602,
+            ]
+        );
+        let mut random = Random(7);
+        assert_eq!(
+            [random.next(), random.next(), random.next()],
+            [
+                7191089600892374487,
+                309689372594955804,
+                16616101746815609346
+            ]
+        );
+        assert_eq!(random.sample(100, 5), [3, 5, 74, 82, 98]);
+    }
+
+    /// The signs are kept, not stored: a rotation read back is the same.
+    #[test]
+    fn a_rotation_survives_the_wire_as_its_width_and_seed() {
+        let rotation = Rotation::new(100, 77);
+        let bytes = rmp_serde::to_vec_named(&rotation).unwrap();
+        let spec: Spec = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!((spec.width, spec.seed), (128, 77));
+        let back: Rotation = rmp_serde::from_slice(&bytes).unwrap();
+        let input = vec![0.5; 100];
+        assert_eq!(back.apply(&input), rotation.apply(&input));
     }
 }
