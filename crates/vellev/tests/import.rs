@@ -106,6 +106,7 @@ fn options(state: &std::path::Path) -> Options {
         classes: vec![],
         embeddings: HashMap::new(),
         vectors: HashMap::new(),
+        dimensions: HashMap::new(),
         created_as: Some("createdAt".into()),
         updated_as: None,
         page: 50,

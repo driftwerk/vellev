@@ -52,6 +52,9 @@ pub struct Options {
     pub embeddings: HashMap<String, Embedding>,
     /// For each class with several named vectors, the one to copy.
     pub vectors: HashMap<String, String>,
+    /// For each class copied with its vectors whose first objects have
+    /// none, how many dimensions its vectors are to have.
+    pub dimensions: HashMap<String, u32>,
     /// A date property to hold each object's creation time in Weaviate.
     pub created_as: Option<String>,
     /// A date property to hold the time each object was last changed.
@@ -131,7 +134,8 @@ pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Re
     let mut state = Progress::load(&options.state, source, tenant)?;
     let weaviate = Weaviate::new(source)?;
     let classes = weaviate.classes(&options.classes).await?;
-    for named in options.embeddings.keys().chain(options.vectors.keys()) {
+    let named = options.embeddings.keys().chain(options.vectors.keys());
+    for named in named.chain(options.dimensions.keys()) {
         if !classes.iter().any(|class| &class.class == named) {
             bail!("{named} is not a class being imported");
         }
@@ -229,14 +233,24 @@ async fn plan(
             ),
         },
     };
+    let mut vectorless = None;
     let embedding = match options.embeddings.get(&class.class) {
         Some(embedding) => embedding.clone(),
         None => {
             let sample = weaviate.page(&class, None, options.page, true).await?;
-            copied_embedding(&class, &vector, &sample)?
+            let given = options.dimensions.get(&class.class).copied();
+            let (embedding, found) = copied_embedding(&class, &vector, &sample, given)?;
+            vectorless = (!found).then(|| {
+                format!(
+                    "no vector was found in its first objects; it holds vectors of {} dimensions",
+                    embedding.dimensions
+                )
+            });
+            embedding
         }
     };
-    let (collection, warnings) = collection(&class, &vector, embedding, options)?;
+    let (collection, mut warnings) = collection(&class, &vector, embedding, options)?;
+    warnings.extend(vectorless);
     let plan = Plan {
         records: tenant.collection(&collection.name),
         dimensions: collection.embedding.dimensions,
@@ -604,28 +618,42 @@ fn collection(
 }
 
 /// How a class copied with its vectors embeds: as the client supplies,
-/// with the dimensions of the first vector found.
-fn copied_embedding(class: &Class, copy: &Copy, sample: &[Object]) -> Result<Embedding> {
-    let Some(vector) = sample.iter().find_map(|object| object.vector(copy)) else {
-        bail!(
-            "class {} has no vector to copy in its first objects; say how vellev is to embed it",
-            class.class
-        );
-    };
+/// with the dimensions of the first vector found, or else those `given`,
+/// and whether a vector was found. A class whose clients supply vectors,
+/// and whose first objects have none, may hold none at all, such as one
+/// that keeps a setting: it is given one dimension unless told otherwise.
+fn copied_embedding(
+    class: &Class,
+    copy: &Copy,
+    sample: &[Object],
+    given: Option<u32>,
+) -> Result<(Embedding, bool)> {
     let vectorizer = match class.named(copy, "vectorizer") {
         Some(named) => named
             .as_object()
             .and_then(|vectorizer| vectorizer.keys().next().cloned()),
         None => class.vectorizer.clone(),
     };
-    Ok(Embedding {
+    let vectorizer = vectorizer.unwrap_or_else(|| "none".into());
+    let found = sample.iter().find_map(|object| object.vector(copy));
+    let dimensions = match (found, given) {
+        (Some(vector), _) => vector.len() as u32,
+        (None, Some(given)) => given,
+        (None, None) if vectorizer == "none" => 1,
+        (None, None) => bail!(
+            "class {} has no vector to copy in its first objects; say how vellev is to embed it, or how many dimensions its vectors have",
+            class.class
+        ),
+    };
+    let embedding = Embedding {
         provider: EmbeddingProvider::None,
-        model: format!("weaviate:{}", vectorizer.as_deref().unwrap_or("none")),
-        dimensions: vector.len() as u32,
+        model: format!("weaviate:{vectorizer}"),
+        dimensions,
         query_prefix: None,
         document_prefix: None,
         properties: Vec::new(),
-    })
+    };
+    Ok((embedding, found.is_some()))
 }
 
 /// An object as Weaviate's REST API gives it.
@@ -880,6 +908,7 @@ mod tests {
             classes: vec![],
             embeddings: HashMap::new(),
             vectors: HashMap::new(),
+            dimensions: HashMap::new(),
             created_as: None,
             updated_as: None,
             page: 100,
@@ -1007,9 +1036,21 @@ mod tests {
             { "id": id(2), "vectors": { "default": [1.0, 2.0, 3.0] } },
         ]))
         .unwrap();
-        let embedding = copied_embedding(&class, &named, &sample).unwrap();
+        let (embedding, found) = copied_embedding(&class, &named, &sample, None).unwrap();
+        assert!(found);
         assert_eq!(embedding.dimensions, 3);
         assert_eq!(embedding.model, "weaviate:text2vec-transformers");
+    }
+
+    #[test]
+    fn a_class_without_vectors_is_copied_with_none_if_its_clients_supply_them() {
+        let none = class(json!([]), json!({ "vectorizer": "none" }));
+        let (embedding, found) = copied_embedding(&none, &Copy::Vector, &[], None).unwrap();
+        assert_eq!((embedding.dimensions, found), (1, false));
+        let (embedding, _) = copied_embedding(&none, &Copy::Vector, &[], Some(384)).unwrap();
+        assert_eq!(embedding.dimensions, 384);
+        let vectorized = class(json!([]), json!({ "vectorizer": "text2vec-transformers" }));
+        assert!(copied_embedding(&vectorized, &Copy::Vector, &[], None).is_err());
     }
 
     fn id(n: u8) -> String {

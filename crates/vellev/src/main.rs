@@ -88,6 +88,10 @@ struct ImportWeaviate {
     /// CLASS=NAME: copy the class's named vector NAME, where it has several.
     #[arg(long = "vector", value_parser = class_vector)]
     vectors: Vec<(String, String)>,
+    /// CLASS=N: the dimensions of the class's vectors, where its first
+    /// objects have none to tell by.
+    #[arg(long = "dimensions", value_parser = class_dimensions)]
+    dimensions: Vec<(String, u32)>,
     /// A date property to hold each object's creation time in Weaviate.
     #[arg(long)]
     created_as: Option<String>,
@@ -118,6 +122,12 @@ fn class_embedding(given: &str) -> Result<(String, Embedding)> {
     let read = || -> Result<Embedding> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) };
     let embedding = read().wrap_err_with(|| format!("reading the embedding in {path}"))?;
     Ok((class.to_string(), embedding))
+}
+
+/// A class's name and the number after `=`.
+fn class_dimensions(given: &str) -> Result<(String, u32)> {
+    let (class, dimensions) = class_vector(given)?;
+    Ok((class, dimensions.parse()?))
 }
 
 /// A class's name and the name after `=`.
@@ -180,6 +190,7 @@ async fn main() -> Result<ExitCode> {
                 classes,
                 embeddings,
                 vectors,
+                dimensions,
                 created_as,
                 updated_as,
                 page,
@@ -196,6 +207,7 @@ async fn main() -> Result<ExitCode> {
                 classes,
                 embeddings: embeddings.into_iter().collect(),
                 vectors: vectors.into_iter().collect(),
+                dimensions: dimensions.into_iter().collect(),
                 created_as,
                 updated_as,
                 page,
