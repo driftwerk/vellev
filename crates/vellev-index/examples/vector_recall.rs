@@ -11,7 +11,7 @@
 use std::time::{Duration, Instant};
 
 use vellev_core::Distance;
-use vellev_index::vector::{distance, BinaryIndex, VectorIndex};
+use vellev_index::vector::{distance, in_row_order, BinaryIndex, VectorIndex};
 
 fn setting<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -128,7 +128,7 @@ fn main() {
         let mut taken = Vec::with_capacity(queries);
         for (query, truth) in asked.iter().zip(&truth) {
             let started = Instant::now();
-            let shortlist = index.shortlist(query, K * oversample, None, &[]);
+            let shortlist = index.shortlist(query, K * oversample, None, &[], &in_row_order);
             let nearest = exact(&vectors, query, shortlist.into_iter(), K);
             taken.push(started.elapsed());
             found += truth.iter().filter(|row| nearest.contains(row)).count();

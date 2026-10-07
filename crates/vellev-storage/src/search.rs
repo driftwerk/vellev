@@ -2,7 +2,7 @@
 
 use vellev_core::{CollectionName, Object};
 use vellev_index::filter::{Filter, Predicate};
-use vellev_index::vector::{Scorer, VectorIndex};
+use vellev_index::vector::{nearest, Scorer, VectorIndex};
 
 use crate::format::CollectionId;
 use crate::state::{Layer, State, Vectors, SHORTLIST_ABOVE};
@@ -53,7 +53,13 @@ pub struct Hit<'a> {
 
 impl State {
     /// The collection's live objects nearest `query.vector`, nearest first,
-    /// ties in object id order. Objects without a vector are never returned.
+    /// those at one distance in object id order. Objects without a vector
+    /// are never returned.
+    ///
+    /// Where a layer's index shortlists, rows it estimates alike are cut in
+    /// object id order too, so that of objects with one vector the lowest
+    /// ids are found first. Rows it estimates differently are found, or
+    /// missed, as any other near neighbour is, whatever their distance.
     pub fn search(&self, collection: &CollectionName, query: &Query<'_>) -> Result<Vec<Hit<'_>>> {
         let (id, schema) = self.catalog().known(collection)?;
         schema.embedding.check(query.vector)?;
@@ -74,7 +80,9 @@ impl State {
                 // estimates err more than others' would otherwise crowd
                 // them out with rows that only look near.
                 Candidates::Estimated(mut rows) => {
-                    let rest = nearest_estimated(&mut rows, query.limit);
+                    let rest = nearest(&mut rows, query.limit, |a, b| {
+                        layer.id(*a).cmp(&layer.id(*b))
+                    });
                     floors += rows.len();
                     exact.extend(rows.into_iter().map(|(_, row)| (at, row)));
                     estimated.extend(
@@ -84,7 +92,11 @@ impl State {
                 }
             }
         }
-        nearest_estimated(&mut estimated, budget.saturating_sub(floors));
+        nearest(
+            &mut estimated,
+            budget.saturating_sub(floors),
+            |(a_at, a), (b_at, b)| layers[*a_at].id(*a).cmp(&layers[*b_at].id(*b)),
+        );
         let estimated = estimated.into_iter().map(|(_, found)| found);
         let mut hits: Vec<Hit<'_>> = exact
             .into_iter()
@@ -129,25 +141,20 @@ fn candidates(
         .vectors
         .as_ref()
         .filter(|_| many_are_live(allowed.len(), layer, live));
+    let ties = |a, b| layer.id(a).cmp(&layer.id(b));
     match shortlist {
-        Some(Vectors::Clustered(clustered)) => {
-            Candidates::Estimated(clustered.estimates(vector, count, only.as_ref(), layer.dead))
-        }
-        Some(vectors) => {
-            Candidates::Exact(vectors.shortlist(vector, count, only.as_ref(), layer.dead))
+        Some(Vectors::Clustered(clustered)) => Candidates::Estimated(clustered.estimates(
+            vector,
+            count,
+            only.as_ref(),
+            layer.dead,
+            &ties,
+        )),
+        Some(binary) => {
+            Candidates::Exact(binary.shortlist(vector, count, only.as_ref(), layer.dead, &ties))
         }
         None => Candidates::Exact(live().collect()),
     }
-}
-
-/// Keep in `rows` the `count` with the nearest estimates, in no order,
-/// returning the others.
-fn nearest_estimated<T>(rows: &mut Vec<(f32, T)>, count: usize) -> Vec<(f32, T)> {
-    if rows.len() <= count {
-        return Vec::new();
-    }
-    rows.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0));
-    rows.split_off(count)
 }
 
 /// The layer's live `row` scored exactly, if it has a vector.

@@ -10,6 +10,7 @@
 //! caller allows, not filtered afterwards, so a filter never thins it.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 
 use roaring::RoaringBitmap;
 use vellev_core::Distance;
@@ -150,6 +151,32 @@ pub(crate) fn normalised(metric: Distance, vector: &[f32]) -> Cow<'_, [f32]> {
     }
 }
 
+/// How to order two rows whose estimated distances are equal.
+pub type Ties<'a> = &'a dyn Fn(u32, u32) -> Ordering;
+
+/// Rows of equal estimate in row order, for a caller with no order of its
+/// own.
+pub fn in_row_order(a: u32, b: u32) -> Ordering {
+    a.cmp(&b)
+}
+
+/// Keep in `rows` the `count` with the nearest estimates, those of equal
+/// estimate ordered by `ties`, returning the others. Neither part is in any
+/// order.
+pub fn nearest<T>(
+    rows: &mut Vec<(f32, T)>,
+    count: usize,
+    ties: impl Fn(&T, &T) -> Ordering,
+) -> Vec<(f32, T)> {
+    if rows.len() <= count {
+        return Vec::new();
+    }
+    rows.select_nth_unstable_by(count, |a, b| {
+        a.0.total_cmp(&b.0).then_with(|| ties(&a.1, &b.1))
+    });
+    rows.split_off(count)
+}
+
 /// A way to pick, cheaply, the rows most likely to be nearest a query.
 pub trait VectorIndex {
     /// How many rows are indexed.
@@ -160,15 +187,36 @@ pub trait VectorIndex {
     }
 
     /// Up to `count` rows likely to be nearest `query`, in no particular
-    /// order, taken only from `only` when it is given and never from a row
-    /// flagged in `skipped`, which is indexed by row.
+    /// order, each with its estimated distance, taken only from `only` when
+    /// it is given and never from a row flagged in `skipped`, which is
+    /// indexed by row. Where not every row of one estimate fits, those
+    /// first by `ties` are taken: rows the index cannot tell apart, such as
+    /// those of one vector, come in the caller's order. Estimates order the
+    /// rows of one index; they are comparable with another index's only
+    /// where the index says so.
+    fn estimates(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)>;
+
+    /// The rows of [`VectorIndex::estimates`], without their estimates.
     fn shortlist(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
-    ) -> Vec<u32>;
+        ties: Ties<'_>,
+    ) -> Vec<u32> {
+        self.estimates(query, count, only, skipped, ties)
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect()
+    }
 }
 
 /// One bit per dimension of each vector, for a scan by Hamming distance.
@@ -308,13 +356,14 @@ impl VectorIndex for BinaryIndex {
         self.rows.len()
     }
 
-    fn shortlist(
+    fn estimates(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
-    ) -> Vec<u32> {
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)> {
         if count == 0 || query.len() != self.mean.len() {
             return Vec::new();
         }
@@ -349,11 +398,8 @@ impl VectorIndex for BinaryIndex {
                 .map(|(position, _)| estimated(position))
                 .collect(),
         };
-        if estimates.len() > count {
-            estimates.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            estimates.truncate(count);
-        }
-        estimates.into_iter().map(|(_, row)| row).collect()
+        nearest(&mut estimates, count, |a, b| ties(*a, *b));
+        estimates
     }
 }
 
@@ -462,7 +508,7 @@ mod tests {
                 .map(|(row, v)| (distance(metric, &query, v), row as u32 * 2))
                 .collect();
             exact.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let shortlist = index.shortlist(&query, count, None, &[]);
+            let shortlist = index.shortlist(&query, count, None, &[], &in_row_order);
             assert_eq!(shortlist.len(), count.min(vectors.len()));
             found += exact[..10]
                 .iter()
@@ -533,6 +579,25 @@ mod tests {
     }
 
     #[test]
+    fn rows_the_index_cannot_tell_apart_are_cut_in_the_callers_order() {
+        let mut random = Random(4);
+        let mut vectors: Vec<Vec<f32>> = (0..500).map(|_| random.vector(32)).collect();
+        // Long enough to be the nearest under every metric.
+        let same: Vec<f32> = random.vector(32).into_iter().map(|v| 4.0 * v).collect();
+        vectors.extend(std::iter::repeat_n(same.clone(), 300));
+        for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
+            let index = indexed(metric, &vectors);
+            let backwards = |a: u32, b: u32| b.cmp(&a);
+            let mut rows = index.shortlist(&same, 3, None, &[], &backwards);
+            rows.sort_unstable();
+            assert_eq!(rows, [1594, 1596, 1598], "{metric:?}");
+            let mut rows = index.shortlist(&same, 3, None, &[], &in_row_order);
+            rows.sort_unstable();
+            assert_eq!(rows, [1000, 1002, 1004], "{metric:?}");
+        }
+    }
+
+    #[test]
     fn lengths_that_overflow_or_vanish_give_a_finite_cosine_distance() {
         for vector in [[1e30f32, 0.0], [1e-30, 0.0], [0.0, 0.0]] {
             let distance = distance(Distance::Cosine, &vector, &vector);
@@ -560,7 +625,7 @@ mod tests {
         let index = indexed(Distance::Cosine, &vectors);
         let query = &vectors[0];
         let shortlist = |count: usize, only: Option<&RoaringBitmap>, skipped: &[bool]| {
-            let mut rows = index.shortlist(query, count, only, skipped);
+            let mut rows = index.shortlist(query, count, only, skipped, &in_row_order);
             rows.sort_unstable();
             rows
         };
@@ -580,7 +645,7 @@ mod tests {
         assert_eq!(shortlist(1000, None, &skipped).len(), 98);
         assert_eq!(shortlist(0, None, &[]), Vec::<u32>::new());
         assert_eq!(
-            index.shortlist(&query[..10], 5, None, &[]),
+            index.shortlist(&query[..10], 5, None, &[], &in_row_order),
             Vec::<u32>::new()
         );
         assert!(BinaryIndex::build(Distance::Cosine, &[]).is_none());

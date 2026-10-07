@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use vellev_core::{Object, ObjectError};
-use vellev_storage::{Hit, Query};
+use vellev_storage::{Hit, Merging, Query};
 
 const VECTORS: &str = "vectors";
 
@@ -481,6 +481,40 @@ async fn a_shortlisted_segment_finds_a_long_vector_with_the_largest_inner_produc
                 assert_eq!(hits[0].object.id, row(SHORTLISTED), "at limit {limit}");
             }
         });
+    }
+}
+
+/// Rows of one vector, written in descending id order so that their rows
+/// run the other way, come back in id order from a segment searched
+/// through either kind of index.
+#[tokio::test]
+async fn rows_of_one_vector_come_back_in_id_order_from_a_shortlisted_segment() {
+    let clustered = Merging {
+        clustered_above: 4_000,
+        ..Merging::default()
+    };
+    for merging in [Merging::default(), clustered] {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let same = vec![0.5; 8];
+        let backwards = (1..=SHORTLISTED).rev().map(|n| (n, same.clone()));
+        flushed(&writer, Distance::L2, backwards.collect()).await;
+        for copy in [
+            writer.partition().clone(),
+            cluster.open().await.partition().clone(),
+        ] {
+            copy.read(|state| {
+                for query in [same.clone(), vec![-1.0; 8]] {
+                    for limit in [1, 3] {
+                        let hits = state
+                            .search(&name(VECTORS), &Query::nearest(&query, limit))
+                            .unwrap();
+                        let first: Vec<ObjectId> = (1..=limit as u64).map(row).collect();
+                        assert_eq!(ids(&hits), first, "{merging:?} at limit {limit}");
+                    }
+                }
+            });
+        }
     }
 }
 

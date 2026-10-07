@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use vellev_core::Distance;
 use vellev_index::clustered::ClusteredIndex;
-use vellev_index::vector::{distance, BinaryIndex, VectorIndex};
+use vellev_index::vector::{distance, in_row_order, BinaryIndex, VectorIndex};
 
 struct Noise(u64);
 
@@ -78,7 +78,7 @@ fn main() {
             let started = Instant::now();
             let mut found = 0;
             for (query, truth) in queries.iter().zip(&exact) {
-                let shortlist = index.shortlist(query, 10 * oversample, None, &[]);
+                let shortlist = index.shortlist(query, 10 * oversample, None, &[], &in_row_order);
                 found += truth.iter().filter(|row| shortlist.contains(row)).count();
             }
             let per_query = started.elapsed() / queries.len() as u32;

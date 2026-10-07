@@ -6,7 +6,7 @@ use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value
 use vellev_index::clustered::ClusteredIndex;
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
-use vellev_index::vector::{BinaryIndex, VectorIndex};
+use vellev_index::vector::{BinaryIndex, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
@@ -92,16 +92,17 @@ impl VectorIndex for Vectors {
         }
     }
 
-    fn shortlist(
+    fn estimates(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
-    ) -> Vec<u32> {
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)> {
         match self {
-            Vectors::Binary(index) => index.shortlist(query, count, only, skipped),
-            Vectors::Clustered(index) => index.shortlist(query, count, only, skipped),
+            Vectors::Binary(index) => index.estimates(query, count, only, skipped, ties),
+            Vectors::Clustered(index) => index.estimates(query, count, only, skipped, ties),
         }
     }
 }
@@ -253,6 +254,10 @@ impl<'a> Layer<'a> {
             Some(column) => column.get(row),
             None => self.rows[row].object.vector.as_deref(),
         }
+    }
+
+    pub fn id(&self, row: u32) -> ObjectId {
+        self.rows[row as usize].object.id
     }
 
     pub fn live(&self, row: usize) -> Live<'a> {

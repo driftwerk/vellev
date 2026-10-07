@@ -23,7 +23,9 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use vellev_core::Distance;
 
-use crate::vector::{dot, normalised, squared_l2, Scorer, VectorIndex};
+use crate::vector::{
+    dot, in_row_order, nearest, normalised, or_farthest, squared_l2, Scorer, Ties, VectorIndex,
+};
 
 /// The share of the true nearest ten that the clusters scanned must hold,
 /// over sample queries, when the index is built.
@@ -372,10 +374,13 @@ impl PartialOrd for Candidate {
     }
 }
 
-/// The `count` nearest candidates offered, farthest on top.
+/// The `count` nearest candidates offered, farthest on top, and those
+/// offered as far as the farthest of them that did not fit: which of the
+/// candidates at that distance are kept is for the caller to say.
 struct Nearest {
     count: usize,
     heap: BinaryHeap<Candidate>,
+    tied: Vec<u32>,
 }
 
 impl Nearest {
@@ -383,19 +388,32 @@ impl Nearest {
         Self {
             count,
             heap: BinaryHeap::with_capacity(count + 1),
+            tied: Vec::new(),
         }
     }
 
     fn offer(&mut self, distance: f32, row: u32) {
+        let distance = or_farthest(distance);
         if self.heap.len() < self.count {
             self.heap.push(Candidate { distance, row });
-        } else if self
-            .heap
-            .peek()
-            .is_some_and(|worst| distance < worst.distance)
-        {
-            self.heap.pop();
-            self.heap.push(Candidate { distance, row });
+            return;
+        }
+        let Some(mut worst) = self.heap.peek_mut() else {
+            return;
+        };
+        match distance.total_cmp(&worst.distance) {
+            Ordering::Greater => {}
+            Ordering::Equal => self.tied.push(row),
+            Ordering::Less => {
+                let out = std::mem::replace(&mut *worst, Candidate { distance, row });
+                drop(worst);
+                match self.heap.peek().map(|worst| worst.distance) {
+                    Some(worst) if worst.total_cmp(&out.distance).is_eq() => {
+                        self.tied.push(out.row)
+                    }
+                    _ => self.tied.clear(),
+                }
+            }
         }
     }
 
@@ -403,11 +421,22 @@ impl Nearest {
         self.heap.len() >= self.count
     }
 
-    fn estimates(self) -> Vec<(f32, u32)> {
-        self.heap
+    /// The nearest `count`, those as far as the farthest of them taken in
+    /// `ties` order.
+    fn estimates(self, ties: Ties<'_>) -> Vec<(f32, u32)> {
+        let Self { count, heap, tied } = self;
+        let farthest = heap.peek().map(|worst| worst.distance);
+        let mut estimates: Vec<(f32, u32)> = heap
             .into_iter()
             .map(|candidate| (candidate.distance, candidate.row))
-            .collect()
+            .collect();
+        estimates.extend(
+            farthest
+                .into_iter()
+                .flat_map(|distance| tied.iter().map(move |row| (distance, *row))),
+        );
+        nearest(&mut estimates, count, |a, b| ties(*a, *b));
+        estimates
     }
 }
 
@@ -587,7 +616,7 @@ impl ClusteredIndex {
                         .unwrap_or(order.len())
                 };
                 nearest
-                    .estimates()
+                    .estimates(&in_row_order)
                     .into_iter()
                     .map(move |(_, row)| rank_of(self.at[self.position(row).unwrap()].0))
             })
@@ -637,16 +666,35 @@ impl ClusteredIndex {
         order
     }
 
-    /// Up to `count` rows likely to be nearest `query`, as for
-    /// [`VectorIndex::shortlist`], each with its estimated distance under
-    /// the index's metric: comparable with the estimates of other indexes
-    /// of vectors measured the same way.
-    pub fn estimates(
+    fn position(&self, row: u32) -> Option<usize> {
+        self.rows.binary_search(&row).ok()
+    }
+
+    fn centroid(&self, cluster: usize) -> &[f32] {
+        &self.centroids[cluster * self.rotation.width..][..self.rotation.width]
+    }
+
+    fn code<'a>(&self, cluster: &'a Cluster, index: usize) -> &'a [u64] {
+        let words = self.rotation.width / 64;
+        &cluster.codes[index * words..][..words]
+    }
+}
+
+impl VectorIndex for ClusteredIndex {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Each estimate is a distance under the index's metric, comparable
+    /// with the estimates of other clustered indexes of vectors measured
+    /// the same way.
+    fn estimates(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
+        ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
@@ -695,39 +743,7 @@ impl ClusteredIndex {
                 }
             }
         }
-        nearest.estimates()
-    }
-
-    fn position(&self, row: u32) -> Option<usize> {
-        self.rows.binary_search(&row).ok()
-    }
-
-    fn centroid(&self, cluster: usize) -> &[f32] {
-        &self.centroids[cluster * self.rotation.width..][..self.rotation.width]
-    }
-
-    fn code<'a>(&self, cluster: &'a Cluster, index: usize) -> &'a [u64] {
-        let words = self.rotation.width / 64;
-        &cluster.codes[index * words..][..words]
-    }
-}
-
-impl VectorIndex for ClusteredIndex {
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn shortlist(
-        &self,
-        query: &[f32],
-        count: usize,
-        only: Option<&RoaringBitmap>,
-        skipped: &[bool],
-    ) -> Vec<u32> {
-        self.estimates(query, count, only, skipped)
-            .into_iter()
-            .map(|(_, row)| row)
-            .collect()
+        nearest.estimates(ties)
     }
 }
 
@@ -840,7 +856,7 @@ mod tests {
                     .step_by(groups)
                     .map(|at| at as u32 * 2)
                     .collect();
-                let shortlist = index.shortlist(query, members.len() * 2, None, &[]);
+                let shortlist = index.shortlist(query, members.len() * 2, None, &[], &in_row_order);
                 let found = members.iter().filter(|row| shortlist.contains(row)).count();
                 assert!(
                     found * 2 >= members.len(),
@@ -881,7 +897,7 @@ mod tests {
                 .map(|(row, v)| (distance(metric, query, v), row as u32 * 2))
                 .collect();
             exact.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let shortlist = index.shortlist(query, count, None, &[]);
+            let shortlist = index.shortlist(query, count, None, &[], &in_row_order);
             found += exact[..10]
                 .iter()
                 .filter(|(_, row)| shortlist.contains(row))
@@ -1026,29 +1042,32 @@ mod tests {
         let query = &vectors[0];
 
         let only: RoaringBitmap = [0u32, 2, 3, 40, 198, 9999].into_iter().collect();
-        let mut allowed = index.shortlist(query, 50, Some(&only), &[]);
+        let mut allowed = index.shortlist(query, 50, Some(&only), &[], &in_row_order);
         allowed.sort_unstable();
         assert_eq!(allowed, [0, 2, 40, 198], "rows 3 and 9999 are not indexed");
 
         let mut skipped = vec![false; 4000];
         skipped[0] = true;
         skipped[40] = true;
-        let mut kept = index.shortlist(query, 50, Some(&only), &skipped);
+        let mut kept = index.shortlist(query, 50, Some(&only), &skipped, &in_row_order);
         kept.sort_unstable();
         assert_eq!(kept, [2, 198]);
 
         let every_other: RoaringBitmap = (0..4000u32).filter(|row| row % 4 == 0).collect();
-        let wide = index.shortlist(query, 30, Some(&every_other), &skipped);
+        let wide = index.shortlist(query, 30, Some(&every_other), &skipped, &in_row_order);
         assert_eq!(wide.len(), 30, "scans on past the usual probes until full");
         assert!(wide
             .iter()
             .all(|row| row % 4 == 0 && *row != 0 && *row != 40));
 
-        let everything = index.shortlist(query, 5000, None, &skipped);
+        let everything = index.shortlist(query, 5000, None, &skipped, &in_row_order);
         assert_eq!(everything.len(), 1998);
-        assert_eq!(index.shortlist(query, 0, None, &[]), Vec::<u32>::new());
         assert_eq!(
-            index.shortlist(&query[..10], 5, None, &[]),
+            index.shortlist(query, 0, None, &[], &in_row_order),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            index.shortlist(&query[..10], 5, None, &[], &in_row_order),
             Vec::<u32>::new()
         );
         assert!(ClusteredIndex::build(Distance::L2, &[]).is_none());
@@ -1060,7 +1079,7 @@ mod tests {
         let index = indexed(Distance::L2, &vectors);
         let query = &vectors[7];
         let few: RoaringBitmap = (0..6000u32).filter(|row| row % 100 == 0).collect();
-        let mut by_rows = index.shortlist(query, 30, Some(&few), &[]);
+        let mut by_rows = index.shortlist(query, 30, Some(&few), &[], &in_row_order);
         by_rows.sort_unstable();
         let mut exact: Vec<(f32, u32)> = few
             .iter()
@@ -1084,11 +1103,11 @@ mod tests {
         let same: Vec<Vec<f32>> = vec![vec![1.0, 2.0, 3.0]; 5];
         let index = indexed(Distance::L2, &same);
         assert!(index.clusters() <= 2);
-        let mut rows = index.shortlist(&[1.0, 2.0, 3.0], 10, None, &[]);
+        let mut rows = index.shortlist(&[1.0, 2.0, 3.0], 10, None, &[], &in_row_order);
         rows.sort_unstable();
         assert_eq!(rows, [0, 2, 4, 6, 8]);
         let one = ClusteredIndex::build(Distance::Cosine, &[(3, &[0.0, 0.0])]).unwrap();
-        assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[]), [3]);
+        assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[], &in_row_order), [3]);
     }
 
     #[test]
@@ -1098,8 +1117,8 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&index).unwrap();
         let back: ClusteredIndex = rmp_serde::from_slice(&bytes).unwrap();
         for query in vectors.iter().step_by(100) {
-            let mut a = index.shortlist(query, 20, None, &[]);
-            let mut b = back.shortlist(query, 20, None, &[]);
+            let mut a = index.shortlist(query, 20, None, &[], &in_row_order);
+            let mut b = back.shortlist(query, 20, None, &[], &in_row_order);
             a.sort_unstable();
             b.sort_unstable();
             assert_eq!(a, b);
