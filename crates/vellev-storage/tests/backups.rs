@@ -214,3 +214,76 @@ async fn purging_leaves_nothing_of_the_tenant() {
     assert!(backups.purge(&cluster.key.tenant).await.unwrap() > 0);
     assert!(keys(&store, "").await.is_empty());
 }
+
+/// A store that counts what is written to it.
+#[derive(Debug)]
+struct Counted {
+    inner: Arc<dyn Blobs>,
+    puts: AtomicUsize,
+}
+
+#[async_trait]
+impl Blobs for Counted {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_backup_writes_only_the_files_no_backup_has_copied_yet() {
+    let cluster = Cluster::new().await;
+    let counted = Arc::new(Counted {
+        inner: memory(),
+        puts: AtomicUsize::new(0),
+    });
+    let backups = Backups::new(counted.clone());
+    let writer = written(&cluster).await;
+    take(&backups, &cluster).await;
+    writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
+    counted.puts.store(0, Ordering::SeqCst);
+    take(&backups, &cluster).await;
+    assert_eq!(
+        counted.puts.load(Ordering::SeqCst),
+        3,
+        "the new log, and the record as pending and as complete"
+    );
+}
+
+#[tokio::test]
+async fn pruning_leaves_a_backup_under_way_and_its_files_alone() {
+    let cluster = Cluster::new().await;
+    let store = memory();
+    let backups = Backups::new(store.clone());
+    let writer = written(&cluster).await;
+    let under_way = take(&backups, &cluster).await;
+    let tenant = &cluster.key.tenant;
+    let records = format!("{tenant}/backups/");
+    let complete = keys(&store, &records).await.pop_first().unwrap();
+    let pending = complete.replace(".backup.json", ".pending.json");
+    store
+        .put(&pending, store.get(&complete).await.unwrap())
+        .await
+        .unwrap();
+    store.delete(&complete).await.unwrap();
+
+    writer.flush().await.unwrap();
+    writer.merge().await.unwrap();
+    writer.clean(Duration::ZERO).await.unwrap();
+    take(&backups, &cluster).await;
+    backups.prune(tenant, Duration::ZERO).await.unwrap();
+    assert!(keys(&store, &records).await.contains(&pending));
+    let files = keys(&store, &format!("{tenant}/files/")).await;
+    assert!(under_way
+        .files()
+        .all(|key| files.contains(&format!("{tenant}/files/{key}"))));
+}
