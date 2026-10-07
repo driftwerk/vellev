@@ -36,6 +36,7 @@ crc32fast = "1"
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
 futures = "0.3"
+http-body-util = "0.1"
 memmap2 = "0.9"
 object_store = { version = "0.12", features = ["aws"] }
 proptest = "1"

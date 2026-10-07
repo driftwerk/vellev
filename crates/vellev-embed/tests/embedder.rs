@@ -130,19 +130,33 @@ async fn a_repeated_query_is_embedded_once_and_the_oldest_are_forgotten() {
 }
 
 #[tokio::test]
-async fn an_answer_that_does_not_fit_is_refused() {
-    for (answer, reason) in [
-        (vec![], "0 vectors for 1 texts"),
+async fn an_answer_that_does_not_fit_is_refused_and_one_of_another_size_for_good() {
+    let malformed = |reason: &str| EmbedError::Malformed {
+        model: "fake".into(),
+        reason: reason.into(),
+    };
+    let unusable = |reason: &str| EmbedError::Unusable {
+        model: "fake".into(),
+        reason: reason.into(),
+    };
+    for (answer, expected) in [
+        (vec![], malformed("0 vectors for 1 texts")),
         (
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],
-            "2 vectors for 1 texts",
+            malformed("2 vectors for 1 texts"),
         ),
-        (vec![vec![1.0, 2.0, 3.0]], "a vector of 3 dimensions, not 2"),
-        (vec![vec![]], "a vector of 0 dimensions, not 2"),
-        (vec![vec![1.0, f32::NAN]], "a vector that is not finite"),
+        (
+            vec![vec![1.0, 2.0, 3.0]],
+            unusable("a vector of 3 dimensions, not 2"),
+        ),
+        (vec![vec![]], unusable("a vector of 0 dimensions, not 2")),
+        (
+            vec![vec![1.0, f32::NAN]],
+            malformed("a vector that is not finite"),
+        ),
         (
             vec![vec![f32::INFINITY, 0.0]],
-            "a vector that is not finite",
+            malformed("a vector that is not finite"),
         ),
     ] {
         let fake = Fake {
@@ -150,10 +164,6 @@ async fn an_answer_that_does_not_fit_is_refused() {
             ..Fake::default()
         };
         let (_, embedder) = embedder(fake);
-        let expected = EmbedError::Malformed {
-            model: "fake".into(),
-            reason: reason.into(),
-        };
         assert_eq!(
             embedder.documents(&texts(&["fox"])).await,
             Err(expected.clone())
@@ -211,7 +221,11 @@ fn a_model_that_cannot_be_embedded_with_is_refused_when_asked_for() {
     let bedrock = || EmbeddingProvider::Bedrock {
         region: "eu-west-2".into(),
     };
-    let refused = |embedding: Embedding| embedders.embedder(&embedding).unwrap_err();
+    let refused = |embedding: Embedding| {
+        let refused = embedders.embedder(&embedding).unwrap_err();
+        assert!(refused.lasting(), "{refused}");
+        refused
+    };
     assert!(embedders
         .embedder(&with(
             EmbeddingProvider::Local,

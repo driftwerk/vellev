@@ -111,12 +111,14 @@ impl Embedder {
                 vectors.len()
             )));
         }
+        // Vectors of another size mean the model is not the one the
+        // collection was made for, however often it is asked.
         let dimensions = self.embedding.dimensions as usize;
         if let Some(wrong) = vectors.iter().find(|vector| vector.len() != dimensions) {
-            return Err(malformed(format!(
-                "a vector of {} dimensions, not {dimensions}",
-                wrong.len()
-            )));
+            return Err(EmbedError::Unusable {
+                model: self.embedding.model.clone(),
+                reason: format!("a vector of {} dimensions, not {dimensions}", wrong.len()),
+            });
         }
         if !vectors.iter().flatten().all(|value| value.is_finite()) {
             return Err(malformed("a vector that is not finite".into()));

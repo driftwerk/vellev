@@ -102,6 +102,12 @@ Clients and nodes of different releases talk to each other.
 - A response may gain fields; clients ignore what they do not know, and an
   outcome of a kind they do not know reads as `unknown`. A response never
   loses a field or changes what one means.
+- A failure may gain codes, and its `limit` and `missing` may gain names. A
+  client reads a code, a limit's name or a kind of missing thing it does
+  not know as `unknown`, and takes an unknown code as final: it does not
+  send the request again. A failure that may pass keeps `unavailable` or
+  `uncertain`, which every client retries; a new code is only for one that
+  will not.
 - A request may gain optional fields. A node refuses a field it does not
   understand, at any depth, so a client using a new field against an older
   node is told so rather than ignored.

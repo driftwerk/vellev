@@ -84,7 +84,34 @@ pub trait Vectorize: std::fmt::Debug + Send + Sync {
         &self,
         embedding: &Embedding,
         texts: Vec<String>,
-    ) -> std::result::Result<Vec<Vec<f32>>, String>;
+    ) -> std::result::Result<Vec<Vec<f32>>, Unembedded>;
+}
+
+/// Why vectors could not be made, and whether asking again could help.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unembedded {
+    pub reason: String,
+    /// Nothing will make them until the node or the collection is set up
+    /// otherwise.
+    pub lasting: bool,
+}
+
+impl Unembedded {
+    /// A failure that may pass.
+    pub fn for_now(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            lasting: false,
+        }
+    }
+
+    /// A failure that will not pass by itself.
+    pub fn for_good(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            lasting: true,
+        }
+    }
 }
 
 /// Holds when the stored object's `property` equals `equals`, where JSON

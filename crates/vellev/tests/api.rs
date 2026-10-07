@@ -637,7 +637,7 @@ async fn the_description_covers_every_route_that_needs_a_key() {
                 .map(move |method| (method.to_uppercase(), path.clone()))
         })
         .collect();
-    assert_eq!(operations.len(), 26, "{operations:?}");
+    assert_eq!(operations.len(), 27, "{operations:?}");
 
     served.with_notes(supplied()).await;
     for (method, path) in &operations {
@@ -907,10 +907,19 @@ async fn what_a_caller_may_ask_is_bounded_and_refusals_keep_their_shape() {
     );
 
     let large = json!({ "properties": { "title": "x".repeat(MAX_BODY) } });
-    let (status, body) = served.put(&object(9), large).await;
+    let (status, body) = served.put(&object(9), large.clone()).await;
     assert_eq!(
         (status, code(&body)),
         (StatusCode::PAYLOAD_TOO_LARGE, "invalid")
+    );
+    let body_bytes = json!({ "name": "body_bytes", "max": MAX_BODY });
+    assert_eq!(body["error"]["limit"], body_bytes);
+    let batched = json!({ "changes": [{ "op": "upsert", "collection": "notes", "id": id(9), "properties": large["properties"] }] });
+    let (status, body) = served.post("/v1/tenants/acme/changes", batched).await;
+    assert_eq!(
+        (status, &body["error"]["limit"]),
+        (StatusCode::PAYLOAD_TOO_LARGE, &body_bytes),
+        "a body read strictly is bounded alike"
     );
 
     let (status, body) = served.call(Method::POST, "/v1/tenants/acme", None).await;
@@ -986,6 +995,20 @@ async fn a_request_for_a_tenant_another_node_holds_is_sent_on_to_it() {
         (status, code(&body)),
         (StatusCode::BAD_REQUEST, "invalid"),
         "the holder's answer comes back as is"
+    );
+    let large = json!({ "properties": { "title": "x".repeat(MAX_BODY) } });
+    let (status, body) = second.put(&object(3), large).await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({
+                "code": "invalid",
+                "message": "length limit exceeded",
+                "limit": { "name": "body_bytes", "max": MAX_BODY },
+            })
+        ),
+        "a body too large to send on is refused where it arrives"
     );
     let (status, _) = second.call_as(None, Method::GET, &object(1), None).await;
     assert_eq!(
@@ -1339,17 +1362,22 @@ async fn a_tenant_key_reaches_its_tenant_alone_and_learns_nothing_of_others() {
         .await;
         let beta_object = beta_notes.to_string() + "/objects/" + &id(1);
         let written = as_key(node, &key, Method::PUT, &beta_object, Some(fox.clone())).await;
-        let missing_message = missing.1["error"]["message"]
-            .as_str()
-            .unwrap()
-            .replace("gamma", "beta");
+        let as_if_absent = |tenant: &str| {
+            json!({ "error": {
+                "code": "not_found",
+                "message": format!("tenant {tenant} does not exist"),
+                "missing": "tenant",
+            } })
+        };
+        assert_eq!(missing.1, as_if_absent("gamma"));
+        assert_eq!(
+            node.get("/v1/tenants/gamma/collections").await,
+            (StatusCode::NOT_FOUND, as_if_absent("gamma")),
+            "a tenant that is not there, as an admin key is told"
+        );
         for (status, body) in [beta, written] {
             assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-            assert_eq!(
-                body["error"]["message"],
-                json!(missing_message),
-                "as if beta were not there"
-            );
+            assert_eq!(body, as_if_absent("beta"), "as if beta were not there");
         }
 
         for (method, path) in [
@@ -1516,6 +1544,7 @@ async fn every_route_is_either_for_admins_or_one_tenants() {
     ];
     let mut classified: Vec<&str> = vellev::server::ADMIN_ONLY
         .iter()
+        .chain(&vellev::server::EVERY_KEY)
         .chain(&tenants_own)
         .copied()
         .collect();
@@ -1556,4 +1585,287 @@ async fn a_tenant_asking_too_much_is_answered_429_with_when_to_ask_again() {
         StatusCode::OK,
         "another tenant is not held up"
     );
+}
+
+/// A failure's whole body, as the API writes it.
+fn failed(code: &str, message: &str, more: Value) -> Value {
+    let mut problem = json!({ "code": code, "message": message });
+    problem
+        .as_object_mut()
+        .unwrap()
+        .extend(more.as_object().unwrap().clone());
+    json!({ "error": problem })
+}
+
+#[tokio::test]
+async fn a_failure_to_find_says_what_is_missing() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    let missing = |what: &str| json!({ "missing": what });
+    let nil = "00000000-0000-0000-0000-000000000000";
+    let patched = json!({ "changes": [{ "op": "patch", "collection": "notes", "id": id(9), "properties": { "n": 1 } }] });
+    let elsewhere = json!({ "changes": [{ "op": "delete", "collection": "absent", "id": id(9) }] });
+    let ghost = || {
+        failed(
+            "not_found",
+            "tenant ghost does not exist",
+            missing("tenant"),
+        )
+    };
+    let no_object = || {
+        failed(
+            "not_found",
+            &format!("object {} does not exist in notes", id(9)),
+            missing("object"),
+        )
+    };
+    let no_collection = || {
+        failed(
+            "not_found",
+            "collection absent does not exist",
+            missing("collection"),
+        )
+    };
+    for (method, path, body, expected) in [
+        (
+            Method::GET,
+            "/v1/nowhere".to_string(),
+            None,
+            failed("not_found", "no such route", missing("route")),
+        ),
+        (
+            Method::GET,
+            "/v1/tenants/ghost/collections".to_string(),
+            None,
+            ghost(),
+        ),
+        (
+            Method::PUT,
+            "/v1/tenants/ghost/collections/notes".to_string(),
+            Some(notes(supplied())),
+            ghost(),
+        ),
+        (
+            Method::GET,
+            "/v1/tenants/ghost/restore-points".to_string(),
+            None,
+            ghost(),
+        ),
+        (
+            Method::GET,
+            "/v1/tenants/acme/collections/absent".to_string(),
+            None,
+            no_collection(),
+        ),
+        (
+            Method::POST,
+            "/v1/tenants/acme/changes".to_string(),
+            Some(elsewhere),
+            no_collection(),
+        ),
+        (Method::GET, object(9), None, no_object()),
+        (
+            Method::POST,
+            "/v1/tenants/acme/changes".to_string(),
+            Some(patched),
+            no_object(),
+        ),
+        (
+            Method::DELETE,
+            format!("/v1/tenants/acme/keys/{nil}"),
+            None,
+            failed(
+                "not_found",
+                &format!("tenant acme has no key {nil}"),
+                missing("key"),
+            ),
+        ),
+        (
+            Method::POST,
+            "/v1/tenants/acme/restore".to_string(),
+            Some(json!({ "at": "2001-01-01T00:00:00Z" })),
+            failed(
+                "not_found",
+                "tenant acme has no state to go back to at that point",
+                missing("restore_point"),
+            ),
+        ),
+    ] {
+        let answer = served.call(method.clone(), &path, body).await;
+        assert_eq!(answer, (StatusCode::NOT_FOUND, expected), "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_for_more_than_the_node_allows_says_the_most_it_may_ask() {
+    let served = Served::new().await;
+    four_notes(&served).await;
+    let limit = |name: &str, max: u64| json!({ "limit": { "name": name, "max": max } });
+    let window = 10 * 366 * 24 * 60 * 60;
+    let published = served.get("/v1/limits").await.1;
+    for (method, path, body, expected) in [
+        (
+            Method::POST,
+            format!("{NOTES}/nearest"),
+            Some(json!({ "vector": [1.0, 0.0], "limit": 51 })),
+            failed(
+                "invalid",
+                "limit must be from 1 to 50, not 51",
+                limit("results", 50),
+            ),
+        ),
+        (
+            Method::POST,
+            format!("{NOTES}/list"),
+            Some(json!({ "limit": 0 })),
+            failed(
+                "invalid",
+                "limit must be from 1 to 50, not 0",
+                limit("results", 50),
+            ),
+        ),
+        (
+            Method::GET,
+            "/v1/tenants?limit=51".to_string(),
+            None,
+            failed(
+                "invalid",
+                "limit must be from 1 to 50, not 51",
+                limit("results", 50),
+            ),
+        ),
+        (
+            Method::POST,
+            format!("{NOTES}/hybrid"),
+            Some(json!({ "text": "fox", "limit": 1, "candidates": 101 })),
+            failed(
+                "invalid",
+                "candidates must be from 1 to 100, not 101",
+                limit("candidates", 100),
+            ),
+        ),
+        (
+            Method::POST,
+            format!("{NOTES}/nearest"),
+            Some(json!({ "vector": [1.0, 0.0], "limit": 1, "oversample": 1025 })),
+            failed(
+                "invalid",
+                "oversample must be from 1 to 1024, not 1025",
+                limit("oversample", 1024),
+            ),
+        ),
+        (
+            Method::PUT,
+            "/v1/tenants/acme/restore-window".to_string(),
+            Some(json!({ "secs": window + 1 })),
+            failed(
+                "invalid",
+                &format!("a restore window is from 1 to {window} seconds"),
+                limit("restore_window_secs", window),
+            ),
+        ),
+    ] {
+        let answer = served.call(method.clone(), &path, body).await;
+        assert_eq!(
+            answer,
+            (StatusCode::BAD_REQUEST, expected.clone()),
+            "{method} {path}"
+        );
+        let refused = &expected["error"]["limit"];
+        assert_eq!(
+            published[refused["name"].as_str().unwrap()],
+            refused["max"],
+            "what is refused is what is published"
+        );
+    }
+    let (status, body) = served
+        .post(
+            &format!("{NOTES}/nearest"),
+            json!({ "vector": [1.0], "limit": 1 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].get("limit").is_none(),
+        "a request invalid in another way names no limit: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_limits_are_told_to_every_key_and_to_no_caller_without_one() {
+    let served = Served::new().await;
+    served.ok(Method::PUT, "/v1/tenants/acme", None).await;
+    let issued = served.ok(Method::POST, "/v1/tenants/acme/keys", None).await;
+    let tenants_key = issued["key"].as_str().unwrap();
+    let limits = json!({
+        "results": MAX_LIMIT,
+        "candidates": 100,
+        "oversample": 1024,
+        "body_bytes": MAX_BODY,
+        "restore_window_secs": 10 * 366 * 24 * 60 * 60,
+    });
+    for key in [KEY, tenants_key] {
+        let told = served
+            .call_as(Some(key), Method::GET, "/v1/limits", None)
+            .await;
+        assert_eq!(told, (StatusCode::OK, limits.clone()));
+    }
+    for key in [None, Some("not-a-key")] {
+        let (status, body) = served.call_as(key, Method::GET, "/v1/limits", None).await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::UNAUTHORIZED, "unauthorized")
+        );
+    }
+    let (status, body) = served
+        .call_as(Some(tenants_key), Method::POST, "/v1/limits", None)
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::METHOD_NOT_ALLOWED, "invalid")
+    );
+}
+
+#[tokio::test]
+async fn a_model_the_node_cannot_run_is_final_and_a_search_falls_back_to_words() {
+    let served = Served::new().await;
+    let unheard_of = json!({
+        "provider": "local",
+        "model": "acme/unheard-of",
+        "dimensions": 2,
+        "properties": ["title"],
+    });
+    served.with_notes(unheard_of).await;
+    let model_unavailable = (
+        StatusCode::NOT_IMPLEMENTED,
+        failed(
+            "model_unavailable",
+            "the collection's embedding model cannot be used by this node",
+            json!({}),
+        ),
+    );
+    let fox = json!({ "properties": { "title": "a red fox" } });
+    assert_eq!(served.put(&object(1), fox).await, model_unavailable);
+    let batched = json!({ "changes": [{ "op": "upsert", "collection": "notes", "id": id(1), "properties": { "title": "a red fox" } }] });
+    assert_eq!(
+        served.post("/v1/tenants/acme/changes", batched).await,
+        model_unavailable
+    );
+    let nearest = json!({ "text": "fox", "limit": 1 });
+    assert_eq!(
+        served.post(&format!("{NOTES}/nearest"), nearest).await,
+        model_unavailable
+    );
+
+    let supplied = json!({ "properties": { "title": "a red fox" }, "vector": [1.0, 0.0] });
+    served.ok(Method::PUT, &object(1), Some(supplied)).await;
+    let by_words = served
+        .ok(
+            Method::POST,
+            &format!("{NOTES}/hybrid"),
+            Some(json!({ "text": "fox", "limit": 1 })),
+        )
+        .await;
+    assert_eq!(ids(&by_words), [id(1)]);
+    assert_eq!(by_words["degraded"], true);
 }

@@ -10,10 +10,11 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value as Document;
 use vellev_api::{
-    After, Backup, Backups, Batch, Change, Changes, Collections, Consistency, Content, Counted,
-    Counting, Failure, Found, Hybrid, IssuedKey, Keyword, Nearest, Objects, OnlyIf, Outcome, Page,
-    RestorePoint, RestorePoints, RestoreTo, RestoreWindow, Restored, Results, Stored, TenantKey,
-    TenantKeys, TenantPage, Tenants, Weighted, Written, AFTER, CONSISTENCY, REQUEST,
+    After, Backup, Backups, Batch, Bounded, Change, Changes, Collections, Consistency, Content,
+    Counted, Counting, Failure, Found, Hybrid, IssuedKey, Keyword, Limits, Missing, Nearest,
+    Objects, OnlyIf, Outcome, Page, RestorePoint, RestorePoints, RestoreTo, RestoreWindow,
+    Restored, Results, Stored, TenantKey, TenantKeys, TenantPage, Tenants, Weighted, Written,
+    AFTER, CONSISTENCY, REQUEST,
 };
 use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, RequestId, TenantId};
 use vellev_node::{Freshness, Reader};
@@ -30,9 +31,26 @@ use crate::server::App;
 type Answer<T> = Result<Json<T>, ApiError>;
 
 /// A JSON body, refused in the API's own words when it does not fit.
-#[derive(FromRequest)]
-#[from_request(via(Json), rejection(ApiError))]
 pub struct Body<T>(T);
+
+impl<T: DeserializeOwned> FromRequest<App> for Body<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(request: axum::extract::Request, app: &App) -> Result<Self, ApiError> {
+        let Json(read) = json(request, app).await?;
+        Ok(Body(read))
+    }
+}
+
+/// A JSON body, refused as too large past the most the node takes.
+async fn json<T: DeserializeOwned>(
+    request: axum::extract::Request,
+    app: &App,
+) -> Result<Json<T>, ApiError> {
+    Json::<T>::from_request(request, app)
+        .await
+        .map_err(|rejection| ApiError::unreadable(rejection, app.allowed().body_bytes))
+}
 
 /// A JSON body that must hold nothing the API does not understand, at any
 /// depth. Schemas tolerate fields they do not know, so that what a newer
@@ -43,11 +61,11 @@ pub struct Body<T>(T);
 /// taken for one not understood.
 pub struct Strict<T>(T);
 
-impl<S: Send + Sync, T: DeserializeOwned + Serialize> FromRequest<S> for Strict<T> {
+impl<T: DeserializeOwned + Serialize> FromRequest<App> for Strict<T> {
     type Rejection = ApiError;
 
-    async fn from_request(request: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
-        let Json(sent) = Json::<Document>::from_request(request, state).await?;
+    async fn from_request(request: axum::extract::Request, app: &App) -> Result<Self, ApiError> {
+        let Json(sent) = json::<Document>(request, app).await?;
         let read = T::deserialize(&sent).map_err(|error| ApiError::invalid(error.to_string()))?;
         let understood =
             serde_json::to_value(&read).map_err(|error| ApiError::invalid(error.to_string()))?;
@@ -352,6 +370,19 @@ fn weights(properties: &[Weighted]) -> Vec<(&str, f32)> {
         .collect()
 }
 
+/// The most a caller may ask of the node: the same for every caller, and
+/// reached by every key.
+#[utoipa::path(
+    get,
+    path = "/v1/limits",
+    responses((status = OK, body = Limits), (status = "4XX", body = Failure),
+        (status = "5XX", body = Failure)
+    )
+)]
+pub async fn limits(Shared(app): Shared<App>) -> Json<Limits> {
+    Json(app.allowed())
+}
+
 #[utoipa::path(
     get,
     path = "/v1/tenants",
@@ -398,11 +429,9 @@ pub async fn restore_points(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
 ) -> Answer<RestorePoints> {
-    let (window, points) = app
-        .node()?
-        .restore_points(&tenant)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("tenant {tenant} does not exist")))?;
+    let (window, points) = app.node()?.restore_points(&tenant).await?.ok_or_else(|| {
+        ApiError::not_found(Missing::Tenant, format!("tenant {tenant} does not exist"))
+    })?;
     let (earliest, latest) = points.unzip();
     Ok(Json(RestorePoints {
         window_secs: window.as_secs(),
@@ -514,9 +543,11 @@ pub async fn set_restore_window(
 ) -> Result<StatusCode, ApiError> {
     let most = MAX_RESTORE_WINDOW.as_secs();
     if window.secs.is_some_and(|secs| secs == 0 || secs > most) {
-        return Err(ApiError::invalid(format!(
-            "a restore window is from 1 to {most} seconds"
-        )));
+        return Err(ApiError::beyond(
+            Bounded::RestoreWindowSecs,
+            most,
+            format!("a restore window is from 1 to {most} seconds"),
+        ));
     }
     let set = app
         .node()?
@@ -524,9 +555,10 @@ pub async fn set_restore_window(
         .await?;
     match set {
         true => Ok(StatusCode::NO_CONTENT),
-        false => Err(ApiError::not_found(format!(
-            "tenant {tenant} does not exist"
-        ))),
+        false => Err(ApiError::not_found(
+            Missing::Tenant,
+            format!("tenant {tenant} does not exist"),
+        )),
     }
 }
 
@@ -551,11 +583,9 @@ pub async fn issue_key(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
 ) -> Result<(StatusCode, Json<IssuedKey>), ApiError> {
-    let issued = app
-        .node()?
-        .issue_key(&tenant)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("tenant {tenant} does not exist")))?;
+    let issued = app.node()?.issue_key(&tenant).await?.ok_or_else(|| {
+        ApiError::not_found(Missing::Tenant, format!("tenant {tenant} does not exist"))
+    })?;
     let issued = IssuedKey {
         id: issued.key.id,
         key: issued.secret,
@@ -604,9 +634,10 @@ pub async fn revoke_key(
 ) -> Result<StatusCode, ApiError> {
     match app.node()?.revoke_key(&tenant, id).await? {
         true => Ok(StatusCode::NO_CONTENT),
-        false => Err(ApiError::not_found(format!(
-            "tenant {tenant} has no key {id}"
-        ))),
+        false => Err(ApiError::not_found(
+            Missing::Key,
+            format!("tenant {tenant} has no key {id}"),
+        )),
     }
 }
 
@@ -625,9 +656,10 @@ pub async fn drop_tenant(
 ) -> Result<StatusCode, ApiError> {
     match app.node()?.drop_tenant(&tenant).await? {
         true => Ok(StatusCode::NO_CONTENT),
-        false => Err(ApiError::not_found(format!(
-            "tenant {tenant} does not exist"
-        ))),
+        false => Err(ApiError::not_found(
+            Missing::Tenant,
+            format!("tenant {tenant} does not exist"),
+        )),
     }
 }
 
@@ -675,10 +707,12 @@ pub async fn collections(
 }
 
 fn schema(state: &State, collection: &CollectionName) -> Result<Collection, ApiError> {
-    state
-        .collection(collection)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found(format!("collection {collection} does not exist")))
+    state.collection(collection).cloned().ok_or_else(|| {
+        ApiError::not_found(
+            Missing::Collection,
+            format!("collection {collection} does not exist"),
+        )
+    })
 }
 
 #[utoipa::path(
@@ -796,7 +830,10 @@ pub async fn object(
                 .filter(|found| viewer.sees(&schema, found.object))
                 .map(|found| stored(found.object, found.vector, true));
             found.ok_or_else(|| {
-                ApiError::not_found(format!("object {id} does not exist in {collection}"))
+                ApiError::not_found(
+                    Missing::Object,
+                    format!("object {id} does not exist in {collection}"),
+                )
             })
         })
         .map(Json)

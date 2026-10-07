@@ -15,9 +15,10 @@ use reqwest::{Method, StatusCode};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Serialize;
 use vellev_api::{
-    After, Backup, Backups, Batch, Change, Changes, Code, Collections, Content, Counted, Failure,
-    Hybrid, IssuedKey, Keyword, Nearest, Objects, Page, RestorePoints, RestoreTo, RestoreWindow,
-    Restored, Results, Stored, TenantKey, TenantKeys, Tenants, Written, AFTER, REQUEST, ROOT,
+    After, Backup, Backups, Batch, Bounded, Change, Changes, Code, Collections, Content, Counted,
+    Failure, Hybrid, IssuedKey, Keyword, Limit, Limits, Missing, Nearest, Objects, Page,
+    RestorePoints, RestoreTo, RestoreWindow, Restored, Results, Stored, TenantKey, TenantKeys,
+    Tenants, Written, AFTER, REQUEST, ROOT,
 };
 use vellev_core::{Collection, CollectionName, ObjectId, Property, RequestId, TenantId};
 use vellev_index::filter::Filter;
@@ -39,6 +40,10 @@ pub enum Error {
         status: StatusCode,
         code: Code,
         message: String,
+        /// What the request asked too much of, and the most it may ask.
+        limit: Option<Limit>,
+        /// What the request named that does not exist, if the node said.
+        missing: Option<Missing>,
     },
     /// The tenant asked more of the node than it may; the request had no
     /// effect, and may be sent again after `wait`.
@@ -89,6 +94,34 @@ impl Error {
         self.code() == Some(Code::NotFound)
     }
 
+    /// What the request asked too much of, and the most it may ask, if the
+    /// node refused it for that. [`Client::limits`] tells them all.
+    pub fn limit(&self) -> Option<Limit> {
+        match self {
+            Self::Api { limit, .. } => *limit,
+            Self::Partial { source, .. } => source.limit(),
+            _ => None,
+        }
+    }
+
+    /// The most of `name` a request may ask for, if the node refused this
+    /// one for asking more.
+    pub fn limit_max(&self, name: Bounded) -> Option<u64> {
+        self.limit()
+            .filter(|limit| limit.name == name)
+            .map(|limit| limit.max)
+    }
+
+    /// What the request named that does not exist, if the node said. A
+    /// tenant's key is told every other tenant is missing.
+    pub fn missing(&self) -> Option<Missing> {
+        match self {
+            Self::Api { missing, .. } => *missing,
+            Self::Partial { source, .. } => source.missing(),
+            _ => None,
+        }
+    }
+
     /// Whether a write that failed this way, every try of it, may
     /// nevertheless have been made. Read before making it again: a new
     /// call is a new write.
@@ -104,7 +137,15 @@ impl Error {
             Self::Api { code, .. } => match code {
                 Code::Unavailable => Fate::NoEffect,
                 Code::Uncertain => Fate::Unknown,
-                _ => Fate::Final,
+                Code::Invalid
+                | Code::Unauthorized
+                | Code::Forbidden
+                | Code::NotFound
+                | Code::Conflict
+                | Code::Limited
+                | Code::ModelUnavailable
+                | Code::Internal
+                | Code::Unknown => Fate::Final,
             },
             Self::Status { status, .. } if status.is_server_error() => Fate::Unknown,
             Self::Status { .. } | Self::Unusable(_) => Fate::Final,
@@ -127,7 +168,8 @@ pub struct Options {
     /// The most objects [`Records::store_all`] sends in one request.
     pub batch_objects: usize,
     /// The most bytes, near enough, it sends in one request. Keep it under
-    /// the node's own limit on a request's body.
+    /// the node's own limit on a request's body, which [`Client::limits`]
+    /// tells.
     pub batch_bytes: usize,
 }
 
@@ -264,6 +306,13 @@ impl Client {
         Ok(())
     }
 
+    /// The most a caller may ask of the node; any key may ask.
+    pub async fn limits(&self) -> Result<Limits> {
+        let path = format!("{ROOT}/limits");
+        self.ask(Kind::Read, Method::GET, &path, None::<&()>, None)
+            .await
+    }
+
     /// Up to `limit` tenants after `after`, in id order.
     pub async fn tenants(&self, after: Option<&TenantId>, limit: u32) -> Result<Tenants> {
         let after = after.map_or(String::new(), |after| format!("&after={after}"));
@@ -396,6 +445,8 @@ impl Client {
                 status,
                 code: error.code,
                 message: error.message,
+                limit: error.limit,
+                missing: error.missing,
             },
             Err(_) => Error::Status {
                 status,

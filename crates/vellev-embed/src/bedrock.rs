@@ -122,10 +122,26 @@ impl Bedrock {
             .body(Blob::new(body.to_string()))
             .send()
             .await
-            .map_err(|error| match (error.code(), error.message()) {
-                (Some(code), Some(message)) => self.failed(format!("{code}: {message}")),
-                (Some(said), None) | (None, Some(said)) => self.failed(said),
-                (None, None) => self.failed(&error),
+            .map_err(|error| {
+                let said = match (error.code(), error.message()) {
+                    (Some(code), Some(message)) => format!("{code}: {message}"),
+                    (Some(said), None) | (None, Some(said)) => said.to_string(),
+                    (None, None) => error.to_string(),
+                };
+                // The node's credentials may not invoke the model, or the
+                // region does not have it: nothing passes until the setup
+                // changes. A refused input may be this text's alone.
+                let lasting = error.as_service_error().is_some_and(|refused| {
+                    refused.is_access_denied_exception()
+                        || refused.is_resource_not_found_exception()
+                });
+                match lasting {
+                    true => EmbedError::Unusable {
+                        model: self.model.clone(),
+                        reason: said,
+                    },
+                    false => self.failed(said),
+                }
             })?;
         serde_json::from_slice::<Answer>(answer.body().as_ref())
             .map(|answer| answer.embedding)

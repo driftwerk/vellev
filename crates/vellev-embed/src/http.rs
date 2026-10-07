@@ -94,6 +94,13 @@ impl Http {
         }
     }
 
+    fn unusable(&self, reason: impl std::fmt::Display) -> EmbedError {
+        EmbedError::Unusable {
+            model: self.model.clone(),
+            reason: self.redacted(reason.to_string()),
+        }
+    }
+
     fn malformed(&self, reason: String) -> EmbedError {
         EmbedError::Malformed {
             model: self.model.clone(),
@@ -131,7 +138,15 @@ impl Http {
                     let refusal: String = refusal.chars().take(REFUSAL_CHARS).collect();
                     let passing = status.as_u16() == 429 || status.is_server_error();
                     let wait = asked.unwrap_or(backoff).min(LONGEST_BACKOFF);
-                    (self.failed(format!("{status}: {refusal}")), passing, wait)
+                    let said = format!("{status}: {refusal}");
+                    // Refused the key, or has no such model: the node is
+                    // set up wrong for this endpoint, whatever the text.
+                    // Any other refusal may be about the texts sent.
+                    let failure = match status.as_u16() {
+                        401 | 403 | 404 => self.unusable(said),
+                        _ => self.failed(said),
+                    };
+                    (failure, passing, wait)
                 }
                 Err(error) => {
                     let passing = error.is_connect() || error.is_timeout();

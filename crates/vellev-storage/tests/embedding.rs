@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use vellev_storage::{Outcome, Vectorize};
+use vellev_storage::{Outcome, Unembedded, Vectorize};
 
 const NOTES: &str = "notes";
 
@@ -30,11 +30,11 @@ impl Vectorize for Lengths {
         &self,
         embedding: &Embedding,
         texts: Vec<String>,
-    ) -> Result<Vec<Vec<f32>>, String> {
+    ) -> Result<Vec<Vec<f32>>, Unembedded> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let fault = self.fault.load(Ordering::SeqCst);
         if fault == AWAY || embedding.model != "lengths" {
-            return Err("the model is away".into());
+            return Err(Unembedded::for_now("the model is away"));
         }
         if fault == SILENT {
             std::future::pending::<()>().await;
@@ -286,17 +286,17 @@ async fn a_commit_that_cannot_be_embedded_changes_nothing_and_the_writer_carries
     lengths.fault.store(AWAY, Ordering::SeqCst);
     let failed = writer.commit(fox()).await.unwrap_err();
     assert!(
-        matches!(&failed, StorageError::Embedding { model, reason } if model == "lengths" && reason == "the model is away"),
+        matches!(&failed, StorageError::Embedding { model, reason, lasting: false } if model == "lengths" && reason == "the model is away"),
         "{failed}"
     );
-    for fault in [TOO_LONG, NOT_A_NUMBER, TOO_FEW] {
+    // Vectors of another size than the collection's will not change by
+    // asking again; too few, or one not finite, might.
+    for (fault, lasts) in [(TOO_LONG, true), (NOT_A_NUMBER, false), (TOO_FEW, false)] {
         lengths.fault.store(fault, Ordering::SeqCst);
+        let failed = writer.commit(fox()).await.unwrap_err();
         assert!(
-            matches!(
-                writer.commit(fox()).await,
-                Err(StorageError::Embedding { .. })
-            ),
-            "{fault}"
+            matches!(failed, StorageError::Embedding { lasting, .. } if lasting == lasts),
+            "{fault}: {failed:?}"
         );
     }
     lengths.fault.store(0, Ordering::SeqCst);
@@ -343,7 +343,7 @@ async fn a_writer_with_nothing_to_embed_with_refuses_only_what_needs_it() {
         .await
         .unwrap_err();
     assert!(
-        matches!(refused, StorageError::Embedding { .. }),
+        matches!(refused, StorageError::Embedding { lasting: true, .. }),
         "{refused}"
     );
 

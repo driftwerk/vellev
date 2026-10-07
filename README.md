@@ -175,6 +175,39 @@ running node. Every route under `/v1` needs one of the configured keys. A
 collection may only name an embedding endpoint listed in
 `VELLEV_EMBEDDING_URLS` or given a key in `VELLEV_EMBEDDING_KEYS`.
 
+`GET /v1/limits` tells any key the most a request may ask for: results of a
+search or a page (`VELLEV_MAX_LIMIT`), candidates each side of a hybrid
+search offers, `oversample`, bytes of a body (`VELLEV_MAX_BODY_BYTES`) and
+seconds of a restore window.
+
+```sh
+call http://127.0.0.1:8080/v1/limits
+# {"results":1000,"candidates":1000,"oversample":1024,"body_bytes":33554432,"restore_window_secs":316224000}
+```
+
+Every failure is `{"error":{"code":…,"message":…}}`, and the code, not the
+message, says what to do. A request for more than the node allows says
+which limit and its most, as those names; a failure to find something says
+what is missing, `tenant`, `collection`, `object`, `key`, `backup`,
+`restore_point` or `route`, except for a write refused before and named
+again, which is refused as it was. A tenant's key is told `tenant` of every
+other tenant.
+
+```json
+{"error":{"code":"invalid","message":"limit must be from 1 to 1000, not 5000","limit":{"name":"results","max":1000}}}
+{"error":{"code":"not_found","message":"collection notes does not exist","missing":"collection"}}
+```
+
+When a collection's text cannot be embedded, `unavailable` (503) means it
+may work later, as when an embedding endpoint is down, overloaded or slow.
+`model_unavailable` (501) means this node cannot use the model until it or
+the collection is set up otherwise: the build cannot run it, the endpoint
+or Bedrock refuses the node's key or credentials or has no such model, or
+its vectors are not the collection's size. Sending the request again will
+not help; sending the vector with it will. The cause is in the node's log.
+A hybrid search that cannot embed its text ranks by the words alone either
+way, and says `degraded`.
+
 ## Vector search
 
 A layer with up to a few thousand vectors is scored exactly. Above that a

@@ -9,7 +9,8 @@ use common::*;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use vellev_api::{
-    Change, Changes, Code, Content, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, AFTER, REQUEST,
+    Bounded, Change, Changes, Code, Content, Hybrid, Keyword, Limit, Limits, Missing, Nearest,
+    OnlyIf, Outcome, Page, AFTER, REQUEST,
 };
 use vellev_client::api::After;
 use vellev_client::{Client, Error, Options};
@@ -148,6 +149,8 @@ fn by_tenant(_: &Asked, path: &str) -> (u16, Value) {
         () if named("wrong") => (400, failure("invalid")),
         () if named("locked") => (401, failure("unauthorized")),
         () if named("broken") => (500, failure("internal")),
+        () if named("modelless") => (501, failure("model_unavailable")),
+        () if named("newer") => (503, failure("something_new")),
         () if named("garbled") => (200, json!("not what was asked for")),
         () => (
             200,
@@ -357,6 +360,8 @@ async fn a_request_is_sent_again_unless_it_was_refused_for_good() {
         ("wrong", 1, false),
         ("locked", 1, false),
         ("broken", 1, false),
+        ("modelless", 1, false),
+        ("newer", 1, false),
         ("garbled", 3, true),
     ] {
         let failed = write(name).await.unwrap_err();
@@ -380,6 +385,8 @@ async fn a_request_is_sent_again_unless_it_was_refused_for_good() {
         ("wrong", 1),
         ("locked", 1),
         ("broken", 1),
+        ("modelless", 1),
+        ("newer", 1),
     ] {
         let failed = read(name).await.unwrap_err();
         assert_eq!(asked(name, "GET"), sends, "a read of {name}: {failed}");
@@ -899,5 +906,84 @@ async fn a_request_turned_away_for_asking_too_much_is_asked_again_once_the_wait_
         started.elapsed() >= Duration::from_millis(900),
         "waited as told: {:?}",
         started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_failure_says_what_was_asked_too_much_of_or_is_missing_and_any_key_learns_the_limits() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    let options = Options {
+        batch_bytes: usize::MAX,
+        ..quick(3)
+    };
+    let client = Client::connect(&[&served.url], KEY, options).unwrap();
+    let limits = client.limits().await.unwrap();
+    assert_eq!(
+        limits,
+        Limits {
+            results: MAX_LIMIT as u64,
+            candidates: 100,
+            oversample: 1_024,
+            body_bytes: MAX_BODY as u64,
+            restore_window_secs: 10 * 366 * 24 * 60 * 60,
+        }
+    );
+    let issued = client.tenant(&tenant("acme")).issue_key().await.unwrap();
+    let tenants_own = Client::connect(&[&served.url], &issued.key, quick(1)).unwrap();
+    assert_eq!(tenants_own.limits().await.unwrap(), limits);
+
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let page = |limit: u64| Page {
+        filter: None,
+        after: None,
+        limit: limit as u32,
+        vectors: false,
+    };
+    let too_many = notes.list(&page(limits.results + 1)).await.unwrap_err();
+    assert_eq!(
+        too_many.limit(),
+        Some(Limit {
+            name: Bounded::Results,
+            max: limits.results
+        })
+    );
+    assert_eq!(too_many.limit_max(Bounded::Results), Some(limits.results));
+    assert_eq!(too_many.limit_max(Bounded::Oversample), None);
+    assert_eq!(too_many.missing(), None);
+    let large = content(&"x".repeat(MAX_BODY), 1, Some([1.0, 0.0]));
+    let unsent = notes.store_all([(oid(1), large)]).await.unwrap_err();
+    assert!(
+        matches!(unsent, Error::Partial { stored: 0, .. }),
+        "{unsent}"
+    );
+    assert_eq!(
+        unsent.limit_max(Bounded::BodyBytes),
+        Some(limits.body_bytes)
+    );
+
+    let ghost = client.tenant(&tenant("ghost")).collections().await;
+    assert_eq!(ghost.unwrap_err().missing(), Some(Missing::Tenant));
+    let absent = client
+        .tenant(&tenant("acme"))
+        .collection(&CollectionName::new("absent").unwrap());
+    let unlisted = absent.list(&page(1)).await.unwrap_err();
+    assert_eq!(
+        (unlisted.missing(), unlisted.limit()),
+        (Some(Missing::Collection), None)
+    );
+    let unstored = absent
+        .store_all([(oid(1), content("fox", 1, Some([1.0, 0.0])))])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(unstored, Error::Partial { stored: 0, .. }),
+        "{unstored}"
+    );
+    assert_eq!(unstored.missing(), Some(Missing::Collection));
+    assert_eq!(
+        notes.get(oid(9)).await.unwrap(),
+        None,
+        "a missing object is still none"
     );
 }

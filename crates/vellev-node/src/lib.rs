@@ -18,7 +18,8 @@ use vellev_storage::coordinator::{
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
-    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
+    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Unembedded, Vectorize,
+    Writer,
 };
 
 mod backing;
@@ -204,20 +205,25 @@ impl Vectorize for Documents {
         &self,
         embedding: &Embedding,
         texts: Vec<String>,
-    ) -> std::result::Result<Vec<Vec<f32>>, String> {
+    ) -> std::result::Result<Vec<Vec<f32>>, Unembedded> {
         let embedder = self
             .0
             .embedder(embedding)
-            .map_err(|error| error.to_string())?
-            .ok_or("its collection's clients supply the vectors")?;
-        let vectors = embedder
-            .documents(&texts)
-            .await
-            .map_err(|error| error.to_string())?;
+            .map_err(unembedded)?
+            .ok_or_else(|| Unembedded::for_now("its collection's clients supply the vectors"))?;
+        let vectors = embedder.documents(&texts).await.map_err(unembedded)?;
         vectors
             .into_iter()
             .collect::<Option<_>>()
-            .ok_or_else(|| "no vector for a text that is not blank".to_string())
+            .ok_or_else(|| Unembedded::for_now("no vector for a text that is not blank"))
+    }
+}
+
+/// An embedding failure as a writer is told it.
+fn unembedded(error: EmbedError) -> Unembedded {
+    Unembedded {
+        reason: error.to_string(),
+        lasting: error.lasting(),
     }
 }
 

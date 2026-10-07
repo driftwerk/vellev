@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use vellev_core::{CollectionName, ObjectError, ObjectId, SchemaError};
 
 use crate::coordinator::CoordinatorError;
+use crate::mutation::Unembedded;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -50,8 +51,14 @@ pub enum StorageError {
     InvalidMutation(String),
     #[error("{0}")]
     InvalidQuery(String),
+    /// Vectors the commit needed could not be made; with `lasting`, not
+    /// until the node or the collection is set up otherwise.
     #[error("embedding with {model} failed: {reason}")]
-    Embedding { model: String, reason: String },
+    Embedding {
+        model: String,
+        reason: String,
+        lasting: bool,
+    },
     #[error(transparent)]
     Schema(#[from] SchemaError),
     #[error(transparent)]
@@ -97,6 +104,15 @@ pub enum Refused {
 }
 
 impl StorageError {
+    /// The failure to make vectors with `model`.
+    pub fn unembedded(model: String, why: Unembedded) -> Self {
+        Self::Embedding {
+            model,
+            reason: why.reason,
+            lasting: why.lasting,
+        }
+    }
+
     /// The failure itself, looking through [`StorageError::Shared`].
     pub fn root(&self) -> &StorageError {
         match self {

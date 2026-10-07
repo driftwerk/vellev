@@ -201,7 +201,39 @@ async fn throttling_and_server_errors_are_tried_again_but_a_refusal_is_final() {
             reason: "400 Bad Request: refused Bearer <redacted>".into()
         }
     );
+    assert!(!refused.lasting(), "a refusal may be about the texts");
     assert_eq!(seen.bodies().len(), 1);
+}
+
+#[tokio::test]
+async fn an_endpoint_that_refuses_the_key_or_has_no_such_model_cannot_be_used() {
+    for (status, said) in [
+        (401, "401 Unauthorized"),
+        (403, "403 Forbidden"),
+        (404, "404 Not Found"),
+    ] {
+        let seen = Seen::refusing(usize::MAX, status);
+        let provider = Http::new(
+            &openai(seen.clone()).await,
+            HttpApi::Openai,
+            "m",
+            Some("sk-secret".into()),
+        )
+        .unwrap();
+        let refused = provider
+            .embed(numbered(1), Purpose::Document)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            EmbedError::Unusable {
+                model: "m".into(),
+                reason: format!("{said}: refused Bearer <redacted>")
+            }
+        );
+        assert!(refused.lasting());
+        assert_eq!(seen.bodies().len(), 1, "{status} is not tried again");
+    }
 }
 
 #[tokio::test]
@@ -269,6 +301,8 @@ async fn bedrock(seen: Arc<Seen>) -> Bedrock {
             let kind = match status.as_u16() {
                 429 => "ThrottlingException",
                 400 => "ValidationException",
+                403 => "AccessDeniedException",
+                404 => "ResourceNotFoundException",
                 _ => "InternalServerException",
             };
             let refusal = Json(json!({ "message": "not now" }));
@@ -356,7 +390,34 @@ async fn titan_is_tried_again_when_throttled_and_long_text_is_cut() {
         matches!(&failed, EmbedError::Failed { model, .. } if model == TITAN),
         "{failed}"
     );
+    assert!(
+        !failed.lasting(),
+        "a refused input may be this text's alone"
+    );
     assert_eq!(seen.bodies().len(), 1);
+}
+
+#[tokio::test]
+async fn titan_that_the_node_may_not_invoke_or_the_region_lacks_cannot_be_used() {
+    for (status, kind) in [
+        (403, "AccessDeniedException"),
+        (404, "ResourceNotFoundException"),
+    ] {
+        let seen = Seen::refusing(usize::MAX, status);
+        let provider = bedrock(seen.clone()).await;
+        let failed = provider
+            .embed(vec!["fox".into()], Purpose::Document)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failed,
+            EmbedError::Unusable {
+                model: TITAN.into(),
+                reason: format!("{kind}: not now")
+            }
+        );
+        assert_eq!(seen.bodies().len(), 1, "{kind} is not tried again");
+    }
 }
 
 #[tokio::test]

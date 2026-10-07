@@ -23,7 +23,7 @@ pub use error::{Refusal, Refused, Result, StorageError};
 pub use group::GroupCommitter;
 pub use hybrid::{Fused, Hybrid, DEFAULT_ALPHA, DEFAULT_CANDIDATES};
 pub use keyword::{Keywords, Scored, MAX_WEIGHT};
-pub use mutation::{Batch, Condition, Mutation, Outcome, Receipt, Vectorize};
+pub use mutation::{Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize};
 pub use partition::{Embedded, Follower, Partition, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::{Live, Merging, State};

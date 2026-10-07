@@ -31,6 +31,11 @@ fn operations() -> Vec<(Method, String)> {
         .collect()
 }
 
+/// A body with every `from` in it written as `to`.
+fn renamed(body: &Value, from: &str, to: &str) -> Value {
+    serde_json::from_str(&body.to_string().replace(from, to)).unwrap()
+}
+
 fn concrete(path: &str, tenant: &str, collection: &str, id: &str) -> String {
     path.replace("{tenant}", tenant)
         .replace("{collection}", collection)
@@ -109,6 +114,18 @@ async fn a_tenant_key_reaches_no_other_tenant_and_learns_nothing_of_it() {
             }
             continue;
         }
+        if vellev::server::EVERY_KEY.contains(&template.as_str()) {
+            let told = served
+                .call_as(Some(&key), method.clone(), &template, None)
+                .await;
+            assert_eq!(
+                told,
+                served.call(method.clone(), &template, None).await,
+                "the same to every key, and of no tenant: {method} {template}"
+            );
+            assert_eq!(told.0, StatusCode::OK, "{method} {template}");
+            continue;
+        }
         // Beta exists and gamma does not: a key for acme cannot tell.
         let path = |tenant: &str| concrete(&template, tenant, "notes", &id(OTHER_OBJECT));
         let (beta_path, gamma_path) = (path("beta"), path("gamma"));
@@ -129,21 +146,15 @@ async fn a_tenant_key_reaches_no_other_tenant_and_learns_nothing_of_it() {
             "{method} {template}: {gamma}"
         );
         assert_eq!(
-            beta["error"]["message"]
-                .as_str()
-                .unwrap()
-                .replace("beta", "gamma"),
-            gamma["error"]["message"].as_str().unwrap(),
+            renamed(&beta, "beta", "gamma"),
+            gamma,
             "{method} {template}"
         );
         // And as a tenant that does not exist is to anyone, where the
         // request, sent without a body, gets as far as asking.
         let (status, truly) = served.call(method.clone(), &gamma_path, None).await;
         if status == StatusCode::NOT_FOUND {
-            assert_eq!(
-                gamma["error"]["message"], truly["error"]["message"],
-                "{method} {template}"
-            );
+            assert_eq!(gamma, truly, "{method} {template}");
             compared += 1;
         }
     }
@@ -174,13 +185,8 @@ async fn names_and_ids_of_another_tenant_are_nothing_in_ones_own() {
     let (status, secret) = as_acme("/v1/tenants/acme/collections/secret".into()).await;
     let (_, made_up) = as_acme("/v1/tenants/acme/collections/madeup".into()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        secret["error"]["message"]
-            .as_str()
-            .unwrap()
-            .replace("secret", "madeup"),
-        made_up["error"]["message"].as_str().unwrap()
-    );
+    assert_eq!(renamed(&secret, "secret", "madeup"), made_up);
+    assert_eq!(made_up["error"]["missing"], "collection");
     let (status, theirs) = as_acme(format!(
         "/v1/tenants/acme/collections/notes/objects/{}",
         id(OTHER_OBJECT)
@@ -192,13 +198,8 @@ async fn names_and_ids_of_another_tenant_are_nothing_in_ones_own() {
     ))
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        theirs["error"]["message"]
-            .as_str()
-            .unwrap()
-            .replace(&id(OTHER_OBJECT), &id(999)),
-        nobodys["error"]["message"].as_str().unwrap()
-    );
+    assert_eq!(renamed(&theirs, &id(OTHER_OBJECT), &id(999)), nobodys);
+    assert_eq!(nobodys["error"]["missing"], "object");
     let listed = served
         .call_as(
             Some(&key),

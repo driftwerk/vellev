@@ -4189,6 +4189,7 @@ dependencies = [
  "chrono",
  "clap",
  "eyre",
+ "http-body-util",
  "jsonwebtoken",
  "object_store",
  "reqwest",

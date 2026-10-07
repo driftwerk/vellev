@@ -122,6 +122,12 @@ pub enum Code {
     /// A write failed at a point where nobody can say whether it took
     /// effect. Read before deciding to send it again.
     Uncertain,
+    /// The collection's embedding model cannot be used by this node until
+    /// the node or the collection is set up otherwise: this build cannot
+    /// run it, whatever serves it refuses the node or does not have it,
+    /// or its vectors are not the collection's size. Sending the same
+    /// request again will not help; one that brings its own vector will.
+    ModelUnavailable,
     Internal,
     /// A code this client does not know, from a newer node.
     #[serde(other)]
@@ -133,6 +139,103 @@ pub enum Code {
 pub struct Problem {
     pub code: Code,
     pub message: String,
+    /// On a refusal of a request that asks for more than the node allows:
+    /// what it asked too much of, and the most it may ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<Limit>,
+    /// On `not_found`: what the request names that does not exist, when
+    /// the node can say. A write refused before and named again is refused
+    /// as it was, without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing: Option<Missing>,
+}
+
+impl Problem {
+    pub fn new(code: Code, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            limit: None,
+            missing: None,
+        }
+    }
+}
+
+/// Something a request may ask for only so much of, as [`Limits`] names
+/// it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bounded {
+    /// Results of a search or a page, asked for as `limit`.
+    Results,
+    /// Results each side of a hybrid search offers for fusing.
+    Candidates,
+    /// Candidates scored exactly for each result.
+    Oversample,
+    /// Bytes of a request's body.
+    BodyBytes,
+    /// Seconds of a tenant's restore window.
+    RestoreWindowSecs,
+    /// Something this client does not know, from a newer node.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The most of something a request may ask for; at least one is always
+/// allowed.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limit {
+    pub name: Bounded,
+    pub max: u64,
+}
+
+/// What a request named that does not exist.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Missing {
+    /// Also what a tenant's key is told of every other tenant.
+    Tenant,
+    Collection,
+    Object,
+    /// One of a tenant's keys.
+    Key,
+    Backup,
+    /// A state of the tenant within its restore window.
+    RestorePoint,
+    /// The route itself: a node of an older release, say.
+    Route,
+    /// Something this client does not know, from a newer node.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The most a caller may ask of the node, each named as [`Bounded`]
+/// names it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    pub results: u64,
+    pub candidates: u64,
+    pub oversample: u64,
+    pub body_bytes: u64,
+    pub restore_window_secs: u64,
+}
+
+impl Limits {
+    /// The most of `name` a request may ask for, if this client knows it.
+    pub fn max(&self, name: Bounded) -> Option<u64> {
+        match name {
+            Bounded::Results => Some(self.results),
+            Bounded::Candidates => Some(self.candidates),
+            Bounded::Oversample => Some(self.oversample),
+            Bounded::BodyBytes => Some(self.body_bytes),
+            Bounded::RestoreWindowSecs => Some(self.restore_window_secs),
+            Bounded::Unknown => None,
+        }
+    }
 }
 
 /// The body of every response that is not a success.
@@ -144,9 +247,8 @@ pub struct Failure {
 
 impl Failure {
     pub fn new(code: Code, message: impl Into<String>) -> Self {
-        let message = message.into();
         Self {
-            error: Problem { code, message },
+            error: Problem::new(code, message),
         }
     }
 }
@@ -702,14 +804,75 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(Failure {
-                error: Problem {
-                    code: Code::NotFound,
-                    message: "gone".into()
-                }
-            })
-            .unwrap(),
+            serde_json::to_value(Failure::new(Code::NotFound, "gone")).unwrap(),
             json!({ "error": { "code": "not_found", "message": "gone" } })
         );
+    }
+
+    #[test]
+    fn a_problem_carries_what_it_can_say_and_reads_whatever_a_node_of_any_release_sends() {
+        let refused = Failure {
+            error: Problem {
+                limit: Some(Limit {
+                    name: Bounded::Results,
+                    max: 1_000,
+                }),
+                ..Problem::new(Code::Invalid, "limit must be from 1 to 1000, not 5000")
+            },
+        };
+        let written = json!({ "error": {
+            "code": "invalid",
+            "message": "limit must be from 1 to 1000, not 5000",
+            "limit": { "name": "results", "max": 1000 },
+        } });
+        assert_eq!(serde_json::to_value(&refused).unwrap(), written);
+        assert_eq!(serde_json::from_value::<Failure>(written).unwrap(), refused);
+        let missing = Failure {
+            error: Problem {
+                missing: Some(Missing::RestorePoint),
+                ..Problem::new(Code::NotFound, "gone")
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&missing).unwrap(),
+            json!({ "error": { "code": "not_found", "message": "gone", "missing": "restore_point" } })
+        );
+        assert_eq!(
+            serde_json::to_value(Code::ModelUnavailable).unwrap(),
+            json!("model_unavailable")
+        );
+
+        let older: Failure =
+            serde_json::from_value(json!({ "error": { "code": "not_found", "message": "gone" } }))
+                .unwrap();
+        assert_eq!(older, Failure::new(Code::NotFound, "gone"));
+        let newer: Failure = serde_json::from_value(json!({ "error": {
+            "code": "something_new",
+            "message": "?",
+            "limit": { "name": "something_new", "max": 3 },
+            "missing": "something_new",
+            "hint": "a field from later still",
+        } }))
+        .unwrap();
+        assert_eq!(
+            newer.error,
+            Problem {
+                limit: Some(Limit {
+                    name: Bounded::Unknown,
+                    max: 3
+                }),
+                missing: Some(Missing::Unknown),
+                ..Problem::new(Code::Unknown, "?")
+            }
+        );
+        let limits = Limits {
+            results: 1_000,
+            candidates: 1_000,
+            oversample: 1_024,
+            body_bytes: 1 << 20,
+            restore_window_secs: 60,
+        };
+        assert_eq!(limits.max(Bounded::Oversample), Some(1_024));
+        assert_eq!(limits.max(Bounded::Unknown), None);
     }
 }
