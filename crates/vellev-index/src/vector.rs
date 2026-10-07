@@ -447,6 +447,10 @@ impl VectorIndex for BinaryIndex {
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
+        // Under cosine a query with no direction is as far from every row,
+        // so every row is estimated alike and the caller's order decides.
+        let directionless =
+            self.metric == Distance::Cosine && query.iter().all(|value| *value == 0.0);
         let query = self.rotation.apply(&normalised(self.metric, query));
         let code: Vec<u64> = encode(&self.centre, &query).collect();
         let reach = residual(&self.centre, &query).0.sqrt()
@@ -456,12 +460,15 @@ impl VectorIndex for BinaryIndex {
             };
         let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
         let estimated = |position: usize| {
-            let (term, length) = self.factors[position];
-            let cosine = self.cosines[self.hamming(position, &code)];
-            (
-                or_farthest(term - reach * length * cosine),
-                self.rows[position],
-            )
+            let estimate = match directionless {
+                true => 0.0,
+                false => {
+                    let (term, length) = self.factors[position];
+                    let cosine = self.cosines[self.hamming(position, &code)];
+                    or_farthest(term - reach * length * cosine)
+                }
+            };
+            (estimate, self.rows[position])
         };
         let mut estimates: Vec<(f32, u32)> = match only {
             None => (0..self.rows.len())

@@ -518,6 +518,29 @@ async fn rows_of_one_vector_come_back_in_id_order_from_a_shortlisted_segment() {
     }
 }
 
+/// A query with no direction is at the same cosine distance from every
+/// row, so a shortlisted segment answers with the lowest ids, as scoring
+/// every row would.
+#[tokio::test]
+async fn a_query_with_no_direction_finds_the_lowest_ids_in_a_shortlisted_segment() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let mut random = Random(37);
+    let backwards = (1..=SHORTLISTED).rev().map(|n| (n, random.vector(8)));
+    flushed(&writer, Distance::Cosine, backwards.collect()).await;
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            let hits = state
+                .search(&name(VECTORS), &Query::nearest(&[0.0; 8], 3))
+                .unwrap();
+            assert_eq!(ids(&hits), [row(1), row(2), row(3)]);
+        });
+    }
+}
+
 /// Copies of one vector in two clustered segments, each written in
 /// descending id order, searched scoring no more than each segment's own
 /// nearest few: those few are its lowest ids, so the lowest of all are
