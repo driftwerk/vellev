@@ -13,6 +13,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use vellev_core::{Distance, SQUARED_LENGTH_UNDER};
 
@@ -305,7 +306,7 @@ impl BinaryIndex {
         };
         let sampled: Vec<(usize, Option<Vec<f32>>)> = Random(ROTATION_SEED)
             .sample(vectors.len(), CENTRE_SAMPLE)
-            .into_iter()
+            .into_par_iter()
             .map(|at| (at, prepared(vectors[at].1)))
             .collect();
         let centre = median(
@@ -313,32 +314,30 @@ impl BinaryIndex {
             sampled.iter().filter_map(|(_, vector)| vector.as_deref()),
         );
         let words = rotation.width / 64;
-        let mut codes = Vec::with_capacity(vectors.len() * words);
-        let mut sampled = sampled.into_iter().peekable();
-        let factors = vectors
-            .iter()
+        let coded: Vec<(Vec<u64>, (f32, f32))> = vectors
+            .par_iter()
             .enumerate()
             .map(|(at, (_, vector))| {
-                let vector = match sampled.next_if(|(sampled, _)| *sampled == at) {
-                    Some((_, vector)) => vector,
-                    None => prepared(vector),
+                let vector = match sampled.binary_search_by_key(&at, |(sampled, _)| *sampled) {
+                    Ok(found) => sampled[found].1.clone(),
+                    Err(_) => prepared(vector),
                 };
                 // A vector stored before lengths were limited may be too long
                 // for its code to say anything. It is ranked first, to be
                 // placed by its exact distance, which may still be finite.
                 let Some(vector) = vector else {
-                    codes.extend(std::iter::repeat_n(0, words));
-                    return (f32::NEG_INFINITY, 0.0);
+                    return (vec![0; words], (f32::NEG_INFINITY, 0.0));
                 };
-                codes.extend(encode(&centre, &vector));
                 let (squared, along) = residual(&centre, &vector);
                 let term = match metric {
                     Distance::L2 => squared,
                     Distance::Dot | Distance::Cosine => -along,
                 };
-                (term, squared.sqrt())
+                (encode(&centre, &vector).collect(), (term, squared.sqrt()))
             })
             .collect();
+        let (codes, factors): (Vec<Vec<u64>>, Vec<(f32, f32)>) = coded.into_iter().unzip();
+        let codes = codes.concat();
         let bits = rotation.width;
         Some(Self {
             metric,
@@ -495,8 +494,6 @@ impl VectorIndex for BinaryIndex {
 
 #[cfg(test)]
 mod tests {
-    use rayon::prelude::*;
-
     use super::*;
 
     /// A small deterministic generator, so tests need no dependency.
