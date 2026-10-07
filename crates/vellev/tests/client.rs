@@ -884,3 +884,20 @@ async fn a_write_whose_answer_was_lost_is_answered_as_it_was_and_a_later_write_s
         "the later write survives"
     );
 }
+
+#[tokio::test]
+async fn a_request_turned_away_for_asking_too_much_is_asked_again_once_the_wait_is_over() {
+    let served = Cluster::new().serve_limited(2.0).await;
+    served.with_notes(supplied()).await;
+    let client = Client::connect(&[&served.url], KEY, quick(4)).unwrap();
+    let acme = client.tenant(&tenant("acme"));
+    let started = Instant::now();
+    for _ in 0..4 {
+        acme.collections().await.unwrap();
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "waited as told: {:?}",
+        started.elapsed()
+    );
+}

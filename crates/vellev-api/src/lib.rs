@@ -108,6 +108,9 @@ pub enum Code {
     NotFound,
     /// The request disagrees with what is stored.
     Conflict,
+    /// The tenant is asking more of the node than it may; the request had
+    /// no effect and may be sent again after the `Retry-After` it gives.
+    Limited,
     /// The node cannot serve this now, and the request has had no effect;
     /// the same request may succeed later or on another node.
     Unavailable,

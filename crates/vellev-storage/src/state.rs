@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
-use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId};
+use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value};
 use vellev_index::clustered::ClusteredIndex;
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
@@ -332,6 +332,36 @@ struct Segment {
     indexes: Arc<Indexes>,
     dead: Vec<bool>,
     deaths: usize,
+    /// About how many bytes the segment takes in memory.
+    resident: usize,
+}
+
+/// About how many bytes a segment of `rows` with `vectors` takes in memory:
+/// its rows and what indexes them, and its vectors if they are held in
+/// memory rather than read in place.
+fn segment_bytes(rows: &[Row], vectors: &Column) -> usize {
+    rows.iter().map(row_bytes).sum::<usize>() + vectors.resident()
+}
+
+/// About how many bytes a row takes in memory, with its place among the
+/// live rows and what the filter and keyword indexes hold of it: about as
+/// much again as its text, and a little for each value.
+fn row_bytes(Row { object, .. }: &Row) -> usize {
+    const ROW: usize = 160 + 64;
+    let properties: usize = object
+        .properties
+        .iter()
+        .map(|(name, value)| {
+            name.len()
+                + 80
+                + match value {
+                    Value::Text(text) => text.len() * 2,
+                    Value::TextArray(texts) => texts.iter().map(|text| text.len() * 2 + 24).sum(),
+                    _ => 0,
+                }
+        })
+        .sum();
+    ROW + properties + object.vector.as_ref().map_or(0, |vector| vector.len() * 4)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -341,6 +371,8 @@ struct Memtable {
     deaths: usize,
     tombstones: Vec<RowKey>,
     indexes: Indexes,
+    /// About how many bytes `rows` take, with what indexes them.
+    bytes: usize,
 }
 
 /// A partition in memory as of one position: flushed segments, the rows
@@ -486,6 +518,15 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
 impl State {
     pub fn position(&self) -> LogPosition {
         self.position
+    }
+
+    /// About how many bytes the state takes in memory: its rows, what
+    /// indexes them, and whatever vectors are held in memory rather than
+    /// read in place from local files. Rough, and cheap to ask: each part
+    /// is counted as it is made.
+    pub fn resident(&self) -> usize {
+        let segments: usize = self.segments.iter().map(|segment| segment.resident).sum();
+        segments + self.memtable.bytes
     }
 
     /// How many rows have been written since the last checkpoint, counting
@@ -760,6 +801,7 @@ impl State {
             })
             .collect();
         self.segments.push(Segment {
+            resident: segment_bytes(&file.rows, &vectors),
             meta,
             file,
             vectors,
@@ -831,10 +873,12 @@ impl State {
                         .entry(*collection)
                         .or_default()
                         .count(index, row as u32, true);
-                    self.memtable.rows.push(Row {
+                    let row = Row {
                         collection: *collection,
                         object: object.clone(),
-                    });
+                    };
+                    self.memtable.bytes += row_bytes(&row);
+                    self.memtable.rows.push(row);
                     self.memtable.dead.push(false);
                 }
                 Op::Delete { collection, id } => {
@@ -1027,6 +1071,7 @@ impl State {
         self.segments.splice(
             run.clone(),
             [Segment {
+                resident: segment_bytes(&file.rows, &vectors),
                 meta,
                 file,
                 vectors,
@@ -1206,6 +1251,7 @@ impl State {
                 })
                 .collect();
             self.segments.push(Segment {
+                resident: segment_bytes(&file.rows, &vectors),
                 meta,
                 file,
                 vectors,
@@ -1236,12 +1282,14 @@ impl State {
             dead,
             deaths,
             indexes,
+            bytes,
             ..
         } = &mut self.memtable;
         let discarded = Discarded {
             _rows: rows.drain(..held).collect(),
             _indexes: std::mem::take(indexes),
         };
+        *bytes = rows.iter().map(row_bytes).sum();
         dead.drain(..held);
         *deaths -= held;
         for (row, Row { collection, object }) in rows.iter().enumerate() {

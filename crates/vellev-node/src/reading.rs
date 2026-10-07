@@ -11,7 +11,7 @@ use vellev_embed::Embedders;
 use vellev_storage::coordinator::{Committed, CoordinatorError, Incarnation, LogPosition};
 use vellev_storage::{Follower, State, StorageError};
 
-use crate::{key, Inner, Node, NodeError, Result, Tenant};
+use crate::{key, Asked, Inner, Node, NodeError, Result, Tenant};
 
 /// How fresh a read must be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +92,13 @@ impl Followed {
         *self.used.lock().expect("use lock") = Instant::now();
     }
 
-    fn idle(&self) -> std::time::Duration {
+    pub(crate) fn idle(&self) -> std::time::Duration {
         self.used.lock().expect("use lock").elapsed()
+    }
+
+    /// About how many bytes the copy takes in memory.
+    pub(crate) fn resident(&self) -> usize {
+        self.follower.partition().read(State::resident)
     }
 
     fn reached(&self, incarnation: Incarnation, position: LogPosition) -> bool {
@@ -115,7 +120,9 @@ impl Node {
     /// committed; any other answers from a copy it follows, brought as far
     /// as `fresh` asks. A read never takes the tenant's lease.
     pub async fn reader(&self, tenant: &TenantId, fresh: Freshness) -> Result<Reader> {
+        self.0.admit(tenant, Asked::Query, 1)?;
         if let Some(writer) = self.0.held(tenant) {
+            writer.touch();
             let partition = writer.writer.partition();
             let current = match fresh {
                 Freshness::Eventual => true,
@@ -188,6 +195,7 @@ impl Node {
             Err(_) => Err(NodeError::Stopped),
         })?;
         followed.touch();
+        self.bound();
         Ok(followed)
     }
 

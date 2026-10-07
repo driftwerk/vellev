@@ -88,6 +88,24 @@ pub struct Config {
     /// seconds.
     #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 24 * 60 * 60)]
     pub grace_secs: u64,
+    /// How long a tenant this node writes for may go unused before it is
+    /// let go, its memory given back, in seconds.
+    #[arg(long, env = "VELLEV_TENANT_IDLE_SECS", default_value_t = 15 * 60)]
+    pub tenant_idle_secs: u64,
+    /// The most queries a second one tenant may ask of a node; unlimited
+    /// if unset. A tenant asking more is answered 429 with Retry-After.
+    #[arg(long, env = "VELLEV_TENANT_QUERIES_PER_SECOND")]
+    pub tenant_queries_per_second: Option<f64>,
+    /// The most objects a second one tenant may write through a node;
+    /// unlimited if unset.
+    #[arg(long, env = "VELLEV_TENANT_WRITES_PER_SECOND")]
+    pub tenant_writes_per_second: Option<f64>,
+    /// About how many megabytes the tenants a node holds may take in
+    /// memory together; past it the least recently used are let go.
+    /// Unbounded if unset. Vectors read in place from the cache directory
+    /// do not count, being the operating system's to page out.
+    #[arg(long, env = "VELLEV_MEMORY_MB")]
+    pub memory_mb: Option<usize>,
     /// The newest file format nodes may write, so that the release before
     /// can still read everything if this one is rolled back. Raise it once
     /// every node runs the release that reads it and rollback is no longer
@@ -229,6 +247,12 @@ impl Config {
             flush_rows: self.flush_rows,
             grace: Duration::from_secs(self.grace_secs),
             max_format: self.max_format,
+            tenant_idle: Duration::from_secs(self.tenant_idle_secs),
+            queries_per_second: self.tenant_queries_per_second,
+            writes_per_second: self.tenant_writes_per_second,
+            memory: self
+                .memory_mb
+                .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
             ..Settings::new(NodeId::reachable_at(address.trim_end_matches('/'), &host))
         };
         Ok(Node::new(
