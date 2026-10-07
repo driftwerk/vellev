@@ -104,7 +104,7 @@ fn main() {
         .enumerate()
         .map(|(row, v)| (row as u32, v.as_slice()))
         .collect();
-    let index = BinaryIndex::build(&rows).expect("there are vectors");
+    let index = BinaryIndex::build(Distance::Cosine, &rows).expect("there are vectors");
     println!(
         "index built in {:.1?} ({} bytes of codes per vector)\n",
         started.elapsed(),

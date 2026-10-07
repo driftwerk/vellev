@@ -23,7 +23,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use vellev_core::Distance;
 
-use crate::vector::{dot, squared_l2, Scorer, VectorIndex};
+use crate::vector::{dot, normalised, squared_l2, Scorer, VectorIndex};
 
 /// The share of the true nearest ten that the clusters scanned must hold,
 /// over sample queries, when the index is built.
@@ -408,19 +408,6 @@ impl Nearest {
             .into_iter()
             .map(|candidate| (candidate.distance, candidate.row))
             .collect()
-    }
-}
-
-fn normalised(metric: Distance, vector: &[f32]) -> Vec<f32> {
-    match metric {
-        Distance::Cosine => {
-            let norm = dot(vector, vector).sqrt();
-            match norm > 0.0 && norm.is_finite() {
-                true => vector.iter().map(|value| value / norm).collect(),
-                false => vector.to_vec(),
-            }
-        }
-        Distance::Dot | Distance::L2 => vector.to_vec(),
     }
 }
 

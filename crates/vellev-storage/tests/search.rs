@@ -391,6 +391,99 @@ async fn a_shortlisted_segment_gives_way_to_newer_layers() {
     }
 }
 
+/// More rows than are scored one by one, so that the segment they are
+/// flushed to is searched through its vector index.
+const SHORTLISTED: u64 = 5_000;
+
+/// Write `vectors`, by id, to a collection of their length measured by
+/// `metric`, and flush them to one segment.
+async fn flushed(writer: &Writer, metric: Distance, vectors: Vec<(u64, Vec<f32>)>) {
+    let dimensions = vectors[0].1.len() as u32;
+    let puts = vectors
+        .into_iter()
+        .map(|(n, vector)| put(n, 0, Some(vector)));
+    writer
+        .commit(
+            [collection(dimensions, metric)]
+                .into_iter()
+                .chain(puts)
+                .collect(),
+        )
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+}
+
+/// Vectors leaning one way, far from the origin, and one fifty times as
+/// long as the query in its very direction: neither the lean they share
+/// nor its length may hide it from a cosine search.
+#[tokio::test]
+async fn a_shortlisted_segment_finds_a_vector_in_the_querys_direction_whatever_its_length() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let mut random = Random(23);
+    let query = random.vector(64);
+    let leaning = (0..SHORTLISTED).map(|n| {
+        let vector = random.vector(64).into_iter().map(|v| v + 1.0).collect();
+        (n, vector)
+    });
+    let along = (SHORTLISTED, query.iter().map(|v| 50.0 * v).collect());
+    flushed(&writer, Distance::Cosine, leaning.chain([along]).collect()).await;
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            let hits = state
+                .search(&name(VECTORS), &Query::nearest(&query, 1))
+                .unwrap();
+            assert_eq!(ids(&hits), [row(SHORTLISTED)]);
+            assert!(hits[0].distance < 1e-6, "{}", hits[0].distance);
+        });
+    }
+}
+
+/// One vector a hundred times as long as the rest, at nearly a right angle
+/// to the query: its inner product with the query, 40, is still far the
+/// largest, the rest's being under 3.
+#[tokio::test]
+async fn a_shortlisted_segment_finds_a_long_vector_with_the_largest_inner_product() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let mut random = Random(29);
+    let query = random.vector(64);
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+    let others: Vec<(u64, Vec<f32>)> = (0..SHORTLISTED).map(|n| (n, random.vector(64))).collect();
+    assert!(others.iter().all(|(_, vector)| dot(vector, &query) < 3.0));
+    let sideways = random.vector(64);
+    let off = (dot(&sideways, &query) - 0.4) / dot(&query, &query);
+    let long: Vec<f32> = sideways
+        .iter()
+        .zip(&query)
+        .map(|(s, q)| 100.0 * (s - off * q))
+        .collect();
+    assert!((dot(&long, &query) - 40.0).abs() < 0.01);
+    flushed(
+        &writer,
+        Distance::Dot,
+        others.into_iter().chain([(SHORTLISTED, long)]).collect(),
+    )
+    .await;
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            for limit in [1, 5] {
+                let hits = state
+                    .search(&name(VECTORS), &Query::nearest(&query, limit))
+                    .unwrap();
+                assert_eq!(hits[0].object.id, row(SHORTLISTED), "at limit {limit}");
+            }
+        });
+    }
+}
+
 /// Values each finite but large enough that a distance overflows: the
 /// inner product of the first two with the third is not a number, the
 /// cosine of the first against [1, 0] comes out as a right angle, and the

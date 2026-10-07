@@ -475,7 +475,7 @@ pub(crate) fn indexed<'a>(
                 ClusteredIndex::build(schema.distance, vectors)
                     .map(|clustered| Vectors::Clustered(Arc::new(clustered)))
             }
-            None => BinaryIndex::build(vectors).map(Vectors::Binary),
+            None => BinaryIndex::build(schema.distance, vectors).map(Vectors::Binary),
         };
     }
     for index in indexes.values_mut() {

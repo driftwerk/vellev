@@ -9,6 +9,8 @@
 //! The shortlist is the only approximate step. It is taken from the rows the
 //! caller allows, not filtered afterwards, so a filter never thins it.
 
+use std::borrow::Cow;
+
 use roaring::RoaringBitmap;
 use vellev_core::Distance;
 
@@ -132,6 +134,22 @@ pub fn certainty(metric: Distance, distance: f32) -> Option<f32> {
     (metric == Distance::Cosine).then_some(1.0 - distance / 2.0)
 }
 
+/// `vector` as an index measures it: scaled to unit length for cosine, so
+/// that only its direction counts, and as it is otherwise. A zero vector, or
+/// one whose length cannot be worked out, is left as it is.
+pub(crate) fn normalised(metric: Distance, vector: &[f32]) -> Cow<'_, [f32]> {
+    match metric {
+        Distance::Cosine => {
+            let norm = dot(vector, vector).sqrt();
+            match norm > 0.0 && norm.is_finite() {
+                true => vector.iter().map(|value| value / norm).collect(),
+                false => Cow::Borrowed(vector),
+            }
+        }
+        Distance::Dot | Distance::L2 => Cow::Borrowed(vector),
+    }
+}
+
 /// A way to pick, cheaply, the rows most likely to be nearest a query.
 pub trait VectorIndex {
     /// How many rows are indexed.
@@ -154,19 +172,48 @@ pub trait VectorIndex {
 }
 
 /// One bit per dimension of each vector, for a scan by Hamming distance.
+///
+/// A row's code says on which side of the mean `m` its vector `o` lies in
+/// each dimension, and the query's code the same of the query `q`. The
+/// share of bits on which they differ estimates the angle between `o - m`
+/// and `q - m` as a share of a half turn: in expectation for codes taken
+/// along random directions, and closely enough along the axes. Up to a term
+/// the same for every row, each metric's distance is a term of the row's
+/// own, kept beside its code, less a multiple of `|o - m| |q - m|` times
+/// that angle's cosine. A row's estimate so weighs the angle by the row's
+/// length, without which a long vector is lost among short ones.
+///
+/// The error of that estimate grows with `|o - m| |q - m|` too, so a long
+/// vector that looks nearly at right angles to the query may still be
+/// nearer than every short one. Each row is ranked by the angle at the near
+/// end of the one-standard-error (Wilson) interval about the measured one,
+/// which is to say by how near it may well be. That end rises with the
+/// Hamming distance, so rows of one length keep the order their Hamming
+/// distances give.
+///
+/// For cosine the vectors and the query are scaled to unit length first,
+/// so that only directions count.
 #[derive(Debug, Clone)]
 pub struct BinaryIndex {
+    metric: Distance,
     mean: Vec<f32>,
     words: usize,
     /// The indexed rows in ascending order; a row's code is at its position.
     rows: Vec<u32>,
     codes: Vec<u64>,
+    /// Each row's `|o - m|`, and its own term of the distance: `|o - m|²`
+    /// for L2, `-m · (o - m)` for the inner products.
+    lengths: Vec<f32>,
+    terms: Vec<f32>,
+    /// By Hamming distance, the cosine of the angle a row is ranked by.
+    cosines: Vec<f32>,
 }
 
 impl BinaryIndex {
     /// Index `vectors`, which must be in ascending row order and all of one
-    /// length. Returns `None` when there is nothing to index.
-    pub fn build(vectors: &[(u32, &[f32])]) -> Option<Self> {
+    /// length, for search under `metric`. Returns `None` when there is
+    /// nothing to index.
+    pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
@@ -175,28 +222,67 @@ impl BinaryIndex {
             .iter()
             .fold(vec![0.0f32; dimensions], |mut sum, (_, vector)| {
                 sum.iter_mut()
-                    .zip(*vector)
+                    .zip(normalised(metric, vector).iter())
                     .for_each(|(sum, value)| *sum += value / count);
                 sum
             });
+        let words = dimensions.div_ceil(64);
+        let mut codes = Vec::with_capacity(vectors.len() * words);
+        let (lengths, terms) = vectors
+            .iter()
+            .map(|(_, vector)| {
+                let vector = normalised(metric, vector);
+                codes.extend(encode(&mean, &vector));
+                let (squared, along) = residual(&mean, &vector);
+                let term = match metric {
+                    Distance::L2 => squared,
+                    Distance::Dot | Distance::Cosine => -along,
+                };
+                (squared.sqrt(), term)
+            })
+            .unzip();
         Some(Self {
-            words: dimensions.div_ceil(64),
+            metric,
+            words,
             rows: vectors.iter().map(|(row, _)| *row).collect(),
-            codes: vectors
-                .iter()
-                .flat_map(|(_, vector)| encode(&mean, vector))
+            codes,
+            lengths,
+            terms,
+            cosines: (0..=dimensions)
+                .map(|hamming| ranked_cosine(hamming, dimensions))
                 .collect(),
             mean,
         })
     }
 
-    fn hamming(&self, position: usize, query: &[u64]) -> u32 {
+    fn hamming(&self, position: usize, query: &[u64]) -> usize {
         let code = &self.codes[position * self.words..(position + 1) * self.words];
         code.iter()
             .zip(query)
-            .map(|(a, b)| (a ^ b).count_ones())
+            .map(|(a, b)| (a ^ b).count_ones() as usize)
             .sum()
     }
+}
+
+/// The squared length of `vector - mean`, and its inner product with `mean`.
+fn residual(mean: &[f32], vector: &[f32]) -> (f32, f32) {
+    mean.iter()
+        .zip(vector)
+        .fold((0.0, 0.0), |(squared, along), (mean, value)| {
+            let difference = value - mean;
+            (squared + difference * difference, along + mean * difference)
+        })
+}
+
+/// The cosine of the angle a row `hamming` of `dimensions` bits from the
+/// query is ranked by: the near end of the Wilson interval, at one standard
+/// error, about the share of a half turn those bits measure.
+fn ranked_cosine(hamming: usize, dimensions: usize) -> f32 {
+    let bits = dimensions as f64;
+    let share = hamming as f64 / bits;
+    let spread = (share * (1.0 - share) / bits + 0.25 / (bits * bits)).sqrt();
+    let near = (share + 0.5 / bits - spread) / (1.0 + 1.0 / bits);
+    (std::f64::consts::PI * near.max(0.0)).cos() as f32
 }
 
 /// One bit per dimension, set where the vector is above the mean. Built
@@ -232,13 +318,23 @@ impl VectorIndex for BinaryIndex {
         if count == 0 || query.len() != self.mean.len() {
             return Vec::new();
         }
-        let query: Vec<u64> = encode(&self.mean, query).collect();
+        let query = normalised(self.metric, query);
+        let code: Vec<u64> = encode(&self.mean, &query).collect();
+        let reach = residual(&self.mean, &query).0.sqrt()
+            * match self.metric {
+                Distance::L2 => 2.0,
+                Distance::Dot | Distance::Cosine => 1.0,
+            };
         let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
-        let scored = |position: usize| (self.hamming(position, &query), self.rows[position]);
-        let mut nearest: Vec<(u32, u32)> = match only {
+        let estimated = |position: usize| {
+            let cosine = self.cosines[self.hamming(position, &code)];
+            let estimate = self.terms[position] - reach * self.lengths[position] * cosine;
+            (or_farthest(estimate), self.rows[position])
+        };
+        let mut estimates: Vec<(f32, u32)> = match only {
             None => (0..self.rows.len())
                 .filter(|p| kept(self.rows[*p]))
-                .map(scored)
+                .map(estimated)
                 .collect(),
             // Both are in ascending row order, so one pass finds each allowed
             // row's position without a search per row.
@@ -250,14 +346,14 @@ impl VectorIndex for BinaryIndex {
                     Some((*position, row))
                 })
                 .filter(|(position, row)| self.rows.get(*position) == Some(row))
-                .map(|(position, _)| scored(position))
+                .map(|(position, _)| estimated(position))
                 .collect(),
         };
-        if nearest.len() > count {
-            nearest.select_nth_unstable(count);
-            nearest.truncate(count);
+        if estimates.len() > count {
+            estimates.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            estimates.truncate(count);
         }
-        nearest.into_iter().map(|(_, row)| row).collect()
+        estimates.into_iter().map(|(_, row)| row).collect()
     }
 }
 
@@ -328,80 +424,112 @@ mod tests {
         assert_eq!(certainty(Distance::L2, 0.3), None);
     }
 
-    fn indexed(vectors: &[Vec<f32>]) -> BinaryIndex {
+    fn indexed(metric: Distance, vectors: &[Vec<f32>]) -> BinaryIndex {
         let rows: Vec<(u32, &[f32])> = vectors
             .iter()
             .enumerate()
             .map(|(row, v)| (row as u32 * 2, v.as_slice()))
             .collect();
-        BinaryIndex::build(&rows).unwrap()
+        BinaryIndex::build(metric, &rows).unwrap()
+    }
+
+    /// Vectors about twenty random centres, `spread` from them.
+    fn grouped(random: &mut Random, count: usize, dimensions: usize, spread: f32) -> Vec<Vec<f32>> {
+        let centres: Vec<Vec<f32>> = (0..20).map(|_| random.vector(dimensions)).collect();
+        (0..count)
+            .map(|n| {
+                let noise = random.vector(dimensions);
+                centres[n % 20]
+                    .iter()
+                    .zip(noise)
+                    .map(|(c, e)| c + spread * e)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Of the true nearest ten of every `step`th vector, nudged, how many a
+    /// shortlist of `count` holds, as a share.
+    fn recall(metric: Distance, vectors: &[Vec<f32>], step: usize, count: usize) -> f64 {
+        let index = indexed(metric, vectors);
+        let mut random = Random(99);
+        let (mut found, mut total) = (0, 0);
+        for query in vectors.iter().step_by(step) {
+            let query: Vec<f32> = query.iter().map(|v| v + 0.05 * random.unit()).collect();
+            let mut exact: Vec<(f32, u32)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (distance(metric, &query, v), row as u32 * 2))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let shortlist = index.shortlist(&query, count, None, &[]);
+            assert_eq!(shortlist.len(), count.min(vectors.len()));
+            found += exact[..10]
+                .iter()
+                .filter(|(_, row)| shortlist.contains(row))
+                .count();
+            total += 10;
+        }
+        found as f64 / total as f64
     }
 
     #[test]
     fn a_shortlist_holds_the_true_neighbours_of_clustered_vectors() {
         let mut random = Random(42);
-        let centres: Vec<Vec<f32>> = (0..20).map(|_| random.vector(256)).collect();
-        let vectors: Vec<Vec<f32>> = (0..4000)
-            .map(|n| {
-                let noise = random.vector(256);
-                centres[n % 20]
-                    .iter()
-                    .zip(noise)
-                    .map(|(c, e)| c + 0.3 * e)
-                    .collect()
-            })
-            .collect();
-        let index = indexed(&vectors);
-        assert_eq!(index.len(), 4000);
-
-        let mut found = 0;
-        for query in vectors.iter().step_by(200) {
-            let mut exact: Vec<(f32, u32)> = vectors
-                .iter()
-                .enumerate()
-                .map(|(row, v)| (distance(Distance::Cosine, query, v), row as u32 * 2))
-                .collect();
-            exact.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let shortlist = index.shortlist(query, 160, None, &[]);
-            assert_eq!(shortlist.len(), 160);
-            found += exact[..10]
-                .iter()
-                .filter(|(_, row)| shortlist.contains(row))
-                .count();
-        }
-        assert!(found >= 190, "{found} of 200 true neighbours shortlisted");
+        let vectors = grouped(&mut random, 4000, 256, 0.3);
+        assert_eq!(indexed(Distance::Cosine, &vectors).len(), 4000);
+        let share = recall(Distance::Cosine, &vectors, 200, 160);
+        assert!(share >= 0.95, "{share} of the true neighbours shortlisted");
     }
 
     #[test]
     fn codes_are_taken_about_the_mean_so_an_offset_shared_by_all_vectors_costs_nothing() {
         let mut random = Random(9);
-        let centres: Vec<Vec<f32>> = (0..20).map(|_| random.vector(256)).collect();
-        let vectors: Vec<Vec<f32>> = (0..4000)
-            .map(|n| {
-                let noise = random.vector(256);
-                centres[n % 20]
-                    .iter()
-                    .zip(noise)
-                    .map(|(c, e)| 5.0 + c + 0.3 * e)
-                    .collect()
+        let vectors: Vec<Vec<f32>> = grouped(&mut random, 4000, 256, 0.3)
+            .into_iter()
+            .map(|v| v.into_iter().map(|x| x + 5.0).collect())
+            .collect();
+        let share = recall(Distance::L2, &vectors, 200, 160);
+        assert!(share >= 0.9, "{share} of the true neighbours shortlisted");
+    }
+
+    /// Lengths spread over a range of sixteen to one, about an offset, as
+    /// vectors that are not normalised may be: the shortlist a search at
+    /// limit ten takes holds nearly all the true nearest ten.
+    #[test]
+    fn a_shortlist_holds_the_true_neighbours_of_vectors_of_any_length() {
+        let mut random = Random(5);
+        let scaled: Vec<Vec<f32>> = grouped(&mut random, 10_000, 128, 0.6)
+            .into_iter()
+            .map(|v| {
+                let length = 0.25 + 3.75 * (random.unit() + 0.5);
+                v.into_iter().map(|x| x * length).collect()
             })
             .collect();
-        let index = indexed(&vectors);
-        let mut found = 0;
-        for query in vectors.iter().step_by(200) {
-            let mut exact: Vec<(f32, u32)> = vectors
-                .iter()
-                .enumerate()
-                .map(|(row, v)| (distance(Distance::L2, query, v), row as u32 * 2))
-                .collect();
-            exact.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let shortlist = index.shortlist(query, 160, None, &[]);
-            found += exact[..10]
-                .iter()
-                .filter(|(_, row)| shortlist.contains(row))
-                .count();
+        let offset: Vec<Vec<f32>> = scaled
+            .iter()
+            .map(|v| v.iter().map(|x| x + 1.0).collect())
+            .collect();
+        for (data, vectors) in [("scaled", &scaled), ("offset", &offset)] {
+            for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
+                let share = recall(metric, vectors, 100, 1280);
+                assert!(share >= 0.99, "{data} {metric:?}: recall@10 {share}");
+            }
         }
-        assert!(found >= 180, "{found} of 200 true neighbours shortlisted");
+    }
+
+    #[test]
+    fn the_ranked_angle_rises_with_the_hamming_distance_from_none_at_all() {
+        for dimensions in [1, 64, 768] {
+            let cosines: Vec<f32> = (0..=dimensions)
+                .map(|hamming| ranked_cosine(hamming, dimensions))
+                .collect();
+            assert_eq!(cosines[0], 1.0);
+            assert!(cosines.windows(2).all(|pair| pair[1] < pair[0]));
+            // Half the bits differing measures a right angle; the rank is
+            // nearer than that.
+            assert!(cosines[dimensions / 2] > 0.0);
+        }
     }
 
     #[test]
@@ -429,28 +557,32 @@ mod tests {
     fn a_shortlist_keeps_to_the_rows_it_is_allowed() {
         let mut random = Random(3);
         let vectors: Vec<Vec<f32>> = (0..100).map(|_| random.vector(64)).collect();
-        let index = indexed(&vectors);
+        let index = indexed(Distance::Cosine, &vectors);
         let query = &vectors[0];
+        let shortlist = |count: usize, only: Option<&RoaringBitmap>, skipped: &[bool]| {
+            let mut rows = index.shortlist(query, count, only, skipped);
+            rows.sort_unstable();
+            rows
+        };
 
         let only: RoaringBitmap = [0u32, 2, 3, 40, 198, 999].into_iter().collect();
-        let mut allowed = index.shortlist(query, 50, Some(&only), &[]);
-        allowed.sort_unstable();
-        assert_eq!(allowed, [0, 2, 40, 198], "rows 3 and 999 are not indexed");
+        assert_eq!(
+            shortlist(50, Some(&only), &[]),
+            [0, 2, 40, 198],
+            "rows 3 and 999 are not indexed"
+        );
 
         let mut skipped = vec![false; 200];
         skipped[0] = true;
         skipped[40] = true;
-        let mut kept = index.shortlist(query, 50, Some(&only), &skipped);
-        kept.sort_unstable();
-        assert_eq!(kept, [2, 198]);
+        assert_eq!(shortlist(50, Some(&only), &skipped), [2, 198]);
 
-        let everything = index.shortlist(query, 1000, None, &skipped);
-        assert_eq!(everything.len(), 98);
-        assert_eq!(index.shortlist(query, 0, None, &[]), Vec::<u32>::new());
+        assert_eq!(shortlist(1000, None, &skipped).len(), 98);
+        assert_eq!(shortlist(0, None, &[]), Vec::<u32>::new());
         assert_eq!(
             index.shortlist(&query[..10], 5, None, &[]),
             Vec::<u32>::new()
         );
-        assert!(BinaryIndex::build(&[]).is_none());
+        assert!(BinaryIndex::build(Distance::Cosine, &[]).is_none());
     }
 }

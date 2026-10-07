@@ -54,7 +54,7 @@ fn main() {
         clustered.probes()
     );
     let started = Instant::now();
-    let binary = BinaryIndex::build(&rows).unwrap();
+    let binary = BinaryIndex::build(Distance::Cosine, &rows).unwrap();
     println!("binary: built in {:.1?}", started.elapsed());
 
     let queries: Vec<&Vec<f32>> = vectors.iter().step_by(count / 50).collect();
