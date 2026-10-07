@@ -34,6 +34,8 @@ struct Store {
     unreadable: AtomicBool,
     /// How long each read takes, when reads are to be slow.
     slow: std::sync::Mutex<Option<Duration>>,
+    /// The prefixes whose cached copies were dropped.
+    forgotten: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -72,6 +74,10 @@ impl Blobs for Store {
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.inner.delete(key).await
     }
+    async fn forget_local(&self, prefix: &str) -> vellev_storage::Result<()> {
+        self.forgotten.lock().unwrap().push(prefix.to_string());
+        Ok(())
+    }
 }
 
 /// What nodes of one cluster share.
@@ -94,6 +100,7 @@ impl Cluster {
                 failing: AtomicBool::new(false),
                 unreadable: AtomicBool::new(false),
                 slow: std::sync::Mutex::new(None),
+                forgotten: std::sync::Mutex::default(),
             }),
         }
     }
@@ -1763,4 +1770,25 @@ async fn every_tenant_is_backed_up_once_a_day_held_or_not() {
         cluster.node().back_up(&tenant("acme")).await,
         Err(NodeError::NoBackups)
     ));
+}
+
+#[tokio::test]
+async fn every_node_drops_what_it_cached_of_a_purged_tenant_not_made_again() {
+    let cluster = Cluster::new();
+    let (purging, other) = (cluster.node(), cluster.node());
+    for name in ["gone", "back"] {
+        purging.create_tenant(&tenant(name)).await.unwrap();
+        purging.drop_tenant(&tenant(name)).await.unwrap();
+    }
+    purging.purge_due().await.unwrap();
+    purging.create_tenant(&tenant("back")).await.unwrap();
+    cluster.store.forgotten.lock().unwrap().clear();
+
+    other.purge_due().await.unwrap();
+    other.purge_due().await.unwrap();
+    assert_eq!(
+        *cluster.store.forgotten.lock().unwrap(),
+        ["gone/"],
+        "once, and not of the tenant made again"
+    );
 }
