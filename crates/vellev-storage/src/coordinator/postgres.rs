@@ -28,6 +28,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
 /// Serialises migrations across nodes starting together. Transaction-scoped,
 /// so it is released with the transaction and never pins an RDS Proxy session.
 const MIGRATION_LOCK: i64 = 0x76656c_6c6576;
+/// The class of the transaction locks that serialise registering and
+/// removing a tenant, each taken with the hash of the tenant's id, so that
+/// a tenant is never registered while its removal marks it to be purged.
+const TENANT_LOCK: i32 = 0x766c;
 
 /// How many times `acquire` re-reads a row that changed under it before
 /// giving up; each retry needs a release to land between its two statements.
@@ -84,6 +88,18 @@ fn snapshot<'q>(
     sqlx::query_as(sql)
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
+}
+
+async fn lock_tenant(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    tenant: &TenantId,
+) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(TENANT_LOCK)
+        .bind(tenant.as_str())
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
 }
 
 fn bigint(value: u64) -> Result<i64> {
@@ -269,8 +285,9 @@ impl From<sqlx::Error> for CoordinatorError {
 impl Coordinator for PostgresCoordinator {
     async fn register(&self, key: &PartitionKey) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
+        lock_tenant(&mut transaction, &key.tenant).await?;
         let purging: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM vellev.purges WHERE tenant = $1 AND purged_at IS NULL FOR SHARE",
+            "SELECT 1 FROM vellev.purges WHERE tenant = $1 AND purged_at IS NULL",
         )
         .bind(key.tenant.as_str())
         .fetch_optional(&mut *transaction)
@@ -293,6 +310,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn remove(&self, key: &PartitionKey) -> Result<bool> {
         let mut transaction = self.pool.begin().await?;
+        lock_tenant(&mut transaction, &key.tenant).await?;
         let done =
             sqlx::query("DELETE FROM vellev.partitions WHERE tenant = $1 AND partition = $2")
                 .bind(key.tenant.as_str())
@@ -729,12 +747,32 @@ impl Coordinator for PostgresCoordinator {
             })
     }
 
-    async fn purged(&self, tenant: &TenantId, forget_after: Duration) -> Result<()> {
+    async fn claim_purge(&self, tenant: &TenantId, hold: Duration) -> Result<Option<Uuid>> {
+        let claim = Uuid::new_v4();
+        let done = sqlx::query(
+            "UPDATE vellev.purges
+             SET claim = $2, claimed_until = now() + make_interval(secs => $3)
+             WHERE tenant = $1 AND purged_at IS NULL
+               AND (claimed_until IS NULL OR claimed_until < now())",
+        )
+        .bind(tenant.as_str())
+        .bind(claim)
+        .bind(checked_hold(hold)?.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        Ok((done.rows_affected() > 0).then_some(claim))
+    }
+
+    async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("UPDATE vellev.purges SET purged_at = now() WHERE tenant = $1")
-            .bind(tenant.as_str())
-            .execute(&mut *transaction)
-            .await?;
+        sqlx::query(
+            "UPDATE vellev.purges SET purged_at = now(), claim = NULL, claimed_until = NULL
+             WHERE tenant = $1 AND claim = $2 AND purged_at IS NULL",
+        )
+        .bind(tenant.as_str())
+        .bind(claim)
+        .execute(&mut *transaction)
+        .await?;
         sqlx::query(
             "DELETE FROM vellev.purges WHERE purged_at < now() - make_interval(secs => $1)",
         )

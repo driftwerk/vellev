@@ -226,7 +226,15 @@ impl Config {
             .filter(|url| !url.is_empty())
             .chain(keyed.into_keys())
             .collect();
-        if self.backup_store.as_deref() == Some(self.store.as_str()) {
+        if self.purge_after_secs < 2 * self.lease_secs {
+            bail!("VELLEV_PURGE_AFTER_SECS must be at least two leases, so a holder lets go first");
+        }
+        if self
+            .backup_store
+            .as_deref()
+            .map(|url| url.trim_end_matches('/'))
+            == Some(self.store.trim_end_matches('/'))
+        {
             bail!("tenants cannot be backed up to the store they are kept in");
         }
         if let Some(url) = &self.advertise_url {

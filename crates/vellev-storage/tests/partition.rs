@@ -461,12 +461,21 @@ impl Coordinator for Unreliable {
         self.inner.purges(due, lately).await
     }
 
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        hold: Duration,
+    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
+        self.inner.claim_purge(tenant, hold).await
+    }
+
     async fn purged(
         &self,
         tenant: &TenantId,
+        claim: uuid::Uuid,
         forget_after: Duration,
     ) -> Result<(), CoordinatorError> {
-        self.inner.purged(tenant, forget_after).await
+        self.inner.purged(tenant, claim, forget_after).await
     }
 
     async fn claim_backup(
@@ -741,11 +750,7 @@ async fn a_follower_of_a_replaced_partition_is_told_to_reopen() {
     let follower = cluster.open().await;
 
     cluster.coordinator.remove(&cluster.key).await.unwrap();
-    cluster
-        .coordinator
-        .purged(&cluster.key.tenant, Duration::ZERO)
-        .await
-        .unwrap();
+    purge(cluster.coordinator.as_ref(), &cluster.key.tenant).await;
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let replacement = cluster.writer().await;
     assert!(matches!(
@@ -942,11 +947,7 @@ async fn a_reading_from_a_removed_history_is_ignored_even_when_it_is_further_alo
     let old = cluster.committed().await;
 
     cluster.coordinator.remove(&cluster.key).await.unwrap();
-    cluster
-        .coordinator
-        .purged(&cluster.key.tenant, Duration::ZERO)
-        .await
-        .unwrap();
+    purge(cluster.coordinator.as_ref(), &cluster.key.tenant).await;
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let writer = cluster.writer().await;
     let position = writer.commit(vec![create("notes")]).await.unwrap().position;
@@ -985,11 +986,7 @@ async fn a_removed_history_is_never_adopted_before_anyone_takes_a_new_lease() {
     let holding_old = cluster.open().await;
 
     cluster.coordinator.remove(&cluster.key).await.unwrap();
-    cluster
-        .coordinator
-        .purged(&cluster.key.tenant, Duration::ZERO)
-        .await
-        .unwrap();
+    purge(cluster.coordinator.as_ref(), &cluster.key.tenant).await;
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let registered = cluster.committed().await;
     assert!(registered.generation > old.generation);
@@ -1611,11 +1608,7 @@ async fn a_copy_never_follows_into_a_tenant_registered_again_even_past_where_it_
     let holding_old = cluster.open().await;
 
     cluster.coordinator.remove(&cluster.key).await.unwrap();
-    cluster
-        .coordinator
-        .purged(&cluster.key.tenant, Duration::ZERO)
-        .await
-        .unwrap();
+    purge(cluster.coordinator.as_ref(), &cluster.key.tenant).await;
     cluster.coordinator.register(&cluster.key).await.unwrap();
     let writer = cluster.writer().await;
     writer.commit(vec![create("notes")]).await.unwrap();

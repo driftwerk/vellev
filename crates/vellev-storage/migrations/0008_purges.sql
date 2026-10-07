@@ -6,5 +6,8 @@
 CREATE TABLE vellev.purges (
     tenant       text        PRIMARY KEY,
     requested_at timestamptz NOT NULL DEFAULT now(),
-    purged_at    timestamptz
+    purged_at    timestamptz,
+    -- The node purging the tenant, and until when.
+    claim        uuid,
+    claimed_until timestamptz
 );

@@ -233,10 +233,7 @@ async fn the_command_line_backs_up_and_restores() {
     assert_eq!(window["window_secs"], json!(120));
 
     let refused = command(&served, &["restore"]).await.unwrap_err();
-    assert!(
-        refused.contains("--at, --position or --backup"),
-        "{refused}"
-    );
+    assert!(refused.contains("required arguments"), "{refused}");
     let refused = command(&served, &["restore", "--position", "1", "--backup", id])
         .await
         .unwrap_err();

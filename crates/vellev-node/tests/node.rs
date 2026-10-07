@@ -256,7 +256,9 @@ async fn tenants_are_created_listed_a_page_at_a_time_and_dropped() {
     assert!(
         matches!(
             node.create_tenant(&tenant("acme")).await,
-            Err(NodeError::Storage(_))
+            Err(NodeError::Storage(
+                vellev_storage::StorageError::Coordinator(CoordinatorError::Purging(_))
+            ))
         ),
         "not made again until what was kept of it is purged"
     );
@@ -924,12 +926,21 @@ impl Coordinator for Unrenewing {
         self.inner.purges(due, lately).await
     }
 
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        hold: Duration,
+    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
+        self.inner.claim_purge(tenant, hold).await
+    }
+
     async fn purged(
         &self,
         tenant: &TenantId,
+        claim: uuid::Uuid,
         forget_after: Duration,
     ) -> Result<(), CoordinatorError> {
-        self.inner.purged(tenant, forget_after).await
+        self.inner.purged(tenant, claim, forget_after).await
     }
 
     async fn claim_backup(

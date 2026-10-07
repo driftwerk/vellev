@@ -340,11 +340,11 @@ impl Blobs for CachedBlobs {
             return Ok(());
         };
         match tokio::fs::remove_dir_all(&path).await {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                tracing::warn!(prefix, %error, "could not drop cached files");
-            }
-            _ => {}
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(StorageError::Blob {
+                key: prefix.to_string(),
+                source: error.into(),
+            }),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }

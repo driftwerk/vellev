@@ -506,7 +506,8 @@ impl Tenant {
     }
 
     /// Back this tenant up now; needs an admin key, and a node with a
-    /// backup store.
+    /// backup store. A try sent again after its answer was lost makes
+    /// another backup, or is refused as a conflict while the first runs.
     pub async fn back_up(&self) -> Result<Backup> {
         self.repeated(Method::POST, "/backups", None::<&()>).await
     }
@@ -525,7 +526,9 @@ impl Tenant {
 
     /// Put this tenant back as it was; needs an admin key. Restoring a
     /// large tenant takes a while: give the client time with
-    /// [`Client::within`]. A restore sent again goes back to the same place.
+    /// [`Client::within`]. A restore sent again goes back to the same
+    /// place, as a commit of its own; one from a backup is refused as a
+    /// conflict while the first runs.
     pub async fn restore(&self, to: RestoreTo) -> Result<Restored> {
         self.repeated(Method::POST, "/restore", Some(&to)).await
     }

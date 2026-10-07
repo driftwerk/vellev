@@ -100,7 +100,8 @@ pub struct Settings {
     /// How long a backup is kept; the newest of a tenant always is.
     pub backups_kept: Duration,
     /// How long after a tenant is removed everything kept of it is
-    /// deleted: long enough for any node still writing it to notice.
+    /// deleted: long enough for any node that held it to notice and stop
+    /// committing. A file a stopped writer uploads later still lingers.
     pub purge_after: Duration,
 }
 

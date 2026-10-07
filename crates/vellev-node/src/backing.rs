@@ -229,8 +229,7 @@ impl Inner {
 
     /// `backup`, if its tenant is still the one it took, with the tenant's
     /// backups pruned. One of a tenant removed while it was copied is
-    /// forgotten again; the rest of what is kept of the tenant goes when it
-    /// is purged.
+    /// discarded, files and all, as the tenant's purge may have run.
     async fn kept(&self, backups: &Backups, tenant: &TenantId, backup: Backup) -> Result<Backup> {
         let now = self.coordinator.committed(&key(tenant)).await?;
         let same = now.is_some_and(|now| {
@@ -240,7 +239,7 @@ impl Inner {
                 .all(|taken| taken.incarnation == now.incarnation)
         });
         if !same {
-            backups.forget(&backup).await?;
+            backups.discard(&backup).await?;
             return Err(NodeError::UnknownTenant(tenant.clone()));
         }
         match backups.prune(tenant, self.settings.backups_kept).await {

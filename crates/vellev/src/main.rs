@@ -78,6 +78,7 @@ enum BackupAction {
     /// Show how far back the tenant may be restored.
     Points,
     /// Put the tenant back as it stood at a moment, a commit, or a backup.
+    #[command(group(clap::ArgGroup::new("to").required(true)))]
     Restore {
         /// A moment in its restore window, as RFC 3339.
         #[arg(long, group = "to")]
@@ -96,8 +97,8 @@ enum BackupAction {
     },
 }
 
-/// How long a restore through the command line may take.
-const RESTORE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// How long a backup or a restore through the command line may take.
+const BACKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Subcommand)]
 enum Import {
@@ -234,7 +235,11 @@ async fn main() -> Result<ExitCode> {
                 tenant,
                 action,
             } = *backup;
-            let client = vellev_client::Client::connect(&[&node], &key, Default::default())?;
+            let options = vellev_client::Options {
+                timeout: BACKUP_TIMEOUT,
+                ..Default::default()
+            };
+            let client = vellev_client::Client::connect(&[&node], &key, options)?;
             let tenant = client.tenant(&tenant);
             let answer = match action {
                 BackupAction::Take => serde_json::to_value(tenant.back_up().await?)?,
@@ -245,13 +250,11 @@ async fn main() -> Result<ExitCode> {
                     position,
                     backup,
                 } => {
-                    let to = match (at, position, backup) {
-                        (Some(at), None, None) => RestoreTo::At(at),
-                        (None, Some(position), None) => RestoreTo::Position(position),
-                        (None, None, Some(backup)) => RestoreTo::Backup(backup),
-                        _ => eyre::bail!("restore to one of --at, --position or --backup"),
-                    };
-                    let tenant = client.within(RESTORE_TIMEOUT).tenant(tenant.id());
+                    let to = at
+                        .map(RestoreTo::At)
+                        .or(position.map(RestoreTo::Position))
+                        .or(backup.map(RestoreTo::Backup))
+                        .ok_or_else(|| eyre::eyre!("restore to --at, --position or --backup"))?;
                     serde_json::to_value(tenant.restore(to).await?)?
                 }
                 BackupAction::Window { secs } => {

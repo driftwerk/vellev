@@ -284,3 +284,16 @@ impl Blobs for Paused {
         self.inner.delete(key).await
     }
 }
+
+/// Purge a removed tenant as a node would, so that it may be made again.
+pub async fn purge(coordinator: &dyn Coordinator, tenant: &TenantId) {
+    let claim = coordinator
+        .claim_purge(tenant, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("a purge to claim");
+    coordinator
+        .purged(tenant, claim, Duration::from_secs(24 * 60 * 60))
+        .await
+        .unwrap();
+}

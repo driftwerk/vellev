@@ -127,7 +127,10 @@ pub enum Acquired {
 pub enum CoordinatorError {
     #[error("partition {0} is not registered")]
     UnknownPartition(PartitionKey),
-    #[error("tenant {0} is being removed; it can be made again once its files are gone")]
+    #[error(
+        "tenant {0} was removed and what was kept of it is being deleted; \
+         it can be made again, empty, once that is done"
+    )]
     Purging(TenantId),
     #[error(
         "lease on {key} at generation {held:?} is fenced; the current generation is {current:?}"
@@ -294,9 +297,14 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// purged, and those purged within `lately`.
     async fn purges(&self, due: Duration, lately: Duration) -> Result<Purges>;
 
-    /// Note that `tenant`'s files are purged, so that it may be made
-    /// again, and forget purges done over `forget_after` ago.
-    async fn purged(&self, tenant: &TenantId, forget_after: Duration) -> Result<()>;
+    /// Take the right to purge `tenant` for `hold`, if its purge is still
+    /// to be done and nobody holds it. Returns the claim if it was taken.
+    async fn claim_purge(&self, tenant: &TenantId, hold: Duration) -> Result<Option<Uuid>>;
+
+    /// Note that `tenant`'s files are purged under `claim`, so that it may
+    /// be made again, and forget purges done over `forget_after` ago. A
+    /// claim that ran out, or a purge done already, is left be.
+    async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()>;
 
     /// How far back `tenant` may be restored, if it is not the default.
     async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>>;

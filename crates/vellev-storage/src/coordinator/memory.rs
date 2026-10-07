@@ -81,8 +81,13 @@ impl Row {
     }
 }
 
-/// When a tenant was removed, and when its files were purged.
-type Purge = (DateTime<Utc>, Option<DateTime<Utc>>);
+/// A removed tenant's purge.
+#[derive(Debug, Clone)]
+struct Purge {
+    requested: DateTime<Utc>,
+    purged: Option<DateTime<Utc>>,
+    claim: Option<(Uuid, DateTime<Utc>)>,
+}
 
 /// The coordinator's rules without a database: the same fencing, driven by an
 /// injectable clock.
@@ -167,14 +172,14 @@ fn expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
 #[async_trait]
 impl Coordinator for MemoryCoordinator {
     async fn register(&self, key: &PartitionKey) -> Result<()> {
+        let mut rows = self.rows.lock().expect("coordinator lock");
         let purging = self.purges.lock().expect("coordinator lock");
         if purging
             .get(&key.tenant)
-            .is_some_and(|(_, purged)| purged.is_none())
+            .is_some_and(|purge| purge.purged.is_none())
         {
             return Err(CoordinatorError::Purging(key.tenant.clone()));
         }
-        let mut rows = self.rows.lock().expect("coordinator lock");
         if !rows.contains_key(key) {
             let generation = self.next_generation();
             let row = Row {
@@ -202,10 +207,15 @@ impl Coordinator for MemoryCoordinator {
                 .expect("coordinator lock")
                 .retain(|(tenant, ..)| tenant != &key.tenant);
             if existed {
+                let purge = Purge {
+                    requested: self.clock.now(),
+                    purged: None,
+                    claim: None,
+                };
                 self.purges
                     .lock()
                     .expect("coordinator lock")
-                    .insert(key.tenant.clone(), (self.clock.now(), None));
+                    .insert(key.tenant.clone(), purge);
             }
         }
         Ok(existed)
@@ -468,10 +478,10 @@ impl Coordinator for MemoryCoordinator {
         let (due, lately) = (window_start(now, due)?, window_start(now, lately)?);
         let purges = self.purges.lock().expect("coordinator lock");
         let mut found = Purges::default();
-        for (tenant, (requested, purged)) in purges.iter() {
-            match purged {
-                None if *requested <= due => found.due.push(tenant.clone()),
-                Some(purged) if *purged >= lately => found.lately.push(tenant.clone()),
+        for (tenant, purge) in purges.iter() {
+            match purge.purged {
+                None if purge.requested <= due => found.due.push(tenant.clone()),
+                Some(purged) if purged >= lately => found.lately.push(tenant.clone()),
                 _ => {}
             }
         }
@@ -480,14 +490,32 @@ impl Coordinator for MemoryCoordinator {
         Ok(found)
     }
 
-    async fn purged(&self, tenant: &TenantId, forget_after: Duration) -> Result<()> {
+    async fn claim_purge(&self, tenant: &TenantId, hold: Duration) -> Result<Option<Uuid>> {
+        let now = self.clock.now();
+        let until = expiry(now, checked_hold(hold)?)?;
+        let mut purges = self.purges.lock().expect("coordinator lock");
+        let Some(purge) = purges.get_mut(tenant).filter(|purge| {
+            purge.purged.is_none() && purge.claim.is_none_or(|(_, until)| until < now)
+        }) else {
+            return Ok(None);
+        };
+        let claim = Uuid::new_v4();
+        purge.claim = Some((claim, until));
+        Ok(Some(claim))
+    }
+
+    async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()> {
         let now = self.clock.now();
         let forgotten = window_start(now, forget_after)?;
         let mut purges = self.purges.lock().expect("coordinator lock");
-        if let Some((_, purged)) = purges.get_mut(tenant) {
-            *purged = Some(now);
+        let held = purges.get_mut(tenant).filter(|purge| {
+            purge.purged.is_none() && purge.claim.is_some_and(|(held, _)| held == claim)
+        });
+        if let Some(purge) = held {
+            purge.purged = Some(now);
+            purge.claim = None;
         }
-        purges.retain(|_, (_, purged)| purged.is_none_or(|purged| purged >= forgotten));
+        purges.retain(|_, purge| purge.purged.is_none_or(|purged| purged >= forgotten));
         Ok(())
     }
 
