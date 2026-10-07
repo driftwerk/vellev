@@ -1119,23 +1119,39 @@ mod tests {
         assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[], &in_row_order), [3]);
     }
 
-    /// An index built by the release before, which knew nothing of rows too
-    /// long to measure, gave thirty copies each of two such vectors codes
-    /// and finite distances from their centroids. Read back, they are
-    /// recognised from what was stored, and left to be scored exactly.
+    /// Indexes built by the release before, which knew nothing of rows too
+    /// long to measure, gave them codes and finite distances from their
+    /// centroids: thirty copies each of `[±2.3e18; 32]` far from theirs,
+    /// and two hundred of `[1e19; 32]` a cluster of their own, at no
+    /// distance from its centroid. Read back, they are recognised from what
+    /// was stored, and left to be scored exactly.
     #[test]
-    fn an_index_built_before_rows_were_measured_recognises_them_on_load() {
-        let bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/clustered-main-legacy-rows.msgpack"
-        ));
-        let index: ClusteredIndex = rmp_serde::from_slice(bytes).unwrap();
-        assert_eq!(index.len(), 3060);
-        let long: Vec<u32> = (3000..3060u32).map(|row| row * 2).collect();
-        assert_eq!(index.unmeasured(None, &[]), long);
-        for query in grouped(31, 3000, 32, 10, 0.4).iter().step_by(300) {
-            let shortlist = index.shortlist(query, 100, None, &[], &in_row_order);
-            assert!(shortlist.iter().all(|row| *row < 6000));
+    fn indexes_built_before_rows_were_measured_recognise_them_on_load() {
+        let fixtures: [(&[u8], usize); 2] = [
+            (
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/clustered-main-legacy-rows.msgpack"
+                )),
+                60,
+            ),
+            (
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/clustered-main-own-cluster.msgpack"
+                )),
+                200,
+            ),
+        ];
+        for (bytes, long) in fixtures {
+            let index: ClusteredIndex = rmp_serde::from_slice(bytes).unwrap();
+            assert_eq!(index.len(), 3000 + long);
+            let rows: Vec<u32> = (3000..3000 + long as u32).map(|row| row * 2).collect();
+            assert_eq!(index.unmeasured(None, &[]), rows, "{long} long rows");
+            for query in grouped(31, 3000, 32, 10, 0.4).iter().step_by(300) {
+                let shortlist = index.shortlist(query, 100, None, &[], &in_row_order);
+                assert!(shortlist.iter().all(|row| *row < 6000));
+            }
         }
     }
 
