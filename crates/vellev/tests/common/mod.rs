@@ -39,6 +39,11 @@ impl Cluster {
         }
     }
 
+    /// The store the cluster's tenants are kept in.
+    pub fn blobs(&self) -> Arc<dyn Blobs> {
+        self.blobs.clone()
+    }
+
     /// Start a node and answer with a caller that holds its key.
     pub async fn serve(&self) -> Served {
         self.serve_embedding_through(&[]).await
@@ -114,10 +119,10 @@ impl Cluster {
             self.coordinator.clone(),
             self.blobs.clone(),
             Arc::new(Embedders::new(Default::default())),
-            adjusted(Settings::new(NodeId::reachable_at(
-                advertised.unwrap_or(&url),
-                "node",
-            ))),
+            adjusted(Settings {
+                purge_after: Duration::ZERO,
+                ..Settings::new(NodeId::reachable_at(advertised.unwrap_or(&url), "node"))
+            }),
         ));
         let limits = Limits {
             results: MAX_LIMIT,

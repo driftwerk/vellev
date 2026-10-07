@@ -166,3 +166,105 @@ async fn a_lost_tenant_whose_restore_failed_is_restored_when_asked_again() {
         .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn the_client_backs_up_lists_and_restores() {
+    let served = Cluster::new().serve_backing_up_to(memory()).await;
+    served.with_notes(supplied()).await;
+    served.ok(Method::PUT, &object(1), Some(titled(1))).await;
+    let client = vellev_client::Client::connect(&[&served.url], KEY, Default::default()).unwrap();
+    let acme = client.tenant(&vellev_core::TenantId::new("acme").unwrap());
+
+    let backup = acme.back_up().await.unwrap();
+    assert_eq!(acme.backups().await.unwrap(), std::slice::from_ref(&backup));
+    let points = acme.restore_points().await.unwrap();
+    let kept = points.latest.unwrap();
+    served.delete(&object(1)).await;
+    let restored = acme
+        .restore(vellev_api::RestoreTo::Position(kept.position))
+        .await
+        .unwrap();
+    assert_eq!(restored.from, kept);
+    assert_eq!(titles(&served).await, ["note 1"]);
+    acme.set_restore_window(Some(60)).await.unwrap();
+    assert_eq!(acme.restore_points().await.unwrap().window_secs, 60);
+}
+
+/// What the command line prints, or why it failed.
+async fn command(served: &Served, args: &[&str]) -> Result<Value, String> {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vellev"));
+    command
+        .args([
+            "backup",
+            "--node",
+            &served.url,
+            "--key",
+            KEY,
+            "--tenant",
+            "acme",
+        ])
+        .args(args);
+    let output = tokio::task::spawn_blocking(move || command.output())
+        .await
+        .unwrap()
+        .unwrap();
+    match output.status.success() {
+        true => Ok(serde_json::from_slice(&output.stdout).unwrap()),
+        false => Err(String::from_utf8_lossy(&output.stderr).into_owned()),
+    }
+}
+
+#[tokio::test]
+async fn the_command_line_backs_up_and_restores() {
+    let served = Cluster::new().serve_backing_up_to(memory()).await;
+    served.with_notes(supplied()).await;
+    served.ok(Method::PUT, &object(1), Some(titled(1))).await;
+
+    let backup = command(&served, &["take"]).await.unwrap();
+    assert_eq!(command(&served, &["list"]).await.unwrap(), json!([backup]));
+    served.delete(&object(1)).await;
+    let id = backup["id"].as_str().unwrap();
+    let restored = command(&served, &["restore", "--backup", id])
+        .await
+        .unwrap();
+    assert_eq!(restored["from"]["position"], backup["position"]);
+    assert_eq!(titles(&served).await, ["note 1"]);
+    let window = command(&served, &["window", "120"]).await.unwrap();
+    assert_eq!(window["window_secs"], json!(120));
+
+    let refused = command(&served, &["restore"]).await.unwrap_err();
+    assert!(refused.contains("required arguments"), "{refused}");
+    let refused = command(&served, &["restore", "--position", "1", "--backup", id])
+        .await
+        .unwrap_err();
+    assert!(refused.contains("cannot be used with"), "{refused}");
+}
+
+#[tokio::test]
+async fn removing_a_tenant_purges_its_files_backups_and_restore_points() {
+    let store = memory();
+    let cluster = Cluster::new();
+    let served = cluster.serve_backing_up_to(store.clone()).await;
+    served.with_notes(supplied()).await;
+    served.ok(Method::PUT, &object(1), Some(titled(1))).await;
+    served.ok(Method::POST, BACKUPS, None).await;
+    served.ok(Method::DELETE, "/v1/tenants/acme", None).await;
+
+    let (status, body) = served.put("/v1/tenants/acme", json!(null)).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::CONFLICT, "conflict"),
+        "not made again before it is purged"
+    );
+    served.node.purge_due().await.unwrap();
+    assert!(store.list("_backups/acme/").await.unwrap().is_empty());
+    assert!(cluster.blobs().list("acme/").await.unwrap().is_empty());
+
+    served.ok(Method::PUT, "/v1/tenants/acme", None).await;
+    let points = served
+        .ok(Method::GET, "/v1/tenants/acme/restore-points", None)
+        .await;
+    assert_eq!(points["earliest"], json!(null), "no restore point is left");
+    let listed = served.ok(Method::GET, BACKUPS, None).await;
+    assert_eq!(listed["backups"], json!([]), "nor any backup");
+}

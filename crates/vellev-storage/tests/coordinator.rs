@@ -7,7 +7,7 @@ use futures::future::join_all;
 use vellev_core::{NodeId, Partition, TenantId};
 use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
-    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, Point, PostgresCoordinator,
+    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, Point, PostgresCoordinator, Purges,
     RestorePoint, Versions, MAX_RESTORE_WINDOW, MAX_TTL,
 };
 
@@ -103,6 +103,18 @@ impl Harness for Pg {
         .execute(&self.pool)
         .await
         .expect("rewind history");
+        sqlx::query(
+            "UPDATE vellev.purges
+             SET requested_at = requested_at - make_interval(secs => $2),
+                 purged_at = purged_at - make_interval(secs => $2),
+                 claimed_until = claimed_until - make_interval(secs => $2)
+             WHERE tenant = $1",
+        )
+        .bind(key.tenant.as_str())
+        .bind(duration.as_secs_f64())
+        .execute(&self.pool)
+        .await
+        .expect("rewind purges");
     }
 }
 
@@ -421,6 +433,7 @@ async fn a_generation_is_never_reused_after_remove_and_register(h: &dyn Harness)
     let (zombie, _) = lease(h, &key, &node("a")).await;
 
     assert!(c.remove(&key).await.unwrap());
+    purge(c, &key.tenant).await;
     c.register(&key).await.unwrap();
     assert!(generation(h, &key).await > zombie.generation);
     let (fresh, _) = lease(h, &key, &node("b")).await;
@@ -456,6 +469,7 @@ async fn the_incarnation_stays_through_leases_and_grows_when_registered_again(h:
         "registering again changes nothing"
     );
     assert!(c.remove(&key).await.unwrap());
+    purge(c, &key.tenant).await;
     c.register(&key).await.unwrap();
     assert!(incarnation().await > first);
 }
@@ -628,6 +642,7 @@ async fn a_key_reaches_its_tenant_until_revoked_or_the_tenant_goes(h: &dyn Harne
     assert!(!c.revoke_key(&tenant.tenant, issued.id).await.unwrap());
 
     c.remove(&tenant).await.unwrap();
+    purge(c, &tenant.tenant).await;
     c.register(&tenant).await.unwrap();
     assert_eq!(
         c.key_tenant(&second).await.unwrap(),
@@ -639,6 +654,16 @@ async fn a_key_reaches_its_tenant_until_revoked_or_the_tenant_goes(h: &dyn Harne
 }
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
+
+/// Purge a removed tenant as a node would, so that it may be made again.
+async fn purge(coordinator: &dyn Coordinator, tenant: &TenantId) {
+    let claim = coordinator
+        .claim_purge(tenant, HOUR)
+        .await
+        .unwrap()
+        .unwrap();
+    coordinator.purged(tenant, claim, 24 * HOUR).await.unwrap();
+}
 
 /// The positions of the earliest and latest states a restore reaching back
 /// `window` may go to.
@@ -749,6 +774,7 @@ async fn removing_a_partition_forgets_its_history(h: &dyn Harness) {
         .unwrap();
     h.coordinator().remove(&key).await.unwrap();
     assert_eq!(reach(h, &key, HOUR).await, None);
+    purge(h.coordinator(), &key.tenant).await;
     h.coordinator().register(&key).await.unwrap();
     assert_eq!(
         reach(h, &key, HOUR).await,
@@ -841,6 +867,87 @@ async fn one_node_at_a_time_backs_a_tenant_up_and_only_when_due(h: &dyn Harness)
     );
 }
 
+async fn a_removed_tenant_is_purged_before_it_is_made_again(h: &dyn Harness) {
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let coordinator = h.coordinator();
+    let due = |purges: Purges| purges.due.contains(tenant);
+    let lately = |purges: Purges| purges.lately.contains(tenant);
+    assert!(!due(coordinator
+        .purges(Duration::ZERO, HOUR)
+        .await
+        .unwrap()));
+    assert_eq!(coordinator.claim_purge(tenant, HOUR).await.unwrap(), None);
+    assert!(coordinator.remove(&key).await.unwrap());
+    assert!(matches!(
+        coordinator.register(&key).await,
+        Err(CoordinatorError::Purging(_))
+    ));
+    assert!(
+        !due(coordinator.purges(HOUR, HOUR).await.unwrap()),
+        "not yet"
+    );
+    assert!(due(coordinator.purges(Duration::ZERO, HOUR).await.unwrap()));
+
+    let first = coordinator
+        .claim_purge(tenant, HOUR)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        coordinator.claim_purge(tenant, HOUR).await.unwrap(),
+        None,
+        "one node purges at a time"
+    );
+    h.pass(&key, 2 * HOUR).await;
+    let second = coordinator
+        .claim_purge(tenant, HOUR)
+        .await
+        .unwrap()
+        .unwrap();
+    coordinator.purged(tenant, first, 24 * HOUR).await.unwrap();
+    assert!(
+        due(coordinator.purges(Duration::ZERO, HOUR).await.unwrap()),
+        "a claim that ran out marks nothing done"
+    );
+    coordinator.purged(tenant, second, 24 * HOUR).await.unwrap();
+    let purges = coordinator.purges(Duration::ZERO, HOUR).await.unwrap();
+    assert!(!due(purges.clone()) && lately(purges));
+    assert_eq!(
+        coordinator.claim_purge(tenant, HOUR).await.unwrap(),
+        None,
+        "a purge done is not claimed again"
+    );
+    coordinator.register(&key).await.unwrap();
+
+    h.pass(&key, 2 * HOUR).await;
+    let purges = coordinator.purges(Duration::ZERO, HOUR).await.unwrap();
+    assert!(!lately(purges), "purged longer ago than lately");
+    assert!(
+        !coordinator.remove(&self::key()).await.unwrap(),
+        "removing what was never there purges nothing"
+    );
+}
+
+async fn registering_and_removing_together_never_leave_a_tenant_to_be_purged(h: &dyn Harness) {
+    let coordinator = h.coordinator();
+    for _ in 0..20 {
+        let key = registered(h).await;
+        let (removed, registered) =
+            tokio::join!(coordinator.remove(&key), coordinator.register(&key));
+        assert!(removed.unwrap());
+        let live = coordinator.committed(&key).await.unwrap().is_some();
+        let purging = coordinator
+            .purges(Duration::ZERO, HOUR)
+            .await
+            .unwrap()
+            .due
+            .contains(&key.tenant);
+        assert!(!(live && purging), "{key} is live and to be purged");
+        assert!(registered.is_ok() || purging);
+    }
+}
+
 async fn ping_succeeds(h: &dyn Harness) {
     h.coordinator().ping().await.unwrap();
 }
@@ -894,6 +1001,8 @@ conformance! {
     removing_a_partition_forgets_its_history,
     a_tenant_keeps_its_own_restore_window_until_told_otherwise,
     one_node_at_a_time_backs_a_tenant_up_and_only_when_due,
+    a_removed_tenant_is_purged_before_it_is_made_again,
+    registering_and_removing_together_never_leave_a_tenant_to_be_purged,
     ping_succeeds,
 }
 

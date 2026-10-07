@@ -104,6 +104,7 @@ impl App {
             node.announcing();
             node.sweeping();
             node.backing_up();
+            node.purging();
         }
     }
 

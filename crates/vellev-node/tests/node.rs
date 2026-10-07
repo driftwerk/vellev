@@ -34,6 +34,8 @@ struct Store {
     unreadable: AtomicBool,
     /// How long each read takes, when reads are to be slow.
     slow: std::sync::Mutex<Option<Duration>>,
+    /// The prefixes whose cached copies were dropped.
+    forgotten: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -72,6 +74,10 @@ impl Blobs for Store {
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.inner.delete(key).await
     }
+    async fn forget_local(&self, prefix: &str) -> vellev_storage::Result<()> {
+        self.forgotten.lock().unwrap().push(prefix.to_string());
+        Ok(())
+    }
 }
 
 /// What nodes of one cluster share.
@@ -94,6 +100,7 @@ impl Cluster {
                 failing: AtomicBool::new(false),
                 unreadable: AtomicBool::new(false),
                 slow: std::sync::Mutex::new(None),
+                forgotten: std::sync::Mutex::default(),
             }),
         }
     }
@@ -110,6 +117,7 @@ impl Cluster {
             lease: LEASE,
             restore_window: Duration::ZERO,
             grace: Duration::ZERO,
+            purge_after: Duration::ZERO,
             ..Settings::new(NodeId::generate("node"))
         }
     }
@@ -252,6 +260,17 @@ async fn tenants_are_created_listed_a_page_at_a_time_and_dropped() {
         "unopened tenants are not kept"
     );
 
+    assert!(
+        matches!(
+            node.create_tenant(&tenant("acme")).await,
+            Err(NodeError::Storage(
+                vellev_storage::StorageError::Coordinator(CoordinatorError::Purging(_))
+            ))
+        ),
+        "not made again until what was kept of it is purged"
+    );
+    node.purge_due().await.unwrap();
+    assert!(cluster.store.list("acme/").await.unwrap().is_empty());
     node.create_tenant(&tenant("acme")).await.unwrap();
     let anew = node.tenant(&tenant("acme")).await.unwrap();
     assert!(anew.read(|state| state.collection(&notes()).is_none()));
@@ -906,6 +925,31 @@ impl Coordinator for Unrenewing {
         self.inner.restore_window(tenant).await
     }
 
+    async fn purges(
+        &self,
+        due: Duration,
+        lately: Duration,
+    ) -> Result<vellev_storage::coordinator::Purges, CoordinatorError> {
+        self.inner.purges(due, lately).await
+    }
+
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        hold: Duration,
+    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
+        self.inner.claim_purge(tenant, hold).await
+    }
+
+    async fn purged(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        forget_after: Duration,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.purged(tenant, claim, forget_after).await
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,
@@ -1123,6 +1167,7 @@ async fn a_tenant_dropped_and_created_again_never_holds_a_read_up() {
     assert_eq!(counted(&followed), 5);
 
     writing.drop_tenant(&tenant("acme")).await.unwrap();
+    writing.purge_due().await.unwrap();
     writing.create_tenant(&tenant("acme")).await.unwrap();
     let acme = writing.tenant(&tenant("acme")).await.unwrap();
     let new = acme
@@ -1316,6 +1361,7 @@ async fn a_strong_read_on_a_holder_of_a_tenant_since_recreated_reads_the_new_one
         .unwrap();
 
     other.drop_tenant(&tenant("acme")).await.unwrap();
+    other.purge_due().await.unwrap();
     other.create_tenant(&tenant("acme")).await.unwrap();
     let eventual = holding
         .reader(&tenant("acme"), Freshness::Eventual)
@@ -1724,4 +1770,25 @@ async fn every_tenant_is_backed_up_once_a_day_held_or_not() {
         cluster.node().back_up(&tenant("acme")).await,
         Err(NodeError::NoBackups)
     ));
+}
+
+#[tokio::test]
+async fn every_node_drops_what_it_cached_of_a_purged_tenant_not_made_again() {
+    let cluster = Cluster::new();
+    let (purging, other) = (cluster.node(), cluster.node());
+    for name in ["gone", "back"] {
+        purging.create_tenant(&tenant(name)).await.unwrap();
+        purging.drop_tenant(&tenant(name)).await.unwrap();
+    }
+    purging.purge_due().await.unwrap();
+    purging.create_tenant(&tenant("back")).await.unwrap();
+    cluster.store.forgotten.lock().unwrap().clear();
+
+    other.purge_due().await.unwrap();
+    other.purge_due().await.unwrap();
+    assert_eq!(
+        *cluster.store.forgotten.lock().unwrap(),
+        ["gone/"],
+        "once, and not of the tenant made again"
+    );
 }

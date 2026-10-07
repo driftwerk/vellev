@@ -175,6 +175,31 @@ impl Coordinator for SlowCoordinator {
         self.inner.restore_window(tenant).await
     }
 
+    async fn purges(
+        &self,
+        due: Duration,
+        lately: Duration,
+    ) -> Result<vellev_storage::coordinator::Purges, CoordinatorError> {
+        self.inner.purges(due, lately).await
+    }
+
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        hold: Duration,
+    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
+        self.inner.claim_purge(tenant, hold).await
+    }
+
+    async fn purged(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        forget_after: Duration,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.purged(tenant, claim, forget_after).await
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,

@@ -295,9 +295,20 @@ impl Backups {
         Ok(copied)
     }
 
-    /// Forget `backup`; the files it alone listed go at the next prune.
-    pub async fn forget(&self, backup: &Backup) -> Result<()> {
-        self.store.delete(&record(backup, COMPLETE)).await
+    /// Discard `backup` of a tenant since removed, and the files it lists:
+    /// a tenant made again under the same id never writes files of the
+    /// same keys.
+    pub async fn discard(&self, backup: &Backup) -> Result<()> {
+        let prefix = files(&backup.tenant);
+        let records = [record(backup, COMPLETE), record(backup, PENDING)];
+        let keys = backup
+            .files()
+            .map(|key| format!("{prefix}{key}"))
+            .chain(records);
+        for key in keys {
+            self.store.delete(&key).await?;
+        }
+        Ok(())
     }
 
     /// Delete everything kept of `tenant`. Returns how many files went.

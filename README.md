@@ -133,6 +133,30 @@ call "http://127.0.0.1:8080/v1/tenants/acme/backups"                      # list
 call -X POST "http://127.0.0.1:8080/v1/tenants/acme/restore" -d '{"backup":"<id>"}'
 ```
 
+The same from the command line, with an admin key in `VELLEV_API_KEY`:
+
+```sh
+vellev backup --tenant acme take
+vellev backup --tenant acme list
+vellev backup --tenant acme points
+vellev backup --tenant acme restore --at 2026-10-07T08:00:00Z   # or --position N, or --backup ID
+vellev backup --tenant acme window 2592000                      # no number for the default
+```
+
+The backup store is trusted: a backup lists key hashes and files, and
+whoever can write to the store can shape what a restore brings back. A
+restore into a cluster that lost a tenant brings back every key the backup
+held, including any revoked since.
+
+Removing a tenant removes everything kept of it. Its restore points go at
+once; `VELLEV_PURGE_AFTER_SECS` (ten minutes, at least two leases) later,
+once any node that held it has stopped committing, one node deletes its
+files and its backups, and every node drops its cached copies. A file a
+stopped writer was still uploading may outlive the purge, but none can
+belong to a tenant made later under the same id, which is refused until the
+purge is done. A backup finishing after the removal discards itself. Removal
+is final: a removed tenant cannot be restored.
+
 Several nodes may run against the same Postgres and store. Each tenant is
 written by one node at a time; a write that reaches another node is sent
 on to the holder, so set `VELLEV_ADVERTISE_URL` to each node's own address

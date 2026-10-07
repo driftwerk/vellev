@@ -128,6 +128,11 @@ pub enum CoordinatorError {
     #[error("partition {0} is not registered")]
     UnknownPartition(PartitionKey),
     #[error(
+        "tenant {0} was removed and what was kept of it is being deleted; \
+         it can be made again, empty, once that is done"
+    )]
+    Purging(TenantId),
+    #[error(
         "lease on {key} at generation {held:?} is fenced; the current generation is {current:?}"
     )]
     Fenced {
@@ -170,12 +175,14 @@ fn checked_ttl(ttl: Duration) -> Result<Duration> {
 #[async_trait]
 pub trait Coordinator: fmt::Debug + Send + Sync {
     /// Create the partition's row at a fresh generation. Registering an
-    /// existing partition changes nothing.
+    /// existing partition changes nothing; one of a tenant whose files are
+    /// still to be purged is refused.
     async fn register(&self, key: &PartitionKey) -> Result<()>;
 
-    /// Delete the partition's row. Returns whether it existed. With the
-    /// tenant's last partition go its keys, so that none reaches a tenant
-    /// made again under the same id.
+    /// Delete the partition's row and its history. Returns whether it
+    /// existed. With the tenant's last partition go its keys, so that none
+    /// reaches a tenant made again under the same id, and its files are
+    /// marked to be purged.
     async fn remove(&self, key: &PartitionKey) -> Result<bool>;
 
     /// Take the lease if nobody holds it, the holder's lease has expired, or
@@ -286,6 +293,19 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// `made`. A claim that ran out and was taken by another is left be.
     async fn release_backup(&self, tenant: &TenantId, claim: Uuid, made: bool) -> Result<()>;
 
+    /// The tenants removed at least `due` ago whose files are still to be
+    /// purged, and those purged within `lately`.
+    async fn purges(&self, due: Duration, lately: Duration) -> Result<Purges>;
+
+    /// Take the right to purge `tenant` for `hold`, if its purge is still
+    /// to be done and nobody holds it. Returns the claim if it was taken.
+    async fn claim_purge(&self, tenant: &TenantId, hold: Duration) -> Result<Option<Uuid>>;
+
+    /// Note that `tenant`'s files are purged under `claim`, so that it may
+    /// be made again, and forget purges done over `forget_after` ago. A
+    /// claim that ran out, or a purge done already, is left be.
+    async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()>;
+
     /// How far back `tenant` may be restored, if it is not the default.
     async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>>;
 
@@ -347,6 +367,13 @@ pub enum Point {
     At(DateTime<Utc>),
     /// The one committed at a position.
     Position(LogPosition),
+}
+
+/// Tenants removed whose files are, or lately were, to be purged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Purges {
+    pub due: Vec<TenantId>,
+    pub lately: Vec<TenantId>,
 }
 
 /// The SHA-256 of a key's secret: all the coordinator keeps of it.
