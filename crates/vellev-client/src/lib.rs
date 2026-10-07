@@ -40,6 +40,10 @@ pub enum Error {
         code: Code,
         message: String,
     },
+    /// The tenant asked more of the node than it may; the request had no
+    /// effect, and may be sent again after `wait`.
+    #[error("vellev turned the request away: {message}")]
+    Limited { message: String, wait: Duration },
     /// Something answered that is not the API, such as a load balancer.
     #[error("{status} from something that is not vellev: {body}")]
     Status { status: StatusCode, body: String },
@@ -75,6 +79,7 @@ impl Error {
     pub fn code(&self) -> Option<Code> {
         match self {
             Self::Api { code, .. } => Some(*code),
+            Self::Limited { .. } => Some(Code::Limited),
             Self::Partial { source, .. } => source.code(),
             _ => None,
         }
@@ -95,8 +100,9 @@ impl Error {
         match self {
             Self::Http(error) if error.is_connect() => Fate::NoEffect,
             Self::Http(_) | Self::Decode(_) => Fate::Unknown,
+            Self::Limited { .. } => Fate::NoEffect,
             Self::Api { code, .. } => match code {
-                Code::Unavailable | Code::Limited => Fate::NoEffect,
+                Code::Unavailable => Fate::NoEffect,
                 Code::Uncertain => Fate::Unknown,
                 _ => Fate::Final,
             },
@@ -304,8 +310,8 @@ impl Client {
         let Inner { nodes, options, .. } = self.inner.as_ref();
         let first = self.known(tenant).node;
         let mut backoff = options.backoff;
+        let (mut node, mut moved) = (first, 0);
         for attempt in 0..options.attempts as usize {
-            let node = (first + attempt) % nodes.len();
             let (after, request) = match kind {
                 Kind::Read => (tenant.and_then(|tenant| self.after(tenant)), None),
                 Kind::Repeatable => (None, None),
@@ -321,7 +327,16 @@ impl Client {
             if failure.fate() == Fate::Final || attempt + 1 == options.attempts as usize {
                 return Err(failure);
             }
-            if (attempt + 1) % nodes.len() == 0 {
+            // Turned away for asking too much: the same of any node, so ask
+            // the same one again once the wait it gave is over.
+            if let Error::Limited { wait, .. } = &failure {
+                tokio::time::sleep((*wait).max(backoff)).await;
+                backoff = backoff.saturating_mul(2).min(LONGEST_BACKOFF);
+                continue;
+            }
+            node = (node + 1) % nodes.len();
+            moved += 1;
+            if moved % nodes.len() == 0 {
                 tokio::time::sleep(backoff).await;
                 backoff = backoff.saturating_mul(2).min(LONGEST_BACKOFF);
             }
@@ -362,12 +377,21 @@ impl Client {
         };
         let response = request.send().await?;
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()?.parse().ok())
+            .map(Duration::from_secs);
         let bytes = response.bytes().await?;
         if status.is_success() {
             let body: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
             return Ok(serde_json::from_slice(body)?);
         }
         Err(match serde_json::from_slice::<Failure>(&bytes) {
+            Ok(Failure { error }) if error.code == Code::Limited => Error::Limited {
+                message: error.message,
+                wait: retry_after.unwrap_or(Duration::from_secs(1)),
+            },
             Ok(Failure { error }) => Error::Api {
                 status,
                 code: error.code,

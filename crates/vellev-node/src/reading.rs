@@ -195,6 +195,7 @@ impl Node {
             Err(_) => Err(NodeError::Stopped),
         })?;
         followed.touch();
+        self.bound();
         Ok(followed)
     }
 

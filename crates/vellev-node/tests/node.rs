@@ -1467,3 +1467,91 @@ async fn past_its_memory_budget_a_node_lets_go_of_the_least_recently_used() {
         "the most recently used is kept"
     );
 }
+
+#[tokio::test]
+async fn many_tenants_are_held_within_the_memory_budget() {
+    let cluster = Cluster::new();
+    let rows = || {
+        let rows = (0..100).map(|n| note(n, &"a long title ".repeat(20), None));
+        std::iter::once(schema(EmbeddingProvider::None))
+            .chain(rows)
+            .collect::<Vec<_>>()
+    };
+    let sizing = cluster.node();
+    sizing.create_tenant(&tenant("sizing")).await.unwrap();
+    let opened = sizing.tenant(&tenant("sizing")).await.unwrap();
+    opened.write(rows()).await.unwrap();
+    let one = opened.read(State::resident);
+    drop(opened);
+    sizing.shutdown().await;
+
+    let budget = one * 4;
+    let node = cluster.node_from(Settings {
+        memory: Some(budget),
+        ..cluster.settings()
+    });
+    for n in 0..12 {
+        let name = format!("t{n}");
+        node.create_tenant(&tenant(&name)).await.unwrap();
+        node.tenant(&tenant(&name))
+            .await
+            .unwrap()
+            .write(rows())
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    node.create_tenant(&tenant("last")).await.unwrap();
+    node.tenant(&tenant("last")).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while node.resident() > budget {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} held over a budget of {budget}",
+            node.resident()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_flooding_a_node_is_turned_away_while_a_quiet_one_is_answered() {
+    let cluster = Cluster::new();
+    let node = cluster.node_from(Settings {
+        queries_per_second: Some(20.0),
+        ..cluster.settings()
+    });
+    for name in ["busy", "quiet"] {
+        node.create_tenant(&tenant(name)).await.unwrap();
+        let opened = node.tenant(&tenant(name)).await.unwrap();
+        opened
+            .write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+    }
+    let flood = (0..500).map(|_| {
+        let node = node.clone();
+        async move {
+            node.reader(&tenant("busy"), Freshness::Eventual)
+                .await
+                .is_ok()
+        }
+    });
+    let quiet = (0..10).map(|_| {
+        let node = node.clone();
+        async move {
+            node.reader(&tenant("quiet"), Freshness::Eventual)
+                .await
+                .is_ok()
+        }
+    });
+    let (flooded, answered) = tokio::join!(join_all(flood), join_all(quiet));
+    assert!(
+        flooded.iter().filter(|ok| **ok).count() <= 25,
+        "the flood is held to its rate"
+    );
+    assert!(
+        answered.iter().all(|ok| *ok),
+        "the quiet tenant is answered"
+    );
+}

@@ -25,7 +25,7 @@ mod limits;
 mod reading;
 
 use keys::Keys;
-pub use limits::Asked;
+use limits::Asked;
 use limits::Limits;
 
 pub use keys::{Issued, REMEMBERED_FOR as KEYS_REMEMBERED_FOR};
@@ -215,7 +215,7 @@ impl Tenant {
         *self.used.lock().expect("used lock") = Instant::now();
     }
 
-    fn unused_for(&self) -> Duration {
+    fn idle(&self) -> Duration {
         self.used.lock().expect("used lock").elapsed()
     }
 
@@ -256,16 +256,15 @@ impl Tenant {
     /// answered as it was, and not made again.
     pub async fn write(&self, batch: impl Into<Batch>) -> Result<Receipt> {
         let batch = batch.into();
-        self.limits
-            .admit(&self.id, Asked::Write, batch.mutations.len())
-            .map_err(|wait| NodeError::Limited {
-                tenant: self.id.clone(),
-                wait,
-            })?;
-        // A request answered already is answered without its vectors.
+        // A request answered already is answered as it was: it costs
+        // nothing, and needs no vectors made.
         let answered = batch
             .request
             .is_some_and(|request| self.read(|state| state.answered(request)));
+        if !answered {
+            self.limits
+                .admit(&self.id, Asked::Write, batch.mutations.len())?;
+        }
         let made = match answered {
             true => Embedded::new(),
             false => self.embedded(&batch.mutations).await,
@@ -344,6 +343,23 @@ impl Tenant {
 }
 
 type Opening = Arc<OnceCell<Arc<Tenant>>>;
+
+/// How long a tenant or copy is kept after it was last used, whatever the
+/// memory budget.
+const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
+
+/// A tenant written for or copied, as a sweep finds it.
+struct Held {
+    id: TenantId,
+    kind: Kind,
+    unused: Duration,
+    size: usize,
+}
+
+enum Kind {
+    Writer(Opening, Arc<Tenant>),
+    Copy(reading::Following, Arc<reading::Followed>),
+}
 
 #[derive(Debug, Default)]
 struct Open {
@@ -461,9 +477,23 @@ impl Node {
     /// recently used beyond [`Settings::memory`]: flush what it holds in
     /// memory, so that whoever opens it next need not read its log, and
     /// release its lease.
+    /// Keep within the memory budget, if there is one, without waiting for
+    /// the next sweep: called as each tenant or copy is opened.
+    pub(crate) fn bound(&self) {
+        if self.0.settings.memory.is_some() {
+            let inner = self.0.clone();
+            tokio::spawn(async move { inner.sweep().await });
+        }
+    }
+
+    /// About how many bytes the tenants and copies this node holds take
+    /// in memory together.
+    pub fn resident(&self) -> usize {
+        self.0.held_now().iter().map(|held| held.size).sum()
+    }
+
     pub fn sweeping(&self) {
-        let idle = self.0.settings.tenant_idle;
-        let every = (idle / 4).clamp(Duration::from_secs(1), Duration::from_secs(10));
+        let every = self.0.sweep_every();
         let inner = Arc::downgrade(&self.0);
         tokio::spawn(async move {
             loop {
@@ -473,20 +503,7 @@ impl Node {
                     return;
                 }
                 inner.limits.forget_idle();
-                let mut going = inner.idle(idle);
-                if let Some(budget) = inner.settings.memory {
-                    going.extend(inner.over(budget));
-                }
-                for tenant in going {
-                    if tenant.read(State::unflushed) > 0 {
-                        if let Err(error) = tenant.flush().await {
-                            tracing::warn!(tenant = %tenant.id, %error, "flush before letting go failed");
-                        }
-                    }
-                    tenant.broken.store(true, Ordering::SeqCst);
-                    inner.release(tenant.writer.lease()).await;
-                    tracing::info!(tenant = %tenant.id, "let go of an idle tenant");
-                }
+                inner.sweep().await;
             }
         });
     }
@@ -596,6 +613,7 @@ impl Node {
         });
         if let Ok(tenant) = &opened {
             tenant.touch();
+            self.bound();
         }
         if opened.is_err() {
             let mut open = self.0.opened();
@@ -637,82 +655,127 @@ impl Inner {
         self.open.lock().expect("tenants lock")
     }
 
-    /// Take out of the open tenants those unused for `idle` that nobody
-    /// holds a reference to but this node.
-    fn idle(&self, idle: Duration) -> Vec<Arc<Tenant>> {
-        let mut open = self.opened();
-        let unused: Vec<TenantId> = open
-            .tenants
+    /// How often tenants are looked over for letting go.
+    fn sweep_every(&self) -> Duration {
+        (self.settings.tenant_idle / 4).clamp(Duration::from_secs(1), Duration::from_secs(10))
+    }
+
+    /// Let go of each tenant unused for longer than
+    /// [`Settings::tenant_idle`], and of the least recently used beyond
+    /// [`Settings::memory`]; for a tenant written for, flush what it holds
+    /// in memory, so that whoever opens it next need not read its log, and
+    /// release its lease. None used within [`RESIDENT_AT_LEAST`] is let go,
+    /// so that tenants in use are not opened over and over, and none a
+    /// request holds or is opening.
+    async fn sweep(&self) {
+        let held = self.held_now();
+        let (idle, recent) = (self.settings.tenant_idle, RESIDENT_AT_LEAST);
+        let mut total: usize = held.iter().map(|held| held.size).sum();
+        let mut chosen: Vec<&Held> = held
             .iter()
-            .filter_map(|(id, opening)| {
-                let tenant = opening.get()?;
-                (Arc::strong_count(tenant) == 1 && tenant.unused_for() >= idle).then(|| id.clone())
-            })
+            .filter(|held| matches!(held.kind, Kind::Writer(..)) && held.unused >= idle)
             .collect();
-        unused
-            .iter()
-            .filter_map(|id| open.tenants.remove(id)?.get().cloned())
+        total -= chosen.iter().map(|held| held.size).sum::<usize>();
+        if let Some(budget) = self.settings.memory {
+            let mut older: Vec<&Held> = held
+                .iter()
+                .filter(|held| {
+                    held.unused >= recent && !chosen.iter().any(|c| std::ptr::eq(*c, *held))
+                })
+                .collect();
+            older.sort_by_key(|held| std::cmp::Reverse(held.unused));
+            for held in older {
+                if total <= budget {
+                    break;
+                }
+                total -= held.size;
+                chosen.push(held);
+            }
+            if total > budget {
+                tracing::warn!(
+                    budget,
+                    held = total,
+                    "over the memory budget with nothing unused to let go"
+                );
+            }
+        }
+        for tenant in self.taken_out(&chosen) {
+            if tenant.read(State::unflushed) > 0 {
+                if let Err(error) = tenant.flush().await {
+                    tracing::warn!(tenant = %tenant.id, %error, "flush before letting go failed");
+                }
+            }
+            tenant.broken.store(true, Ordering::SeqCst);
+            self.release(tenant.writer.lease()).await;
+            tracing::info!(tenant = %tenant.id, "let go of a tenant");
+        }
+    }
+
+    /// What the node holds now, sized and aged without holding the lock.
+    fn held_now(&self) -> Vec<Held> {
+        let held: Vec<(TenantId, Kind)> = {
+            let open = self.opened();
+            let writers = open.tenants.iter().filter_map(|(id, opening)| {
+                let tenant = opening.get()?.clone();
+                Some((id.clone(), Kind::Writer(opening.clone(), tenant)))
+            });
+            let copies = open.followers.iter().filter_map(|(id, following)| {
+                let copy = following.get()?.clone();
+                Some((id.clone(), Kind::Copy(following.clone(), copy)))
+            });
+            writers.chain(copies).collect()
+        };
+        held.into_iter()
+            .map(|(id, kind)| {
+                let (unused, size) = match &kind {
+                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.read(State::resident)),
+                    Kind::Copy(_, copy) => (copy.idle(), copy.resident()),
+                };
+                Held {
+                    id,
+                    kind,
+                    unused,
+                    size,
+                }
+            })
             .collect()
     }
 
-    /// Take out of the open tenants and copies the least recently used
-    /// that nobody holds a reference to but this node, until what is left
-    /// takes no more than `budget` bytes, as far as that can be done.
-    /// Returns the tenants written for, which are still to be let go; the
-    /// copies need nothing more.
-    fn over(&self, budget: usize) -> Vec<Arc<Tenant>> {
-        enum Held {
-            Writer(Arc<Tenant>),
-            Copy(Arc<reading::Followed>),
-        }
+    /// Take `chosen` out of what the node holds, each only if it is still
+    /// the one held and nobody but the node and this sweep has it, nor is
+    /// opening it. Returns the tenants written for, still to be let go.
+    fn taken_out(&self, chosen: &[&Held]) -> Vec<Arc<Tenant>> {
         let mut open = self.opened();
-        let writers = open.tenants.iter().filter_map(|(id, opening)| {
-            let tenant = opening.get()?.clone();
-            let size = tenant.read(State::resident);
-            Some((id.clone(), tenant.unused_for(), size, Held::Writer(tenant)))
-        });
-        let copies = open.followers.iter().filter_map(|(id, following)| {
-            let copy = following.get()?.clone();
-            Some((id.clone(), copy.idle(), copy.resident(), Held::Copy(copy)))
-        });
-        let mut held: Vec<_> = writers.chain(copies).collect();
-        let mut total: usize = held.iter().map(|(.., size, _)| size).sum();
-        held.sort_by_key(|(_, unused, ..)| std::cmp::Reverse(*unused));
         let mut going = Vec::new();
-        for (id, _, size, kept) in held {
-            if total <= budget {
-                break;
-            }
-            // Ours, and the reference just taken: nobody else's.
-            let free = match &kept {
-                Held::Writer(tenant) => Arc::strong_count(tenant) == 2,
-                Held::Copy(copy) => Arc::strong_count(copy) == 2,
-            };
-            if !free {
-                continue;
-            }
-            match kept {
-                Held::Writer(tenant) => {
-                    open.tenants.remove(&id);
-                    going.push(tenant);
+        for held in chosen {
+            match &held.kind {
+                Kind::Writer(opening, tenant) => {
+                    let same = open
+                        .tenants
+                        .get(&held.id)
+                        .is_some_and(|now| Arc::ptr_eq(now, opening));
+                    if same && Arc::strong_count(opening) == 2 && Arc::strong_count(tenant) == 2 {
+                        open.tenants.remove(&held.id);
+                        going.push(tenant.clone());
+                    }
                 }
-                Held::Copy(_) => {
-                    open.followers.remove(&id);
+                Kind::Copy(following, copy) => {
+                    let same = open
+                        .followers
+                        .get(&held.id)
+                        .is_some_and(|now| Arc::ptr_eq(now, following));
+                    if same && Arc::strong_count(following) == 2 && Arc::strong_count(copy) == 2 {
+                        open.followers.remove(&held.id);
+                    }
                 }
             }
-            total -= size;
         }
         going
     }
 
     /// Take `cost` of what `tenant` may ask for now.
     fn admit(&self, tenant: &TenantId, asked: Asked, cost: usize) -> Result<()> {
-        self.limits
-            .admit(tenant, asked, cost)
-            .map_err(|wait| NodeError::Limited {
-                tenant: tenant.clone(),
-                wait,
-            })
+        self.limits.admit(tenant, asked, cost)
     }
 
     async fn release(&self, lease: &Lease) {

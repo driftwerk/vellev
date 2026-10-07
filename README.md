@@ -68,8 +68,8 @@ A node lets go of a tenant nobody has used for `VELLEV_TENANT_IDLE_SECS`
 bounds what the tenants a node holds may take in memory together; past it
 the least recently used are let go. `VELLEV_TENANT_QUERIES_PER_SECOND` and
 `VELLEV_TENANT_WRITES_PER_SECOND` (objects) bound what one tenant may ask of
-a node; a tenant asking more is answered 429 with `Retry-After`, and the
-client waits and asks again.
+each node, not of the cluster; a tenant asking more is answered 429 with
+`Retry-After`, and the client waits as long and asks the same node again.
 
 `vellev serve --help` lists every setting. On SIGTERM a node reports not
 ready, keeps serving for `VELLEV_STOP_DELAY_SECS` (a few seconds on Docker

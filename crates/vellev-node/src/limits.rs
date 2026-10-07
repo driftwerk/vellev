@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use vellev_core::TenantId;
 
+use crate::{NodeError, Result};
+
 /// What a request asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Asked {
@@ -39,15 +41,22 @@ impl Limits {
         }
     }
 
-    /// Take `cost` of what `tenant` may ask for now, or say how long until
-    /// it may. A cost above what the bucket holds is taken as a full one,
-    /// so that no single request is turned away for ever.
-    pub fn admit(&self, tenant: &TenantId, asked: Asked, cost: usize) -> Result<(), Duration> {
-        let rate = match asked {
+    fn rate(&self, asked: Asked) -> Option<f64> {
+        match asked {
             Asked::Query => self.queries,
             Asked::Write => self.writes,
+        }
+    }
+
+    /// Take `cost` of what `tenant` may ask for now, or say how long until
+    /// it may. A request costing more than a bucket holds is let through
+    /// once the bucket is full, and leaves it owing the rest, so that none
+    /// is turned away for ever and the rate holds however requests are
+    /// sized.
+    pub fn admit(&self, tenant: &TenantId, asked: Asked, cost: usize) -> Result<()> {
+        let Some(rate) = self.rate(asked) else {
+            return Ok(());
         };
-        let Some(rate) = rate else { return Ok(()) };
         let now = Instant::now();
         let mut buckets = self.buckets.lock().expect("limits lock");
         let bucket = buckets.entry((tenant.clone(), asked)).or_insert(Bucket {
@@ -57,12 +66,17 @@ impl Limits {
         bucket.tokens =
             (bucket.tokens + rate * now.duration_since(bucket.at).as_secs_f64()).min(rate);
         bucket.at = now;
-        let cost = (cost as f64).min(rate);
-        if bucket.tokens >= cost {
+        let cost = cost as f64;
+        if bucket.tokens >= cost.min(rate) {
             bucket.tokens -= cost;
             return Ok(());
         }
-        Err(Duration::from_secs_f64((cost - bucket.tokens) / rate))
+        let wait = Duration::from_secs_f64((cost.min(rate) - bucket.tokens) / rate);
+        tracing::debug!(%tenant, ?asked, ?wait, "turned away");
+        Err(NodeError::Limited {
+            tenant: tenant.clone(),
+            wait,
+        })
     }
 
     /// Forget buckets full again, which cost nothing to make afresh.
@@ -72,11 +86,7 @@ impl Limits {
             .lock()
             .expect("limits lock")
             .retain(|(_, asked), bucket| {
-                let rate = match asked {
-                    Asked::Query => self.queries,
-                    Asked::Write => self.writes,
-                }
-                .unwrap_or(0.0);
+                let rate = self.rate(*asked).unwrap_or(0.0);
                 bucket.tokens + rate * now.duration_since(bucket.at).as_secs_f64() < rate
             });
     }
@@ -96,17 +106,34 @@ mod tests {
         for _ in 0..10 {
             limits.admit(&busy, Asked::Query, 1).unwrap();
         }
-        let wait = limits.admit(&busy, Asked::Query, 1).unwrap_err();
+        let waited = |turned: Result<()>| match turned {
+            Err(NodeError::Limited { wait, .. }) => wait,
+            other => panic!("{other:?}"),
+        };
+        let wait = waited(limits.admit(&busy, Asked::Query, 1));
         assert!(
             wait > Duration::ZERO && wait <= Duration::from_millis(100),
             "{wait:?}"
         );
         limits.admit(&quiet, Asked::Query, 1).unwrap();
-        limits.admit(&busy, Asked::Write, 500).unwrap();
-        assert!(limits.admit(&busy, Asked::Write, 1).is_err());
         let unlimited = Limits::new(None, None);
         for _ in 0..1_000 {
             unlimited.admit(&busy, Asked::Query, 1).unwrap();
         }
+    }
+
+    #[test]
+    fn a_batch_larger_than_a_bucket_is_let_through_and_owed() {
+        let limits = Limits::new(None, Some(100.0));
+        let busy = TenantId::new("busy").unwrap();
+        limits.admit(&busy, Asked::Write, 500).unwrap();
+        let owed = match limits.admit(&busy, Asked::Write, 1) {
+            Err(NodeError::Limited { wait, .. }) => wait,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            owed >= Duration::from_secs(4),
+            "{owed:?}: the 400 over is owed"
+        );
     }
 }

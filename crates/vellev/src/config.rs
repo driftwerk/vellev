@@ -250,7 +250,9 @@ impl Config {
             tenant_idle: Duration::from_secs(self.tenant_idle_secs),
             queries_per_second: self.tenant_queries_per_second,
             writes_per_second: self.tenant_writes_per_second,
-            memory: self.memory_mb.map(|megabytes| megabytes * 1024 * 1024),
+            memory: self
+                .memory_mb
+                .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
             ..Settings::new(NodeId::reachable_at(address.trim_end_matches('/'), &host))
         };
         Ok(Node::new(
