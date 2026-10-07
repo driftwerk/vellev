@@ -81,11 +81,13 @@ fn dot_and_norm(a: &[f32], b: &[f32]) -> (f32, f32) {
 
 /// `distance`, or the farthest there is when it is not a number: a sort
 /// cannot be trusted to put a NaN last, as the sign it comes with varies.
+/// A negative zero comes back as zero, which a sort by total order would
+/// otherwise put before it.
 pub(crate) fn or_farthest(distance: f32) -> f32 {
     if distance.is_nan() {
         f32::INFINITY
     } else {
-        distance
+        distance + 0.0
     }
 }
 
@@ -211,10 +213,15 @@ pub(crate) fn normalised(metric: Distance, vector: &[f32]) -> Cow<'_, [f32]> {
     }
 }
 
-/// Whether `query`, measured by `metric`, is as far from every vector,
-/// being a cosine query with no direction.
-pub(crate) fn directionless(metric: Distance, query: &[f32]) -> bool {
-    metric == Distance::Cosine && unit(query).is_none()
+/// Whether `query`, measured by `metric`, is as far from every vector: a
+/// cosine query with no direction, at distance one from each, or a zero
+/// query under the inner product, at distance zero from each.
+pub(crate) fn as_far_from_every_vector(metric: Distance, query: &[f32]) -> bool {
+    match metric {
+        Distance::Cosine => unit(query).is_none(),
+        Distance::Dot => query.iter().all(|value| *value == 0.0),
+        Distance::L2 => false,
+    }
 }
 
 /// How to order two rows whose estimated distances are equal.
@@ -539,7 +546,7 @@ impl VectorIndex for BinaryIndex {
         }
         // A query as far from every row is estimated alike for each, and
         // the caller's order decides.
-        let directionless = directionless(self.metric, query);
+        let as_far_from_every_row = as_far_from_every_vector(self.metric, query);
         let query = self.rotation.apply(&normalised(self.metric, query));
         let code: Vec<u64> = encode(&self.centre, &query).collect();
         let reach = residual(&self.centre, &query).0.sqrt()
@@ -549,7 +556,7 @@ impl VectorIndex for BinaryIndex {
             };
         let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
         let estimated = |position: usize| {
-            let estimate = match directionless {
+            let estimate = match as_far_from_every_row {
                 true => 0.0,
                 false => {
                     let (term, length) = self.factors[position];
@@ -997,6 +1004,18 @@ mod tests {
             rows.sort_unstable();
             assert_eq!(rows, [1000, 1002, 1004], "{metric:?}");
         }
+    }
+
+    /// A zero query is at an inner product of zero from every vector, and
+    /// every such distance is the same zero, not some of them negative.
+    #[test]
+    fn a_zero_query_is_at_the_same_inner_product_from_every_vector() {
+        let zero = [0.0, 0.0];
+        let distances: Vec<u32> = [[1.0, 2.0], [-1.0, -2.0], [-1.0, 2.0]]
+            .iter()
+            .map(|vector| distance(Distance::Dot, &zero, vector).to_bits())
+            .collect();
+        assert_eq!(distances, [0.0f32.to_bits(); 3]);
     }
 
     /// Scoring a vector by cosine reads it once, as the inner product does,

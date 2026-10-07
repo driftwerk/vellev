@@ -25,8 +25,8 @@ use vellev_core::Distance;
 
 use crate::rotation::{Random, Rotation};
 use crate::vector::{
-    allowed, directionless, dot, in_row_order, measurable, nearest, normalised, or_farthest,
-    squared_l2, Scorer, Ties, VectorIndex,
+    allowed, as_far_from_every_vector, dot, in_row_order, measurable, nearest, normalised,
+    or_farthest, squared_l2, Scorer, Ties, VectorIndex,
 };
 
 /// The share of the true nearest ten that the clusters scanned must hold,
@@ -704,7 +704,7 @@ impl VectorIndex for ClusteredIndex {
         let mut nearest = Nearest::new(count, ties);
         // A query as far from every row is estimated alike for each, in
         // whatever cluster, and the caller's order decides.
-        if directionless(self.metric, query) {
+        if as_far_from_every_vector(self.metric, query) {
             let mut offer = |row: u32| nearest.offer(0.0, row);
             match only {
                 Some(only) => only
