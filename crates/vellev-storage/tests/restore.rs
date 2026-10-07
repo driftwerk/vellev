@@ -232,6 +232,7 @@ async fn a_restore_keeps_its_old_segments_once_its_target_has_aged_out() {
     };
     let writer = writer(&cluster).await;
     let (head, position) = history(&cluster, &writer).await;
+    let (latest, latest_at) = now(&cluster).await;
     let restored = writer.restore(&head, position).await.unwrap();
     writer.commit(vec![upsert("notes", 4, 4)]).await.unwrap();
 
@@ -247,5 +248,59 @@ async fn a_restore_keeps_its_old_segments_once_its_target_has_aged_out() {
             .partition()
             .read(|state| ns(state, &[1, 2, 3, 4])),
         [Some(1), Some(20), Some(3), Some(4)]
+    );
+    // The merge, which the restore follows, and the restore: the
+    // checkpoints before the merge only states gone out of the window need.
+    let checkpoints = cluster
+        .blobs
+        .list(&Layout(&cluster.key).prefix())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|listed| listed.key.ends_with(".manifest"))
+        .count();
+    assert_eq!(checkpoints, 2);
+    writer.restore(&latest, latest_at).await.unwrap();
+    assert_eq!(
+        writer.partition().read(|state| ns(state, &[1, 2, 3])),
+        [None, Some(200), Some(300)],
+        "how it stood just before the restore is restorable still"
+    );
+}
+
+#[tokio::test]
+async fn how_a_partition_stood_when_its_window_began_stays_restorable() {
+    let aged = Arc::new(Aged {
+        inner: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new()))),
+        young_from: AtomicUsize::new(0),
+    });
+    let cluster = Cluster {
+        blobs: aged.clone(),
+        ..Cluster::new().await
+    };
+    let writer = writer(&cluster).await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    writer.commit(vec![upsert("notes", 1, 10)]).await.unwrap();
+    writer.flush().await.unwrap();
+    let (head, position) = now(&cluster).await;
+    assert!(writer.merge().await.unwrap().is_some());
+
+    // Everything from the merge on is recent; the head before it is how
+    // the partition stood when the window began.
+    aged.young_from
+        .store(position.next().unwrap().0 as usize, Ordering::SeqCst);
+    writer.clean(Duration::from_secs(60 * 60)).await.unwrap();
+    writer.restore(&head, position).await.unwrap();
+    assert_eq!(
+        cluster
+            .open()
+            .await
+            .partition()
+            .read(|state| ns(state, &[1])),
+        [Some(10)]
     );
 }
