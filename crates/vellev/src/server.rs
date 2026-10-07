@@ -103,6 +103,7 @@ impl App {
         if self.node.set(node.clone()).is_ok() {
             node.announcing();
             node.sweeping();
+            node.backing_up();
         }
     }
 
@@ -222,9 +223,9 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// The routes only an admin key reaches: the tenants themselves, their
-/// keys, and putting them back as they were. Every other route that needs
+/// keys, backing them up and putting them back as they were. Every other route that needs
 /// a key is one tenant's.
-pub const ADMIN_ONLY: [&str; 7] = [
+pub const ADMIN_ONLY: [&str; 8] = [
     "/v1/tenants",
     "/v1/tenants/{tenant}",
     "/v1/tenants/{tenant}/keys",
@@ -232,18 +233,20 @@ pub const ADMIN_ONLY: [&str; 7] = [
     "/v1/tenants/{tenant}/restore-points",
     "/v1/tenants/{tenant}/restore-window",
     "/v1/tenants/{tenant}/restore",
+    "/v1/tenants/{tenant}/backups",
 ];
 
-/// The admin routes that are the coordinator's alone, done where the
-/// request arrives; a restore is sent on to the node that writes the
-/// tenant, as its writes are.
-const COORDINATED: [&str; 6] = [
+/// The admin routes done where the request arrives, which need no writer:
+/// a backup is read from the store. A restore is sent on to the node that
+/// writes the tenant, as its writes are.
+const COORDINATED: [&str; 7] = [
     "/v1/tenants",
     "/v1/tenants/{tenant}",
     "/v1/tenants/{tenant}/keys",
     "/v1/tenants/{tenant}/keys/{id}",
     "/v1/tenants/{tenant}/restore-points",
     "/v1/tenants/{tenant}/restore-window",
+    "/v1/tenants/{tenant}/backups",
 ];
 
 /// Let a request through if its key reaches what it asks for. An admin key,
@@ -463,6 +466,7 @@ fn described() -> (Router<App>, OpenApi) {
         .routes(routes!(api::restore_points))
         .routes(routes!(api::restore))
         .routes(routes!(api::set_restore_window))
+        .routes(routes!(api::back_up, api::backups))
         .routes(routes!(api::revoke_key))
         .routes(routes!(api::changes))
         .routes(routes!(api::collections))

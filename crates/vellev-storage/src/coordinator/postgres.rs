@@ -9,9 +9,9 @@ use uuid::Uuid;
 use vellev_core::{NodeId, Partition, TenantId};
 
 use super::{
-    checked_ttl, checked_window, Acquired, Commit, Committed, Coordinator, CoordinatorError,
-    Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Point,
-    RestorePoint, Result, TenantKey, Versions,
+    checked_hold, checked_ttl, checked_window, Acquired, Commit, Committed, Coordinator,
+    CoordinatorError, Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef,
+    PartitionKey, Point, RestorePoint, Result, TenantKey, Versions,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -21,6 +21,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("../../migrations/0004_nodes.sql")),
     (5, include_str!("../../migrations/0005_tenant_keys.sql")),
     (6, include_str!("../../migrations/0006_commits.sql")),
+    (7, include_str!("../../migrations/0007_backups.sql")),
 ];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
@@ -575,21 +576,29 @@ impl Coordinator for PostgresCoordinator {
         .fetch_one(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(Some(TenantKey { id, created }))
+        Ok(Some(TenantKey {
+            id,
+            created,
+            hash: *hash,
+        }))
     }
 
     async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>> {
-        let keys: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT id, created_at FROM vellev.tenant_keys WHERE tenant = $1
+        let keys: Vec<(Uuid, DateTime<Utc>, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, created_at, hash FROM vellev.tenant_keys WHERE tenant = $1
              ORDER BY created_at, id",
         )
         .bind(tenant.as_str())
         .fetch_all(&self.pool)
         .await?;
-        Ok(keys
-            .into_iter()
-            .map(|(id, created)| TenantKey { id, created })
-            .collect())
+        keys.into_iter()
+            .map(|(id, created, hash)| {
+                let hash = KeyHash::try_from(hash.as_slice()).map_err(|_| {
+                    invariant(format!("key {id} has a hash of {} bytes", hash.len()))
+                })?;
+                Ok(TenantKey { id, created, hash })
+            })
+            .collect()
     }
 
     async fn revoke_key(&self, tenant: &TenantId, id: Uuid) -> Result<bool> {
@@ -675,6 +684,48 @@ impl Coordinator for PostgresCoordinator {
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected())
+    }
+
+    async fn claim_backup(
+        &self,
+        tenant: &TenantId,
+        due: Option<Duration>,
+        hold: Duration,
+    ) -> Result<Option<Uuid>> {
+        let claim = Uuid::new_v4();
+        let done = sqlx::query(
+            "UPDATE vellev.partitions
+             SET backup_claim = $2, backup_claimed_until = now() + make_interval(secs => $4)
+             WHERE tenant = $1
+               AND NOT EXISTS (
+                   SELECT 1 FROM vellev.partitions
+                   WHERE tenant = $1
+                     AND NOT ((backup_claimed_until IS NULL OR backup_claimed_until < now())
+                              AND ($3::float8 IS NULL OR backed_up_at IS NULL
+                                   OR backed_up_at <= now() - make_interval(secs => $3))))",
+        )
+        .bind(tenant.as_str())
+        .bind(claim)
+        .bind(due.map(|due| due.as_secs_f64()))
+        .bind(checked_hold(hold)?.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        Ok((done.rows_affected() > 0).then_some(claim))
+    }
+
+    async fn release_backup(&self, tenant: &TenantId, claim: Uuid, made: bool) -> Result<()> {
+        sqlx::query(
+            "UPDATE vellev.partitions
+             SET backup_claim = NULL, backup_claimed_until = NULL,
+                 backed_up_at = CASE WHEN $3 THEN now() ELSE backed_up_at END
+             WHERE tenant = $1 AND backup_claim = $2",
+        )
+        .bind(tenant.as_str())
+        .bind(claim)
+        .bind(made)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>> {

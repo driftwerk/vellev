@@ -271,6 +271,21 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// to. Returns how many.
     async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64>;
 
+    /// Take the right to back `tenant` up, or restore it from a backup,
+    /// for `hold`: if nobody holds it, and with `due` only if its last
+    /// backup is at least that old. Returns the claim, by which it is let
+    /// go, if it was taken.
+    async fn claim_backup(
+        &self,
+        tenant: &TenantId,
+        due: Option<Duration>,
+        hold: Duration,
+    ) -> Result<Option<Uuid>>;
+
+    /// Let go of `claim`, noting that the tenant was backed up now if
+    /// `made`. A claim that ran out and was taken by another is left be.
+    async fn release_backup(&self, tenant: &TenantId, claim: Uuid, made: bool) -> Result<()>;
+
     /// How far back `tenant` may be restored, if it is not the default.
     async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>>;
 
@@ -279,6 +294,17 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// such a tenant.
     async fn set_restore_window(&self, tenant: &TenantId, window: Option<Duration>)
         -> Result<bool>;
+}
+
+/// The longest a backup may be claimed for at once.
+pub const MAX_BACKUP_HOLD: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn checked_hold(hold: Duration) -> Result<Duration> {
+    (hold <= MAX_BACKUP_HOLD).then_some(hold).ok_or_else(|| {
+        CoordinatorError::InvalidArgument(format!(
+            "a backup claim of {hold:?} exceeds {MAX_BACKUP_HOLD:?}"
+        ))
+    })
 }
 
 /// The longest a restore window may be.
@@ -326,12 +352,13 @@ pub enum Point {
 /// The SHA-256 of a key's secret: all the coordinator keeps of it.
 pub type KeyHash = [u8; 32];
 
-/// A key that reaches one tenant, as listed: when it was issued, and the
-/// id it is revoked by.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A key that reaches one tenant, as listed: when it was issued, the id it
+/// is revoked by, and the hash of its secret, by which a backup keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantKey {
     pub id: Uuid,
     pub created: DateTime<Utc>,
+    pub hash: KeyHash,
 }
 
 /// The newest file format and node-to-node protocol a node can read.

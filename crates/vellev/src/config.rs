@@ -93,6 +93,16 @@ pub struct Config {
     /// it, in seconds. What a restore that far back needs is kept.
     #[arg(long, env = "VELLEV_RESTORE_WINDOW_SECS", default_value_t = 14 * 24 * 60 * 60)]
     pub restore_window_secs: u64,
+    /// Where tenants are backed up to, as `VELLEV_STORE` names a store;
+    /// best a bucket of its own. Without one nothing is backed up.
+    #[arg(long, env = "VELLEV_BACKUP_STORE")]
+    pub backup_store: Option<String>,
+    /// How often each tenant is backed up, in seconds.
+    #[arg(long, env = "VELLEV_BACKUP_EVERY_SECS", default_value_t = 24 * 60 * 60)]
+    pub backup_every_secs: u64,
+    /// How long a backup is kept, in seconds; a tenant's newest always is.
+    #[arg(long, env = "VELLEV_BACKUPS_KEPT_SECS", default_value_t = 35 * 24 * 60 * 60)]
+    pub backups_kept_secs: u64,
     /// How much longer than a tenant's restore window its files that
     /// nothing reaches any more, such as segments a merge replaced, are
     /// kept before they are deleted, in seconds.
@@ -212,6 +222,9 @@ impl Config {
             .filter(|url| !url.is_empty())
             .chain(keyed.into_keys())
             .collect();
+        if self.backup_store.as_deref() == Some(self.store.as_str()) {
+            bail!("tenants cannot be backed up to the store they are kept in");
+        }
         if let Some(url) = &self.advertise_url {
             let parsed = reqwest::Url::parse(url).ok();
             let usable = parsed.is_some_and(|url| {
@@ -256,6 +269,15 @@ impl Config {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
             restore_window: Duration::from_secs(self.restore_window_secs),
+            backups: self
+                .backup_store
+                .as_deref()
+                .map(self::store)
+                .transpose()
+                .wrap_err("opening the backup store")?
+                .map(|store| Arc::new(store) as Arc<dyn Blobs>),
+            backup_every: Duration::from_secs(self.backup_every_secs),
+            backups_kept: Duration::from_secs(self.backups_kept_secs),
             grace: Duration::from_secs(self.grace_secs),
             max_format: self.max_format,
             tenant_idle: Duration::from_secs(self.tenant_idle_secs),

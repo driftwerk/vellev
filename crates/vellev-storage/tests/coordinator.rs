@@ -81,7 +81,9 @@ impl Harness for Pg {
     async fn pass(&self, key: &PartitionKey, duration: Duration) {
         sqlx::query(
             "UPDATE vellev.partitions
-             SET lease_expires_at = lease_expires_at - make_interval(secs => $3)
+             SET lease_expires_at = lease_expires_at - make_interval(secs => $3),
+                 backup_claimed_until = backup_claimed_until - make_interval(secs => $3),
+                 backed_up_at = backed_up_at - make_interval(secs => $3)
              WHERE tenant = $1 AND partition = $2",
         )
         .bind(key.tenant.as_str())
@@ -89,7 +91,7 @@ impl Harness for Pg {
         .bind(duration.as_secs_f64())
         .execute(&self.pool)
         .await
-        .expect("rewind lease");
+        .expect("rewind lease and backups");
         sqlx::query(
             "UPDATE vellev.commits
              SET committed_at = committed_at - make_interval(secs => $3)
@@ -784,6 +786,61 @@ async fn a_tenant_keeps_its_own_restore_window_until_told_otherwise(h: &dyn Harn
         .unwrap());
 }
 
+async fn one_node_at_a_time_backs_a_tenant_up_and_only_when_due(h: &dyn Harness) {
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let coordinator = h.coordinator();
+    let day = Some(24 * HOUR);
+    let first = coordinator.claim_backup(tenant, day, HOUR).await.unwrap();
+    let first = first.expect("never backed up, so due");
+    assert_eq!(
+        coordinator.claim_backup(tenant, None, HOUR).await.unwrap(),
+        None,
+        "held"
+    );
+    coordinator
+        .release_backup(tenant, first, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.claim_backup(tenant, day, HOUR).await.unwrap(),
+        None,
+        "backed up just now"
+    );
+    let asked = coordinator.claim_backup(tenant, None, HOUR).await.unwrap();
+    let asked = asked.expect("asked for, a backup need not be due");
+
+    h.pass(&key, 2 * HOUR).await;
+    let taken_over = coordinator.claim_backup(tenant, None, HOUR).await.unwrap();
+    let taken_over = taken_over.expect("a claim that ran out is taken over");
+    coordinator
+        .release_backup(tenant, asked, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.claim_backup(tenant, None, HOUR).await.unwrap(),
+        None,
+        "a stale release leaves the newer claim be"
+    );
+    coordinator
+        .release_backup(tenant, taken_over, false)
+        .await
+        .unwrap();
+    assert!(coordinator
+        .claim_backup(tenant, None, HOUR)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        coordinator
+            .claim_backup(&self::key().tenant, None, HOUR)
+            .await
+            .unwrap(),
+        None,
+        "no such tenant"
+    );
+}
+
 async fn ping_succeeds(h: &dyn Harness) {
     h.coordinator().ping().await.unwrap();
 }
@@ -836,6 +893,7 @@ conformance! {
     a_restore_reaches_back_through_its_window_and_to_how_it_then_stood,
     removing_a_partition_forgets_its_history,
     a_tenant_keeps_its_own_restore_window_until_told_otherwise,
+    one_node_at_a_time_backs_a_tenant_up_and_only_when_due,
     ping_succeeds,
 }
 

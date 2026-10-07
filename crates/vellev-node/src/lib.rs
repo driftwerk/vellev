@@ -13,14 +13,15 @@ use vellev_core::{CollectionName, Embedding, NodeId, Partition, TenantId};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
-    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, Point, RestorePoint,
-    TenantKey, Versions, MAX_RESTORE_WINDOW,
+    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, ManifestRef, PartitionKey, Point,
+    RestorePoint, TenantKey, Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
     Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
 };
 
+mod backing;
 mod keys;
 mod limits;
 mod reading;
@@ -91,6 +92,12 @@ pub struct Settings {
     /// copied for reads, may take in memory together, if there is a bound.
     /// Past it the least recently used that nobody is using go first.
     pub memory: Option<usize>,
+    /// Where tenants are backed up to, if anywhere.
+    pub backups: Option<Arc<dyn Blobs>>,
+    /// How often each tenant is backed up.
+    pub backup_every: Duration,
+    /// How long a backup is kept; the newest of a tenant always is.
+    pub backups_kept: Duration,
 }
 
 impl Settings {
@@ -111,6 +118,9 @@ impl Settings {
             queries_per_second: None,
             writes_per_second: None,
             memory: None,
+            backups: None,
+            backup_every: Duration::from_secs(24 * 60 * 60),
+            backups_kept: Duration::from_secs(35 * 24 * 60 * 60),
         }
     }
 }
@@ -135,6 +145,12 @@ pub enum NodeError {
     Ahead(TenantId),
     #[error("tenant {0} has no state to go back to at that point")]
     NoRestorePoint(TenantId),
+    #[error("no backup store is configured")]
+    NoBackups,
+    #[error("tenant {0} is being backed up or restored from a backup already")]
+    BackingUp(TenantId),
+    #[error("tenant {0} has no backup {1}")]
+    UnknownBackup(TenantId, uuid::Uuid),
     #[error("the cluster writes file format {cluster}, and this release reads only up to {reads}")]
     Outdated { cluster: u16, reads: u16 },
     #[error(transparent)]
@@ -339,6 +355,26 @@ impl Tenant {
         let window = restore_window(coordinator, &self.id, default_window).await?;
         coordinator.forget_history(&key(&self.id), window).await?;
         self.compact(window.saturating_add(grace)).await
+    }
+
+    /// Put the tenant back as it stood at `head`, as
+    /// [`Writer::restore`] does, running to the end even if the caller
+    /// stops waiting.
+    async fn restored(
+        self: &Arc<Self>,
+        head: Option<ManifestRef>,
+        position: LogPosition,
+    ) -> Result<LogPosition> {
+        let tenant = self.clone();
+        tokio::spawn(async move {
+            tenant
+                .writer
+                .restore(head.as_ref(), position)
+                .await
+                .map_err(|error| tenant.closed(error))
+        })
+        .await
+        .map_err(|error| StorageError::Background(error.to_string()))?
     }
 
     /// An error from something that leaves the writer open unless it says
@@ -629,19 +665,9 @@ impl Node {
             .restore_point(&key(tenant), point, window)
             .await?
             .ok_or_else(|| NodeError::NoRestorePoint(tenant.clone()))?;
-        let restoring = {
-            let (opened, target) = (opened.clone(), target.clone());
-            tokio::spawn(async move {
-                opened
-                    .writer
-                    .restore(&target.head, target.position)
-                    .await
-                    .map_err(|error| opened.closed(error))
-            })
-        };
-        let restored = restoring
-            .await
-            .map_err(|error| StorageError::Background(error.to_string()))??;
+        let restored = opened
+            .restored(Some(target.head.clone()), target.position)
+            .await?;
         tracing::info!(%tenant, from = ?target.position, at = %target.at, ?restored, "restored");
         Ok((target, restored))
     }

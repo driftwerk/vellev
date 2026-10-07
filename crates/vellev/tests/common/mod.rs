@@ -20,6 +20,10 @@ pub const KEY: &str = "test-key";
 pub const MAX_LIMIT: usize = 50;
 pub const MAX_BODY: usize = 64 * 1024;
 
+pub fn memory() -> Arc<dyn Blobs> {
+    Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))
+}
+
 /// What the nodes of one cluster share.
 #[derive(Clone)]
 pub struct Cluster {
@@ -31,7 +35,7 @@ impl Cluster {
     pub fn new() -> Self {
         Self {
             coordinator: Arc::new(MemoryCoordinator::default()),
-            blobs: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new()))),
+            blobs: memory(),
         }
     }
 
@@ -52,6 +56,18 @@ impl Cluster {
     /// rather than where it listens.
     pub async fn serve_advertising(&self, address: &str) -> Served {
         let served = self.unstarted(&[], Some(address)).await;
+        served.app.start(served.node.clone());
+        served
+    }
+
+    /// A node that backs tenants up to `store`.
+    pub async fn serve_backing_up_to(&self, store: Arc<dyn Blobs>) -> Served {
+        let served = self
+            .unstarted_with(&[], None, &[], |settings| Settings {
+                backups: Some(store),
+                ..settings
+            })
+            .await;
         served.app.start(served.node.clone());
         served
     }
