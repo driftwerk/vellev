@@ -529,8 +529,11 @@ fn collection(
             let text = matches!(data_type, DataType::Text | DataType::TextArray);
             let filterable = property.index_filterable.unwrap_or(true)
                 || property.index_range_filters.unwrap_or(false);
-            let searchable = text && property.index_searchable.unwrap_or(true);
             let tokenization = property.tokenization.as_deref().unwrap_or("word");
+            // A whole value, an id most likely, is matched by filters
+            // alone: searched by its words it would only skew the scores.
+            let searchable =
+                text && tokenization != "field" && property.index_searchable.unwrap_or(true);
             if text && filterable && tokenization != "field" {
                 warnings.push(format!(
                     "property {} is filtered by {tokenization} in Weaviate and by whole value in vellev",
@@ -935,6 +938,7 @@ mod tests {
             json!([
                 { "name": "content", "dataType": ["text"], "indexFilterable": false },
                 { "name": "owner", "dataType": ["text"], "tokenization": "field", "indexSearchable": false },
+                { "name": "identityId", "dataType": ["text"], "tokenization": "field" },
                 { "name": "tags", "dataType": ["text[]"] },
                 { "name": "count", "dataType": ["int"], "indexFilterable": false, "indexRangeFilters": true },
                 { "name": "importance", "dataType": ["number"] },
@@ -966,6 +970,7 @@ mod tests {
             [
                 ("content", DataType::Text, false, true),
                 ("owner", DataType::Text, true, false),
+                ("identityId", DataType::Text, true, false),
                 ("tags", DataType::TextArray, true, true),
                 ("count", DataType::Int, true, false),
                 ("importance", DataType::Number, true, false),
