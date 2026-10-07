@@ -23,6 +23,8 @@ use utoipa_axum::routes;
 use vellev_api::Code;
 use vellev_core::{Collection, EmbeddingProvider, TenantId};
 use vellev_node::{Node, NodeError};
+
+use crate::identity::{Caller, IdentityKeys};
 use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE};
 
 use crate::api;
@@ -54,6 +56,8 @@ pub struct App {
     stopping: Arc<AtomicBool>,
     /// The keys a caller may present; with none, nobody may call.
     keys: Arc<[String]>,
+    /// The keys whose identity tokens are trusted.
+    pub(crate) identity_keys: Arc<IdentityKeys>,
     limits: Limits,
     /// For sending a request on to the node that holds its tenant.
     http: reqwest::Client,
@@ -74,12 +78,21 @@ impl App {
             node: Arc::default(),
             stopping: Arc::default(),
             keys,
+            identity_keys: Arc::default(),
             limits,
             http: reqwest::Client::builder()
                 .connect_timeout(FORWARD_CONNECT_TIMEOUT)
                 .timeout(FORWARD_TIMEOUT)
                 .build()
                 .expect("an HTTP client with default settings"),
+        }
+    }
+
+    /// Trust identity tokens signed by `keys`.
+    pub fn trusting(self, keys: IdentityKeys) -> Self {
+        Self {
+            identity_keys: Arc::new(keys),
+            ..self
         }
     }
 
@@ -239,6 +252,8 @@ async fn authorized(
         .iter()
         .fold(false, |known, key| known | same(key, presented));
     if admin {
+        let mut request = request;
+        request.extensions_mut().insert(Caller::Admin);
         return Ok(next.run(request).await);
     }
     let reaches = app
@@ -252,6 +267,7 @@ async fn authorized(
     }
     // The tenant as the router read it, which is what the handler is given.
     let (mut parts, body) = request.into_parts();
+    parts.extensions.insert(Caller::Tenant);
     let named = RawPathParams::from_request_parts(&mut parts, &app)
         .await
         .ok()

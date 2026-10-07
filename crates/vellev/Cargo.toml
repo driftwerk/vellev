@@ -10,6 +10,7 @@ vellev-api = { workspace = true, features = ["openapi"] }
 vellev-client.workspace = true
 vellev-core.workspace = true
 vellev-embed.workspace = true
+vellev-index.workspace = true
 vellev-node.workspace = true
 vellev-storage.workspace = true
 
@@ -17,6 +18,7 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 eyre.workspace = true
+jsonwebtoken.workspace = true
 object_store.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -30,6 +32,7 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 
 [dev-dependencies]
-vellev-index.workspace = true
+base64.workspace = true
+ring.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true

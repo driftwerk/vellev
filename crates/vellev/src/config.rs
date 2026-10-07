@@ -33,6 +33,12 @@ pub struct Config {
     /// in place from it; a node without one holds every vector in memory.
     #[arg(long, env = "VELLEV_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
+    /// The public keys whose identity tokens are trusted, as KID=X separated
+    /// by commas, X being the Ed25519 key in unpadded base64url as a JWK's
+    /// `x` holds it. A read of a collection with an access rule made with a
+    /// tenant's key sees only what the token's person may.
+    #[arg(long, env = "VELLEV_IDENTITY_KEYS", value_delimiter = ',')]
+    pub identity_keys: Vec<String>,
     /// The admin keys, separated by commas: each reaches every tenant and
     /// alone may create, drop and list tenants and issue their keys. A key
     /// that reaches one tenant is issued through the API.

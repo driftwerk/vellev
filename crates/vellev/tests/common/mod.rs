@@ -8,6 +8,7 @@ use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use vellev::identity::IdentityKeys;
 use vellev::server::{App, Limits};
 use vellev_core::NodeId;
 use vellev_embed::Embedders;
@@ -58,7 +59,7 @@ impl Cluster {
     /// A node limited to `queries` a second for each tenant.
     pub async fn serve_limited(&self, queries: f64) -> Served {
         let served = self
-            .unstarted_with(&[], None, |settings| Settings {
+            .unstarted_with(&[], None, &[], |settings| Settings {
                 queries_per_second: Some(queries),
                 ..settings
             })
@@ -67,10 +68,20 @@ impl Cluster {
         served
     }
 
+    /// A node that trusts identity tokens signed by these keys, given as
+    /// `KID=X`.
+    pub async fn serve_trusting(&self, keys: &[String]) -> Served {
+        let served = self
+            .unstarted_with(&[], None, keys, |settings| settings)
+            .await;
+        served.app.start(served.node.clone());
+        served
+    }
+
     /// A node that is listening but has not yet reached what it serves
     /// from.
     pub async fn unstarted(&self, urls: &[String], advertised: Option<&str>) -> Served {
-        self.unstarted_with(urls, advertised, |settings| settings)
+        self.unstarted_with(urls, advertised, &[], |settings| settings)
             .await
     }
 
@@ -78,6 +89,7 @@ impl Cluster {
         &self,
         urls: &[String],
         advertised: Option<&str>,
+        trusted: &[String],
         adjusted: impl FnOnce(Settings) -> Settings,
     ) -> Served {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -96,7 +108,8 @@ impl Cluster {
             body: MAX_BODY,
             embedding_urls: urls.into(),
         };
-        let app = App::new([KEY.to_string(), "second-key".to_string()].into(), limits);
+        let app = App::new([KEY.to_string(), "second-key".to_string()].into(), limits)
+            .trusting(IdentityKeys::parse(trusted).unwrap());
         let (stop, stopped) = oneshot::channel::<()>();
         let served = tokio::spawn(vellev::server::serve(listener, app.clone(), async {
             stopped.await.ok();
