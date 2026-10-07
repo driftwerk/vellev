@@ -6,7 +6,24 @@ use serde_json::Value as Json;
 
 use crate::{Collection, DataType, Embedding, ObjectId};
 
+/// Why an object, or a vector searched by, is refused. More reasons may come,
+/// so a match on one outside this crate needs an arm for the rest:
+///
+/// ```compile_fail
+/// use vellev_core::ObjectError;
+///
+/// fn reason(error: &ObjectError) -> &'static str {
+///     match error {
+///         ObjectError::UnknownProperty(_) => "unknown property",
+///         ObjectError::Type { .. } => "wrong type",
+///         ObjectError::VectorLength { .. } => "wrong length",
+///         ObjectError::VectorNotFinite => "not finite",
+///         ObjectError::VectorTooLong => "too long",
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ObjectError {
     #[error("property {0:?} is not declared on the collection")]
     UnknownProperty(String),
