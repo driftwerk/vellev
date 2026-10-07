@@ -564,6 +564,36 @@ mod tests {
         }
     }
 
+    /// Twenty vectors a hundred times as long as the rest, each at nearly a
+    /// right angle to the query, with inner products of 40 against the
+    /// rest's under 3. Measured, about half of them look at or past a right
+    /// angle; ranked by how near they may be, all are shortlisted.
+    #[test]
+    fn long_vectors_at_nearly_a_right_angle_are_shortlisted_by_how_near_they_may_be() {
+        let mut random = Random(31);
+        let query = random.vector(64);
+        let mut vectors: Vec<Vec<f32>> = (0..5000).map(|_| random.vector(64)).collect();
+        let long: Vec<Vec<f32>> = (0..20)
+            .map(|_| {
+                let sideways = random.vector(64);
+                let off = (dot(&sideways, &query) - 0.4) / dot(&query, &query);
+                sideways
+                    .iter()
+                    .zip(&query)
+                    .map(|(s, q)| 100.0 * (s - off * q))
+                    .collect()
+            })
+            .collect();
+        assert!(vectors.iter().all(|vector| dot(vector, &query) < 3.0));
+        vectors.extend(long);
+        let index = indexed(Distance::Dot, &vectors);
+        let shortlist = index.shortlist(&query, 128, None, &[], &in_row_order);
+        let found = (5000..5020u32)
+            .filter(|row| shortlist.contains(&(row * 2)))
+            .count();
+        assert_eq!(found, 20);
+    }
+
     #[test]
     fn the_ranked_angle_rises_with_the_hamming_distance_from_none_at_all() {
         for dimensions in [1, 64, 768] {
