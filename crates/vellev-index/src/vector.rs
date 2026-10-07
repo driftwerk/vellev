@@ -318,6 +318,18 @@ const CENTRE_SAMPLE: usize = 4096;
 ///
 /// For cosine the vectors and the query are scaled to unit length first,
 /// so that only directions count.
+///
+/// Every coded vector's squared length is under `L`, the write limit with
+/// the index's margin, `17/16 · 2^124`, and the query's under `2^124`. In
+/// each coordinate at least half the sampled values are at least as large
+/// as their median, so the centre's squared length is at most twice their
+/// mean square, under `2L`. Then `|o - m| < √L + √(2L) < 2^63.4` and
+/// `|o - m|² < 2^126.7`, and `|q - m| < 2^63.3`. The L2 estimate, the first
+/// less `2 |q - m| |o - m|` times a cosine, lies between `-2^127.7` and
+/// `2^128.3`: it is never `-∞`, but for a row facing away from the query
+/// near the limit it may come out as `+∞`, which ranks that row last. The
+/// inner products' estimates stay under `2^127.2` either way. No estimate
+/// is NaN: an infinity can only be the last sum taken.
 #[derive(Debug, Clone)]
 pub struct BinaryIndex {
     metric: Distance,
@@ -688,8 +700,11 @@ mod tests {
     }
 
     /// Noise drawn independently along each axis is the one case where
-    /// codes along the axes do better than along random directions, by two
-    /// points over ten draws; the rotation is kept for every other case.
+    /// codes along the axes do better than along random directions: on this
+    /// draw 0.945, against 0.99 without the rotation. The rotation is kept
+    /// for what it does to real embeddings, whose dimensions are anything
+    /// but independent: on driftwerk's, recall@10 at oversample 4 rose from
+    /// 0.796 to 0.990 under cosine, and from 0.196 to 0.914 under dot.
     #[test]
     fn a_shortlist_holds_the_true_neighbours_of_clustered_vectors() {
         let mut random = Random(42);

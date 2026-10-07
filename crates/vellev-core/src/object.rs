@@ -104,7 +104,9 @@ impl Value {
 /// A vector's squared length must be under this, 2^124, so that its length
 /// is under 2^62. Then the squared distance between two vectors, at most
 /// `(2^62 + 2^62)^2 = 2^126`, and their inner product, at most 2^124, stay
-/// within an `f32`, which holds up to nearly 2^128.
+/// within an `f32`, which holds up to nearly 2^128. What the vector indexes
+/// estimate from such vectors is bounded as their own documentation says:
+/// never NaN, and infinite only where it ranks a row last.
 pub const SQUARED_LENGTH_UNDER: f32 = (1u128 << 124) as f32;
 
 impl Embedding {
