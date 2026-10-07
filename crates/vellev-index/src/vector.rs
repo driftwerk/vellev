@@ -1,7 +1,8 @@
 //! Nearest-vector search by a compressed scan and an exact rescore.
 //!
-//! A [`BinaryIndex`] keeps one bit per dimension of every vector: whether it
-//! lies above the mean of the indexed vectors in that dimension. Comparing
+//! A [`BinaryIndex`] keeps one bit per coordinate of every vector, once
+//! turned by a random rotation: whether it lies above a centre of the
+//! indexed vectors in that coordinate. Comparing
 //! two such codes costs a few XOR and popcount instructions, so a scan over
 //! every code produces a shortlist cheaply, and only the shortlist is scored
 //! with the full vectors and the real distance.
@@ -13,7 +14,9 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use roaring::RoaringBitmap;
-use vellev_core::Distance;
+use vellev_core::{Distance, SQUARED_LENGTH_UNDER};
+
+use crate::rotation::{Random, Rotation};
 
 const LANES: usize = 16;
 
@@ -219,40 +222,57 @@ pub trait VectorIndex {
     }
 }
 
-/// One bit per dimension of each vector, for a scan by Hamming distance.
+/// Seeds the rotation and the sample the centre is taken from, which must
+/// come out the same on every load.
+const ROTATION_SEED: u64 = 0x0B17_C0DE;
+/// How many vectors, at most, the centre is the median of.
+const CENTRE_SAMPLE: usize = 4096;
+
+/// One bit per coordinate of each vector after a random rotation, for a
+/// scan by Hamming distance.
 ///
-/// A row's code says on which side of the mean `m` its vector `o` lies in
-/// each dimension, and the query's code the same of the query `q`. The
-/// share of bits on which they differ estimates the angle between `o - m`
-/// and `q - m` as a share of a half turn: in expectation for codes taken
-/// along random directions, and closely enough along the axes. Up to a term
-/// the same for every row, each metric's distance is a term of the row's
-/// own, kept beside its code, less a multiple of `|o - m| |q - m|` times
-/// that angle's cosine. A row's estimate so weighs the angle by the row's
-/// length, without which a long vector is lost among short ones.
+/// The rotation makes each bit a sign along a random direction, which meets
+/// every axis, rather than along an axis: a vector that lies along a few
+/// axes is coded as faithfully as one spread over all of them. Every
+/// coordinate of the rotation is coded, the dimensions padded to a power of
+/// two, as the padding's bits buy more recall than they cost.
+///
+/// A row's code says on which side of a centre `m` each coordinate of its
+/// rotated vector `o` lies, and the query's code the same of the query `q`.
+/// The share of bits on which they differ estimates the angle between
+/// `o - m` and `q - m` as a share of a half turn. Whatever `m` is, each
+/// metric's distance is, up to a term the same for every row, a term of the
+/// row's own, kept beside its code, less a multiple of `|o - m| |q - m|`
+/// times that angle's cosine. A row's estimate so weighs the angle by the
+/// row's length, without which a long vector is lost among short ones. The
+/// centre is the median, coordinate by coordinate, of a sample of the
+/// vectors: unlike their mean, it stays among them however far a few lie
+/// from the rest, so one such vector cannot spoil every other row's code.
 ///
 /// The error of that estimate grows with `|o - m| |q - m|` too, so a long
 /// vector that looks nearly at right angles to the query may still be
 /// nearer than every short one. Each row is ranked by the angle at the near
 /// end of the one-standard-error (Wilson) interval about the measured one,
 /// which is to say by how near it may well be. That end rises with the
-/// Hamming distance, so rows of one length keep the order their Hamming
-/// distances give.
+/// Hamming distance, so of two rows with the same term and length the one
+/// fewer bits away ranks nearer.
 ///
 /// For cosine the vectors and the query are scaled to unit length first,
 /// so that only directions count.
 #[derive(Debug, Clone)]
 pub struct BinaryIndex {
     metric: Distance,
-    mean: Vec<f32>,
+    dimensions: usize,
+    rotation: Rotation,
+    /// `m`, rotated as the vectors are.
+    centre: Vec<f32>,
     words: usize,
     /// The indexed rows in ascending order; a row's code is at its position.
     rows: Vec<u32>,
     codes: Vec<u64>,
-    /// Each row's `|o - m|`, and its own term of the distance: `|o - m|²`
-    /// for L2, `-m · (o - m)` for the inner products.
-    lengths: Vec<f32>,
-    terms: Vec<f32>,
+    /// Each row's own term of the distance, `|o - m|²` for L2 and
+    /// `-m · (o - m)` for the inner products, and its `|o - m|`.
+    factors: Vec<(f32, f32)>,
     /// By Hamming distance, the cosine of the angle a row is ranked by.
     cosines: Vec<f32>,
 }
@@ -265,51 +285,60 @@ impl BinaryIndex {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
-        // A vector stored before lengths were limited may be too long to
-        // square. Left out of the mean, it spoils no other row's estimate.
-        let (sum, measured) = vectors.iter().fold(
-            (vec![0.0f32; dimensions], 0usize),
-            |(mut sum, measured), (_, vector)| {
-                let vector = normalised(metric, vector);
-                if !dot(&vector, &vector).is_finite() {
-                    return (sum, measured);
-                }
-                sum.iter_mut()
-                    .zip(vector.iter())
-                    .for_each(|(sum, value)| *sum += value);
-                (sum, measured + 1)
-            },
-        );
-        let mean: Vec<f32> = sum
+        let rotation = Rotation::new(dimensions, ROTATION_SEED);
+        let prepared = |vector: &[f32]| {
+            let rotated = rotation.apply(&normalised(metric, vector));
+            measurable(&rotated).then_some(rotated)
+        };
+        let sampled: Vec<(usize, Option<Vec<f32>>)> = Random(ROTATION_SEED)
+            .sample(vectors.len(), CENTRE_SAMPLE)
             .into_iter()
-            .map(|sum| sum / measured.max(1) as f32)
+            .map(|at| (at, prepared(vectors[at].1)))
             .collect();
-        let words = dimensions.div_ceil(64);
+        let centre = median(
+            rotation.width,
+            sampled.iter().filter_map(|(_, vector)| vector.as_deref()),
+        );
+        let words = rotation.width / 64;
         let mut codes = Vec::with_capacity(vectors.len() * words);
-        let (lengths, terms) = vectors
+        let mut sampled = sampled.into_iter().peekable();
+        let factors = vectors
             .iter()
-            .map(|(_, vector)| {
-                let vector = normalised(metric, vector);
-                codes.extend(encode(&mean, &vector));
-                let (squared, along) = residual(&mean, &vector);
+            .enumerate()
+            .map(|(at, (_, vector))| {
+                let vector = match sampled.next_if(|(sampled, _)| *sampled == at) {
+                    Some((_, vector)) => vector,
+                    None => prepared(vector),
+                };
+                // A vector stored before lengths were limited may be too long
+                // for its code to say anything. It is ranked first, to be
+                // placed by its exact distance, which may still be finite.
+                let Some(vector) = vector else {
+                    codes.extend(std::iter::repeat_n(0, words));
+                    return (f32::NEG_INFINITY, 0.0);
+                };
+                codes.extend(encode(&centre, &vector));
+                let (squared, along) = residual(&centre, &vector);
                 let term = match metric {
                     Distance::L2 => squared,
                     Distance::Dot | Distance::Cosine => -along,
                 };
-                (squared.sqrt(), term)
+                (term, squared.sqrt())
             })
-            .unzip();
+            .collect();
+        let bits = rotation.width;
         Some(Self {
             metric,
+            dimensions,
+            rotation,
+            centre,
             words,
             rows: vectors.iter().map(|(row, _)| *row).collect(),
             codes,
-            lengths,
-            terms,
-            cosines: (0..=dimensions)
-                .map(|hamming| ranked_cosine(hamming, dimensions))
+            factors,
+            cosines: (0..=bits)
+                .map(|hamming| ranked_cosine(hamming, bits))
                 .collect(),
-            mean,
         })
     }
 
@@ -322,13 +351,41 @@ impl BinaryIndex {
     }
 }
 
-/// The squared length of `vector - mean`, and its inner product with `mean`.
-fn residual(mean: &[f32], vector: &[f32]) -> (f32, f32) {
-    mean.iter()
+/// Whether `vector` is as short as a collection accepts, so that every
+/// distance worked out from it fits in an `f32`.
+fn measurable(vector: &[f32]) -> bool {
+    dot(vector, vector) < SQUARED_LENGTH_UNDER
+}
+
+/// The median of `vectors` in each of their `width` coordinates, or the
+/// origin when there are none. Unlike the mean, it stays among the vectors
+/// however far a few of them lie from the rest.
+fn median<'a>(width: usize, vectors: impl Iterator<Item = &'a [f32]>) -> Vec<f32> {
+    let vectors: Vec<&[f32]> = vectors.collect();
+    (0..width)
+        .map(|coordinate| {
+            let mut values: Vec<f32> = vectors.iter().map(|vector| vector[coordinate]).collect();
+            let middle = values.len() / 2;
+            match values.is_empty() {
+                true => 0.0,
+                false => *values.select_nth_unstable_by(middle, f32::total_cmp).1,
+            }
+        })
+        .collect()
+}
+
+/// The squared length of `vector - centre`, and its inner product with
+/// `centre`.
+fn residual(centre: &[f32], vector: &[f32]) -> (f32, f32) {
+    centre
+        .iter()
         .zip(vector)
-        .fold((0.0, 0.0), |(squared, along), (mean, value)| {
-            let difference = value - mean;
-            (squared + difference * difference, along + mean * difference)
+        .fold((0.0, 0.0), |(squared, along), (centre, value)| {
+            let difference = value - centre;
+            (
+                squared + difference * difference,
+                along + centre * difference,
+            )
         })
 }
 
@@ -343,20 +400,20 @@ fn ranked_cosine(hamming: usize, dimensions: usize) -> f32 {
     (std::f64::consts::PI * near.max(0.0)).cos() as f32
 }
 
-/// One bit per dimension, set where the vector is above the mean. Built
+/// One bit per coordinate, set where the vector is above the centre. Built
 /// without a branch per dimension, which a coin-flip bit would mispredict
 /// half the time.
-fn encode<'a>(mean: &'a [f32], vector: &'a [f32]) -> impl Iterator<Item = u64> + 'a {
+fn encode<'a>(centre: &'a [f32], vector: &'a [f32]) -> impl Iterator<Item = u64> + 'a {
     vector
         .chunks(64)
-        .zip(mean.chunks(64))
-        .map(|(values, means)| {
+        .zip(centre.chunks(64))
+        .map(|(values, centres)| {
             values
                 .iter()
-                .zip(means)
+                .zip(centres)
                 .enumerate()
-                .fold(0u64, |word, (bit, (value, mean))| {
-                    word | (u64::from(value > mean) << bit)
+                .fold(0u64, |word, (bit, (value, centre))| {
+                    word | (u64::from(value > centre) << bit)
                 })
         })
 }
@@ -374,21 +431,24 @@ impl VectorIndex for BinaryIndex {
         skipped: &[bool],
         ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
-        if count == 0 || query.len() != self.mean.len() {
+        if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
-        let query = normalised(self.metric, query);
-        let code: Vec<u64> = encode(&self.mean, &query).collect();
-        let reach = residual(&self.mean, &query).0.sqrt()
+        let query = self.rotation.apply(&normalised(self.metric, query));
+        let code: Vec<u64> = encode(&self.centre, &query).collect();
+        let reach = residual(&self.centre, &query).0.sqrt()
             * match self.metric {
                 Distance::L2 => 2.0,
                 Distance::Dot | Distance::Cosine => 1.0,
             };
         let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
         let estimated = |position: usize| {
+            let (term, length) = self.factors[position];
             let cosine = self.cosines[self.hamming(position, &code)];
-            let estimate = self.terms[position] - reach * self.lengths[position] * cosine;
-            (or_farthest(estimate), self.rows[position])
+            (
+                or_farthest(term - reach * length * cosine),
+                self.rows[position],
+            )
         };
         let mut estimates: Vec<(f32, u32)> = match only {
             None => (0..self.rows.len())
@@ -504,20 +564,26 @@ mod tests {
             .collect()
     }
 
-    /// Of the true nearest ten of every `step`th vector, nudged, how many a
-    /// shortlist of `count` holds, as a share.
-    fn recall(metric: Distance, vectors: &[Vec<f32>], step: usize, count: usize) -> f64 {
+    /// Of the true nearest ten among `vectors` of every `step`th of
+    /// `queries`, nudged, how many a shortlist of `count` holds, as a share.
+    fn recall(
+        metric: Distance,
+        vectors: &[Vec<f32>],
+        queries: &[Vec<f32>],
+        step: usize,
+        count: usize,
+    ) -> f64 {
         let index = indexed(metric, vectors);
         let mut random = Random(99);
         let (mut found, mut total) = (0, 0);
-        for query in vectors.iter().step_by(step) {
+        for query in queries.iter().step_by(step) {
             let query: Vec<f32> = query.iter().map(|v| v + 0.05 * random.unit()).collect();
             let mut exact: Vec<(f32, u32)> = vectors
                 .iter()
                 .enumerate()
                 .map(|(row, v)| (distance(metric, &query, v), row as u32 * 2))
                 .collect();
-            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            exact.select_nth_unstable_by(9, |a, b| a.0.total_cmp(&b.0));
             let shortlist = index.shortlist(&query, count, None, &[], &in_row_order);
             assert_eq!(shortlist.len(), count.min(vectors.len()));
             found += exact[..10]
@@ -529,23 +595,26 @@ mod tests {
         found as f64 / total as f64
     }
 
+    /// Noise drawn independently along each axis is the one case where
+    /// codes along the axes do better than along random directions, by two
+    /// points over ten draws; the rotation is kept for every other case.
     #[test]
     fn a_shortlist_holds_the_true_neighbours_of_clustered_vectors() {
         let mut random = Random(42);
         let vectors = grouped(&mut random, 4000, 256, 0.3);
         assert_eq!(indexed(Distance::Cosine, &vectors).len(), 4000);
-        let share = recall(Distance::Cosine, &vectors, 200, 160);
-        assert!(share >= 0.95, "{share} of the true neighbours shortlisted");
+        let share = recall(Distance::Cosine, &vectors, &vectors, 200, 160);
+        assert!(share >= 0.92, "{share} of the true neighbours shortlisted");
     }
 
     #[test]
-    fn codes_are_taken_about_the_mean_so_an_offset_shared_by_all_vectors_costs_nothing() {
+    fn codes_are_taken_about_a_centre_so_an_offset_shared_by_all_vectors_costs_nothing() {
         let mut random = Random(9);
         let vectors: Vec<Vec<f32>> = grouped(&mut random, 4000, 256, 0.3)
             .into_iter()
             .map(|v| v.into_iter().map(|x| x + 5.0).collect())
             .collect();
-        let share = recall(Distance::L2, &vectors, 200, 160);
+        let share = recall(Distance::L2, &vectors, &vectors, 200, 160);
         assert!(share >= 0.9, "{share} of the true neighbours shortlisted");
     }
 
@@ -568,52 +637,118 @@ mod tests {
             .collect();
         for (data, vectors) in [("scaled", &scaled), ("offset", &offset)] {
             for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
-                let share = recall(metric, vectors, 100, 1280);
+                let share = recall(metric, vectors, vectors, 100, 1280);
                 assert!(share >= 0.99, "{data} {metric:?}: recall@10 {share}");
             }
         }
     }
 
-    /// Twenty vectors a hundred times as long as the rest, each at nearly a
-    /// right angle to the query, with inner products of 40 against the
-    /// rest's under 3. Measured, about half of them look at or past a right
-    /// angle; ranked by how near they may be, all are shortlisted.
+    /// A long vector along one axis, the query's largest, whose inner
+    /// product with the query beats every other row's by a third. Its signs
+    /// along the axes say nothing of it but in that one axis; after the
+    /// rotation every bit sees it.
     #[test]
-    fn long_vectors_at_nearly_a_right_angle_are_shortlisted_by_how_near_they_may_be() {
-        let mut random = Random(31);
-        let query = random.vector(64);
-        let mut vectors: Vec<Vec<f32>> = (0..5000).map(|_| random.vector(64)).collect();
-        let long: Vec<Vec<f32>> = (0..20)
-            .map(|_| {
-                let sideways = random.vector(64);
-                let off = (dot(&sideways, &query) - 0.4) / dot(&query, &query);
-                sideways
+    fn a_long_vector_along_one_axis_is_shortlisted_as_one_spread_over_all() {
+        let mut random = Random(7);
+        let normal = |random: &mut Random| -> f32 { (0..12).map(|_| random.unit()).sum() };
+        for _ in 0..10 {
+            let query: Vec<f32> = (0..256).map(|_| normal(&mut random)).collect();
+            let mut vectors: Vec<Vec<f32>> = (0..5000)
+                .map(|_| (0..256).map(|_| normal(&mut random)).collect())
+                .collect();
+            let best = vectors
+                .iter()
+                .map(|vector| dot(vector, &query))
+                .fold(f32::MIN, f32::max);
+            let (axis, along) =
+                query
                     .iter()
-                    .zip(&query)
-                    .map(|(s, q)| 100.0 * (s - off * q))
-                    .collect()
-            })
-            .collect();
-        assert!(vectors.iter().all(|vector| dot(vector, &query) < 3.0));
-        vectors.extend(long);
-        let index = indexed(Distance::Dot, &vectors);
-        let shortlist = index.shortlist(&query, 128, None, &[], &in_row_order);
-        let found = (5000..5020u32)
-            .filter(|row| shortlist.contains(&(row * 2)))
-            .count();
-        assert_eq!(found, 20);
+                    .copied()
+                    .enumerate()
+                    .fold((0, f32::MIN), |most, (axis, value)| {
+                        if value > most.1 {
+                            (axis, value)
+                        } else {
+                            most
+                        }
+                    });
+            let mut sparse = vec![0.0; 256];
+            sparse[axis] = 1.3 * best / along;
+            vectors.push(sparse);
+            let index = indexed(Distance::Dot, &vectors);
+            let shortlist = index.shortlist(&query, 128, None, &[], &in_row_order);
+            assert!(shortlist.contains(&10_000), "best {best}");
+        }
     }
 
-    /// A vector too long to square, as one stored before lengths were
-    /// limited may be, leaves the other rows' shortlist as it was.
+    /// Twenty vectors a hundred times as long as the rest, each at nearly a
+    /// right angle to the query, with inner products of 40 against the
+    /// rest's under 3, over ten draws. Measured, about half of them look at
+    /// or past a right angle, and ranked by the measured angle about three
+    /// in four are shortlisted; ranked by how near they may be, nearly all.
     #[test]
-    fn a_vector_too_long_to_square_spoils_no_other_rows_estimate() {
-        let mut random = Random(13);
-        let mut vectors = grouped(&mut random, 4000, 64, 0.3);
-        vectors.push(vec![1e30; 64]);
-        for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
-            let share = recall(metric, &vectors, 200, 160);
-            assert!(share >= 0.9, "{metric:?}: {share} of the true neighbours");
+    fn long_vectors_at_nearly_a_right_angle_are_shortlisted_by_how_near_they_may_be() {
+        let found: usize = (31..41)
+            .map(|seed| {
+                let mut random = Random(seed);
+                let query = random.vector(64);
+                let mut vectors: Vec<Vec<f32>> = (0..5000).map(|_| random.vector(64)).collect();
+                assert!(vectors.iter().all(|vector| dot(vector, &query) < 3.0));
+                vectors.extend((0..20).map(|_| {
+                    let sideways = random.vector(64);
+                    let off = (dot(&sideways, &query) - 0.4) / dot(&query, &query);
+                    sideways
+                        .iter()
+                        .zip(&query)
+                        .map(|(s, q)| 100.0 * (s - off * q))
+                        .collect()
+                }));
+                let index = indexed(Distance::Dot, &vectors);
+                let shortlist = index.shortlist(&query, 128, None, &[], &in_row_order);
+                (5000..5020u32)
+                    .filter(|row| shortlist.contains(&(row * 2)))
+                    .count()
+            })
+            .sum();
+        assert!(found >= 185, "{found} of 200 long vectors shortlisted");
+    }
+
+    /// One vector far from the rest, as long as a collection accepts or, as
+    /// one stored before lengths were limited may be, longer: the centre the
+    /// codes are taken about stays among the rest, and so does their recall.
+    #[test]
+    fn a_vector_far_from_the_rest_spoils_no_other_rows_code() {
+        for (case, outlier) in [
+            ("none", None),
+            ("accepted", Some(4e17)),
+            ("legacy", Some(1.5e18)),
+        ] {
+            let mut random = Random(13);
+            let mut vectors = grouped(&mut random, 4000, 64, 0.3);
+            let queries = vectors.clone();
+            vectors.extend(outlier.map(|value| vec![value; 64]));
+            for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
+                let share = recall(metric, &vectors, &queries, 200, 160);
+                assert!(
+                    share >= 0.9,
+                    "{case} {metric:?}: {share} of the true neighbours"
+                );
+            }
+        }
+    }
+
+    /// A vector longer than a collection accepts, though its squared length
+    /// is just finite, has no code to rank it by: it is shortlisted always,
+    /// to be placed by its exact distance.
+    #[test]
+    fn a_vector_too_long_to_measure_is_always_shortlisted() {
+        let mut random = Random(17);
+        let mut vectors = grouped(&mut random, 1000, 64, 0.3);
+        vectors.push(vec![2.3e18; 64]);
+        for metric in [Distance::Dot, Distance::L2] {
+            let index = indexed(metric, &vectors);
+            let shortlist = index.shortlist(&vectors[0], 5, None, &[], &in_row_order);
+            assert!(shortlist.contains(&2000), "{metric:?}");
         }
     }
 

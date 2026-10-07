@@ -105,7 +105,7 @@ impl Value {
 /// is under 2^62. Then the squared distance between two vectors, at most
 /// `(2^62 + 2^62)^2 = 2^126`, and their inner product, at most 2^124, stay
 /// within an `f32`, which holds up to nearly 2^128.
-const SQUARED_LENGTH_UNDER: f32 = (1u128 << 124) as f32;
+pub const SQUARED_LENGTH_UNDER: f32 = (1u128 << 124) as f32;
 
 impl Embedding {
     /// `vector` if it is one this embedding's collection can hold.
