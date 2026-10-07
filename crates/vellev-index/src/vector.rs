@@ -495,6 +495,8 @@ impl VectorIndex for BinaryIndex {
 
 #[cfg(test)]
 mod tests {
+    use rayon::prelude::*;
+
     use super::*;
 
     /// A small deterministic generator, so tests need no dependency.
@@ -594,25 +596,28 @@ mod tests {
         count: usize,
     ) -> f64 {
         let index = indexed(metric, vectors);
-        let mut random = Random(99);
-        let (mut found, mut total) = (0, 0);
-        for query in queries.iter().step_by(step) {
-            let query: Vec<f32> = query.iter().map(|v| v + 0.05 * random.unit()).collect();
-            let mut exact: Vec<(f32, u32)> = vectors
-                .iter()
-                .enumerate()
-                .map(|(row, v)| (distance(metric, &query, v), row as u32 * 2))
-                .collect();
-            exact.select_nth_unstable_by(9, |a, b| a.0.total_cmp(&b.0));
-            let shortlist = index.shortlist(&query, count, None, &[], &in_row_order);
-            assert_eq!(shortlist.len(), count.min(vectors.len()));
-            found += exact[..10]
-                .iter()
-                .filter(|(_, row)| shortlist.contains(row))
-                .count();
-            total += 10;
-        }
-        found as f64 / total as f64
+        let found: usize = queries
+            .par_iter()
+            .step_by(step)
+            .enumerate()
+            .map(|(at, query)| {
+                let mut random = Random(99 + at as u64);
+                let query: Vec<f32> = query.iter().map(|v| v + 0.05 * random.unit()).collect();
+                let mut exact: Vec<(f32, u32)> = vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(row, v)| (distance(metric, &query, v), row as u32 * 2))
+                    .collect();
+                exact.select_nth_unstable_by(9, |a, b| a.0.total_cmp(&b.0));
+                let shortlist = index.shortlist(&query, count, None, &[], &in_row_order);
+                assert_eq!(shortlist.len(), count.min(vectors.len()));
+                exact[..10]
+                    .iter()
+                    .filter(|(_, row)| shortlist.contains(row))
+                    .count()
+            })
+            .sum();
+        found as f64 / (queries.len().div_ceil(step) * 10) as f64
     }
 
     /// Noise drawn independently along each axis is the one case where
