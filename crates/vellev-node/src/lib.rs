@@ -13,8 +13,8 @@ use vellev_core::{CollectionName, Embedding, NodeId, Partition, TenantId};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
-    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, PartitionKey, Point, RestorePoint,
-    TenantKey, Versions, MAX_RESTORE_WINDOW,
+    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, ManifestRef, PartitionKey, Point,
+    RestorePoint, TenantKey, Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
@@ -357,6 +357,26 @@ impl Tenant {
         self.compact(window.saturating_add(grace)).await
     }
 
+    /// Put the tenant back as it stood at `head`, as
+    /// [`Writer::restore`] does, running to the end even if the caller
+    /// stops waiting.
+    async fn restored(
+        self: &Arc<Self>,
+        head: Option<ManifestRef>,
+        position: LogPosition,
+    ) -> Result<LogPosition> {
+        let tenant = self.clone();
+        tokio::spawn(async move {
+            tenant
+                .writer
+                .restore(head.as_ref(), position)
+                .await
+                .map_err(|error| tenant.closed(error))
+        })
+        .await
+        .map_err(|error| StorageError::Background(error.to_string()))?
+    }
+
     /// An error from something that leaves the writer open unless it says
     /// it is closed.
     fn closed(&self, error: StorageError) -> NodeError {
@@ -645,19 +665,9 @@ impl Node {
             .restore_point(&key(tenant), point, window)
             .await?
             .ok_or_else(|| NodeError::NoRestorePoint(tenant.clone()))?;
-        let restoring = {
-            let (opened, target) = (opened.clone(), target.clone());
-            tokio::spawn(async move {
-                opened
-                    .writer
-                    .restore(Some(&target.head), target.position)
-                    .await
-                    .map_err(|error| opened.closed(error))
-            })
-        };
-        let restored = restoring
-            .await
-            .map_err(|error| StorageError::Background(error.to_string()))??;
+        let restored = opened
+            .restored(Some(target.head.clone()), target.position)
+            .await?;
         tracing::info!(%tenant, from = ?target.position, at = %target.at, ?restored, "restored");
         Ok((target, restored))
     }

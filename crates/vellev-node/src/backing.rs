@@ -3,15 +3,17 @@
 //!
 //! One node at a time backs a tenant up or restores it from a backup, by a
 //! claim in the coordinator, so that pruning never deletes a file another
-//! backup is copying. The daily backups need no node to hold the tenant,
-//! so tenants nobody has used for a while are backed up as well.
+//! backup is copying. Each runs to its end once begun, whoever stops
+//! waiting, and lets its claim go. The daily backups need no node to hold
+//! the tenant, so tenants nobody has used for a while are backed up too.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use uuid::Uuid;
 use vellev_core::TenantId;
 use vellev_storage::backups::{Backup, Backups};
-use vellev_storage::coordinator::{LogPosition, PartitionKey};
+use vellev_storage::coordinator::{LogPosition, ManifestRef, PartitionKey};
 use vellev_storage::StorageError;
 
 use crate::{key, Inner, Node, NodeError, Result};
@@ -23,6 +25,9 @@ const HOLD: Duration = Duration::from_secs(6 * 60 * 60);
 const LOOKED_FOR_EVERY: Duration = Duration::from_secs(10 * 60);
 /// How many tenants are looked through at a time.
 const PAGE: usize = 256;
+/// How many times a restore starts again when cleaning up deletes a file
+/// it needs from the store before it is read.
+const ATTEMPTS: usize = 3;
 
 impl Node {
     /// Back `tenant` up now, whenever it was last backed up.
@@ -31,8 +36,9 @@ impl Node {
         if self.0.coordinator.committed(&key(tenant)).await?.is_none() {
             return Err(NodeError::UnknownTenant(tenant.clone()));
         }
-        let claim = self.0.claim(tenant, None).await?;
-        self.0.backed_up(&backups, tenant, claim).await
+        let claim = self.0.claim(tenant).await?;
+        let (inner, tenant) = (self.0.clone(), tenant.clone());
+        finished(async move { inner.backed_up(&backups, &tenant, claim).await }).await
     }
 
     /// The backups of `tenant` there are, oldest first.
@@ -51,56 +57,78 @@ impl Node {
         id: Uuid,
     ) -> Result<(Backup, LogPosition)> {
         let backups = self.0.backups()?;
-        let backup = backups
+        backups
             .find(tenant, id)
             .await?
             .ok_or_else(|| NodeError::UnknownBackup(tenant.clone(), id))?;
-        let coordinator = &self.0.coordinator;
-        if coordinator.committed(&key(tenant)).await?.is_none() {
-            coordinator.register(&key(tenant)).await?;
-            coordinator
-                .set_restore_window(tenant, backup.restore_window)
-                .await?;
-            for kept in &backup.keys {
-                coordinator.issue_key(tenant, kept.id, &kept.hash).await?;
-            }
-        }
-        let claim = self.0.claim(tenant, None).await?;
-        let restored = self.restored_from(&backups, tenant, &backup).await;
-        coordinator.release_backup(tenant, claim, false).await?;
-        restored.map(|restored| (backup, restored))
+        self.0.coordinator.register(&key(tenant)).await?;
+        let claim = self.0.claim(tenant).await?;
+        let (node, tenant) = (self.clone(), tenant.clone());
+        finished(async move {
+            let restored = node.restored_from(&backups, &tenant, id).await;
+            node.0.let_go(&tenant, claim, true).await;
+            restored
+        })
+        .await
     }
 
+    /// The restore of [`Self::restore_backup`], under its claim. A tenant
+    /// that never had a commit, as one just made has not, takes the keys
+    /// and window the backup kept, any it lacks, so that a restore that
+    /// failed part way can be asked for again.
     async fn restored_from(
         &self,
         backups: &Backups,
         tenant: &TenantId,
-        backup: &Backup,
-    ) -> Result<LogPosition> {
+        id: Uuid,
+    ) -> Result<(Backup, LogPosition)> {
+        let backup = backups
+            .find(tenant, id)
+            .await?
+            .ok_or_else(|| NodeError::UnknownBackup(tenant.clone(), id))?;
         let taken = backup
             .partitions
             .iter()
             .find(|taken| taken.key(tenant) == key(tenant))
-            .ok_or_else(|| NodeError::UnknownBackup(tenant.clone(), backup.id))?;
-        let copied = backups.fetch_back(&self.0.blobs, backup).await?;
+            .ok_or_else(|| StorageError::Corrupt {
+                key: id.to_string(),
+                reason: format!("backup {id} holds nothing of tenant {tenant}"),
+            })?;
+        let coordinator = &self.0.coordinator;
+        let fresh = coordinator
+            .committed(&key(tenant))
+            .await?
+            .is_some_and(|committed| committed.manifest.is_none());
+        if fresh {
+            coordinator
+                .set_restore_window(tenant, backup.restore_window)
+                .await?;
+            let held = coordinator.keys(tenant).await?;
+            let missing = backup
+                .keys
+                .iter()
+                .filter(|kept| held.iter().all(|key| key.id != kept.id));
+            for kept in missing {
+                coordinator.issue_key(tenant, kept.id, &kept.hash).await?;
+            }
+        }
         let opened = self.tenant(tenant).await?;
-        let restoring = {
-            let (opened, head) = (opened.clone(), taken.head.clone());
-            let position = taken.position;
-            tokio::spawn(async move {
-                let head = head.map(vellev_storage::coordinator::ManifestRef);
-                opened
-                    .writer
-                    .restore(head.as_ref(), position)
-                    .await
-                    .map_err(|error| opened.closed(error))
-            })
-        };
-        let restored = restoring
-            .await
-            .map_err(|error| StorageError::Background(error.to_string()))??;
-        tracing::info!(%tenant, backup = %backup.id, copied, ?restored, "restored from a backup");
-        Ok(restored)
+        let head = taken.head.clone().map(ManifestRef);
+        let mut attempt = 1;
+        loop {
+            let copied = backups.fetch_back(&self.0.blobs, &backup).await?;
+            match opened.restored(head.clone(), taken.position).await {
+                Err(NodeError::Storage(StorageError::Missing { key })) if attempt < ATTEMPTS => {
+                    tracing::info!(%tenant, key, "a file went before it was restored; again");
+                    attempt += 1;
+                }
+                restored => {
+                    let restored = restored?;
+                    tracing::info!(%tenant, backup = %id, copied, ?restored, "restored from a backup");
+                    return Ok((backup, restored));
+                }
+            }
+        }
     }
 
     /// Back up each tenant whose last backup is as old as the node backs
@@ -110,22 +138,24 @@ impl Node {
     }
 
     /// Back up every tenant due a backup, now and then, for as long as the
-    /// node runs. Does nothing without a backup store.
+    /// node runs, starting a while after it does so that nodes started
+    /// together look at different times. Does nothing without a backup
+    /// store.
     pub fn backing_up(&self) {
         if self.0.settings.backups.is_none() {
             return;
         }
-        let inner = std::sync::Arc::downgrade(&self.0);
+        let inner = Arc::downgrade(&self.0);
+        let first = LOOKED_FOR_EVERY.mul_f64(f64::from(Uuid::new_v4().as_u128() as u16) / 65_536.0);
         tokio::spawn(async move {
+            tokio::time::sleep(first).await;
             loop {
-                tokio::time::sleep(LOOKED_FOR_EVERY).await;
-                let Some(inner) = inner.upgrade() else { return };
-                if inner.opened().stopped {
-                    return;
-                }
-                if let Err(error) = inner.back_up_due().await {
+                let Some(node) = inner.upgrade() else { return };
+                if let Err(error) = node.back_up_due().await {
                     tracing::warn!(%error, "could not look for tenants to back up");
                 }
+                drop(node);
+                tokio::time::sleep(LOOKED_FOR_EVERY).await;
             }
         });
     }
@@ -146,16 +176,18 @@ impl Inner {
         loop {
             let page = self.coordinator.partitions(after.as_ref(), PAGE).await?;
             for key in &page {
+                if self.opened().stopped {
+                    return Ok(());
+                }
                 let due = Some(self.settings.backup_every);
-                let Some(claim) = self
-                    .coordinator
-                    .claim_backup(&key.tenant, due, HOLD)
-                    .await?
-                else {
-                    continue;
-                };
-                if let Err(error) = self.backed_up(&backups, &key.tenant, claim).await {
-                    tracing::warn!(tenant = %key.tenant, %error, "backup failed");
+                match self.coordinator.claim_backup(&key.tenant, due, HOLD).await {
+                    Ok(Some(claim)) => {
+                        if let Err(error) = self.backed_up(&backups, &key.tenant, claim).await {
+                            tracing::warn!(tenant = %key.tenant, %error, "backup failed");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(tenant = %key.tenant, %error, "could not claim"),
                 }
             }
             match page.last() {
@@ -165,41 +197,67 @@ impl Inner {
         }
     }
 
-    async fn claim(&self, tenant: &TenantId, due: Option<Duration>) -> Result<Uuid> {
+    async fn claim(&self, tenant: &TenantId) -> Result<Uuid> {
         self.coordinator
-            .claim_backup(tenant, due, HOLD)
+            .claim_backup(tenant, None, HOLD)
             .await?
             .ok_or_else(|| NodeError::BackingUp(tenant.clone()))
     }
 
-    /// Back `tenant` up under `claim`, prune its backups, and let the claim
-    /// go. A tenant removed while it was copied has its backups purged,
-    /// so that nothing of it outlives it.
-    async fn backed_up(&self, backups: &Backups, tenant: &TenantId, claim: Uuid) -> Result<Backup> {
-        let made = async {
-            let partitions = [key(tenant)];
-            let backup = backups
-                .take(&self.blobs, self.coordinator.as_ref(), tenant, &partitions)
-                .await?;
-            let now = self.coordinator.committed(&key(tenant)).await?;
-            let same = now.is_some_and(|now| {
-                backup
-                    .partitions
-                    .iter()
-                    .all(|taken| taken.incarnation == now.incarnation)
-            });
-            if !same {
-                backups.purge(tenant).await?;
-                return Err(NodeError::UnknownTenant(tenant.clone()));
-            }
-            let pruned = backups.prune(tenant, self.settings.backups_kept).await?;
-            tracing::info!(%tenant, backup = %backup.id, pruned, "backed up");
-            Ok(backup)
+    /// Let `claim` go, noting a backup made now if `made`. A claim that
+    /// cannot be let go runs out by itself.
+    async fn let_go(&self, tenant: &TenantId, claim: Uuid, made: bool) {
+        if let Err(error) = self.coordinator.release_backup(tenant, claim, made).await {
+            tracing::warn!(%tenant, %error, "a backup claim was left to run out");
         }
-        .await;
-        self.coordinator
-            .release_backup(tenant, claim, made.is_ok())
-            .await?;
+    }
+
+    /// Back `tenant` up under `claim`, prune its backups, and let the claim
+    /// go.
+    async fn backed_up(&self, backups: &Backups, tenant: &TenantId, claim: Uuid) -> Result<Backup> {
+        let partitions = [key(tenant)];
+        let taken = backups
+            .take(&self.blobs, self.coordinator.as_ref(), tenant, &partitions)
+            .await;
+        let made = match taken {
+            Ok(backup) => self.kept(backups, tenant, backup).await,
+            Err(error) => Err(error.into()),
+        };
+        self.let_go(tenant, claim, made.is_ok()).await;
         made
     }
+
+    /// `backup`, if its tenant is still the one it took, with the tenant's
+    /// backups pruned. One of a tenant removed while it was copied is
+    /// forgotten again; the rest of what is kept of the tenant goes when it
+    /// is purged.
+    async fn kept(&self, backups: &Backups, tenant: &TenantId, backup: Backup) -> Result<Backup> {
+        let now = self.coordinator.committed(&key(tenant)).await?;
+        let same = now.is_some_and(|now| {
+            backup
+                .partitions
+                .iter()
+                .all(|taken| taken.incarnation == now.incarnation)
+        });
+        if !same {
+            backups.forget(&backup).await?;
+            return Err(NodeError::UnknownTenant(tenant.clone()));
+        }
+        match backups.prune(tenant, self.settings.backups_kept).await {
+            Ok(pruned) => tracing::info!(%tenant, backup = %backup.id, pruned, "backed up"),
+            Err(error) => {
+                tracing::warn!(%tenant, backup = %backup.id, %error, "backed up; pruning failed")
+            }
+        }
+        Ok(backup)
+    }
+}
+
+/// Run `work` to its end on a task of its own, whoever stops waiting.
+async fn finished<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    tokio::spawn(work)
+        .await
+        .map_err(|error| StorageError::Background(error.to_string()))?
 }

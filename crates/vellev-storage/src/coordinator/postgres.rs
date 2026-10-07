@@ -697,9 +697,12 @@ impl Coordinator for PostgresCoordinator {
             "UPDATE vellev.partitions
              SET backup_claim = $2, backup_claimed_until = now() + make_interval(secs => $4)
              WHERE tenant = $1
-               AND (backup_claimed_until IS NULL OR backup_claimed_until < now())
-               AND ($3::float8 IS NULL OR backed_up_at IS NULL
-                    OR backed_up_at <= now() - make_interval(secs => $3))",
+               AND NOT EXISTS (
+                   SELECT 1 FROM vellev.partitions
+                   WHERE tenant = $1
+                     AND NOT ((backup_claimed_until IS NULL OR backup_claimed_until < now())
+                              AND ($3::float8 IS NULL OR backed_up_at IS NULL
+                                   OR backed_up_at <= now() - make_interval(secs => $3))))",
         )
         .bind(tenant.as_str())
         .bind(claim)

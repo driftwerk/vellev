@@ -1,13 +1,18 @@
 //! Copies of tenants in a second store, from which a tenant is put back as
 //! it was when copied: in its own cluster, or in another that has lost it.
 //!
-//! Every file of a tenant is copied once, under `{tenant}/files/`, and each
-//! backup lists the ones it needs. Files never change, so a backup costs
-//! what changed since the one before. A backup is a record under
-//! `{tenant}/backups/`, written as pending before any file is copied, so
-//! that pruning, which keeps every file any record lists, leaves them be,
-//! and then as complete. All of a tenant lies under its own prefix, in one
-//! bucket however many tenants there are.
+//! Every file of a tenant is copied once, under `_backups/{tenant}/files/`,
+//! and each backup lists the ones it needs. Files never change, so a backup
+//! costs what changed since the one before. A backup is a record under
+//! `_backups/{tenant}/backups/`, written as pending before any file is
+//! copied, so that pruning, which keeps every file any record lists, leaves
+//! them be, and then as complete once every file it lists is there. All of
+//! a tenant lies under its own prefix, in one bucket however many tenants
+//! there are; no tenant's own files could lie under `_backups/`, so that
+//! even a store given as both deletes none of them.
+//!
+//! A record is trusted only so far: one naming another tenant, or a file
+//! outside the partition it names, is not restored from.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vellev_core::{Partition as PartitionNumber, TenantId};
 
-use crate::blobs::Blobs;
+use crate::blobs::{is_plain, Blobs, Layout};
 use crate::coordinator::{Coordinator, Incarnation, LogPosition, PartitionKey, TenantKey};
 use crate::partition::Partition;
 use crate::{Result, StorageError};
@@ -29,8 +34,8 @@ use crate::{Result, StorageError};
 /// while it copies, as cleaning up does to what a newer head no longer
 /// needs; the files of the head it then reads are never deleted.
 const ATTEMPTS: usize = 3;
-/// How many files are copied at once.
-const COPIED_AT_ONCE: usize = 8;
+/// How many files are copied or read at once.
+const AT_ONCE: usize = 8;
 /// How long a pending record is kept: longer than any backup takes.
 const PENDING_KEPT: Duration = Duration::from_secs(24 * 60 * 60);
 const COMPLETE: &str = ".backup.json";
@@ -53,6 +58,13 @@ impl Backup {
     /// The files every partition it took is loaded from.
     pub fn files(&self) -> impl Iterator<Item = &String> {
         self.partitions.iter().flat_map(|taken| &taken.files)
+    }
+
+    /// Where the tenant's first partition was when it was taken.
+    pub fn position(&self) -> LogPosition {
+        self.partitions
+            .first()
+            .map_or(LogPosition::default(), |taken| taken.position)
     }
 }
 
@@ -87,6 +99,7 @@ impl Backups {
     }
 
     /// Copy `partitions` of `tenant`, as committed now, out of `primary`.
+    /// Nothing else may back the tenant up or prune its backups meanwhile.
     pub async fn take(
         &self,
         primary: &Arc<dyn Blobs>,
@@ -96,31 +109,41 @@ impl Backups {
     ) -> Result<Backup> {
         let mut attempt = 1;
         loop {
-            let backup = taken(primary, coordinator, tenant, partitions).await?;
-            let pending = record(&backup, PENDING);
-            self.store.put(&pending, encoded(&backup)?).await?;
-            let copied = self.copied(primary, &backup).await;
-            let done = match copied {
-                Ok(()) => {
-                    self.store
-                        .put(&record(&backup, COMPLETE), encoded(&backup)?)
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            self.store.delete(&pending).await?;
-            match done {
-                Ok(()) => return Ok(backup),
+            match self.attempt(primary, coordinator, tenant, partitions).await {
                 Err(StorageError::Missing { key }) if attempt < ATTEMPTS => {
                     tracing::info!(%tenant, key, "a file went while it was copied; starting again");
                     attempt += 1;
                 }
-                Err(error) => return Err(error),
+                taken => return taken,
             }
         }
     }
 
-    /// Copy the files of `backup` not yet in the store.
+    async fn attempt(
+        &self,
+        primary: &Arc<dyn Blobs>,
+        coordinator: &dyn Coordinator,
+        tenant: &TenantId,
+        partitions: &[PartitionKey],
+    ) -> Result<Backup> {
+        let backup = taken(primary, coordinator, tenant, partitions).await?;
+        let pending = record(&backup, PENDING);
+        self.store.put(&pending, encoded(&backup)?).await?;
+        let completed = async {
+            self.copied(primary, &backup).await?;
+            self.store
+                .put(&record(&backup, COMPLETE), encoded(&backup)?)
+                .await
+        }
+        .await;
+        if let Err(error) = self.store.delete(&pending).await {
+            tracing::warn!(%tenant, key = pending, %error, "a pending backup record was left");
+        }
+        completed.map(|()| backup)
+    }
+
+    /// Copy the files of `backup` not yet in the store, and make sure that
+    /// every one it lists is there.
     async fn copied(&self, primary: &Arc<dyn Blobs>, backup: &Backup) -> Result<()> {
         let prefix = &files(&backup.tenant);
         let held = self.keys(prefix).await?;
@@ -133,18 +156,27 @@ impl Backups {
             .into_iter()
             .map(|(key, copied)| copy(primary.as_ref(), key, self.store.as_ref(), copied));
         stream::iter(copies)
-            .buffer_unordered(COPIED_AT_ONCE)
-            .try_collect()
-            .await
+            .buffer_unordered(AT_ONCE)
+            .try_collect::<()>()
+            .await?;
+        let held = self.keys(prefix).await?;
+        match backup
+            .files()
+            .find(|key| !held.contains(&format!("{prefix}{key}")))
+        {
+            Some(key) => Err(StorageError::Missing {
+                key: format!("{prefix}{key}"),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// The complete backups of `tenant`, oldest first.
     pub async fn list(&self, tenant: &TenantId) -> Result<Vec<Backup>> {
         Ok(self
-            .records(tenant)
+            .records(tenant, COMPLETE)
             .await?
             .into_iter()
-            .filter(|(key, _)| key.ends_with(COMPLETE))
             .map(|(_, backup)| backup)
             .collect())
     }
@@ -158,17 +190,23 @@ impl Backups {
             .find(|backup| backup.id == id))
     }
 
-    /// Every record of `tenant`'s backups, by key, oldest first.
-    async fn records(&self, tenant: &TenantId) -> Result<Vec<(String, Backup)>> {
+    /// The records of `tenant`'s backups whose keys end in `ending`, by
+    /// key, oldest first. One that went meanwhile, cannot be read, or names
+    /// another tenant is passed over.
+    async fn records(&self, tenant: &TenantId, ending: &str) -> Result<Vec<(String, Backup)>> {
         let listed = self.store.list(&records(tenant)).await?;
         let reads = listed
             .into_iter()
-            .map(|listed| read(self.store.as_ref(), listed.key));
-        let mut records: Vec<(String, Backup)> = stream::iter(reads)
-            .buffer_unordered(COPIED_AT_ONCE)
+            .filter(|listed| listed.key.ends_with(ending))
+            .map(|listed| read(self.store.as_ref(), listed.key, tenant));
+        let read: Vec<Option<(String, Backup)>> = stream::iter(reads)
+            .buffer_unordered(AT_ONCE)
             .try_collect()
             .await?;
-        records.sort_by_key(|(_, backup)| backup.taken_at);
+        let mut records: Vec<(String, Backup)> = read.into_iter().flatten().collect();
+        records.sort_by(|(key, backup), (other, than)| {
+            (backup.taken_at, key).cmp(&(than.taken_at, other))
+        });
         Ok(records)
     }
 
@@ -184,7 +222,7 @@ impl Backups {
                 .and_then(|kept| now.checked_sub_signed(kept))
         };
         let (complete, pending): (Vec<_>, Vec<_>) = self
-            .records(tenant)
+            .records(tenant, ".json")
             .await?
             .into_iter()
             .partition(|(key, _)| key.ends_with(COMPLETE));
@@ -222,7 +260,17 @@ impl Backups {
         let prefix = &files(&backup.tenant);
         let mut held = HashSet::new();
         for taken in &backup.partitions {
-            let layout = crate::blobs::Layout(&taken.key(&backup.tenant)).prefix();
+            let layout = Layout(&taken.key(&backup.tenant)).prefix();
+            if let Some(stray) = taken
+                .files
+                .iter()
+                .find(|key| !(is_plain(key) && key.starts_with(&layout)))
+            {
+                return Err(StorageError::corrupt(
+                    stray,
+                    format!("backup {} lists it, outside {layout}", backup.id),
+                ));
+            }
             held.extend(
                 primary
                     .list(&layout)
@@ -241,15 +289,20 @@ impl Backups {
             .into_iter()
             .map(|(kept, key)| copy(self.store.as_ref(), kept, primary.as_ref(), key));
         stream::iter(copies)
-            .buffer_unordered(COPIED_AT_ONCE)
+            .buffer_unordered(AT_ONCE)
             .try_collect::<()>()
             .await?;
         Ok(copied)
     }
 
+    /// Forget `backup`; the files it alone listed go at the next prune.
+    pub async fn forget(&self, backup: &Backup) -> Result<()> {
+        self.store.delete(&record(backup, COMPLETE)).await
+    }
+
     /// Delete everything kept of `tenant`. Returns how many files went.
     pub async fn purge(&self, tenant: &TenantId) -> Result<usize> {
-        let listed = self.store.list(&format!("{tenant}/")).await?;
+        let listed = self.store.list(&kept(tenant)).await?;
         for file in &listed {
             self.store.delete(&file.key).await?;
         }
@@ -302,19 +355,41 @@ async fn copy(from: &dyn Blobs, key: String, to: &dyn Blobs, copied: String) -> 
     to.put(&copied, from.get(&key).await?).await
 }
 
-async fn read(store: &dyn Blobs, key: String) -> Result<(String, Backup)> {
-    let bytes = store.get(&key).await?;
-    let backup = serde_json::from_slice(&bytes)
-        .map_err(|error| StorageError::corrupt(&key, error.to_string()))?;
-    Ok((key, backup))
+/// The record under `key`, if it is one of `tenant`'s.
+async fn read(
+    store: &dyn Blobs,
+    key: String,
+    tenant: &TenantId,
+) -> Result<Option<(String, Backup)>> {
+    let bytes = match store.get(&key).await {
+        Ok(bytes) => bytes,
+        Err(StorageError::Missing { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match serde_json::from_slice::<Backup>(&bytes) {
+        Ok(backup) if &backup.tenant == tenant => Ok(Some((key, backup))),
+        Ok(backup) => {
+            tracing::warn!(key, named = %backup.tenant, "a backup record names another tenant");
+            Ok(None)
+        }
+        Err(error) => {
+            tracing::warn!(key, %error, "a backup record cannot be read");
+            Ok(None)
+        }
+    }
+}
+
+/// Where everything of `tenant` is kept.
+fn kept(tenant: &TenantId) -> String {
+    format!("_backups/{tenant}/")
 }
 
 fn files(tenant: &TenantId) -> String {
-    format!("{tenant}/files/")
+    format!("{}files/", kept(tenant))
 }
 
 fn records(tenant: &TenantId) -> String {
-    format!("{tenant}/backups/")
+    format!("{}backups/", kept(tenant))
 }
 
 fn record(backup: &Backup, suffix: &str) -> String {

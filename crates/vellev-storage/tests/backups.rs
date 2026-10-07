@@ -95,7 +95,7 @@ async fn each_file_is_copied_once_whatever_the_backups_that_need_it() {
     let backups = Backups::new(store.clone());
     let writer = written(&cluster).await;
     let first = take(&backups, &cluster).await;
-    let files = format!("{}/files/", cluster.key.tenant);
+    let files = format!("_backups/{}/files/", cluster.key.tenant);
     let after_first = keys(&store, &files).await;
     assert_eq!(after_first.len(), first.partitions[0].files.len());
 
@@ -139,7 +139,7 @@ async fn pruning_keeps_the_newest_and_every_file_a_kept_backup_lists() {
         backups.list(tenant).await.unwrap(),
         std::slice::from_ref(&second)
     );
-    let files = format!("{tenant}/files/");
+    let files = format!("_backups/{tenant}/files/");
     let left = keys(&store, &files).await;
     let wanted: BTreeSet<String> = second.partitions[0]
         .files
@@ -200,7 +200,11 @@ async fn a_backup_starts_again_when_a_file_goes_while_it_copies() {
     let backups = Backups::new(store.clone());
     let backup = take(&backups, &vanishing).await;
     assert_eq!(backups.list(&vanishing.key.tenant).await.unwrap(), [backup]);
-    let records = keys(&store, &format!("{}/backups/", vanishing.key.tenant)).await;
+    let records = keys(
+        &store,
+        &format!("_backups/{}/backups/", vanishing.key.tenant),
+    )
+    .await;
     assert_eq!(records.len(), 1, "no pending record is left: {records:?}");
 }
 
@@ -267,7 +271,7 @@ async fn pruning_leaves_a_backup_under_way_and_its_files_alone() {
     let writer = written(&cluster).await;
     let under_way = take(&backups, &cluster).await;
     let tenant = &cluster.key.tenant;
-    let records = format!("{tenant}/backups/");
+    let records = format!("_backups/{tenant}/backups/");
     let complete = keys(&store, &records).await.pop_first().unwrap();
     let pending = complete.replace(".backup.json", ".pending.json");
     store
@@ -282,8 +286,91 @@ async fn pruning_leaves_a_backup_under_way_and_its_files_alone() {
     take(&backups, &cluster).await;
     backups.prune(tenant, Duration::ZERO).await.unwrap();
     assert!(keys(&store, &records).await.contains(&pending));
-    let files = keys(&store, &format!("{tenant}/files/")).await;
+    let files = keys(&store, &format!("_backups/{tenant}/files/")).await;
     assert!(under_way
         .files()
-        .all(|key| files.contains(&format!("{tenant}/files/{key}"))));
+        .all(|key| files.contains(&format!("_backups/{tenant}/files/{key}"))));
+}
+
+#[tokio::test]
+async fn records_unreadable_or_of_another_tenant_are_passed_over() {
+    let cluster = Cluster::new().await;
+    let store = memory();
+    let backups = Backups::new(store.clone());
+    written(&cluster).await;
+    let backup = take(&backups, &cluster).await;
+    let tenant = &cluster.key.tenant;
+    let records = format!("_backups/{tenant}/backups/");
+    store
+        .put(&format!("{records}0-broken.backup.json"), Bytes::from("{"))
+        .await
+        .unwrap();
+    let mut another = serde_json::to_value(&backup).unwrap();
+    another["tenant"] = json!("beta");
+    another["id"] = json!(uuid::Uuid::new_v4());
+    store
+        .put(
+            &format!("{records}1-another.backup.json"),
+            Bytes::from(serde_json::to_vec(&another).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        backups.list(tenant).await.unwrap(),
+        std::slice::from_ref(&backup)
+    );
+}
+
+#[tokio::test]
+async fn a_backup_listing_a_file_outside_its_partition_is_not_restored() {
+    let cluster = Cluster::new().await;
+    let backups = Backups::new(memory());
+    written(&cluster).await;
+    let mut backup = take(&backups, &cluster).await;
+    backup.partitions[0]
+        .files
+        .push("beta/0/segment/stray.segment".into());
+    let refused = backups.fetch_back(&memory(), &backup).await.unwrap_err();
+    assert!(matches!(refused, StorageError::Corrupt { .. }), "{refused}");
+}
+
+/// A store that loses the first file written to it, as if a prune had
+/// deleted it under a backup whose claim ran out.
+#[derive(Debug)]
+struct Losing {
+    inner: Arc<dyn Blobs>,
+    lost: AtomicBool,
+}
+
+#[async_trait]
+impl Blobs for Losing {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if key.contains("/files/") && !self.lost.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_backup_is_complete_only_once_every_file_it_lists_is_there() {
+    let cluster = Cluster::new().await;
+    let store = memory();
+    let backups = Backups::new(Arc::new(Losing {
+        inner: store.clone(),
+        lost: AtomicBool::new(false),
+    }));
+    written(&cluster).await;
+    let backup = take(&backups, &cluster).await;
+    let files = keys(&store, &format!("_backups/{}/files/", cluster.key.tenant)).await;
+    assert_eq!(files.len(), backup.partitions[0].files.len());
 }

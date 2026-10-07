@@ -437,13 +437,9 @@ pub async fn restore(
         RestoreTo::Position(position) => Point::Position(LogPosition(position)),
         RestoreTo::Backup(id) => {
             let (backup, position) = node.restore_backup(&tenant, id).await?;
-            let taken = backup
-                .partitions
-                .first()
-                .map_or(0, |taken| taken.position.0);
             return Ok(Json(Restored {
                 from: RestorePoint {
-                    position: taken,
+                    position: backup.position().0,
                     at: backup.taken_at,
                 },
                 position: position.0,
@@ -495,10 +491,7 @@ fn kept(backup: vellev_storage::backups::Backup) -> Backup {
     Backup {
         id: backup.id,
         taken_at: backup.taken_at,
-        position: backup
-            .partitions
-            .first()
-            .map_or(0, |taken| taken.position.0),
+        position: backup.position().0,
         files: backup.files().count(),
     }
 }

@@ -127,3 +127,42 @@ async fn backups_need_a_store_a_tenant_and_a_backup_that_exists() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn a_lost_tenant_whose_restore_failed_is_restored_when_asked_again() {
+    let store = memory();
+    let lost = Cluster::new().serve_backing_up_to(store.clone()).await;
+    lost.with_notes(supplied()).await;
+    lost.ok(Method::PUT, &object(1), Some(titled(1))).await;
+    let issued = lost.ok(Method::POST, "/v1/tenants/acme/keys", None).await;
+    let backup = lost.ok(Method::POST, BACKUPS, None).await;
+    let files = store.list("_backups/acme/files/").await.unwrap();
+    let hidden = files.first().unwrap();
+    let kept = store.get(&hidden.key).await.unwrap();
+    store.delete(&hidden.key).await.unwrap();
+
+    let fresh = Cluster::new().serve_backing_up_to(store.clone()).await;
+    let (status, _) = fresh.post(RESTORE, json!({ "backup": backup["id"] })).await;
+    assert!(status.is_server_error(), "{status}");
+    fresh.node.back_up_due().await.unwrap();
+    let listed = fresh.ok(Method::GET, BACKUPS, None).await;
+    assert_eq!(
+        listed["backups"],
+        json!([backup.clone()]),
+        "no backup of the empty tenant is taken in the meantime"
+    );
+
+    store.put(&hidden.key, kept).await.unwrap();
+    fresh
+        .ok(
+            Method::POST,
+            RESTORE,
+            Some(json!({ "backup": backup["id"] })),
+        )
+        .await;
+    assert_eq!(titles(&fresh).await, ["note 1"]);
+    let (status, _) = fresh
+        .call_as(issued["key"].as_str(), Method::GET, NOTES, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
