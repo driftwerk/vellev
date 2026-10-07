@@ -201,9 +201,11 @@ other tenant.
 When a collection's text cannot be embedded, `unavailable` (503) means it
 may work later, as when an embedding endpoint is down, overloaded or slow.
 `model_unavailable` (501) means this node cannot use the model until it or
-the collection is set up otherwise: the build cannot run it, the endpoint
-or Bedrock refuses the node's key or credentials or has no such model, or
-its vectors are not the collection's size. Sending the request again will
+the collection is set up otherwise: the build cannot run it, the node may
+not write `VELLEV_MODEL_DIR` to fetch it, the endpoint or Bedrock refuses
+the node's key or credentials or has no such model, or its vectors are not
+the collection's size. A node that cannot reach where a local model is
+fetched from answers `unavailable`, as a network that may come back. Sending the request again will
 not help; sending the vector with it will. The cause is in the node's log.
 A hybrid search that cannot embed its text ranks by the words alone either
 way, and says `degraded`.
