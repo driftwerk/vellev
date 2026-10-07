@@ -844,6 +844,35 @@ mod tests {
         }
     }
 
+    /// Vectors and queries at the length limit, leaning one way, so that
+    /// the centre is far out too, and facing every way about it: no
+    /// estimate is NaN or `-∞`, and only an L2 estimate is ever infinite.
+    #[test]
+    fn estimates_at_the_length_limit_are_never_nan_or_minus_infinity() {
+        let mut random = Random(31);
+        let lean = random.vector(64);
+        let mut at_limit = || {
+            let vector: Vec<f32> = lean.iter().map(|l| l + 0.5 * random.unit()).collect();
+            let scale = (0.99 * SQUARED_LENGTH_UNDER / dot(&vector, &vector)).sqrt();
+            vector.into_iter().map(|v| v * scale).collect::<Vec<f32>>()
+        };
+        let vectors: Vec<Vec<f32>> = (0..500).map(|_| at_limit()).collect();
+        let queries: Vec<Vec<f32>> = (0..20).map(|_| at_limit()).collect();
+        for metric in [Distance::Dot, Distance::L2] {
+            let index = indexed(metric, &vectors);
+            assert!(index.unmeasured(None, &[]).is_empty());
+            for query in queries.iter().chain(&vectors[..20]) {
+                for (estimate, _) in index.estimates(query, 500, None, &[], &in_row_order) {
+                    assert!(
+                        !estimate.is_nan() && estimate != f32::NEG_INFINITY,
+                        "{metric:?}"
+                    );
+                    assert!(estimate.is_finite() || metric == Distance::L2, "{metric:?}");
+                }
+            }
+        }
+    }
+
     /// A write sums a vector's squares one after another, the index in
     /// lanes: at the limit the two can fall either side of it, and every
     /// vector a write accepts must still be measured.
