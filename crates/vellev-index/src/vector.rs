@@ -450,7 +450,12 @@ const MEASURABLE_UNDER: f32 = SQUARED_LENGTH_UNDER * (1.0 + 1.0 / 16.0);
 /// longer than a collection accepts. Only a vector stored before lengths
 /// were limited can be longer.
 pub(crate) fn measurable(metric: Distance, vector: &[f32]) -> bool {
-    metric == Distance::Cosine || dot(vector, vector) < MEASURABLE_UNDER
+    metric == Distance::Cosine || short_enough(f64::from(dot(vector, vector)))
+}
+
+/// Whether a vector of this squared length can be measured.
+pub(crate) fn short_enough(squared: f64) -> bool {
+    squared < f64::from(MEASURABLE_UNDER)
 }
 
 /// Of `rows`, in ascending order, those in `only` when it is given and not

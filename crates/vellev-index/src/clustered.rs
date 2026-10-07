@@ -26,7 +26,7 @@ use vellev_core::Distance;
 use crate::rotation::{Random, Rotation};
 use crate::vector::{
     allowed, as_far_from_every_vector, dot, in_row_order, measurable, nearest, normalised,
-    or_farthest, squared_l2, Scorer, Ties, VectorIndex,
+    or_farthest, short_enough, squared_l2, Scorer, Ties, VectorIndex,
 };
 
 /// The share of the true nearest ten that the clusters scanned must hold,
@@ -95,30 +95,40 @@ struct Factor {
 
 impl Factor {
     /// What a row too long to measure is kept with: a distance from its
-    /// centroid that is not finite, which marks it as having no estimate.
-    /// A row an index built before lengths were limited could not measure
-    /// came out the same way, so reads the same.
+    /// centroid that is not finite.
     const UNMEASURED: Self = Self {
         norm: f32::INFINITY,
         align: 1.0,
         along: 0.0,
     };
 
-    fn measured(&self) -> bool {
-        self.norm.is_finite()
+    /// The squared length of the vector `o = c + r` this factor stands for
+    /// in a cluster whose centroid `c` has the squared length `centroid`:
+    /// `|c|² + 2 |r| (r̂ · c) + |r|²`, in `f64`, where no term overflows. It
+    /// is not finite for a row kept as [`Factor::UNMEASURED`].
+    fn squared(&self, centroid: f64) -> f64 {
+        let norm = f64::from(self.norm);
+        centroid + 2.0 * norm * f64::from(self.along) + norm * norm
     }
 }
 
-/// The rows of `clusters` with no estimate, in ascending order.
-fn unmeasured(clusters: &[Cluster]) -> Vec<u32> {
+/// The rows of `clusters`, whose centroids are `centroids`, `width` values
+/// each, that are too long to measure, in ascending order. Each row's
+/// squared length is worked out again from what is stored with it rather
+/// than read from a mark: an index built before rows too long to measure
+/// were set apart kept them as any other, often at a finite distance from
+/// a centroid of their own, and only their length tells them apart.
+fn unmeasured(clusters: &[Cluster], centroids: &[f32], width: usize) -> Vec<u32> {
     let mut rows: Vec<u32> = clusters
         .iter()
-        .flat_map(|members| {
+        .zip(centroids.chunks_exact(width))
+        .flat_map(|(members, centroid)| {
+            let centroid: f64 = centroid.iter().map(|v| f64::from(*v).powi(2)).sum();
             members
                 .rows
                 .iter()
                 .zip(&members.factors)
-                .filter(|(_, factor)| !factor.measured())
+                .filter(move |(_, factor)| !short_enough(factor.squared(centroid)))
                 .map(|(row, _)| *row)
         })
         .collect();
@@ -156,9 +166,9 @@ impl From<Wire> for ClusteredIndex {
         Self {
             metric: wire.metric,
             dimensions: wire.dimensions,
+            unmeasured: unmeasured(&wire.clusters, &wire.centroids, wire.rotation.width),
             rotation: wire.rotation,
             centroids: wire.centroids,
-            unmeasured: unmeasured(&wire.clusters),
             clusters: wire.clusters,
             rows,
             at,
@@ -568,9 +578,9 @@ impl ClusteredIndex {
         let mut index = Self {
             metric,
             dimensions,
+            unmeasured: unmeasured(&clusters, &centroids, width),
             rotation,
             centroids,
-            unmeasured: unmeasured(&clusters),
             clusters,
             rows: vectors.iter().map(|(row, _)| *row).collect(),
             at,
@@ -1107,6 +1117,26 @@ mod tests {
         assert_eq!(rows, [0, 2, 4, 6, 8]);
         let one = ClusteredIndex::build(Distance::Cosine, &[(3, &[0.0, 0.0])]).unwrap();
         assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[], &in_row_order), [3]);
+    }
+
+    /// An index built by the release before, which knew nothing of rows too
+    /// long to measure, gave thirty copies each of two such vectors codes
+    /// and finite distances from their centroids. Read back, they are
+    /// recognised from what was stored, and left to be scored exactly.
+    #[test]
+    fn an_index_built_before_rows_were_measured_recognises_them_on_load() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/clustered-main-legacy-rows.msgpack"
+        ));
+        let index: ClusteredIndex = rmp_serde::from_slice(bytes).unwrap();
+        assert_eq!(index.len(), 3060);
+        let long: Vec<u32> = (3000..3060u32).map(|row| row * 2).collect();
+        assert_eq!(index.unmeasured(None, &[]), long);
+        for query in grouped(31, 3000, 32, 10, 0.4).iter().step_by(300) {
+            let shortlist = index.shortlist(query, 100, None, &[], &in_row_order);
+            assert!(shortlist.iter().all(|row| *row < 6000));
+        }
     }
 
     /// Rows that cannot be measured shape nothing: the clusters, and how
