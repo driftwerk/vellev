@@ -91,11 +91,7 @@ impl State {
                 );
             }
         }
-        nearest(
-            &mut estimated,
-            budget.saturating_sub(floors),
-            |(a_at, a), (b_at, b)| layers[*a_at].id(*a).cmp(&layers[*b_at].id(*b)),
-        );
+        nearest_across(&layers, &mut estimated, budget.saturating_sub(floors));
         let estimated = estimated.into_iter().map(|(_, found)| found);
         let mut hits: Vec<Hit<'_>> = exact
             .into_iter()
@@ -110,6 +106,17 @@ impl State {
         hits.truncate(query.limit);
         Ok(hits)
     }
+}
+
+/// Keep in `estimated`, rows of `layers` by the layer they are in, the
+/// `count` with the nearest estimates, those of equal estimate in object
+/// id order, whatever layers they are in, as at every other cut: which
+/// rows are scored then depends on the rows alone, not on how they lie
+/// across layers.
+fn nearest_across(layers: &[Layer<'_>], estimated: &mut Vec<(f32, (usize, u32))>, count: usize) {
+    nearest(estimated, count, |(a_at, a), (b_at, b)| {
+        layers[*a_at].id(*a).cmp(&layers[*b_at].id(*b))
+    });
 }
 
 /// What a layer offers a query.
@@ -191,4 +198,52 @@ fn many_are_live<I: Iterator<Item = u32>>(
     let dead = layer.deaths as u64;
     allowed > threshold
         && (allowed - allowed.min(dead) > threshold || live().count() as u64 > threshold)
+}
+
+#[cfg(test)]
+mod tests {
+    use vellev_core::ObjectId;
+
+    use super::*;
+    use crate::format::Row;
+    use crate::state::Indexes;
+
+    fn rows(ids: &[u128]) -> Vec<Row> {
+        ids.iter()
+            .map(|id| Row {
+                collection: CollectionId(0),
+                object: Object {
+                    id: ObjectId(uuid::Uuid::from_u128(*id)),
+                    properties: Default::default(),
+                    vector: Some(vec![1.0]),
+                },
+            })
+            .collect()
+    }
+
+    /// Rows estimated alike in two layers are cut in object id order
+    /// across both, not layer by layer.
+    #[test]
+    fn ties_across_layers_are_cut_in_object_id_order() {
+        let (first, second) = (rows(&[30, 10]), rows(&[20, 5]));
+        let indexes = Indexes::new();
+        let layer = |rows| Layer {
+            rows,
+            dead: &[false, false],
+            deaths: 0,
+            indexes: &indexes,
+            vectors: None,
+        };
+        let layers = [layer(&first), layer(&second)];
+        let mut estimated: Vec<(f32, (usize, u32))> = [(0, 0), (0, 1), (1, 0), (1, 1)]
+            .map(|at| (1.0, at))
+            .to_vec();
+        nearest_across(&layers, &mut estimated, 2);
+        let mut kept: Vec<ObjectId> = estimated
+            .iter()
+            .map(|(_, (at, row))| layers[*at].id(*row))
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [5, 10].map(|id| ObjectId(uuid::Uuid::from_u128(id))));
+    }
 }

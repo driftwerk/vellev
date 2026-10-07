@@ -1146,8 +1146,12 @@ mod tests {
         let backwards = |a: u32, b: u32| b.cmp(&a);
         let mut nearest = Nearest::new(3, &backwards);
         for row in 0..10_000 {
+            let before = nearest.tied.len();
             nearest.offer(1.0, row);
-            assert!(nearest.tied.len() <= 6, "{} tied", nearest.tied.len());
+            let after = nearest.tied.len();
+            assert!(after <= 6, "{after} tied");
+            // Let go of all but the count at once, not one at a time.
+            assert!(before < 6 || after == 3, "{before} tied became {after}");
         }
         let mut rows: Vec<u32> = nearest
             .estimates()
@@ -1156,6 +1160,18 @@ mod tests {
             .collect();
         rows.sort_unstable();
         assert_eq!(rows, [9997, 9998, 9999]);
+    }
+
+    /// Rows tied with the farthest of the nearest are tied no longer once
+    /// a nearer row puts it out and the farthest left is nearer still: none
+    /// of them may then displace the rows that are kept.
+    #[test]
+    fn ties_with_a_farthest_that_is_put_out_are_let_go() {
+        let mut nearest = Nearest::new(1, &in_row_order);
+        nearest.offer(1.0, 5);
+        nearest.offer(1.0, 3);
+        nearest.offer(0.5, 9);
+        assert_eq!(nearest.estimates(), [(0.5, 9)]);
     }
 
     /// A row put out of the nearest by a nearer one, when the farthest left
