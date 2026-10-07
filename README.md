@@ -71,6 +71,16 @@ the least recently used are let go. `VELLEV_TENANT_QUERIES_PER_SECOND` and
 each node, not of the cluster; a tenant asking more is answered 429 with
 `Retry-After`, and the client waits as long and asks the same node again.
 
+A collection with an `access_rule` is read with a tenant's key only on
+behalf of a person: the caller sends an identity token in
+`x-vellev-identity`, a JWT signed with Ed25519 under a key id, naming the
+tenant, the person's `identity_id` and `teams`, and `exp`. Every read is then
+narrowed to the rows the person owns or that name one of their teams,
+whatever filter the caller adds; with no token nothing of the collection is
+read. Admin keys read everything. A node trusts the public keys in
+`VELLEV_IDENTITY_KEYS` (`KID=X`, X the key's 32 bytes in unpadded base64url),
+so a key is rotated by trusting the new one beside the old.
+
 `vellev serve --help` lists every setting. On SIGTERM a node reports not
 ready, keeps serving for `VELLEV_STOP_DELAY_SECS` (a few seconds on Docker
 Swarm; none is needed on ECS), finishes what is in flight within
