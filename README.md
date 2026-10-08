@@ -223,9 +223,8 @@ model as it is set up, and will not until someone puts that right. It is
 said only of what the node's own build and setup settle, or what serves
 the model says outright in its own code for it, and `reason` says which:
 
-- `build`: the node's build cannot run the model: it was built without
-  local models, or the collection was made by a release that knew a model
-  this one does not;
+- `build`: the node's release does not run the model: the collection was
+  made by a release that knew a model this one does not;
 - `setup`: the node may not write the directory local models are kept in,
   which is `HF_HOME` if that is set and `VELLEV_MODEL_DIR` otherwise; or
   an OpenAI endpoint answers `invalid_api_key`;
@@ -240,9 +239,13 @@ the model says outright in its own code for it, and `reason` says which:
 It never means the request is at fault or may be dropped. Keep it, and
 send it again once the node is put right; one that brings its own vector
 needs no model. A node that has met such a fault does not ask the model
-again for 20 seconds, nor log it again, so a setup put right takes effect
-within that; nothing reloads a node's settings while it runs, so most
-faults of setup are put right by starting the node again. Meanwhile
+again for 20 seconds, and logs it once in that time however many requests
+meet it, hybrid searches that fall back among them; so a setup put right
+takes effect within that. It cuts the other way too: something in front of
+an OpenAI endpoint that answers `model_not_found` or `invalid_api_key` for
+a moment, in OpenAI's own form, costs 20 seconds of `model_unavailable`.
+Nothing reloads a node's settings while it runs, so most faults of setup
+are put right by starting the node again. Meanwhile
 another node may be able to answer, and which node embeds depends on the
 request:
 
@@ -268,21 +271,22 @@ instead, and says `degraded`, with why in `degraded_by`: `unavailable` or
 `model_unavailable`, as it would have been refused. A Rust client of one
 address gives that answer as it comes. One of several, told
 `model_unavailable`, first asks each address it has not yet asked, once and
-at once and for no more than two seconds each, and gives the first answer
-ranked in full, or failing one the answer by the words.
+at once, and gives the first answer ranked in full, or failing one the
+answer by the words. Each is given `Options::better_within` to answer, two
+seconds unless set otherwise: a node that takes longer to embed a text
+does not get to better the answer, and none at all asks nobody. The
+address that answered in full is the one asked first from then on.
 
 A collection can only be made with a model this release runs: for a local
 model, one of those fastembed lists, at its own size; on Bedrock, Titan
 text embeddings v2 at 256, 512 or 1024 dimensions. Anything else is the
 request's fault, `invalid`, as is whatever else is wrong with the schema,
 which is said first; a release that knows more models may be running on
-another node during a rolling deploy, and answers for itself. A model the
-release runs and this node's build does not, for being built without local
-models, is refused with `model_unavailable`, `reason: build`, by the node
-that holds the tenant. Making again a collection that is there exactly so
-changes nothing, as ever, and one that is there otherwise is a `conflict`,
-whatever the model. What only using a model shows, such as an endpoint that
-refuses the node, is found at the first write.
+another node during a rolling deploy, and answers for itself. Making again
+a collection that is there exactly so changes nothing, as ever, and one
+that is there otherwise is a `conflict`, whatever the model. What only
+using a model shows, such as an endpoint that refuses the node, is found at
+the first write.
 
 A request is sent at most as many times as the client has tries
 (`Options::attempts`) and one less than it has addresses, each for no

@@ -471,11 +471,9 @@ async fn vellev_answers_as_weaviate_does() {
     let weaviate = Weaviate::load(&url, &corpus).await;
 
     let served = Served::new().await;
-    let options = Options {
-        timeout: Duration::from_secs(30),
-        batch_bytes: MAX_BODY / 2,
-        ..Options::default()
-    };
+    let options = Options::default()
+        .timeout(Duration::from_secs(30))
+        .batch_bytes(MAX_BODY / 2);
     let client = Client::connect(&[&served.url], KEY, options).unwrap();
     let tenant = client.tenant(&TenantId::new("differential").unwrap());
     tenant.create().await.unwrap();
@@ -484,10 +482,7 @@ async fn vellev_answers_as_weaviate_does() {
     memories.create(&schema).await.unwrap();
     memories
         .store_all(corpus.objects.iter().map(|(id, properties, vector)| {
-            let content = Content {
-                properties: properties.clone(),
-                vector: Some(vector.clone()),
-            };
+            let content = Content::new(properties.clone()).vector(vector.clone());
             (*id, content)
         }))
         .await
@@ -508,14 +503,8 @@ async fn vellev_answers_as_weaviate_does() {
         let filter = filter.as_ref();
         let mut found: [Vec<Agreement>; 4] = Default::default();
         for (text, vector) in &corpus.queries {
-            let nearest = Nearest {
-                vector: Some(vector.clone()),
-                text: None,
-                limit: LIMIT as u32,
-                filter: parsed.clone(),
-                oversample: None,
-                vectors: false,
-            };
+            let mut nearest = Nearest::to_vector(vector.clone(), LIMIT as u32);
+            nearest.filter = parsed.clone();
             let ours = ids(memories.nearest(&nearest).await.unwrap(), |found| {
                 found.certainty
             });
@@ -523,13 +512,8 @@ async fn vellev_answers_as_weaviate_does() {
             let theirs = weaviate.search(&argument, LIMIT, filter, "certainty").await;
             found[0].push(agreement(&ours, &theirs));
 
-            let keyword = Keyword {
-                text: text.clone(),
-                properties: Vec::new(),
-                limit: LIMIT as u32,
-                filter: parsed.clone(),
-                vectors: false,
-            };
+            let mut keyword = Keyword::new(text.clone(), LIMIT as u32);
+            keyword.filter = parsed.clone();
             let ours = ids(memories.keyword(&keyword).await.unwrap(), |found| {
                 found.keyword
             });
@@ -539,18 +523,11 @@ async fn vellev_answers_as_weaviate_does() {
             let ten = weaviate.search(&argument, LIMIT, filter, "score").await;
             found[2].push(agreement(&ours, &ten));
 
-            let hybrid = Hybrid {
-                text: text.clone(),
-                vector: Some(vector.clone()),
-                alpha: Some(ALPHA),
-                fusion: Fusion::RelativeScore,
-                properties: Vec::new(),
-                limit: LIMIT as u32,
-                candidates: None,
-                filter: parsed.clone(),
-                oversample: None,
-                vectors: false,
-            };
+            let mut hybrid = Hybrid::new(text.clone(), LIMIT as u32)
+                .vector(vector.clone())
+                .alpha(ALPHA)
+                .fusion(Fusion::RelativeScore);
+            hybrid.filter = parsed.clone();
             let ours = ids(memories.hybrid(&hybrid).await.unwrap(), |found| found.score);
             let argument = format!(
                 "hybrid: {{ query: {}, vector: {}, alpha: {ALPHA}, fusionType: relativeScoreFusion }}",

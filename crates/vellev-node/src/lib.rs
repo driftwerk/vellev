@@ -319,11 +319,11 @@ impl Tenant {
     /// that makes again a collection there exactly so changes nothing, as
     /// ever.
     ///
-    /// A model no build of this release runs is the request's fault. One
-    /// this build cannot run, though another may, is this node's: the
-    /// node that writes the tenant now, which another built otherwise may
-    /// do later and answer otherwise. Whatever only using the model would
-    /// show, such as an endpoint that refuses the node, is not looked for.
+    /// A model this release does not run is the request's fault. That is
+    /// this node's answer, the node that writes the tenant now: one of a
+    /// release that knows other models may do so later and answer
+    /// otherwise. Whatever only using the model would show, such as an
+    /// endpoint that refuses the node, is not looked for.
     fn can_embed(&self, mutations: &[Mutation]) -> Result<()> {
         let makes = |mutation: &Mutation| matches!(mutation, Mutation::CreateCollection(_));
         if !mutations.iter().any(makes) {
@@ -332,10 +332,13 @@ impl Tenant {
         self.writer
             .creates(mutations)
             .iter()
-            .try_for_each(|schema| match self.embedders.admits(&schema.embedding) {
-                Err(EmbedError::NoSuchModel(reason)) => Err(NodeError::NoSuchModel(reason)),
-                Err(error) if error.lasting().is_some() => Err(NodeError::Embed(error)),
-                _ => Ok(()),
+            .try_for_each(|schema| {
+                self.embedders
+                    .admits(&schema.embedding)
+                    .map_err(|refused| match refused {
+                        EmbedError::NoSuchModel(reason) => NodeError::NoSuchModel(reason),
+                        other => NodeError::Embed(other),
+                    })
             })
     }
 

@@ -225,31 +225,28 @@ impl<S: Send + Sync> FromRequestParts<S> for Fresh {
 }
 
 fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool) -> Stored {
-    Stored {
-        id: object.id,
-        properties: object.properties_json(),
-        vector: vector.filter(|_| vectors).map(<[f32]>::to_vec),
-    }
+    Stored::new(
+        object.id,
+        object.properties_json(),
+        vector.filter(|_| vectors).map(<[f32]>::to_vec),
+    )
 }
 
 fn written(receipt: Receipt) -> Written {
     use vellev_storage::Outcome as Did;
-    Written {
-        incarnation: receipt.incarnation.0,
-        position: receipt.position.0,
-        outcomes: receipt
-            .outcomes
-            .into_iter()
-            .map(|outcome| match outcome {
-                Did::Applied => Outcome::Applied,
-                Did::Unchanged => Outcome::Unchanged,
-                Did::Value(value) => Outcome::Value {
-                    value: value.to_json(),
-                },
-                Did::Deleted(count) => Outcome::Deleted { count },
-            })
-            .collect(),
-    }
+    let outcomes = receipt
+        .outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            Did::Applied => Outcome::Applied,
+            Did::Unchanged => Outcome::Unchanged,
+            Did::Value(value) => Outcome::Value {
+                value: value.to_json(),
+            },
+            Did::Deleted(count) => Outcome::Deleted { count },
+        })
+        .collect();
+    Written::new(receipt.incarnation.0, receipt.position.0, outcomes)
 }
 
 fn condition(only_if: Option<OnlyIf>) -> Option<Condition> {
@@ -395,7 +392,7 @@ pub async fn tenants(Shared(app): Shared<App>, Asked(page): Asked<TenantPage>) -
     let limit = app.limit(page.limit)?;
     let tenants = app.node()?.tenants(page.after.as_ref(), limit).await?;
     let next = tenants.last().filter(|_| tenants.len() == limit).cloned();
-    Ok(Json(Tenants { tenants, next }))
+    Ok(Json(Tenants::new(tenants, next)))
 }
 
 /// Creating a tenant that exists changes nothing.
@@ -433,11 +430,11 @@ pub async fn restore_points(
         ApiError::not_found(Missing::Tenant, format!("tenant {tenant} does not exist"))
     })?;
     let (earliest, latest) = points.unzip();
-    Ok(Json(RestorePoints {
-        window_secs: window.as_secs(),
-        earliest: earliest.map(described),
-        latest: latest.map(described),
-    }))
+    Ok(Json(RestorePoints::new(
+        window.as_secs(),
+        earliest.map(described),
+        latest.map(described),
+    )))
 }
 
 /// Put the tenant back as it stood at a moment or a commit within its
@@ -466,20 +463,12 @@ pub async fn restore(
         RestoreTo::Position(position) => Point::Position(LogPosition(position)),
         RestoreTo::Backup(id) => {
             let (backup, position) = node.restore_backup(&tenant, id).await?;
-            return Ok(Json(Restored {
-                from: RestorePoint {
-                    position: backup.position().0,
-                    at: backup.taken_at,
-                },
-                position: position.0,
-            }));
+            let from = RestorePoint::new(backup.position().0, backup.taken_at);
+            return Ok(Json(Restored::new(from, position.0)));
         }
     };
     let (from, position) = node.restore(&tenant, point).await?;
-    Ok(Json(Restored {
-        from: described(from),
-        position: position.0,
-    }))
+    Ok(Json(Restored::new(described(from), position.0)))
 }
 
 /// Back the tenant up now, whenever it was last backed up.
@@ -510,19 +499,17 @@ pub async fn back_up(
 )]
 pub async fn backups(Shared(app): Shared<App>, Named(tenant): Named<TenantId>) -> Answer<Backups> {
     let backups = app.node()?.backups(&tenant).await?;
-    Ok(Json(Backups {
-        backups: backups.into_iter().map(kept).collect(),
-    }))
+    Ok(Json(Backups::new(backups.into_iter().map(kept).collect())))
 }
 
 /// A backup as the API describes it.
 fn kept(backup: vellev_storage::backups::Backup) -> Backup {
-    Backup {
-        id: backup.id,
-        taken_at: backup.taken_at,
-        position: backup.position().0,
-        files: backup.files().count(),
-    }
+    Backup::new(
+        backup.id,
+        backup.taken_at,
+        backup.position().0,
+        backup.files().count(),
+    )
 }
 
 /// Set how far back the tenant may be restored, or with none go back to
@@ -569,10 +556,7 @@ pub async fn set_restore_window(
 
 /// A restore point as the API describes it.
 fn described(point: vellev_storage::coordinator::RestorePoint) -> RestorePoint {
-    RestorePoint {
-        position: point.position.0,
-        at: point.at,
-    }
+    RestorePoint::new(point.position.0, point.at)
 }
 
 /// Issue a key that reaches this tenant alone. Only an admin key may.
@@ -591,11 +575,7 @@ pub async fn issue_key(
     let issued = app.node()?.issue_key(&tenant).await?.ok_or_else(|| {
         ApiError::not_found(Missing::Tenant, format!("tenant {tenant} does not exist"))
     })?;
-    let issued = IssuedKey {
-        id: issued.key.id,
-        key: issued.secret,
-        created: issued.key.created,
-    };
+    let issued = IssuedKey::new(issued.key.id, issued.secret, issued.key.created);
     Ok((StatusCode::CREATED, Json(issued)))
 }
 
@@ -616,12 +596,9 @@ pub async fn tenant_keys(
     let keys = app.node()?.keys(&tenant).await?;
     let keys = keys
         .into_iter()
-        .map(|key| TenantKey {
-            id: key.id,
-            created: key.created,
-        })
+        .map(|key| TenantKey::new(key.id, key.created))
         .collect();
-    Ok(Json(TenantKeys { keys }))
+    Ok(Json(TenantKeys::new(keys)))
 }
 
 /// Revoke one of this tenant's keys. Only an admin key may.
@@ -708,7 +685,7 @@ pub async fn collections(
 ) -> Answer<Collections> {
     let tenant = app.node()?.reader(&tenant, fresh).await?;
     let collections = tenant.read(|state| state.collections().cloned().collect());
-    Ok(Json(Collections { collections }))
+    Ok(Json(Collections::new(collections)))
 }
 
 fn schema(state: &State, collection: &CollectionName) -> Result<Collection, ApiError> {
@@ -860,7 +837,9 @@ pub async fn put_object(
     Requested(request): Requested,
     Body(content): Body<Content>,
 ) -> Answer<Written> {
-    let Content { properties, vector } = content;
+    let Content {
+        properties, vector, ..
+    } = content;
     let upsert = Mutation::Upsert {
         collection,
         id,
@@ -890,6 +869,7 @@ pub async fn patch_object(
         properties,
         vector,
         only_if,
+        ..
     } = changes;
     let patch = Mutation::Patch {
         collection,
@@ -925,33 +905,25 @@ pub async fn delete_object(
 }
 
 fn hit(hit: Hit<'_>, vectors: bool) -> Found {
-    Found {
-        object: stored(hit.object, Some(hit.vector), vectors),
-        score: None,
-        distance: Some(hit.distance),
-        certainty: hit.certainty,
-        keyword: None,
-    }
+    let mut found = Found::new(stored(hit.object, Some(hit.vector), vectors));
+    found.distance = Some(hit.distance);
+    found.certainty = hit.certainty;
+    found
 }
 
 fn scored(scored: Scored<'_>, vectors: bool) -> Found {
-    Found {
-        object: stored(scored.object, scored.vector, vectors),
-        score: None,
-        distance: None,
-        certainty: None,
-        keyword: Some(scored.score),
-    }
+    let mut found = Found::new(stored(scored.object, scored.vector, vectors));
+    found.keyword = Some(scored.score);
+    found
 }
 
 fn fused(fused: Fused<'_>, vectors: bool) -> Found {
-    Found {
-        object: stored(fused.object, fused.vector, vectors),
-        score: Some(fused.score),
-        distance: fused.distance,
-        certainty: fused.certainty,
-        keyword: fused.keyword,
-    }
+    let mut found = Found::new(stored(fused.object, fused.vector, vectors));
+    found.score = Some(fused.score);
+    found.distance = fused.distance;
+    found.certainty = fused.certainty;
+    found.keyword = fused.keyword;
+    found
 }
 
 /// The objects nearest a vector, or nearest what a text embeds to.
@@ -1074,10 +1046,17 @@ pub async fn hybrid(
         None => match tenant.query_vector(&collection, &asked.text).await {
             Ok(vector) => (vector, None),
             Err(vellev_node::NodeError::Embed(error)) => {
-                tracing::warn!(%error, "searching by words alone");
+                // A fault that stands was said where it was met, once for
+                // as long as it stands; one that may pass is said here.
                 let refused = match error.lasting() {
-                    Some(_) => Code::ModelUnavailable,
-                    None => Code::Unavailable,
+                    Some(_) => {
+                        tracing::debug!(%error, "searching by words alone");
+                        Code::ModelUnavailable
+                    }
+                    None => {
+                        tracing::warn!(%error, "searching by words alone");
+                        Code::Unavailable
+                    }
                 };
                 (None, Some(refused))
             }
@@ -1138,7 +1117,7 @@ pub async fn list(
             .take(limit)
             .map(|found| stored(found.object, found.vector, page.vectors))
             .collect();
-        Ok(Json(Objects { objects, next }))
+        Ok(Json(Objects::new(objects, next)))
     })
     .await
 }
@@ -1167,9 +1146,7 @@ pub async fn count(
             Some(filter) => state.select(&collection, filter)?.len(),
             None => state.count(&collection),
         };
-        Ok(Json(Counted {
-            count: count as u64,
-        }))
+        Ok(Json(Counted::new(count as u64)))
     })
     .await
 }

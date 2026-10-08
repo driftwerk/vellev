@@ -119,10 +119,7 @@ fn options(state: &std::path::Path) -> Options {
 }
 
 async fn tenant(served: &Served, name: &str) -> vellev_client::Tenant {
-    let options = ClientOptions {
-        batch_bytes: MAX_BODY / 2,
-        ..ClientOptions::default()
-    };
+    let options = ClientOptions::default().batch_bytes(MAX_BODY / 2);
     let client = Client::connect(&[&served.url], KEY, options).unwrap();
     client.tenant(&TenantId::new(name).unwrap())
 }
@@ -175,16 +172,7 @@ async fn a_weaviate_class_is_copied_whole_with_its_ids_vectors_and_settings() {
         assert_eq!(Value::Object(properties), expected, "{n}");
         assert_eq!(stored.vector, Some(vector(n)), "{n}");
     }
-    let found = records
-        .keyword(&Keyword {
-            text: "owls".into(),
-            properties: vec![],
-            limit: 5,
-            filter: None,
-            vectors: false,
-        })
-        .await
-        .unwrap();
+    let found = records.keyword(&Keyword::new("owls", 5)).await.unwrap();
     assert_eq!(found.results.len(), 5);
 
     let again = import::weaviate(&source, &tenant, &options).await.unwrap();

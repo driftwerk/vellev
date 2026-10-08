@@ -33,10 +33,6 @@ mod schedule;
 
 use schedule::{Next, Schedule, Tried};
 
-/// How long another address is given to better an answer in hand, such as
-/// a search ranked by the words alone: somebody is waiting for it.
-const BETTER_WITHIN: Duration = Duration::from_secs(2);
-
 /// How much of an answer that is not the API's is kept for the error.
 const KEPT_BODY: usize = 300;
 
@@ -62,6 +58,7 @@ pub enum Error {
     /// The tenant asked more of the node than it may; the request had no
     /// effect, and may be sent again after `wait`.
     #[error("vellev turned the request away: {message}")]
+    #[non_exhaustive]
     Limited { message: String, wait: Duration },
     /// Something answered that is not the API, such as a load balancer.
     #[error("{status} from something that is not vellev: {body}")]
@@ -72,6 +69,7 @@ pub enum Error {
     /// [`Records::store_all`] failed part of the way: `stored` objects are
     /// stored, the last of them readable from `position`.
     #[error("{stored} objects stored before a failure: {source}")]
+    #[non_exhaustive]
     Partial {
         stored: usize,
         position: Option<u64>,
@@ -225,7 +223,18 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// How a client asks. Start from [`Options::default`] and change what is
+/// to be otherwise:
+///
+/// ```
+/// use std::time::Duration;
+/// let options = vellev_client::Options::default()
+///     .timeout(Duration::from_secs(5))
+///     .attempts(3);
+/// assert_eq!(options.attempts, 3);
+/// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Options {
     /// How long one try of a request may take; see [`Client::within`].
     pub timeout: Duration,
@@ -249,6 +258,51 @@ pub struct Options {
     /// the node's own limit on a request's body, which [`Client::limits`]
     /// tells.
     pub batch_bytes: usize,
+    /// How long each other address is given to better a hybrid search a
+    /// node could only rank by the words alone, for want of a model it
+    /// can use: somebody is waiting for the answer in hand. A node that
+    /// takes longer than this to embed a text does not get to better it.
+    /// With none, the answer in hand is given at once and no other
+    /// address is asked. No longer than [`Self::timeout`] in any case.
+    pub better_within: Duration,
+}
+
+impl Options {
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn attempts(mut self, attempts: u32) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
+    #[must_use]
+    pub fn backoff(mut self, backoff: Duration) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    #[must_use]
+    pub fn batch_objects(mut self, batch_objects: usize) -> Self {
+        self.batch_objects = batch_objects;
+        self
+    }
+
+    #[must_use]
+    pub fn batch_bytes(mut self, batch_bytes: usize) -> Self {
+        self.batch_bytes = batch_bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn better_within(mut self, better_within: Duration) -> Self {
+        self.better_within = better_within;
+        self
+    }
 }
 
 impl Default for Options {
@@ -259,6 +313,7 @@ impl Default for Options {
             backoff: Duration::from_millis(100),
             batch_objects: 500,
             batch_bytes: 8 * 1024 * 1024,
+            better_within: Duration::from_secs(2),
         }
     }
 }
@@ -452,7 +507,7 @@ impl Client {
     /// As [`Self::ask`], for a request a node may answer with less than
     /// another would. An answer that does not pass `whole` is kept, and
     /// each address not yet asked is asked once, at once, for no longer
-    /// than [`BETTER_WITHIN`], whether it can do better: the first whole
+    /// than [`Options::better_within`], whether it can do better: the first whole
     /// answer is given, and failing one the answer kept, never a failure.
     /// Only a whole answer teaches the client which node to ask first.
     ///
@@ -481,7 +536,8 @@ impl Client {
             };
             let answer = asking.once(node, &method, path, body, after, request).await;
             let tried = match answer {
-                Ok(answer) if whole(&answer) => {
+                // With no time given to better an answer, any is whole.
+                Ok(answer) if whole(&answer) || options.better_within.is_zero() => {
                     self.learnt().entry(tenant.cloned()).or_default().node = node;
                     return Ok(answer);
                 }
@@ -515,7 +571,7 @@ impl Client {
                     node = address;
                 }
                 Next::AskForBetter { address } => {
-                    asking = self.within(self.timeout.min(BETTER_WITHIN));
+                    asking = self.within(self.timeout.min(options.better_within));
                     node = address;
                 }
             }
@@ -717,7 +773,7 @@ impl Tenant {
     /// Set how far back this tenant may be restored, in seconds, or with
     /// none go back to the default; needs an admin key.
     pub async fn set_restore_window(&self, secs: Option<u64>) -> Result<()> {
-        let window = RestoreWindow { secs };
+        let window = RestoreWindow::new(secs);
         self.repeated(Method::PUT, "/restore-window", Some(&window))
             .await
     }
@@ -757,7 +813,7 @@ impl Tenant {
     }
 
     async fn batch(&self, changes: Vec<Change>) -> Result<Written> {
-        let batch = Batch { changes };
+        let batch = Batch::new(changes);
         self.write(Method::POST, "/changes", Some(&batch)).await
     }
 
@@ -901,9 +957,11 @@ impl Records {
 
     /// A node that cannot embed the text ranks by the words alone and
     /// says so in [`Results::degraded_by`]. If it cannot as it is set up,
-    /// each other address not yet asked is asked once, at once and not
-    /// for long, and its answer is given only if none does better. A
-    /// client of one address is given it straight away.
+    /// each other address not yet asked is asked once, at once and for no
+    /// longer than [`Options::better_within`], and its answer is given
+    /// only if none does better; the address that does is the one asked
+    /// first from then on. A client of one address is given it straight
+    /// away.
     pub async fn hybrid(&self, asked: &Hybrid) -> Result<Results> {
         let path = self.tenant.path(&self.path("/hybrid"));
         let whole = |results: &Results| results.degraded_by != Some(Code::ModelUnavailable);

@@ -2141,3 +2141,82 @@ async fn a_write_the_holding_node_cannot_embed_is_refused_by_every_node_and_make
     assert_eq!(made.0, StatusCode::OK, "{}", made.1);
     assert_eq!(wrong.get(&object(1)).await.0, StatusCode::OK);
 }
+
+/// What is logged while it is listened for, with the level of each.
+#[derive(Clone, Default)]
+struct Logged(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl Logged {
+    /// How many times something holding `words` was logged at `level`.
+    fn times(&self, level: tracing::Level, words: &str) -> usize {
+        let logged = self.0.lock().unwrap();
+        logged
+            .iter()
+            .filter(|(at, said)| *at == level && said.contains(words))
+            .count()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logged {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        let level = *event.metadata().level();
+        self.0.lock().unwrap().push((level, message.0));
+    }
+}
+
+#[tokio::test]
+async fn a_fault_that_stands_is_logged_once_however_many_searches_fall_back_for_it() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let logged = Logged::default();
+    let _listening =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(logged.clone()));
+
+    let url = keyed_embedding_server("sk-right").await;
+    let served = Cluster::new().serve_embedding_keyed(&url, "sk-wrong").await;
+    let embedding = json!({
+        "provider": "http",
+        "api": "openai",
+        "url": url,
+        "model": "stand-in",
+        "dimensions": 2,
+        "properties": ["title"],
+    });
+    served.with_notes(embedding).await;
+    for _ in 0..3 {
+        let by_words = served
+            .ok(
+                Method::POST,
+                &format!("{NOTES}/hybrid"),
+                Some(json!({ "text": "fox", "limit": 1 })),
+            )
+            .await;
+        assert_eq!(by_words["degraded_by"], "model_unavailable");
+        let nearest = json!({ "text": "fox", "limit": 1 });
+        let refused = served.post(&format!("{NOTES}/nearest"), nearest).await;
+        assert_eq!(refused, model_unavailable("setup"));
+    }
+    assert_eq!(
+        logged.times(tracing::Level::ERROR, "the embedding model cannot be used"),
+        1,
+        "said once while it stands"
+    );
+    let per_request = logged.times(tracing::Level::WARN, "searching by words alone")
+        + logged.times(tracing::Level::WARN, "embedding failed")
+        + logged.times(tracing::Level::ERROR, "searching by words alone");
+    assert_eq!(per_request, 0, "and not again for each request");
+    assert_eq!(
+        logged.times(tracing::Level::DEBUG, "searching by words alone"),
+        3,
+        "but for whoever follows one request"
+    );
+}

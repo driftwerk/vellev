@@ -386,3 +386,61 @@ fn settings_never_print_a_key() {
     assert!(printed.contains("https://api.example.test"), "{printed}");
     assert!(!printed.contains("sk-secret"), "{printed}");
 }
+
+/// A model whose first call is refused for good, but not until it is let
+/// go, and whose every other call is answered at once.
+#[derive(Debug, Default)]
+struct RefusedLate {
+    calls: std::sync::atomic::AtomicUsize,
+    let_go: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Provider for RefusedLate {
+    async fn embed(&self, texts: Vec<String>, _: Purpose) -> Result<Vec<Vec<f32>>> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            self.let_go.notified().await;
+            return Err(EmbedError::Unusable {
+                model: "fake".into(),
+                reason: "401 Unauthorized: no such key".into(),
+                fault: vellev_core::ModelFault::Setup,
+            });
+        }
+        Ok(vec![vec![1.0, 2.0]; texts.len()])
+    }
+}
+
+#[tokio::test]
+async fn a_fault_that_comes_to_light_after_the_model_has_answered_well_since_does_not_stand() {
+    let model = Arc::new(RefusedLate::default());
+    let embedder = Arc::new(Embedder::new(
+        model.clone(),
+        embedding(EmbeddingProvider::Local),
+    ));
+    let calls = || model.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let first = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.query("asked while the key was wrong").await })
+    };
+    while calls() == 0 {
+        tokio::task::yield_now().await;
+    }
+    // The setup is put right, and the model answers, before the first
+    // call hears that it was refused.
+    assert_eq!(
+        embedder.query("asked since").await,
+        Ok(Some(vec![1.0, 2.0]))
+    );
+    model.let_go.notify_one();
+    assert!(
+        first.await.unwrap().is_err(),
+        "the call itself still failed"
+    );
+    assert_eq!(
+        embedder.query("asked after").await,
+        Ok(Some(vec![1.0, 2.0])),
+        "and the model is still asked"
+    );
+    assert_eq!(calls(), 3);
+}

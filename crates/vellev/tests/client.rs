@@ -21,20 +21,15 @@ use vellev_index::filter::Filter;
 const NEVER: Duration = Duration::from_secs(600);
 
 fn tries(attempts: u32) -> Options {
-    Options {
-        timeout: Duration::from_secs(10),
-        attempts,
-        backoff: NEVER,
-        ..Options::default()
-    }
+    Options::default()
+        .timeout(Duration::from_secs(10))
+        .attempts(attempts)
+        .backoff(NEVER)
 }
 
 /// As [`tries`], for a client of one node, which waits between tries.
 fn quick(attempts: u32) -> Options {
-    Options {
-        backoff: Duration::from_millis(1),
-        ..tries(attempts)
-    }
+    tries(attempts).backoff(Duration::from_millis(1))
 }
 
 fn tenant(id: &str) -> TenantId {
@@ -54,13 +49,10 @@ fn oid(n: u64) -> ObjectId {
 }
 
 fn content(title: &str, n: u64, vector: Option<[f32; 2]>) -> Content {
-    Content {
-        properties: json!({ "title": title, "n": n })
-            .as_object()
-            .unwrap()
-            .clone(),
-        vector: vector.map(Vec::from),
-    }
+    let properties = json!({ "title": title, "n": n });
+    let mut content = Content::new(properties.as_object().unwrap().clone());
+    content.vector = vector.map(Vec::from);
+    content
 }
 
 fn increment() -> Vec<Change> {
@@ -200,14 +192,10 @@ async fn the_whole_api_is_reached_through_the_client() {
         .unwrap();
     let stored = notes.get(oid(1)).await.unwrap().unwrap();
     assert_eq!((stored.id, stored.vector), (oid(1), Some(vec![1.0, 0.0])));
-    let patched = Changes {
-        properties: json!({ "n": 5 }).as_object().unwrap().clone(),
-        vector: None,
-        only_if: Some(OnlyIf {
-            property: "n".into(),
-            equals: json!(1),
-        }),
-    };
+    let patched = Changes::new(json!({ "n": 5 }).as_object().unwrap().clone()).only_if(OnlyIf {
+        property: "n".into(),
+        equals: json!(1),
+    });
     notes.patch(oid(1), &patched).await.unwrap();
     let clash = notes.patch(oid(1), &patched).await.unwrap_err();
     assert_eq!(clash.code(), Some(Code::Conflict));
@@ -232,53 +220,23 @@ async fn the_whole_api_is_reached_through_the_client() {
     );
     assert_eq!(client.after(&tenant("acme")), Some(changed.after()));
 
-    let nearest = Nearest {
-        vector: Some(vec![1.0, 0.0]),
-        text: None,
-        limit: 1,
-        filter: None,
-        oversample: None,
-        vectors: true,
-    };
+    let nearest = Nearest::to_vector(vec![1.0, 0.0], 1).vectors(true);
     let found = notes.nearest(&nearest).await.unwrap();
     assert_eq!(
         (found.results[0].object.id, found.results[0].distance),
         (oid(1), Some(0.0))
     );
     assert_eq!(found.results[0].object.vector, Some(vec![1.0, 0.0]));
-    let keyword = Keyword {
-        text: "hen".into(),
-        properties: vec![],
-        limit: 5,
-        filter: None,
-        vectors: false,
-    };
+    let keyword = Keyword::new("hen", 5);
     let found = notes.keyword(&keyword).await.unwrap();
     assert_eq!(found.results.len(), 1);
     assert!(found.results[0].keyword.unwrap() > 0.0);
-    let hybrid = Hybrid {
-        text: "fox".into(),
-        vector: Some(vec![1.0, 0.0]),
-        alpha: None,
-        fusion: Default::default(),
-        properties: vec![],
-        limit: 5,
-        candidates: None,
-        filter: None,
-        oversample: None,
-        vectors: false,
-    };
+    let hybrid = Hybrid::new("fox", 5).vector(vec![1.0, 0.0]);
     let fused = notes.hybrid(&hybrid).await.unwrap();
     assert_eq!(fused.results[0].object.id, oid(1));
     assert!(!fused.degraded);
 
-    let page = Page {
-        filter: None,
-        after: None,
-        limit: 1,
-        vectors: false,
-    };
-    let first = notes.list(&page).await.unwrap();
+    let first = notes.list(&Page::new(1)).await.unwrap();
     assert_eq!((first.objects.len(), first.next), (1, Some(oid(1))));
     let big = Filter::Gte {
         property: "n".into(),
@@ -286,7 +244,7 @@ async fn the_whole_api_is_reached_through_the_client() {
     };
     assert_eq!(notes.count(None).await.unwrap(), 2);
     assert_eq!(notes.count(Some(&big)).await.unwrap(), 1);
-    let none = notes.list(&Page { limit: 0, ..page }).await.unwrap_err();
+    let none = notes.list(&Page::new(0)).await.unwrap_err();
     assert_eq!(none.code(), Some(Code::Invalid));
 
     notes.delete(oid(2)).await.unwrap();
@@ -398,11 +356,7 @@ async fn a_request_is_sent_again_unless_it_was_refused_for_good() {
     };
     let patch = |name: &'static str| {
         let notes = client.tenant(&tenant(name)).collection(&notes_named());
-        let changes = Changes {
-            properties: json!({ "n": 2 }).as_object().unwrap().clone(),
-            vector: None,
-            only_if: None,
-        };
+        let changes = Changes::new(json!({ "n": 2 }).as_object().unwrap().clone());
         async move { notes.patch(oid(1), &changes).await }
     };
     for (name, sends) in [("torn", 3), ("proxied", 3), ("garbled", 3), ("wrong", 1)] {
@@ -486,10 +440,7 @@ async fn each_tenant_is_asked_of_the_node_that_last_answered_for_it() {
 #[tokio::test]
 async fn a_node_still_starting_is_waited_for() {
     let served = Cluster::new().unstarted(&[], None).await;
-    let patient = Options {
-        backoff: Duration::from_millis(50),
-        ..tries(8)
-    };
+    let patient = tries(8).backoff(Duration::from_millis(50));
     let client = Client::connect(&[&served.url], KEY, patient).unwrap();
     let (app, node) = (served.app.clone(), served.node.clone());
     tokio::spawn(async move {
@@ -658,10 +609,7 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     };
     let start = 1;
 
-    let by_count = notes_of(Options {
-        batch_objects: 10,
-        ..tries(1)
-    });
+    let by_count = notes_of(tries(1).batch_objects(10));
     assert_eq!(
         by_count.store_all(objects()).await.unwrap(),
         Some(start + 3)
@@ -680,10 +628,7 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     served
         .ok(reqwest::Method::PUT, NOTES, Some(notes(supplied())))
         .await;
-    let one_each = notes_of(Options {
-        batch_bytes: 1,
-        ..tries(1)
-    });
+    let one_each = notes_of(tries(1).batch_bytes(1));
     assert_eq!(
         one_each.store_all(objects()).await.unwrap(),
         Some(start + 4 + 2 + 25)
@@ -694,13 +639,7 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
         .ok(reqwest::Method::PUT, NOTES, Some(notes(supplied())))
         .await;
     let spoilt = objects().map(|(id, content)| match id == oid(14) {
-        true => (
-            id,
-            Content {
-                vector: Some(vec![1.0; 3]),
-                ..content
-            },
-        ),
+        true => (id, content.vector(vec![1.0; 3])),
         false => (id, content),
     });
     let failed = by_count.store_all(spoilt).await.unwrap_err();
@@ -913,10 +852,7 @@ async fn a_request_turned_away_for_asking_too_much_is_asked_again_once_the_wait_
 async fn a_failure_says_what_was_asked_too_much_of_or_is_missing_and_any_key_learns_the_limits() {
     let served = Served::new().await;
     served.with_notes(supplied()).await;
-    let options = Options {
-        batch_bytes: usize::MAX,
-        ..quick(3)
-    };
+    let options = quick(3).batch_bytes(usize::MAX);
     let client = Client::connect(&[&served.url], KEY, options).unwrap();
     let limits = client
         .limits()
@@ -938,12 +874,7 @@ async fn a_failure_says_what_was_asked_too_much_of_or_is_missing_and_any_key_lea
     assert_eq!(tenants_own.limits().await.unwrap(), Some(limits));
 
     let notes = client.tenant(&tenant("acme")).collection(&notes_named());
-    let page = |limit: u64| Page {
-        filter: None,
-        after: None,
-        limit: limit as u32,
-        vectors: false,
-    };
+    let page = |limit: u64| Page::new(limit as u32);
     let too_many = notes.list(&page(limits.results + 1)).await.unwrap_err();
     assert_eq!(
         too_many.limit(),
@@ -1193,10 +1124,7 @@ async fn one_address_with_a_node_behind_it_that_can_answers_on_a_later_try() {
         },
     )
     .await;
-    let options = Options {
-        backoff: Duration::from_millis(300),
-        ..tries(4)
-    };
+    let options = tries(4).backoff(Duration::from_millis(300));
     let client = Client::connect(&[&balancer.url], KEY, options).unwrap();
     let acme = client.tenant(&tenant("acme"));
     let started = Instant::now();
@@ -1232,18 +1160,7 @@ fn by_words(degraded_by: &str) -> (u16, Value) {
 /// A hybrid search for foxes through `client`.
 async fn foxes(client: &Client) -> vellev_client::Result<vellev_api::Results> {
     let notes = client.tenant(&tenant("acme")).collection(&notes_named());
-    let asked = Hybrid {
-        text: "fox".into(),
-        vector: None,
-        alpha: None,
-        fusion: Default::default(),
-        properties: Vec::new(),
-        limit: 5,
-        candidates: None,
-        filter: None,
-        oversample: None,
-        vectors: false,
-    };
+    let asked = Hybrid::new("fox", 5);
     // Nothing here is to wait: a search that does has gone wrong.
     tokio::time::timeout(Duration::from_secs(30), notes.hybrid(&asked))
         .await
@@ -1350,11 +1267,9 @@ async fn an_address_that_never_answers_does_not_keep_back_the_answer_in_hand() {
     let hung = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, silent).await.unwrap() });
 
-    // Each try may take a minute; the answer in hand waits two seconds.
-    let options = Options {
-        timeout: Duration::from_secs(60),
-        ..tries(4)
-    };
+    // Each try may take a minute; the answer in hand waits two seconds,
+    // unless the client says otherwise.
+    let options = tries(4).timeout(Duration::from_secs(60));
     let client = Client::connect(&[&cannot.url, &hung], KEY, options).unwrap();
     let started = Instant::now();
     let found = foxes(&client).await.unwrap();
@@ -1365,6 +1280,26 @@ async fn an_address_that_never_answers_does_not_keep_back_the_answer_in_hand() {
         "the other address was given two seconds, not its minute: {took:?}"
     );
     assert_eq!(cannot.asked("hybrid"), 1);
+
+    let brief = tries(4)
+        .timeout(Duration::from_secs(60))
+        .better_within(Duration::from_millis(200));
+    let client = Client::connect(&[&cannot.url, &hung], KEY, brief).unwrap();
+    let started = Instant::now();
+    foxes(&client).await.unwrap();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(190) && took < Duration::from_millis(1_500),
+        "as long as the client gives, and no longer: {took:?}"
+    );
+
+    // Given no time at all, no other address is asked.
+    let full = Stub::answering(|_, _| (200, json!({ "results": [] }))).await;
+    let at_once = tries(4).better_within(Duration::ZERO);
+    let client = Client::connect(&[&cannot.url, &full.url], KEY, at_once).unwrap();
+    let found = foxes(&client).await.unwrap();
+    assert_eq!(found.degraded_by, Some(Code::ModelUnavailable));
+    assert_eq!(full.asked("hybrid"), 0);
 }
 
 #[tokio::test]
@@ -1435,34 +1370,13 @@ async fn a_search_a_node_cannot_embed_for_is_answered_by_one_that_can() {
     // Asked of the node set up wrong first, with one try and no waiting.
     let client = Client::connect(&[&wrong.url, &right.url], KEY, tries(1)).unwrap();
     let notes = client.tenant(&tenant("acme")).collection(&notes_named());
-    let fox = Content {
-        properties: json!({ "title": "a red fox" }).as_object().unwrap().clone(),
-        vector: None,
-    };
+    let fox = Content::new(json!({ "title": "a red fox" }).as_object().unwrap().clone());
     notes.put(oid(1), &fox).await.unwrap();
-    let nearest = Nearest {
-        vector: None,
-        text: Some("a red fox".into()),
-        limit: 1,
-        filter: None,
-        oversample: None,
-        vectors: true,
-    };
+    let nearest = Nearest::to_text("a red fox", 1).vectors(true);
     let found = notes.nearest(&nearest).await.unwrap();
     assert_eq!(found.results[0].object.vector, Some(vec![9.0, 3.0]));
 
-    let hybrid = Hybrid {
-        text: "a red fox".into(),
-        vector: None,
-        alpha: None,
-        fusion: Default::default(),
-        properties: Vec::new(),
-        limit: 1,
-        candidates: None,
-        filter: None,
-        oversample: None,
-        vectors: false,
-    };
+    let hybrid = Hybrid::new("a red fox", 1);
     // A client that has yet to learn which node can: it asks the node set
     // up wrong first, and goes on past its answer by the words alone.
     let fresh = Client::connect(&[&wrong.url, &right.url], KEY, tries(1)).unwrap();

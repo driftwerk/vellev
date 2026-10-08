@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,6 +59,8 @@ pub struct Embedder {
     queries: Mutex<Queries>,
     /// The lasting fault met last, and when.
     fault: Mutex<Option<(Instant, EmbedError)>>,
+    /// How many times the model has answered well.
+    answered: AtomicU64,
 }
 
 impl Embedder {
@@ -67,6 +70,7 @@ impl Embedder {
             embedding,
             queries: Mutex::default(),
             fault: Mutex::default(),
+            answered: AtomicU64::new(0),
         }
     }
 
@@ -113,17 +117,30 @@ impl Embedder {
         if let Some(fault) = self.standing() {
             return Err(fault);
         }
+        let before = self.answered.load(Ordering::SeqCst);
         let made = self.made(texts, wanted, purpose).await;
-        if let Err((error, Some(lies_in))) = made.as_ref().map_err(|error| (error, error.lasting()))
-        {
-            // Said once for as long as it stands, not once a request.
-            tracing::error!(
-                model = %self.embedding.model,
-                ?lies_in,
-                cause = %error,
-                "the embedding model cannot be used; not asking it again for {FAULT_STANDS:?}"
-            );
-            *self.fault.lock().expect("fault lock") = Some((Instant::now(), error.clone()));
+        match made.as_ref().map_err(|error| (error, error.lasting())) {
+            Ok(_) => {
+                self.answered.fetch_add(1, Ordering::SeqCst);
+            }
+            Err((error, Some(lies_in))) => {
+                // A fault met by a call the model has since answered
+                // another well is one put right meanwhile: it does not
+                // stand, however late the news of it comes.
+                let mut fault = self.fault.lock().expect("fault lock");
+                if self.answered.load(Ordering::SeqCst) == before {
+                    // Said once for as long as it stands, not once a
+                    // request.
+                    tracing::error!(
+                        model = %self.embedding.model,
+                        ?lies_in,
+                        cause = %error,
+                        "the embedding model cannot be used; not asking it again for {FAULT_STANDS:?}"
+                    );
+                    *fault = Some((Instant::now(), error.clone()));
+                }
+            }
+            Err((_, None)) => {}
         }
         made
     }
