@@ -77,20 +77,24 @@ meanwhile is kept. Only a change to an object's vector alone, landing in
 the instant between that read and the step, goes unseen.
 
 The ledger costs one small object per imported object, with no vector
-and no index: about 135 bytes in the tenant's log and 130 once in its
-files, so some 0.6 GB for a class of four million objects. It is ordinary
+and no index. Measured over 60,000 entries, that is 135 bytes each in the
+tenant's log and 106 once in a segment and its manifest: some 0.4 GB of
+files for a class of four million objects, beside what of the log is
+still kept. It is ordinary
 tenant data: it is backed up and restored with the tenant, dropped with
 it, and listed among its collections, as is `vellev_imports`, which holds
 one object per class saying which Weaviate it came from. A collection is
 caught up only from that Weaviate, known by its address. Where the
 address changes between runs, as through a tunnel, name the Weaviate with
-`--from-name` on every run. Dropping a collection and importing again
-starts it, and its ledger, afresh.
+`--from-name` on every run. A collection that is dropped is imported
+again from the start, its ledger with it; drop one only if nothing but
+the import has written to it, since whatever else did is gone with it.
 
 A collection imported by a release from before the ledger has none. The
 next run takes up every object that is still exactly as Weaviate has it,
-fetching each to compare, and keeps the rest untouched; dropping the
-collection and importing it again is quicker and brings everything.
+fetching each to compare, and keeps the rest untouched. Where nothing
+but the import has written to the collection, dropping it and importing
+it again is quicker and brings everything.
 
 **What a run reports**, per class: `stored`, `changed` and `deleted`, the
 objects it added, replaced and removed; `kept`, those it found were not

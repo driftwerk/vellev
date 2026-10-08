@@ -946,10 +946,9 @@ async fn an_import_of_a_weaviate_written_to_all_the_while_is_exact_after_the_nex
     let first = importing.run().await.unwrap();
     assert!(importing.proxy.spent());
     let copied = &first.classes[class];
-    assert_eq!(
-        copied.caught_up(),
-        copied.weaviate == copied.imported,
-        "a run says whether it caught up"
+    assert!(
+        !copied.caught_up() && !first.matched(),
+        "written to behind the catch-up, the run says it has not caught up: {copied:?}"
     );
     assert_eq!(copied.kept, 0);
 
@@ -1017,6 +1016,7 @@ async fn a_weaviate_that_turns_requests_away_or_fails_for_a_while_is_asked_again
     let page: Vec<&str> = page.iter().map(String::as_str).collect();
     for status in [
         StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::REQUEST_TIMEOUT,
         StatusCode::SERVICE_UNAVAILABLE,
     ] {
         importing.proxy.answer(0, &page, status, json!({}));
@@ -1272,4 +1272,71 @@ async fn an_import_begun_again_does_not_bring_back_what_another_writer_deleted()
     // ledger says the objects were there.
     std::fs::remove_file(&importing.options.state).unwrap();
     assert_eq!(importing.counts().await, ([0, 0, 0, 0], [10, 10, 0]));
+}
+
+/// An address that cuts short its answer to the first request made of
+/// it, a 404 said to be longer than what is sent, and passes every other
+/// connection on to `to`.
+async fn cutting_short(to: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let to = to.trim_start_matches("http://").to_string();
+    tokio::spawn(async move {
+        let mut cut = false;
+        loop {
+            let (mut asking, _) = listener.accept().await.unwrap();
+            if !std::mem::replace(&mut cut, true) {
+                let mut asked = [0; 4096];
+                assert!(asking.read(&mut asked).await.unwrap() > 0);
+                let short = b"HTTP/1.1 404 Not Found\r\ncontent-length: 100\r\n\r\ncut";
+                asking.write_all(short).await.unwrap();
+                continue;
+            }
+            let to = to.clone();
+            tokio::spawn(async move {
+                let mut onward = tokio::net::TcpStream::connect(&to).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut asking, &mut onward).await;
+            });
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn an_answer_cut_short_is_asked_for_again_though_it_began_as_a_404() {
+    let Some(importing) = Importing::new("VellevImportCut", 10).await else {
+        return;
+    };
+    // Taken at its word, a 404 would say Weaviate holds nothing there.
+    let cutting = cutting_short(&importing.weaviate.url).await;
+    let report = import::weaviate(&source(&cutting), &importing.tenant, &importing.options)
+        .await
+        .unwrap();
+    assert!(report.matched(), "{report:?}");
+    assert_eq!(report.classes[importing.class].stored, 10);
+}
+
+#[tokio::test]
+async fn a_class_whose_name_leaves_no_room_for_its_ledgers_is_refused_before_anything_is_made() {
+    let Ok(url) = std::env::var("VELLEV_WEAVIATE_URL") else {
+        return;
+    };
+    let class = format!("VellevImportLong{}", "g".repeat(105));
+    Weaviate::load(&url, &class, 1).await;
+    let served = Served::new().await;
+    let tenant = tenant(&served, "long").await;
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        classes: vec![class.clone()],
+        ..options(&dir.path().join("state.json"))
+    };
+    let refused = import::weaviate(&source(&url), &tenant, &options)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("too long for a ledger"),
+        "{refused}"
+    );
+    assert_eq!(tenant.collections().await.unwrap(), []);
 }

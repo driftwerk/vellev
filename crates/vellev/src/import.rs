@@ -943,7 +943,7 @@ impl Copying<'_> {
         let class = &self.plan.class;
         if self.weaviate.count(class).await? == 0 && self.plan.ledger.count(None).await? > 0 {
             bail!(
-                "Weaviate holds nothing of class {}, which was imported from it; if that is right, drop the collection, and otherwise check what Weaviate this is: nothing was deleted",
+                "Weaviate holds nothing of class {}, which was imported from it, and nothing was deleted: check what Weaviate this is. If the class is truly empty, the collection is to be emptied by whoever knows that nothing else has written to it",
                 class.class
             );
         }
@@ -1460,7 +1460,7 @@ impl Object {
         let dimensions = plan.schema.embedding.dimensions;
         if let Some(vector) = vector.filter(|vector| vector.len() != dimensions as usize) {
             bail!(
-                "object {} of {class} has a vector of {} dimensions, not the collection's {dimensions}; if the class's vectors are of that size, drop the collection and import it again, saying so",
+                "object {} of {class} has a vector of {} dimensions, not the collection's {dimensions}; if the class's vectors are of that size, it must be imported into a collection made anew, saying so",
                 self.id,
                 vector.len()
             );

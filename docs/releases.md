@@ -302,8 +302,12 @@ and say what the caller then answers for.
   time. A rate that is not a number is refused.
 - New: `--batch-bytes`, the most bytes sent to the node in one request,
   8 MiB unless given.
-- A collection imported by an earlier release has no ledger: drop it and
-  import it again, or see the README for what a run does with it.
+- A collection imported by an earlier release has no ledger. If nothing
+  but the import has written to it, drop it and import it again;
+  otherwise see the README for what a run does with it.
+- The command now fails whenever a collection holds objects the import
+  did not bring, as it will for good once another writer stores its own
+  there. The message says so and that running again changes nothing.
 
 ### vellev-client
 
