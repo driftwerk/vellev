@@ -481,6 +481,15 @@ async fn called(model: &Told, calls: usize) {
     panic!("the model was called {} times, not {calls}", model.calls());
 }
 
+/// What `what` comes to, which it must within seconds: should a call in
+/// it come to wait on another that is held, it fails rather than waits
+/// for ever.
+async fn soon<T>(what: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(5), what)
+        .await
+        .expect("no call waits on another")
+}
+
 fn told(model: Told) -> (Arc<Told>, Arc<Embedder>) {
     let model = Arc::new(model);
     let embedder = Embedder::new(model.clone(), embedding(EmbeddingProvider::Local));
@@ -560,43 +569,49 @@ async fn a_call_never_waits_on_another_whatever_the_other_is_about() {
 
 #[tokio::test]
 async fn a_fault_that_comes_to_light_after_the_model_has_answered_well_since_does_not_stand() {
-    let (model, embedder) = told(Told::default());
-    assert!(embedder.query("first").await.is_ok());
-    let late = {
-        let embedder = embedder.clone();
-        tokio::spawn(async move { embedder.query("refused, once held").await })
-    };
-    called(&model, 2).await;
-    // The setup is put right, and the model answers, before the earlier
-    // call hears that it was refused.
-    assert!(embedder.query("asked since").await.is_ok());
-    model.let_go.notify_one();
-    assert_eq!(late.await.unwrap(), Err(Told::refused()));
-    assert!(
-        embedder.query("asked after").await.is_ok(),
-        "and the model is still asked"
-    );
-    assert_eq!(model.calls(), 4);
+    soon(async {
+        let (model, embedder) = told(Told::default());
+        assert!(embedder.query("first").await.is_ok());
+        let late = {
+            let embedder = embedder.clone();
+            tokio::spawn(async move { embedder.query("refused, once held").await })
+        };
+        called(&model, 2).await;
+        // The setup is put right, and the model answers, before the earlier
+        // call hears that it was refused.
+        assert!(embedder.query("asked since").await.is_ok());
+        model.let_go.notify_one();
+        assert_eq!(late.await.unwrap(), Err(Told::refused()));
+        assert!(
+            embedder.query("asked after").await.is_ok(),
+            "and the model is still asked"
+        );
+        assert_eq!(model.calls(), 4);
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn a_fault_that_stands_is_lifted_by_the_model_answering_well_however_late() {
-    let (model, embedder) = told(Told::default());
-    assert!(embedder.query("first").await.is_ok());
-    let slow = {
-        let embedder = embedder.clone();
-        tokio::spawn(async move { embedder.query("held").await })
-    };
-    called(&model, 2).await;
-    assert_eq!(embedder.query("refused").await, Err(Told::refused()));
-    assert_eq!(
-        embedder.query("asked while it stands").await,
-        Err(Told::refused())
-    );
-    assert_eq!(model.calls(), 3, "it stands: the model is not asked");
-    // The call that was out all along comes back answered.
-    model.let_go.notify_one();
-    assert!(slow.await.unwrap().is_ok());
-    assert!(embedder.query("asked after").await.is_ok());
-    assert_eq!(model.calls(), 4);
+    soon(async {
+        let (model, embedder) = told(Told::default());
+        assert!(embedder.query("first").await.is_ok());
+        let slow = {
+            let embedder = embedder.clone();
+            tokio::spawn(async move { embedder.query("held").await })
+        };
+        called(&model, 2).await;
+        assert_eq!(embedder.query("refused").await, Err(Told::refused()));
+        assert_eq!(
+            embedder.query("asked while it stands").await,
+            Err(Told::refused())
+        );
+        assert_eq!(model.calls(), 3, "it stands: the model is not asked");
+        // The call that was out all along comes back answered.
+        model.let_go.notify_one();
+        assert!(slow.await.unwrap().is_ok());
+        assert!(embedder.query("asked after").await.is_ok());
+        assert_eq!(model.calls(), 4);
+    })
+    .await;
 }
