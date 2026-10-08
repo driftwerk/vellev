@@ -341,7 +341,8 @@ CI: bump the workspace version, then push a tag `v<version>`. The release
 runs every CI gate first, refuses to start if any of the crates' versions is
 on crates.io from another commit, and publishes them in dependency order. It
 needs a `CARGO_REGISTRY_TOKEN` secret allowed to publish new crates. The
-server's crates are not published.
+server's crates are not published. What each release changes for whoever
+uses the crates is in [docs/releases.md](docs/releases.md).
 
 ## Simulation
 
