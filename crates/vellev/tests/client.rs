@@ -1290,7 +1290,11 @@ async fn a_search_a_node_cannot_embed_for_is_answered_by_one_that_can() {
         oversample: None,
         vectors: false,
     };
-    let fused = notes.hybrid(&hybrid).await.unwrap();
+    // A client that has yet to learn which node can: it asks the node set
+    // up wrong first, and goes on past its answer by the words alone.
+    let fresh = Client::connect(&[&wrong.url, &right.url], KEY, tries(1)).unwrap();
+    let fresh = fresh.tenant(&tenant("acme")).collection(&notes_named());
+    let fused = fresh.hybrid(&hybrid).await.unwrap();
     assert_eq!((fused.degraded, fused.degraded_by), (false, None));
     assert!(fused.results[0].distance.is_some(), "ranked by meaning too");
 
