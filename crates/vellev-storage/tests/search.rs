@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use vellev_core::{Object, ObjectError};
-use vellev_storage::{Hit, Query};
+use vellev_storage::{Hit, Merging, Query};
 
 const VECTORS: &str = "vectors";
 
@@ -387,6 +387,435 @@ async fn a_shortlisted_segment_gives_way_to_newer_layers() {
             assert_eq!(hits[0].certainty, Some(1.0));
             assert_eq!(hits[1].object.id, nearest[2]);
             assert!(!ids(&hits).contains(&nearest[0]) && !ids(&hits).contains(&nearest[1]));
+        });
+    }
+}
+
+/// More rows than are scored one by one, so that the segment they are
+/// flushed to is searched through its vector index.
+const SHORTLISTED: u64 = 5_000;
+
+/// What gives a flushed segment of [`SHORTLISTED`] rows each kind of vector
+/// index: a scan of every code, and clusters of them.
+fn index_kinds() -> [Merging; 2] {
+    let clustered = Merging {
+        clustered_above: 4_000,
+        ..Merging::default()
+    };
+    [Merging::default(), clustered]
+}
+
+/// Write `vectors`, by id, to a collection of their length measured by
+/// `metric`, and flush them to one segment.
+async fn flushed(writer: &Writer, metric: Distance, vectors: Vec<(u64, Vec<f32>)>) {
+    let dimensions = vectors[0].1.len() as u32;
+    let puts = vectors
+        .into_iter()
+        .map(|(n, vector)| put(n, 0, Some(vector)));
+    writer
+        .commit(
+            [collection(dimensions, metric)]
+                .into_iter()
+                .chain(puts)
+                .collect(),
+        )
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+}
+
+/// Vectors leaning one way, far from the origin, and one fifty times as
+/// long as the query in its very direction: neither the lean they share
+/// nor its length may hide it from a cosine search.
+#[tokio::test]
+async fn a_shortlisted_segment_finds_a_vector_in_the_querys_direction_whatever_its_length() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let mut random = Random(23);
+    let query = random.vector(64);
+    let leaning = (0..SHORTLISTED).map(|n| {
+        let vector = random.vector(64).into_iter().map(|v| v + 1.0).collect();
+        (n, vector)
+    });
+    let along = (SHORTLISTED, query.iter().map(|v| 50.0 * v).collect());
+    flushed(&writer, Distance::Cosine, leaning.chain([along]).collect()).await;
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            let hits = state
+                .search(&name(VECTORS), &Query::nearest(&query, 1))
+                .unwrap();
+            assert_eq!(ids(&hits), [row(SHORTLISTED)]);
+            assert!(hits[0].distance < 1e-6, "{}", hits[0].distance);
+        });
+    }
+}
+
+/// One vector a hundred times as long as the rest, at nearly a right angle
+/// to the query: its inner product with the query, 40, is still far the
+/// largest, the rest's being under 3.
+#[tokio::test]
+async fn a_shortlisted_segment_finds_a_long_vector_with_the_largest_inner_product() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let mut random = Random(29);
+    let query = random.vector(64);
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+    let others: Vec<(u64, Vec<f32>)> = (0..SHORTLISTED).map(|n| (n, random.vector(64))).collect();
+    assert!(others.iter().all(|(_, vector)| dot(vector, &query) < 3.0));
+    let sideways = random.vector(64);
+    let off = (dot(&sideways, &query) - 0.4) / dot(&query, &query);
+    let long: Vec<f32> = sideways
+        .iter()
+        .zip(&query)
+        .map(|(s, q)| 100.0 * (s - off * q))
+        .collect();
+    assert!((dot(&long, &query) - 40.0).abs() < 0.01);
+    flushed(
+        &writer,
+        Distance::Dot,
+        others.into_iter().chain([(SHORTLISTED, long)]).collect(),
+    )
+    .await;
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            for limit in [1, 5] {
+                let hits = state
+                    .search(&name(VECTORS), &Query::nearest(&query, limit))
+                    .unwrap();
+                assert_eq!(hits[0].object.id, row(SHORTLISTED), "at limit {limit}");
+            }
+        });
+    }
+}
+
+/// Rows of one vector, written in descending id order so that their rows
+/// run the other way, come back in id order from a segment searched
+/// through either kind of index.
+#[tokio::test]
+async fn rows_of_one_vector_come_back_in_id_order_from_a_shortlisted_segment() {
+    for merging in index_kinds() {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let same = vec![0.5; 8];
+        let backwards = (1..=SHORTLISTED).rev().map(|n| (n, same.clone()));
+        flushed(&writer, Distance::L2, backwards.collect()).await;
+        for copy in [
+            writer.partition().clone(),
+            cluster.open().await.partition().clone(),
+        ] {
+            copy.read(|state| {
+                for query in [same.clone(), vec![-1.0; 8]] {
+                    for limit in [1, 3] {
+                        let hits = state
+                            .search(&name(VECTORS), &Query::nearest(&query, limit))
+                            .unwrap();
+                        let first: Vec<ObjectId> = (1..=limit as u64).map(row).collect();
+                        assert_eq!(ids(&hits), first, "{merging:?} at limit {limit}");
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// The objects a filter keeps include those with no vector, which no
+/// vector index holds. Searched by a zero query, as far from every row,
+/// with no more rows scored than asked for, a shortlisted segment still
+/// answers with the lowest ids of those that have a vector.
+#[tokio::test]
+async fn a_zero_query_passes_over_the_objects_with_no_vector() {
+    for merging in index_kinds() {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let mut random = Random(47);
+        let unvectored = (1..=10).map(|n| put(n, 0, None));
+        let vectored = (11..=SHORTLISTED + 10).map(|n| put(n, 0, Some(random.vector(8))));
+        writer
+            .commit(
+                [collection(8, Distance::Cosine)]
+                    .into_iter()
+                    .chain(unvectored)
+                    .chain(vectored)
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let everything = group_is(0);
+        writer.partition().read(|state| {
+            let asked = Query {
+                oversample: 1,
+                ..Query::nearest(&[0.0; 8], 3)
+            }
+            .filtered(&everything);
+            let hits = state.search(&name(VECTORS), &asked).unwrap();
+            assert_eq!(ids(&hits), [row(11), row(12), row(13)], "{merging:?}");
+        });
+    }
+}
+
+/// A zero query is as far from every row, at cosine distance one or at an
+/// inner product of zero, so a shortlisted segment answers with the lowest
+/// ids, as scoring every row would.
+#[tokio::test]
+async fn a_zero_query_finds_the_lowest_ids_in_a_shortlisted_segment() {
+    for metric in [Distance::Cosine, Distance::Dot] {
+        for merging in index_kinds() {
+            let cluster = Cluster::new().await;
+            let writer = cluster.writer().await.merging_with(merging);
+            let mut random = Random(37);
+            let backwards = (1..=SHORTLISTED).rev().map(|n| (n, random.vector(8)));
+            flushed(&writer, metric, backwards.collect()).await;
+            for copy in [
+                writer.partition().clone(),
+                cluster.open().await.partition().clone(),
+            ] {
+                copy.read(|state| {
+                    let hits = state
+                        .search(&name(VECTORS), &Query::nearest(&[0.0; 8], 3))
+                        .unwrap();
+                    let lowest = [row(1), row(2), row(3)];
+                    assert_eq!(ids(&hits), lowest, "{metric:?} {merging:?}");
+                });
+            }
+        }
+    }
+}
+
+/// A query so short that its squared length underflows an `f32` still has
+/// a direction, which both the index and the exact score see: it finds
+/// the vector it points along, at no distance.
+#[tokio::test]
+async fn a_query_too_short_to_square_finds_the_vector_it_points_along() {
+    for merging in index_kinds() {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let mut random = Random(41);
+        let vectors: Vec<(u64, Vec<f32>)> =
+            (1..=SHORTLISTED).map(|n| (n, random.vector(8))).collect();
+        let query: Vec<f32> = vectors[1233].1.iter().map(|value| 1e-30 * value).collect();
+        flushed(&writer, Distance::Cosine, vectors).await;
+        for copy in [
+            writer.partition().clone(),
+            cluster.open().await.partition().clone(),
+        ] {
+            copy.read(|state| {
+                let hits = state
+                    .search(&name(VECTORS), &Query::nearest(&query, 1))
+                    .unwrap();
+                assert_eq!(ids(&hits), [row(1234)], "{merging:?}");
+                assert!(hits[0].distance < 1e-6, "{merging:?}: {}", hits[0].distance);
+            });
+        }
+    }
+}
+
+/// Rows longer than a collection accepts, as were stored before lengths
+/// were limited, forged into the log as no write can make them now. However
+/// many there are, a shortlisted segment of either kind scores them exactly
+/// beside its shortlist: they are found where they are nearest, and crowd
+/// out nothing where they are not; and as of any other row, one a filter
+/// leaves out, or one since deleted, is never returned.
+#[tokio::test]
+async fn rows_too_long_to_measure_are_scored_exactly_beside_the_shortlist() {
+    for merging in index_kinds() {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await.merging_with(merging);
+        let mut random = Random(43);
+        // Three plainly nearest the query that points away from the long rows.
+        let measured = (1..=SHORTLISTED)
+            .map(|n| put(n, 0, Some(random.vector(8))))
+            .chain((7_001..=7_003).map(|n| put(n, 0, Some(vec![-5.0; 8]))));
+        writer
+            .commit(
+                [collection(8, Distance::Dot)]
+                    .into_iter()
+                    .chain(measured)
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let head = cluster.committed().await;
+        let position = head.log_position.next().unwrap();
+        let key = Layout(&cluster.key).log(position, writer.author());
+        // Every other one in a group of its own, for a filter to leave out.
+        let long = (9_001..=9_600).map(|n| format::Op::Upsert {
+            collection: CollectionId(0),
+            object: Object {
+                id: row(n),
+                properties: BTreeMap::from([(
+                    "n".to_string(),
+                    Value::Int(9 * (n % 2 == 0) as i64),
+                )]),
+                vector: Some(vec![2.3e18; 8]),
+            },
+        });
+        let log = LogSegment {
+            position,
+            prev: head.manifest.map(|manifest| manifest.0),
+            ops: long.collect(),
+            answered: Vec::new(),
+        };
+        cluster
+            .blobs
+            .put(&key, format::encode(Kind::Log, &log).unwrap())
+            .await
+            .unwrap();
+        cluster
+            .coordinator
+            .commit(
+                writer.lease(),
+                Commit {
+                    log_position: position,
+                    manifest: Some(ManifestRef(key)),
+                },
+            )
+            .await
+            .unwrap();
+        let writer = cluster.writer().await.merging_with(merging);
+        writer.flush().await.unwrap();
+        // The nearest long row of all is deleted, and stays in the segment
+        // as a dead one.
+        writer.commit(vec![remove(9_001)]).await.unwrap();
+        let not_nine = Filter::Ne {
+            property: "n".into(),
+            value: json!(9),
+        };
+        let kept = |object: &Object| object.properties.get("n") != Some(&Value::Int(9));
+        for copy in [
+            writer.partition().clone(),
+            cluster.open().await.partition().clone(),
+        ] {
+            copy.read(|state| {
+                assert_eq!(state.count(&name(VECTORS)), 5_602);
+                for query in [[1.0; 8], [-1.0; 8]] {
+                    let hits = state
+                        .search(&name(VECTORS), &Query::nearest(&query, 3))
+                        .unwrap();
+                    assert_eq!(
+                        ids(&hits),
+                        brute_force(state, Distance::Dot, &query, 3, |_| true),
+                        "{merging:?} {query:?}"
+                    );
+                    let hits = state
+                        .search(
+                            &name(VECTORS),
+                            &Query::nearest(&query, 3).filtered(&not_nine),
+                        )
+                        .unwrap();
+                    assert!(hits.iter().all(|hit| kept(hit.object)), "{merging:?}");
+                    assert_eq!(
+                        ids(&hits),
+                        brute_force(state, Distance::Dot, &query, 3, kept),
+                        "{merging:?} {query:?} filtered"
+                    );
+                }
+                // Towards the long rows, the nearest are the lowest ids of
+                // those neither deleted nor filtered out.
+                let towards = Query::nearest(&[1.0; 8], 3);
+                let hits = state.search(&name(VECTORS), &towards).unwrap();
+                assert_eq!(ids(&hits), [row(9_002), row(9_003), row(9_004)]);
+                let hits = state
+                    .search(&name(VECTORS), &towards.filtered(&not_nine))
+                    .unwrap();
+                assert_eq!(ids(&hits), [row(9_003), row(9_005), row(9_007)]);
+            });
+        }
+    }
+}
+
+/// Copies of one vector in two clustered segments, each written in
+/// descending id order, searched scoring no more than each segment's own
+/// nearest few: those few are its lowest ids, so the lowest of all are
+/// found.
+#[tokio::test]
+async fn each_clustered_segments_own_nearest_few_are_its_lowest_ids() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await.merging_with(Merging {
+        clustered_above: 4_000,
+        ..Merging::default()
+    });
+    writer
+        .commit(vec![collection(8, Distance::L2)])
+        .await
+        .unwrap();
+    let same = vec![0.5; 8];
+    for first in [1, SHORTLISTED + 1] {
+        let backwards = (first..first + SHORTLISTED).rev();
+        writer
+            .commit(backwards.map(|n| put(n, 0, Some(same.clone()))).collect())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    for copy in [
+        writer.partition().clone(),
+        cluster.open().await.partition().clone(),
+    ] {
+        copy.read(|state| {
+            // Six rows scored, three from each segment.
+            let asked = Query {
+                oversample: 2,
+                ..Query::nearest(&same, 3)
+            };
+            let hits = state.search(&name(VECTORS), &asked).unwrap();
+            assert_eq!(ids(&hits), [row(1), row(2), row(3)]);
+        });
+    }
+}
+
+/// Values each finite but large enough that a distance overflows: the
+/// inner product of the first two with the third is not a number, the
+/// cosine of the first against [1, 0] comes out as a right angle, and the
+/// last two are infinitely far from their opposites.
+#[tokio::test]
+async fn vectors_too_long_to_measure_are_refused_on_write_and_on_query() {
+    let too_long = [
+        vec![1e30, -1e30],
+        vec![1e30, 1e30],
+        vec![1e20, 0.0],
+        vec![1.3e19, 0.0],
+        vec![-1.3e19, 0.0],
+    ];
+    for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await;
+        writer
+            .commit(vec![collection(2, metric), put(1, 0, Some(vec![1.0, 1.0]))])
+            .await
+            .unwrap();
+        for vector in &too_long {
+            let error = writer
+                .commit(vec![put(2, 0, Some(vector.clone()))])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, StorageError::Object(ObjectError::VectorTooLong)),
+                "{metric:?} {vector:?}: {error:?}"
+            );
+            writer.partition().read(|state| {
+                let error = state
+                    .search(&name(VECTORS), &Query::nearest(vector, 3))
+                    .unwrap_err();
+                assert!(
+                    matches!(error, StorageError::Object(ObjectError::VectorTooLong)),
+                    "{metric:?} {vector:?}: {error:?}"
+                );
+            });
+        }
+        writer.partition().read(|state| {
+            assert_eq!(
+                ids(&state
+                    .search(&name(VECTORS), &Query::nearest(&[4e18, 0.0], 3))
+                    .unwrap()),
+                [row(1)]
+            );
         });
     }
 }

@@ -1,8 +1,8 @@
 //! Nearest-vector search over a partition's layers.
 
-use vellev_core::{Collection, CollectionName, Object, ObjectError};
+use vellev_core::{CollectionName, Object};
 use vellev_index::filter::{Filter, Predicate};
-use vellev_index::vector::{Scorer, VectorIndex};
+use vellev_index::vector::{nearest, Scorer, VectorIndex};
 
 use crate::format::CollectionId;
 use crate::state::{Layer, State, Vectors, SHORTLIST_ABOVE};
@@ -53,10 +53,16 @@ pub struct Hit<'a> {
 
 impl State {
     /// The collection's live objects nearest `query.vector`, nearest first,
-    /// ties in object id order. Objects without a vector are never returned.
+    /// those at one distance in object id order. Objects without a vector
+    /// are never returned.
+    ///
+    /// Where a layer's index shortlists, rows it estimates alike are cut in
+    /// object id order too, so that of objects with one vector the lowest
+    /// ids are found first. Rows it estimates differently are found, or
+    /// missed, as any other near neighbour is, whatever their distance.
     pub fn search(&self, collection: &CollectionName, query: &Query<'_>) -> Result<Vec<Hit<'_>>> {
         let (id, schema) = self.catalog().known(collection)?;
-        comparable(schema, query.vector)?;
+        schema.embedding.check(query.vector)?;
         let predicate = query
             .filter
             .map(|filter| filter.compile(schema))
@@ -68,23 +74,24 @@ impl State {
         let mut estimated = Vec::new();
         let mut floors = 0;
         for (at, layer) in layers.iter().enumerate() {
-            match candidates(layer, id, predicate.as_ref(), query.vector, budget) {
-                Candidates::Exact(rows) => exact.extend(rows.into_iter().map(|row| (at, row))),
-                // Each layer's own nearest few are always scored: one whose
-                // estimates err more than others' would otherwise crowd
-                // them out with rows that only look near.
-                Candidates::Estimated(mut rows) => {
-                    let rest = nearest_estimated(&mut rows, query.limit);
-                    floors += rows.len();
-                    exact.extend(rows.into_iter().map(|(_, row)| (at, row)));
-                    estimated.extend(
-                        rest.into_iter()
-                            .map(|(estimate, row)| (estimate, (at, row))),
-                    );
-                }
+            let offered = candidates(layer, id, predicate.as_ref(), query.vector, budget);
+            exact.extend(offered.exact.into_iter().map(|row| (at, row)));
+            // Each layer's own nearest few are always scored: one whose
+            // estimates err more than others' would otherwise crowd them
+            // out with rows that only look near.
+            if let Some(mut rows) = offered.estimated {
+                let rest = nearest(&mut rows, query.limit, |a, b| {
+                    layer.id(*a).cmp(&layer.id(*b))
+                });
+                floors += rows.len();
+                exact.extend(rows.into_iter().map(|(_, row)| (at, row)));
+                estimated.extend(
+                    rest.into_iter()
+                        .map(|(estimate, row)| (estimate, (at, row))),
+                );
             }
         }
-        nearest_estimated(&mut estimated, budget.saturating_sub(floors));
+        nearest_across(&layers, &mut estimated, budget.saturating_sub(floors));
         let estimated = estimated.into_iter().map(|(_, found)| found);
         let mut hits: Vec<Hit<'_>> = exact
             .into_iter()
@@ -101,33 +108,30 @@ impl State {
     }
 }
 
-/// Whether `vector` can be compared with the collection's.
-pub(crate) fn comparable(schema: &Collection, vector: &[f32]) -> Result<()> {
-    let expected = schema.embedding.dimensions;
-    if vector.len() != expected as usize {
-        return Err(ObjectError::VectorLength {
-            expected,
-            got: vector.len(),
-        }
-        .into());
-    }
-    if !vector.iter().all(|value| value.is_finite()) {
-        return Err(ObjectError::VectorNotFinite.into());
-    }
-    Ok(())
+/// Keep in `estimated`, rows of `layers` by the layer they are in, the
+/// `count` with the nearest estimates, those of equal estimate in object
+/// id order, whatever layers they are in, as at every other cut: which
+/// rows are scored then depends on the rows alone, not on how they lie
+/// across layers.
+fn nearest_across(layers: &[Layer<'_>], estimated: &mut Vec<(f32, (usize, u32))>, count: usize) {
+    nearest(estimated, count, |(a_at, a), (b_at, b)| {
+        layers[*a_at].id(*a).cmp(&layers[*b_at].id(*b))
+    });
 }
 
 /// What a layer offers a query.
-enum Candidates {
+#[derive(Default)]
+struct Candidates {
     /// Rows to score exactly.
-    Exact(Vec<u32>),
+    exact: Vec<u32>,
     /// Rows its clustered index estimates nearest, with their estimated
     /// distances, to be scored only if among the nearest of every layer.
-    Estimated(Vec<(f32, u32)>),
+    estimated: Option<Vec<(f32, u32)>>,
 }
 
 /// The layer's candidates: every allowed live row when there are few,
-/// otherwise up to `count` its vector index picks.
+/// otherwise up to `count` its vector index picks, and besides them every
+/// allowed row it has no estimate for.
 fn candidates(
     layer: &Layer<'_>,
     collection: CollectionId,
@@ -136,7 +140,7 @@ fn candidates(
     count: usize,
 ) -> Candidates {
     let Some(index) = layer.indexes.get(&collection) else {
-        return Candidates::Exact(Vec::new());
+        return Candidates::default();
     };
     let only = predicate.map(|predicate| predicate.select(&index.rows));
     let allowed = only.as_ref().unwrap_or(index.rows.rows());
@@ -145,25 +149,28 @@ fn candidates(
         .vectors
         .as_ref()
         .filter(|_| many_are_live(allowed.len(), layer, live));
-    match shortlist {
-        Some(Vectors::Clustered(clustered)) => {
-            Candidates::Estimated(clustered.estimates(vector, count, only.as_ref(), layer.dead))
-        }
-        Some(vectors) => {
-            Candidates::Exact(vectors.shortlist(vector, count, only.as_ref(), layer.dead))
-        }
-        None => Candidates::Exact(live().collect()),
+    let Some(vectors) = shortlist else {
+        return Candidates {
+            exact: live().collect(),
+            estimated: None,
+        };
+    };
+    let ties = |a, b| layer.id(a).cmp(&layer.id(b));
+    let unmeasured = vectors.unmeasured(only.as_ref(), layer.dead);
+    match vectors {
+        Vectors::Clustered(clustered) => Candidates {
+            exact: unmeasured,
+            estimated: Some(clustered.estimates(vector, count, only.as_ref(), layer.dead, &ties)),
+        },
+        Vectors::Binary(binary) => Candidates {
+            exact: binary
+                .shortlist(vector, count, only.as_ref(), layer.dead, &ties)
+                .into_iter()
+                .chain(unmeasured)
+                .collect(),
+            estimated: None,
+        },
     }
-}
-
-/// Keep in `rows` the `count` with the nearest estimates, in no order,
-/// returning the others.
-fn nearest_estimated<T>(rows: &mut Vec<(f32, T)>, count: usize) -> Vec<(f32, T)> {
-    if rows.len() <= count {
-        return Vec::new();
-    }
-    rows.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0));
-    rows.split_off(count)
 }
 
 /// The layer's live `row` scored exactly, if it has a vector.
@@ -191,4 +198,52 @@ fn many_are_live<I: Iterator<Item = u32>>(
     let dead = layer.deaths as u64;
     allowed > threshold
         && (allowed - allowed.min(dead) > threshold || live().count() as u64 > threshold)
+}
+
+#[cfg(test)]
+mod tests {
+    use vellev_core::ObjectId;
+
+    use super::*;
+    use crate::format::Row;
+    use crate::state::Indexes;
+
+    fn rows(ids: &[u128]) -> Vec<Row> {
+        ids.iter()
+            .map(|id| Row {
+                collection: CollectionId(0),
+                object: Object {
+                    id: ObjectId(uuid::Uuid::from_u128(*id)),
+                    properties: Default::default(),
+                    vector: Some(vec![1.0]),
+                },
+            })
+            .collect()
+    }
+
+    /// Rows estimated alike in two layers are cut in object id order
+    /// across both, not layer by layer.
+    #[test]
+    fn ties_across_layers_are_cut_in_object_id_order() {
+        let (first, second) = (rows(&[30, 10]), rows(&[20, 5]));
+        let indexes = Indexes::new();
+        let layer = |rows| Layer {
+            rows,
+            dead: &[false, false],
+            deaths: 0,
+            indexes: &indexes,
+            vectors: None,
+        };
+        let layers = [layer(&first), layer(&second)];
+        let mut estimated: Vec<(f32, (usize, u32))> = [(0, 0), (0, 1), (1, 0), (1, 1)]
+            .map(|at| (1.0, at))
+            .to_vec();
+        nearest_across(&layers, &mut estimated, 2);
+        let mut kept: Vec<ObjectId> = estimated
+            .iter()
+            .map(|(_, (at, row))| layers[*at].id(*row))
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [5, 10].map(|id| ObjectId(uuid::Uuid::from_u128(id))));
+    }
 }

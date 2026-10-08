@@ -1,6 +1,8 @@
 mod common;
 
 use common::*;
+use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use vellev_index::clustered::ClusteredIndex;
 use vellev_index::vector::VectorIndex;
 use vellev_storage::{Merging, Query};
@@ -284,6 +286,98 @@ async fn an_index_file_of_another_segment_or_of_other_rows_is_not_used() {
         hits * 100 < total * 50,
         "{hits} of {total}: the check is what tells"
     );
+}
+
+/// An index file as it is stored, to write one that no build would give.
+#[derive(Serialize, Deserialize)]
+struct StoredIndexes {
+    segment: String,
+    vectors: Vec<(CollectionId, StoredIndex)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredIndex {
+    metric: Distance,
+    dimensions: usize,
+    rotation: StoredRotation,
+    centroids: Vec<f32>,
+    clusters: Vec<StoredCluster>,
+    probes: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredRotation {
+    width: usize,
+    seed: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredCluster {
+    rows: ByteBuf,
+    codes: ByteBuf,
+    norms: ByteBuf,
+    aligns: ByteBuf,
+    alongs: ByteBuf,
+}
+
+/// An index file whose checksum holds and which reads, but which is no
+/// index of the segment's vectors as they are, or says to scan a number of
+/// clusters it has not got, is not used: the segment is searched by a scan
+/// of its codes instead, and finds what it should.
+#[tokio::test]
+async fn an_index_file_that_does_not_fit_the_segments_vectors_is_not_used() {
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    merged(&cluster, &vectors).await;
+    let segment = segments_of(&cluster).await.remove(0);
+    let index = segment.index.unwrap();
+    let original = cluster.blobs.get(&index).await.unwrap();
+    let found_by_a_scan = |what: String| {
+        let (cluster, vectors) = (&cluster, &vectors);
+        async move {
+            let follower = cluster.open().await;
+            let (hits, total) = follower.partition().read(|state| found(state, vectors));
+            assert!(
+                hits * 100 >= total * 97,
+                "{what}: {hits} of {total} by a scan instead"
+            );
+        }
+    };
+
+    let built = |metric: Distance, shift: u32, vectors: &[Vec<f32>]| {
+        let rows: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(row, vector)| (row as u32 + shift, vector.as_slice()))
+            .collect();
+        ClusteredIndex::build(metric, &rows).unwrap()
+    };
+    // Of the vectors in reverse, so that an index of them misleads if it
+    // is used, as the test of another segment's shows.
+    let backwards: Vec<Vec<f32>> = vectors.iter().rev().cloned().collect();
+    let wider: Vec<Vec<f32>> = vectors
+        .iter()
+        .map(|vector| vector.iter().copied().chain([0.0; 8]).collect())
+        .collect();
+    let unfitting = [
+        ("another metric", built(Distance::Dot, 0, &backwards)),
+        ("other dimensions", built(Distance::Cosine, 0, &wider)),
+        ("other rows", built(Distance::Cosine, 1, &vectors)),
+    ];
+    for (what, unfitting) in unfitting {
+        replace_index(&cluster, &index, &segment.key, unfitting).await;
+        found_by_a_scan(format!("an index of {what}")).await;
+    }
+
+    // More clusters than any index has: used, it overflows where a query
+    // works out what a scan visits. An index to scan none is refused too,
+    // which the index's own tests tell; here it would find the same.
+    let mut stored: StoredIndexes = format::decode(&index, Kind::Index, &original).unwrap();
+    stored.vectors[0].1.probes = usize::MAX;
+    let frame = format::encode(Kind::Index, &stored).unwrap();
+    cluster.blobs.delete(&index).await.unwrap();
+    cluster.blobs.put(&index, frame).await.unwrap();
+    found_by_a_scan("an index to scan more clusters than it has".to_string()).await;
 }
 
 #[tokio::test]

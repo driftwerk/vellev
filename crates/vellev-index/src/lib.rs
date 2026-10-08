@@ -3,5 +3,6 @@
 pub mod clustered;
 pub mod filter;
 pub mod fusion;
+mod rotation;
 pub mod text;
 pub mod vector;

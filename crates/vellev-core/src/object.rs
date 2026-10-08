@@ -6,7 +6,24 @@ use serde_json::Value as Json;
 
 use crate::{Collection, DataType, Embedding, ObjectId};
 
+/// Why an object, or a vector searched by, is refused. More reasons may come,
+/// so a match on one outside this crate needs an arm for the rest:
+///
+/// ```compile_fail
+/// use vellev_core::ObjectError;
+///
+/// fn reason(error: &ObjectError) -> &'static str {
+///     match error {
+///         ObjectError::UnknownProperty(_) => "unknown property",
+///         ObjectError::Type { .. } => "wrong type",
+///         ObjectError::VectorLength { .. } => "wrong length",
+///         ObjectError::VectorNotFinite => "not finite",
+///         ObjectError::VectorTooLong => "too long",
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ObjectError {
     #[error("property {0:?} is not declared on the collection")]
     UnknownProperty(String),
@@ -19,6 +36,8 @@ pub enum ObjectError {
     VectorLength { expected: u32, got: usize },
     #[error("vector contains a value that is not a finite number")]
     VectorNotFinite,
+    #[error("vector is too long: its length must be under 2^62, about 4.6e18")]
+    VectorTooLong,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,9 +118,23 @@ impl Value {
     }
 }
 
+/// A vector's squared length must be under this, 2^124, so that its length
+/// is under 2^62. Then the squared distance between two vectors, at most
+/// `(2^62 + 2^62)^2 = 2^126`, and their inner product, at most 2^124, stay
+/// within an `f32`, which holds up to nearly 2^128. What the vector indexes
+/// estimate from such vectors is bounded as their own documentation says:
+/// never NaN, and infinite only where it ranks a row last.
+pub const SQUARED_LENGTH_UNDER: f32 = (1u128 << 124) as f32;
+
 impl Embedding {
     /// `vector` if it is one this embedding's collection can hold.
     pub fn checked(&self, vector: Vec<f32>) -> Result<Vec<f32>, ObjectError> {
+        self.check(&vector).map(|()| vector)
+    }
+
+    /// Whether `vector` is one this embedding's collection can hold, or
+    /// search by.
+    pub fn check(&self, vector: &[f32]) -> Result<(), ObjectError> {
         let expected = self.dimensions;
         if vector.len() != expected as usize {
             return Err(ObjectError::VectorLength {
@@ -112,7 +145,10 @@ impl Embedding {
         if !vector.iter().all(|v| v.is_finite()) {
             return Err(ObjectError::VectorNotFinite);
         }
-        Ok(vector)
+        if vector.iter().map(|v| v * v).sum::<f32>() >= SQUARED_LENGTH_UNDER {
+            return Err(ObjectError::VectorTooLong);
+        }
+        Ok(())
     }
 }
 
@@ -347,6 +383,22 @@ mod tests {
             parse(json!({}), Some(vector)),
             Err(ObjectError::VectorNotFinite)
         );
+    }
+
+    #[test]
+    fn a_vector_must_be_short_enough_for_every_distance_to_be_finite() {
+        let with = |values: &[f32]| {
+            let mut vector = vec![0.0; 768];
+            vector[..values.len()].copy_from_slice(values);
+            parse(json!({}), Some(vector)).map(|object| object.vector.is_some())
+        };
+        assert_eq!(with(&[4e18]), Ok(true));
+        assert_eq!(with(&[3e18, 3e18]), Ok(true));
+        // Its squared length, 1.7e38, is finite; its squared distance from
+        // its opposite, 6.8e38, is not.
+        assert_eq!(with(&[1.3e19]), Err(ObjectError::VectorTooLong));
+        assert_eq!(with(&[4e18, 4e18]), Err(ObjectError::VectorTooLong));
+        assert_eq!(with(&[1e20]), Err(ObjectError::VectorTooLong));
     }
 
     #[test]

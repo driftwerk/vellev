@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value};
-use vellev_index::clustered::ClusteredIndex;
+use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
-use vellev_index::vector::{BinaryIndex, VectorIndex};
+use vellev_index::vector::{BinaryIndex, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
@@ -92,16 +92,24 @@ impl VectorIndex for Vectors {
         }
     }
 
-    fn shortlist(
+    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+        match self {
+            Vectors::Binary(index) => index.unmeasured(only, skipped),
+            Vectors::Clustered(index) => index.unmeasured(only, skipped),
+        }
+    }
+
+    fn estimates(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
-    ) -> Vec<u32> {
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)> {
         match self {
-            Vectors::Binary(index) => index.shortlist(query, count, only, skipped),
-            Vectors::Clustered(index) => index.shortlist(query, count, only, skipped),
+            Vectors::Binary(index) => index.estimates(query, count, only, skipped, ties),
+            Vectors::Clustered(index) => index.estimates(query, count, only, skipped, ties),
         }
     }
 }
@@ -255,6 +263,10 @@ impl<'a> Layer<'a> {
         }
     }
 
+    pub fn id(&self, row: u32) -> ObjectId {
+        self.rows[row as usize].object.id
+    }
+
     pub fn live(&self, row: usize) -> Live<'a> {
         Live {
             object: &self.rows[row].object,
@@ -305,11 +317,22 @@ impl Loaded {
         }
         Ok(self.indexes.clone().unwrap_or_else(|| {
             let column = |row| self.vectors.get(row);
+            // Said once, as the segment is loaded: it is searched by a scan
+            // of its codes from now until it is next merged.
+            let unused = |collection: CollectionId, unfit: Unfit| {
+                tracing::warn!(
+                    key,
+                    collection = collection.0,
+                    %unfit,
+                    "a segment's stored index is not used"
+                );
+            };
             Arc::new(indexed(
                 catalog,
                 &self.file.rows,
                 column,
                 &self.stored,
+                unused,
                 None,
             ))
         }))
@@ -431,8 +454,10 @@ fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a 
 
 /// Index `rows` for filtering, keyword search and vector search, for the
 /// collections `catalog` knows, numbered as the rows lie. A clustered index
-/// in `stored` for a collection with as many vectors as it holds is used
-/// rather than built again; otherwise one is built for a collection with
+/// in `stored` for a collection is used rather than built again if it is
+/// one of just the collection's rows with vectors here, of their
+/// dimensions and by its metric, and `unused` is told of one that is not;
+/// otherwise one is built for a collection with
 /// more vectors than `clustered_above`, when that is given, which only the
 /// writer does. The filter indexes are summarised, the rows being all
 /// there will be. An index built under an older catalog stays right: a
@@ -443,6 +468,7 @@ pub(crate) fn indexed<'a>(
     rows: &'a [Row],
     vector_of: impl Fn(usize) -> Option<&'a [f32]>,
     stored: &Stored,
+    unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
 ) -> Indexes {
     let mut indexes = Indexes::new();
@@ -464,9 +490,12 @@ pub(crate) fn indexed<'a>(
         else {
             continue;
         };
-        let kept = stored
-            .get(collection)
-            .filter(|clustered| clustered.len() == vectors.len());
+        let kept = stored.get(collection).filter(|clustered| {
+            clustered
+                .fit(schema.distance, vectors)
+                .map_err(|unfit| unused(*collection, unfit))
+                .is_ok()
+        });
         index.vectors = match kept {
             Some(clustered) => Some(Vectors::Clustered(clustered.clone())),
             None if clustered_above
@@ -475,7 +504,7 @@ pub(crate) fn indexed<'a>(
                 ClusteredIndex::build(schema.distance, vectors)
                     .map(|clustered| Vectors::Clustered(Arc::new(clustered)))
             }
-            None => BinaryIndex::build(vectors).map(Vectors::Binary),
+            None => BinaryIndex::build(schema.distance, vectors).map(Vectors::Binary),
         };
     }
     for index in indexes.values_mut() {

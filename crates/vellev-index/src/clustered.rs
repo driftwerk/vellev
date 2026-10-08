@@ -23,7 +23,11 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use vellev_core::Distance;
 
-use crate::vector::{dot, squared_l2, Scorer, VectorIndex};
+use crate::rotation::{Random, Rotation};
+use crate::vector::{
+    allowed, as_far_from_every_vector, dot, in_row_order, measurable, nearest, normalised,
+    or_farthest, short_enough, squared_l2, Scorer, Ties, VectorIndex,
+};
 
 /// The share of the true nearest ten that the clusters scanned must hold,
 /// over sample queries, when the index is built.
@@ -37,9 +41,20 @@ const MOST_CLUSTERS: usize = 4096;
 /// How many vectors per cluster k-means is trained on, at most.
 const TRAINING_PER_CLUSTER: usize = 64;
 
+/// In what an index is not one of the vectors it is asked to stand for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Unfit {
+    #[error("it measures by another metric")]
+    Metric,
+    #[error("it is of vectors of other dimensions")]
+    Dimensions,
+    #[error("it is of other rows")]
+    Rows,
+}
+
 /// Vectors clustered around centroids, each kept as a one-bit code.
 #[derive(Clone, Deserialize)]
-#[serde(from = "Wire")]
+#[serde(try_from = "Wire")]
 pub struct ClusteredIndex {
     metric: Distance,
     dimensions: usize,
@@ -51,6 +66,9 @@ pub struct ClusteredIndex {
     /// its place in it; both follow from the clusters.
     rows: Vec<u32>,
     at: Vec<(u32, u32)>,
+    /// The rows with no estimate, in ascending order; they follow from the
+    /// clusters too.
+    unmeasured: Vec<u32>,
     /// How many clusters a query scans.
     probes: usize,
 }
@@ -68,7 +86,7 @@ impl fmt::Debug for ClusteredIndex {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "ClusterWire", into = "ClusterWire")]
+#[serde(try_from = "ClusterWire", into = "ClusterWire")]
 struct Cluster {
     rows: Vec<u32>,
     codes: Vec<u64>,
@@ -86,6 +104,49 @@ struct Factor {
     along: f32,
 }
 
+impl Factor {
+    /// What a row too long to measure is kept with: a distance from its
+    /// centroid that is not finite.
+    const UNMEASURED: Self = Self {
+        norm: f32::INFINITY,
+        align: 1.0,
+        along: 0.0,
+    };
+
+    /// The squared length of the vector `o = c + r` this factor stands for
+    /// in a cluster whose centroid `c` has the squared length `centroid`:
+    /// `|c|² + 2 |r| (r̂ · c) + |r|²`, in `f64`, where no term overflows. It
+    /// is not finite for a row kept as [`Factor::UNMEASURED`].
+    fn squared(&self, centroid: f64) -> f64 {
+        let norm = f64::from(self.norm);
+        centroid + 2.0 * norm * f64::from(self.along) + norm * norm
+    }
+}
+
+/// The rows of `clusters`, whose centroids are `centroids`, `width` values
+/// each, that are too long to measure, in ascending order. Each row's
+/// squared length is worked out again from what is stored with it rather
+/// than read from a mark: an index built before rows too long to measure
+/// were set apart kept them as any other, often at a finite distance from
+/// a centroid of their own, and only their length tells them apart.
+fn unmeasured(clusters: &[Cluster], centroids: &[f32], width: usize) -> Vec<u32> {
+    let mut rows: Vec<u32> = clusters
+        .iter()
+        .zip(centroids.chunks_exact(width))
+        .flat_map(|(members, centroid)| {
+            let centroid: f64 = centroid.iter().map(|v| f64::from(*v).powi(2)).sum();
+            members
+                .rows
+                .iter()
+                .zip(&members.factors)
+                .filter(move |(_, factor)| !short_enough(factor.squared(centroid)))
+                .map(|(row, _)| *row)
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
 /// The index on the wire: what cannot be rebuilt from the rest.
 #[derive(Serialize, Deserialize)]
 struct Wire {
@@ -97,8 +158,49 @@ struct Wire {
     probes: usize,
 }
 
-impl From<Wire> for ClusteredIndex {
-    fn from(wire: Wire) -> Self {
+impl Wire {
+    /// What is wrong with the index as read, if its parts do not fit one
+    /// another: a file that is corrupt, which would otherwise be found out
+    /// by a panic at some later query.
+    fn fault(&self) -> Option<String> {
+        let width = self.rotation.width;
+        if self.dimensions > width {
+            return Some(format!(
+                "{} dimensions in a rotation {width} wide",
+                self.dimensions
+            ));
+        }
+        if self.clusters.is_empty() {
+            return Some("no clusters".to_string());
+        }
+        if !(1..=self.clusters.len()).contains(&self.probes) {
+            return Some(format!(
+                "{} clusters to scan of {}",
+                self.probes,
+                self.clusters.len()
+            ));
+        }
+        if self.centroids.len() != self.clusters.len() * width {
+            return Some(format!(
+                "{} centroid values for {} clusters {width} wide",
+                self.centroids.len(),
+                self.clusters.len()
+            ));
+        }
+        self.clusters
+            .iter()
+            .position(|cluster| cluster.codes.len() != cluster.rows.len() * (width / 64))
+            .map(|cluster| format!("cluster {cluster}'s codes are not {width} bits a row"))
+    }
+}
+
+impl TryFrom<Wire> for ClusteredIndex {
+    type Error = String;
+
+    fn try_from(wire: Wire) -> Result<Self, Self::Error> {
+        if let Some(fault) = wire.fault() {
+            return Err(fault);
+        }
         let mut rows: Vec<(u32, (u32, u32))> = wire
             .clusters
             .iter()
@@ -113,16 +215,17 @@ impl From<Wire> for ClusteredIndex {
             .collect();
         rows.sort_unstable();
         let (rows, at) = rows.into_iter().unzip();
-        Self {
+        Ok(Self {
             metric: wire.metric,
             dimensions: wire.dimensions,
+            unmeasured: unmeasured(&wire.clusters, &wire.centroids, wire.rotation.width),
             rotation: wire.rotation,
             centroids: wire.centroids,
             clusters: wire.clusters,
             rows,
             at,
             probes: wire.probes,
-        }
+        })
     }
 }
 
@@ -176,8 +279,15 @@ impl From<Cluster> for ClusterWire {
     }
 }
 
-impl From<ClusterWire> for Cluster {
-    fn from(wire: ClusterWire) -> Self {
+/// A cluster is read back only if each of its rows has all its factors.
+impl TryFrom<ClusterWire> for Cluster {
+    type Error = String;
+
+    fn try_from(wire: ClusterWire) -> Result<Self, Self::Error> {
+        let rows = wire.rows.len();
+        if [wire.norms.len(), wire.aligns.len(), wire.alongs.len()] != [rows; 3] {
+            return Err(format!("a cluster of {rows} rows without factors for each"));
+        }
         let factors = wire
             .norms
             .into_iter()
@@ -185,88 +295,11 @@ impl From<ClusterWire> for Cluster {
             .zip(wire.alongs)
             .map(|((norm, align), along)| Factor { norm, align, along })
             .collect();
-        Self {
+        Ok(Self {
             rows: wire.rows,
             codes: wire.codes,
             factors,
-        }
-    }
-}
-
-/// A random orthogonal rotation: random signs followed by a Walsh-Hadamard
-/// transform, over the dimensions padded to a power of two.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Rotation {
-    width: usize,
-    seed: u64,
-}
-
-impl Rotation {
-    fn new(dimensions: usize, seed: u64) -> Self {
-        Self {
-            width: dimensions.next_power_of_two().max(64),
-            seed,
-        }
-    }
-
-    fn apply(&self, vector: &[f32]) -> Vec<f32> {
-        let mut random = Random(self.seed);
-        let mut rotated: Vec<f32> = (0..self.width)
-            .map(|i| {
-                let sign = if random.next() & 1 == 0 { 1.0 } else { -1.0 };
-                vector.get(i).copied().unwrap_or(0.0) * sign
-            })
-            .collect();
-        let mut half = 1;
-        while half < self.width {
-            for block in rotated.chunks_exact_mut(half * 2) {
-                let (low, high) = block.split_at_mut(half);
-                for (a, b) in low.iter_mut().zip(high) {
-                    let (x, y) = (*a, *b);
-                    *a = x + y;
-                    *b = x - y;
-                }
-            }
-            half *= 2;
-        }
-        let scale = 1.0 / (self.width as f32).sqrt();
-        rotated.iter_mut().for_each(|value| *value *= scale);
-        rotated
-    }
-}
-
-/// A small deterministic generator; the rotation and the sampling need
-/// nothing better, and must come out the same on every load.
-struct Random(u64);
-
-impl Random {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, bound: usize) -> usize {
-        (self.next() % bound as u64) as usize
-    }
-
-    /// `count` of the positions `0..len`, or all of them if there are no
-    /// more, in ascending order. Chosen at random rather than evenly
-    /// spaced: rows written in a repeating pattern would otherwise be
-    /// sampled in step with it, and whole kinds of vector left out.
-    fn sample(&mut self, len: usize, count: usize) -> Vec<usize> {
-        if count >= len {
-            return (0..len).collect();
-        }
-        let mut chosen = std::collections::HashSet::with_capacity(count);
-        while chosen.len() < count {
-            chosen.insert(self.below(len));
-        }
-        let mut chosen: Vec<usize> = chosen.into_iter().collect();
-        chosen.sort_unstable();
-        chosen
+        })
     }
 }
 
@@ -372,30 +405,60 @@ impl PartialOrd for Candidate {
     }
 }
 
-/// The `count` nearest candidates offered, farthest on top.
-struct Nearest {
+/// The `count` nearest candidates offered, farthest on top, and those
+/// offered as far as the farthest of them that did not fit: which of the
+/// candidates at that distance are kept is for `ties` to say.
+struct Nearest<'a> {
     count: usize,
     heap: BinaryHeap<Candidate>,
+    /// Never more than twice `count`: past that, only the first `count` by
+    /// `ties` can be kept, and the rest are let go.
+    tied: Vec<u32>,
+    ties: Ties<'a>,
 }
 
-impl Nearest {
-    fn new(count: usize) -> Self {
+impl<'a> Nearest<'a> {
+    fn new(count: usize, ties: Ties<'a>) -> Self {
         Self {
             count,
             heap: BinaryHeap::with_capacity(count + 1),
+            tied: Vec::new(),
+            ties,
+        }
+    }
+
+    fn tie(&mut self, row: u32) {
+        self.tied.push(row);
+        if self.tied.len() > 2 * self.count {
+            self.tied
+                .select_nth_unstable_by(self.count, |a, b| (self.ties)(*a, *b));
+            self.tied.truncate(self.count);
         }
     }
 
     fn offer(&mut self, distance: f32, row: u32) {
+        let distance = or_farthest(distance);
         if self.heap.len() < self.count {
             self.heap.push(Candidate { distance, row });
-        } else if self
-            .heap
-            .peek()
-            .is_some_and(|worst| distance < worst.distance)
-        {
-            self.heap.pop();
-            self.heap.push(Candidate { distance, row });
+            return;
+        }
+        let Some(mut worst) = self.heap.peek_mut() else {
+            return;
+        };
+        match distance.total_cmp(&worst.distance) {
+            Ordering::Greater => {}
+            Ordering::Equal => {
+                drop(worst);
+                self.tie(row);
+            }
+            Ordering::Less => {
+                let out = std::mem::replace(&mut *worst, Candidate { distance, row });
+                drop(worst);
+                match self.heap.peek().map(|worst| worst.distance) {
+                    Some(worst) if worst.total_cmp(&out.distance).is_eq() => self.tie(out.row),
+                    _ => self.tied.clear(),
+                }
+            }
         }
     }
 
@@ -403,24 +466,27 @@ impl Nearest {
         self.heap.len() >= self.count
     }
 
+    /// The nearest `count`, those as far as the farthest of them taken in
+    /// `ties` order.
     fn estimates(self) -> Vec<(f32, u32)> {
-        self.heap
+        let Self {
+            count,
+            heap,
+            tied,
+            ties,
+        } = self;
+        let farthest = heap.peek().map(|worst| worst.distance);
+        let mut estimates: Vec<(f32, u32)> = heap
             .into_iter()
             .map(|candidate| (candidate.distance, candidate.row))
-            .collect()
-    }
-}
-
-fn normalised(metric: Distance, vector: &[f32]) -> Vec<f32> {
-    match metric {
-        Distance::Cosine => {
-            let norm = dot(vector, vector).sqrt();
-            match norm > 0.0 && norm.is_finite() {
-                true => vector.iter().map(|value| value / norm).collect(),
-                false => vector.to_vec(),
-            }
-        }
-        Distance::Dot | Distance::L2 => vector.to_vec(),
+            .collect();
+        estimates.extend(
+            farthest
+                .into_iter()
+                .flat_map(|distance| tied.iter().map(move |row| (distance, *row))),
+        );
+        nearest(&mut estimates, count, |a, b| ties(*a, *b));
+        estimates
     }
 }
 
@@ -491,23 +557,41 @@ impl ClusteredIndex {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
-        let mut random = Random(vectors.len() as u64 ^ ((dimensions as u64) << 32));
+        // Clusters, and how many a query scans, are drawn from the rows that
+        // can be measured alone; any other, stored before lengths were
+        // limited, would drag them far away. The rows that can are all the
+        // index is shaped by, so it comes out the same with or without the
+        // others.
+        let measured: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .copied()
+            .filter(|(_, vector)| measurable(metric, vector))
+            .collect();
+        let mut random = Random(measured.len() as u64 ^ ((dimensions as u64) << 32));
         let rotation = Rotation::new(dimensions, random.next());
         let width = rotation.width;
         let rotated = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
 
-        let k = clusters_for(vectors.len());
+        let k = clusters_for(measured.len().max(1));
         let training: Vec<Vec<f32>> = random
-            .sample(vectors.len(), k * TRAINING_PER_CLUSTER)
+            .sample(measured.len(), k * TRAINING_PER_CLUSTER)
             .into_par_iter()
-            .map(|at| rotated(vectors[at].1))
+            .map(|at| rotated(measured[at].1))
             .collect();
-        let centroids = kmeans(&training, k, width, &mut random);
+        let centroids = match training.is_empty() {
+            true => vec![0.0; k * width],
+            false => kmeans(&training, k, width, &mut random),
+        };
 
         let scale = 1.0 / (width as f32).sqrt();
         let coded: Vec<(usize, Vec<u64>, Factor)> = vectors
             .par_iter()
             .map(|(_, vector)| {
+                // Defence in depth: its length, worked out again from its
+                // factors, would set such a row apart even if it were coded.
+                if !measurable(metric, vector) {
+                    return (0, vec![0; width / 64], Factor::UNMEASURED);
+                }
                 let rotated = rotated(vector);
                 let cluster = nearest_centroid(&centroids, width, &rotated);
                 let centroid = &centroids[cluster * width..][..width];
@@ -555,6 +639,7 @@ impl ClusteredIndex {
         let mut index = Self {
             metric,
             dimensions,
+            unmeasured: unmeasured(&clusters, &centroids, width),
             rotation,
             centroids,
             clusters,
@@ -562,13 +647,32 @@ impl ClusteredIndex {
             at,
             probes: 1,
         };
-        index.probes = index.tuned(vectors, &mut random);
+        index.probes = index.tuned(&measured, &mut random);
         Some(index)
     }
 
     /// How many clusters a query scans.
     pub fn probes(&self) -> usize {
         self.probes
+    }
+
+    /// Whether this is an index of just these vectors' rows, of their
+    /// dimensions, measured by `metric`, or else in what it is not: what
+    /// one read back from a file must be before it is trusted with them.
+    /// An index of other rows would name rows that are not there, and one
+    /// of other dimensions or another metric would answer nothing, or
+    /// wrongly.
+    pub fn fit(&self, metric: Distance, vectors: &[(u32, &[f32])]) -> Result<(), Unfit> {
+        let dimensions = vectors.first().map(|(_, vector)| vector.len());
+        if self.metric != metric {
+            Err(Unfit::Metric)
+        } else if dimensions.is_some_and(|dimensions| dimensions != self.dimensions) {
+            Err(Unfit::Dimensions)
+        } else if !self.rows.iter().eq(vectors.iter().map(|(row, _)| row)) {
+            Err(Unfit::Rows)
+        } else {
+            Ok(())
+        }
     }
 
     /// How many clusters the rows are grouped in.
@@ -578,7 +682,8 @@ impl ClusteredIndex {
 
     /// The fewest clusters whose scan holds [`RECALL_FLOOR`] of the true
     /// nearest [`TUNING_NEIGHBOURS`] of sample queries drawn at random from
-    /// the vectors themselves, each left out of its own neighbours.
+    /// `vectors` themselves, each left out of its own neighbours: the rows
+    /// that can be measured, as no other is ever offered.
     fn tuned(&self, vectors: &[(u32, &[f32])], random: &mut Random) -> usize {
         let ranks: Vec<usize> = random
             .sample(vectors.len(), TUNING_QUERIES)
@@ -586,7 +691,7 @@ impl ClusteredIndex {
             .map(|at| &vectors[at])
             .flat_map_iter(|(row, query)| {
                 let scorer = Scorer::new(self.metric, query);
-                let mut nearest = Nearest::new(TUNING_NEIGHBOURS);
+                let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
                 for (other, vector) in vectors {
                     if other != row {
                         nearest.offer(scorer.distance(vector), *other);
@@ -650,23 +755,68 @@ impl ClusteredIndex {
         order
     }
 
-    /// Up to `count` rows likely to be nearest `query`, as for
-    /// [`VectorIndex::shortlist`], each with its estimated distance under
-    /// the index's metric: comparable with the estimates of other indexes
-    /// of vectors measured the same way.
-    pub fn estimates(
+    fn position(&self, row: u32) -> Option<usize> {
+        self.rows.binary_search(&row).ok()
+    }
+
+    fn centroid(&self, cluster: usize) -> &[f32] {
+        &self.centroids[cluster * self.rotation.width..][..self.rotation.width]
+    }
+
+    fn code<'a>(&self, cluster: &'a Cluster, index: usize) -> &'a [u64] {
+        let words = self.rotation.width / 64;
+        &cluster.codes[index * words..][..words]
+    }
+}
+
+impl VectorIndex for ClusteredIndex {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+        allowed(&self.unmeasured, only, skipped)
+    }
+
+    /// Each estimate is a distance under the index's metric, comparable
+    /// with the estimates of other clustered indexes of vectors measured
+    /// the same way.
+    fn estimates(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
+        ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
+        // A row with no estimate is never offered: the caller scores it.
+        let kept = |row: u32| {
+            !skipped.get(row as usize).copied().unwrap_or(false)
+                && self.unmeasured.binary_search(&row).is_err()
+        };
+        let mut nearest = Nearest::new(count, ties);
+        // A query as far from every row is estimated alike for each, in
+        // whatever cluster, and the caller's order decides.
+        if as_far_from_every_vector(self.metric, query) {
+            let mut offer = |row: u32| nearest.offer(0.0, row);
+            match only {
+                Some(only) => only
+                    .iter()
+                    .filter(|row| kept(*row) && self.position(*row).is_some())
+                    .for_each(&mut offer),
+                None => self
+                    .rows
+                    .iter()
+                    .copied()
+                    .filter(|row| kept(*row))
+                    .for_each(&mut offer),
+            }
+            return nearest.estimates();
+        }
         let query = self.prepared(query);
-        let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
-        let mut nearest = Nearest::new(count);
         let per_probe = self.rows.len().div_ceil(self.clusters.len()) * self.probes;
         match only {
             // Fewer rows allowed than a scan would visit: visit just those,
@@ -709,38 +859,6 @@ impl ClusteredIndex {
             }
         }
         nearest.estimates()
-    }
-
-    fn position(&self, row: u32) -> Option<usize> {
-        self.rows.binary_search(&row).ok()
-    }
-
-    fn centroid(&self, cluster: usize) -> &[f32] {
-        &self.centroids[cluster * self.rotation.width..][..self.rotation.width]
-    }
-
-    fn code<'a>(&self, cluster: &'a Cluster, index: usize) -> &'a [u64] {
-        let words = self.rotation.width / 64;
-        &cluster.codes[index * words..][..words]
-    }
-}
-
-impl VectorIndex for ClusteredIndex {
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn shortlist(
-        &self,
-        query: &[f32],
-        count: usize,
-        only: Option<&RoaringBitmap>,
-        skipped: &[bool],
-    ) -> Vec<u32> {
-        self.estimates(query, count, only, skipped)
-            .into_iter()
-            .map(|(_, row)| row)
-            .collect()
     }
 }
 
@@ -793,6 +911,7 @@ mod le {
 mod tests {
     use super::*;
     use crate::vector::distance;
+    use vellev_core::SQUARED_LENGTH_UNDER;
 
     struct Noise(u64);
 
@@ -853,7 +972,7 @@ mod tests {
                     .step_by(groups)
                     .map(|at| at as u32 * 2)
                     .collect();
-                let shortlist = index.shortlist(query, members.len() * 2, None, &[]);
+                let shortlist = index.shortlist(query, members.len() * 2, None, &[], &in_row_order);
                 let found = members.iter().filter(|row| shortlist.contains(row)).count();
                 assert!(
                     found * 2 >= members.len(),
@@ -894,7 +1013,7 @@ mod tests {
                 .map(|(row, v)| (distance(metric, query, v), row as u32 * 2))
                 .collect();
             exact.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let shortlist = index.shortlist(query, count, None, &[]);
+            let shortlist = index.shortlist(query, count, None, &[], &in_row_order);
             found += exact[..10]
                 .iter()
                 .filter(|(_, row)| shortlist.contains(row))
@@ -902,20 +1021,6 @@ mod tests {
             total += 10;
         }
         (found, total)
-    }
-
-    #[test]
-    fn the_rotation_keeps_lengths_and_inner_products() {
-        let mut noise = Noise(5);
-        let rotation = Rotation::new(100, 77);
-        assert_eq!(rotation.width, 128);
-        for _ in 0..5 {
-            let (a, b) = (noise.vector(100), noise.vector(100));
-            let (ra, rb) = (rotation.apply(&a), rotation.apply(&b));
-            assert!((dot(&a, &b) - dot(&ra, &rb)).abs() < 1e-4);
-            assert!((dot(&a, &a) - dot(&ra, &ra)).abs() < 1e-4);
-        }
-        assert_eq!(rotation.apply(&[1.0; 100]), rotation.apply(&[1.0; 100]));
     }
 
     /// Vectors with no group structure and lengths spread over a range.
@@ -981,18 +1086,6 @@ mod tests {
     }
 
     #[test]
-    fn the_rotation_spreads_a_direction_over_every_coordinate() {
-        let rotation = Rotation::new(64, 3);
-        let rotated = rotation.apply(&[1.0; 64]);
-        let largest = rotated.iter().fold(0.0f32, |most, v| most.max(v.abs()));
-        let length = dot(&rotated, &rotated).sqrt();
-        assert!(
-            largest < 0.5 * length,
-            "{largest} of {length} in one coordinate"
-        );
-    }
-
-    #[test]
     fn a_shortlist_holds_the_true_neighbours_under_every_metric() {
         let vectors = grouped(42, 6000, 128, 40, 0.4);
         for metric in [Distance::Cosine, Distance::Dot, Distance::L2] {
@@ -1039,29 +1132,32 @@ mod tests {
         let query = &vectors[0];
 
         let only: RoaringBitmap = [0u32, 2, 3, 40, 198, 9999].into_iter().collect();
-        let mut allowed = index.shortlist(query, 50, Some(&only), &[]);
+        let mut allowed = index.shortlist(query, 50, Some(&only), &[], &in_row_order);
         allowed.sort_unstable();
         assert_eq!(allowed, [0, 2, 40, 198], "rows 3 and 9999 are not indexed");
 
         let mut skipped = vec![false; 4000];
         skipped[0] = true;
         skipped[40] = true;
-        let mut kept = index.shortlist(query, 50, Some(&only), &skipped);
+        let mut kept = index.shortlist(query, 50, Some(&only), &skipped, &in_row_order);
         kept.sort_unstable();
         assert_eq!(kept, [2, 198]);
 
         let every_other: RoaringBitmap = (0..4000u32).filter(|row| row % 4 == 0).collect();
-        let wide = index.shortlist(query, 30, Some(&every_other), &skipped);
+        let wide = index.shortlist(query, 30, Some(&every_other), &skipped, &in_row_order);
         assert_eq!(wide.len(), 30, "scans on past the usual probes until full");
         assert!(wide
             .iter()
             .all(|row| row % 4 == 0 && *row != 0 && *row != 40));
 
-        let everything = index.shortlist(query, 5000, None, &skipped);
+        let everything = index.shortlist(query, 5000, None, &skipped, &in_row_order);
         assert_eq!(everything.len(), 1998);
-        assert_eq!(index.shortlist(query, 0, None, &[]), Vec::<u32>::new());
         assert_eq!(
-            index.shortlist(&query[..10], 5, None, &[]),
+            index.shortlist(query, 0, None, &[], &in_row_order),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            index.shortlist(&query[..10], 5, None, &[], &in_row_order),
             Vec::<u32>::new()
         );
         assert!(ClusteredIndex::build(Distance::L2, &[]).is_none());
@@ -1073,7 +1169,7 @@ mod tests {
         let index = indexed(Distance::L2, &vectors);
         let query = &vectors[7];
         let few: RoaringBitmap = (0..6000u32).filter(|row| row % 100 == 0).collect();
-        let mut by_rows = index.shortlist(query, 30, Some(&few), &[]);
+        let mut by_rows = index.shortlist(query, 30, Some(&few), &[], &in_row_order);
         by_rows.sort_unstable();
         let mut exact: Vec<(f32, u32)> = few
             .iter()
@@ -1097,11 +1193,288 @@ mod tests {
         let same: Vec<Vec<f32>> = vec![vec![1.0, 2.0, 3.0]; 5];
         let index = indexed(Distance::L2, &same);
         assert!(index.clusters() <= 2);
-        let mut rows = index.shortlist(&[1.0, 2.0, 3.0], 10, None, &[]);
+        let mut rows = index.shortlist(&[1.0, 2.0, 3.0], 10, None, &[], &in_row_order);
         rows.sort_unstable();
         assert_eq!(rows, [0, 2, 4, 6, 8]);
         let one = ClusteredIndex::build(Distance::Cosine, &[(3, &[0.0, 0.0])]).unwrap();
-        assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[]), [3]);
+        assert_eq!(one.shortlist(&[1.0, 0.0], 1, None, &[], &in_row_order), [3]);
+    }
+
+    /// What a row's factors say of its squared length is what it is: for
+    /// rows at an everyday length, and for rows leaning far one way near
+    /// the length limit, where each lies far along its centroid.
+    #[test]
+    fn a_rows_squared_length_is_worked_out_again_from_its_factors() {
+        let everyday = scattered(41, 2000, 48);
+        let mut noise = Noise(43);
+        let lean = noise.vector(48);
+        let far: Vec<Vec<f32>> = (0..2000)
+            .map(|_| {
+                let vector: Vec<f32> = lean.iter().map(|l| l + 0.3 * noise.unit()).collect();
+                let scale = (0.9 * SQUARED_LENGTH_UNDER / dot(&vector, &vector)).sqrt();
+                vector.into_iter().map(|v| v * scale).collect()
+            })
+            .collect();
+        for vectors in [everyday, far] {
+            for metric in [Distance::Dot, Distance::L2] {
+                let index = indexed(metric, &vectors);
+                assert!(index.unmeasured(None, &[]).is_empty());
+                for (at, vector) in vectors.iter().enumerate().step_by(7) {
+                    let (cluster, place) = index.at[index.position(at as u32 * 2).unwrap()];
+                    let centroid = index.centroid(cluster as usize);
+                    let centroid: f64 = centroid.iter().map(|v| f64::from(*v).powi(2)).sum();
+                    let factor = index.clusters[cluster as usize].factors[place as usize];
+                    let rotated = index.prepared(vector);
+                    let exact: f64 = rotated.iter().map(|v| f64::from(*v).powi(2)).sum();
+                    let worked = factor.squared(centroid);
+                    assert!(
+                        (worked - exact).abs() <= 1e-4 * exact,
+                        "{metric:?}: {worked} against {exact}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Indexes built by the release before, which knew nothing of rows too
+    /// long to measure, gave them codes and finite distances from their
+    /// centroids: thirty copies each of `[±2.3e18; 32]` far from theirs,
+    /// and two hundred of `[1e19; 32]` a cluster of their own, at no
+    /// distance from its centroid. Read back, they are recognised from what
+    /// was stored, and left to be scored exactly.
+    #[test]
+    fn indexes_built_before_rows_were_measured_recognise_them_on_load() {
+        let fixtures: [(&[u8], usize); 2] = [
+            (
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/clustered-main-legacy-rows.msgpack"
+                )),
+                60,
+            ),
+            (
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/clustered-main-own-cluster.msgpack"
+                )),
+                200,
+            ),
+        ];
+        for (bytes, long) in fixtures {
+            let index: ClusteredIndex = rmp_serde::from_slice(bytes).unwrap();
+            assert_eq!(index.len(), 3000 + long);
+            let rows: Vec<u32> = (3000..3000 + long as u32).map(|row| row * 2).collect();
+            assert_eq!(index.unmeasured(None, &[]), rows, "{long} long rows");
+            for query in grouped(31, 3000, 32, 10, 0.4).iter().step_by(300) {
+                let shortlist = index.shortlist(query, 100, None, &[], &in_row_order);
+                assert!(shortlist.iter().all(|row| *row < 6000));
+            }
+        }
+    }
+
+    /// Rows that cannot be measured shape nothing: the clusters, and how
+    /// many a query scans, which is kept with the index and paid by every
+    /// query, come out as without them.
+    #[test]
+    fn rows_too_long_to_measure_leave_the_index_as_it_would_be() {
+        let measured = grouped(29, 3000, 32, 10, 0.4);
+        let with_long: Vec<Vec<f32>> = measured
+            .iter()
+            .enumerate()
+            .flat_map(|(at, vector)| {
+                let long = (at % 50 == 0)
+                    .then(|| vec![2.3e18 * if at % 100 == 0 { 1.0 } else { -1.0 }; 32]);
+                std::iter::once(vector.clone()).chain(long)
+            })
+            .collect();
+        assert_eq!(with_long.len(), 3060);
+        for metric in [Distance::Dot, Distance::L2] {
+            let (without, with) = (indexed(metric, &measured), indexed(metric, &with_long));
+            assert_eq!(with.unmeasured(None, &[]).len(), 60);
+            assert_eq!(
+                (with.clusters(), with.probes()),
+                (without.clusters(), without.probes()),
+                "{metric:?}"
+            );
+            assert_eq!(with.centroids, without.centroids, "{metric:?}");
+        }
+    }
+
+    /// Vectors longer than a collection accepts have no estimate: they draw
+    /// no centroid to them, take no place in a shortlist, and are left for
+    /// the caller to score exactly, read back from the wire as they were.
+    #[test]
+    fn vectors_too_long_to_measure_are_left_to_be_scored_exactly() {
+        let mut vectors = grouped(23, 3000, 32, 10, 0.4);
+        vectors.extend(std::iter::repeat_n(vec![2.3e18; 32], 300));
+        let long: Vec<u32> = (3000..3300u32).map(|row| row * 2).collect();
+        for metric in [Distance::Dot, Distance::L2] {
+            let index = indexed(metric, &vectors);
+            assert_eq!(index.len(), 3300);
+            assert_eq!(index.unmeasured(None, &[]), long, "{metric:?}");
+            let mut found = 0;
+            for query in vectors[..3000].iter().step_by(300) {
+                let shortlist = index.shortlist(query, 100, None, &[], &in_row_order);
+                assert_eq!(shortlist.len(), 100);
+                assert!(shortlist.iter().all(|row| *row < 6000), "{metric:?}");
+                let mut exact: Vec<(f32, u32)> = vectors[..3000]
+                    .iter()
+                    .enumerate()
+                    .map(|(row, v)| (distance(metric, query, v), row as u32 * 2))
+                    .collect();
+                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+                found += exact[..10]
+                    .iter()
+                    .filter(|(_, row)| shortlist.contains(row))
+                    .count();
+            }
+            assert!(found >= 90, "{metric:?}: {found} of 100 true neighbours");
+            let bytes = rmp_serde::to_vec_named(&index).unwrap();
+            let back: ClusteredIndex = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.unmeasured(None, &[]), long);
+        }
+    }
+
+    /// A flood of rows at one distance, as of copies of one vector, holds
+    /// no more than twice the count while scanned, and keeps the first of
+    /// them by the caller's order.
+    #[test]
+    fn a_flood_of_ties_is_held_to_twice_the_count() {
+        let backwards = |a: u32, b: u32| b.cmp(&a);
+        let mut nearest = Nearest::new(3, &backwards);
+        for row in 0..10_000 {
+            let before = nearest.tied.len();
+            nearest.offer(1.0, row);
+            let after = nearest.tied.len();
+            assert!(after <= 6, "{after} tied");
+            // Let go of all but the count at once, not one at a time.
+            assert!(before < 6 || after == 3, "{before} tied became {after}");
+        }
+        let mut rows: Vec<u32> = nearest
+            .estimates()
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(rows, [9997, 9998, 9999]);
+    }
+
+    /// Rows tied with the farthest of the nearest are tied no longer once
+    /// a nearer row puts it out and the farthest left is nearer still: none
+    /// of them may then displace the rows that are kept.
+    #[test]
+    fn ties_with_a_farthest_that_is_put_out_are_let_go() {
+        let mut nearest = Nearest::new(1, &in_row_order);
+        nearest.offer(1.0, 5);
+        nearest.offer(1.0, 3);
+        nearest.offer(0.5, 9);
+        assert_eq!(nearest.estimates(), [(0.5, 9)]);
+    }
+
+    /// A row put out of the nearest by a nearer one, when the farthest left
+    /// is as far as it was, is still tied with it, and the caller's order
+    /// may yet prefer it.
+    #[test]
+    fn a_row_put_out_by_a_nearer_one_stays_tied_with_the_farthest() {
+        let backwards = |a: u32, b: u32| b.cmp(&a);
+        let mut nearest = Nearest::new(2, &backwards);
+        nearest.offer(1.0, 5);
+        nearest.offer(1.0, 7);
+        nearest.offer(0.5, 9);
+        let mut rows: Vec<u32> = nearest
+            .estimates()
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(rows, [7, 9]);
+    }
+
+    /// An index is one of just the rows, dimensions and metric it was built
+    /// of: whoever reads one back for some vectors asks before trusting it.
+    #[test]
+    fn an_index_fits_only_the_vectors_it_was_built_of() {
+        let vectors = grouped(27, 500, 16, 5, 0.4);
+        let rows = |shift: u32, vectors: &'_ [Vec<f32>]| -> Vec<(u32, Vec<f32>)> {
+            vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2 + shift, v.clone()))
+                .collect()
+        };
+        let index = indexed(Distance::Cosine, &vectors);
+        let fit = |metric, rows: &[(u32, Vec<f32>)]| {
+            let rows: Vec<(u32, &[f32])> =
+                rows.iter().map(|(row, v)| (*row, v.as_slice())).collect();
+            index.fit(metric, &rows)
+        };
+        let wider = grouped(27, 500, 17, 5, 0.4);
+        assert_eq!(fit(Distance::Cosine, &rows(0, &vectors)), Ok(()));
+        assert_eq!(fit(Distance::Dot, &rows(0, &vectors)), Err(Unfit::Metric));
+        assert_eq!(
+            fit(Distance::Cosine, &rows(0, &wider)),
+            Err(Unfit::Dimensions)
+        );
+        assert_eq!(fit(Distance::Cosine, &rows(1, &vectors)), Err(Unfit::Rows));
+        assert_eq!(
+            fit(Distance::Cosine, &rows(0, &vectors[..499])),
+            Err(Unfit::Rows)
+        );
+    }
+
+    /// An index whose stored parts do not fit one another is refused when
+    /// read: a width no rotation has, which would otherwise be sized by,
+    /// and centroids, codes, factors or a count of clusters to scan that
+    /// would otherwise panic at some later query. Whether it is an index of
+    /// the vectors it is read for is not told here but by
+    /// [`ClusteredIndex::fit`].
+    #[test]
+    fn an_index_whose_parts_do_not_fit_is_refused_on_load() {
+        let index = indexed(Distance::L2, &grouped(21, 1000, 48, 8, 0.4));
+        let bytes = rmp_serde::to_vec_named(&index).unwrap();
+        type Corrupt = fn(&mut Wire);
+        let reread = |corrupt: Corrupt| {
+            let mut wire: Wire = rmp_serde::from_slice(&bytes).unwrap();
+            corrupt(&mut wire);
+            let bytes = rmp_serde::to_vec_named(&wire).unwrap();
+            rmp_serde::from_slice::<ClusteredIndex>(&bytes).map(|index| index.len())
+        };
+        assert_eq!(reread(|_| {}).unwrap(), 1000);
+        let corruptions: [(&str, Corrupt); 11] = [
+            ("no clusters to scan", |wire| wire.probes = 0),
+            ("more clusters to scan than there are", |wire| {
+                wire.probes = usize::MAX
+            }),
+            ("no width", |wire| wire.rotation.width = 0),
+            ("a width that is no power of two", |wire| {
+                wire.rotation.width = 100
+            }),
+            ("a width beyond memory", |wire| {
+                wire.rotation.width = 1 << 40
+            }),
+            ("a width the centroids and codes are not of", |wire| {
+                wire.rotation.width = 128
+            }),
+            ("more dimensions than the width", |wire| {
+                wire.dimensions = 65
+            }),
+            ("a centroid cut short", |wire| {
+                wire.centroids.pop();
+            }),
+            ("a code cut short", |wire| {
+                wire.clusters[0].codes.pop();
+            }),
+            ("a row without factors", |wire| {
+                wire.clusters[0].factors.pop();
+            }),
+            ("no clusters", |wire| {
+                wire.clusters.clear();
+                wire.centroids.clear();
+            }),
+        ];
+        for (what, corrupt) in corruptions {
+            assert!(reread(corrupt).is_err(), "an index with {what} was read");
+        }
     }
 
     #[test]
@@ -1111,8 +1484,8 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&index).unwrap();
         let back: ClusteredIndex = rmp_serde::from_slice(&bytes).unwrap();
         for query in vectors.iter().step_by(100) {
-            let mut a = index.shortlist(query, 20, None, &[]);
-            let mut b = back.shortlist(query, 20, None, &[]);
+            let mut a = index.shortlist(query, 20, None, &[], &in_row_order);
+            let mut b = back.shortlist(query, 20, None, &[], &in_row_order);
             a.sort_unstable();
             b.sort_unstable();
             assert_eq!(a, b);
