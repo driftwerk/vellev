@@ -1191,6 +1191,13 @@ async fn a_run_deletes_nothing_when_more_is_gone_than_it_may_delete() {
     }
     weaviate.put(class, 5, changed(5)).await;
 
+    let caught_up = || {
+        let state = std::fs::read(&importing.options.state).unwrap();
+        let progress: Value = serde_json::from_slice(&state).unwrap();
+        progress["classes"][class]["caught_up_to"].clone()
+    };
+    let before = caught_up();
+
     // By default a run deletes at most one object in twenty of a class.
     let usual = Options {
         deletes: Options::new(Default::default()).deletes,
@@ -1201,6 +1208,11 @@ async fn a_run_deletes_nothing_when_more_is_gone_than_it_may_delete() {
     assert_eq!(counts(&report, class), ([0, 1, 0, 0, 0], [37, 40, 40]));
     assert_eq!((copied.pending, copied.budget), (3, Some(2)));
     assert_eq!(report.outcome(false), Outcome::Unsettled);
+    assert_eq!(
+        caught_up(),
+        before,
+        "a catch-up that deleted nothing it should have is not one to go on from"
+    );
     for n in [1, 2, 3] {
         assert!(importing.get(n).await.is_some());
     }
@@ -1215,6 +1227,7 @@ async fn a_run_deletes_nothing_when_more_is_gone_than_it_may_delete() {
     assert_eq!(counts(&report, class), ([0; 5], [37, 40, 40]));
     assert_eq!((copied.pending, copied.budget), (3, None));
     assert_eq!(report.outcome(true), Outcome::Settled);
+    assert_ne!(caught_up(), before);
 
     // Within what it may delete, it deletes: three of the sixty the
     // ledger then holds.
@@ -1594,6 +1607,13 @@ async fn a_collection_without_a_ledger_is_taken_up_and_given_nothing_it_lacks() 
     weaviate.add(class, 301..302).await;
     assert_eq!(importing.counts().await, ([1, 1, 1, 3, 0], [120, 120, 119]));
     assert!(importing.get(301).await.is_some());
+
+    // And by one that has lost its state and walks from the start: the
+    // taking up is over, and is not begun again.
+    weaviate.add(class, 302..303).await;
+    std::fs::remove_file(&importing.options.state).unwrap();
+    assert_eq!(importing.counts().await, ([1, 0, 0, 3, 0], [121, 121, 120]));
+    assert!(importing.get(302).await.is_some());
 }
 
 #[tokio::test]

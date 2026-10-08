@@ -2565,11 +2565,10 @@ impl Weaviate {
             let (status, _) = self
                 .answer("whether it is ready", |http| http.get(&url))
                 .await?;
-            let shards = match status.is_success() {
-                true => self.shards(class).await?,
-                false => Some(vec![(String::new(), false)]),
-            };
-            let Some(shards) = shards else {
+            if !status.is_success() {
+                bail!("Weaviate answered whether it is ready with {status}; nothing was deleted");
+            }
+            let Some(shards) = self.shards(class).await? else {
                 bail!(
                     "Weaviate no longer has class {}; its objects stay in the collection",
                     class.class
