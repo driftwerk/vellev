@@ -79,6 +79,32 @@ fn dot_and_norm(a: &[f32], b: &[f32]) -> (f32, f32) {
         .fold(tail, |(dot, norm), (d, n)| (dot + d, norm + n))
 }
 
+/// As [`dot_and_norm`], in `f64`, where neither sum can overflow or vanish
+/// whatever finite values the vectors hold: for a vector whose squared
+/// length an `f32` cannot hold in full, being too long or too short.
+fn wide_dot_and_norm(a: &[f32], b: &[f32]) -> (f64, f64) {
+    let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
+    let tail = a_chunks.remainder().iter().zip(b_chunks.remainder()).fold(
+        (0.0, 0.0),
+        |(dot, norm), (x, y)| {
+            let (x, y) = (f64::from(*x), f64::from(*y));
+            (dot + x * y, norm + y * y)
+        },
+    );
+    let sums = a_chunks
+        .zip(b_chunks)
+        .fold([(0.0f64, 0.0f64); LANES], |mut sums, (x, y)| {
+            for lane in 0..LANES {
+                let (x, y) = (f64::from(x[lane]), f64::from(y[lane]));
+                sums[lane].0 += x * y;
+                sums[lane].1 += y * y;
+            }
+            sums
+        });
+    sums.iter()
+        .fold(tail, |(dot, norm), (d, n)| (dot + d, norm + n))
+}
+
 /// `distance`, or the farthest there is when it is not a number: a sort
 /// cannot be trusted to put a NaN last, as the sign it comes with varies.
 /// A negative zero comes back as zero, which a sort by total order would
@@ -131,14 +157,22 @@ pub struct Scorer<'q> {
     measure: Measure,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum Measure {
     /// The query's squared length, a normal `f32`.
     Squared(f32),
-    /// The query scaled to unit length, as its square is not.
-    Unit(Vec<f32>),
+    /// The query's squared length as only an `f64` holds it in full.
+    Wide(f64),
     /// The query has no direction.
     Directionless,
+}
+
+/// The cosine of the angle between two vectors with the inner product
+/// `along` and the squared lengths `a` and `b`. The root of a square is the
+/// number squared, to the bit, so of a vector against itself, whose inner
+/// product is its squared length summed the same way, it is exactly one.
+fn cosine(along: f64, a: f64, b: f64) -> f32 {
+    (along / (a * b).sqrt()) as f32
 }
 
 impl<'q> Scorer<'q> {
@@ -148,7 +182,10 @@ impl<'q> Scorer<'q> {
         let (_, squared) = dot_and_norm(query, query);
         let measure = match squared.is_normal() {
             true => Measure::Squared(squared),
-            false => unit(query).map_or(Measure::Directionless, Measure::Unit),
+            false => match wide_dot_and_norm(query, query).1 {
+                wide if wide > 0.0 && wide.is_finite() => Measure::Wide(wide),
+                _ => Measure::Directionless,
+            },
         };
         Self {
             metric,
@@ -157,26 +194,39 @@ impl<'q> Scorer<'q> {
         }
     }
 
+    /// The cosine of the angle between the query, of the squared length
+    /// `query`, and `vector`, worked out in `f64`: for when either's
+    /// squared length is more or less than an `f32` holds in full. `None`
+    /// when `vector` has no direction.
+    fn wide_cosine(&self, query: f64, vector: &[f32]) -> Option<f32> {
+        // A zero vector is the likeliest to come here, and need not be
+        // summed again: no value of it has a bit set but its sign. Told so,
+        // without a branch a value, rather than by comparing each to zero,
+        // which stops at the first that is not and so cannot be vectorised.
+        let set = vector
+            .iter()
+            .fold(0, |set, value| set | (value.to_bits() << 1));
+        if set == 0 {
+            return None;
+        }
+        let (along, squared) = wide_dot_and_norm(self.query, vector);
+        squared.is_finite().then(|| cosine(along, query, squared))
+    }
+
     pub fn distance(&self, vector: &[f32]) -> f32 {
         match self.metric {
             Distance::Cosine => {
-                // As both lengths' squares are normal, as nearly every pair's
-                // are, straight from them; otherwise from both directions.
-                let directions = |query: &[f32]| unit(vector).map(|vector| dot(query, &vector));
-                let cosine = match &self.measure {
+                let cosine = match self.measure {
                     Measure::Squared(query) => {
+                        // Straight from the squares where the row's is a
+                        // normal `f32` too, as nearly every one is.
                         let (along, squared) = dot_and_norm(self.query, vector);
-                        // In `f64` the product of the squares is exact and
-                        // its root correctly rounded, so a vector against
-                        // itself, whose `along` is its squared length to the
-                        // bit, has a cosine of exactly one.
-                        let lengths = (f64::from(*query) * f64::from(squared)).sqrt();
                         match squared.is_normal() {
-                            true => Some((f64::from(along) / lengths) as f32),
-                            false => unit(self.query).and_then(|query| directions(&query)),
+                            true => Some(cosine(along.into(), query.into(), squared.into())),
+                            false => self.wide_cosine(query.into(), vector),
                         }
                     }
-                    Measure::Unit(query) => directions(query),
+                    Measure::Wide(query) => self.wide_cosine(query, vector),
                     Measure::Directionless => None,
                 };
                 cosine.map_or(1.0, |cosine| 1.0 - cosine.clamp(-1.0, 1.0))
@@ -1033,51 +1083,65 @@ mod tests {
 
     /// Scoring a vector by cosine reads it once, as the inner product does,
     /// and costs little more: a shape of its sums that defeats the
-    /// compiler's vectorising has made it three times as slow before. Each
-    /// is timed at its fastest of several rounds, which whatever else the
-    /// machine is doing slows least. Timings mean nothing unoptimised, so
-    /// this runs only in a release build.
+    /// compiler's vectorising has made it three times as slow before, and a
+    /// zero row, which takes a path of its own, five times. The vectors fit
+    /// in the processor's cache, so that it is the arithmetic that is timed
+    /// and not the memory it is read from, and each kind is timed at its
+    /// fastest of many rounds, which whatever else the machine is doing
+    /// slows least. Timings mean nothing unoptimised, so this runs only in
+    /// a release build.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "timings mean nothing unoptimised")]
     fn scoring_by_cosine_costs_little_more_than_by_inner_product() {
+        use std::hint::black_box;
+
         let mut random = Random(59);
-        let vectors: Vec<Vec<f32>> = (0..20_000).map(|_| random.vector(768)).collect();
+        let vectors: Vec<Vec<f32>> = (0..32).map(|_| random.vector(768)).collect();
+        let zero = vec![vec![0.0; 768]; 32];
         let query = random.vector(768);
-        let fastest = |metric: Distance| {
+        let fastest = |metric: Distance, vectors: &[Vec<f32>]| {
             let scorer = Scorer::new(metric, &query);
-            (0..15)
+            (0..50)
                 .map(|_| {
                     let started = std::time::Instant::now();
-                    for vector in &vectors {
-                        std::hint::black_box(scorer.distance(std::hint::black_box(vector)));
+                    for vector in vectors.iter().cycle().take(3200) {
+                        black_box(scorer.distance(black_box(vector)));
                     }
                     started.elapsed()
                 })
                 .min()
-                .unwrap()
+                .map_or(0.0, |fastest| fastest.as_secs_f64())
         };
-        let (cosine, inner) = (fastest(Distance::Cosine), fastest(Distance::Dot));
-        assert!(
-            cosine < inner * 2,
-            "cosine took {cosine:?} against {inner:?} for the inner product"
+        let inner = fastest(Distance::Dot, &vectors);
+        let cosine = fastest(Distance::Cosine, &vectors) / inner;
+        let over_zero = fastest(Distance::Cosine, &zero) / inner;
+        println!(
+            "a cosine score takes {cosine:.2} times an inner product's, \
+             and {over_zero:.2} times over a zero row"
         );
+        assert!(cosine < 3.0, "{cosine:.2} times an inner product's");
+        assert!(over_zero < 4.0, "{over_zero:.2} times over a zero row");
     }
 
     /// A vector is at no cosine distance from itself, and so of certainty
-    /// exactly one, at every length and over every number of dimensions.
+    /// exactly one, over every number of dimensions and at every length:
+    /// everyday ones, and those whose squares an `f32` cannot hold in full,
+    /// down to values that are not even normal numbers.
     #[test]
     fn a_vector_against_itself_is_at_no_cosine_distance_exactly() {
         let mut random = Random(53);
+        let scales = [1e-40, 1e-30, 1e-20, 1e-6, 1.0, 1e6, 1e18, 1e30];
         for dimensions in 3..=1536 {
-            let scale = 10f32.powi(dimensions as i32 % 13 - 6);
-            let vector: Vec<f32> = random
-                .vector(dimensions)
-                .into_iter()
-                .map(|value| value * scale)
-                .collect();
-            let distance = distance(Distance::Cosine, &vector, &vector);
-            assert_eq!(distance, 0.0, "{dimensions} dimensions");
-            assert_eq!(certainty(Distance::Cosine, distance), Some(1.0));
+            for scale in [scales[dimensions % 8], scales[dimensions % 7]] {
+                let vector: Vec<f32> = random
+                    .vector(dimensions)
+                    .into_iter()
+                    .map(|value| value * scale)
+                    .collect();
+                let distance = distance(Distance::Cosine, &vector, &vector);
+                assert_eq!(distance, 0.0, "{dimensions} dimensions at {scale}");
+                assert_eq!(certainty(Distance::Cosine, distance), Some(1.0));
+            }
         }
     }
 
@@ -1102,7 +1166,14 @@ mod tests {
         assert!(
             (distance(Distance::Cosine, &east, &north_ish) - (1.0 - 0.5f32.sqrt())).abs() < 1e-6
         );
-        for vector in [[0.0f32, 0.0], [f32::INFINITY, 0.0], [f32::NAN, 1.0]] {
+        let directionless = [
+            [0.0f32, 0.0],
+            [-0.0, 0.0],
+            [-0.0, -0.0],
+            [f32::INFINITY, 0.0],
+            [f32::NAN, 1.0],
+        ];
+        for vector in directionless {
             assert_eq!(
                 distance(Distance::Cosine, &east, &vector),
                 1.0,

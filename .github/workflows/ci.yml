@@ -80,6 +80,11 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+      # What a score costs is only told optimised, so the index's tests that
+      # time it are left out above and run here: one small crate and what
+      # it depends on, built without debug info, and its timings printed.
+      - name: Index tests, optimised
+        run: cargo test --release --locked -p vellev-index --lib -- --nocapture
 
   deny:
     name: Licences
