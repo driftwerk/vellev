@@ -1264,10 +1264,12 @@ async fn an_import_begun_again_does_not_bring_back_what_another_writer_deleted()
         return;
     };
     importing.run().await.unwrap();
-    importing.records.delete(oid(2)).await.unwrap();
+    for n in 0..10 {
+        importing.records.delete(oid(n)).await.unwrap();
+    }
     // With its state lost the import walks every page again, and finds
-    // nothing in the collection under note 2's id.
+    // nothing in the collection under any id of the page: only the
+    // ledger says the objects were there.
     std::fs::remove_file(&importing.options.state).unwrap();
-    assert_eq!(importing.counts().await, ([0, 0, 0, 0], [10, 10, 9]));
-    assert!(importing.get(2).await.is_none());
+    assert_eq!(importing.counts().await, ([0, 0, 0, 0], [10, 10, 0]));
 }
