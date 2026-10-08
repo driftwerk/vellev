@@ -121,7 +121,7 @@ fn unloaded(model: &str, kept: &Path, error: &fastembed::Error) -> EmbedError {
             reason: format!("the node may not write {}: {error:#}", kept.display()),
             fault: vellev_core::ModelFault::Setup,
         },
-        false => failure(model, format!("{error:#}")),
+        false => failure(model, crate::without_keys(&format!("{error:#}"))),
     }
 }
 

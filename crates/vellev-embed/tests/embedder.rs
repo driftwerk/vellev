@@ -387,60 +387,195 @@ fn settings_never_print_a_key() {
     assert!(!printed.contains("sk-secret"), "{printed}");
 }
 
-/// A model whose first call is refused for good, but not until it is let
-/// go, and whose every other call is answered at once.
+/// A model that answers each text as the text says: "refused" is refused
+/// for good, "held" waits to be let go first, and "never" never answers.
+/// While `refusing`, every text is refused for good, after `slow`.
 #[derive(Debug, Default)]
-struct RefusedLate {
+struct Told {
     calls: std::sync::atomic::AtomicUsize,
+    in_flight: std::sync::atomic::AtomicUsize,
+    most_in_flight: std::sync::atomic::AtomicUsize,
+    refusing: std::sync::atomic::AtomicBool,
+    slow: std::time::Duration,
     let_go: tokio::sync::Notify,
 }
 
-#[async_trait]
-impl Provider for RefusedLate {
-    async fn embed(&self, texts: Vec<String>, _: Purpose) -> Result<Vec<Vec<f32>>> {
-        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if call == 0 {
-            self.let_go.notified().await;
-            return Err(EmbedError::Unusable {
-                model: "fake".into(),
-                reason: "401 Unauthorized: no such key".into(),
-                fault: vellev_core::ModelFault::Setup,
-            });
-        }
-        Ok(vec![vec![1.0, 2.0]; texts.len()])
+impl Told {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn refused() -> EmbedError {
+        EmbedError::Unusable {
+            model: "fake".into(),
+            reason: "401 Unauthorized: no such key".into(),
+            fault: vellev_core::ModelFault::Setup,
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for Told {
+    async fn embed(&self, texts: Vec<String>, _: Purpose) -> Result<Vec<Vec<f32>>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.calls.fetch_add(1, SeqCst);
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.most_in_flight.fetch_max(now, SeqCst);
+        let says = |word: &str| texts.iter().any(|text| text.contains(word));
+        tokio::time::sleep(self.slow).await;
+        if says("never") {
+            std::future::pending::<()>().await;
+        }
+        if says("held") {
+            self.let_go.notified().await;
+        }
+        self.in_flight.fetch_sub(1, SeqCst);
+        match self.refusing.load(SeqCst) || says("refused") {
+            true => Err(Self::refused()),
+            false => Ok(vec![vec![1.0, 2.0]; texts.len()]),
+        }
+    }
+}
+
+fn told(model: Told) -> (Arc<Told>, Arc<Embedder>) {
+    let model = Arc::new(model);
+    let embedder = Embedder::new(model.clone(), embedding(EmbeddingProvider::Local));
+    (model, Arc::new(embedder))
+}
+
+/// Every text of `texts` asked of `embedder` at once.
+async fn at_once(embedder: &Arc<Embedder>, texts: &[String]) -> Vec<Result<Option<Vec<f32>>>> {
+    futures::future::join_all(texts.iter().map(|text| embedder.query(text))).await
+}
+
+fn numbered(word: &str, count: usize) -> Vec<String> {
+    (0..count).map(|n| format!("{word} {n}")).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fault_met_by_many_at_once_is_asked_about_once_while_it_stands() {
+    let (model, embedder) = told(Told {
+        slow: std::time::Duration::from_millis(50),
+        refusing: true.into(),
+        ..Told::default()
+    });
+    let refused = |answers: Vec<Result<Option<Vec<f32>>>>| {
+        assert_eq!(answers.len(), 8);
+        assert!(answers.iter().all(|answer| answer == &Err(Told::refused())));
+    };
+    // Nothing is known of the model: one call finds out, and the rest
+    // take its word.
+    refused(at_once(&embedder, &numbered("first", 8)).await);
+    assert_eq!(model.calls(), 1);
+    tokio::time::advance(vellev_embed::FAULT_STANDS / 2).await;
+    refused(at_once(&embedder, &numbered("meanwhile", 8)).await);
+    assert_eq!(model.calls(), 1);
+    // The fault stands from when it was met, not from when it was last
+    // run into: once it no longer does, one call finds out again.
+    tokio::time::advance(vellev_embed::FAULT_STANDS / 2).await;
+    refused(at_once(&embedder, &numbered("again", 8)).await);
+    assert_eq!(model.calls(), 2);
+
+    // Put right, the model is found so by one call, and then asked by
+    // every call as it comes, however many at once.
+    model
+        .refusing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::advance(vellev_embed::FAULT_STANDS).await;
+    let answers = at_once(&embedder, &numbered("put right", 8)).await;
+    assert!(answers.iter().all(Result::is_ok), "{answers:?}");
+    assert_eq!(model.calls(), 2 + 8);
+    let most = || {
+        model
+            .most_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    assert_eq!(most(), 7, "the seven that waited, together");
+    at_once(&embedder, &numbered("since", 8)).await;
+    assert_eq!(most(), 8, "and from then on all together");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_model_that_fails_in_a_way_that_may_pass_is_asked_by_every_call() {
+    // A failure that may pass says nothing of whether the model can be
+    // used: after the first, nobody waits on anybody.
+    let (fake, embedder) = embedder(Fake {
+        failures: Mutex::new(9),
+        ..Fake::default()
+    });
+    let embedder = Arc::new(embedder);
+    let answers = at_once(&embedder, &numbered("fox", 8)).await;
+    assert!(answers.iter().all(Result::is_err));
+    assert_eq!(fake.purposes.lock().unwrap().len(), 8);
 }
 
 #[tokio::test]
 async fn a_fault_that_comes_to_light_after_the_model_has_answered_well_since_does_not_stand() {
-    let model = Arc::new(RefusedLate::default());
-    let embedder = Arc::new(Embedder::new(
-        model.clone(),
-        embedding(EmbeddingProvider::Local),
-    ));
-    let calls = || model.calls.load(std::sync::atomic::Ordering::SeqCst);
-    let first = {
+    let (model, embedder) = told(Told::default());
+    assert!(embedder.query("first").await.is_ok());
+    let late = {
         let embedder = embedder.clone();
-        tokio::spawn(async move { embedder.query("asked while the key was wrong").await })
+        tokio::spawn(async move { embedder.query("refused, once held").await })
     };
-    while calls() == 0 {
+    while model.calls() < 2 {
         tokio::task::yield_now().await;
     }
-    // The setup is put right, and the model answers, before the first
+    // The setup is put right, and the model answers, before the earlier
     // call hears that it was refused.
-    assert_eq!(
-        embedder.query("asked since").await,
-        Ok(Some(vec![1.0, 2.0]))
-    );
+    assert!(embedder.query("asked since").await.is_ok());
     model.let_go.notify_one();
+    assert_eq!(late.await.unwrap(), Err(Told::refused()));
     assert!(
-        first.await.unwrap().is_err(),
-        "the call itself still failed"
-    );
-    assert_eq!(
-        embedder.query("asked after").await,
-        Ok(Some(vec![1.0, 2.0])),
+        embedder.query("asked after").await.is_ok(),
         "and the model is still asked"
     );
-    assert_eq!(calls(), 3);
+    assert_eq!(model.calls(), 4);
+}
+
+#[tokio::test]
+async fn a_fault_that_stands_is_lifted_by_the_model_answering_well_however_late() {
+    let (model, embedder) = told(Told::default());
+    assert!(embedder.query("first").await.is_ok());
+    let slow = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.query("held").await })
+    };
+    while model.calls() < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(embedder.query("refused").await, Err(Told::refused()));
+    assert_eq!(
+        embedder.query("asked while it stands").await,
+        Err(Told::refused())
+    );
+    assert_eq!(model.calls(), 3, "it stands: the model is not asked");
+    // The call that was out all along comes back answered.
+    model.let_go.notify_one();
+    assert!(slow.await.unwrap().is_ok());
+    assert!(embedder.query("asked after").await.is_ok());
+    assert_eq!(model.calls(), 4);
+}
+
+#[tokio::test]
+async fn a_call_finding_out_whose_caller_goes_away_does_not_keep_the_others_waiting() {
+    let (model, embedder) = told(Told::default());
+    let finding_out = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.query("never").await })
+    };
+    while model.calls() < 1 {
+        tokio::task::yield_now().await;
+    }
+    let waiting = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.query("fox").await })
+    };
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(model.calls(), 1, "it waits for the one finding out");
+    finding_out.abort();
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), waiting).await;
+    assert!(answered.unwrap().unwrap().is_ok());
+    assert_eq!(model.calls(), 2);
 }

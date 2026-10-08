@@ -11,6 +11,9 @@ cannot see.
 Bring clients up to this release before the nodes: see
 `model_unavailable` below.
 
+The workspace's version is raised to 0.2.0 by a later change, and nothing
+is published from main before that.
+
 ### What a node answers
 
 - **A new code, `model_unavailable` (501)**, where a node used to answer
@@ -123,6 +126,8 @@ exhaustive, and `OnlyIf` and `Weighted` stay plain structs. A caller only
 ever builds the three enums, which `#[non_exhaustive]` does not bear on,
 and the only `match` on them is the node's, where an op not handled should
 not build. A new op, or a new field of an op, will be a breaking change.
+`OnlyIf::new` and `Weighted::new` are there for whoever would rather not
+write the two out.
 
 ### vellev-core
 
@@ -144,8 +149,11 @@ Breaking:
 - `VectorIndex` has two more required methods, `estimates` and
   `unmeasured`, its `shortlist` takes five parameters where it took four,
   and it can no longer be implemented outside the crate.
-- `ClusteredIndex::estimates` and `BinaryIndex::build` take other
-  parameters than they did: see each.
+- `BinaryIndex::build`, which was `build(vectors: &[(u32, &[f32])])`, is
+  `build(metric: Distance, vectors: &[(u32, &[f32])])`.
+- `ClusteredIndex::estimates` is no longer a method of its own: it is the
+  `VectorIndex` trait's, with a new last parameter, `ties: Ties<'_>`, and
+  whoever calls it must have `VectorIndex` in scope.
 
 New: `ClusteredIndex::fit`, which says whether an index is fit for the
 vectors it is given, and `Unfit`, why it is not.

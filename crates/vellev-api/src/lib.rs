@@ -907,6 +907,26 @@ impl Changes {
     }
 }
 
+impl OnlyIf {
+    /// Holds when the stored object's `property` equals `equals`.
+    pub fn new(property: impl Into<String>, equals: Json) -> Self {
+        Self {
+            property: property.into(),
+            equals,
+        }
+    }
+}
+
+impl Weighted {
+    /// A match in `property` counting `weight` beside the others.
+    pub fn new(property: impl Into<String>, weight: f32) -> Self {
+        Self {
+            property: property.into(),
+            weight,
+        }
+    }
+}
+
 impl Batch {
     pub fn new(changes: Vec<Change>) -> Self {
         Self { changes }
@@ -1428,12 +1448,11 @@ mod tests {
             value: json!(1),
         };
         let id = ObjectId(Default::default());
-        let weighted = || {
-            vec![Weighted {
-                property: "title".into(),
-                weight: 2.0,
-            }]
-        };
+        let weighted = || vec![Weighted::new("title", 2.0)];
+        assert_eq!(
+            serde_json::to_value(weighted()).unwrap(),
+            json!([{ "property": "title", "weight": 2.0 }])
+        );
         let cases = [
             (
                 serde_json::to_value(Nearest::to_vector(vec![1.0, 0.0], 5)).unwrap(),
@@ -1508,10 +1527,11 @@ mod tests {
                 json!({ "properties": {} }),
             ),
             (
-                serde_json::to_value(Changes::new(Map::new()).vector(vec![1.0]).only_if(OnlyIf {
-                    property: "n".into(),
-                    equals: json!(1),
-                }))
+                serde_json::to_value(
+                    Changes::new(Map::new())
+                        .vector(vec![1.0])
+                        .only_if(OnlyIf::new("n", json!(1))),
+                )
                 .unwrap(),
                 json!({ "properties": {}, "vector": [1.0], "only_if": { "property": "n", "equals": 1 } }),
             ),

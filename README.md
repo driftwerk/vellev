@@ -240,8 +240,13 @@ It never means the request is at fault or may be dropped. Keep it, and
 send it again once the node is put right; one that brings its own vector
 needs no model. A node that has met such a fault does not ask the model
 again for 20 seconds, and logs it once in that time however many requests
-meet it, hybrid searches that fall back among them; so a setup put right
-takes effect within that. It cuts the other way too: something in front of
+meet it, at once or one after another, hybrid searches that fall back
+among them; so a setup put right takes effect within that. Until a model
+has answered or failed in some way that may pass, at first and after each
+such 20 seconds, one request at a time is let through to it and the others
+wait on what it finds; after that every request goes to the model as it
+comes. Keys, and what is shaped like one, are taken out of what a model's
+server says before it is logged. It cuts the other way too: something in front of
 an OpenAI endpoint that answers `model_not_found` or `invalid_api_key` for
 a moment, in OpenAI's own form, costs 20 seconds of `model_unavailable`.
 Nothing reloads a node's settings while it runs, so most faults of setup

@@ -47,12 +47,19 @@ pub struct Embedders {
 struct Told(HashMap<Embedding, Instant>);
 
 impl Told {
-    /// Whether `embedding` has not been spoken of within the time, which
-    /// it now has. What was spoken of longer ago is forgotten.
+    /// Whether `embedding` was not spoken of within the time, in which
+    /// case it now is: once in each such time, however often it comes up
+    /// meanwhile. What was spoken of longer ago is forgotten.
     fn first(&mut self, embedding: &Embedding, now: Instant) -> bool {
         self.0
             .retain(|_, told| now.duration_since(*told) < FAULT_STANDS);
-        self.0.insert(embedding.clone(), now).is_none()
+        match self.0.contains_key(embedding) {
+            true => false,
+            false => {
+                self.0.insert(embedding.clone(), now);
+                true
+            }
+        }
     }
 }
 
@@ -195,20 +202,20 @@ mod tests {
         assert!(told.first(&embedding("one"), Instant::now()));
         assert!(!told.first(&embedding("one"), Instant::now()));
         assert!(told.first(&embedding("two"), Instant::now()));
-        tokio::time::advance(crate::FAULT_STANDS / 2).await;
-        assert!(!told.first(&embedding("one"), Instant::now()));
-        tokio::time::advance(crate::FAULT_STANDS / 2).await;
-        assert!(
-            !told.first(&embedding("one"), Instant::now()),
-            "spoken of again meanwhile, it still stands"
-        );
+        // Coming up all the while, it is said once in each such time: it
+        // is not put off for having come up.
+        let step = crate::FAULT_STANDS / 4;
+        let mut said = 1;
+        for _ in 0..12 {
+            tokio::time::advance(step).await;
+            said += usize::from(told.first(&embedding("one"), Instant::now()));
+        }
+        assert_eq!(said, 1 + 3, "once at first, and once in each time after");
         assert_eq!(
             told.0.len(),
             1,
             "what was last spoken of long ago is forgotten"
         );
-        tokio::time::advance(crate::FAULT_STANDS).await;
-        assert!(told.first(&embedding("one"), Instant::now()));
     }
 
     #[test]

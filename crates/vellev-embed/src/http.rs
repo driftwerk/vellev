@@ -109,11 +109,15 @@ impl Http {
         })
     }
 
+    /// `text` without this endpoint's key, or anything else shaped like
+    /// one: an endpoint may quote back a key it refuses, with its middle
+    /// masked or not.
     fn redacted(&self, text: String) -> String {
-        match &self.key {
+        let text = match &self.key {
             Some(key) => text.replace(key.as_str(), "<redacted>"),
             None => text,
-        }
+        };
+        crate::without_keys(&text)
     }
 
     fn failed(&self, reason: impl std::fmt::Display) -> EmbedError {

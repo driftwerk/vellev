@@ -69,6 +69,50 @@ impl EmbedError {
 
 pub type Result<T> = std::result::Result<T, EmbedError>;
 
+/// `said`, by whatever serves a model, with anything shaped like a key
+/// taken out: what is said goes to the node's log, and a refusal may quote
+/// the key it refuses, whole or with its middle masked. Only the shapes
+/// keys are known to have are taken for one, so that a model's name is
+/// left as it is: what follows `Bearer`, an OpenAI key (`sk-`), a Hugging
+/// Face token (`hf_` and twenty letters or digits or more) and an AWS
+/// access key id (`AKIA` or `ASIA` and sixteen capitals or digits).
+pub(crate) fn without_keys(said: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+    let apart = |c: char| c.is_whitespace() || "\"'`,;:(){}[]=".contains(c);
+    let key_shaped = |word: &str| {
+        let aws = |prefix: &str| {
+            word.strip_prefix(prefix).is_some_and(|rest| {
+                rest.len() == 16
+                    && rest
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            })
+        };
+        let hugging_face = word.strip_prefix("hf_").is_some_and(|rest| {
+            rest.len() >= 20 && rest.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+        (word.starts_with("sk-") && word.len() > 3) || hugging_face || aws("AKIA") || aws("ASIA")
+    };
+    let mut out = String::with_capacity(said.len());
+    let mut after_bearer = false;
+    let mut rest = said;
+    while !rest.is_empty() {
+        let end = rest.find(apart).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(end);
+        if !word.is_empty() {
+            match after_bearer || key_shaped(word) {
+                true => out.push_str(REDACTED),
+                false => out.push_str(word),
+            }
+            after_bearer = word.eq_ignore_ascii_case("bearer");
+        }
+        let gap = tail.find(|c| !apart(c)).unwrap_or(tail.len());
+        out.push_str(&tail[..gap]);
+        rest = &tail[gap..];
+    }
+    out
+}
+
 /// What texts are embedded for. Someone is waiting on a query, so where a
 /// model has a queue, queries go ahead of documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +131,55 @@ pub trait Provider: std::fmt::Debug + Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_is_shaped_like_a_key_is_taken_out_and_a_models_name_is_not() {
+        for (said, kept) in [
+            (
+                "Incorrect API key provided: sk-proj-abc123XYZ. Find yours at example.test",
+                "Incorrect API key provided: <redacted> Find yours at example.test",
+            ),
+            (
+                r#"{"error":{"message":"Incorrect API key provided: sk-…abcd","code":"invalid_api_key"}}"#,
+                r#"{"error":{"message":"Incorrect API key provided: <redacted>","code":"invalid_api_key"}}"#,
+            ),
+            ("key sk-****abcd refused", "key <redacted> refused"),
+            ("key 'sk-ab...yz' refused", "key '<redacted>' refused"),
+            (
+                "Authorization: Bearer abc.def.ghi was refused",
+                "Authorization: Bearer <redacted> was refused",
+            ),
+            (
+                "authorization=bearer\tabc123",
+                "authorization=bearer\t<redacted>",
+            ),
+            (
+                "token hf_abcdefghij0123456789ABCD is not valid",
+                "token <redacted> is not valid",
+            ),
+            (
+                "The security token AKIAIOSFODNN7EXAMPLE is not valid",
+                "The security token <redacted> is not valid",
+            ),
+            ("id ASIA0123456789ABCDEF, expired", "id <redacted>, expired"),
+            // Not keys: models' names, and what only looks a little like one.
+            (
+                "model text-embedding-3-small not found",
+                "model text-embedding-3-small not found",
+            ),
+            (
+                "BAAI/bge-base-en-v1.5 via hf_hub is not sk- shaped",
+                "BAAI/bge-base-en-v1.5 via hf_hub is not sk- shaped",
+            ),
+            (
+                "amazon.titan-embed-text-v2:0 in AKIAshort or a task-list",
+                "amazon.titan-embed-text-v2:0 in AKIAshort or a task-list",
+            ),
+            ("", ""),
+        ] {
+            assert_eq!(without_keys(said), kept, "{said}");
+        }
+    }
 
     #[test]
     fn only_a_model_that_cannot_be_run_or_used_fails_for_good() {

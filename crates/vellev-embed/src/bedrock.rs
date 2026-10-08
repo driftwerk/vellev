@@ -135,6 +135,7 @@ impl Bedrock {
                     (Some(said), None) | (None, Some(said)) => said.to_string(),
                     (None, None) => error.to_string(),
                 };
+                let said = crate::without_keys(&said);
                 // Bedrock says the region has no such model: nothing passes
                 // until the collection or the region is another. Access
                 // denied is not taken so, being also what is said while a
