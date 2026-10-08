@@ -546,6 +546,26 @@ impl Writer {
     /// vectors ahead of the commit and hand them to
     /// [`Self::commit_group_with`], rather than have the commit make them
     /// while every other write waits.
+    /// The collections `mutations` would make, were they committed now:
+    /// none for one that is there already exactly so, and none at all if
+    /// the batch would be refused. A commit made meanwhile may change
+    /// that, and the commit of these still decides what is made.
+    pub fn creates(&self, mutations: &[Mutation]) -> Vec<vellev_core::Collection> {
+        self.partition.read(|state| {
+            let mut draft = Draft::new(state);
+            if draft.batch(mutations.to_vec()).is_err() {
+                return Vec::new();
+            }
+            let (ops, _) = draft.finish();
+            ops.into_iter()
+                .filter_map(|op| match op {
+                    Op::CreateCollection { schema, .. } => Some(*schema),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
     pub fn wanted(&self, mutations: &[Mutation]) -> Vec<(Embedding, String)> {
         self.partition.read(|state| {
             let mut draft = Draft::new(state);

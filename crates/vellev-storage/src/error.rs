@@ -93,9 +93,31 @@ pub struct Refusal {
     pub message: String,
     /// What the request named that was not there. A release from before
     /// this was kept neither reads nor keeps it, and a refusal that has
-    /// been through one says only that something was not found.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// been through one says only that something was not found. So does
+    /// one that lacked a kind of thing this release has no name for,
+    /// kept by a later one: it reads as nothing kept, not as a file that
+    /// cannot be read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lacking_if_known"
+    )]
     pub lacking: Option<Lacking>,
+}
+
+fn lacking_if_known<'de, D: serde::Deserializer<'de>>(
+    kept: D,
+) -> std::result::Result<Option<Lacking>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Kept {
+        Known(Lacking),
+        Unknown(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Kept>::deserialize(kept)? {
+        Some(Kept::Known(lacking)) => Some(lacking),
+        Some(Kept::Unknown(_)) | None => None,
+    })
 }
 
 /// What a request named that was not there.

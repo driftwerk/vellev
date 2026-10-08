@@ -34,7 +34,10 @@ A release may, without a new format:
 A refusal's `lacking`, what a refused request named that was not there,
 is such a field: a node of the release before reads past it, and drops it
 when it writes the manifest again, after which a try of that request is
-still refused alike and says only that something was not found.
+still refused alike and says only that something was not found. It is
+read so that a kind of thing a later release names, which this one does
+not know, is nothing kept rather than a file that cannot be read: a later
+release may add one without a new format.
 
 Anything else is a new format:
 

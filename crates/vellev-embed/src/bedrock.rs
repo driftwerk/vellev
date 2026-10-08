@@ -43,17 +43,24 @@ struct Answer {
 }
 
 impl Bedrock {
-    pub fn new(region: &str, model: &str, dimensions: u32) -> Result<Self> {
+    /// Whether `model` at `dimensions` is one that can be embedded with
+    /// through Bedrock, as far as can be told without asking it.
+    pub fn admits(model: &str, dimensions: u32) -> Result<()> {
         if !model.starts_with(MODEL) {
-            return Err(EmbedError::Unsupported(format!(
+            return Err(EmbedError::NoSuchModel(format!(
                 "{model} is not {MODEL}, the one Bedrock model that can be embedded with"
             )));
         }
         if !DIMENSIONS.contains(&dimensions) {
-            return Err(EmbedError::Unsupported(format!(
+            return Err(EmbedError::NoSuchModel(format!(
                 "{model} has 256, 512 or 1024 dimensions, not {dimensions}"
             )));
         }
+        Ok(())
+    }
+
+    pub fn new(region: &str, model: &str, dimensions: u32) -> Result<Self> {
+        Self::admits(model, dimensions)?;
         Ok(Self {
             region: region.to_string(),
             model: model.to_string(),

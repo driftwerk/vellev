@@ -266,6 +266,20 @@ async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be
             "401 Unauthorized",
             ModelFault::Setup,
         ),
+        // Said with a status that is otherwise worth another try, it is
+        // still said: the endpoint is not asked again.
+        (
+            503,
+            "model_not_found",
+            "503 Service Unavailable",
+            ModelFault::Provider,
+        ),
+        (
+            429,
+            "invalid_api_key",
+            "429 Too Many Requests",
+            ModelFault::Setup,
+        ),
     ] {
         let seen = Arc::new(Seen::default());
         let url = refusing_as_openai(status, coded(code), seen.clone()).await;

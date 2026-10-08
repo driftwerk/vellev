@@ -1936,39 +1936,85 @@ fn model_unavailable(reason: &str) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
-async fn a_collection_whose_model_the_node_cannot_run_is_not_made() {
+async fn a_collection_with_a_model_no_build_runs_is_refused_as_the_requests_fault() {
     let served = Served::new().await;
     served.ok(Method::PUT, "/v1/tenants/acme", None).await;
-    let unheard_of = json!({
-        "provider": "local",
-        "model": "acme/unheard-of",
-        "dimensions": 2,
-        "properties": ["title"],
-    });
-    assert_eq!(
-        served.put(NOTES, notes(unheard_of.clone())).await,
-        model_unavailable("build")
-    );
+    let local = |model: &str, dimensions: u32| json!({ "provider": "local", "model": model, "dimensions": dimensions, "properties": ["title"] });
+    let unheard_of = local("acme/unheard-of", 2);
+    let invalid = |message: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            failed("invalid", message, json!({})),
+        )
+    };
+    let titan = json!({ "provider": "bedrock", "region": "eu-west-2", "model": "amazon.titan-embed-text-v2:0", "dimensions": 2 });
+    for (embedding, message) in [
+        (unheard_of.clone(), "acme/unheard-of cannot be run locally"),
+        (
+            local("BAAI/bge-base-en-v1.5", 1024),
+            "BAAI/bge-base-en-v1.5 has 768 dimensions, not 1024",
+        ),
+        (
+            titan,
+            "amazon.titan-embed-text-v2:0 has 256, 512 or 1024 dimensions, not 2",
+        ),
+    ] {
+        assert_eq!(
+            served.put(NOTES, notes(embedding.clone())).await,
+            invalid(message),
+            "{embedding}"
+        );
+    }
     let batched = json!({ "changes": [
         { "op": "create_collection", "schema": notes(supplied()) },
         { "op": "drop_collection", "collection": "notes" },
-        { "op": "create_collection", "schema": notes(unheard_of) },
+        { "op": "create_collection", "schema": notes(unheard_of.clone()) },
     ] });
     assert_eq!(
         served.post("/v1/tenants/acme/changes", batched).await,
-        model_unavailable("build"),
+        invalid("acme/unheard-of cannot be run locally"),
         "nor in a batch, none of which is made"
     );
     assert_eq!(
         served.get("/v1/tenants/acme/collections").await.1,
         json!({ "collections": [] })
     );
-    let wrong_size = json!({ "provider": "bedrock", "region": "eu-west-2", "model": "amazon.titan-embed-text-v2:0", "dimensions": 2 });
-    assert_eq!(
-        served.put(NOTES, notes(wrong_size)).await,
-        model_unavailable("build")
+
+    // What is wrong with the request otherwise is what is said of it: the
+    // model is looked at only for a collection that would be made.
+    let mut undeclared = notes(unheard_of.clone());
+    undeclared["embedding"]["properties"] = json!(["absent"]);
+    let (status, body) = served.put(NOTES, undeclared).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"));
+    assert!(
+        !body.to_string().contains("cannot be run locally"),
+        "the schema's own fault comes first: {body}"
     );
     served.ok(Method::PUT, NOTES, Some(notes(supplied()))).await;
+    let (status, body) = served.put(NOTES, notes(unheard_of.clone())).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::CONFLICT, "conflict"),
+        "a collection there already, otherwise, is a clash: {body}"
+    );
+
+    // A request answered already is answered as it was, whatever it is
+    // sent with the second time.
+    let named = [(REQUEST, "6f1c2b9e-1d0a-4c55-9a3e-2f6c4d8b7a14")];
+    let others = "/v1/tenants/acme/collections/others";
+    let schema = |embedding: Value| {
+        let mut schema = notes(embedding);
+        schema["name"] = json!("others");
+        Some(schema)
+    };
+    let made = served
+        .call_headed(Some(KEY), Method::PUT, others, schema(supplied()), &named)
+        .await;
+    assert_eq!(made.0, StatusCode::OK, "{}", made.1);
+    let again = served
+        .call_headed(Some(KEY), Method::PUT, others, schema(unheard_of), &named)
+        .await;
+    assert_eq!(again, made);
 }
 
 #[tokio::test]

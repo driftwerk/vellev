@@ -534,6 +534,61 @@ mod tests {
             "a refusal that found nothing missing is written as it always was"
         );
         assert_ne!(kept, before);
+
+        // A release after this one may name another kind of thing: read
+        // here, after a rollback, its refusal is one that kept nothing.
+        #[derive(Debug, Serialize)]
+        enum LaterLacking {
+            Property,
+        }
+        #[derive(Debug, Serialize)]
+        struct LaterRefusal {
+            kind: crate::Refused,
+            message: String,
+            lacking: Option<LaterLacking>,
+        }
+        #[derive(Debug, Serialize)]
+        enum LaterAnswer {
+            Refused(LaterRefusal),
+        }
+        #[derive(Debug, Serialize)]
+        struct LaterAnswered {
+            request: RequestId,
+            at: u64,
+            answer: LaterAnswer,
+        }
+        #[derive(Debug, Serialize)]
+        struct LaterLog {
+            position: LogPosition,
+            prev: Option<String>,
+            ops: Vec<Op>,
+            answered: Vec<LaterAnswered>,
+        }
+        let LogSegment {
+            position,
+            prev,
+            ops,
+            ..
+        } = log();
+        let later = LaterLog {
+            position,
+            prev,
+            ops,
+            answered: vec![LaterAnswered {
+                request,
+                at: 1_791_300_000_000,
+                answer: LaterAnswer::Refused(LaterRefusal {
+                    kind: crate::Refused::NotFound,
+                    message: message.into(),
+                    lacking: Some(LaterLacking::Property),
+                }),
+            }],
+        };
+        let from_later = encode(Kind::Log, &later).unwrap();
+        assert_eq!(
+            decode::<LogSegment>("k", Kind::Log, &from_later).unwrap(),
+            refused(None)
+        );
     }
 
     #[test]

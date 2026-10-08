@@ -1001,11 +1001,7 @@ pub async fn nearest(
             .collect())
     })
     .await?;
-    Ok(Json(Results {
-        results,
-        degraded: false,
-        degraded_by: None,
-    }))
+    Ok(Json(Results::found(results)))
 }
 
 /// The objects whose searchable text best matches the words of a text.
@@ -1042,11 +1038,7 @@ pub async fn keyword(
             .collect())
     })
     .await?;
-    Ok(Json(Results {
-        results,
-        degraded: false,
-        degraded_by: None,
-    }))
+    Ok(Json(Results::found(results)))
 }
 
 /// The objects that best match a text by meaning and by wording together.
@@ -1112,10 +1104,9 @@ pub async fn hybrid(
             .collect())
     })
     .await?;
-    Ok(Json(Results {
-        results,
-        degraded: degraded_by.is_some(),
-        degraded_by,
+    Ok(Json(match degraded_by {
+        Some(refused) => Results::by_words(results, refused),
+        None => Results::found(results),
     }))
 }
 

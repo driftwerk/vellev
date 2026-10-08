@@ -164,6 +164,10 @@ pub enum NodeError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Embed(#[from] EmbedError),
+    /// A collection was to be made with a model no build of this release
+    /// runs.
+    #[error("{0}")]
+    NoSuchModel(String),
 }
 
 impl From<CoordinatorError> for NodeError {
@@ -307,27 +311,29 @@ impl Tenant {
             .collect()
     }
 
-    /// Refuse to make a collection whose embedding model this node cannot
-    /// run however it is asked, rather than make one every write to which
-    /// would be refused. That is this node's answer, the node that writes
-    /// the tenant now: one built or set up otherwise may take the tenant
-    /// later and answer otherwise. Whatever only using the model would
-    /// show, such as an endpoint that refuses the node, is not looked for.
+    /// Refuse to make a collection that could not be embedded for, rather
+    /// than make one every write to which would be refused. Only the
+    /// collections the batch would in fact make are looked at, once the
+    /// batch is known to be one that would be made: a batch that is
+    /// invalid or clashes with what is stored is refused as that, and one
+    /// that makes again a collection there exactly so changes nothing, as
+    /// ever.
     ///
-    /// A collection there already, exactly as it is asked for, is not
-    /// looked at: making it again changes nothing, as it always has.
+    /// A model no build of this release runs is the request's fault. One
+    /// this build cannot run, though another may, is this node's: the
+    /// node that writes the tenant now, which another built otherwise may
+    /// do later and answer otherwise. Whatever only using the model would
+    /// show, such as an endpoint that refuses the node, is not looked for.
     fn can_embed(&self, mutations: &[Mutation]) -> Result<()> {
-        mutations
+        let makes = |mutation: &Mutation| matches!(mutation, Mutation::CreateCollection(_));
+        if !mutations.iter().any(makes) {
+            return Ok(());
+        }
+        self.writer
+            .creates(mutations)
             .iter()
-            .filter_map(|mutation| match mutation {
-                Mutation::CreateCollection(schema) => Some(schema),
-                _ => None,
-            })
-            .filter(|schema| {
-                let there = self.read(|state| state.collection(&schema.name) == Some(schema));
-                !there
-            })
-            .try_for_each(|schema| match self.embedders.embedder(&schema.embedding) {
+            .try_for_each(|schema| match self.embedders.admits(&schema.embedding) {
+                Err(EmbedError::NoSuchModel(reason)) => Err(NodeError::NoSuchModel(reason)),
                 Err(error) if error.lasting().is_some() => Err(NodeError::Embed(error)),
                 _ => Ok(()),
             })

@@ -106,23 +106,25 @@ impl std::str::FromStr for Consistency {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Code {
+    // Each is numbered, so that a code added later leaves the others as
+    // they were for whoever casts one to a number.
     /// The request is malformed or asks for something that cannot be.
-    Invalid,
-    Unauthorized,
+    Invalid = 0,
+    Unauthorized = 1,
     /// The key is valid, and does not reach what the request asks for.
-    Forbidden,
-    NotFound,
+    Forbidden = 2,
+    NotFound = 3,
     /// The request disagrees with what is stored.
-    Conflict,
+    Conflict = 4,
     /// The tenant is asking more of the node than it may; the request had
     /// no effect and may be sent again after the `Retry-After` it gives.
-    Limited,
+    Limited = 5,
     /// The node cannot serve this now, and the request has had no effect;
     /// the same request may succeed later or on another node.
-    Unavailable,
+    Unavailable = 6,
     /// A write failed at a point where nobody can say whether it took
     /// effect. Read before deciding to send it again.
-    Uncertain,
+    Uncertain = 7,
     /// This node cannot use the collection's embedding model until its
     /// setup is put right: the build cannot run the model, the node may
     /// not write where the model is kept, whatever serves it says it has
@@ -131,11 +133,11 @@ pub enum Code {
     /// may be able to do it now, and this one once it is put right, so
     /// the request is to be kept and sent again, never dropped; one that
     /// brings its own vector needs no model.
-    ModelUnavailable,
-    Internal,
+    ModelUnavailable = 10,
+    Internal = 8,
     /// A code this client does not know, from a newer node.
     #[serde(other)]
-    Unknown,
+    Unknown = 9,
 }
 
 impl Code {
@@ -222,6 +224,8 @@ impl From<ModelFault> for Reason {
             ModelFault::Build => Reason::Build,
             ModelFault::Setup => Reason::Setup,
             ModelFault::Provider => Reason::Provider,
+            // A fault named since this was written.
+            _ => Reason::Unknown,
         }
     }
 }
@@ -252,9 +256,16 @@ pub enum Bounded {
 /// allowed.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Limit {
     pub name: Bounded,
     pub max: u64,
+}
+
+impl Limit {
+    pub fn new(name: Bounded, max: u64) -> Self {
+        Self { name, max }
+    }
 }
 
 /// What a request named that does not exist.
@@ -315,8 +326,15 @@ impl Limits {
 /// The body of every response that is not a success.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Failure {
     pub error: Problem,
+}
+
+impl From<Problem> for Failure {
+    fn from(error: Problem) -> Self {
+        Self { error }
+    }
 }
 
 impl Failure {
@@ -592,6 +610,7 @@ pub struct Batch {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Outcome {
     Applied,
     /// The change was valid and altered nothing.
@@ -730,6 +749,7 @@ pub struct Found {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Results {
     pub results: Vec<Found>,
     /// Set when a hybrid search could not embed its text and so ranked by
@@ -742,6 +762,28 @@ pub struct Results {
     /// as it is set up, where another node may answer in full.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_by: Option<Code>,
+}
+
+impl Results {
+    /// What a search found, ranked as it was asked to be.
+    pub fn found(results: Vec<Found>) -> Self {
+        Self {
+            results,
+            degraded: false,
+            degraded_by: None,
+        }
+    }
+
+    /// What a hybrid search found by the words alone, its text not having
+    /// been embedded: `refused` is how it would have been refused had it
+    /// not fallen back.
+    pub fn by_words(results: Vec<Found>, refused: Code) -> Self {
+        Self {
+            results,
+            degraded: true,
+            degraded_by: Some(refused),
+        }
+    }
 }
 
 /// One page of a collection in id order.
@@ -927,11 +969,8 @@ mod tests {
                 json!(written)
             );
         }
-        let degraded = Results {
-            results: Vec::new(),
-            degraded: true,
-            degraded_by: Some(Code::ModelUnavailable),
-        };
+        let degraded = Results::by_words(Vec::new(), Code::ModelUnavailable);
+        assert!(degraded.degraded);
         let written =
             json!({ "results": [], "degraded": true, "degraded_by": "model_unavailable" });
         assert_eq!(serde_json::to_value(&degraded).unwrap(), written);
@@ -942,11 +981,7 @@ mod tests {
         let older: Results =
             serde_json::from_value(json!({ "results": [], "degraded": true })).unwrap();
         assert_eq!((older.degraded, older.degraded_by), (true, None));
-        let full = Results {
-            results: Vec::new(),
-            degraded: false,
-            degraded_by: None,
-        };
+        let full = Results::found(Vec::new());
         assert_eq!(
             serde_json::to_value(&full).unwrap(),
             json!({ "results": [] })
@@ -1049,6 +1084,23 @@ mod tests {
         ];
         for (code, status) in statuses {
             assert_eq!(code.status(), status, "{code:?}");
+        }
+        // As a number, each code is what it was before any was added.
+        let numbered = [
+            Code::Invalid,
+            Code::Unauthorized,
+            Code::Forbidden,
+            Code::NotFound,
+            Code::Conflict,
+            Code::Limited,
+            Code::Unavailable,
+            Code::Uncertain,
+            Code::Internal,
+            Code::Unknown,
+            Code::ModelUnavailable,
+        ];
+        for (number, code) in numbered.into_iter().enumerate() {
+            assert_eq!(code as usize, number, "{code:?}");
         }
     }
 }

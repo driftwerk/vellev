@@ -44,7 +44,7 @@ impl ApiError {
     /// allows, `max`.
     pub fn beyond(name: Bounded, max: u64, message: impl Into<String>) -> Self {
         let mut error = Self::invalid(message);
-        error.problem.limit = Some(Limit { name, max });
+        error.problem.limit = Some(Limit::new(name, max));
         error
     }
 
@@ -86,7 +86,9 @@ impl ApiError {
     fn unembedded(cause: impl std::fmt::Display, lasting: Option<ModelFault>) -> Self {
         match lasting {
             Some(fault) => {
-                tracing::error!(%cause, ?fault, "the embedding model cannot be used");
+                // Said at length where it is met, once while it stands;
+                // here once a request, for whoever is following one.
+                tracing::debug!(%cause, ?fault, "the embedding model cannot be used");
                 let mut error = Self::new(
                     Code::ModelUnavailable,
                     "this node cannot use the collection's embedding model as it is set up",
@@ -110,7 +112,7 @@ impl IntoResponse for ApiError {
             retry_after,
         } = self;
         let code = problem.code;
-        let body = Json(Failure { error: problem });
+        let body = Json(Failure::from(problem));
         match (code, retry_after) {
             (Code::Unauthorized, _) => {
                 (status, [(WWW_AUTHENTICATE, "Bearer")], body).into_response()
@@ -205,7 +207,9 @@ impl From<NodeError> for ApiError {
                 Self::not_found(Missing::RestorePoint, error.to_string())
             }
             NodeError::UnknownBackup(..) => Self::not_found(Missing::Backup, error.to_string()),
-            NodeError::Ahead(_) | NodeError::NoBackups => Self::invalid(error.to_string()),
+            NodeError::Ahead(_) | NodeError::NoBackups | NodeError::NoSuchModel(_) => {
+                Self::invalid(error.to_string())
+            }
             NodeError::BackingUp(_) => Self::new(Code::Conflict, error.to_string()),
             NodeError::Elsewhere { .. }
             | NodeError::Outdated { .. }

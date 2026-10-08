@@ -8,7 +8,7 @@ mod local;
 mod registry;
 
 pub use bedrock::Bedrock;
-pub use embedder::Embedder;
+pub use embedder::{Embedder, FAULT_STANDS};
 pub use http::Http;
 #[cfg(feature = "local")]
 pub use local::Local;
@@ -19,9 +19,17 @@ use vellev_core::ModelFault;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum EmbedError {
-    /// This build cannot run the model at all.
+    /// This build cannot run the model, though another may: it was built
+    /// without local models.
     #[error("{0}")]
     Unsupported(String),
+    /// No build of this release runs such a model: its name is not one
+    /// the release knows, or the model is not of that size. Whoever asks
+    /// for a collection to be made with it has asked for what cannot be.
+    /// Met in a collection already there, made by a release that knew
+    /// other models, it is this build's fault like any other.
+    #[error("{0}")]
+    NoSuchModel(String),
     /// Asking the model failed in a way that may pass.
     #[error("embedding with {model} failed: {reason}")]
     Failed { model: String, reason: String },
@@ -52,7 +60,7 @@ impl EmbedError {
     /// Where the fault lies, if the failure is lasting.
     pub fn lasting(&self) -> Option<ModelFault> {
         match self {
-            Self::Unsupported(_) => Some(ModelFault::Build),
+            Self::Unsupported(_) | Self::NoSuchModel(_) => Some(ModelFault::Build),
             Self::Unusable { fault, .. } => Some(*fault),
             Self::Failed { .. } | Self::Malformed { .. } => None,
         }
@@ -86,6 +94,10 @@ mod tests {
         let failures = [
             (
                 EmbedError::Unsupported(reason.clone()),
+                Some(ModelFault::Build),
+            ),
+            (
+                EmbedError::NoSuchModel(reason.clone()),
                 Some(ModelFault::Build),
             ),
             (

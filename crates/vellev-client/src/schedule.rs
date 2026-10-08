@@ -19,13 +19,26 @@
 //!    waited, and the backoff doubles, up to [`LONGEST_BACKOFF`]. No wait
 //!    comes before an address not asked since the last. An address that
 //!    turned the request away for asking too much is asked again itself,
-//!    after the wait it gave if that is longer.
+//!    after the wait it gave if that is longer, up to
+//!    [`LONGEST_TURNED_AWAY`].
 //! 5. The request is given up when its tries are spent.
+//! 6. An answer that is less than another address might give ends all of
+//!    the above. Each address not yet asked for this request is asked
+//!    once, at once, whatever the others answer, and nothing more is sent:
+//!    the answer in hand is not kept back for a better one that may never
+//!    come. A client of one address sends nothing more at all.
+//!
+//! So a request is sent at most as many times as it has tries and one
+//! less than there are addresses.
 
 use std::time::Duration;
 
 /// The longest wait between two tries.
 pub(crate) const LONGEST_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The longest an address that turns a request away can make its caller
+/// wait before the next try, whatever wait it gives.
+pub(crate) const LONGEST_TURNED_AWAY: Duration = Duration::from_secs(60);
 
 /// How a try ended, where it did not end the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +50,8 @@ pub(crate) enum Tried {
     TurnedAway(Duration),
     /// The address cannot do it as it is set up; another may.
     NotByThisAddress,
+    /// The address answered with less than another might.
+    Less,
 }
 
 /// What to do after a try.
@@ -46,6 +61,11 @@ pub(crate) enum Next {
     Ask {
         address: usize,
         after: Duration,
+    },
+    /// Ask this address at once, and not for long, whether it can better
+    /// the answer in hand.
+    AskForBetter {
+        address: usize,
     },
     GiveUp,
 }
@@ -60,6 +80,10 @@ pub(crate) struct Schedule {
     unable: Vec<bool>,
     /// The addresses asked since the last wait.
     asked: Vec<bool>,
+    /// The addresses asked at all.
+    sent: Vec<bool>,
+    /// Whether an answer is in hand that another address might better.
+    bettering: bool,
 }
 
 impl Schedule {
@@ -73,18 +97,31 @@ impl Schedule {
             tries_left: tries,
             backoff,
             unable: vec![false; addresses],
+            sent: asked.clone(),
             asked,
+            bettering: false,
         }
     }
 
     /// What follows a try of the address asked last that ended as `tried`.
     pub fn after(&mut self, tried: Tried) -> Next {
+        self.bettering |= tried == Tried::Less;
+        if self.bettering {
+            return match self.sent.iter().position(|sent| !sent) {
+                Some(address) => {
+                    self.sent[address] = true;
+                    self.address = address;
+                    Next::AskForBetter { address }
+                }
+                None => Next::GiveUp,
+            };
+        }
         let free = match tried {
             Tried::NotByThisAddress => {
                 self.unable[self.address] = true;
                 self.unable.contains(&false)
             }
-            Tried::MayPass | Tried::TurnedAway(_) => false,
+            Tried::MayPass | Tried::TurnedAway(_) | Tried::Less => false,
         };
         if !free {
             self.tries_left = self.tries_left.saturating_sub(1);
@@ -93,8 +130,10 @@ impl Schedule {
             }
         }
         let (address, least) = match tried {
-            Tried::TurnedAway(wait) => (self.address, wait),
-            Tried::MayPass | Tried::NotByThisAddress => (self.following(), Duration::ZERO),
+            Tried::TurnedAway(wait) => (self.address, wait.min(LONGEST_TURNED_AWAY)),
+            Tried::MayPass | Tried::NotByThisAddress | Tried::Less => {
+                (self.following(), Duration::ZERO)
+            }
         };
         let after = match self.asked[address] {
             true => {
@@ -106,6 +145,7 @@ impl Schedule {
             false => Duration::ZERO,
         };
         self.asked[address] = true;
+        self.sent[address] = true;
         self.address = address;
         Next::Ask { address, after }
     }
@@ -149,6 +189,7 @@ mod tests {
             };
             match schedule.after(tried) {
                 Next::GiveUp => return (asked, false),
+                Next::AskForBetter { address: next } => unreachable!("no answer was less: {next}"),
                 Next::Ask {
                     address: next,
                     after,
@@ -252,6 +293,77 @@ mod tests {
             asked(&[answers], 0, 2),
             (vec![(0, NONE), (0, MS(1_000))], false)
         );
+        // However long an address says to wait, it is not waited on past
+        // the longest.
+        let for_an_hour: &[Option<Tried>] = &[Some(Tried::TurnedAway(MS(3_600_000))), None];
+        assert_eq!(
+            asked(&[for_an_hour], 0, 2),
+            (vec![(0, NONE), (0, LONGEST_TURNED_AWAY)], true)
+        );
+    }
+
+    /// The steps that follow each of `tried` in turn, from a request to
+    /// `addresses` starting at `first` with four tries.
+    fn steps(addresses: usize, first: usize, tried: &[Tried]) -> Vec<Next> {
+        let mut schedule = Schedule::new(addresses, first, 4, BACKOFF);
+        tried.iter().map(|tried| schedule.after(*tried)).collect()
+    }
+
+    #[test]
+    fn an_answer_that_is_less_is_bettered_only_by_addresses_not_yet_asked_each_once_at_once() {
+        let better = |address| Next::AskForBetter { address };
+        assert_eq!(
+            steps(1, 0, &[Tried::Less]),
+            [Next::GiveUp],
+            "one address has nobody to better it"
+        );
+        // Whatever the others answer, each is asked once and no more.
+        for others in [
+            [Tried::Less, Tried::Less],
+            [Tried::MayPass, Tried::NotByThisAddress],
+            [Tried::TurnedAway(MS(1_000)), Tried::MayPass],
+        ] {
+            assert_eq!(
+                steps(3, 1, &[Tried::Less, others[0], others[1]]),
+                [better(0), better(2), Next::GiveUp],
+                "{others:?}"
+            );
+        }
+        // An address that failed before the lesser answer came is not
+        // asked again for a better one, nor is one that could not.
+        assert_eq!(
+            steps(3, 0, &[Tried::MayPass, Tried::Less, Tried::MayPass]),
+            [
+                Next::Ask {
+                    address: 1,
+                    after: NONE
+                },
+                better(2),
+                Next::GiveUp
+            ]
+        );
+        assert_eq!(
+            steps(2, 0, &[Tried::NotByThisAddress, Tried::Less]),
+            [
+                Next::Ask {
+                    address: 1,
+                    after: NONE
+                },
+                Next::GiveUp
+            ]
+        );
+        // After tries spent on failures that may pass, with their waits,
+        // a lesser answer is still the end of them.
+        assert_eq!(
+            steps(1, 0, &[Tried::MayPass, Tried::Less]),
+            [
+                Next::Ask {
+                    address: 0,
+                    after: MS(100)
+                },
+                Next::GiveUp
+            ]
+        );
     }
 
     #[test]
@@ -275,77 +387,105 @@ mod tests {
         );
     }
 
-    /// Every way a request to up to three addresses can go for seven
-    /// tries' answers: whatever the answers, the rules hold.
+    /// Every way a request to up to three addresses can go for six tries'
+    /// answers: whatever the answers, the rules hold. What is expected is
+    /// worked out here from the rules as they are written above, not as
+    /// the schedule works them out.
     #[test]
-    fn whatever_the_answers_no_address_is_asked_twice_without_a_wait_nor_waited_for_unasked() {
+    fn whatever_the_answers_the_rules_hold() {
         let kinds = [
             Tried::MayPass,
             Tried::NotByThisAddress,
+            // Shorter than the first backoff, longer than the longest
+            // backoff, and longer than an address may make a caller wait.
             Tried::TurnedAway(MS(30)),
+            Tried::TurnedAway(MS(10_000)),
+            Tried::TurnedAway(MS(120_000)),
         ];
+        const ANSWERS: u32 = 6;
         let mut checked = 0;
         for addresses in 1..=3usize {
             for tries in 1..=4u32 {
                 for first in 0..addresses {
-                    for script in 0..kinds.len().pow(7) {
-                        let answer = |sent: usize| kinds[script / kinds.len().pow(sent as u32) % 3];
+                    for script in 0..kinds.len().pow(ANSWERS) {
                         let mut schedule = Schedule::new(addresses, first, tries, BACKOFF);
+                        // What the rules say, kept apart from the schedule.
                         let mut since_wait = vec![false; addresses];
                         since_wait[first] = true;
-                        let mut unable = vec![false; addresses];
-                        let (mut address, mut sends, mut spent) = (first, 1, 0);
-                        for sent in 0..7 {
-                            let tried = answer(sent);
-                            if tried == Tried::NotByThisAddress {
-                                unable[address] = true;
-                            }
-                            let free = tried == Tried::NotByThisAddress && unable.contains(&false);
-                            spent += u32::from(!free);
-                            let next = schedule.after(tried);
+                        let mut said_cannot = vec![false; addresses];
+                        let mut waits = 0u32;
+                        let (mut address, mut sends) = (first, 1usize);
+                        let mut given_up = false;
+                        for answer in 0..ANSWERS {
+                            let tried = kinds[script / kinds.len().pow(answer) % kinds.len()];
                             let context = format!(
-                                "{addresses} addresses, {tries} tries, from {first}, script {script}, send {sent}"
+                                "{addresses} addresses, {tries} tries, from {first}, \
+                                 script {script}, answer {answer}: {tried:?}"
                             );
+                            if tried == Tried::NotByThisAddress {
+                                said_cannot[address] = true;
+                            }
+                            let cannot = said_cannot.iter().filter(|said| **said).count();
+                            // Rule 3: a request is sent once for each try,
+                            // and once more for each address that said it
+                            // cannot while another had yet to.
+                            let allowed = tries as usize + cannot.min(addresses - 1);
+                            let next = schedule.after(tried);
                             let Next::Ask { address: to, after } = next else {
+                                assert_eq!(next, Next::GiveUp, "{context}");
                                 assert_eq!(
-                                    spent, tries,
-                                    "given up only with the tries spent: {context}"
+                                    sends, allowed,
+                                    "given up too soon or too late: {context}"
                                 );
+                                given_up = true;
                                 break;
                             };
-                            assert!(
-                                spent < tries,
-                                "not given up with the tries spent: {context}"
-                            );
-                            if after > NONE {
-                                assert!(
-                                    since_wait[to],
+                            assert!(sends < allowed, "sent past its tries: {context}");
+                            // Rule 4: the wait that is due, if one is.
+                            let backoff = (BACKOFF * 2u32.pow(waits)).min(LONGEST_BACKOFF);
+                            let due = match tried {
+                                Tried::TurnedAway(given) => {
+                                    assert_eq!(to, address, "asked again itself: {context}");
+                                    backoff.max(given.min(Duration::from_secs(60)))
+                                }
+                                _ => {
+                                    // Rules 1 and 2: the next in order
+                                    // that is not passed over.
+                                    let all_cannot = cannot == addresses;
+                                    let expected = (1..=addresses)
+                                        .map(|step| (address + step) % addresses)
+                                        .find(|next| all_cannot || !said_cannot[*next]);
+                                    assert_eq!(Some(to), expected, "{context}");
+                                    backoff
+                                }
+                            };
+                            match since_wait[to] {
+                                true => {
+                                    assert_eq!(
+                                        after, due,
+                                        "asked twice without the wait due: {context}"
+                                    );
+                                    since_wait.fill(false);
+                                    waits += 1;
+                                }
+                                false => assert_eq!(
+                                    after, NONE,
                                     "a wait before an address not asked: {context}"
-                                );
-                                since_wait.fill(false);
+                                ),
                             }
-                            assert!(!since_wait[to], "asked twice without a wait: {context}");
-                            if let Tried::TurnedAway(wait) = tried {
-                                assert!(to == address && after >= wait, "{context}");
-                            }
-                            let passed_over = unable[to] && unable.contains(&false);
-                            assert!(
-                                !passed_over,
-                                "an address that cannot was asked while another may: {context}"
-                            );
                             since_wait[to] = true;
                             address = to;
                             sends += 1;
                         }
                         assert!(
-                            sends <= addresses - 1 + tries as usize,
-                            "{sends} sends of {addresses} addresses with {tries} tries, script {script}"
+                            given_up,
+                            "never given up: {addresses} addresses, {tries} tries, script {script}"
                         );
                         checked += 1;
                     }
                 }
             }
         }
-        assert_eq!(checked, (1 + 2 + 3) * 4 * 3usize.pow(7));
+        assert_eq!(checked, (1 + 2 + 3) * 4 * kinds.len().pow(ANSWERS));
     }
 }

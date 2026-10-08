@@ -2,9 +2,11 @@
 //!
 //! A [`Client`] knows several nodes and asks whichever serves a tenant. A
 //! request that fails in a way that may pass is sent again, on the next
-//! node, as long as that cannot make a change twice. One a node cannot do
-//! as it is set up is asked of every other address first, and then tried
-//! again like any other: behind one address there may be another node. Each write is named,
+//! node, as long as that cannot make a change twice. A read a node cannot
+//! do as it is set up is asked of every other address first, and then
+//! tried again like any other: behind one address there may be another
+//! node. A write it cannot do fails at once: one node makes a tenant's
+//! writes, whichever address is asked. Each write is named,
 //! the same on every try, and a node answers a try of a write it has
 //! already made as it did then, so a write whose fate is unknown is sent
 //! again like a read.
@@ -31,10 +33,15 @@ mod schedule;
 
 use schedule::{Next, Schedule, Tried};
 
+/// How long another address is given to better an answer in hand, such as
+/// a search ranked by the words alone: somebody is waiting for it.
+const BETTER_WITHIN: Duration = Duration::from_secs(2);
+
 /// How much of an answer that is not the API's is kept for the error.
 const KEPT_BODY: usize = 300;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("request to vellev failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -105,10 +112,12 @@ impl Error {
         self.code() == Some(Code::NotFound)
     }
 
-    /// Whether no node that answered, in every try of every address, can
-    /// use the collection's embedding model as it is set up. Nothing was
-    /// done. Keep the request, and send it again once a node has been put
-    /// right; do not drop it. [`Error::reason`] says where the fault lies.
+    /// Whether the node that answered last cannot use the collection's
+    /// embedding model as it is set up: for a read, after every address
+    /// was asked and the tries were spent; for a write, the node that
+    /// holds the tenant, asked once. Nothing was done. Keep the request,
+    /// and send it again once a node has been put right; do not drop it.
+    /// [`Error::reason`] says where the fault lies.
     pub fn is_model_unavailable(&self) -> bool {
         self.code() == Some(Code::ModelUnavailable)
     }
@@ -149,6 +158,32 @@ impl Error {
             Self::Api { reason, .. } => *reason,
             Self::Partial { source, .. } => source.reason(),
             _ => None,
+        }
+    }
+
+    /// Whether this is how a node of a release before `GET /v1/limits`
+    /// answers it: an admin key that there is no such route, with nothing
+    /// said to be missing or with the route said to be; a tenant's key, in
+    /// those releases' very words, that the route is not for it. The words
+    /// are matched on purpose: nothing else tells that answer from one a
+    /// later release may give for another reason, and those releases'
+    /// words will not change.
+    fn is_from_before_the_limits(&self) -> bool {
+        match self {
+            Self::Api {
+                code: Code::NotFound,
+                missing: None | Some(Missing::Route),
+                ..
+            } => true,
+            Self::Api {
+                code: Code::Forbidden,
+                message,
+                limit: None,
+                missing: None,
+                reason: None,
+                ..
+            } => message == "only an admin key may do this",
+            _ => false,
         }
     }
 
@@ -194,10 +229,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Options {
     /// How long one try of a request may take; see [`Client::within`].
     pub timeout: Duration,
-    /// How many times a request is tried in all.
+    /// How many tries a request has: how many times it may fail in a way
+    /// that may pass before it is given up. It is sent at most this many
+    /// times and one less than there are addresses: an address that says
+    /// it cannot do the request as it is set up costs no try while
+    /// another has yet to say so, and an address asked whether it can
+    /// better a search ranked by the words alone costs none. A write is
+    /// sent at most this many times. A request may so take as long as
+    /// that many tries of [`Self::timeout`] each, and the waits between,
+    /// none longer than a minute.
     pub attempts: u32,
-    /// How long to wait once every node has been tried; each wait after
-    /// is twice the one before.
+    /// How long to wait before an address is asked again; each wait after
+    /// is twice the one before, up to five seconds. An address that turns
+    /// a request away for asking too much says how long itself.
     pub backoff: Duration,
     /// The most objects [`Records::store_all`] sends in one request.
     pub batch_objects: usize,
@@ -345,7 +389,7 @@ impl Client {
     /// admin key that there is no such route, saying nothing of what is
     /// missing, and a tenant's key that the route is not for it. Then go
     /// by what a refusal says: see [`Error::limit`]. Any other failure is
-    /// one, a key the node does not know among them.
+    /// one: a key the node does not know, or anything else forbidden.
     pub async fn limits(&self) -> Result<Option<Limits>> {
         let path = format!("{ROOT}/limits");
         let told = self
@@ -353,13 +397,7 @@ impl Client {
             .await;
         match told {
             Ok(limits) => Ok(Some(limits)),
-            Err(error) if error.code() == Some(Code::Forbidden) => Ok(None),
-            Err(error)
-                if error.is_not_found()
-                    && matches!(error.missing(), None | Some(Missing::Route)) =>
-            {
-                Ok(None)
-            }
+            Err(error) if error.is_from_before_the_limits() => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -412,11 +450,15 @@ impl Client {
     }
 
     /// As [`Self::ask`], for a request a node may answer with less than
-    /// another would: an answer that does not pass `whole` is kept, and
-    /// the request goes on as if that address had said it cannot do it as
-    /// it is set up. The fullest answer had is given: a whole one as soon
-    /// as an address gives it, and failing that the one kept, rather than
-    /// a failure.
+    /// another would. An answer that does not pass `whole` is kept, and
+    /// each address not yet asked is asked once, at once, for no longer
+    /// than [`BETTER_WITHIN`], whether it can do better: the first whole
+    /// answer is given, and failing one the answer kept, never a failure.
+    /// Only a whole answer teaches the client which node to ask first.
+    ///
+    /// A write a node cannot do as it is set up fails there and then: it
+    /// is made by the one node that holds its tenant whichever address is
+    /// asked, so every address would say the same.
     async fn ask_for<T: DeserializeOwned>(
         &self,
         kind: Kind,
@@ -430,31 +472,34 @@ impl Client {
         let mut node = self.known(tenant).node;
         let mut schedule = Schedule::new(nodes.len(), node, options.attempts, options.backoff);
         let mut kept: Result<T> = Err(Error::Unusable("a client needs at least one try"));
+        let mut asking = self.clone();
         loop {
             let (after, request) = match kind {
                 Kind::Read => (tenant.and_then(|tenant| self.after(tenant)), None),
                 Kind::Repeatable => (None, None),
                 Kind::Write(request) => (None, Some(request)),
             };
-            let tried = match self.once(node, &method, path, body, after, request).await {
+            let answer = asking.once(node, &method, path, body, after, request).await;
+            let tried = match answer {
                 Ok(answer) if whole(&answer) => {
                     self.learnt().entry(tenant.cloned()).or_default().node = node;
                     return Ok(answer);
                 }
                 Ok(less) => {
                     kept = Ok(less);
-                    Tried::NotByThisAddress
+                    Tried::Less
                 }
+                // With an answer in hand, how another address failed to
+                // better it is of no account.
+                Err(_) if kept.is_ok() => Tried::MayPass,
                 Err(failure) => {
-                    let tried = match (&failure, failure.fate()) {
-                        (_, Fate::Final) => None,
-                        (Error::Limited { wait, .. }, _) => Some(Tried::TurnedAway(*wait)),
-                        (_, Fate::NotByThisNode) => Some(Tried::NotByThisAddress),
-                        (_, Fate::NoEffect | Fate::Unknown) => Some(Tried::MayPass),
+                    let tried = match (&failure, failure.fate(), kind) {
+                        (_, Fate::Final, _) | (_, Fate::NotByThisNode, Kind::Write(_)) => None,
+                        (Error::Limited { wait, .. }, ..) => Some(Tried::TurnedAway(*wait)),
+                        (_, Fate::NotByThisNode, _) => Some(Tried::NotByThisAddress),
+                        (_, Fate::NoEffect | Fate::Unknown, _) => Some(Tried::MayPass),
                     };
-                    if kept.is_err() {
-                        kept = Err(failure);
-                    }
+                    kept = Err(failure);
                     match tried {
                         Some(tried) => tried,
                         None => return kept,
@@ -467,6 +512,10 @@ impl Client {
                     if !after.is_zero() {
                         tokio::time::sleep(after).await;
                     }
+                    node = address;
+                }
+                Next::AskForBetter { address } => {
+                    asking = self.within(self.timeout.min(BETTER_WITHIN));
                     node = address;
                 }
             }
@@ -517,11 +566,11 @@ impl Client {
             return Ok(serde_json::from_slice(body)?);
         }
         Err(match serde_json::from_slice::<Failure>(&bytes) {
-            Ok(Failure { error }) if error.code == Code::Limited => Error::Limited {
+            Ok(Failure { error, .. }) if error.code == Code::Limited => Error::Limited {
                 message: error.message,
                 wait: retry_after.unwrap_or(Duration::from_secs(1)),
             },
-            Ok(Failure { error }) => Error::Api {
+            Ok(Failure { error, .. }) => Error::Api {
                 status,
                 code: error.code,
                 message: error.message,
@@ -852,8 +901,9 @@ impl Records {
 
     /// A node that cannot embed the text ranks by the words alone and
     /// says so in [`Results::degraded_by`]. If it cannot as it is set up,
-    /// the other addresses are asked as for any request it could not do,
-    /// and its answer is given only if none does better.
+    /// each other address not yet asked is asked once, at once and not
+    /// for long, and its answer is given only if none does better. A
+    /// client of one address is given it straight away.
     pub async fn hybrid(&self, asked: &Hybrid) -> Result<Results> {
         let path = self.tenant.path(&self.path("/hybrid"));
         let whole = |results: &Results| results.degraded_by != Some(Code::ModelUnavailable);

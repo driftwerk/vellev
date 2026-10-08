@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use tokio::time::Instant;
 use vellev_core::{Embedding, EmbeddingProvider};
 
-use crate::{Bedrock, Embedder, Http, Provider, Result};
+use crate::{Bedrock, Embedder, Http, Provider, Result, FAULT_STANDS};
 
 /// What embedding needs from the node rather than from a collection.
 #[derive(Clone, Default)]
@@ -35,6 +36,24 @@ pub struct Embedders {
     settings: Settings,
     providers: Mutex<HashMap<Model, Arc<dyn Provider>>>,
     embedders: Mutex<HashMap<Embedding, Arc<Embedder>>>,
+    /// The ways of embedding lately found to be ones this build cannot
+    /// run, so that each is logged once while it stands.
+    refused: Mutex<Told>,
+}
+
+/// What has been said lately, and when: each thing is to be said once in
+/// any [`FAULT_STANDS`], however often it comes up.
+#[derive(Debug, Default)]
+struct Told(HashMap<Embedding, Instant>);
+
+impl Told {
+    /// Whether `embedding` has not been spoken of within the time, which
+    /// it now has. What was spoken of longer ago is forgotten.
+    fn first(&mut self, embedding: &Embedding, now: Instant) -> bool {
+        self.0
+            .retain(|_, told| now.duration_since(*told) < FAULT_STANDS);
+        self.0.insert(embedding.clone(), now).is_none()
+    }
 }
 
 impl Embedders {
@@ -43,6 +62,7 @@ impl Embedders {
             settings,
             providers: Mutex::default(),
             embedders: Mutex::default(),
+            refused: Mutex::default(),
         }
     }
 
@@ -53,11 +73,64 @@ impl Embedders {
         if let Some(embedder) = embedders.get(embedding) {
             return Ok(Some(embedder.clone()));
         }
-        Ok(self.provider(embedding)?.map(|provider| {
+        let provider = self.provider(embedding).inspect_err(|error| {
+            // Only a collection there already comes to this: one made by
+            // a release or a build that could run its model.
+            let mut refused = self.refused.lock().expect("refused lock");
+            if error.lasting().is_some() && refused.first(embedding, Instant::now()) {
+                tracing::error!(
+                    model = %embedding.model,
+                    cause = %error,
+                    "a collection's embedding model cannot be run by this build"
+                );
+            }
+        })?;
+        Ok(provider.map(|provider| {
             let embedder = Arc::new(Embedder::new(provider, embedding.clone()));
             embedders.insert(embedding.clone(), embedder.clone());
             embedder
         }))
+    }
+
+    /// Whether a collection that embeds as `embedding` says could be
+    /// embedded for here, as far as can be told without using the model:
+    /// that its model is one of this release's, at that size, and that
+    /// this build can run it. Nothing is built, started or kept for the
+    /// asking, so that asking costs nothing however often and of however
+    /// many models it is done.
+    pub fn admits(&self, embedding: &Embedding) -> Result<()> {
+        let Embedding {
+            provider,
+            model,
+            dimensions,
+            ..
+        } = embedding;
+        match provider {
+            EmbeddingProvider::None | EmbeddingProvider::Http { .. } => Ok(()),
+            EmbeddingProvider::Local => Self::runs_locally(model, *dimensions),
+            EmbeddingProvider::Bedrock { .. } => Bedrock::admits(model, *dimensions),
+        }
+    }
+
+    #[cfg(feature = "local")]
+    fn runs_locally(model: &str, dimensions: u32) -> Result<()> {
+        crate::local::known(model, dimensions).map(drop)
+    }
+
+    #[cfg(not(feature = "local"))]
+    fn runs_locally(model: &str, _dimensions: u32) -> Result<()> {
+        Err(Self::without_local(model))
+    }
+
+    /// What a build without local models says of one.
+    #[cfg_attr(feature = "local", cfg(test))]
+    fn without_local(model: &str) -> crate::EmbedError {
+        crate::EmbedError::Unsupported(format!("this build cannot run {model} locally"))
+    }
+
+    /// How many embedders are held.
+    pub fn held(&self) -> usize {
+        self.embedders.lock().expect("embedders lock").len()
     }
 
     fn provider(&self, embedding: &Embedding) -> Result<Option<Arc<dyn Provider>>> {
@@ -98,8 +171,55 @@ impl Embedders {
 
     #[cfg(not(feature = "local"))]
     fn local(&self, model: &str, _dimensions: u32) -> Result<Arc<dyn Provider>> {
-        Err(crate::EmbedError::Unsupported(format!(
-            "this build cannot run {model} locally"
-        )))
+        Err(Self::without_local(model))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vellev_core::ModelFault;
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_thing_is_said_once_while_it_stands_and_then_forgotten() {
+        let embedding = |model: &str| Embedding {
+            provider: EmbeddingProvider::Local,
+            model: model.into(),
+            dimensions: 2,
+            query_prefix: None,
+            document_prefix: None,
+            properties: Vec::new(),
+        };
+        let mut told = Told::default();
+        assert!(told.first(&embedding("one"), Instant::now()));
+        assert!(!told.first(&embedding("one"), Instant::now()));
+        assert!(told.first(&embedding("two"), Instant::now()));
+        tokio::time::advance(crate::FAULT_STANDS / 2).await;
+        assert!(!told.first(&embedding("one"), Instant::now()));
+        tokio::time::advance(crate::FAULT_STANDS / 2).await;
+        assert!(
+            !told.first(&embedding("one"), Instant::now()),
+            "spoken of again meanwhile, it still stands"
+        );
+        assert_eq!(
+            told.0.len(),
+            1,
+            "what was last spoken of long ago is forgotten"
+        );
+        tokio::time::advance(crate::FAULT_STANDS).await;
+        assert!(told.first(&embedding("one"), Instant::now()));
+    }
+
+    #[test]
+    fn a_build_without_local_models_is_at_fault_not_whoever_asks_for_one() {
+        let said = Embedders::without_local("BAAI/bge-base-en-v1.5");
+        assert_eq!(
+            said,
+            crate::EmbedError::Unsupported(
+                "this build cannot run BAAI/bge-base-en-v1.5 locally".into()
+            )
+        );
+        assert_eq!(said.lasting(), Some(ModelFault::Build));
     }
 }

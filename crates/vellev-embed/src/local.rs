@@ -133,15 +133,18 @@ fn failure(model: &str, reason: impl Into<String>) -> EmbedError {
     }
 }
 
-/// The model of this name, whichever organisation's copy of it is run.
-fn known(model: &str, dimensions: u32) -> Result<EmbeddingModel> {
+/// The model of this name, whichever organisation's copy of it is run. The
+/// models that can be run are those this release's fastembed lists, at
+/// the size each has: a name it does not list, or a listed model at
+/// another size, is no model of this release, built however it is.
+pub(crate) fn known(model: &str, dimensions: u32) -> Result<EmbeddingModel> {
     let name = |code: &str| code.rsplit('/').next().unwrap_or(code).to_lowercase();
     let found = TextEmbedding::list_supported_models()
         .into_iter()
         .find(|info| name(&info.model_code) == name(model))
-        .ok_or_else(|| EmbedError::Unsupported(format!("{model} cannot be run locally")))?;
+        .ok_or_else(|| EmbedError::NoSuchModel(format!("{model} cannot be run locally")))?;
     if found.dim != dimensions as usize {
-        return Err(EmbedError::Unsupported(format!(
+        return Err(EmbedError::NoSuchModel(format!(
             "{model} has {} dimensions, not {dimensions}",
             found.dim
         )));
@@ -563,6 +566,33 @@ mod tests {
             1,
             "this crate and fastembed must use one hf-hub: see Cargo.toml"
         );
+        // And fastembed does fetch with it: were it to fetch some other
+        // way, one version in the lock file would show nothing.
+        assert!(!depends_on(&two, "hf-hub", "fastembed"));
+        let with = "[[package]]\nname = \"fastembed\"\ndependencies = [\n \"anyhow\",\n \"hf-hub\",\n]\n\n\
+                    [[package]]\nname = \"other\"\ndependencies = [\n \"hf-hub 0.5.0\",\n]\n";
+        assert!(depends_on(with, "fastembed", "hf-hub"));
+        assert!(depends_on(with, "other", "hf-hub"));
+        assert!(!depends_on(with, "fastembed", "hf"));
+        assert!(!depends_on(with, "anyhow", "hf-hub"));
+        assert!(
+            depends_on(lock, "fastembed", "hf-hub"),
+            "fastembed no longer fetches models with hf-hub: see Cargo.toml"
+        );
+    }
+
+    /// Whether the package `name` of a lock file depends on `on`.
+    fn depends_on(lock: &str, name: &str, on: &str) -> bool {
+        let entry = format!("name = \"{name}\"");
+        lock.split("[[package]]")
+            .filter(|package| package.lines().any(|line| line == entry))
+            .any(|package| {
+                package
+                    .lines()
+                    .filter_map(|line| line.trim().strip_prefix('"'))
+                    .filter_map(|line| line.strip_suffix("\","))
+                    .any(|dependency| dependency.split(' ').next() == Some(on))
+            })
     }
 
     #[test]
@@ -583,11 +613,11 @@ mod tests {
         }
         assert_eq!(
             known("BAAI/bge-base-en-v1.5", 1024).unwrap_err(),
-            EmbedError::Unsupported("BAAI/bge-base-en-v1.5 has 768 dimensions, not 1024".into())
+            EmbedError::NoSuchModel("BAAI/bge-base-en-v1.5 has 768 dimensions, not 1024".into())
         );
         assert_eq!(
             known("acme/unheard-of", 768).unwrap_err(),
-            EmbedError::Unsupported("acme/unheard-of cannot be run locally".into())
+            EmbedError::NoSuchModel("acme/unheard-of cannot be run locally".into())
         );
     }
 }

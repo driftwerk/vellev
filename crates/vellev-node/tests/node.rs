@@ -22,7 +22,7 @@ use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, KeyHash, Lease, LogPosition,
     ManualClock, MemoryCoordinator, PartitionKey, Point, RestorePoint, TenantKey, Versions,
 };
-use vellev_storage::{Mutation, Outcome, State, StorageError, Writer};
+use vellev_storage::{Batch, Mutation, Outcome, State, StorageError, Writer};
 
 const LEASE: Duration = Duration::from_secs(30);
 
@@ -1824,34 +1824,73 @@ async fn a_collection_the_node_cannot_embed_for_is_not_made_but_one_there_alread
         [Outcome::Unchanged],
         "made again as it is, it changes nothing"
     );
-    let cannot = |refused: Result<_, NodeError>| {
-        matches!(
-            refused,
-            Err(NodeError::Embed(error)) if error.lasting() == Some(vellev_core::ModelFault::Build)
-        )
-    };
+    let no_such_model = |refused: Result<_, NodeError>| matches!(refused, Err(NodeError::NoSuchModel(reason)) if reason == "stand-in cannot be run locally");
     let Mutation::CreateCollection(mut changed) = unrunnable() else {
         unreachable!("a schema makes a collection");
     };
     changed.embedding.query_prefix = None;
+    let clash = acme.write(vec![Mutation::CreateCollection(changed)]).await;
     assert!(
-        cannot(acme.write(vec![Mutation::CreateCollection(changed)]).await),
-        "but not made otherwise"
+        matches!(
+            &clash,
+            Err(NodeError::Storage(error))
+                if matches!(error.root(), StorageError::CollectionExists(_))
+        ),
+        "made otherwise, it clashes with what is stored, whatever its model: {clash:?}"
     );
-    let again_under_another_name = vec![Mutation::DropCollection(notes()), unrunnable()];
+    let dropped_and_made = vec![Mutation::DropCollection(notes()), unrunnable()];
     assert!(
-        !cannot(acme.write(again_under_another_name).await),
-        "the collection as it stands is what is compared"
+        no_such_model(acme.write(dropped_and_made).await),
+        "dropped and made in one batch, it would be made, and is not"
     );
     let Mutation::CreateCollection(mut elsewhere) = unrunnable() else {
         unreachable!("a schema makes a collection");
     };
     elsewhere.name = CollectionName::new("others").unwrap();
-    assert!(cannot(
-        acme.write(vec![Mutation::CreateCollection(elsewhere)])
+    assert!(no_such_model(
+        acme.write(vec![Mutation::CreateCollection(elsewhere.clone())])
             .await
     ));
-    assert!(acme.read(|state| state
-        .collection(&CollectionName::new("others").unwrap())
-        .is_none()));
+    let others = CollectionName::new("others").unwrap();
+    assert!(acme.read(|state| state.collection(&others).is_none()));
+    assert!(acme.read(|state| state.collection(&notes()).is_some()));
+
+    // In the collection that is there, it is this build that cannot run
+    // the model, not the writer of an object who is at fault.
+    let unembedded = acme.write(vec![note(1, "fox", None)]).await;
+    assert!(
+        matches!(
+            &unembedded,
+            Err(NodeError::Storage(error)) if matches!(
+                error.root(),
+                StorageError::Embedding { lasting: Some(vellev_core::ModelFault::Build), .. }
+            )
+        ),
+        "{unembedded:?}"
+    );
+
+    // A request answered already is answered as it was, and what it is
+    // sent with the second time is not looked at.
+    let request = Some(vellev_core::RequestId::generate());
+    let mut supplied = elsewhere.clone();
+    supplied.embedding.provider = EmbeddingProvider::None;
+    let made = acme
+        .write(Batch {
+            request,
+            mutations: vec![Mutation::CreateCollection(supplied)],
+        })
+        .await
+        .unwrap();
+    assert_eq!(made.outcomes, [Outcome::Applied]);
+    let again = acme
+        .write(Batch {
+            request,
+            mutations: vec![Mutation::CreateCollection(elsewhere)],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.position, again.outcomes),
+        (made.position, made.outcomes)
+    );
 }

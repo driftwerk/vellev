@@ -136,6 +136,7 @@ pub enum EmbeddingProvider {
 /// Why a node cannot use a collection's embedding model until its setup is
 /// put right: where the fault lies, and so who is to put it right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ModelFault {
     /// The node's build cannot run the model: another build may.
     Build,

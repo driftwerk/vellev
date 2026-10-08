@@ -223,8 +223,9 @@ model as it is set up, and will not until someone puts that right. It is
 said only of what the node's own build and setup settle, or what serves
 the model says outright in its own code for it, and `reason` says which:
 
-- `build`: the node's build cannot run the model: its name or size is not
-  one it knows, or it was built without local models;
+- `build`: the node's build cannot run the model: it was built without
+  local models, or the collection was made by a release that knew a model
+  this one does not;
 - `setup`: the node may not write the directory local models are kept in,
   which is `HF_HOME` if that is set and `VELLEV_MODEL_DIR` otherwise; or
   an OpenAI endpoint answers `invalid_api_key`;
@@ -238,8 +239,12 @@ the model says outright in its own code for it, and `reason` says which:
 
 It never means the request is at fault or may be dropped. Keep it, and
 send it again once the node is put right; one that brings its own vector
-needs no model. Meanwhile another node may be able to answer, and which
-node embeds depends on the request:
+needs no model. A node that has met such a fault does not ask the model
+again for 20 seconds, nor log it again, so a setup put right takes effect
+within that; nothing reloads a node's settings while it runs, so most
+faults of setup are put right by starting the node again. Meanwhile
+another node may be able to answer, and which node embeds depends on the
+request:
 
 - A search is embedded for by the node it reaches. Another node, set up
   right, answers it.
@@ -249,26 +254,41 @@ node embeds depends on the request:
   stopped and so lets the tenant go to another node. No node sends a
   request on to one that can embed it.
 
-The Rust client deals with both the same way. It asks every other address
-it knows first, at once, and then tries again as it does after
-`unavailable`, with the same tries and waits: a client given one address,
-a load balancer's or a service's, is sent to another node by that. It fails
-with `model_unavailable` only when its tries are spent. Giving it the
-nodes' own addresses is not needed; it only finds a node that can sooner.
+So the Rust client does not treat the two alike. A write answered
+`model_unavailable` fails at once: no other address would say otherwise.
+A search is asked of every other address the client knows first, at once,
+and then tried again as it is after `unavailable`, with the same tries and
+waits, failing with `model_unavailable` only when they are spent. A client
+given one address, a load balancer's or a service's, is so sent to another
+node by whatever is behind that address, and needs no more than that; the
+nodes' own addresses only find a node that can sooner.
 
 A hybrid search that cannot embed its text ranks by the words alone
 instead, and says `degraded`, with why in `degraded_by`: `unavailable` or
-`model_unavailable`, as it would have been refused. For the second the Rust
-client asks on as above, since another node may answer in full, and gives
-the answer by the words only if none does.
+`model_unavailable`, as it would have been refused. A Rust client of one
+address gives that answer as it comes. One of several, told
+`model_unavailable`, first asks each address it has not yet asked, once and
+at once and for no more than two seconds each, and gives the first answer
+ranked in full, or failing one the answer by the words.
 
-A collection whose model the node's build cannot run is refused when it is
-made, with `model_unavailable`, by the node that holds the tenant then; a
-node of another build may hold it later and answer otherwise, so run one
-build, and during a rolling deploy expect either answer. Making again a
-collection that is there exactly so changes nothing, as ever, whatever its
-model. What only using a model shows, such as an endpoint that refuses the
-node, is found at the first write.
+A collection can only be made with a model this release runs: for a local
+model, one of those fastembed lists, at its own size; on Bedrock, Titan
+text embeddings v2 at 256, 512 or 1024 dimensions. Anything else is the
+request's fault, `invalid`, as is whatever else is wrong with the schema,
+which is said first; a release that knows more models may be running on
+another node during a rolling deploy, and answers for itself. A model the
+release runs and this node's build does not, for being built without local
+models, is refused with `model_unavailable`, `reason: build`, by the node
+that holds the tenant. Making again a collection that is there exactly so
+changes nothing, as ever, and one that is there otherwise is a `conflict`,
+whatever the model. What only using a model shows, such as an endpoint that
+refuses the node, is found at the first write.
+
+A request is sent at most as many times as the client has tries
+(`Options::attempts`) and one less than it has addresses, each for no
+longer than its timeout, with a wait before any address is asked again
+that doubles up to five seconds; a node that turns a request away with
+`Retry-After` is waited on that long, up to a minute.
 
 ## Vector search
 

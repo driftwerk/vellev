@@ -1,10 +1,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::OnceCell;
+use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault};
 
 use crate::{EmbedError, Provider, Purpose, Result};
+
+/// How long a fault that will not pass until the setup is put right is
+/// taken to stand, without the model being asked again: a node set up
+/// wrong would otherwise ask whatever serves the model, and write to its
+/// log, on every request. A setup put right takes effect within it.
+pub const FAULT_STANDS: Duration = Duration::from_secs(20);
 
 /// How many query vectors an embedder keeps: one request often searches
 /// several times with the same text.
@@ -48,6 +56,8 @@ pub struct Embedder {
     provider: Arc<dyn Provider>,
     embedding: Embedding,
     queries: Mutex<Queries>,
+    /// The lasting fault met last, and when.
+    fault: Mutex<Option<(Instant, EmbedError)>>,
 }
 
 impl Embedder {
@@ -56,6 +66,7 @@ impl Embedder {
             provider,
             embedding,
             queries: Mutex::default(),
+            fault: Mutex::default(),
         }
     }
 
@@ -99,6 +110,43 @@ impl Embedder {
         if wanted.is_empty() {
             return Ok(vec![None; texts.len()]);
         }
+        if let Some(fault) = self.standing() {
+            return Err(fault);
+        }
+        let made = self.made(texts, wanted, purpose).await;
+        if let Err((error, Some(lies_in))) = made.as_ref().map_err(|error| (error, error.lasting()))
+        {
+            // Said once for as long as it stands, not once a request.
+            tracing::error!(
+                model = %self.embedding.model,
+                ?lies_in,
+                cause = %error,
+                "the embedding model cannot be used; not asking it again for {FAULT_STANDS:?}"
+            );
+            *self.fault.lock().expect("fault lock") = Some((Instant::now(), error.clone()));
+        }
+        made
+    }
+
+    /// The lasting fault met within [`FAULT_STANDS`], if there is one.
+    fn standing(&self) -> Option<EmbedError> {
+        let mut fault = self.fault.lock().expect("fault lock");
+        if let Some((met, _)) = fault.as_ref() {
+            if met.elapsed() >= FAULT_STANDS {
+                *fault = None;
+            }
+        }
+        fault.as_ref().map(|(_, error)| error.clone())
+    }
+
+    /// The vectors the model makes for `wanted`, the texts of `texts` that
+    /// are not blank, checked and put back in their places.
+    async fn made(
+        &self,
+        texts: &[String],
+        wanted: Vec<String>,
+        purpose: Purpose,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
         let asked = wanted.len();
         let vectors = self.provider.embed(wanted, purpose).await?;
         let malformed = |reason: String| EmbedError::Malformed {
