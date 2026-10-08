@@ -620,7 +620,8 @@ async fn a_query_too_short_to_square_finds_the_vector_it_points_along() {
 /// were limited, forged into the log as no write can make them now. However
 /// many there are, a shortlisted segment of either kind scores them exactly
 /// beside its shortlist: they are found where they are nearest, and crowd
-/// out nothing where they are not.
+/// out nothing where they are not; and as of any other row, one a filter
+/// leaves out, or one since deleted, is never returned.
 #[tokio::test]
 async fn rows_too_long_to_measure_are_scored_exactly_beside_the_shortlist() {
     for merging in index_kinds() {
@@ -643,11 +644,15 @@ async fn rows_too_long_to_measure_are_scored_exactly_beside_the_shortlist() {
         let head = cluster.committed().await;
         let position = head.log_position.next().unwrap();
         let key = Layout(&cluster.key).log(position, writer.author());
+        // Every other one in a group of its own, for a filter to leave out.
         let long = (9_001..=9_600).map(|n| format::Op::Upsert {
             collection: CollectionId(0),
             object: Object {
                 id: row(n),
-                properties: BTreeMap::from([("n".to_string(), Value::Int(0))]),
+                properties: BTreeMap::from([(
+                    "n".to_string(),
+                    Value::Int(9 * (n % 2 == 0) as i64),
+                )]),
                 vector: Some(vec![2.3e18; 8]),
             },
         });
@@ -675,12 +680,20 @@ async fn rows_too_long_to_measure_are_scored_exactly_beside_the_shortlist() {
             .unwrap();
         let writer = cluster.writer().await.merging_with(merging);
         writer.flush().await.unwrap();
+        // The nearest long row of all is deleted, and stays in the segment
+        // as a dead one.
+        writer.commit(vec![remove(9_001)]).await.unwrap();
+        let not_nine = Filter::Ne {
+            property: "n".into(),
+            value: json!(9),
+        };
+        let kept = |object: &Object| object.properties.get("n") != Some(&Value::Int(9));
         for copy in [
             writer.partition().clone(),
             cluster.open().await.partition().clone(),
         ] {
             copy.read(|state| {
-                assert_eq!(state.count(&name(VECTORS)), 5_603);
+                assert_eq!(state.count(&name(VECTORS)), 5_602);
                 for query in [[1.0; 8], [-1.0; 8]] {
                     let hits = state
                         .search(&name(VECTORS), &Query::nearest(&query, 3))
@@ -690,7 +703,28 @@ async fn rows_too_long_to_measure_are_scored_exactly_beside_the_shortlist() {
                         brute_force(state, Distance::Dot, &query, 3, |_| true),
                         "{merging:?} {query:?}"
                     );
+                    let hits = state
+                        .search(
+                            &name(VECTORS),
+                            &Query::nearest(&query, 3).filtered(&not_nine),
+                        )
+                        .unwrap();
+                    assert!(hits.iter().all(|hit| kept(hit.object)), "{merging:?}");
+                    assert_eq!(
+                        ids(&hits),
+                        brute_force(state, Distance::Dot, &query, 3, kept),
+                        "{merging:?} {query:?} filtered"
+                    );
                 }
+                // Towards the long rows, the nearest are the lowest ids of
+                // those neither deleted nor filtered out.
+                let towards = Query::nearest(&[1.0; 8], 3);
+                let hits = state.search(&name(VECTORS), &towards).unwrap();
+                assert_eq!(ids(&hits), [row(9_002), row(9_003), row(9_004)]);
+                let hits = state
+                    .search(&name(VECTORS), &towards.filtered(&not_nine))
+                    .unwrap();
+                assert_eq!(ids(&hits), [row(9_003), row(9_005), row(9_007)]);
             });
         }
     }
