@@ -261,9 +261,9 @@ pub struct Options {
     /// How long each other address is given to better a hybrid search a
     /// node could only rank by the words alone, for want of a model it
     /// can use: somebody is waiting for the answer in hand. A node that
-    /// takes longer than this to embed a text does not get to better it.
-    /// With none, the answer in hand is given at once and no other
-    /// address is asked. No longer than [`Self::timeout`] in any case.
+    /// takes longer than this to embed a text does not get to better it,
+    /// and with none no address has time to. No longer than
+    /// [`Self::timeout`] in any case.
     pub better_within: Duration,
 }
 
@@ -536,8 +536,7 @@ impl Client {
             };
             let answer = asking.once(node, &method, path, body, after, request).await;
             let tried = match answer {
-                // With no time given to better an answer, any is whole.
-                Ok(answer) if whole(&answer) || options.better_within.is_zero() => {
+                Ok(answer) if whole(&answer) => {
                     self.learnt().entry(tenant.cloned()).or_default().node = node;
                     return Ok(answer);
                 }

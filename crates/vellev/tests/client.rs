@@ -1293,13 +1293,15 @@ async fn an_address_that_never_answers_does_not_keep_back_the_answer_in_hand() {
         "as long as the client gives, and no longer: {took:?}"
     );
 
-    // Given no time at all, no other address is asked.
-    let full = Stub::answering(|_, _| (200, json!({ "results": [] }))).await;
-    let at_once = tries(4).better_within(Duration::ZERO);
-    let client = Client::connect(&[&cannot.url, &full.url], KEY, at_once).unwrap();
+    // Given no time at all, no other address has time to better it.
+    let at_once = tries(4)
+        .timeout(Duration::from_secs(60))
+        .better_within(Duration::ZERO);
+    let client = Client::connect(&[&cannot.url, &hung], KEY, at_once).unwrap();
+    let started = Instant::now();
     let found = foxes(&client).await.unwrap();
     assert_eq!(found.degraded_by, Some(Code::ModelUnavailable));
-    assert_eq!(full.asked("hybrid"), 0);
+    assert!(started.elapsed() < Duration::from_millis(150));
 }
 
 #[tokio::test]

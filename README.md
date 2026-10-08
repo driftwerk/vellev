@@ -274,7 +274,8 @@ address gives that answer as it comes. One of several, told
 at once, and gives the first answer ranked in full, or failing one the
 answer by the words. Each is given `Options::better_within` to answer, two
 seconds unless set otherwise: a node that takes longer to embed a text
-does not get to better the answer, and none at all asks nobody. The
+does not get to better the answer, and with none no address has time to.
+The
 address that answered in full is the one asked first from then on.
 
 A collection can only be made with a model this release runs: for a local

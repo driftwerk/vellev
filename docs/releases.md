@@ -66,7 +66,7 @@ Breaking:
 - **A hybrid search answered by the words alone for `model_unavailable`**
   is, by a client of several addresses, first asked of each address not
   yet asked, once and at once, each for `Options::better_within` at most
-  (two seconds unless set; none asks nobody). A client of one address gets
+  (two seconds unless set; with none, no address has time to). A client of one address gets
   the answer as before.
 - An address that turns a request away is waited on for the `Retry-After`
   it gives, up to a minute.
