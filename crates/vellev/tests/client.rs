@@ -1081,9 +1081,10 @@ async fn a_write_no_node_can_embed_fails_at_the_first_to_say_so_and_says_where_t
     let (first, second) = (cannot().await, cannot().await);
     let client = Client::connect(&[&first.url, &second.url], KEY, tries(4)).unwrap();
     let notes = client.tenant(&tenant("acme")).collection(&notes_named());
-    let failed = notes
-        .put(oid(1), &content("fox", 1, None))
+    let fox = content("fox", 1, None);
+    let failed = tokio::time::timeout(Duration::from_secs(30), notes.put(oid(1), &fox))
         .await
+        .expect("failed at once, with no wait")
         .unwrap_err();
     assert!(failed.is_model_unavailable(), "{failed}");
     assert!(!failed.is_unknown_outcome());
@@ -1243,7 +1244,10 @@ async fn foxes(client: &Client) -> vellev_client::Result<vellev_api::Results> {
         oversample: None,
         vectors: false,
     };
-    notes.hybrid(&asked).await
+    // Nothing here is to wait: a search that does has gone wrong.
+    tokio::time::timeout(Duration::from_secs(30), notes.hybrid(&asked))
+        .await
+        .expect("a search answered without the waits a failure has")
 }
 
 #[tokio::test]
