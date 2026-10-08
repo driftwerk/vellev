@@ -510,7 +510,9 @@ async fn a_call_never_waits_on_another_whatever_the_other_is_about() {
     }
     // A query meanwhile is answered in its own time: at once.
     let started = tokio::time::Instant::now();
-    assert_eq!(embedder.query("fox").await, Ok(Some(vec![1.0, 2.0])));
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(1), embedder.query("fox"));
+    let answered = answered.await.expect("it does not wait for the documents");
+    assert_eq!(answered, Ok(Some(vec![1.0, 2.0])));
     assert_eq!(started.elapsed(), std::time::Duration::ZERO);
     assert_eq!(model.calls(), 2);
     assert!(!documents.is_finished());
