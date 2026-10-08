@@ -114,7 +114,29 @@ enum Import {
     /// Copy a Weaviate instance's classes into a vellev tenant, resuming
     /// where an import that stopped left off.
     Weaviate(Box<ImportWeaviate>),
+    /// End the import of a tenant's classes, once nothing more is to be
+    /// brought from Weaviate: drop each ledger, which frees what it takes
+    /// on the node, and note that the collection is no longer imported,
+    /// so that no later run changes it.
+    Finalise {
+        /// The vellev node.
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        to: String,
+        /// The vellev API key.
+        #[arg(long, env = "VELLEV_API_KEY")]
+        key: String,
+        #[arg(long, value_parser = |id: &str| TenantId::new(id))]
+        tenant: TenantId,
+        /// A class to end the import of; every imported class when none
+        /// is named.
+        #[arg(long = "class")]
+        classes: Vec<String>,
+    },
 }
+
+/// What `import weaviate` exits with when Weaviate was written to behind
+/// the catch-up, and another run is all it takes.
+const BEHIND: u8 = 3;
 
 #[derive(clap::Args)]
 struct ImportWeaviate {
@@ -161,9 +183,10 @@ struct ImportWeaviate {
     #[arg(long)]
     updated_as: Option<String>,
     /// How many objects to copy at a time; at most the node's limit on
-    /// results.
-    #[arg(long, default_value_t = 100)]
-    page: usize,
+    /// results, which it is unless given, or 1000 where the node does not
+    /// say.
+    #[arg(long)]
+    page: Option<usize>,
     /// The most bytes of objects to send the node in one request, near
     /// enough; under its limit on a request's body.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
@@ -178,6 +201,54 @@ struct ImportWeaviate {
     /// Where progress is kept; vellev-import-TENANT.json by default.
     #[arg(long)]
     state: Option<PathBuf>,
+    /// Delete nothing: what Weaviate no longer holds is only counted, as
+    /// pending.
+    #[arg(long)]
+    no_delete: bool,
+    /// The most objects of a class a run may delete. A run that finds
+    /// more gone from Weaviate deletes none of them and fails, since a
+    /// Weaviate emptied, restored or mistaken for another looks the same.
+    #[arg(long, default_value_t = 1_000)]
+    max_deletes: u64,
+    /// The most of a class a run may delete, as a part of what was
+    /// imported of it, between 0 and 1; the fewer of this and
+    /// --max-deletes holds.
+    #[arg(long, default_value_t = 0.05)]
+    max_delete_fraction: f64,
+    /// How many seconds after Weaviate first says it holds no such object
+    /// it is asked again, before the object is deleted.
+    #[arg(long, default_value_t = 5)]
+    confirm_secs: u64,
+    /// How many seconds a request Weaviate fails or turns away is asked
+    /// again before the run stops: as long as a restart of it may take.
+    #[arg(long, default_value_t = 600)]
+    patience_secs: u64,
+    /// Say that nothing but an import has written to the collections
+    /// found without a ledger, such as those an earlier release imported:
+    /// what they lack is stored and what differs from Weaviate's is
+    /// replaced, where otherwise both are left alone.
+    #[arg(long)]
+    sole_writer: bool,
+    /// Say that a class Weaviate has made again since it was imported is
+    /// the one to go on from.
+    #[arg(long)]
+    accept_remade: bool,
+    /// Pass over an object vellev cannot hold and report it, where
+    /// otherwise the run stops at it.
+    #[arg(long)]
+    skip_refused: bool,
+    /// Fail too when a collection holds anything that is not as the
+    /// import left it: another writer's objects, or its deletions.
+    #[arg(long)]
+    strict: bool,
+    /// Change nothing, and compare what each collection holds with what
+    /// Weaviate does, object by object: over this many pages begun at
+    /// ids picked at random, 20 unless given.
+    #[arg(long, num_args = 0..=1, default_missing_value = "20")]
+    verify: Option<usize>,
+    /// As --verify, over every object.
+    #[arg(long, conflicts_with = "verify")]
+    verify_all: bool,
 }
 
 /// A class's name and the embedding in the file named after `=`.
@@ -306,12 +377,47 @@ async fn main() -> Result<ExitCode> {
                 per_second,
                 skew_secs,
                 state,
+                no_delete,
+                max_deletes,
+                max_delete_fraction,
+                confirm_secs,
+                patience_secs,
+                sole_writer,
+                accept_remade,
+                skip_refused,
+                strict,
+                verify,
+                verify_all,
             } = *import;
             let source = vellev::import::Source {
                 url: from,
                 key: from_key,
                 tenant: from_tenant,
                 name: from_name,
+            };
+            let client = vellev_client::Client::connect(&[&to], &key, Default::default())?;
+            let page = match page {
+                Some(page) => page,
+                None => {
+                    let results = client
+                        .limits()
+                        .await?
+                        .and_then(|limits| limits.max(vellev_client::api::Bounded::Results));
+                    results.map_or(1_000, |results| results as usize)
+                }
+            };
+            let state =
+                state.unwrap_or_else(|| PathBuf::from(format!("vellev-import-{tenant}.json")));
+            let deletes = match no_delete {
+                true => vellev::import::Deletes::None,
+                false => vellev::import::Deletes::UpTo {
+                    count: max_deletes,
+                    fraction: max_delete_fraction,
+                },
+            };
+            let mode = match (verify, verify_all) {
+                (None, false) => vellev::import::Mode::Import,
+                (pages, _) => vellev::import::Mode::Verify { pages },
             };
             let options = vellev::import::Options {
                 classes,
@@ -324,10 +430,15 @@ async fn main() -> Result<ExitCode> {
                 batch_bytes,
                 per_second,
                 skew: Duration::from_secs(skew_secs),
-                state: state
-                    .unwrap_or_else(|| PathBuf::from(format!("vellev-import-{tenant}.json"))),
+                deletes,
+                confirm: Duration::from_secs(confirm_secs),
+                patience: Duration::from_secs(patience_secs),
+                sole_writer,
+                accept_remade,
+                skip_refused,
+                mode,
+                ..vellev::import::Options::new(state)
             };
-            let client = vellev_client::Client::connect(&[&to], &key, Default::default())?;
             let report =
                 vellev::import::weaviate(&source, &client.tenant(&tenant), &options).await?;
             for (class, copied) in &report.classes {
@@ -336,28 +447,50 @@ async fn main() -> Result<ExitCode> {
                 }
             }
             println!("{}", serde_json::to_string_pretty(&report)?);
-            if report.matched() {
-                return Ok(ExitCode::SUCCESS);
-            }
-            let classes = |of: fn(&vellev::import::Copied) -> bool| {
+            let classes = |of: &dyn Fn(&vellev::import::Copied) -> bool| {
                 let named = report.classes.iter().filter(|(_, copied)| of(copied));
-                named.map(|(class, _)| class.as_str()).collect::<Vec<_>>()
+                let named: Vec<&str> = named.map(|(class, _)| class.as_str()).collect();
+                (!named.is_empty()).then(|| named.join(", "))
             };
-            let behind = classes(|copied| !copied.caught_up());
-            if !behind.is_empty() {
+            if let Some(over) = classes(&|copied| copied.budget.is_some()) {
+                eprintln!("{over}: more objects are gone from Weaviate than a run may delete, so none was deleted: see `pending` and `budget`. A Weaviate that was emptied, restored or is not the one imported looks like this. If they are truly gone, raise --max-deletes and --max-delete-fraction for one run");
+            }
+            if let Some(refused) = classes(&|copied| !copied.refused.is_empty()) {
                 eprintln!(
-                    "{}: Weaviate holds a different number of objects than the import has accounted for; it was written to during the run; run again to catch up",
-                    behind.join(", ")
+                    "{refused}: some objects vellev cannot hold were passed over: see `refused`"
                 );
             }
-            let touched = classes(|copied| !copied.untouched());
-            if !touched.is_empty() {
-                eprintln!(
-                    "{}: the collection holds objects that are not as the import left them, written, changed or deleted by something else; they were left as they are, and running again will not change that",
-                    touched.join(", ")
-                );
+            if let Some(large) = classes(&|copied| !copied.too_large.is_empty()) {
+                eprintln!("{large}: some objects changed in Weaviate are too large to replace safely in one request, and were left as they are: see `too_large`");
             }
-            Ok(ExitCode::FAILURE)
+            if let Some(wrong) = classes(&|copied| {
+                let verified = copied.verified.as_ref();
+                verified.is_some_and(|verified| verified.different + verified.missing > 0)
+            }) {
+                eprintln!("{wrong}: the collection does not hold some of the import's objects as Weaviate does: see `verified`");
+            }
+            if let Some(behind) = classes(&|copied| !copied.caught_up()) {
+                eprintln!("{behind}: Weaviate holds a different number of objects than the import has accounted for; it was written to during the run; run again to catch up");
+            }
+            if let Some(touched) = classes(&|copied| !copied.untouched()) {
+                eprintln!("{touched}: the collection holds objects that are not as the import left them, written, changed or deleted by something else; they were left as they are, and running again will not change that");
+            }
+            Ok(match report.outcome(strict) {
+                vellev::import::Outcome::Settled => ExitCode::SUCCESS,
+                vellev::import::Outcome::Behind => ExitCode::from(BEHIND),
+                vellev::import::Outcome::Unsettled => ExitCode::FAILURE,
+            })
+        }
+        Command::Import(Import::Finalise {
+            to,
+            key,
+            tenant,
+            classes,
+        }) => {
+            let client = vellev_client::Client::connect(&[&to], &key, Default::default())?;
+            let ended = vellev::import::finalise(&client.tenant(&tenant), &classes).await?;
+            println!("{}", serde_json::to_string_pretty(&ended)?);
+            Ok(ExitCode::SUCCESS)
         }
         Command::Health { url, timeout_secs } => {
             let client = vellev_client::Client::new(&url, Duration::from_secs(timeout_secs))?;

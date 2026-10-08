@@ -1,13 +1,14 @@
 //! Copying a Weaviate into a tenant. Runs only when `VELLEV_WEAVIATE_URL`
 //! names a Weaviate to load, such as the one in `docker-compose.dev.yml`.
 //!
-//! Where a test needs Weaviate to change at a given moment of an import,
-//! or to fail, the import reaches it through a [`Proxy`] that does so
-//! before passing a chosen request on.
+//! Where a test needs Weaviate or another writer to do something at a
+//! given moment of an import, or either side to fail, the import reaches
+//! Weaviate and the node each through a [`Proxy`] that does so around a
+//! chosen request.
 
 mod common;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use axum::response::IntoResponse;
 use common::*;
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Map, Value};
-use vellev::import::{self, Options, Report, Source};
+use vellev::import::{self, Deletes, Mode, Options, Outcome, Report, Source};
 use vellev_api::{Changes, Content, Keyword, Page};
 use vellev_client::{Client, Options as ClientOptions, Records, Tenant};
 use vellev_core::{CollectionName, ObjectId, TenantId};
@@ -39,19 +40,21 @@ fn oid(n: u64) -> ObjectId {
     serde_json::from_value(json!(uuid(n))).unwrap()
 }
 
+/// A note. Its score has as many digits as a double holds, which a
+/// reader that rounds twice gets wrong.
 fn object(n: u64) -> Value {
     json!({
         "title": format!("note {n} about {}", ["foxes", "hens", "owls"][n as usize % 3]),
         "tags": [format!("t{}", n % 4)],
         "n": n,
-        "score": n as f64 / 8.0,
+        "score": n as f64 / 7.0,
         "seen": n.is_multiple_of(2),
         "at": format!("2026-05-{:02}T09:00:00Z", 1 + n % 28),
     })
 }
 
 fn vector(n: u64) -> Vec<f32> {
-    vec![1.0, (n % 7) as f32, (n % 11) as f32, 0.5]
+    vec![1.0, (n % 7) as f32, (n % 11) as f32 / 3.0, 0.5]
 }
 
 /// A value with every number read as vellev returns a `number`.
@@ -66,6 +69,10 @@ fn plain(value: &Value) -> Value {
             .into(),
         other => other.clone(),
     }
+}
+
+fn map(value: Value) -> Map<String, Value> {
+    value.as_object().unwrap().clone()
 }
 
 /// Objects by id: their properties and vector.
@@ -116,6 +123,12 @@ impl Weaviate {
             .await;
     }
 
+    /// Make the class, empty.
+    async fn make(&self, class: &str) {
+        let schema = Self::schema(class);
+        self.send(Method::POST, "/v1/schema", Some(schema)).await;
+    }
+
     /// A class `class` holding notes `0..objects`.
     async fn load(url: &str, class: &str, objects: u64) -> Self {
         let weaviate = Self {
@@ -123,10 +136,7 @@ impl Weaviate {
             http: reqwest::Client::new(),
         };
         weaviate.drop(class).await;
-        let schema = Self::schema(class);
-        weaviate
-            .send(Method::POST, "/v1/schema", Some(schema))
-            .await;
+        weaviate.make(class).await;
         weaviate.add(class, 0..objects).await;
         weaviate
     }
@@ -154,10 +164,10 @@ impl Weaviate {
         self.send(Method::PUT, &path, Some(body)).await;
     }
 
-    /// Store a new note `n` with these properties.
-    async fn post(&self, class: &str, n: u64, properties: Value) {
+    /// Store a new note `n` with these properties and this vector.
+    async fn post(&self, class: &str, n: u64, properties: Value, vector: Vec<f32>) {
         let body =
-            json!({ "class": class, "id": uuid(n), "properties": properties, "vector": vector(n) });
+            json!({ "class": class, "id": uuid(n), "properties": properties, "vector": vector });
         self.send(Method::POST, "/v1/objects", Some(body)).await;
     }
 
@@ -170,6 +180,12 @@ impl Weaviate {
     async fn forget(&self, class: &str, id: &str) {
         let path = format!("{}/v1/objects/{class}/{id}", self.url);
         self.http.delete(path).send().await.unwrap();
+    }
+
+    /// A page of the class as Weaviate lists it to a catch-up.
+    async fn listed(&self, class: &str) -> Value {
+        let path = format!("/v1/objects?class={class}&limit=100");
+        self.send(Method::GET, &path, None).await
     }
 
     /// Every object of the class.
@@ -215,8 +231,8 @@ async fn held(records: &Records) -> Held {
 
 type Doing = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Something to do before a request is passed on, given the request's
-/// method and path.
+/// Something to do around a request, given the request's method and
+/// path.
 struct Rule {
     /// The request has every one of these in its method and path, and
     /// none of those that begin with `!`.
@@ -224,11 +240,15 @@ struct Rule {
     /// How many such requests pass untouched first.
     skip: usize,
     act: Box<dyn FnOnce(String) -> Doing + Send>,
+    /// Whether to act once the request has been answered, before the
+    /// answer is passed back, rather than before it is passed on.
+    after: bool,
     /// What to answer in place of passing it on.
     answer: Option<(StatusCode, Value)>,
 }
 
-/// Passes requests on to a Weaviate, doing what its rules say first.
+/// Passes requests on to a Weaviate or a node, doing what its rules say
+/// around them.
 #[derive(Clone)]
 struct Proxy {
     url: String,
@@ -238,12 +258,12 @@ struct Proxy {
 }
 
 impl Proxy {
-    async fn to(weaviate: &Weaviate) -> Self {
+    async fn to(url: &str) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = Self {
             url: format!("http://{}", listener.local_addr().unwrap()),
-            to: weaviate.url.clone(),
-            http: weaviate.http.clone(),
+            to: url.trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
             rules: Arc::default(),
         };
         let router = axum::Router::new()
@@ -254,20 +274,31 @@ impl Proxy {
     }
 
     /// Before the request after the first `skip` that have all of `has`
-    /// in their method and path, do `act`.
+    /// in their method and path is passed on, do `act`.
     fn before<F: Future<Output = ()> + Send + 'static>(
         &self,
         skip: usize,
         has: &[&str],
         act: impl FnOnce(String) -> F + Send + 'static,
     ) {
-        self.rule(skip, has, Box::new(|line| Box::pin(act(line))), None);
+        self.rule(skip, has, Box::new(|line| Box::pin(act(line))), false, None);
+    }
+
+    /// Once such a request has been answered, and before whoever made
+    /// it has the answer, do `act`.
+    fn after<F: Future<Output = ()> + Send + 'static>(
+        &self,
+        skip: usize,
+        has: &[&str],
+        act: impl FnOnce() -> F + Send + 'static,
+    ) {
+        self.rule(skip, has, Box::new(|_| Box::pin(act())), true, None);
     }
 
     /// Answer such a request with `status` and `body`, once.
     fn answer(&self, skip: usize, has: &[&str], status: StatusCode, body: Value) {
         let nothing = Box::new(|_| Box::pin(async {}) as Doing);
-        self.rule(skip, has, nothing, Some((status, body)));
+        self.rule(skip, has, nothing, false, Some((status, body)));
     }
 
     fn rule(
@@ -275,12 +306,14 @@ impl Proxy {
         skip: usize,
         has: &[&str],
         act: Box<dyn FnOnce(String) -> Doing + Send>,
+        after: bool,
         answer: Option<(StatusCode, Value)>,
     ) {
         self.rules.lock().unwrap().push(Rule {
             has: has.iter().map(|has| has.to_string()).collect(),
             skip,
             act,
+            after,
             answer,
         });
     }
@@ -313,22 +346,41 @@ impl Proxy {
                 None => None,
             }
         };
-        if let Some(rule) = due {
-            (rule.act)(line.clone()).await;
-            if let Some((status, body)) = rule.answer {
-                return (status, axum::Json(body)).into_response();
+        let mut later = None;
+        match due {
+            Some(rule) if rule.after => later = Some(rule.act),
+            Some(rule) => {
+                (rule.act)(line.clone()).await;
+                if let Some((status, body)) = rule.answer {
+                    return (status, axum::Json(body)).into_response();
+                }
             }
+            None => {}
         }
         let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let mut passed = proxy
             .http
             .request(parts.method, format!("{}{path}", proxy.to))
             .body(body);
-        if let Some(kind) = parts.headers.get(reqwest::header::CONTENT_TYPE) {
-            passed = passed.header(reqwest::header::CONTENT_TYPE, kind);
+        for (name, value) in &parts.headers {
+            if name != reqwest::header::HOST && name != reqwest::header::CONTENT_LENGTH {
+                passed = passed.header(name, value);
+            }
         }
         let answer = passed.send().await.unwrap();
-        (answer.status(), answer.bytes().await.unwrap()).into_response()
+        let status = answer.status();
+        let kind = answer.headers().get(reqwest::header::CONTENT_TYPE).cloned();
+        let bytes = answer.bytes().await.unwrap();
+        if let Some(act) = later {
+            act(line).await;
+        }
+        let mut answer = (status, bytes).into_response();
+        if let Some(kind) = kind {
+            answer
+                .headers_mut()
+                .insert(reqwest::header::CONTENT_TYPE, kind);
+        }
+        answer
     }
 }
 
@@ -339,21 +391,23 @@ fn after(line: &str) -> &str {
     after.split('&').next().unwrap()
 }
 
+/// How the tests import: a page of 50, no margin for the clocks, since
+/// Weaviate runs on this machine's and a margin would fetch again
+/// whatever was written just before a catch-up, and no bound on what a
+/// run may delete of classes this small.
 fn options(state: &std::path::Path) -> Options {
     Options {
-        classes: vec![],
-        embeddings: HashMap::new(),
-        vectors: HashMap::new(),
-        dimensions: HashMap::new(),
         created_as: Some("createdAt".into()),
-        updated_as: None,
         page: 50,
         batch_bytes: MAX_BODY / 2,
-        per_second: None,
-        // Weaviate runs on this machine's clock; a margin would fetch
-        // again whatever was written just before a catch-up.
         skew: Duration::ZERO,
-        state: state.to_path_buf(),
+        deletes: Deletes::UpTo {
+            count: 1_000,
+            fraction: 1.0,
+        },
+        confirm: Duration::from_millis(20),
+        patience: Duration::from_secs(10),
+        ..Options::new(state.to_path_buf())
     }
 }
 
@@ -366,17 +420,39 @@ fn source(url: &str) -> Source {
     }
 }
 
-async fn tenant(served: &Served, name: &str) -> Tenant {
+async fn tenant(url: &str, name: &str) -> Tenant {
     let options = ClientOptions::default().batch_bytes(MAX_BODY / 2);
-    let client = Client::connect(&[&served.url], KEY, options).unwrap();
+    let client = Client::connect(&[url], KEY, options).unwrap();
     client.tenant(&TenantId::new(name).unwrap())
+}
+
+/// What a run did and found: how many objects it stored, changed and
+/// deleted, how many the ledger keeps as another writer's and how many
+/// it left behind; and how many Weaviate, the ledger and the collection
+/// hold.
+type Counts = ([u64; 5], [u64; 3]);
+
+fn counts(report: &Report, class: &str) -> Counts {
+    let copied = &report.classes[class];
+    (
+        [
+            copied.stored,
+            copied.changed,
+            copied.deleted,
+            copied.kept,
+            copied.left,
+        ],
+        [copied.weaviate, copied.imported, copied.vellev],
+    )
 }
 
 /// One class of a Weaviate and the tenant it is imported into.
 struct Importing {
     class: &'static str,
     weaviate: Weaviate,
+    /// Between the import and Weaviate, and between it and the node.
     proxy: Proxy,
+    front: Proxy,
     // Held so that the node goes on serving and the state file stays.
     _served: Served,
     dir: tempfile::TempDir,
@@ -392,7 +468,8 @@ impl Importing {
         let url = std::env::var("VELLEV_WEAVIATE_URL").ok()?;
         let weaviate = Weaviate::load(&url, class, objects).await;
         let served = Served::new().await;
-        let tenant = tenant(&served, &class.to_lowercase()).await;
+        let front = Proxy::to(&served.url).await;
+        let tenant = tenant(&front.url, &class.to_lowercase()).await;
         let dir = tempfile::tempdir().unwrap();
         let options = Options {
             classes: vec![class.into()],
@@ -400,7 +477,8 @@ impl Importing {
         };
         Some(Self {
             class,
-            proxy: Proxy::to(&weaviate).await,
+            proxy: Proxy::to(&weaviate.url).await,
+            front,
             weaviate,
             _served: served,
             records: tenant.collection(&CollectionName::new(class).unwrap()),
@@ -410,21 +488,17 @@ impl Importing {
         })
     }
 
-    /// Import through the proxy.
+    /// Import through the proxies.
     async fn run(&self) -> eyre::Result<Report> {
-        import::weaviate(&source(&self.proxy.url), &self.tenant, &self.options).await
+        self.run_as(&self.options).await
     }
 
-    /// Import, and answer with what was stored, changed, deleted and
-    /// kept, and how many objects Weaviate, the ledger and the collection
-    /// hold.
-    async fn counts(&self) -> ([u64; 4], [u64; 3]) {
-        let report = self.run().await.unwrap();
-        let copied = &report.classes[self.class];
-        (
-            [copied.stored, copied.changed, copied.deleted, copied.kept],
-            [copied.weaviate, copied.imported, copied.vellev],
-        )
+    async fn run_as(&self, options: &Options) -> eyre::Result<Report> {
+        import::weaviate(&source(&self.proxy.url), &self.tenant, options).await
+    }
+
+    async fn counts(&self) -> Counts {
+        counts(&self.run().await.unwrap(), self.class)
     }
 
     fn ledger(&self) -> Records {
@@ -436,16 +510,29 @@ impl Importing {
         self.records.get(oid(n)).await.unwrap()
     }
 
-    /// A page of objects of this class, as the import asks Weaviate for
-    /// one: with vectors on its first pass, without to catch up.
+    /// A page of objects of this class after another, as the import asks
+    /// Weaviate for one: with vectors on its first walk, without to
+    /// catch up.
     fn page(&self, vectors: bool) -> Vec<String> {
         let page = format!("GET /v1/objects?class={}&", self.class);
         let vectors = if vectors { "" } else { "!" };
         vec![page, "after=".into(), format!("{vectors}include=vector")]
     }
 
+    /// The first page of a catch-up.
+    fn first(&self) -> Vec<String> {
+        let page = format!("GET /v1/objects?class={}&", self.class);
+        vec![page, "!after=".into(), "!include=vector".into()]
+    }
+
+    /// Weaviate asked for note `n` by itself.
     fn object(&self, n: u64) -> String {
         format!("GET /v1/objects/{}/{}", self.class, uuid(n))
+    }
+
+    /// The node asked for note `n` of the collection by itself.
+    fn read(&self, n: u64) -> String {
+        format!("/collections/{}/objects/{}", self.class, uuid(n))
     }
 
     async fn assert_same(&self) {
@@ -459,14 +546,25 @@ impl Importing {
     }
 }
 
+fn strs(owned: &[String]) -> Vec<&str> {
+    owned.iter().map(String::as_str).collect()
+}
+
 fn changed(n: u64) -> Value {
-    json!({ "title": format!("note {n} changed"), "n": 1_000_000 + n })
+    json!({ "title": format!("note {n} changed"), "n": 1_000_000 + n, "score": n as f64 / 3.0 })
 }
 
 fn foreign(n: u64) -> Content {
-    let properties = json!({ "title": format!("another writer's {n}") });
-    let mut content = Content::new(properties.as_object().unwrap().clone());
+    let mut content = Content::new(map(json!({ "title": format!("another writer's {n}") })));
     content.vector = Some(vec![0.0, 0.0, 0.0, 1.0]);
+    content
+}
+
+/// Note `n` exactly as Weaviate holds it, where no time of creation is
+/// kept.
+fn mirrored(n: u64) -> Content {
+    let mut content = Content::new(map(object(n)));
+    content.vector = Some(vector(n));
     content
 }
 
@@ -476,18 +574,11 @@ async fn a_weaviate_class_is_copied_whole_with_its_ids_vectors_and_settings() {
         return;
     };
     let report = importing.run().await.unwrap();
-    assert!(report.matched());
-    let copied = &report.classes[importing.class];
+    assert_eq!(report.outcome(true), Outcome::Settled);
     assert_eq!(
-        (
-            copied.stored,
-            copied.weaviate,
-            copied.imported,
-            copied.vellev
-        ),
-        (OBJECTS, OBJECTS, OBJECTS, OBJECTS)
+        counts(&report, importing.class),
+        ([OBJECTS, 0, 0, 0, 0], [OBJECTS; 3])
     );
-    assert_eq!((copied.changed, copied.deleted, copied.kept), (0, 0, 0));
 
     let records = &importing.records;
     let schema = records.schema().await.unwrap().unwrap();
@@ -510,7 +601,7 @@ async fn a_weaviate_class_is_copied_whole_with_its_ids_vectors_and_settings() {
 
     assert_eq!(
         importing.counts().await,
-        ([0, 0, 0, 0], [OBJECTS; 3]),
+        ([0; 5], [OBJECTS; 3]),
         "a finished import, caught up, has nothing more to do"
     );
 }
@@ -536,13 +627,10 @@ async fn an_import_stopped_part_way_resumes_and_catches_up_with_what_changed_mea
     std::fs::write(state, serde_json::to_vec(&progress).unwrap()).unwrap();
 
     let report = importing.run().await.unwrap();
-    assert!(report.matched());
-    let copied = &report.classes[class];
-    assert_eq!(copied.stored, OBJECTS / 2);
-    assert_eq!((copied.changed, copied.deleted, copied.kept), (1, 1, 0));
+    assert_eq!(report.outcome(true), Outcome::Settled);
     assert_eq!(
-        [copied.weaviate, copied.imported, copied.vellev],
-        [OBJECTS - 1; 3]
+        counts(&report, class),
+        ([OBJECTS / 2, 1, 1, 0, 0], [OBJECTS - 1; 3])
     );
     let changed = importing.get(0).await.unwrap();
     assert_eq!(changed.properties["n"], json!(1_000_000));
@@ -555,7 +643,7 @@ async fn an_import_stopped_part_way_resumes_and_catches_up_with_what_changed_mea
     std::fs::write(state, serde_json::to_vec(&progress).unwrap()).unwrap();
     assert_eq!(
         importing.counts().await,
-        ([0, 0, 0, 0], [OBJECTS - 1; 3]),
+        ([0; 5], [OBJECTS - 1; 3]),
         "every page stored before is passed over"
     );
 }
@@ -610,7 +698,7 @@ async fn a_named_vector_and_a_tenant_of_a_multi_tenant_class_are_copied_beside_a
     }
 
     let served = Served::new().await;
-    let tenant = tenant(&served, "mixed").await;
+    let tenant = tenant(&served.url, "mixed").await;
     let dir = tempfile::tempdir().unwrap();
     let options = Options {
         classes: vec![
@@ -636,7 +724,7 @@ async fn a_named_vector_and_a_tenant_of_a_multi_tenant_class_are_copied_beside_a
         ..untenanted
     };
     let report = import::weaviate(&source, &tenant, &options).await.unwrap();
-    assert!(report.matched(), "{report:?}");
+    assert_eq!(report.outcome(true), Outcome::Settled, "{report:?}");
     let counts: Vec<u64> = report
         .classes
         .values()
@@ -653,15 +741,20 @@ async fn a_named_vector_and_a_tenant_of_a_multi_tenant_class_are_copied_beside_a
     assert_eq!(stored.properties["title"], json!("t1"));
     assert!(tenanted.get(oid(103)).await.unwrap().is_none());
 
-    // A named vector that changes is caught up with as any other.
+    // A named vector that changes, and an object of a tenant that goes,
+    // are caught up with as any other.
     let renamed = json!({ "class": "VellevImportNamed", "id": uuid(3), "properties": { "title": "renamed" }, "vectors": { "default": vector(4) } });
     let path = format!("/v1/objects/VellevImportNamed/{}", uuid(3));
     weaviate.send(Method::PUT, &path, Some(renamed)).await;
+    let path = format!("/v1/objects/VellevImportTenanted/{}?tenant=t1", uuid(5));
+    weaviate.send(Method::DELETE, &path, None).await;
     let again = import::weaviate(&source, &tenant, &options).await.unwrap();
-    assert!(again.matched(), "{again:?}");
+    assert_eq!(again.outcome(true), Outcome::Settled, "{again:?}");
     assert_eq!(again.classes["VellevImportNamed"].changed, 1);
+    assert_eq!(again.classes["VellevImportTenanted"].deleted, 1);
     let stored = named.get(oid(3)).await.unwrap().unwrap();
     assert_eq!(stored.vector, Some(vector(4)));
+    assert!(tenanted.get(oid(5)).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -670,12 +763,12 @@ async fn a_catch_up_replaces_and_deletes_only_what_the_import_left_and_nobody_ha
         return;
     };
     let (class, weaviate, records) = (importing.class, &importing.weaviate, &importing.records);
-    assert_eq!(importing.counts().await, ([40, 0, 0, 0], [40; 3]));
+    assert_eq!(importing.counts().await, ([40, 0, 0, 0, 0], [40; 3]));
 
     // Another writer stores a memory of its own, changes one the import
     // brought, replaces another and deletes two more.
     records.put(oid(1_000), &foreign(1_000)).await.unwrap();
-    let patch = Changes::new(json!({ "n": -2 }).as_object().unwrap().clone());
+    let patch = Changes::new(map(json!({ "n": -2 })));
     records.patch(oid(2), &patch).await.unwrap();
     records.put(oid(3), &foreign(3)).await.unwrap();
     records.delete(oid(4)).await.unwrap();
@@ -689,14 +782,13 @@ async fn a_catch_up_replaces_and_deletes_only_what_the_import_left_and_nobody_ha
     weaviate.add(class, 50..51).await;
 
     let report = importing.run().await.unwrap();
-    let copied = &report.classes[class];
     assert_eq!(
-        [copied.stored, copied.changed, copied.deleted, copied.kept],
-        [1, 1, 1, 3],
-        "note 50 stored, 5 changed, 1 deleted; 2, 3 and 4 kept as found"
+        counts(&report, class),
+        ([1, 1, 1, 2, 1], [39; 3]),
+        "note 50 stored, 5 changed, 1 deleted; 3 and 4 kept as found; 2 left behind"
     );
-    assert_eq!([copied.weaviate, copied.imported, copied.vellev], [39; 3]);
-    assert!(copied.caught_up() && !copied.untouched() && !report.matched());
+    assert_eq!(report.outcome(false), Outcome::Settled);
+    assert_eq!(report.outcome(true), Outcome::Unsettled);
 
     let untouched = |stored: Option<vellev_api::Stored>, content: &Content| {
         let stored = stored.unwrap();
@@ -721,16 +813,16 @@ async fn a_catch_up_replaces_and_deletes_only_what_the_import_left_and_nobody_ha
     );
     assert!(importing.get(50).await.is_some());
 
-    // Run again, the import finds nothing of its own to do, and leaves
-    // the other writer's objects where they are.
-    assert_eq!(importing.counts().await, ([0, 0, 0, 0], [39; 3]));
+    // Run again, the import finds nothing of its own to do, leaves the
+    // other writer's objects where they are, and says the same of them.
+    assert_eq!(importing.counts().await, ([0, 0, 0, 2, 0], [39; 3]));
     untouched(importing.get(1_000).await, &foreign(1_000));
     untouched(importing.get(3).await, &foreign(3));
 
     // Weaviate changes an object the other writer deleted: it stays
     // deleted.
     weaviate.put(class, 6, changed(6)).await;
-    assert_eq!(importing.counts().await, ([0, 0, 0, 1], [39; 3]));
+    assert_eq!(importing.counts().await, ([0, 0, 0, 3, 0], [39; 3]));
     assert!(importing.get(6).await.is_none());
 }
 
@@ -743,16 +835,14 @@ async fn objects_a_mirror_wrote_under_weaviates_ids_are_taken_as_they_are() {
     // exactly as the import would.
     importing.options.created_as = None;
     let (class, weaviate, records) = (importing.class, &importing.weaviate, &importing.records);
-    assert_eq!(importing.counts().await, ([10, 0, 0, 0], [10; 3]));
+    assert_eq!(importing.counts().await, ([10, 0, 0, 0, 0], [10; 3]));
 
     // Weaviate gains notes 10..30. A mirror has already stored 10..20 as
     // Weaviate has them and 20..25 otherwise, as it would a change the
     // import has yet to see.
     weaviate.add(class, 10..30).await;
     for n in 10..20 {
-        let mut content = Content::new(object(n).as_object().unwrap().clone());
-        content.vector = Some(vector(n));
-        records.put(oid(n), &content).await.unwrap();
+        records.put(oid(n), &mirrored(n)).await.unwrap();
     }
     for n in 20..25 {
         records.put(oid(n), &foreign(n)).await.unwrap();
@@ -762,7 +852,7 @@ async fn objects_a_mirror_wrote_under_weaviates_ids_are_taken_as_they_are() {
     std::fs::remove_file(&importing.options.state).unwrap();
     assert_eq!(
         importing.counts().await,
-        ([5, 0, 0, 5], [30; 3]),
+        ([5, 0, 0, 5, 0], [30; 3]),
         "25..30 stored; 20..25 kept as the mirror has them"
     );
     for n in 20..25 {
@@ -771,13 +861,21 @@ async fn objects_a_mirror_wrote_under_weaviates_ids_are_taken_as_they_are() {
             foreign(n).properties
         );
     }
-    assert_eq!(importing.counts().await, ([0, 0, 0, 0], [30; 3]));
+    assert_eq!(importing.counts().await, ([0, 0, 0, 5, 0], [30; 3]));
+
+    // Weaviate changes a note and the mirror stores the change: the
+    // object is as the import would have it, and the import's.
+    weaviate.put(class, 20, changed(20)).await;
+    let mut caught_up = Content::new(map(changed(20)));
+    caught_up.vector = Some(vector(20));
+    records.put(oid(20), &caught_up).await.unwrap();
+    assert_eq!(importing.counts().await, ([0, 0, 0, 4, 0], [30; 3]));
 
     // What the mirror stored as Weaviate has it goes when Weaviate's
     // does; what it stored otherwise is left for it to delete.
     weaviate.delete(class, 12).await;
     weaviate.delete(class, 22).await;
-    assert_eq!(importing.counts().await, ([0, 0, 1, 1], [28, 28, 29]));
+    assert_eq!(importing.counts().await, ([0, 0, 1, 3, 1], [28, 28, 29]));
     assert!(importing.get(12).await.is_none());
     assert!(importing.get(22).await.is_some());
 }
@@ -791,30 +889,142 @@ async fn an_object_another_writer_changes_or_deletes_while_the_import_deletes_it
     importing.run().await.unwrap();
     weaviate.delete(class, 3).await;
     weaviate.delete(class, 6).await;
-    weaviate.put(class, 4, changed(4)).await;
 
-    // The import asks Weaviate whether it still has the class once it
-    // has read the object it is about to delete: the other writer's
-    // delete of note 6, and then its change to note 3, land between
-    // that read and the import's delete.
-    assert!(oid(6) < oid(3), "note 6 is come to first");
-    let schema = format!("GET /v1/schema/{class}");
+    // The other writer's delete of note 6, and its change to note 3,
+    // land between the import's reading each and its deleting it.
     let records = importing.records.clone();
-    importing.proxy.before(0, &[&schema], move |_| async move {
-        records.delete(oid(6)).await.unwrap();
-    });
+    let read = importing.read(6);
+    importing
+        .front
+        .after(0, &["GET", &read], move || async move {
+            records.delete(oid(6)).await.unwrap();
+        });
     let records = importing.records.clone();
-    importing.proxy.before(0, &[&schema], move |_| async move {
-        let patch = Changes::new(json!({ "n": 99 }).as_object().unwrap().clone());
-        records.patch(oid(3), &patch).await.unwrap();
-    });
-    assert_eq!(importing.counts().await, ([0, 1, 0, 1], [8, 8, 9]));
-    assert!(importing.proxy.spent());
+    let read = importing.read(3);
+    importing
+        .front
+        .after(0, &["GET", &read], move || async move {
+            let patch = Changes::new(map(json!({ "n": 99 })));
+            records.patch(oid(3), &patch).await.unwrap();
+        });
+    assert_eq!(importing.counts().await, ([0, 0, 0, 0, 1], [8, 8, 9]));
+    assert!(importing.front.spent());
     assert!(importing.get(6).await.is_none());
     assert_eq!(importing.get(3).await.unwrap().properties["n"], json!(99));
+}
+
+#[tokio::test]
+async fn an_object_another_writer_changes_while_the_import_replaces_it_is_kept() {
+    let Some(importing) = Importing::new("VellevImportRacedReplace", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    // Note 20 has no tags.
+    let mut untagged = object(20);
+    untagged.as_object_mut().unwrap().remove("tags");
+    weaviate.post(class, 20, untagged, vector(20)).await;
+    importing.run().await.unwrap();
+    weaviate.put(class, 4, changed(4)).await;
+    weaviate.put(class, 20, changed(20)).await;
+
+    // The other writer changes a value of note 4, and gives note 20 one
+    // where it had none, between the import's reading the two and its
+    // storing Weaviate's in their place.
+    let records = importing.records.clone();
+    let read = format!("/collections/{class}/list");
+    importing
+        .front
+        .after(0, &["POST", &read], move || async move {
+            let patch = Changes::new(map(json!({ "n": 99 })));
+            records.patch(oid(4), &patch).await.unwrap();
+            let patch = Changes::new(map(json!({ "tags": ["theirs"] })));
+            records.patch(oid(20), &patch).await.unwrap();
+        });
+    assert_eq!(importing.counts().await, ([0, 0, 0, 2, 0], [11; 3]));
+    assert!(importing.front.spent());
+    let kept = importing.get(4).await.unwrap();
+    assert_eq!(kept.properties["n"], json!(99));
+    assert_eq!(kept.properties["title"], json!("note 4 about hens"));
+    let kept = importing.get(20).await.unwrap();
+    assert_eq!(kept.properties["tags"], json!(["theirs"]));
+    assert_eq!(kept.properties["title"], json!("note 20 about owls"));
+}
+
+#[tokio::test]
+async fn an_object_another_writer_stores_while_the_import_stores_its_page_is_kept() {
+    let Some(importing) = Importing::new("VellevImportRacedStore", 10).await else {
+        return;
+    };
+    // The collection is made by the import's first request to change
+    // the tenant; its second stores the page, none of whose ids the
+    // ledger has. The other writer stores note 3 just before it.
+    let records = importing.records.clone();
+    importing
+        .front
+        .before(1, &["POST", "/changes"], move |_| async move {
+            records.put(oid(3), &foreign(3)).await.unwrap();
+        });
+    assert_eq!(importing.counts().await, ([9, 0, 0, 1, 0], [10; 3]));
+    assert!(importing.front.spent());
     assert_eq!(
-        importing.get(4).await.unwrap().properties["n"],
-        json!(1_000_004)
+        importing.get(3).await.unwrap().properties,
+        foreign(3).properties
+    );
+}
+
+#[tokio::test]
+async fn an_entry_written_while_an_object_is_settled_is_read_before_it_is_settled_again() {
+    let Some(mut importing) = Importing::new("VellevImportRacedEntry", 10).await else {
+        return;
+    };
+    importing.options.created_as = None;
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    weaviate.add(class, 30..31).await;
+
+    // Another import, as it were, stores note 30 while this one is about
+    // to, and then its entry while this one settles the note by itself.
+    let read = importing.read(30);
+    let records = importing.records.clone();
+    importing
+        .front
+        .after(0, &["GET", &read], move || async move {
+            records.put(oid(30), &mirrored(30)).await.unwrap();
+        });
+    let ledger = importing.ledger();
+    importing
+        .front
+        .after(0, &["GET", &read], move || async move {
+            let entry = Content::new(map(json!({ "hash": "another import's" })));
+            ledger.put(oid(30), &entry).await.unwrap();
+        });
+    assert_eq!(importing.counts().await, ([0; 5], [11; 3]));
+    assert!(importing.front.spent());
+    importing.assert_same().await;
+}
+
+#[tokio::test]
+async fn a_refusal_that_no_other_writer_explains_stops_the_run() {
+    let Some(importing) = Importing::new("VellevImportBusy", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    importing.weaviate.put(importing.class, 4, changed(4)).await;
+    // The node answers as it does of a tenant it is purging: the same
+    // code as for an object another writer changed, with nothing changed.
+    let busy = json!({ "error": { "code": "conflict", "message": "tenant is being purged" } });
+    // The first request to change the tenant, which sees to its
+    // collections, is let through.
+    for skip in [1, 0, 0] {
+        let changes = ["POST", "/changes"];
+        importing
+            .front
+            .answer(skip, &changes, StatusCode::CONFLICT, busy.clone());
+    }
+    let refused = importing.run().await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("being purged"),
+        "{refused:#}"
     );
 }
 
@@ -834,12 +1044,11 @@ async fn a_class_that_gained_a_property_goes_on_being_imported_with_it() {
     weaviate.put(class, 1, moody.clone()).await;
     let mut newcomer = object(20);
     newcomer["mood"] = json!("wary");
-    weaviate.post(class, 20, newcomer).await;
+    weaviate.post(class, 20, newcomer, vector(20)).await;
 
     let report = importing.run().await.unwrap();
-    assert!(report.matched(), "{report:?}");
-    let copied = &report.classes[class];
-    assert_eq!((copied.stored, copied.changed), (1, 1));
+    assert_eq!(report.outcome(true), Outcome::Settled, "{report:?}");
+    assert_eq!(counts(&report, class), ([1, 1, 0, 0, 0], [11; 3]));
     let schema = importing.records.schema().await.unwrap().unwrap();
     let mood = schema.property("mood").unwrap();
     assert_eq!(mood.data_type, vellev_core::DataType::Text);
@@ -855,7 +1064,8 @@ async fn a_class_that_gained_a_property_goes_on_being_imported_with_it() {
     importing.assert_same().await;
 
     // A class made again with a property of another type, and vectors of
-    // another size, is refused, and says both.
+    // another size, is refused, and says both, even to one told to go
+    // on from a class made again.
     weaviate.drop(class).await;
     let mut schema = Weaviate::schema(class);
     schema["properties"][2] = json!({ "name": "n", "dataType": ["text"] });
@@ -866,7 +1076,11 @@ async fn a_class_that_gained_a_property_goes_on_being_imported_with_it() {
     weaviate
         .send(Method::POST, "/v1/objects", Some(other))
         .await;
-    let refused = importing.run().await.unwrap_err();
+    let remade = Options {
+        accept_remade: true,
+        ..importing.options.clone()
+    };
+    let refused = importing.run_as(&remade).await.unwrap_err();
     let refused = format!("{refused:#}");
     for reason in [
         "no longer fits its collection",
@@ -881,7 +1095,7 @@ async fn a_class_that_gained_a_property_goes_on_being_imported_with_it() {
 #[tokio::test]
 async fn an_object_gone_from_weaviate_between_being_listed_and_fetched_is_gone_from_the_collection()
 {
-    let Some(importing) = Importing::new("VellevImportVanished", 10).await else {
+    let Some(importing) = Importing::new("VellevImportVanished", 20).await else {
         return;
     };
     let (class, weaviate) = (importing.class, importing.weaviate.clone());
@@ -900,13 +1114,8 @@ async fn an_object_gone_from_weaviate_between_being_listed_and_fetched_is_gone_f
     }
     let report = importing.run().await.unwrap();
     assert!(importing.proxy.spent());
-    let copied = &report.classes[class];
-    assert_eq!(
-        [copied.stored, copied.changed, copied.deleted, copied.kept],
-        [0, 0, 1, 0]
-    );
-    assert_eq!([copied.weaviate, copied.imported, copied.vellev], [9; 3]);
-    assert!(report.matched());
+    assert_eq!(counts(&report, class), ([0, 0, 1, 0, 0], [19; 3]));
+    assert_eq!(report.outcome(true), Outcome::Settled);
     assert!(importing.get(4).await.is_none());
     importing.assert_same().await;
 }
@@ -921,23 +1130,24 @@ async fn an_import_of_a_weaviate_written_to_all_the_while_is_exact_after_the_nex
     // Before a page is passed on, Weaviate gains objects, has others
     // changed and loses others, on both sides of where the walk has
     // reached, the one the page starts after among them: on the first
-    // pass's third page, and on the catch-up's second and fourth.
+    // walk's third page, and on the catch-up's second and fourth.
     let disturb = |vectors: bool, skip: usize, nth: u64| {
         let weaviate = weaviate.clone();
         let page = importing.page(vectors);
-        let page: Vec<&str> = page.iter().map(String::as_str).collect();
-        importing.proxy.before(skip, &page, move |line| async move {
-            weaviate
-                .add(class, 1_000 + 30 * nth..1_008 + 30 * nth)
-                .await;
-            for n in 10 + 30 * nth..18 + 30 * nth {
-                weaviate.put(class, n, changed(n)).await;
-            }
-            for n in 150 + 30 * nth..158 + 30 * nth {
-                weaviate.delete(class, n).await;
-            }
-            weaviate.forget(class, after(&line)).await;
-        });
+        importing
+            .proxy
+            .before(skip, &strs(&page), move |line| async move {
+                weaviate
+                    .add(class, 1_000 + 30 * nth..1_008 + 30 * nth)
+                    .await;
+                for n in 10 + 30 * nth..18 + 30 * nth {
+                    weaviate.put(class, n, changed(n)).await;
+                }
+                for n in 150 + 30 * nth..158 + 30 * nth {
+                    weaviate.delete(class, n).await;
+                }
+                weaviate.forget(class, after(&line)).await;
+            });
     };
     disturb(true, 1, 0);
     disturb(false, 1, 1);
@@ -946,14 +1156,15 @@ async fn an_import_of_a_weaviate_written_to_all_the_while_is_exact_after_the_nex
     let first = importing.run().await.unwrap();
     assert!(importing.proxy.spent());
     let copied = &first.classes[class];
-    assert!(
-        !copied.caught_up() && !first.matched(),
+    assert_eq!(
+        first.outcome(false),
+        Outcome::Behind,
         "written to behind the catch-up, the run says it has not caught up: {copied:?}"
     );
-    assert_eq!(copied.kept, 0);
+    assert_eq!((copied.kept, copied.left), (0, 0));
 
     let second = importing.run().await.unwrap();
-    assert!(second.matched(), "{second:?}");
+    assert_eq!(second.outcome(true), Outcome::Settled, "{second:?}");
     importing.assert_same().await;
     let held = weaviate.held(class).await;
     assert!(
@@ -963,25 +1174,137 @@ async fn an_import_of_a_weaviate_written_to_all_the_while_is_exact_after_the_nex
     assert_eq!(held[&oid(70)].0["n"], json!(1_000_070.0));
     assert_eq!(
         importing.counts().await,
-        ([0, 0, 0, 0], [held.len() as u64; 3]),
+        ([0; 5], [held.len() as u64; 3]),
         "and then there is nothing more to do"
     );
 }
 
 #[tokio::test]
-async fn nothing_is_deleted_for_a_class_weaviate_no_longer_has_or_has_nothing_of() {
-    let Some(importing) = Importing::new("VellevImportDropped", 20).await else {
+async fn a_run_deletes_nothing_when_more_is_gone_than_it_may_delete() {
+    let Some(importing) = Importing::new("VellevImportBudget", 40).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    for n in [1, 2, 3] {
+        weaviate.delete(class, n).await;
+    }
+    weaviate.put(class, 5, changed(5)).await;
+
+    // By default a run deletes at most one object in twenty of a class.
+    let usual = Options {
+        deletes: Options::new(Default::default()).deletes,
+        ..importing.options.clone()
+    };
+    let report = importing.run_as(&usual).await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!(counts(&report, class), ([0, 1, 0, 0, 0], [37, 40, 40]));
+    assert_eq!((copied.pending, copied.budget), (3, Some(2)));
+    assert_eq!(report.outcome(false), Outcome::Unsettled);
+    for n in [1, 2, 3] {
+        assert!(importing.get(n).await.is_some());
+    }
+
+    // Told to delete nothing, it counts what is gone and is done.
+    let none = Options {
+        deletes: Deletes::None,
+        ..importing.options.clone()
+    };
+    let report = importing.run_as(&none).await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!(counts(&report, class), ([0; 5], [37, 40, 40]));
+    assert_eq!((copied.pending, copied.budget), (3, None));
+    assert_eq!(report.outcome(true), Outcome::Settled);
+
+    // Within what it may delete, it deletes: three of the sixty the
+    // ledger then holds.
+    weaviate.add(class, 100..120).await;
+    let report = importing.run_as(&none).await.unwrap();
+    assert_eq!(counts(&report, class), ([20, 0, 0, 0, 0], [57, 60, 60]));
+    let report = importing.run_as(&usual).await.unwrap();
+    assert_eq!(counts(&report, class), ([0, 0, 3, 0, 0], [57; 3]));
+    assert_eq!(report.outcome(true), Outcome::Settled);
+}
+
+#[tokio::test]
+async fn nothing_is_deleted_for_a_class_made_again_or_dropped() {
+    let Some(importing) = Importing::new("VellevImportRemade", 20).await else {
         return;
     };
     let (class, weaviate) = (importing.class, importing.weaviate.clone());
     importing.run().await.unwrap();
+    let all = async || {
+        let objects = importing.records.count(None).await.unwrap();
+        (objects, importing.ledger().count(None).await.unwrap())
+    };
 
-    // The class is dropped just as the catch-up asks for an object it
-    // did not list: Weaviate answers as it would of a deleted object.
+    // Made again with one object, as a Weaviate begun afresh at the same
+    // address would have it: the class is not the one imported.
+    weaviate.drop(class).await;
+    weaviate.make(class).await;
+    weaviate.add(class, 0..1).await;
+    let refused = importing.run().await.unwrap_err();
+    assert!(
+        refused.to_string().contains("has been made again"),
+        "{refused}"
+    );
+    assert_eq!(all().await, (20, 20));
+
+    // Told to go on from it, a run still deletes no more than it may:
+    // here nothing, where nineteen of twenty are gone.
+    let usual = Options {
+        accept_remade: true,
+        deletes: Options::new(Default::default()).deletes,
+        ..importing.options.clone()
+    };
+    let report = importing.run_as(&usual).await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!(
+        (copied.deleted, copied.pending, copied.budget),
+        (0, 19, Some(1))
+    );
+    assert_eq!(report.outcome(false), Outcome::Unsettled);
+    assert_eq!(all().await, (20, 20));
+
+    // Made again while a catch-up walks it, with no bound on what a run
+    // may delete: what the walk no longer lists is asked for, and the
+    // class is found to be another before anything is deleted.
+    let weaviate = Weaviate::load(&weaviate.url, class, 20).await;
+    let remade = Options {
+        accept_remade: true,
+        page: 5,
+        ..importing.options.clone()
+    };
+    importing.run_as(&remade).await.unwrap();
+    assert_eq!(all().await, (20, 20));
+    let again = weaviate.clone();
+    let page = importing.page(false);
+    importing
+        .proxy
+        .before(1, &strs(&page), move |_| async move {
+            again.drop(class).await;
+            again.make(class).await;
+        });
+    let options = Options {
+        page: 5,
+        ..importing.options.clone()
+    };
+    let refused = importing.run_as(&options).await.unwrap_err();
+    assert!(importing.proxy.spent());
+    assert!(
+        refused.to_string().contains("has been made again"),
+        "{refused}"
+    );
+    assert_eq!(all().await, (20, 20));
+
+    // Dropped as the deleting begins: Weaviate answers of an object in a
+    // class it no longer has as of one it deleted.
+    let weaviate = Weaviate::load(&weaviate.url, class, 20).await;
+    importing.run_as(&remade).await.unwrap();
     weaviate.delete(class, 5).await;
-    let fetch = importing.object(5);
     let dropping = weaviate.clone();
-    importing.proxy.before(0, &[&fetch], move |_| async move {
+    let shards = format!("GET /v1/schema/{class}/shards");
+    importing.proxy.before(1, &[&shards], move |_| async move {
         dropping.drop(class).await;
     });
     let refused = importing.run().await.unwrap_err();
@@ -990,21 +1313,58 @@ async fn nothing_is_deleted_for_a_class_weaviate_no_longer_has_or_has_nothing_of
         refused.to_string().contains("no longer has class"),
         "{refused}"
     );
-    assert_eq!(importing.records.count(None).await.unwrap(), 20);
+    assert_eq!(all().await, (20, 20));
+}
 
-    // Made again and empty, as a Weaviate begun afresh at the same
-    // address would have it, it is not taken to have deleted everything.
-    let schema = Weaviate::schema(class);
-    weaviate
-        .send(Method::POST, "/v1/schema", Some(schema))
-        .await;
-    let refused = importing.run().await.unwrap_err();
+#[tokio::test]
+async fn a_weaviate_that_is_starting_is_not_believed_about_what_it_does_not_hold() {
+    let Some(importing) = Importing::new("VellevImportStarting", 20).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+
+    // A Weaviate that is starting lists less than it holds, and answers
+    // that it holds no such object for objects it holds. Here it leaves
+    // notes 5 and 6 out of its listing, says it is not ready, then that
+    // a shard is still loading, and answers the first asking for note 5
+    // as if it held none.
+    let mut listed = weaviate.listed(class).await;
+    let objects = listed["objects"].as_array_mut().unwrap();
+    objects.retain(|object| ![json!(uuid(5)), json!(uuid(6))].contains(&object["id"]));
+    let first = importing.first();
+    let proxy = &importing.proxy;
+    proxy.answer(0, &strs(&first), StatusCode::OK, listed.clone());
+    let unready = StatusCode::SERVICE_UNAVAILABLE;
+    proxy.answer(0, &["/v1/.well-known/ready"], unready, json!({}));
+    let shards = format!("GET /v1/schema/{class}/shards");
+    let loading = json!([{ "name": "s", "status": "LOADING" }]);
+    proxy.answer(1, &[&shards], StatusCode::OK, loading.clone());
+    let missing = StatusCode::NOT_FOUND;
+    proxy.answer(0, &[&importing.object(5)], missing, json!({}));
+    assert_eq!(importing.counts().await, ([0; 5], [20; 3]));
+    assert!(proxy.spent());
+
+    // One whose shards never finish loading is waited on, and then the
+    // run stops, having deleted nothing, though here the note is gone.
+    weaviate.delete(class, 6).await;
+    let impatient = Options {
+        patience: Duration::from_secs(1),
+        ..importing.options.clone()
+    };
+    for skip in [1, 0, 0, 0, 0, 0, 0, 0] {
+        proxy.answer(skip, &[&shards], StatusCode::OK, loading.clone());
+    }
+    let refused = importing.run_as(&impatient).await.unwrap_err();
     assert!(
-        refused.to_string().contains("holds nothing of class"),
+        refused.to_string().contains("was not ready to say"),
         "{refused}"
     );
-    assert_eq!(importing.records.count(None).await.unwrap(), 20);
-    assert_eq!(importing.ledger().count(None).await.unwrap(), 20);
+    assert!(importing.get(6).await.is_some());
+    proxy.rules.lock().unwrap().clear();
+
+    // Ready, and asked twice, it is believed.
+    assert_eq!(importing.counts().await, ([0, 0, 1, 0, 0], [19; 3]));
 }
 
 #[tokio::test]
@@ -1013,16 +1373,30 @@ async fn a_weaviate_that_turns_requests_away_or_fails_for_a_while_is_asked_again
         return;
     };
     let page = importing.page(true);
-    let page: Vec<&str> = page.iter().map(String::as_str).collect();
     for status in [
         StatusCode::TOO_MANY_REQUESTS,
         StatusCode::REQUEST_TIMEOUT,
         StatusCode::SERVICE_UNAVAILABLE,
     ] {
-        importing.proxy.answer(0, &page, status, json!({}));
+        importing.proxy.answer(0, &strs(&page), status, json!({}));
     }
-    assert_eq!(importing.counts().await, ([120, 0, 0, 0], [120; 3]));
+    assert_eq!(importing.counts().await, ([120, 0, 0, 0, 0], [120; 3]));
     assert!(importing.proxy.spent());
+
+    // For no longer than it is told to be patient.
+    for _ in 0..4 {
+        let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+        importing
+            .proxy
+            .answer(0, &["GET /v1/schema"], unavailable, json!({}));
+    }
+    let impatient = Options {
+        patience: Duration::from_secs(1),
+        ..importing.options.clone()
+    };
+    let refused = importing.run_as(&impatient).await.unwrap_err();
+    assert!(refused.to_string().contains("Weaviate failed"), "{refused}");
+    assert!(!importing.proxy.spent(), "it gave up before the fourth");
 }
 
 #[tokio::test]
@@ -1035,9 +1409,10 @@ async fn a_weaviate_that_lists_its_ids_out_of_order_is_not_caught_up_with() {
     // Walked beside the ledger, a listing out of order would make
     // objects that are there look gone.
     let page = importing.page(false);
-    let page: Vec<&str> = page.iter().map(String::as_str).collect();
     let unordered = json!({ "objects": [{ "id": uuid(3) }, { "id": uuid(2) }] });
-    importing.proxy.answer(0, &page, StatusCode::OK, unordered);
+    importing
+        .proxy
+        .answer(0, &strs(&page), StatusCode::OK, unordered);
     let refused = importing.run().await.unwrap_err();
     assert!(importing.proxy.spent());
     assert!(
@@ -1045,7 +1420,18 @@ async fn a_weaviate_that_lists_its_ids_out_of_order_is_not_caught_up_with() {
         "{refused}"
     );
     assert_eq!(importing.records.count(None).await.unwrap(), 120);
-    assert_eq!(importing.counts().await, ([0, 0, 0, 0], [120; 3]));
+
+    // Nor is a ledger the node lists out of order walked.
+    let list = format!("/collections/vellev_imported_{}/list", importing.class);
+    let entry = |n: u64| json!({ "id": uuid(n), "properties": { "hash": "h" } });
+    let unordered = json!({ "objects": [entry(3), entry(2)] });
+    importing
+        .front
+        .answer(0, &["POST", &list], StatusCode::OK, unordered);
+    let refused = importing.run().await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(refused.to_string().contains("out of order"), "{refused}");
+    assert_eq!(importing.counts().await, ([0; 5], [120; 3]));
 }
 
 #[tokio::test]
@@ -1079,16 +1465,14 @@ async fn a_collection_is_caught_up_only_from_the_weaviate_it_was_imported_from_a
     let report = import::weaviate(&named, &importing.tenant, &elsewhere)
         .await
         .unwrap();
-    assert!(report.matched(), "{report:?}");
+    assert_eq!(report.outcome(true), Outcome::Settled, "{report:?}");
     assert_eq!(report.classes[class].deleted, 1);
 
     let otherwise = Options {
         created_as: None,
         ..importing.options.clone()
     };
-    let refused = import::weaviate(&source(&importing.proxy.url), &importing.tenant, &otherwise)
-        .await
-        .unwrap_err();
+    let refused = importing.run_as(&otherwise).await.unwrap_err();
     assert!(
         refused
             .to_string()
@@ -1098,41 +1482,398 @@ async fn a_collection_is_caught_up_only_from_the_weaviate_it_was_imported_from_a
 }
 
 #[tokio::test]
+async fn two_runs_do_not_share_a_state_file() {
+    let Some(importing) = Importing::new("VellevImportLocked", 120).await else {
+        return;
+    };
+    let (one, other) = tokio::join!(importing.run(), importing.run());
+    let refused = match (one, other) {
+        (Ok(_), Err(refused)) | (Err(refused), Ok(_)) => refused,
+        (one, other) => panic!("one of two runs is refused: {one:?} {other:?}"),
+    };
+    assert!(
+        refused.to_string().contains("another import is running"),
+        "{refused}"
+    );
+    assert_eq!(importing.counts().await, ([0; 5], [120; 3]));
+}
+
+#[tokio::test]
 async fn a_collection_dropped_is_imported_again_from_the_start() {
     let Some(importing) = Importing::new("VellevImportAgain", 20).await else {
         return;
     };
     importing.run().await.unwrap();
     importing.records.drop().await.unwrap();
-    assert_eq!(importing.counts().await, ([20, 0, 0, 0], [20; 3]));
+    assert_eq!(importing.counts().await, ([20, 0, 0, 0, 0], [20; 3]));
     importing.assert_same().await;
 }
 
 #[tokio::test]
-async fn without_its_ledger_an_import_takes_up_what_is_as_weaviate_has_it_and_deletes_nothing() {
-    let Some(importing) = Importing::new("VellevImportLedgerless", 20).await else {
+async fn a_collection_made_anew_is_copied_by_the_page_whatever_the_state_file_says() {
+    let Some(importing) = Importing::new("VellevImportAnew", 20).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    importing.records.drop().await.unwrap();
+
+    // The state file says the class was copied whole. Believed, it would
+    // leave every object to the catch-up, to fetch one at a time.
+    let singly = format!("GET /v1/objects/{}/", importing.class);
+    importing.proxy.before(0, &[&singly], |_| async {});
+    assert_eq!(importing.counts().await, ([20, 0, 0, 0, 0], [20; 3]));
+    assert!(!importing.proxy.spent(), "no object was fetched by itself");
+}
+
+#[tokio::test]
+async fn a_catch_up_fetches_and_stores_many_changes_by_the_page() {
+    let Some(importing) = Importing::new("VellevImportBatched", 60).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    for n in 0..30 {
+        weaviate.put(class, n, changed(n)).await;
+    }
+    weaviate.add(class, 100..120).await;
+
+    // Half of what the catch-up lists has changed or is new: neither
+    // Weaviate nor the node is asked for an object by itself.
+    let singly = format!("GET /v1/objects/{class}/");
+    importing.proxy.before(0, &[&singly], |_| async {});
+    let read = format!("/collections/{class}/objects/");
+    importing.front.before(0, &["GET", &read], |_| async {});
+    assert_eq!(importing.counts().await, ([20, 30, 0, 0, 0], [80; 3]));
+    assert!(!importing.proxy.spent() && !importing.front.spent());
+    importing.assert_same().await;
+}
+
+#[tokio::test]
+async fn a_collection_without_a_ledger_is_taken_up_and_given_nothing_it_lacks() {
+    let Some(importing) = Importing::new("VellevImportLedgerless", 120).await else {
         return;
     };
     let (class, weaviate) = (importing.class, &importing.weaviate);
     importing.run().await.unwrap();
 
     // As a collection imported before there were ledgers: the import
-    // cannot know which of its objects it brought.
+    // cannot know which of its objects it brought, nor whether one that
+    // is missing was deleted or is new to Weaviate.
     importing.ledger().drop().await.unwrap();
     weaviate.put(class, 2, changed(2)).await;
     weaviate.delete(class, 3).await;
+    importing.records.delete(oid(9)).await.unwrap();
+    weaviate.add(class, 300..301).await;
+
+    // The taking up stops part way, and goes on from there.
+    let page = importing.page(true);
+    let fault = StatusCode::BAD_REQUEST;
+    importing.proxy.answer(0, &strs(&page), fault, json!({}));
+    let stopped = importing.run().await.unwrap_err();
+    assert!(stopped.to_string().contains("400"), "{stopped}");
+    let state = std::fs::read(&importing.options.state).unwrap();
+    let progress: Value = serde_json::from_slice(&state).unwrap();
+    assert_eq!(progress["classes"][class]["done"], json!(false));
+    assert_ne!(progress["classes"][class]["after"], Value::Null);
+    assert_eq!(importing.ledger().count(None).await.unwrap(), 50);
+
     assert_eq!(
         importing.counts().await,
-        ([0, 0, 0, 1], [19, 19, 20]),
-        "note 2 is not as Weaviate has it, and kept; note 3 is nobody's to delete"
+        ([0, 0, 0, 3, 0], [120, 120, 119]),
+        "note 2 is not as Weaviate has it, notes 9 and 300 are not there: kept so"
     );
     assert_eq!(importing.get(2).await.unwrap().properties["n"], json!(2));
-    assert!(importing.get(3).await.is_some());
+    assert!(importing.get(3).await.is_some(), "nobody's to delete");
+    assert!(importing.get(9).await.is_none());
+    assert!(importing.get(300).await.is_none());
 
-    // What it took up is the import's from then on.
+    // What it took up is the import's from then on, and what is new to
+    // Weaviate from then on is stored.
     weaviate.put(class, 7, changed(7)).await;
     weaviate.delete(class, 8).await;
-    assert_eq!(importing.counts().await, ([0, 1, 1, 0], [18, 18, 19]));
+    weaviate.add(class, 301..302).await;
+    assert_eq!(importing.counts().await, ([1, 1, 1, 3, 0], [120, 120, 119]));
+    assert!(importing.get(301).await.is_some());
+}
+
+#[tokio::test]
+async fn a_collection_without_a_ledger_and_no_other_writer_is_brought_to_what_weaviate_holds() {
+    let Some(importing) = Importing::new("VellevImportSole", 60).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    importing.ledger().drop().await.unwrap();
+    weaviate.put(class, 2, changed(2)).await;
+    weaviate.delete(class, 3).await;
+    importing.records.delete(oid(9)).await.unwrap();
+    weaviate.add(class, 300..301).await;
+
+    let sole = Options {
+        sole_writer: true,
+        ..importing.options.clone()
+    };
+    let report = importing.run_as(&sole).await.unwrap();
+    assert_eq!(
+        counts(&report, class),
+        ([2, 1, 0, 0, 0], [60, 60, 61]),
+        "notes 9 and 300 stored, note 2 replaced"
+    );
+    assert_eq!(
+        importing.get(2).await.unwrap().properties["n"],
+        json!(1_000_002)
+    );
+    // What Weaviate deleted before there was a ledger is nobody's the
+    // import knows of: it stays.
+    assert!(importing.get(3).await.is_some());
+    assert_eq!(report.outcome(false), Outcome::Settled);
+    assert_eq!(report.outcome(true), Outcome::Unsettled);
+}
+
+#[tokio::test]
+async fn an_import_ended_drops_its_ledger_and_is_not_taken_up_again() {
+    let Some(importing) = Importing::new("VellevImportEnded", 20).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    let unknown = import::finalise(&importing.tenant, &["Nothing".to_string()]).await;
+    assert!(unknown
+        .unwrap_err()
+        .to_string()
+        .contains("was not imported"));
+    assert_eq!(
+        import::finalise(&importing.tenant, &[]).await.unwrap(),
+        [class]
+    );
+    assert!(importing.ledger().schema().await.unwrap().is_none());
+
+    weaviate.delete(class, 1).await;
+    weaviate.put(class, 2, changed(2)).await;
+    let refused = importing.run().await.unwrap_err();
+    assert!(refused.to_string().contains("was ended"), "{refused}");
+    assert_eq!(importing.records.count(None).await.unwrap(), 20);
+    assert_eq!(importing.get(2).await.unwrap().properties["n"], json!(2));
+    assert!(importing.ledger().schema().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_comparison_finds_what_the_counts_do_not() {
+    let Some(importing) = Importing::new("VellevImportVerified", 120).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    let verify = async |pages: Option<usize>| {
+        let options = Options {
+            mode: Mode::Verify { pages },
+            ..importing.options.clone()
+        };
+        let report = importing.run_as(&options).await.unwrap();
+        let verified = report.classes[class].verified.clone().unwrap();
+        (verified, report.outcome(false))
+    };
+    let (all, outcome) = verify(None).await;
+    assert_eq!(
+        (all.looked, all.same, outcome),
+        (120, 120, Outcome::Settled)
+    );
+    let (some, _) = verify(Some(3)).await;
+    assert!(some.looked > 0 && some.looked == some.same, "{some:?}");
+
+    // Another writer changes one of the import's objects and deletes
+    // another, a third is the other writer's by the ledger, and Weaviate
+    // gains one: as many objects as before, and a run that settles.
+    let patch = Changes::new(map(json!({ "n": -2 })));
+    importing.records.patch(oid(2), &patch).await.unwrap();
+    importing.records.delete(oid(3)).await.unwrap();
+    importing.records.put(oid(4), &foreign(4)).await.unwrap();
+    weaviate.put(class, 4, changed(4)).await;
+    assert_eq!(importing.counts().await, ([0, 0, 0, 1, 0], [120, 120, 119]));
+    weaviate.add(class, 300..301).await;
+    let before = held(&importing.records).await;
+    let (all, outcome) = verify(None).await;
+    assert_eq!(
+        (all.looked, all.same, all.different, all.missing),
+        (121, 117, 1, 1)
+    );
+    assert_eq!((all.kept, all.unaccounted), (1, 1));
+    let mut examples = all.examples.clone();
+    examples.sort();
+    assert_eq!(examples, [uuid(2), uuid(3)]);
+    assert_eq!(outcome, Outcome::Unsettled);
+    assert_eq!(held(&importing.records).await, before, "it changes nothing");
+    assert_eq!(importing.ledger().count(None).await.unwrap(), 120);
+}
+
+#[tokio::test]
+async fn an_object_vellev_cannot_hold_stops_the_run_or_is_passed_over_and_reported() {
+    let Some(importing) = Importing::new("VellevImportRefused", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    // A vector longer than vellev measures.
+    weaviate
+        .post(class, 20, object(20), vec![3.0e30, 0.0, 0.0, 0.0])
+        .await;
+    let refused = importing.run().await.unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("object {}", uuid(20))),
+        "{refused}"
+    );
+
+    let skipping = Options {
+        skip_refused: true,
+        ..importing.options.clone()
+    };
+    let report = importing.run_as(&skipping).await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!(counts(&report, class), ([10, 0, 0, 0, 0], [11, 10, 10]));
+    let refused: Vec<&String> = copied.refused.keys().collect();
+    assert_eq!(refused, [&uuid(20)]);
+    assert!(copied.refused[&uuid(20)].contains("too long"));
+    assert_eq!(report.outcome(false), Outcome::Unsettled);
+    // It is said again by every run, and by the catch-up that finds it.
+    let report = importing.run_as(&skipping).await.unwrap();
+    assert_eq!(report.classes[class].refused.len(), 1);
+}
+
+#[tokio::test]
+async fn an_object_too_large_to_replace_safely_is_left_and_reported() {
+    let Some(importing) = Importing::new("VellevImportLarge", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    // It fits a request once, and not twice: once to say what must not
+    // have changed and once more to replace it.
+    let large = |mark: &str| json!({ "title": format!("{mark} {}", "x".repeat(MAX_BODY * 2 / 3)) });
+    weaviate.post(class, 20, large("first"), vector(20)).await;
+    assert_eq!(importing.counts().await, ([11, 0, 0, 0, 0], [11; 3]));
+    weaviate.put(class, 20, large("second")).await;
+    weaviate.put(class, 4, changed(4)).await;
+    let report = importing.run().await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!(counts(&report, class), ([0, 1, 0, 0, 0], [11; 3]));
+    assert_eq!(copied.too_large, [uuid(20)]);
+    assert_eq!(report.outcome(false), Outcome::Unsettled);
+    let title = importing.get(20).await.unwrap().properties["title"].clone();
+    assert!(title.as_str().unwrap().starts_with("first"));
+}
+
+#[tokio::test]
+async fn a_change_is_caught_up_with_however_far_behind_weaviates_clock_is() {
+    let Some(importing) = Importing::new("VellevImportBehind", 10).await else {
+        return;
+    };
+    let class = importing.class;
+    importing.run().await.unwrap();
+
+    // As if Weaviate's clock were an hour behind this one, and no margin
+    // allowed for it: by its time alone the change is too old to look at.
+    let state = &importing.options.state;
+    let mut progress: Value = serde_json::from_slice(&std::fs::read(state).unwrap()).unwrap();
+    let caught_up = &mut progress["classes"][class]["caught_up_to"];
+    *caught_up = json!(caught_up.as_i64().unwrap() + 3_600_000);
+    std::fs::write(state, serde_json::to_vec(&progress).unwrap()).unwrap();
+    importing.weaviate.put(class, 5, changed(5)).await;
+    assert_eq!(importing.counts().await, ([0, 1, 0, 0, 0], [10; 3]));
+    importing.assert_same().await;
+}
+
+#[tokio::test]
+async fn a_change_that_left_weaviates_time_as_it_was_is_found_within_the_margin() {
+    let Some(importing) = Importing::new("VellevImportSameTime", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    let before = weaviate.listed(class).await;
+    weaviate.put(class, 5, changed(5)).await;
+
+    // Weaviate tells time by the millisecond: an object changed twice in
+    // one, the import reading it between, is listed with the time the
+    // ledger has. Here the listing says of note 5 what it said before.
+    let first = importing.first();
+    let listing = || {
+        importing
+            .proxy
+            .answer(0, &strs(&first), StatusCode::OK, before.clone())
+    };
+    listing();
+    assert_eq!(
+        importing.counts().await,
+        ([0; 5], [10; 3]),
+        "with no margin it is taken for unchanged"
+    );
+    listing();
+    let margin = Options {
+        skew: Duration::from_secs(3_600),
+        ..importing.options.clone()
+    };
+    let report = importing.run_as(&margin).await.unwrap();
+    assert_eq!(counts(&report, class), ([0, 1, 0, 0, 0], [10; 3]));
+    importing.assert_same().await;
+}
+
+#[tokio::test]
+async fn an_object_written_again_unchanged_has_only_its_time_noted() {
+    let Some(importing) = Importing::new("VellevImportRewritten", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    let noted = async || {
+        let entry = importing.ledger().get(oid(5)).await.unwrap().unwrap();
+        entry.properties["updated"].clone()
+    };
+    let listed = async || {
+        let listed = weaviate.listed(class).await;
+        let objects = listed["objects"].as_array().unwrap();
+        let note = objects.iter().find(|object| object["id"] == json!(uuid(5)));
+        note.unwrap()["lastUpdateTimeUnix"].clone()
+    };
+    let before = noted().await;
+    assert_eq!(before, listed().await);
+    weaviate.put(class, 5, changed(5)).await;
+    weaviate.put(class, 5, object(5)).await;
+    assert_ne!(before, listed().await);
+    assert_eq!(importing.counts().await, ([0; 5], [10; 3]));
+    assert_eq!(noted().await, listed().await);
+    // So that the next catch-up has no reason to fetch it.
+    let singly = importing.object(5);
+    importing.proxy.before(0, &[&singly], |_| async {});
+    assert_eq!(importing.counts().await, ([0; 5], [10; 3]));
+    assert!(!importing.proxy.spent());
+}
+
+#[tokio::test]
+async fn the_object_with_the_last_id_of_all_is_deleted_when_weaviate_deletes_it() {
+    let Some(importing) = Importing::new("VellevImportLast", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    let last = (0..10).max_by_key(|n| oid(*n)).unwrap();
+    importing.weaviate.delete(importing.class, last).await;
+    assert_eq!(importing.counts().await, ([0, 0, 1, 0, 0], [9; 3]));
+    assert!(importing.get(last).await.is_none());
+}
+
+#[tokio::test]
+async fn an_import_begun_again_does_not_bring_back_what_another_writer_deleted() {
+    let Some(importing) = Importing::new("VellevImportBegunAgain", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    for n in 0..10 {
+        importing.records.delete(oid(n)).await.unwrap();
+    }
+    // With its state lost the import walks every page again, and finds
+    // nothing in the collection under any id of the page: only the
+    // ledger says the objects were there.
+    std::fs::remove_file(&importing.options.state).unwrap();
+    assert_eq!(importing.counts().await, ([0; 5], [10, 10, 0]));
 }
 
 #[tokio::test]
@@ -1146,7 +1887,7 @@ async fn a_class_vellev_embeds_is_caught_up_by_its_properties_alone() {
     let served = Cluster::new()
         .serve_embedding_keyed(&model, "sk-right")
         .await;
-    let tenant = tenant(&served, "embedded").await;
+    let tenant = tenant(&served.url, "embedded").await;
     let dir = tempfile::tempdir().unwrap();
     let embedding = json!({
         "provider": "http",
@@ -1167,7 +1908,7 @@ async fn a_class_vellev_embeds_is_caught_up_by_its_properties_alone() {
     };
     let source = source(&url);
     let report = import::weaviate(&source, &tenant, &options).await.unwrap();
-    assert!(report.matched(), "{report:?}");
+    assert_eq!(report.outcome(true), Outcome::Settled, "{report:?}");
     let records = tenant.collection(&CollectionName::new(class).unwrap());
     let embedded = |title: &str| {
         Some(vec![
@@ -1183,9 +1924,8 @@ async fn a_class_vellev_embeds_is_caught_up_by_its_properties_alone() {
     weaviate.put(class, 2, changed(2)).await;
     weaviate.delete(class, 3).await;
     let report = import::weaviate(&source, &tenant, &options).await.unwrap();
-    assert!(report.matched(), "{report:?}");
-    let copied = &report.classes[class];
-    assert_eq!((copied.changed, copied.deleted, copied.kept), (1, 1, 0));
+    assert_eq!(report.outcome(true), Outcome::Settled, "{report:?}");
+    assert_eq!(counts(&report, class), ([0, 1, 1, 0, 0], [9; 3]));
     let stored = records.get(oid(2)).await.unwrap().unwrap();
     assert_eq!(stored.properties["title"], json!("note 2 changed"));
     assert_eq!(stored.vector, embedded("note 2 changed"));
@@ -1193,8 +1933,7 @@ async fn a_class_vellev_embeds_is_caught_up_by_its_properties_alone() {
 
 #[tokio::test]
 async fn a_rate_that_is_no_number_or_none_at_all_is_refused() {
-    let client = Client::connect(&["http://127.0.0.1:9"], KEY, ClientOptions::default()).unwrap();
-    let tenant = client.tenant(&TenantId::new("unreached").unwrap());
+    let tenant = tenant("http://127.0.0.1:9", "unreached").await;
     for rate in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
         let options = Options {
             per_second: Some(rate),
@@ -1208,70 +1947,6 @@ async fn a_rate_that_is_no_number_or_none_at_all_is_refused() {
             "{rate}: {refused}"
         );
     }
-}
-
-#[tokio::test]
-async fn a_collection_made_anew_is_copied_by_the_page_whatever_the_state_file_says() {
-    let Some(importing) = Importing::new("VellevImportAnew", 20).await else {
-        return;
-    };
-    importing.run().await.unwrap();
-    importing.records.drop().await.unwrap();
-
-    // The state file says the class was copied whole. Believed, it would
-    // leave every object to the catch-up, to fetch one at a time.
-    let singly = format!("GET /v1/objects/{}/", importing.class);
-    importing.proxy.before(0, &[&singly], |_| async {});
-    assert_eq!(importing.counts().await, ([20, 0, 0, 0], [20; 3]));
-    assert!(!importing.proxy.spent(), "no object was fetched by itself");
-}
-
-#[tokio::test]
-async fn a_change_is_caught_up_with_however_far_behind_weaviates_clock_is() {
-    let Some(importing) = Importing::new("VellevImportBehind", 10).await else {
-        return;
-    };
-    let class = importing.class;
-    importing.run().await.unwrap();
-
-    // As if Weaviate's clock were an hour behind this one, and no margin
-    // allowed for it: by its time alone the change is too old to look at.
-    let state = &importing.options.state;
-    let mut progress: Value = serde_json::from_slice(&std::fs::read(state).unwrap()).unwrap();
-    let caught_up = &mut progress["classes"][class]["caught_up_to"];
-    *caught_up = json!(caught_up.as_i64().unwrap() + 3_600_000);
-    std::fs::write(state, serde_json::to_vec(&progress).unwrap()).unwrap();
-    importing.weaviate.put(class, 5, changed(5)).await;
-    assert_eq!(importing.counts().await, ([0, 1, 0, 0], [10; 3]));
-    importing.assert_same().await;
-}
-
-#[tokio::test]
-async fn the_object_with_the_last_id_of_all_is_deleted_when_weaviate_deletes_it() {
-    let Some(importing) = Importing::new("VellevImportLast", 10).await else {
-        return;
-    };
-    importing.run().await.unwrap();
-    let last = (0..10).max_by_key(|n| oid(*n)).unwrap();
-    importing.weaviate.delete(importing.class, last).await;
-    assert_eq!(importing.counts().await, ([0, 0, 1, 0], [9; 3]));
-    assert!(importing.get(last).await.is_none());
-}
-
-#[tokio::test]
-async fn an_import_begun_again_does_not_bring_back_what_another_writer_deleted() {
-    let Some(importing) = Importing::new("VellevImportBegunAgain", 10).await else {
-        return;
-    };
-    importing.run().await.unwrap();
-    for n in 0..10 {
-        importing.records.delete(oid(n)).await.unwrap();
-    }
-    // With its state lost the import walks every page again, and finds
-    // nothing in the collection under any id of the page: only the
-    // ledger says the objects were there.
-    std::fs::remove_file(&importing.options.state).unwrap();
-    assert_eq!(importing.counts().await, ([0, 0, 0, 0], [10, 10, 0]));
 }
 
 /// An address that cuts short its answer to the first request made of
@@ -1313,7 +1988,7 @@ async fn an_answer_cut_short_is_asked_for_again_though_it_began_as_a_404() {
     let report = import::weaviate(&source(&cutting), &importing.tenant, &importing.options)
         .await
         .unwrap();
-    assert!(report.matched(), "{report:?}");
+    assert_eq!(report.outcome(true), Outcome::Settled, "{report:?}");
     assert_eq!(report.classes[importing.class].stored, 10);
 }
 
@@ -1325,7 +2000,7 @@ async fn a_class_whose_name_leaves_no_room_for_its_ledgers_is_refused_before_any
     let class = format!("VellevImportLong{}", "g".repeat(105));
     Weaviate::load(&url, &class, 1).await;
     let served = Served::new().await;
-    let tenant = tenant(&served, "long").await;
+    let tenant = tenant(&served.url, "long").await;
     let dir = tempfile::tempdir().unwrap();
     let options = Options {
         classes: vec![class.clone()],
