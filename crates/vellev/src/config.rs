@@ -272,6 +272,7 @@ impl Config {
         let embedders = Embedders::new(vellev_embed::Settings {
             cache: self.model_dir.clone(),
             keys: self.embedding_keys()?,
+            ..Default::default()
         });
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "vellev".into());
         let address = self

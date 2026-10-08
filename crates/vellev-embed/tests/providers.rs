@@ -321,7 +321,7 @@ async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be
         .unwrap_err();
     let said = refused.to_string();
     assert!(
-        said.contains("Incorrect API key provided: <redacted> Find yours")
+        said.contains("Incorrect API key provided: <redacted>. Find yours")
             && !said.contains("wxyz"),
         "{said}"
     );
@@ -431,7 +431,12 @@ async fn bedrock(seen: Arc<Seen>) -> Bedrock {
                 404 => "ResourceNotFoundException",
                 _ => "InternalServerException",
             };
-            let refusal = Json(json!({ "message": "not now" }));
+            // A refusal that quotes back how the request was signed.
+            let message = match status.as_u16() {
+                400 => "not now: Credential=AKIAIOSFODNN7EXAMPLE/20261008/eu-west-2",
+                _ => "not now",
+            };
+            let refusal = Json(json!({ "message": message }));
             return Err((status, [("x-amzn-errortype", kind)], refusal));
         }
         let text = body["inputText"].as_str().unwrap();
@@ -512,9 +517,13 @@ async fn titan_is_tried_again_when_throttled_and_long_text_is_cut() {
         .embed(vec!["fox".into()], Purpose::Document)
         .await
         .unwrap_err();
-    assert!(
-        matches!(&failed, EmbedError::Failed { model, .. } if model == TITAN),
-        "{failed}"
+    assert_eq!(
+        failed,
+        EmbedError::Failed {
+            model: TITAN.into(),
+            reason: "ValidationException: not now: Credential=<redacted>/20261008/eu-west-2".into()
+        },
+        "with the key it was signed with taken out"
     );
     assert_eq!(
         failed.lasting(),

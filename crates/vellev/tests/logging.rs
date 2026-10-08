@@ -43,13 +43,27 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logged {
 
 #[tokio::test]
 async fn a_fault_that_stands_is_logged_once_however_many_searches_fall_back_for_it() {
+    // Should anything here wait for ever, it fails rather than hangs.
+    tokio::time::timeout(std::time::Duration::from_secs(120), logged_once())
+        .await
+        .expect("nothing waits on anything");
+}
+
+async fn logged_once() {
     use tracing_subscriber::layer::SubscriberExt;
     let logged = Logged::default();
     let _listening =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(logged.clone()));
 
     let url = keyed_embedding_server("sk-right").await;
-    let served = Cluster::new().serve_embedding_keyed(&url, "sk-wrong").await;
+    // The fault stands for longer than any run of this could take: how
+    // often it is said does not turn on how fast this machine is.
+    let embedding = vellev_embed::Settings {
+        keys: [(url.clone(), "sk-wrong".to_string())].into(),
+        fault_stands: std::time::Duration::from_secs(24 * 60 * 60),
+        ..Default::default()
+    };
+    let served = Cluster::new().serve_embedding_with(&url, embedding).await;
     let embedding = json!({
         "provider": "http",
         "api": "openai",

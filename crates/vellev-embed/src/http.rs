@@ -91,10 +91,7 @@ impl Http {
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(ATTEMPT_TIMEOUT)
             .build()
-            .map_err(|error| EmbedError::Failed {
-                model: model.to_string(),
-                reason: format!("no HTTP client: {error}"),
-            })?;
+            .map_err(|error| EmbedError::failed(model, format!("no HTTP client: {error}")))?;
         let url = url.trim_end_matches('/');
         let url = match api {
             HttpApi::Tei => url,
@@ -109,37 +106,25 @@ impl Http {
         })
     }
 
-    /// `text` without this endpoint's key, or anything else shaped like
-    /// one: an endpoint may quote back a key it refuses, with its middle
-    /// masked or not.
+    /// `text` without this endpoint's key, whatever its shape. Anything
+    /// else shaped like a key is taken out where the failure is made.
     fn redacted(&self, text: String) -> String {
-        let text = match &self.key {
+        match &self.key {
             Some(key) => text.replace(key.as_str(), "<redacted>"),
             None => text,
-        };
-        crate::without_keys(&text)
+        }
     }
 
     fn failed(&self, reason: impl std::fmt::Display) -> EmbedError {
-        EmbedError::Failed {
-            model: self.model.clone(),
-            reason: self.redacted(reason.to_string()),
-        }
+        EmbedError::failed(&self.model, self.redacted(reason.to_string()))
     }
 
     fn unusable(&self, fault: ModelFault, reason: impl std::fmt::Display) -> EmbedError {
-        EmbedError::Unusable {
-            model: self.model.clone(),
-            reason: self.redacted(reason.to_string()),
-            fault,
-        }
+        EmbedError::unusable(&self.model, fault, self.redacted(reason.to_string()))
     }
 
     fn malformed(&self, reason: String) -> EmbedError {
-        EmbedError::Malformed {
-            model: self.model.clone(),
-            reason,
-        }
+        EmbedError::malformed(&self.model, self.redacted(reason))
     }
 
     /// One request, sent until it is answered or refused for good.

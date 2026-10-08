@@ -2,16 +2,17 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{watch, OnceCell};
+use tokio::sync::OnceCell;
 use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault};
 
 use crate::{EmbedError, Provider, Purpose, Result};
 
 /// How long a fault that will not pass until the setup is put right is
-/// taken to stand, without the model being asked again: a node set up
-/// wrong would otherwise ask whatever serves the model, and write to its
-/// log, on every request. A setup put right takes effect within it.
+/// taken to stand, unless an embedder is told otherwise, without the model
+/// being asked again: a node set up wrong would otherwise ask whatever
+/// serves the model, and write to its log, on every request. A setup put
+/// right takes effect within it.
 pub const FAULT_STANDS: Duration = Duration::from_secs(20);
 
 /// How many query vectors an embedder keeps: one request often searches
@@ -57,73 +58,18 @@ pub struct Embedder {
     embedding: Embedding,
     queries: Mutex<Queries>,
     health: Mutex<Health>,
+    /// How long a lasting fault stands.
+    fault_stands: Duration,
 }
 
-/// What is known of whether the model can be used.
-///
-/// While nothing is known, at first and again once a fault no longer
-/// stands, one call at a time is let through to the model to find out, and
-/// the others wait for it: were the model to refuse for good, each would
-/// otherwise be refused in turn, and the fault said as many times. As soon
-/// as a call comes back any other way, every call goes to the model as it
-/// arrives, however many at once, as it always did.
+/// What is known of whether the model can be used. It is looked at and
+/// changed in a moment, and no call ever waits on another for it.
 #[derive(Debug, Default)]
 struct Health {
     /// The lasting fault that stands, and since when.
     fault: Option<(Instant, EmbedError)>,
-    /// Whether the model has been asked, since it last stood refused, and
-    /// did not refuse for good.
-    tried: bool,
     /// How many times the model has answered well.
     answered: u64,
-    /// The call finding out whether the model can be used, as those that
-    /// wait for it see it: closed once it is over.
-    finding_out: Option<watch::Receiver<()>>,
-}
-
-/// What a call is to do, by what is known of the model.
-enum Turn {
-    /// Ask the model. With a sender, this call is the one finding out, and
-    /// lets the others go by dropping it.
-    Ask(Option<watch::Sender<()>>),
-    /// Wait for the call that is finding out.
-    Wait(watch::Receiver<()>),
-    Refused(EmbedError),
-}
-
-impl Health {
-    fn turn(&mut self) -> Turn {
-        if self
-            .fault
-            .as_ref()
-            .is_some_and(|(met, _)| met.elapsed() >= FAULT_STANDS)
-        {
-            *self = Health {
-                answered: self.answered,
-                ..Health::default()
-            };
-        }
-        if let Some((_, fault)) = &self.fault {
-            return Turn::Refused(fault.clone());
-        }
-        // A call that was finding out and never said, its caller gone.
-        if self
-            .finding_out
-            .as_ref()
-            .is_some_and(|finding| finding.has_changed().is_err())
-        {
-            self.finding_out = None;
-        }
-        match (self.tried, &self.finding_out) {
-            (true, _) => Turn::Ask(None),
-            (false, Some(finding)) => Turn::Wait(finding.clone()),
-            (false, None) => {
-                let (found, finding) = watch::channel(());
-                self.finding_out = Some(finding);
-                Turn::Ask(Some(found))
-            }
-        }
-    }
 }
 
 impl Embedder {
@@ -133,6 +79,17 @@ impl Embedder {
             embedding,
             queries: Mutex::default(),
             health: Mutex::default(),
+            fault_stands: FAULT_STANDS,
+        }
+    }
+
+    /// This embedder, taking a lasting fault to stand for `fault_stands`
+    /// rather than [`FAULT_STANDS`].
+    #[must_use]
+    pub fn standing_for(self, fault_stands: Duration) -> Self {
+        Self {
+            fault_stands,
+            ..self
         }
     }
 
@@ -176,52 +133,73 @@ impl Embedder {
         if wanted.is_empty() {
             return Ok(vec![None; texts.len()]);
         }
-        let (found, before) = loop {
-            let (turn, answered) = {
-                let mut health = self.health.lock().expect("health lock");
-                (health.turn(), health.answered)
-            };
-            match turn {
-                Turn::Ask(found) => break (found, answered),
-                Turn::Refused(fault) => return Err(fault),
-                // Over when the call finding out lets go, however it ended.
-                Turn::Wait(mut finding) => drop(finding.changed().await),
-            }
-        };
+        let before = self.standing()?;
         let made = self.made(texts, wanted, purpose).await;
+        if let Some((fault, lies_in)) = self.heard(before, &made) {
+            // Said here, once for as long as it stands, with nothing held.
+            tracing::error!(
+                model = %self.embedding.model,
+                ?lies_in,
+                cause = %fault,
+                "the embedding model cannot be used; not asking it again for {:?}",
+                self.fault_stands
+            );
+        }
+        made
+    }
+
+    /// How many times the model had answered well when this was asked, or
+    /// the fault that stands. While one does, the model is not asked.
+    ///
+    /// Nothing else keeps a call from the model: no call waits on another
+    /// to find out whether the model can be used. So the calls that are
+    /// out when a fault first shows, or go out before the first of them
+    /// hears of it, each ask the model once and are each refused. What is
+    /// kept to is that the fault is said once for as long as it stands,
+    /// and that the model is not asked again while it does: not that it
+    /// is asked once.
+    fn standing(&self) -> Result<u64> {
         let mut health = self.health.lock().expect("health lock");
-        match made.as_ref().map_err(|error| (error, error.lasting())) {
-            // The model answers: whatever was said of it before, by a call
-            // that had yet to come back, it can be used.
+        if health
+            .fault
+            .as_ref()
+            .is_some_and(|(met, _)| met.elapsed() >= self.fault_stands)
+        {
+            health.fault = None;
+        }
+        match &health.fault {
+            Some((_, fault)) => Err(fault.clone()),
+            None => Ok(health.answered),
+        }
+    }
+
+    /// Take note of how a call that went out when the model had answered
+    /// well `before` times came back. The fault it met, with where that
+    /// lies, if it is one that now stands and is to be said.
+    ///
+    /// The model answering lifts whatever fault stands: a call that had
+    /// yet to come back when the fault was met shows it has passed. A
+    /// fault met by a call the model has answered another well since is
+    /// one put right meanwhile, and does not stand, however late the news
+    /// of it comes. And one that stands already is not said again, nor
+    /// made to stand the longer.
+    fn heard<T>(&self, before: u64, made: &Result<T>) -> Option<(EmbedError, ModelFault)> {
+        let mut health = self.health.lock().expect("health lock");
+        match made {
             Ok(_) => {
                 health.answered += 1;
-                health.tried = true;
                 health.fault = None;
+                None
             }
-            // A fault met by a call the model has since answered another
-            // well is one put right meanwhile: it does not stand, however
-            // late the news of it comes. And one that stands already is
-            // not said again, nor made to stand the longer.
-            Err((error, Some(lies_in))) => {
-                if health.answered == before && health.fault.is_none() {
-                    tracing::error!(
-                        model = %self.embedding.model,
-                        ?lies_in,
-                        cause = %error,
-                        "the embedding model cannot be used; not asking it again for {FAULT_STANDS:?}"
-                    );
+            Err(error) => {
+                let lies_in = error.lasting()?;
+                let stands = health.answered == before && health.fault.is_none();
+                stands.then(|| {
                     health.fault = Some((Instant::now(), error.clone()));
-                    health.tried = false;
-                }
+                    (error.clone(), lies_in)
+                })
             }
-            Err((_, None)) => health.tried = true,
         }
-        if found.is_some() {
-            health.finding_out = None;
-        }
-        drop(health);
-        drop(found);
-        made
     }
 
     /// The vectors the model makes for `wanted`, the texts of `texts` that
@@ -234,10 +212,7 @@ impl Embedder {
     ) -> Result<Vec<Option<Vec<f32>>>> {
         let asked = wanted.len();
         let vectors = self.provider.embed(wanted, purpose).await?;
-        let malformed = |reason: String| EmbedError::Malformed {
-            model: self.embedding.model.clone(),
-            reason,
-        };
+        let malformed = |reason: String| EmbedError::malformed(&self.embedding.model, reason);
         if vectors.len() != asked {
             return Err(malformed(format!(
                 "{} vectors for {asked} texts",
@@ -248,11 +223,11 @@ impl Embedder {
         // collection was made for, however often it is asked.
         let dimensions = self.embedding.dimensions as usize;
         if let Some(wrong) = vectors.iter().find(|vector| vector.len() != dimensions) {
-            return Err(EmbedError::Unusable {
-                model: self.embedding.model.clone(),
-                reason: format!("a vector of {} dimensions, not {dimensions}", wrong.len()),
-                fault: ModelFault::Provider,
-            });
+            return Err(EmbedError::unusable(
+                &self.embedding.model,
+                ModelFault::Provider,
+                format!("a vector of {} dimensions, not {dimensions}", wrong.len()),
+            ));
         }
         if !vectors.iter().flatten().all(|value| value.is_finite()) {
             return Err(malformed("a vector that is not finite".into()));

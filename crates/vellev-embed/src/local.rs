@@ -79,10 +79,7 @@ impl Local {
         std::thread::Builder::new()
             .name(format!("embed {model}"))
             .spawn(move || run(&name, load, waiting))
-            .map_err(|error| EmbedError::Failed {
-                model: model.to_string(),
-                reason: format!("no thread to run it on: {error}"),
-            })?;
+            .map_err(|error| failure(model, format!("no thread to run it on: {error}")))?;
         Ok(Self {
             model: model.to_string(),
             jobs,
@@ -116,21 +113,18 @@ fn unloaded(model: &str, kept: &Path, error: &fastembed::Error) -> EmbedError {
             _ => false,
         });
     match barred {
-        true => EmbedError::Unusable {
-            model: model.to_string(),
-            reason: format!("the node may not write {}: {error:#}", kept.display()),
-            fault: vellev_core::ModelFault::Setup,
-        },
-        false => failure(model, crate::without_keys(&format!("{error:#}"))),
+        true => EmbedError::unusable(
+            model,
+            vellev_core::ModelFault::Setup,
+            format!("the node may not write {}: {error:#}", kept.display()),
+        ),
+        false => failure(model, format!("{error:#}")),
     }
 }
 
 /// A failure of `model` that may pass.
-fn failure(model: &str, reason: impl Into<String>) -> EmbedError {
-    EmbedError::Failed {
-        model: model.to_string(),
-        reason: reason.into(),
-    }
+fn failure(model: &str, reason: impl std::fmt::Display) -> EmbedError {
+    EmbedError::failed(model, reason)
 }
 
 /// The model of this name, whichever organisation's copy of it is run. The
@@ -319,6 +313,9 @@ mod tests {
                 if texts.contains(&"fail") {
                     return Err("told to".to_string());
                 }
+                if texts.contains(&"quote") {
+                    return Err("401 for hf_abcdefghij0123456789ABCD".to_string());
+                }
                 Ok(texts.iter().map(|text| vec![text.len() as f32]).collect())
             }) as Model)
         });
@@ -405,6 +402,12 @@ mod tests {
         assert_eq!(embed("fox").await, Ok(vec![vec![3.0]]));
         assert_eq!(embed("fail").await, Err(failed("told to")));
         assert_eq!(runs.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        runs.let_through(1);
+        assert_eq!(
+            embed("quote").await,
+            Err(failed("401 for <redacted>")),
+            "a token the model quotes is not passed on"
+        );
         assert_eq!(embed("panic").await, Err(failed("the model panicked")));
         assert_eq!(embed("hen").await, Ok(vec![vec![3.0]]));
         assert_eq!(runs.loads.load(std::sync::atomic::Ordering::SeqCst), 3);
@@ -504,6 +507,20 @@ mod tests {
                 "{kind:?}"
             );
         }
+        // What is said of either kind is said without a token quoted in it.
+        let token = "hf_abcdefghij0123456789ABCD";
+        let quoting = fastembed::Error::msg(format!("401 Unauthorized for {token}"));
+        assert_eq!(
+            unloaded("m", kept, &quoting),
+            failed_as("m", "401 Unauthorized for <redacted>")
+        );
+        let barred = fastembed::Error::new(FetchError::IoError(ErrorKind::PermissionDenied.into()))
+            .context(format!("fetching as {token}"));
+        let said = unloaded("m", kept, &barred).to_string();
+        assert!(
+            said.contains("fetching as <redacted>") && !said.contains(token),
+            "{said}"
+        );
         let passing = [
             fetching(FetchError::IoError(ErrorKind::StorageFull.into())),
             fetching(FetchError::IoError(ErrorKind::TimedOut.into())),

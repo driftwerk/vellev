@@ -64,6 +64,16 @@ impl Cluster {
             keys: [(url.to_string(), key.to_string())].into(),
             ..Default::default()
         };
+        self.serve_embedding_with(url, embedding).await
+    }
+
+    /// A node that may embed through the endpoint at `url`, embedding as
+    /// `embedding` says.
+    pub async fn serve_embedding_with(
+        &self,
+        url: &str,
+        embedding: vellev_embed::Settings,
+    ) -> Served {
         let served = self
             .unstarted_as(&[url.to_string()], None, &[], embedding, |settings| {
                 settings

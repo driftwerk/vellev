@@ -381,6 +381,7 @@ fn settings_never_print_a_key() {
             "sk-secret".to_string(),
         )]
         .into(),
+        ..Settings::default()
     };
     let printed = format!("{settings:?} {:?}", Embedders::new(settings.clone()));
     assert!(printed.contains("https://api.example.test"), "{printed}");
@@ -460,7 +461,7 @@ fn numbered(word: &str, count: usize) -> Vec<String> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_fault_met_by_many_at_once_is_asked_about_once_while_it_stands() {
+async fn a_fault_met_by_many_at_once_is_met_by_each_once_and_by_none_while_it_stands() {
     let (model, embedder) = told(Told {
         slow: std::time::Duration::from_millis(50),
         refusing: true.into(),
@@ -470,53 +471,55 @@ async fn a_fault_met_by_many_at_once_is_asked_about_once_while_it_stands() {
         assert_eq!(answers.len(), 8);
         assert!(answers.iter().all(|answer| answer == &Err(Told::refused())));
     };
-    // Nothing is known of the model: one call finds out, and the rest
-    // take its word.
+    // Nothing is known of the model, and no call waits on another to find
+    // out: each that is out before the first hears of the fault asks.
     refused(at_once(&embedder, &numbered("first", 8)).await);
-    assert_eq!(model.calls(), 1);
+    assert_eq!(model.calls(), 8);
+    // While it stands, none does.
     tokio::time::advance(vellev_embed::FAULT_STANDS / 2).await;
     refused(at_once(&embedder, &numbered("meanwhile", 8)).await);
-    assert_eq!(model.calls(), 1);
-    // The fault stands from when it was met, not from when it was last
-    // run into: once it no longer does, one call finds out again.
-    tokio::time::advance(vellev_embed::FAULT_STANDS / 2).await;
-    refused(at_once(&embedder, &numbered("again", 8)).await);
-    assert_eq!(model.calls(), 2);
+    refused(vec![embedder.query("one more").await; 8]);
+    assert_eq!(model.calls(), 8);
 
-    // Put right, the model is found so by one call, and then asked by
-    // every call as it comes, however many at once.
+    // Put right, the model is asked by every call as it comes, however
+    // many at once, once the fault no longer stands.
     model
         .refusing
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::advance(vellev_embed::FAULT_STANDS).await;
+    tokio::time::advance(vellev_embed::FAULT_STANDS / 2).await;
     let answers = at_once(&embedder, &numbered("put right", 8)).await;
     assert!(answers.iter().all(Result::is_ok), "{answers:?}");
-    assert_eq!(model.calls(), 2 + 8);
-    let most = || {
-        model
-            .most_in_flight
-            .load(std::sync::atomic::Ordering::SeqCst)
-    };
-    assert_eq!(most(), 7, "the seven that waited, together");
-    at_once(&embedder, &numbered("since", 8)).await;
-    assert_eq!(most(), 8, "and from then on all together");
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_model_that_fails_in_a_way_that_may_pass_is_asked_by_every_call() {
-    // A failure that may pass says nothing against the model: after the
-    // first, nobody waits on anybody.
-    let (model, embedder) = told(Told {
-        slow: std::time::Duration::from_millis(50),
-        ..Told::default()
-    });
-    let answers = at_once(&embedder, &numbered("failing", 8)).await;
-    assert!(answers.iter().all(Result::is_err));
-    assert_eq!(model.calls(), 8);
+    assert_eq!(model.calls(), 8 + 8);
     let most = model
         .most_in_flight
         .load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(most, 7, "one found out, and the seven went together");
+    assert_eq!(most, 8, "all together");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_never_waits_on_another_whatever_the_other_is_about() {
+    // Documents are being embedded, and slowly: for as long as they are
+    // held. Nothing is known of the model yet.
+    let (model, embedder) = told(Told::default());
+    let documents = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.documents(&["held".to_string()]).await })
+    };
+    while model.calls() < 1 {
+        tokio::task::yield_now().await;
+    }
+    // A query meanwhile is answered in its own time: at once.
+    let started = tokio::time::Instant::now();
+    assert_eq!(embedder.query("fox").await, Ok(Some(vec![1.0, 2.0])));
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    assert_eq!(model.calls(), 2);
+    assert!(!documents.is_finished());
+    // So are calls that fail in a way that may pass: all go, together.
+    let answers = at_once(&embedder, &numbered("failing", 8)).await;
+    assert!(answers.iter().all(Result::is_err));
+    assert_eq!(model.calls(), 2 + 8);
+    model.let_go.notify_one();
+    assert!(documents.await.unwrap().is_ok());
 }
 
 #[tokio::test]
@@ -564,28 +567,4 @@ async fn a_fault_that_stands_is_lifted_by_the_model_answering_well_however_late(
     assert!(slow.await.unwrap().is_ok());
     assert!(embedder.query("asked after").await.is_ok());
     assert_eq!(model.calls(), 4);
-}
-
-#[tokio::test]
-async fn a_call_finding_out_whose_caller_goes_away_does_not_keep_the_others_waiting() {
-    let (model, embedder) = told(Told::default());
-    let finding_out = {
-        let embedder = embedder.clone();
-        tokio::spawn(async move { embedder.query("never").await })
-    };
-    while model.calls() < 1 {
-        tokio::task::yield_now().await;
-    }
-    let waiting = {
-        let embedder = embedder.clone();
-        tokio::spawn(async move { embedder.query("fox").await })
-    };
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(model.calls(), 1, "it waits for the one finding out");
-    finding_out.abort();
-    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), waiting).await;
-    assert!(answered.unwrap().unwrap().is_ok());
-    assert_eq!(model.calls(), 2);
 }

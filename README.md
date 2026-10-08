@@ -241,16 +241,25 @@ send it again once the node is put right; one that brings its own vector
 needs no model. A node that has met such a fault does not ask the model
 again for 20 seconds, and logs it once in that time however many requests
 meet it, at once or one after another, hybrid searches that fall back
-among them; so a setup put right takes effect within that. Until a model
-has answered or failed in some way that may pass, at first and after each
-such 20 seconds, one request at a time is let through to it and the others
-wait on what it finds; after that every request goes to the model as it
-comes. Keys, and what is shaped like one, are taken out of what a model's
-server says before it is logged. It cuts the other way too: something in front of
-an OpenAI endpoint that answers `model_not_found` or `invalid_api_key` for
-a moment, in OpenAI's own form, costs 20 seconds of `model_unavailable`.
-Nothing reloads a node's settings while it runs, so most faults of setup
-are put right by starting the node again. Meanwhile
+among them; so a setup put right takes effect within that. That is all
+that is promised: no request waits on another to find out whether a model
+can be used, so the requests already on their way to the model when a
+fault first shows, or that set out before the first of them hears of it,
+each reach the model once and are each refused. A model that answers a
+request lifts a fault at once.
+
+What a model's server says is logged without what is shaped like a key in
+it: a JSON web token, what follows `Bearer` or `Basic` if it is as long as
+a credential, a key or token given in a query string, keys beginning `sk-`
+and Hugging Face's tokens, whole or masked, and AWS access key ids. A key
+with no shape of its own, such as an AWS secret or an Azure key, is not
+known for one.
+
+The 20 seconds cut the other way too: something in front of an OpenAI
+endpoint that answers `model_not_found` or `invalid_api_key` for a moment,
+in OpenAI's own form, costs 20 seconds of `model_unavailable`. Nothing
+reloads a node's settings while it runs, so most faults of setup are put
+right by starting the node again. Meanwhile
 another node may be able to answer, and which node embeds depends on the
 request:
 

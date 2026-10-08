@@ -105,10 +105,7 @@ impl Bedrock {
     }
 
     fn failed(&self, reason: impl std::fmt::Display) -> EmbedError {
-        EmbedError::Failed {
-            model: self.model.clone(),
-            reason: reason.to_string(),
-        }
+        EmbedError::failed(&self.model, reason)
     }
 
     async fn one(&self, text: &str) -> Result<Vec<f32>> {
@@ -135,7 +132,6 @@ impl Bedrock {
                     (Some(said), None) | (None, Some(said)) => said.to_string(),
                     (None, None) => error.to_string(),
                 };
-                let said = crate::without_keys(&said);
                 // Bedrock says the region has no such model: nothing passes
                 // until the collection or the region is another. Access
                 // denied is not taken so, being also what is said while a
@@ -145,19 +141,16 @@ impl Bedrock {
                     .as_service_error()
                     .is_some_and(|refused| refused.is_resource_not_found_exception());
                 match lasting {
-                    true => EmbedError::Unusable {
-                        model: self.model.clone(),
-                        reason: said,
-                        fault: vellev_core::ModelFault::Provider,
-                    },
+                    true => {
+                        EmbedError::unusable(&self.model, vellev_core::ModelFault::Provider, said)
+                    }
                     false => self.failed(said),
                 }
             })?;
         serde_json::from_slice::<Answer>(answer.body().as_ref())
             .map(|answer| answer.embedding)
-            .map_err(|error| EmbedError::Malformed {
-                model: self.model.clone(),
-                reason: format!("an unreadable answer: {error}"),
+            .map_err(|error| {
+                EmbedError::malformed(&self.model, format!("an unreadable answer: {error}"))
             })
     }
 }

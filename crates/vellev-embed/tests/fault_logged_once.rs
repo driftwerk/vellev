@@ -75,6 +75,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logged {
 
 #[tokio::test(start_paused = true)]
 async fn a_fault_met_by_many_at_once_is_logged_once_in_each_time_it_stands() {
+    // Should anything here wait for ever, it fails rather than hangs.
+    tokio::time::timeout(Duration::from_secs(24 * 60 * 60), logged_once())
+        .await
+        .expect("nothing waits on anything");
+}
+
+async fn logged_once() {
     let logged = Logged::default();
     let _listening =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(logged.clone()));
@@ -98,45 +105,32 @@ async fn a_fault_met_by_many_at_once_is_logged_once_in_each_time_it_stands() {
         }
     };
     let so_far = || (model.calls.load(Ordering::SeqCst), logged.errors());
-    eight("first").await;
-    assert_eq!(so_far(), (1, 1), "eight at once: asked once, said once");
-    for _ in 0..3 {
-        tokio::time::advance(FAULT_STANDS / 4).await;
-        eight("meanwhile").await;
-        assert_eq!(so_far(), (1, 1), "run into while it stands");
-    }
-    // It stands from when it was met, not from when it was last run into.
-    tokio::time::advance(FAULT_STANDS / 4).await;
-    eight("again").await;
-    assert_eq!(so_far(), (2, 2));
-    tokio::time::advance(FAULT_STANDS).await;
-    eight("and again").await;
-    assert_eq!(so_far(), (3, 3));
+    let ms = Duration::from_millis;
 
-    // A model that has been answering is asked by every call as it comes.
-    // Refusing all at once, it is asked by all that were out already, but
-    // the fault is said once, and stands from the first to hear of it,
-    // not the last.
+    // Eight at once, with nothing known of the model: each asks, the
+    // first hearing of the fault 50 ms in and the last 400, and it is said
+    // once. It stands from when the first heard, not the last.
+    let started = tokio::time::Instant::now();
+    eight("first").await;
+    assert_eq!(started.elapsed(), ms(400));
+    assert_eq!(so_far(), (8, 1));
+    tokio::time::advance(FAULT_STANDS / 2).await;
+    eight("meanwhile").await;
+    assert_eq!(so_far(), (8, 1), "run into while it stands: not asked");
+    tokio::time::advance(FAULT_STANDS / 2 - ms(350) - ms(1)).await;
+    eight("to the last moment").await;
+    assert_eq!(so_far(), (8, 1));
+    tokio::time::advance(ms(1)).await;
+    eight("no longer").await;
+    assert_eq!(so_far(), (16, 2), "said again, once, in the time after");
+
+    // A model that has been answering and then refuses: likewise.
     model.answering.store(true, Ordering::SeqCst);
     tokio::time::advance(FAULT_STANDS).await;
     assert!(embedder.query("it answers").await.is_ok());
-    assert!(embedder.query("and again").await.is_ok());
     model.answering.store(false, Ordering::SeqCst);
-    let before = so_far();
-    let started = tokio::time::Instant::now();
     eight("all at once").await;
-    assert_eq!(so_far(), (before.0 + 8, before.1 + 1));
-    assert_eq!(
-        started.elapsed(),
-        Duration::from_millis(50 * 8),
-        "the last heard of it eight times as late as the first"
-    );
-    // The first heard of it 50 ms in: from then it stands, to the moment.
-    tokio::time::advance(FAULT_STANDS - Duration::from_millis(50 * 7) - Duration::from_millis(1))
-        .await;
-    eight("still").await;
-    assert_eq!(so_far(), (before.0 + 8, before.1 + 1));
-    tokio::time::advance(Duration::from_millis(1)).await;
-    eight("no longer").await;
-    assert_eq!(so_far(), (before.0 + 9, before.1 + 2));
+    assert_eq!(so_far(), (16 + 1 + 8, 3));
+    eight("meanwhile").await;
+    assert_eq!(so_far(), (16 + 1 + 8, 3));
 }

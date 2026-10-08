@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::time::Instant;
 use vellev_core::{Embedding, EmbeddingProvider};
@@ -8,13 +9,26 @@ use vellev_core::{Embedding, EmbeddingProvider};
 use crate::{Bedrock, Embedder, Http, Provider, Result, FAULT_STANDS};
 
 /// What embedding needs from the node rather than from a collection.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Settings {
     /// Where local models are kept once fetched.
     pub cache: PathBuf,
     /// The bearer token for each HTTP endpoint that wants one, by its URL
     /// as collections give it. No other endpoint is sent a token.
     pub keys: HashMap<String, String>,
+    /// How long a model found to be one that cannot be used is taken to
+    /// stay so, without being asked or logged again.
+    pub fault_stands: Duration,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            cache: PathBuf::new(),
+            keys: HashMap::new(),
+            fault_stands: FAULT_STANDS,
+        }
+    }
 }
 
 impl std::fmt::Debug for Settings {
@@ -42,7 +56,7 @@ pub struct Embedders {
 }
 
 /// What has been said lately, and when: each thing is to be said once in
-/// any [`FAULT_STANDS`], however often it comes up.
+/// any time a fault stands, however often it comes up.
 #[derive(Debug, Default)]
 struct Told(HashMap<Embedding, Instant>);
 
@@ -50,9 +64,8 @@ impl Told {
     /// Whether `embedding` was not spoken of within the time, in which
     /// case it now is: once in each such time, however often it comes up
     /// meanwhile. What was spoken of longer ago is forgotten.
-    fn first(&mut self, embedding: &Embedding, now: Instant) -> bool {
-        self.0
-            .retain(|_, told| now.duration_since(*told) < FAULT_STANDS);
+    fn first(&mut self, embedding: &Embedding, now: Instant, stands: Duration) -> bool {
+        self.0.retain(|_, told| now.duration_since(*told) < stands);
         match self.0.contains_key(embedding) {
             true => false,
             false => {
@@ -76,24 +89,35 @@ impl Embedders {
     /// The embedder for a collection that embeds as `embedding` says, or
     /// `None` if its clients supply every vector.
     pub fn embedder(&self, embedding: &Embedding) -> Result<Option<Arc<Embedder>>> {
-        let mut embedders = self.embedders.lock().expect("embedders lock");
-        if let Some(embedder) = embedders.get(embedding) {
-            return Ok(Some(embedder.clone()));
-        }
-        let provider = self.provider(embedding).inspect_err(|error| {
-            // Only a collection there already comes to this: one made by
-            // a release or a build that could run its model.
-            let mut refused = self.refused.lock().expect("refused lock");
-            if error.lasting().is_some() && refused.first(embedding, Instant::now()) {
+        let held = self.held_or_built(embedding);
+        // Only a collection there already comes to a refusal here: one
+        // made by a release or a build that could run its model. It is
+        // said once while it stands, and with nothing held.
+        if let Err(error) = &held {
+            let first = error.lasting().is_some() && {
+                let mut refused = self.refused.lock().expect("refused lock");
+                refused.first(embedding, Instant::now(), self.settings.fault_stands)
+            };
+            if first {
                 tracing::error!(
                     model = %embedding.model,
                     cause = %error,
                     "a collection's embedding model cannot be run by this build"
                 );
             }
-        })?;
+        }
+        held
+    }
+
+    fn held_or_built(&self, embedding: &Embedding) -> Result<Option<Arc<Embedder>>> {
+        let mut embedders = self.embedders.lock().expect("embedders lock");
+        if let Some(embedder) = embedders.get(embedding) {
+            return Ok(Some(embedder.clone()));
+        }
+        let provider = self.provider(embedding)?;
         Ok(provider.map(|provider| {
-            let embedder = Arc::new(Embedder::new(provider, embedding.clone()));
+            let embedder = Embedder::new(provider, embedding.clone());
+            let embedder = Arc::new(embedder.standing_for(self.settings.fault_stands));
             embedders.insert(embedding.clone(), embedder.clone());
             embedder
         }))
@@ -199,16 +223,16 @@ mod tests {
             properties: Vec::new(),
         };
         let mut told = Told::default();
-        assert!(told.first(&embedding("one"), Instant::now()));
-        assert!(!told.first(&embedding("one"), Instant::now()));
-        assert!(told.first(&embedding("two"), Instant::now()));
+        assert!(told.first(&embedding("one"), Instant::now(), FAULT_STANDS));
+        assert!(!told.first(&embedding("one"), Instant::now(), FAULT_STANDS));
+        assert!(told.first(&embedding("two"), Instant::now(), FAULT_STANDS));
         // Coming up all the while, it is said once in each such time: it
         // is not put off for having come up.
-        let step = crate::FAULT_STANDS / 4;
+        let step = FAULT_STANDS / 4;
         let mut said = 1;
         for _ in 0..12 {
             tokio::time::advance(step).await;
-            said += usize::from(told.first(&embedding("one"), Instant::now()));
+            said += usize::from(told.first(&embedding("one"), Instant::now(), FAULT_STANDS));
         }
         assert_eq!(said, 1 + 3, "once at first, and once in each time after");
         assert_eq!(

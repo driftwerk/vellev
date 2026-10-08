@@ -22,6 +22,7 @@ futures.workspace = true
 # models with, or a cache that cannot be written is no longer recognised.
 # A test in local.rs fails if Cargo.lock comes to hold two.
 hf-hub = { version = "0.5", optional = true, default-features = false, features = ["ureq"] }
+regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
