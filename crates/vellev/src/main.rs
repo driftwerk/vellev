@@ -127,6 +127,11 @@ struct ImportWeaviate {
     /// The Weaviate tenant to copy, for classes with multi-tenancy on.
     #[arg(long)]
     from_tenant: Option<String>,
+    /// What to call this Weaviate, where its address changes between runs:
+    /// an import goes on only from the Weaviate it began from, which it
+    /// knows by this name, or by its address when none is given.
+    #[arg(long)]
+    from_name: Option<String>,
     /// The vellev node to copy into.
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     to: String,
@@ -159,7 +164,11 @@ struct ImportWeaviate {
     /// results.
     #[arg(long, default_value_t = 100)]
     page: usize,
-    /// The most objects to copy a second.
+    /// The most bytes of objects to send the node in one request, near
+    /// enough; under its limit on a request's body.
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    batch_bytes: usize,
+    /// The most objects to ask of Weaviate a second.
     #[arg(long)]
     per_second: Option<f64>,
     /// How far Weaviate's clock may be behind this machine's, in seconds:
@@ -282,6 +291,7 @@ async fn main() -> Result<ExitCode> {
                 from,
                 from_key,
                 from_tenant,
+                from_name,
                 to,
                 key,
                 tenant,
@@ -292,6 +302,7 @@ async fn main() -> Result<ExitCode> {
                 created_as,
                 updated_as,
                 page,
+                batch_bytes,
                 per_second,
                 skew_secs,
                 state,
@@ -300,6 +311,7 @@ async fn main() -> Result<ExitCode> {
                 url: from,
                 key: from_key,
                 tenant: from_tenant,
+                name: from_name,
             };
             let options = vellev::import::Options {
                 classes,
@@ -309,6 +321,7 @@ async fn main() -> Result<ExitCode> {
                 created_as,
                 updated_as,
                 page,
+                batch_bytes,
                 per_second,
                 skew: Duration::from_secs(skew_secs),
                 state: state
@@ -326,7 +339,24 @@ async fn main() -> Result<ExitCode> {
             if report.matched() {
                 return Ok(ExitCode::SUCCESS);
             }
-            eprintln!("some classes hold a different number of objects in vellev than in Weaviate; run again to catch up");
+            let classes = |of: fn(&vellev::import::Copied) -> bool| {
+                let named = report.classes.iter().filter(|(_, copied)| of(copied));
+                named.map(|(class, _)| class.as_str()).collect::<Vec<_>>()
+            };
+            let behind = classes(|copied| !copied.caught_up());
+            if !behind.is_empty() {
+                eprintln!(
+                    "{}: Weaviate holds a different number of objects than the import has accounted for; it was written to during the run; run again to catch up",
+                    behind.join(", ")
+                );
+            }
+            let touched = classes(|copied| !copied.untouched());
+            if !touched.is_empty() {
+                eprintln!(
+                    "{}: the collection holds objects that are not as the import left them, written, changed or deleted by something else; they were left as they are, and running again will not change that",
+                    touched.join(", ")
+                );
+            }
             Ok(ExitCode::FAILURE)
         }
         Command::Health { url, timeout_secs } => {

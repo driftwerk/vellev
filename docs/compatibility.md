@@ -380,6 +380,29 @@ do the same until every node is 0.2, and may use the query after. A node
 of 0.1 answers objects without `version`, which the client crate reads as
 `None`.
 
+## The Weaviate import
+
+`vellev import weaviate` of one release goes on from where that of the
+release before stopped.
+
+- The state file keeps its fields and their meaning; a release may add
+  fields that the one before ignores.
+- A tenant imported into holds the import's own collections beside the
+  imported ones: `vellev_imported_CLASS` for each class and
+  `vellev_imports`. No Weaviate class can be named so, since theirs begin
+  with a capital. A release may add properties to them and never changes
+  what one means. The ledger's hash is of an object as that release's
+  nodes return it, so if a release changes how a stored value is written
+  out, the import of that release takes the objects for changed by
+  another writer and leaves them, rather than replacing or deleting them
+  on a hash it can no longer make.
+- A collection imported before there was a ledger is not caught up as it
+  was: see the README. Nothing is deleted from it.
+- The report may gain fields. `stored` now counts every object a run
+  added and `changed` every one it replaced, in either pass, where
+  `changed` used to count what the catch-up stored, new objects included,
+  and objects stored again unchanged.
+
 ## Between nodes
 
 A node sends writes for a tenant on to the node that holds it, marked

@@ -270,6 +270,41 @@ and say what the caller then answers for.
   their segments about 12% longer, resident memory about 10% more.
   Searches are unchanged.
 
+### vellev import weaviate
+
+- **A catch-up deletes only what the import stored.** It used to delete
+  every object of the collection that Weaviate did not hold, whoever
+  wrote it. The import now keeps a ledger in the tenant,
+  `vellev_imported_CLASS`, and replaces or deletes an object only while
+  it is exactly as the import left it; anything else is left and counted
+  as `kept`. The README states the rule.
+- **A class that gained a property is caught up**, the property added to
+  the collection, where a run used to fail. A class that no longer fits
+  is refused with every reason.
+- **The report is exact.** An object deleted from Weaviate between being
+  listed and being fetched is deleted from the collection in the same
+  run, where it used to stay until the next. `changed` no longer counts
+  objects stored again unchanged. New fields: `kept` and `imported`. The
+  command fails unless Weaviate, the ledger and the collection hold the
+  same number of objects and nothing was kept, and says which of the two
+  it was.
+- **Nothing is deleted for a class Weaviate has dropped or holds nothing
+  of**: the run stops and says so.
+- **A collection is caught up only from the Weaviate it was imported
+  from.** `--from-name` names one whose address changes between runs.
+  `--created-as` and `--updated-as` must stay as they were.
+- A catch-up no longer holds every id of a class in memory: it reads
+  Weaviate and the ledger a page at a time.
+- A request Weaviate turns away with 429 or 408, or whose answer is cut
+  short, is asked again, as a failure of the server was.
+- `--per-second` holds after a stall too, where the time lost used to be
+  made up in a burst, and covers the objects a catch-up fetches one at a
+  time. A rate that is not a number is refused.
+- New: `--batch-bytes`, the most bytes sent to the node in one request,
+  8 MiB unless given.
+- A collection imported by an earlier release has no ledger: drop it and
+  import it again, or see the README for what a run does with it.
+
 ### vellev-client
 
 Breaking:
