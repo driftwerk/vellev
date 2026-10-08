@@ -47,66 +47,174 @@ another distance. A property the class no longer has stays in the
 collection, since vellev drops none and objects stored before still have
 their values.
 
-**What the import changes, and what it leaves.** Beside each collection
-it keeps a ledger, a collection named `vellev_imported_CLASS`: for each of
-Weaviate's ids it has accounted for, when Weaviate says the object last
-changed and a hash of the object as the import stored it. The rule is:
+### What the import changes, and what it leaves
+
+Beside each collection it keeps a ledger, a collection named
+`vellev_imported_CLASS`: for each of Weaviate's ids it has accounted for,
+when Weaviate says the object last changed, a hash of the object as the
+import stored it, and a mark if the collection holds something else. The
+rule is:
 
 - An object is the import's while the collection holds, under an id the
   ledger has, exactly what the ledger's hash says. The import replaces
   and deletes only its own objects.
-- It deletes one only when Weaviate answers that it holds no such object
-  while still having the class; never because an object is missing from a
-  listing, and never for a class Weaviate has dropped or holds nothing
-  of.
 - It stores a new object only where the collection holds nothing under
   the id and the ledger has no entry. What somebody deleted in vellev is
   not brought back.
-- Everything else is left as it is and counted as `kept`: an object
-  written to vellev under an id Weaviate never had, one changed or
-  replaced in vellev since the import stored it, one deleted there. So a
-  writer that has moved to vellev, or one that mirrors Weaviate into
-  vellev under Weaviate's ids, is not undone by a later run. An object a
-  mirror stores exactly as the import would is the import's too: it goes
-  when Weaviate's does.
+- Everything else is left as it is, and the ledger marks it: an object
+  changed or replaced in vellev since the import stored it, one deleted
+  there, one written under Weaviate's id by something else. An object
+  under an id Weaviate never had is never looked at. So a writer that
+  has moved to vellev, or one that mirrors Weaviate into vellev under
+  Weaviate's ids, is not undone by a later run. An object a mirror
+  stores exactly as the import would is the import's too: it goes when
+  Weaviate's does.
 
-The object and its ledger entry are written in one atomic step, and the
-step that replaces or deletes an object fails if any of the object's
-properties changed since the import read it, so a write that lands
-meanwhile is kept. Only a change to an object's vector alone, landing in
-the instant between that read and the step, goes unseen.
+The object and its ledger entry are written in one atomic step. The step
+that replaces or deletes an object fails if any of the object's
+properties changed since the import read it, those without a value
+included, so a write that lands meanwhile is kept, and nothing is asked
+of Weaviate between that read and the step. Two things go unseen in the
+instant between them: a change to the object's vector alone, and a value
+for a property the collection gained since the run began. vellev has no
+condition on an object's version yet; with one, neither would.
 
-The ledger costs one small object per imported object, with no vector
-and no index. Measured over 60,000 entries, that is 135 bytes each in the
-tenant's log and 106 once in a segment and its manifest: some 0.4 GB of
-files for a class of four million objects, beside what of the log is
-still kept. It is ordinary
-tenant data: it is backed up and restored with the tenant, dropped with
-it, and listed among its collections, as is `vellev_imports`, which holds
-one object per class saying which Weaviate it came from. A collection is
-caught up only from that Weaviate, known by its address. Where the
-address changes between runs, as through a tunnel, name the Weaviate with
-`--from-name` on every run. A collection that is dropped is imported
-again from the start, its ledger with it; drop one only if nothing but
-the import has written to it, since whatever else did is gone with it.
+### Deleting
 
-A collection imported by a release from before the ledger has none. The
-next run takes up every object that is still exactly as Weaviate has it,
-fetching each to compare, and keeps the rest untouched. Where nothing
-but the import has written to the collection, dropping it and importing
-it again is quicker and brings everything.
+Nothing is deleted while Weaviate is walked. What the ledger has and the
+walk did not list is first only counted.
 
-**What a run reports**, per class: `stored`, `changed` and `deleted`, the
-objects it added, replaced and removed; `kept`, those it found were not
-its own to replace or remove; and `weaviate`, `imported` and `vellev`,
-how many objects Weaviate holds, the ledger has accounted for, and the
-collection holds. The run succeeds when the three are equal and nothing
-was kept. `weaviate` and `imported` differ when Weaviate was written to
-during the run: run again. `kept` or a different `vellev` means another
-writer has been at the collection, and running again will not change
-that. The counts cover what the run looked at: it does not read again an
-object that Weaviate has not changed, so one changed only in vellev is
-not noticed until Weaviate changes or deletes it.
+- **A run deletes at most `--max-deletes` objects of a class (1000) and
+  at most `--max-delete-fraction` of what was imported of it (0.05),
+  whichever is fewer.** A run that finds more gone deletes none of them,
+  reports them as `pending` beside the `budget`, and fails: a Weaviate
+  that was emptied, restored from a backup, or is not the one imported
+  looks exactly like one that deleted a great deal. If they are truly
+  gone, raise the two for one run.
+- `--no-delete` deletes nothing, and counts what is gone as `pending`.
+- Within the bound, each object is asked for by itself twice,
+  `--confirm-secs` apart (5), of every copy of the class
+  (`consistency_level=ALL`), and each time only once Weaviate answers
+  that it is ready and every shard of the class is loaded: a Weaviate
+  that is starting answers that it holds no such object for objects it
+  holds. One it turns out to hold is settled like any other.
+- A class is known by the names Weaviate gave its shards when it made
+  it. One made again under the same name has others: the run stops
+  before changing anything, and goes on only with `--accept-remade`,
+  still within the bound. A class with tenants has no such names, its
+  shards being named after its tenants; for those the bound is the
+  guard.
+
+### Collections that had no ledger
+
+A collection that was there before its ledger, such as one imported by a
+release from before there were ledgers, or one something else made, is
+taken up on the next run: every object of Weaviate's is given its entry,
+by what the collection holds under its id, a page of both at a time, the
+walk resuming where it stopped.
+
+- What the collection holds exactly as Weaviate does becomes the
+  import's.
+- What it holds otherwise is left, and marked as another writer's.
+- **What it does not hold is not stored**, and is marked too: without a
+  ledger, an object new to Weaviate and one deleted in vellev look the
+  same.
+- `--sole-writer` says nothing but an import has written to the
+  collection: then what it lacks is stored and what differs is replaced.
+  Collections imported before numbers were read exactly (see the release
+  notes) hold some numbers a last digit off from Weaviate's, and are
+  only brought level this way.
+- Nothing is deleted in the taking up. An object Weaviate deleted before
+  there was a ledger stays, the import knowing nothing of it.
+
+Once the taking up is over, an object without an entry is new to
+Weaviate, and is stored.
+
+### Ending an import
+
+```sh
+vellev import finalise --to http://vellev:8080 --tenant acme
+```
+
+Once writes have moved to vellev and a last run has settled, end the
+import (of each `--class`, or of every class). It drops the ledgers, and
+with them what they take on the node, and notes in the tenant that the
+collections are no longer imported, so that a later `import weaviate`
+refuses them rather than change what is now vellev's own.
+
+### What a run reports
+
+Per class:
+
+- `stored`, `changed`, `deleted`: the objects it added, replaced and
+  removed.
+- `kept`: the objects of Weaviate's the ledger marks as another
+  writer's. The same on every run while they stay so.
+- `left`: objects gone from Weaviate that this run left in the
+  collection because they were not as the import had stored them.
+- `pending` and `budget`: see above.
+- `refused`: objects vellev cannot hold, by id, with why. One stops the
+  run unless `--skip-refused` is given.
+- `too_large`: objects changed in Weaviate that could not be replaced,
+  because the step that replaces one safely says twice over what it
+  holds, once to say what must not have changed, and the two did not fit
+  the node's limit on a request. They are left as they are.
+- `weaviate`, `imported`, `vellev`: how many objects Weaviate holds, the
+  ledger has accounted for, and the collection holds.
+
+The command exits with
+
+- **0** when everything that is the import's is as Weaviate has it.
+  Objects of another writer's do not count against it.
+- **3** when Weaviate was written to behind the catch-up: run again.
+- **1** when something is left that another run will not put right by
+  itself: more gone than it may delete, objects refused or too large, a
+  comparison that found differences, or any failure.
+
+`--strict` makes it 1 as well whenever a collection holds anything that
+is not as the import left it.
+
+The counts do not say that the collection holds what Weaviate does: a
+run does not read again an object Weaviate has not changed. `--verify`
+does. It changes nothing, and compares the two object by object, by the
+same hash: over 20 pages begun at ids picked at random, or as many as it
+is given, or over everything with `--verify-all`. It reports, under
+`verified`, how many it `looked` at, how many are the `same`, how many
+of the import's are `different` or `missing`, with some of their ids,
+and how many are `kept` by another writer or `unaccounted` for.
+
+### What it costs
+
+- The ledger holds one small object for each imported object, with no
+  vector, nothing indexed and nothing searched. Measured over 60,000
+  entries, that is 135 bytes each in the tenant's log and 106 once in a
+  segment and its manifest, and about 447 bytes each in the node's
+  memory while the tenant is held: for a class of 4.2 million objects,
+  some 0.45 GB of files and 1.9 GB of memory. `import finalise` frees
+  both.
+- It is ordinary tenant data: backed up and restored with the tenant,
+  dropped with it, and listed among its collections, as is
+  `vellev_imports`, which holds one object per class saying where it
+  came from.
+- A catch-up lists the whole ledger, a page at a time. Until the node
+  lists a collection without sorting all of it for each page, that
+  listing grows with the square of the ledger; `--page` is therefore as
+  large as the node allows unless given.
+- A catch-up asks Weaviate for every id, without vectors, and fetches
+  what changed: a page at a time where much of a page changed, one
+  object at a time where little did. With the default `--skew-secs` of
+  300 it also fetches again whatever changed in the five minutes before
+  the last catch-up began, and stores none of it that is unchanged.
+- A request Weaviate fails or turns away is asked again for
+  `--patience-secs` (600) before the run stops.
+
+A collection is caught up only from the Weaviate it was imported from,
+known by its address. Where the address changes between runs, as through
+a tunnel, name the Weaviate with `--from-name` on every run. A
+collection that is dropped is imported again from the start, its ledger
+with it; drop one only if nothing but the import has written to it,
+since whatever else did is gone with it. Two runs cannot share a state
+file.
 
 ## Run
 

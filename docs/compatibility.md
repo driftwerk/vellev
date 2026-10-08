@@ -390,18 +390,26 @@ release before stopped.
 - A tenant imported into holds the import's own collections beside the
   imported ones: `vellev_imported_CLASS` for each class and
   `vellev_imports`. No Weaviate class can be named so, since theirs begin
-  with a capital. A release may add properties to them and never changes
-  what one means. The ledger's hash is of an object as that release's
-  nodes return it, so if a release changes how a stored value is written
-  out, the import of that release takes the objects for changed by
-  another writer and leaves them, rather than replacing or deleting them
-  on a hash it can no longer make.
-- A collection imported before there was a ledger is not caught up as it
-  was: see the README. Nothing is deleted from it.
-- The report may gain fields. `stored` now counts every object a run
-  added and `changed` every one it replaced, in either pass, where
-  `changed` used to count what the catch-up stored, new objects included,
-  and objects stored again unchanged.
+  with a capital. A release may add properties to them, which it does to
+  those already there, and never changes what one means. Each object in
+  them has a version, the first when it says none; an import that reads
+  a later one than it knows stops, and changes nothing.
+- The ledger's hash is of an object as that release's nodes return it.
+  If a release changes how a stored value is written out, the import of
+  that release takes the objects for another writer's and leaves them,
+  rather than replacing or deleting them on a hash it can no longer make.
+  A test holds the hash of fixed objects to what it was.
+- **Numbers.** A node of this release reads the numbers in a request
+  exactly. One of an earlier release read about three in ten doubles
+  with a full set of digits as a neighbouring double, and stored that.
+  Whatever such a node stored stays as it stored it. Run no import that
+  keeps a ledger against nodes from before this release: the hashes it
+  would keep are of numbers the node did not store.
+- A collection imported before there was a ledger is taken up, not
+  caught up as it was: see the README. Nothing is deleted from it.
+- The report may gain fields. Its exit status is 0 when everything that
+  is the import's is settled, 3 when another run is all it takes, and 1
+  otherwise; before, it was 1 whenever the counts differed.
 
 ## Between nodes
 

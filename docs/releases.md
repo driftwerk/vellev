@@ -270,44 +270,81 @@ and say what the caller then answers for.
   their segments about 12% longer, resident memory about 10% more.
   Searches are unchanged.
 
+### Numbers are read exactly
+
+- **A node now stores the number it was sent.** `serde_json` was built
+  without `float_roundtrip`, and read about three in ten doubles with a
+  full set of digits as a neighbouring double: `-2.3624865652539077e-47`
+  came back `-2.3624865652539072e-47`. Every number property written
+  through the API was open to it; vectors were not, an `f32` surviving
+  the older reader. Numbers stored before stay as they were stored.
+- It costs time reading JSON: a request of 200 vectors of 768 dimensions
+  parses in 7.7 ms where it took 4.1 ms, one of 1536 dimensions in
+  15.3 ms where it took 7.9 ms. Against the rest of a write it does not
+  show: storing vectors through the API measured 100 to 120 microseconds
+  a vector of 768 dimensions and 220 to 290 a vector of 1536 both before
+  and after, the runs differing more among themselves than across the
+  change.
+- **This must be on every node before an import keeps a ledger there.**
+  The ledger's hash is of the object as Weaviate holds it; a node that
+  stores another number makes every object with such a number look like
+  another writer's.
+
 ### vellev import weaviate
 
 - **A catch-up deletes only what the import stored.** It used to delete
   every object of the collection that Weaviate did not hold, whoever
   wrote it. The import now keeps a ledger in the tenant,
   `vellev_imported_CLASS`, and replaces or deletes an object only while
-  it is exactly as the import left it; anything else is left and counted
-  as `kept`. The README states the rule.
+  it is exactly as the import left it; anything else is left, and marked
+  in the ledger. The README states the rule.
+- **Nothing is deleted until Weaviate has been walked, and then only
+  within a bound**: `--max-deletes` (1000) and `--max-delete-fraction`
+  (0.05) of a class, the fewer. A run that finds more gone deletes none
+  and fails. `--no-delete` deletes nothing. Each object is asked for
+  twice, `--confirm-secs` apart, with Weaviate ready and the class's
+  shards loaded, before it is deleted.
+- **A class made again in Weaviate is not taken for the one imported**:
+  the run stops, unless given `--accept-remade`.
 - **A class that gained a property is caught up**, the property added to
   the collection, where a run used to fail. A class that no longer fits
   is refused with every reason.
-- **The report is exact.** An object deleted from Weaviate between being
-  listed and being fetched is deleted from the collection in the same
-  run, where it used to stay until the next. `changed` no longer counts
-  objects stored again unchanged. New fields: `kept` and `imported`. The
-  command fails unless Weaviate, the ledger and the collection hold the
-  same number of objects and nothing was kept, and says which of the two
-  it was.
-- **Nothing is deleted for a class Weaviate has dropped or holds nothing
-  of**: the run stops and says so.
+- **A collection without a ledger is taken up, and given nothing it
+  lacks** unless `--sole-writer` says nothing else wrote to it. That is
+  every collection imported by an earlier release. Because those hold
+  numbers read the old way, only `--sole-writer`, or importing again
+  into a collection made anew, brings them level with Weaviate.
+- **`vellev import finalise`** ends an import: it drops the ledgers and
+  notes that the collections are no longer imported.
+- **The exit status says what is left**: 0 when everything that is the
+  import's is settled, whatever another writer has done beside it; 3
+  when Weaviate was written to behind the catch-up and another run is
+  all it takes; 1 otherwise. `--strict` fails as before on anything of
+  another writer's.
+- **The report is exact, and the same every run.** An object deleted
+  from Weaviate between being listed and being fetched is deleted in the
+  same run. `changed` no longer counts objects stored again unchanged.
+  New fields: `kept`, `left`, `pending`, `budget`, `refused`,
+  `too_large`, `imported`, `verified`.
+- **`--verify` and `--verify-all`** compare what a collection holds with
+  what Weaviate does, object by object, and change nothing.
 - **A collection is caught up only from the Weaviate it was imported
   from.** `--from-name` names one whose address changes between runs.
   `--created-as` and `--updated-as` must stay as they were.
-- A catch-up no longer holds every id of a class in memory: it reads
-  Weaviate and the ledger a page at a time.
+- `--skip-refused` passes over an object vellev cannot hold, and reports
+  it, where a run otherwise stops at it.
+- A catch-up no longer holds every id of a class in memory, and fetches
+  and stores by the page where much of a page changed.
 - A request Weaviate turns away with 429 or 408, or whose answer is cut
-  short, is asked again, as a failure of the server was.
+  short, is asked again, as a failure of the server was, and for
+  `--patience-secs` (600) rather than five times.
 - `--per-second` holds after a stall too, where the time lost used to be
   made up in a burst, and covers the objects a catch-up fetches one at a
   time. A rate that is not a number is refused.
-- New: `--batch-bytes`, the most bytes sent to the node in one request,
-  8 MiB unless given.
-- A collection imported by an earlier release has no ledger. If nothing
-  but the import has written to it, drop it and import it again;
-  otherwise see the README for what a run does with it.
-- The command now fails whenever a collection holds objects the import
-  did not bring, as it will for good once another writer stores its own
-  there. The message says so and that running again changes nothing.
+- `--page` is the node's limit on results unless given, where it was
+  100. `--batch-bytes` is the most bytes sent to the node in one
+  request, 8 MiB unless given.
+- Two runs with the same state file: the second is refused.
 
 ### vellev-client
 
