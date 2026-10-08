@@ -474,6 +474,15 @@ mod tests {
             fastembed::Error::new(cause).context("Failed to retrieve model.onnx")
         };
         let kept = Path::new("/models");
+        // The same failure further down, as it would lie were it wrapped
+        // on its way up.
+        #[derive(Debug, thiserror::Error)]
+        #[error("the model could not be fetched")]
+        struct Wrapped(#[source] FetchError);
+        let wrapped = fastembed::Error::new(Wrapped(FetchError::IoError(
+            ErrorKind::PermissionDenied.into(),
+        )));
+        assert!(unloaded("m", kept, &wrapped).lasting(), "{wrapped:#}");
         for kind in [ErrorKind::PermissionDenied, ErrorKind::ReadOnlyFilesystem] {
             let error = fetching(FetchError::IoError(kind.into()));
             assert_eq!(

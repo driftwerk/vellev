@@ -242,7 +242,8 @@ it the nodes' own addresses. A request that brings its own vector needs no
 model.
 
 A collection whose model the node's build cannot run is refused when it is
-made, with `model_unavailable`, by the node that holds the tenant then;
+made, or made again, with `model_unavailable`, by the node that holds the
+tenant then;
 a node of another build may hold it later and answer otherwise, so run one
 build, and during a rolling deploy expect either answer. What only using a
 model shows, such as an endpoint that refuses the node, is found at the

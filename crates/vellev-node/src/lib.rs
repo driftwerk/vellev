@@ -307,8 +307,7 @@ impl Tenant {
     /// would be refused. That is this node's answer, the node that writes
     /// the tenant now: one built or set up otherwise may take the tenant
     /// later and answer otherwise. Whatever only using the model would
-    /// show, such as an endpoint that refuses the node, is not looked for,
-    /// and a collection there already is left to be answered as it was.
+    /// show, such as an endpoint that refuses the node, is not looked for.
     fn can_embed(&self, mutations: &[Mutation]) -> Result<()> {
         mutations
             .iter()
@@ -316,7 +315,6 @@ impl Tenant {
                 Mutation::CreateCollection(schema) => Some(schema),
                 _ => None,
             })
-            .filter(|schema| self.read(|state| state.collection(&schema.name).is_none()))
             .try_for_each(|schema| match self.embedders.embedder(&schema.embedding) {
                 Err(error) if error.lasting() => Err(NodeError::Embed(error)),
                 _ => Ok(()),
