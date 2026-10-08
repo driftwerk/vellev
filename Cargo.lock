@@ -4327,6 +4327,7 @@ dependencies = [
  "rmp-serde",
  "roaring",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sqlx",
  "tempfile",

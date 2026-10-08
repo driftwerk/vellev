@@ -162,6 +162,13 @@ impl Wire {
         if self.clusters.is_empty() {
             return Some("no clusters".to_string());
         }
+        if !(1..=self.clusters.len()).contains(&self.probes) {
+            return Some(format!(
+                "{} clusters to scan of {}",
+                self.probes,
+                self.clusters.len()
+            ));
+        }
         if self.centroids.len() != self.clusters.len() * width {
             return Some(format!(
                 "{} centroid values for {} clusters {width} wide",
@@ -636,6 +643,19 @@ impl ClusteredIndex {
     /// How many clusters a query scans.
     pub fn probes(&self) -> usize {
         self.probes
+    }
+
+    /// Whether this is an index of just these vectors' rows, of their
+    /// dimensions, measured by `metric`: what one read back from a file
+    /// must be before it is trusted with them. An index of other rows
+    /// would name rows that are not there, and one of other dimensions or
+    /// another metric would answer nothing, or wrongly.
+    pub fn fits(&self, metric: Distance, vectors: &[(u32, &[f32])]) -> bool {
+        self.metric == metric
+            && vectors
+                .first()
+                .is_none_or(|(_, vector)| vector.len() == self.dimensions)
+            && self.rows.iter().eq(vectors.iter().map(|(row, _)| row))
     }
 
     /// How many clusters the rows are grouped in.
@@ -1353,9 +1373,41 @@ mod tests {
         assert_eq!(rows, [7, 9]);
     }
 
+    /// An index is one of just the rows, dimensions and metric it was built
+    /// of: whoever reads one back for some vectors asks before trusting it.
+    #[test]
+    fn an_index_fits_only_the_vectors_it_was_built_of() {
+        let vectors = grouped(27, 500, 16, 5, 0.4);
+        let rows = |shift: u32, vectors: &'_ [Vec<f32>]| -> Vec<(u32, Vec<f32>)> {
+            vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2 + shift, v.clone()))
+                .collect()
+        };
+        let fits = |index: &ClusteredIndex, metric, rows: &[(u32, Vec<f32>)]| {
+            let rows: Vec<(u32, &[f32])> =
+                rows.iter().map(|(row, v)| (*row, v.as_slice())).collect();
+            index.fits(metric, &rows)
+        };
+        let index = indexed(Distance::Cosine, &vectors);
+        assert!(fits(&index, Distance::Cosine, &rows(0, &vectors)));
+        assert!(!fits(&index, Distance::Dot, &rows(0, &vectors)));
+        assert!(!fits(&index, Distance::Cosine, &rows(1, &vectors)));
+        assert!(!fits(&index, Distance::Cosine, &rows(0, &vectors[..499])));
+        assert!(!fits(
+            &index,
+            Distance::Cosine,
+            &rows(0, &grouped(27, 500, 17, 5, 0.4))
+        ));
+    }
+
     /// An index whose stored parts do not fit one another is refused when
-    /// read, not left to panic at a query, or to take all memory for a
-    /// rotation as wide as a corrupt file says.
+    /// read: a width no rotation has, which would otherwise be sized by,
+    /// and centroids, codes, factors or a count of clusters to scan that
+    /// would otherwise panic at some later query. Whether it is an index of
+    /// the vectors it is read for is not told here but by
+    /// [`ClusteredIndex::fits`].
     #[test]
     fn an_index_whose_parts_do_not_fit_is_refused_on_load() {
         let index = indexed(Distance::L2, &grouped(21, 1000, 48, 8, 0.4));
@@ -1368,7 +1420,11 @@ mod tests {
             rmp_serde::from_slice::<ClusteredIndex>(&bytes).map(|index| index.len())
         };
         assert_eq!(reread(|_| {}).unwrap(), 1000);
-        let corruptions: [(&str, Corrupt); 9] = [
+        let corruptions: [(&str, Corrupt); 11] = [
+            ("no clusters to scan", |wire| wire.probes = 0),
+            ("more clusters to scan than there are", |wire| {
+                wire.probes = usize::MAX
+            }),
             ("no width", |wire| wire.rotation.width = 0),
             ("a width that is no power of two", |wire| {
                 wire.rotation.width = 100

@@ -443,8 +443,9 @@ fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a 
 
 /// Index `rows` for filtering, keyword search and vector search, for the
 /// collections `catalog` knows, numbered as the rows lie. A clustered index
-/// in `stored` for a collection with as many vectors as it holds is used
-/// rather than built again; otherwise one is built for a collection with
+/// in `stored` for a collection is used rather than built again if it is
+/// one of just the collection's rows with vectors here, of their
+/// dimensions and by its metric; otherwise one is built for a collection with
 /// more vectors than `clustered_above`, when that is given, which only the
 /// writer does. The filter indexes are summarised, the rows being all
 /// there will be. An index built under an older catalog stays right: a
@@ -478,7 +479,7 @@ pub(crate) fn indexed<'a>(
         };
         let kept = stored
             .get(collection)
-            .filter(|clustered| clustered.len() == vectors.len());
+            .filter(|clustered| clustered.fits(schema.distance, vectors));
         index.vectors = match kept {
             Some(clustered) => Some(Vectors::Clustered(clustered.clone())),
             None if clustered_above
