@@ -1004,7 +1004,14 @@ impl Writer {
         let above = Some(self.merging.clustered_above);
         blocking(move || {
             let inline = |row: usize| file.rows[row].object.vector.as_deref();
-            let indexes = state::indexed(&catalog, &file.rows, inline, &Stored::default(), above);
+            let indexes = state::indexed(
+                &catalog,
+                &file.rows,
+                inline,
+                &Stored::default(),
+                |_, _| {},
+                above,
+            );
             let vectors = Column::taken_from(&mut file.rows);
             let segment = encode(Kind::Segment, &file)?;
             let column = vectors.encode();

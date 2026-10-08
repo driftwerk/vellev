@@ -41,6 +41,17 @@ const MOST_CLUSTERS: usize = 4096;
 /// How many vectors per cluster k-means is trained on, at most.
 const TRAINING_PER_CLUSTER: usize = 64;
 
+/// In what an index is not one of the vectors it is asked to stand for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Unfit {
+    #[error("it measures by another metric")]
+    Metric,
+    #[error("it is of vectors of other dimensions")]
+    Dimensions,
+    #[error("it is of other rows")]
+    Rows,
+}
+
 /// Vectors clustered around centroids, each kept as a one-bit code.
 #[derive(Clone, Deserialize)]
 #[serde(try_from = "Wire")]
@@ -646,16 +657,22 @@ impl ClusteredIndex {
     }
 
     /// Whether this is an index of just these vectors' rows, of their
-    /// dimensions, measured by `metric`: what one read back from a file
-    /// must be before it is trusted with them. An index of other rows
-    /// would name rows that are not there, and one of other dimensions or
-    /// another metric would answer nothing, or wrongly.
-    pub fn fits(&self, metric: Distance, vectors: &[(u32, &[f32])]) -> bool {
-        self.metric == metric
-            && vectors
-                .first()
-                .is_none_or(|(_, vector)| vector.len() == self.dimensions)
-            && self.rows.iter().eq(vectors.iter().map(|(row, _)| row))
+    /// dimensions, measured by `metric`, or else in what it is not: what
+    /// one read back from a file must be before it is trusted with them.
+    /// An index of other rows would name rows that are not there, and one
+    /// of other dimensions or another metric would answer nothing, or
+    /// wrongly.
+    pub fn fit(&self, metric: Distance, vectors: &[(u32, &[f32])]) -> Result<(), Unfit> {
+        let dimensions = vectors.first().map(|(_, vector)| vector.len());
+        if self.metric != metric {
+            Err(Unfit::Metric)
+        } else if dimensions.is_some_and(|dimensions| dimensions != self.dimensions) {
+            Err(Unfit::Dimensions)
+        } else if !self.rows.iter().eq(vectors.iter().map(|(row, _)| row)) {
+            Err(Unfit::Rows)
+        } else {
+            Ok(())
+        }
     }
 
     /// How many clusters the rows are grouped in.
@@ -1385,21 +1402,24 @@ mod tests {
                 .map(|(row, v)| (row as u32 * 2 + shift, v.clone()))
                 .collect()
         };
-        let fits = |index: &ClusteredIndex, metric, rows: &[(u32, Vec<f32>)]| {
+        let index = indexed(Distance::Cosine, &vectors);
+        let fit = |metric, rows: &[(u32, Vec<f32>)]| {
             let rows: Vec<(u32, &[f32])> =
                 rows.iter().map(|(row, v)| (*row, v.as_slice())).collect();
-            index.fits(metric, &rows)
+            index.fit(metric, &rows)
         };
-        let index = indexed(Distance::Cosine, &vectors);
-        assert!(fits(&index, Distance::Cosine, &rows(0, &vectors)));
-        assert!(!fits(&index, Distance::Dot, &rows(0, &vectors)));
-        assert!(!fits(&index, Distance::Cosine, &rows(1, &vectors)));
-        assert!(!fits(&index, Distance::Cosine, &rows(0, &vectors[..499])));
-        assert!(!fits(
-            &index,
-            Distance::Cosine,
-            &rows(0, &grouped(27, 500, 17, 5, 0.4))
-        ));
+        let wider = grouped(27, 500, 17, 5, 0.4);
+        assert_eq!(fit(Distance::Cosine, &rows(0, &vectors)), Ok(()));
+        assert_eq!(fit(Distance::Dot, &rows(0, &vectors)), Err(Unfit::Metric));
+        assert_eq!(
+            fit(Distance::Cosine, &rows(0, &wider)),
+            Err(Unfit::Dimensions)
+        );
+        assert_eq!(fit(Distance::Cosine, &rows(1, &vectors)), Err(Unfit::Rows));
+        assert_eq!(
+            fit(Distance::Cosine, &rows(0, &vectors[..499])),
+            Err(Unfit::Rows)
+        );
     }
 
     /// An index whose stored parts do not fit one another is refused when
@@ -1407,7 +1427,7 @@ mod tests {
     /// and centroids, codes, factors or a count of clusters to scan that
     /// would otherwise panic at some later query. Whether it is an index of
     /// the vectors it is read for is not told here but by
-    /// [`ClusteredIndex::fits`].
+    /// [`ClusteredIndex::fit`].
     #[test]
     fn an_index_whose_parts_do_not_fit_is_refused_on_load() {
         let index = indexed(Distance::L2, &grouped(21, 1000, 48, 8, 0.4));

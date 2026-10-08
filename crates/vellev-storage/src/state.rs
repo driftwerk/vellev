@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value};
-use vellev_index::clustered::ClusteredIndex;
+use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
 use vellev_index::vector::{BinaryIndex, Ties, VectorIndex};
@@ -317,11 +317,22 @@ impl Loaded {
         }
         Ok(self.indexes.clone().unwrap_or_else(|| {
             let column = |row| self.vectors.get(row);
+            // Said once, as the segment is loaded: it is searched by a scan
+            // of its codes from now until it is next merged.
+            let unused = |collection: CollectionId, unfit: Unfit| {
+                tracing::warn!(
+                    key,
+                    collection = collection.0,
+                    %unfit,
+                    "a segment's stored index is not used"
+                );
+            };
             Arc::new(indexed(
                 catalog,
                 &self.file.rows,
                 column,
                 &self.stored,
+                unused,
                 None,
             ))
         }))
@@ -445,7 +456,8 @@ fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a 
 /// collections `catalog` knows, numbered as the rows lie. A clustered index
 /// in `stored` for a collection is used rather than built again if it is
 /// one of just the collection's rows with vectors here, of their
-/// dimensions and by its metric; otherwise one is built for a collection with
+/// dimensions and by its metric, and `unused` is told of one that is not;
+/// otherwise one is built for a collection with
 /// more vectors than `clustered_above`, when that is given, which only the
 /// writer does. The filter indexes are summarised, the rows being all
 /// there will be. An index built under an older catalog stays right: a
@@ -456,6 +468,7 @@ pub(crate) fn indexed<'a>(
     rows: &'a [Row],
     vector_of: impl Fn(usize) -> Option<&'a [f32]>,
     stored: &Stored,
+    unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
 ) -> Indexes {
     let mut indexes = Indexes::new();
@@ -477,9 +490,12 @@ pub(crate) fn indexed<'a>(
         else {
             continue;
         };
-        let kept = stored
-            .get(collection)
-            .filter(|clustered| clustered.fits(schema.distance, vectors));
+        let kept = stored.get(collection).filter(|clustered| {
+            clustered
+                .fit(schema.distance, vectors)
+                .map_err(|unfit| unused(*collection, unfit))
+                .is_ok()
+        });
         index.vectors = match kept {
             Some(clustered) => Some(Vectors::Clustered(clustered.clone())),
             None if clustered_above
