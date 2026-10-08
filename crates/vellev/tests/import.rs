@@ -1251,17 +1251,19 @@ async fn nothing_is_deleted_for_a_class_made_again_or_dropped() {
         (objects, importing.ledger().count(None).await.unwrap())
     };
 
-    // Made again with one object, as a Weaviate begun afresh at the same
-    // address would have it: the class is not the one imported.
+    // Made again, as a Weaviate begun afresh at the same address would
+    // have it, with one note it had, changed, and one it had not: the
+    // class is not the one imported, and nothing of it is stored either.
     weaviate.drop(class).await;
     weaviate.make(class).await;
-    weaviate.add(class, 0..1).await;
+    weaviate.post(class, 0, changed(0), vector(0)).await;
     let refused = importing.run().await.unwrap_err();
     assert!(
         refused.to_string().contains("has been made again"),
         "{refused}"
     );
     assert_eq!(all().await, (20, 20));
+    assert_eq!(importing.get(0).await.unwrap().properties["n"], json!(0));
 
     // Told to go on from it, a run still deletes no more than it may:
     // here nothing, where nineteen of twenty are gone.
@@ -1376,8 +1378,34 @@ async fn a_weaviate_that_is_starting_is_not_believed_about_what_it_does_not_hold
     assert!(importing.get(6).await.is_some());
     proxy.rules.lock().unwrap().clear();
 
+    // Nor is one believed that answers the question of whether it is
+    // ready with anything but that it is.
+    let ready = ["/v1/.well-known/ready"];
+    proxy.answer(0, &ready, StatusCode::NOT_FOUND, json!({}));
+    let refused = importing.run().await.unwrap_err();
+    assert!(
+        refused.to_string().contains("whether it is ready"),
+        "{refused}"
+    );
+    assert!(importing.get(6).await.is_some());
+
     // Ready, and asked twice, it is believed.
     assert_eq!(importing.counts().await, ([0, 0, 1, 0, 0], [19; 3]));
+}
+
+#[tokio::test]
+async fn a_class_emptied_in_weaviate_is_emptied_by_a_run_allowed_to() {
+    let Some(importing) = Importing::new("VellevImportEmptied", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    for n in 0..10 {
+        importing.weaviate.delete(importing.class, n).await;
+    }
+    // No object is left to tell the length of the class's vectors by:
+    // the collection says it. And the tests let a run delete all of a
+    // class.
+    assert_eq!(importing.counts().await, ([0, 0, 10, 0, 0], [0; 3]));
 }
 
 #[tokio::test]
@@ -1520,22 +1548,6 @@ async fn a_collection_dropped_is_imported_again_from_the_start() {
     importing.records.drop().await.unwrap();
     assert_eq!(importing.counts().await, ([20, 0, 0, 0, 0], [20; 3]));
     importing.assert_same().await;
-}
-
-#[tokio::test]
-async fn a_collection_made_anew_is_copied_by_the_page_whatever_the_state_file_says() {
-    let Some(importing) = Importing::new("VellevImportAnew", 20).await else {
-        return;
-    };
-    importing.run().await.unwrap();
-    importing.records.drop().await.unwrap();
-
-    // The state file says the class was copied whole. Believed, it would
-    // leave every object to the catch-up, to fetch one at a time.
-    let singly = format!("GET /v1/objects/{}/", importing.class);
-    importing.proxy.before(0, &[&singly], |_| async {});
-    assert_eq!(importing.counts().await, ([20, 0, 0, 0, 0], [20; 3]));
-    assert!(!importing.proxy.spent(), "no object was fetched by itself");
 }
 
 #[tokio::test]

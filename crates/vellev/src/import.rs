@@ -733,11 +733,6 @@ async fn prepare(
                     // is gone is taken up from the start.
                     binding.adopting = bound.adopting || ledgered.is_none();
                     begins = ledgered.is_none();
-                    // An identity is noted the first time it is known,
-                    // and kept from then on.
-                    if !options.accept_remade {
-                        binding.shards = bound.shards.clone().or(identity);
-                    }
                 }
                 None => {
                     binding.adopting = true;
