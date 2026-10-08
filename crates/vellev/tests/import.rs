@@ -1209,3 +1209,39 @@ async fn a_rate_that_is_no_number_or_none_at_all_is_refused() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_collection_made_anew_is_copied_by_the_page_whatever_the_state_file_says() {
+    let Some(importing) = Importing::new("VellevImportAnew", 20).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    importing.records.drop().await.unwrap();
+
+    // The state file says the class was copied whole. Believed, it would
+    // leave every object to the catch-up, to fetch one at a time.
+    let singly = format!("GET /v1/objects/{}/", importing.class);
+    importing.proxy.before(0, &[&singly], |_| async {});
+    assert_eq!(importing.counts().await, ([20, 0, 0, 0], [20; 3]));
+    assert!(!importing.proxy.spent(), "no object was fetched by itself");
+}
+
+#[tokio::test]
+async fn a_change_is_caught_up_with_however_far_behind_weaviates_clock_is() {
+    let Some(importing) = Importing::new("VellevImportBehind", 10).await else {
+        return;
+    };
+    let class = importing.class;
+    importing.run().await.unwrap();
+
+    // As if Weaviate's clock were an hour behind this one, and no margin
+    // allowed for it: by its time alone the change is too old to look at.
+    let state = &importing.options.state;
+    let mut progress: Value = serde_json::from_slice(&std::fs::read(state).unwrap()).unwrap();
+    let caught_up = &mut progress["classes"][class]["caught_up_to"];
+    *caught_up = json!(caught_up.as_i64().unwrap() + 3_600_000);
+    std::fs::write(state, serde_json::to_vec(&progress).unwrap()).unwrap();
+    importing.weaviate.put(class, 5, changed(5)).await;
+    assert_eq!(importing.counts().await, ([0, 1, 0, 0], [10; 3]));
+    importing.assert_same().await;
+}
