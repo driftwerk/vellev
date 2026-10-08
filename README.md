@@ -239,3 +239,9 @@ PROPTEST_CASES=20000 cargo test --release -p vellev-storage --test simulation   
 
 CI runs `cargo fmt --check`, `cargo clippy -D warnings`, the tests, a licence
 check (`cargo deny check`, config in `deny.toml`) and an image build.
+
+Once every check has passed on main, CI pushes the image it built and
+started to Docker Hub as `kingsleyh/vellev:sha-<commit>` (linux/amd64). A
+release tag names that same image by its version as well, for example
+`kingsleyh/vellev:0.2.0`. Pin a deployment to the `sha-` name or a version;
+there is no `latest`.
