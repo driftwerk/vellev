@@ -119,6 +119,7 @@ fn unloaded(model: &str, kept: &Path, error: &fastembed::Error) -> EmbedError {
         true => EmbedError::Unusable {
             model: model.to_string(),
             reason: format!("the node may not write {}: {error:#}", kept.display()),
+            fault: vellev_core::ModelFault::Setup,
         },
         false => failure(model, format!("{error:#}")),
     }
@@ -451,6 +452,7 @@ mod tests {
         let barred = || EmbedError::Unusable {
             model: "stand-in".into(),
             reason: "its cache may not be written".into(),
+            fault: vellev_core::ModelFault::Setup,
         };
         let load: Load = Box::new(move || {
             tried.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -482,14 +484,19 @@ mod tests {
         let wrapped = fastembed::Error::new(Wrapped(FetchError::IoError(
             ErrorKind::PermissionDenied.into(),
         )));
-        assert!(unloaded("m", kept, &wrapped).lasting(), "{wrapped:#}");
+        assert_eq!(
+            unloaded("m", kept, &wrapped).lasting(),
+            Some(vellev_core::ModelFault::Setup),
+            "{wrapped:#}"
+        );
         for kind in [ErrorKind::PermissionDenied, ErrorKind::ReadOnlyFilesystem] {
             let error = fetching(FetchError::IoError(kind.into()));
             assert_eq!(
                 unloaded("m", kept, &error),
                 EmbedError::Unusable {
                     model: "m".into(),
-                    reason: format!("the node may not write /models: {error:#}")
+                    reason: format!("the node may not write /models: {error:#}"),
+                    fault: vellev_core::ModelFault::Setup,
                 },
                 "{kind:?}"
             );
@@ -521,6 +528,41 @@ mod tests {
             model: model.into(),
             reason: reason.into(),
         }
+    }
+
+    /// How many versions of `name` a lock file holds.
+    fn versions(lock: &str, name: &str) -> usize {
+        let entry = format!("name = \"{name}\"");
+        lock.lines().filter(|line| *line == entry).count()
+    }
+
+    /// A model directory the node may not write is known by the type of
+    /// the fetcher's error. Were this crate built against one version of
+    /// the fetcher and fastembed against another, the types would differ,
+    /// nothing would fail to build, and that case would quietly be taken
+    /// for one that may pass.
+    #[test]
+    fn the_fetcher_whose_errors_are_known_is_the_one_fastembed_fetches_with() {
+        let two = [
+            "[[package]]",
+            "name = \"hf-hub\"",
+            "version = \"0.4.3\"",
+            "",
+            "[[package]]",
+            "name = \"hf-hub\"",
+            "version = \"0.5.0\"",
+            "",
+            "[[package]]",
+            "name = \"hf-hub-extras\"",
+        ]
+        .join("\n");
+        assert_eq!(versions(&two, "hf-hub"), 2);
+        let lock = include_str!("../../../Cargo.lock");
+        assert_eq!(
+            versions(lock, "hf-hub"),
+            1,
+            "this crate and fastembed must use one hf-hub: see Cargo.toml"
+        );
     }
 
     #[test]

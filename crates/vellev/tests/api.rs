@@ -829,6 +829,7 @@ async fn a_collection_that_embeds_takes_text_and_falls_back_to_words_when_it_can
     assert_eq!(ids(&by_words), [id(2)]);
     assert!(by_words["results"][0].get("distance").is_none());
     assert_eq!(by_words["degraded"], true);
+    assert_eq!(by_words["degraded_by"], "unavailable", "it may pass");
     let (status, body) = served
         .post(
             &format!("{NOTES}/nearest"),
@@ -1606,6 +1607,12 @@ async fn every_route_is_either_for_admins_or_one_tenants() {
         "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
         "/v1/tenants/{tenant}/collections/{collection}/properties",
     ];
+    for route in vellev::server::EVERY_KEY {
+        assert!(
+            !route.contains("{tenant}"),
+            "{route} names a tenant, which a route for every key must not: it is one tenant's"
+        );
+    }
     let mut classified: Vec<&str> = vellev::server::ADMIN_ONLY
         .iter()
         .chain(&vellev::server::EVERY_KEY)
@@ -1917,13 +1924,13 @@ async fn the_limits_are_told_to_every_key_and_to_no_caller_without_one() {
 }
 
 /// What a node that cannot use a collection's model answers.
-fn model_unavailable() -> (StatusCode, Value) {
+fn model_unavailable(reason: &str) -> (StatusCode, Value) {
     (
         StatusCode::NOT_IMPLEMENTED,
         failed(
             "model_unavailable",
             "this node cannot use the collection's embedding model as it is set up",
-            json!({}),
+            json!({ "reason": reason }),
         ),
     )
 }
@@ -1940,7 +1947,7 @@ async fn a_collection_whose_model_the_node_cannot_run_is_not_made() {
     });
     assert_eq!(
         served.put(NOTES, notes(unheard_of.clone())).await,
-        model_unavailable()
+        model_unavailable("build")
     );
     let batched = json!({ "changes": [
         { "op": "create_collection", "schema": notes(supplied()) },
@@ -1949,7 +1956,7 @@ async fn a_collection_whose_model_the_node_cannot_run_is_not_made() {
     ] });
     assert_eq!(
         served.post("/v1/tenants/acme/changes", batched).await,
-        model_unavailable(),
+        model_unavailable("build"),
         "nor in a batch, none of which is made"
     );
     assert_eq!(
@@ -1959,7 +1966,7 @@ async fn a_collection_whose_model_the_node_cannot_run_is_not_made() {
     let wrong_size = json!({ "provider": "bedrock", "region": "eu-west-2", "model": "amazon.titan-embed-text-v2:0", "dimensions": 2 });
     assert_eq!(
         served.put(NOTES, notes(wrong_size)).await,
-        model_unavailable()
+        model_unavailable("build")
     );
     served.ok(Method::PUT, NOTES, Some(notes(supplied()))).await;
 }
@@ -1997,7 +2004,7 @@ async fn a_node_set_up_wrong_for_a_model_says_so_and_one_set_up_right_answers() 
     assert_eq!(ids(&found), [id(1)]);
     assert_eq!(
         wrong.post(&format!("{NOTES}/nearest"), nearest).await,
-        model_unavailable()
+        model_unavailable("setup")
     );
     let by_words = wrong
         .ok(
@@ -2008,6 +2015,10 @@ async fn a_node_set_up_wrong_for_a_model_says_so_and_one_set_up_right_answers() 
         .await;
     assert_eq!(ids(&by_words), [id(1)]);
     assert_eq!(by_words["degraded"], true);
+    assert_eq!(
+        by_words["degraded_by"], "model_unavailable",
+        "another node may answer in full"
+    );
     let supplied = json!({ "vector": [9.0, 3.0], "limit": 1 });
     let found = wrong
         .ok(Method::POST, &format!("{NOTES}/nearest"), Some(supplied))
@@ -2046,13 +2057,13 @@ async fn a_write_the_holding_node_cannot_embed_is_refused_by_every_node_and_make
                 &named,
             )
             .await;
-        assert_eq!(refused, model_unavailable());
+        assert_eq!(refused, model_unavailable("setup"));
     }
     assert_eq!(wrong.get(&object(1)).await.0, StatusCode::NOT_FOUND);
     let batched = json!({ "changes": [{ "op": "upsert", "collection": "notes", "id": id(1), "properties": { "title": "a red fox" } }] });
     assert_eq!(
         right.post("/v1/tenants/acme/changes", batched).await,
-        model_unavailable()
+        model_unavailable("setup")
     );
     // Nothing of the refusal is kept: the same write, named the same,
     // is made once it brings what the node could not make.

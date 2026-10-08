@@ -10,9 +10,9 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value as Document;
 use vellev_api::{
-    After, Backup, Backups, Batch, Bounded, Change, Changes, Collections, Consistency, Content,
-    Counted, Counting, Failure, Found, Hybrid, IssuedKey, Keyword, Limits, Missing, Nearest,
-    Objects, OnlyIf, Outcome, Page, RestorePoint, RestorePoints, RestoreTo, RestoreWindow,
+    After, Backup, Backups, Batch, Bounded, Change, Changes, Code, Collections, Consistency,
+    Content, Counted, Counting, Failure, Found, Hybrid, IssuedKey, Keyword, Limits, Missing,
+    Nearest, Objects, OnlyIf, Outcome, Page, RestorePoint, RestorePoints, RestoreTo, RestoreWindow,
     Restored, Results, Stored, TenantKey, TenantKeys, TenantPage, Tenants, Weighted, Written,
     AFTER, CONSISTENCY, REQUEST,
 };
@@ -1004,6 +1004,7 @@ pub async fn nearest(
     Ok(Json(Results {
         results,
         degraded: false,
+        degraded_by: None,
     }))
 }
 
@@ -1044,11 +1045,13 @@ pub async fn keyword(
     Ok(Json(Results {
         results,
         degraded: false,
+        degraded_by: None,
     }))
 }
 
 /// The objects that best match a text by meaning and by wording together.
-/// If the text cannot be embedded just now, the words alone decide.
+/// If the node cannot embed the text, the words alone decide, and the
+/// answer says why.
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/collections/{collection}/hybrid",
@@ -1071,14 +1074,20 @@ pub async fn hybrid(
     let alpha = asked.alpha.unwrap_or(DEFAULT_ALPHA);
     let tenant = app.node()?.reader(&tenant, fresh).await?;
     let weighs_meaning = alpha > 0.0 && alpha <= 1.0;
-    let (vector, degraded) = match asked.vector {
-        Some(vector) => (Some(vector), false),
-        None if !weighs_meaning => (None, false),
+    // Why the words alone decide, if the text could not be embedded: as
+    // the search would have been refused had it not fallen back.
+    let (vector, degraded_by) = match asked.vector {
+        Some(vector) => (Some(vector), None),
+        None if !weighs_meaning => (None, None),
         None => match tenant.query_vector(&collection, &asked.text).await {
-            Ok(vector) => (vector, false),
+            Ok(vector) => (vector, None),
             Err(vellev_node::NodeError::Embed(error)) => {
                 tracing::warn!(%error, "searching by words alone");
-                (None, true)
+                let refused = match error.lasting() {
+                    Some(_) => Code::ModelUnavailable,
+                    None => Code::Unavailable,
+                };
+                (None, Some(refused))
             }
             Err(error) => return Err(error.into()),
         },
@@ -1103,7 +1112,11 @@ pub async fn hybrid(
             .collect())
     })
     .await?;
-    Ok(Json(Results { results, degraded }))
+    Ok(Json(Results {
+        results,
+        degraded: degraded_by.is_some(),
+        degraded_by,
+    }))
 }
 
 /// One page of a collection in id order.

@@ -22,7 +22,7 @@ use vellev_storage::coordinator::{
     Acquired, Commit, Committed, Coordinator, CoordinatorError, KeyHash, Lease, LogPosition,
     ManualClock, MemoryCoordinator, PartitionKey, Point, RestorePoint, TenantKey, Versions,
 };
-use vellev_storage::{Mutation, State, StorageError};
+use vellev_storage::{Mutation, Outcome, State, StorageError, Writer};
 
 const LEASE: Duration = Duration::from_secs(30);
 
@@ -1791,4 +1791,67 @@ async fn every_node_drops_what_it_cached_of_a_purged_tenant_not_made_again() {
         ["gone/"],
         "once, and not of the tenant made again"
     );
+}
+
+#[tokio::test]
+async fn a_collection_the_node_cannot_embed_for_is_not_made_but_one_there_already_is_left_be() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    // A collection this build cannot run the model of, as a node of
+    // another build would have made it: written straight to the store.
+    let unrunnable = || schema(EmbeddingProvider::Local);
+    let key = PartitionKey {
+        tenant: tenant("acme"),
+        partition: Partition::DEFAULT,
+    };
+    let other_build = NodeId::generate("node");
+    let acquired = cluster.coordinator.acquire(&key, &other_build, LEASE);
+    let Acquired::Lease { lease, committed } = acquired.await.unwrap() else {
+        panic!("nobody holds the tenant yet");
+    };
+    let coordinator: Arc<dyn Coordinator> = cluster.coordinator.clone();
+    let writer = Writer::open(cluster.store.clone(), coordinator, lease, &committed)
+        .await
+        .unwrap();
+    writer.commit(vec![unrunnable()]).await.unwrap();
+    cluster.clock.advance(LEASE);
+
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    let again = acme.write(vec![unrunnable()]).await.unwrap();
+    assert_eq!(
+        again.outcomes,
+        [Outcome::Unchanged],
+        "made again as it is, it changes nothing"
+    );
+    let cannot = |refused: Result<_, NodeError>| {
+        matches!(
+            refused,
+            Err(NodeError::Embed(error)) if error.lasting() == Some(vellev_core::ModelFault::Build)
+        )
+    };
+    let Mutation::CreateCollection(mut changed) = unrunnable() else {
+        unreachable!("a schema makes a collection");
+    };
+    changed.embedding.query_prefix = None;
+    assert!(
+        cannot(acme.write(vec![Mutation::CreateCollection(changed)]).await),
+        "but not made otherwise"
+    );
+    let again_under_another_name = vec![Mutation::DropCollection(notes()), unrunnable()];
+    assert!(
+        !cannot(acme.write(again_under_another_name).await),
+        "the collection as it stands is what is compared"
+    );
+    let Mutation::CreateCollection(mut elsewhere) = unrunnable() else {
+        unreachable!("a schema makes a collection");
+    };
+    elsewhere.name = CollectionName::new("others").unwrap();
+    assert!(cannot(
+        acme.write(vec![Mutation::CreateCollection(elsewhere)])
+            .await
+    ));
+    assert!(acme.read(|state| state
+        .collection(&CollectionName::new("others").unwrap())
+        .is_none()));
 }

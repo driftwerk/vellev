@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
 use tokio::sync::Mutex;
-use vellev_core::{Embedding, ObjectError};
+use vellev_core::{Embedding, ModelFault, ObjectError};
 
 use crate::blobs::{is_plain, Author, Blobs, Layout, Listed};
 use crate::catalog::Catalog;
@@ -819,10 +819,9 @@ impl Writer {
         embedding: &Embedding,
         texts: Vec<String>,
     ) -> std::result::Result<Vec<Vec<f32>>, Unembedded> {
-        let vectorize = self
-            .vectorize
-            .as_ref()
-            .ok_or_else(|| Unembedded::for_good("this writer has nothing to embed with"))?;
+        let vectorize = self.vectorize.as_ref().ok_or_else(|| {
+            Unembedded::for_good(ModelFault::Setup, "this writer has nothing to embed with")
+        })?;
         let asked = texts.len();
         let vectors = tokio::time::timeout(EMBEDDING_TIMEOUT, vectorize.vectors(embedding, texts))
             .await
@@ -839,7 +838,9 @@ impl Writer {
             .into_iter()
             .map(|vector| {
                 embedding.checked(vector).map_err(|error| match error {
-                    ObjectError::VectorLength { .. } => Unembedded::for_good(error.to_string()),
+                    ObjectError::VectorLength { .. } => {
+                        Unembedded::for_good(ModelFault::Provider, error.to_string())
+                    }
                     _ => Unembedded::for_now(error.to_string()),
                 })
             })

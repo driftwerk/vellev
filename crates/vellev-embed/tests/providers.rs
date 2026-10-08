@@ -9,7 +9,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use vellev_core::HttpApi;
-use vellev_core::{Embedding, EmbeddingProvider};
+use vellev_core::{Embedding, EmbeddingProvider, ModelFault};
 use vellev_embed::{Bedrock, EmbedError, Embedders, Http, Provider, Purpose, Settings};
 
 /// What a stand-in server was sent, and how many of its first requests it
@@ -201,7 +201,7 @@ async fn throttling_and_server_errors_are_tried_again_but_a_refusal_is_final() {
             reason: "400 Bad Request: refused Bearer <redacted>".into()
         }
     );
-    assert!(!refused.lasting(), "a refusal may be about the texts");
+    assert_eq!(refused.lasting(), None, "a refusal may be about the texts");
     assert_eq!(seen.bodies().len(), 1);
 }
 
@@ -231,7 +231,7 @@ async fn a_bare_refusal_of_the_key_or_the_route_may_pass_whatever_stands_in_fron
                 reason: format!("{said}: refused Bearer <redacted>")
             }
         );
-        assert!(!refused.lasting(), "{status}");
+        assert_eq!(refused.lasting(), None, "{status}");
         assert_eq!(seen.bodies().len(), 1, "{status} is not tried again");
     }
 }
@@ -253,10 +253,19 @@ async fn refusing_as_openai(status: u16, error: Value, seen: Arc<Seen>) -> Strin
 #[tokio::test]
 async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be_used() {
     let coded = |code: &str| json!({ "error": { "message": "no", "type": "t", "code": code } });
-    for (status, code, said) in [
-        (404, "model_not_found", "404 Not Found"),
-        (401, "invalid_api_key", "401 Unauthorized"),
-        (429, "insufficient_quota", "429 Too Many Requests"),
+    for (status, code, said, fault) in [
+        (
+            404,
+            "model_not_found",
+            "404 Not Found",
+            ModelFault::Provider,
+        ),
+        (
+            401,
+            "invalid_api_key",
+            "401 Unauthorized",
+            ModelFault::Setup,
+        ),
     ] {
         let seen = Arc::new(Seen::default());
         let url = refusing_as_openai(status, coded(code), seen.clone()).await;
@@ -269,10 +278,11 @@ async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be
             refused,
             EmbedError::Unusable {
                 model: "m".into(),
-                reason: format!("{said}: {}", coded(code))
+                reason: format!("{said}: {}", coded(code)),
+                fault,
             }
         );
-        assert!(refused.lasting(), "{code}");
+        assert_eq!(refused.lasting(), Some(fault), "{code}");
         assert_eq!(seen.bodies().len(), 1, "{code} is not tried again");
 
         let tei = Http::new(&url, HttpApi::Tei, "m", None).unwrap();
@@ -282,9 +292,12 @@ async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be
             "only an OpenAI endpoint is taken at OpenAI's word: {code}"
         );
     }
-    // Whatever else is said, however plainly, may pass.
+    // Whatever else is said, however plainly, may pass: an account with
+    // nothing left to spend is paid up without a change to the node.
     for (status, said) in [
         (429, coded("rate_limit_exceeded")),
+        (429, coded("insufficient_quota")),
+        (403, coded("insufficient_quota")),
         (
             404,
             json!({ "error": { "message": "model \"m\" not found", "code": null } }),
@@ -468,8 +481,9 @@ async fn titan_is_tried_again_when_throttled_and_long_text_is_cut() {
         matches!(&failed, EmbedError::Failed { model, .. } if model == TITAN),
         "{failed}"
     );
-    assert!(
-        !failed.lasting(),
+    assert_eq!(
+        failed.lasting(),
+        None,
         "a refused input may be this text's alone"
     );
     assert_eq!(seen.bodies().len(), 1);
@@ -491,7 +505,8 @@ async fn a_region_without_titan_cannot_be_used_and_access_denied_may_pass() {
         refused(404).await,
         EmbedError::Unusable {
             model: TITAN.into(),
-            reason: "ResourceNotFoundException: not now".into()
+            reason: "ResourceNotFoundException: not now".into(),
+            fault: ModelFault::Provider,
         }
     );
     assert_eq!(

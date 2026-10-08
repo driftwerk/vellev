@@ -451,41 +451,89 @@ mod tests {
 
     #[test]
     fn what_a_refusal_found_missing_is_kept_and_a_release_from_before_it_reads_past_it() {
-        /// A refusal as the release before this field kept it.
+        /// A log as the release before `lacking` was kept reads and
+        /// writes it.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct OlderLog {
+            position: LogPosition,
+            prev: Option<String>,
+            ops: Vec<Op>,
+            answered: Vec<OlderAnswered>,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct OlderAnswered {
+            request: RequestId,
+            at: u64,
+            answer: OlderAnswer,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum OlderAnswer {
+            Made(Vec<Outcome>),
+            Refused(OlderRefusal),
+        }
         #[derive(Debug, PartialEq, Serialize, Deserialize)]
         struct OlderRefusal {
             kind: crate::Refused,
             message: String,
         }
-        let refusal = |lacking| Refusal {
-            kind: crate::Refused::NotFound,
-            message: "collection notes does not exist".into(),
-            lacking,
+        let message = "collection notes does not exist";
+        let request = RequestId(uuid::Uuid::from_u128(11));
+        let refused = |lacking| LogSegment {
+            answered: vec![Answered {
+                request,
+                at: 1_791_300_000_000,
+                answer: Answer::Refused(Refusal {
+                    kind: crate::Refused::NotFound,
+                    message: message.into(),
+                    lacking,
+                }),
+            }],
+            ..log()
         };
-        let older = || OlderRefusal {
-            kind: crate::Refused::NotFound,
-            message: "collection notes does not exist".into(),
+        let older = || {
+            let LogSegment {
+                position,
+                prev,
+                ops,
+                ..
+            } = log();
+            OlderLog {
+                position,
+                prev,
+                ops,
+                answered: vec![OlderAnswered {
+                    request,
+                    at: 1_791_300_000_000,
+                    answer: OlderAnswer::Refused(OlderRefusal {
+                        kind: crate::Refused::NotFound,
+                        message: message.into(),
+                    }),
+                }],
+            }
         };
-        let kept = rmp_serde::to_vec_named(&refusal(Some(crate::Lacking::Collection))).unwrap();
+        let lacking = refused(Some(crate::Lacking::Collection));
+        let kept = encode(Kind::Log, &lacking).unwrap();
         assert_eq!(
-            rmp_serde::from_slice::<Refusal>(&kept).unwrap(),
-            refusal(Some(crate::Lacking::Collection))
+            decode::<LogSegment>("k", Kind::Log, &kept).unwrap(),
+            lacking
         );
         assert_eq!(
-            rmp_serde::from_slice::<OlderRefusal>(&kept).unwrap(),
+            decode::<OlderLog>("k", Kind::Log, &kept).unwrap(),
             older(),
             "the release before reads past what it does not know"
         );
-        let before = rmp_serde::to_vec_named(&older()).unwrap();
+        let before = encode(Kind::Log, &older()).unwrap();
         assert_eq!(
-            rmp_serde::from_slice::<Refusal>(&before).unwrap(),
-            refusal(None)
+            decode::<LogSegment>("k", Kind::Log, &before).unwrap(),
+            refused(None),
+            "and what it wrote reads as a refusal that kept nothing"
         );
         assert_eq!(
-            rmp_serde::to_vec_named(&refusal(None)).unwrap(),
+            encode(Kind::Log, &refused(None)).unwrap(),
             before,
             "a refusal that found nothing missing is written as it always was"
         );
+        assert_ne!(kept, before);
     }
 
     #[test]

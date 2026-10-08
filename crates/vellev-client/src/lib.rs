@@ -3,8 +3,8 @@
 //! A [`Client`] knows several nodes and asks whichever serves a tenant. A
 //! request that fails in a way that may pass is sent again, on the next
 //! node, as long as that cannot make a change twice. One a node cannot do
-//! as it is set up is asked of each other node once, and fails only when
-//! none of them can. Each write is named,
+//! as it is set up is asked of every other address first, and then tried
+//! again like any other: behind one address there may be another node. Each write is named,
 //! the same on every try, and a node answers a try of a write it has
 //! already made as it did then, so a write whose fate is unknown is sent
 //! again like a read.
@@ -18,7 +18,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Serialize;
 use vellev_api::{
     After, Backup, Backups, Batch, Bounded, Change, Changes, Code, Collections, Content, Counted,
-    Failure, Hybrid, IssuedKey, Keyword, Limit, Limits, Missing, Nearest, Objects, Page,
+    Failure, Hybrid, IssuedKey, Keyword, Limit, Limits, Missing, Nearest, Objects, Page, Reason,
     RestorePoints, RestoreTo, RestoreWindow, Restored, Results, Stored, TenantKey, TenantKeys,
     Tenants, Written, AFTER, REQUEST, ROOT,
 };
@@ -27,8 +27,10 @@ use vellev_index::filter::Filter;
 
 pub use vellev_api as api;
 
-/// The longest wait between two tries.
-const LONGEST_BACKOFF: Duration = Duration::from_secs(5);
+mod schedule;
+
+use schedule::{Next, Schedule, Tried};
+
 /// How much of an answer that is not the API's is kept for the error.
 const KEPT_BODY: usize = 300;
 
@@ -47,6 +49,8 @@ pub enum Error {
         limit: Option<Limit>,
         /// What the request named that does not exist, if the node said.
         missing: Option<Missing>,
+        /// Where the fault lies, for a model a node cannot use.
+        reason: Option<Reason>,
     },
     /// The tenant asked more of the node than it may; the request had no
     /// effect, and may be sent again after `wait`.
@@ -79,7 +83,8 @@ enum Fate {
     /// It may or may not have been carried out.
     Unknown,
     /// It had no effect, and the node that answered cannot do it as it is
-    /// set up, however often it is asked; another node may.
+    /// set up, however often it is asked; another node may, at another
+    /// address or behind the same one.
     NotByThisNode,
     /// It was refused for good.
     Final,
@@ -100,9 +105,10 @@ impl Error {
         self.code() == Some(Code::NotFound)
     }
 
-    /// Whether no node asked can use the collection's embedding model as
-    /// it is set up. Nothing was done. Keep the request, and send it again
-    /// once a node has been put right; do not drop it.
+    /// Whether no node that answered, in every try of every address, can
+    /// use the collection's embedding model as it is set up. Nothing was
+    /// done. Keep the request, and send it again once a node has been put
+    /// right; do not drop it. [`Error::reason`] says where the fault lies.
     pub fn is_model_unavailable(&self) -> bool {
         self.code() == Some(Code::ModelUnavailable)
     }
@@ -131,6 +137,17 @@ impl Error {
         match self {
             Self::Api { missing, .. } => *missing,
             Self::Partial { source, .. } => source.missing(),
+            _ => None,
+        }
+    }
+
+    /// Where the fault lies, for a model the node that answered cannot
+    /// use as it is set up: in its build, its setup, or what serves the
+    /// model.
+    pub fn reason(&self) -> Option<Reason> {
+        match self {
+            Self::Api { reason, .. } => *reason,
+            Self::Partial { source, .. } => source.reason(),
             _ => None,
         }
     }
@@ -325,9 +342,10 @@ impl Client {
 
     /// The most a caller may ask of the node; any key may ask. `None`
     /// from a node of a release before it told them, which answers an
-    /// admin key that there is no such route and a tenant's key that the
-    /// route is not for it. Then go by what a refusal says: see
-    /// [`Error::limit`].
+    /// admin key that there is no such route, saying nothing of what is
+    /// missing, and a tenant's key that the route is not for it. Then go
+    /// by what a refusal says: see [`Error::limit`]. Any other failure is
+    /// one, a key the node does not know among them.
     pub async fn limits(&self) -> Result<Option<Limits>> {
         let path = format!("{ROOT}/limits");
         let told = self
@@ -335,7 +353,11 @@ impl Client {
             .await;
         match told {
             Ok(limits) => Ok(Some(limits)),
-            Err(error) if matches!(error.code(), Some(Code::NotFound | Code::Forbidden)) => {
+            Err(error) if error.code() == Some(Code::Forbidden) => Ok(None),
+            Err(error)
+                if error.is_not_found()
+                    && matches!(error.missing(), None | Some(Missing::Route)) =>
+            {
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -375,14 +397,8 @@ impl Client {
     }
 
     /// Send a request, and again while it fails in a way that may pass
-    /// and sending it again is safe, starting from the node that last
-    /// answered for the tenant. Every node is tried before any wait.
-    ///
-    /// A node that cannot do the request as it is set up is not asked
-    /// again: the next node that has not said so is asked at once, which
-    /// spends none of the tries, and the request fails that way only once
-    /// every node has said so. A write is made by the one node that holds
-    /// its tenant whichever node is asked, so each then answers alike.
+    /// and sending it again is safe, to the address and after the wait
+    /// the [`schedule`] gives.
     async fn ask<T: DeserializeOwned>(
         &self,
         kind: Kind,
@@ -391,59 +407,70 @@ impl Client {
         body: Option<&(impl Serialize + ?Sized)>,
         tenant: Option<&TenantId>,
     ) -> Result<T> {
+        self.ask_for(kind, method, path, body, tenant, |_| true)
+            .await
+    }
+
+    /// As [`Self::ask`], for a request a node may answer with less than
+    /// another would: an answer that does not pass `whole` is kept, and
+    /// the request goes on as if that address had said it cannot do it as
+    /// it is set up. The fullest answer had is given: a whole one as soon
+    /// as an address gives it, and failing that the one kept, rather than
+    /// a failure.
+    async fn ask_for<T: DeserializeOwned>(
+        &self,
+        kind: Kind,
+        method: Method,
+        path: &str,
+        body: Option<&(impl Serialize + ?Sized)>,
+        tenant: Option<&TenantId>,
+        whole: impl Fn(&T) -> bool,
+    ) -> Result<T> {
         let Inner { nodes, options, .. } = self.inner.as_ref();
-        let first = self.known(tenant).node;
-        let mut backoff = options.backoff;
-        let (mut node, mut moved) = (first, 0);
-        let mut unable = vec![false; nodes.len()];
-        // The next node after `node` that has not said it cannot.
-        let next = |node: usize, unable: &[bool]| {
-            (1..=nodes.len())
-                .map(|step| (node + step) % nodes.len())
-                .find(|&other| !unable[other])
-        };
-        let mut attempt = 0;
-        while attempt < options.attempts as usize {
+        let mut node = self.known(tenant).node;
+        let mut schedule = Schedule::new(nodes.len(), node, options.attempts, options.backoff);
+        let mut kept: Result<T> = Err(Error::Unusable("a client needs at least one try"));
+        loop {
             let (after, request) = match kind {
                 Kind::Read => (tenant.and_then(|tenant| self.after(tenant)), None),
                 Kind::Repeatable => (None, None),
                 Kind::Write(request) => (None, Some(request)),
             };
-            let failure = match self.once(node, &method, path, body, after, request).await {
-                Ok(answer) => {
+            let tried = match self.once(node, &method, path, body, after, request).await {
+                Ok(answer) if whole(&answer) => {
                     self.learnt().entry(tenant.cloned()).or_default().node = node;
                     return Ok(answer);
                 }
-                Err(failure) => failure,
-            };
-            if failure.fate() == Fate::NotByThisNode {
-                unable[node] = true;
-                match next(node, &unable) {
-                    Some(able) => node = able,
-                    None => return Err(failure),
+                Ok(less) => {
+                    kept = Ok(less);
+                    Tried::NotByThisAddress
                 }
-                continue;
-            }
-            attempt += 1;
-            if failure.fate() == Fate::Final || attempt == options.attempts as usize {
-                return Err(failure);
-            }
-            // Turned away for asking too much: the same of any node, so ask
-            // the same one again once the wait it gave is over.
-            if let Error::Limited { wait, .. } = &failure {
-                tokio::time::sleep((*wait).max(backoff)).await;
-                backoff = backoff.saturating_mul(2).min(LONGEST_BACKOFF);
-                continue;
-            }
-            let able = unable.iter().filter(|unable| !**unable).count();
-            node = next(node, &unable).unwrap_or(node);
-            moved += 1;
-            if moved % able == 0 {
-                tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2).min(LONGEST_BACKOFF);
+                Err(failure) => {
+                    let tried = match (&failure, failure.fate()) {
+                        (_, Fate::Final) => None,
+                        (Error::Limited { wait, .. }, _) => Some(Tried::TurnedAway(*wait)),
+                        (_, Fate::NotByThisNode) => Some(Tried::NotByThisAddress),
+                        (_, Fate::NoEffect | Fate::Unknown) => Some(Tried::MayPass),
+                    };
+                    if kept.is_err() {
+                        kept = Err(failure);
+                    }
+                    match tried {
+                        Some(tried) => tried,
+                        None => return kept,
+                    }
+                }
+            };
+            match schedule.after(tried) {
+                Next::GiveUp => return kept,
+                Next::Ask { address, after } => {
+                    if !after.is_zero() {
+                        tokio::time::sleep(after).await;
+                    }
+                    node = address;
+                }
             }
         }
-        Err(Error::Unusable("a client needs at least one try"))
     }
 
     async fn once<T: DeserializeOwned>(
@@ -500,6 +527,7 @@ impl Client {
                 message: error.message,
                 limit: error.limit,
                 missing: error.missing,
+                reason: error.reason,
             },
             Err(_) => Error::Status {
                 status,
@@ -822,8 +850,18 @@ impl Records {
         self.search("/keyword", asked).await
     }
 
+    /// A node that cannot embed the text ranks by the words alone and
+    /// says so in [`Results::degraded_by`]. If it cannot as it is set up,
+    /// the other addresses are asked as for any request it could not do,
+    /// and its answer is given only if none does better.
     pub async fn hybrid(&self, asked: &Hybrid) -> Result<Results> {
-        self.search("/hybrid", asked).await
+        let path = self.tenant.path(&self.path("/hybrid"));
+        let whole = |results: &Results| results.degraded_by != Some(Code::ModelUnavailable);
+        let tenant = Some(&self.tenant.id);
+        self.tenant
+            .client
+            .ask_for(Kind::Read, Method::POST, &path, Some(asked), tenant, whole)
+            .await
     }
 
     pub async fn list(&self, page: &Page) -> Result<Objects> {

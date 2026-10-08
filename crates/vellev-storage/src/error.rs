@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use vellev_core::{CollectionName, ObjectError, ObjectId, SchemaError};
+use vellev_core::{CollectionName, ModelFault, ObjectError, ObjectId, SchemaError};
 
 use crate::coordinator::CoordinatorError;
 use crate::mutation::Unembedded;
@@ -52,12 +52,12 @@ pub enum StorageError {
     #[error("{0}")]
     InvalidQuery(String),
     /// Vectors the commit needed could not be made; with `lasting`, not
-    /// until the node or the collection is set up otherwise.
+    /// until that fault is put right.
     #[error("embedding with {model} failed: {reason}")]
     Embedding {
         model: String,
         reason: String,
-        lasting: bool,
+        lasting: Option<ModelFault>,
     },
     #[error(transparent)]
     Schema(#[from] SchemaError),

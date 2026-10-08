@@ -15,6 +15,7 @@ pub use local::Local;
 pub use registry::{Embedders, Settings};
 
 use async_trait::async_trait;
+use vellev_core::ModelFault;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum EmbedError {
@@ -32,7 +33,11 @@ pub enum EmbedError {
     /// will not serve this key's account, or its vectors are not the
     /// collection's size.
     #[error("{model} cannot be used: {reason}")]
-    Unusable { model: String, reason: String },
+    Unusable {
+        model: String,
+        reason: String,
+        fault: ModelFault,
+    },
 }
 
 impl EmbedError {
@@ -43,10 +48,13 @@ impl EmbedError {
     /// have passed is the costlier mistake. So a bare refusal of a key, a
     /// model's input, or a node with no credentials or no network to
     /// fetch a model over, may pass, and is not.
-    pub fn lasting(&self) -> bool {
+    ///
+    /// Where the fault lies, if the failure is lasting.
+    pub fn lasting(&self) -> Option<ModelFault> {
         match self {
-            Self::Unsupported(_) | Self::Unusable { .. } => true,
-            Self::Failed { .. } | Self::Malformed { .. } => false,
+            Self::Unsupported(_) => Some(ModelFault::Build),
+            Self::Unusable { fault, .. } => Some(*fault),
+            Self::Failed { .. } | Self::Malformed { .. } => None,
         }
     }
 }
@@ -76,22 +84,26 @@ mod tests {
     fn only_a_model_that_cannot_be_run_or_used_fails_for_good() {
         let (model, reason) = (String::from("m"), String::from("said"));
         let failures = [
-            (EmbedError::Unsupported(reason.clone()), true),
+            (
+                EmbedError::Unsupported(reason.clone()),
+                Some(ModelFault::Build),
+            ),
             (
                 EmbedError::Unusable {
                     model: model.clone(),
                     reason: reason.clone(),
+                    fault: ModelFault::Provider,
                 },
-                true,
+                Some(ModelFault::Provider),
             ),
             (
                 EmbedError::Failed {
                     model: model.clone(),
                     reason: reason.clone(),
                 },
-                false,
+                None,
             ),
-            (EmbedError::Malformed { model, reason }, false),
+            (EmbedError::Malformed { model, reason }, None),
         ];
         for (failure, lasting) in failures {
             assert_eq!(failure.lasting(), lasting, "{failure}");

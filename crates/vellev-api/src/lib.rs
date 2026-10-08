@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
-use vellev_core::{Collection, CollectionName, ObjectId, Property, TenantId};
+use vellev_core::{Collection, CollectionName, ModelFault, ObjectId, Property, TenantId};
 use vellev_index::filter::Filter;
 use vellev_index::fusion::Fusion;
 
@@ -176,6 +176,10 @@ pub struct Problem {
     /// as it was, without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing: Option<Missing>,
+    /// On `model_unavailable`: where the fault lies, and so who is to put
+    /// it right. It says nothing of what was asked or of what answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
 }
 
 impl Problem {
@@ -185,6 +189,39 @@ impl Problem {
             message: message.into(),
             limit: None,
             missing: None,
+            reason: None,
+        }
+    }
+}
+
+/// Why a node cannot use a collection's embedding model as it is set up.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Reason {
+    /// The node's build cannot run the model; a node of another build
+    /// may.
+    Build,
+    /// The node is set up wrong for the model: it may not write where the
+    /// model is kept, or what serves the model does not know the node's
+    /// key. A node set up right may answer.
+    Setup,
+    /// What serves the model says it has no such model, or its vectors
+    /// are not the collection's size: likely the same of every node,
+    /// until the collection or what serves it is changed.
+    Provider,
+    /// Something this client does not know, from a newer node.
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<ModelFault> for Reason {
+    fn from(fault: ModelFault) -> Self {
+        match fault {
+            ModelFault::Build => Reason::Build,
+            ModelFault::Setup => Reason::Setup,
+            ModelFault::Provider => Reason::Provider,
         }
     }
 }
@@ -699,6 +736,12 @@ pub struct Results {
     /// the words alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub degraded: bool,
+    /// Why, as the search would have been refused had it not fallen back:
+    /// `unavailable` if the text may be embedded later, and
+    /// `model_unavailable` if the node that answered cannot use the model
+    /// as it is set up, where another node may answer in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_by: Option<Code>,
 }
 
 /// One page of a collection in id order.
@@ -864,6 +907,50 @@ mod tests {
         } });
         assert_eq!(serde_json::to_value(&refused).unwrap(), written);
         assert_eq!(serde_json::from_value::<Failure>(written).unwrap(), refused);
+        let modelless = Failure {
+            error: Problem {
+                reason: Some(ModelFault::Setup.into()),
+                ..Problem::new(Code::ModelUnavailable, "no")
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&modelless).unwrap(),
+            json!({ "error": { "code": "model_unavailable", "message": "no", "reason": "setup" } })
+        );
+        for (fault, written) in [
+            (ModelFault::Build, "build"),
+            (ModelFault::Setup, "setup"),
+            (ModelFault::Provider, "provider"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(Reason::from(fault)).unwrap(),
+                json!(written)
+            );
+        }
+        let degraded = Results {
+            results: Vec::new(),
+            degraded: true,
+            degraded_by: Some(Code::ModelUnavailable),
+        };
+        let written =
+            json!({ "results": [], "degraded": true, "degraded_by": "model_unavailable" });
+        assert_eq!(serde_json::to_value(&degraded).unwrap(), written);
+        assert_eq!(
+            serde_json::from_value::<Results>(written).unwrap(),
+            degraded
+        );
+        let older: Results =
+            serde_json::from_value(json!({ "results": [], "degraded": true })).unwrap();
+        assert_eq!((older.degraded, older.degraded_by), (true, None));
+        let full = Results {
+            results: Vec::new(),
+            degraded: false,
+            degraded_by: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            json!({ "results": [] })
+        );
         let missing = Failure {
             error: Problem {
                 missing: Some(Missing::RestorePoint),
@@ -888,6 +975,7 @@ mod tests {
             "message": "?",
             "limit": { "name": "something_new", "max": 3 },
             "missing": "something_new",
+            "reason": "something_new",
             "hint": "a field from later still",
         } }))
         .unwrap();
@@ -899,6 +987,7 @@ mod tests {
                     max: 3
                 }),
                 missing: Some(Missing::Unknown),
+                reason: Some(Reason::Unknown),
                 ..Problem::new(Code::Unknown, "?")
             }
         );

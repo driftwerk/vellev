@@ -8,5 +8,5 @@ pub use ids::{CollectionName, IdError, NodeId, ObjectId, Partition, RequestId, T
 pub use object::{Object, ObjectError, Value, SQUARED_LENGTH_UNDER};
 pub use schema::{
     AccessRule, Bm25, Collection, DataType, Distance, Embedding, EmbeddingProvider, HttpApi,
-    Property, SchemaError, MAX_DIMENSIONS,
+    ModelFault, Property, SchemaError, MAX_DIMENSIONS,
 };

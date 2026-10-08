@@ -203,8 +203,7 @@ refusal meanwhile, which keeps only that something was.
 ```
 
 When a collection's text cannot be embedded, the answer is one of two, and
-in both nothing was done. A hybrid search ranks by the words alone
-instead, and says `degraded`.
+in both nothing was done.
 
 `unavailable` (503) means it may work later, on this node or another: send
 the request again. Everything that might pass is answered so, including
@@ -212,42 +211,64 @@ much that will not pass by itself, because a node cannot tell it from what
 will: an endpoint or Bedrock refusing the node's key or credentials with
 no more than a status (a firewall or a proxy answers 401, 403 and 404 too,
 and a permission just granted takes a while to hold), a refusal worded
-only in prose or in codes other than OpenAI's, which are not read, a
-model's input refused, which may be that text's alone, a node with no
-AWS credentials, and a node with no network to fetch a local model over.
-The cause is in the node's log each time; if it goes on, look there.
+only in prose or in codes other than OpenAI's, which are not read, an
+account with nothing left to spend (`insufficient_quota`, which paying
+puts right), a model's input refused, which may be that text's alone, a
+node with no AWS credentials, and a node with no network to fetch a local
+model over. The cause is in the node's log each time; if it goes on, look
+there.
 
 `model_unavailable` (501) means the node that answered cannot use the
 model as it is set up, and will not until someone puts that right. It is
 said only of what the node's own build and setup settle, or what serves
-the model says outright in its own code for it:
+the model says outright in its own code for it, and `reason` says which:
 
-- the build cannot run the model: its name or size is not one it knows,
-  or it was built without local models;
-- the node may not write the directory local models are kept in, which is
-  `HF_HOME` if that is set and `VELLEV_MODEL_DIR` otherwise;
-- an OpenAI endpoint answers `model_not_found`, `invalid_api_key` or
-  `insufficient_quota`;
-- Bedrock answers that the region has no such model;
-- the model's vectors are not the collection's size.
+- `build`: the node's build cannot run the model: its name or size is not
+  one it knows, or it was built without local models;
+- `setup`: the node may not write the directory local models are kept in,
+  which is `HF_HOME` if that is set and `VELLEV_MODEL_DIR` otherwise; or
+  an OpenAI endpoint answers `invalid_api_key`;
+- `provider`: an OpenAI endpoint answers `model_not_found`, Bedrock that
+  the region has no such model, or the model's vectors are not the
+  collection's size.
+
+```json
+{"error":{"code":"model_unavailable","message":"this node cannot use the collection's embedding model as it is set up","reason":"setup"}}
+```
 
 It never means the request is at fault or may be dropped. Keep it, and
-send it again once the node is put right. Another node may be able to
-answer meanwhile: a search is embedded for by the node it reaches, so the
-Rust client asks each other node it knows once, at once, and fails only
-when every one says the same. A write is embedded for by the one node that
-holds its tenant, whichever node it reaches, so every node answers a write
-alike. A client that knows only a load balancer cannot choose a node: give
-it the nodes' own addresses. A request that brings its own vector needs no
-model.
+send it again once the node is put right; one that brings its own vector
+needs no model. Meanwhile another node may be able to answer, and which
+node embeds depends on the request:
+
+- A search is embedded for by the node it reaches. Another node, set up
+  right, answers it.
+- A write is embedded for by the one node that holds its tenant, whichever
+  node it reaches. If that node cannot use the model, every node answers
+  every such write `model_unavailable` until it is put right, or is
+  stopped and so lets the tenant go to another node. No node sends a
+  request on to one that can embed it.
+
+The Rust client deals with both the same way. It asks every other address
+it knows first, at once, and then tries again as it does after
+`unavailable`, with the same tries and waits: a client given one address,
+a load balancer's or a service's, is sent to another node by that. It fails
+with `model_unavailable` only when its tries are spent. Giving it the
+nodes' own addresses is not needed; it only finds a node that can sooner.
+
+A hybrid search that cannot embed its text ranks by the words alone
+instead, and says `degraded`, with why in `degraded_by`: `unavailable` or
+`model_unavailable`, as it would have been refused. For the second the Rust
+client asks on as above, since another node may answer in full, and gives
+the answer by the words only if none does.
 
 A collection whose model the node's build cannot run is refused when it is
-made, or made again, with `model_unavailable`, by the node that holds the
-tenant then;
-a node of another build may hold it later and answer otherwise, so run one
-build, and during a rolling deploy expect either answer. What only using a
-model shows, such as an endpoint that refuses the node, is found at the
-first write.
+made, with `model_unavailable`, by the node that holds the tenant then; a
+node of another build may hold it later and answer otherwise, so run one
+build, and during a rolling deploy expect either answer. Making again a
+collection that is there exactly so changes nothing, as ever, whatever its
+model. What only using a model shows, such as an endpoint that refuses the
+node, is found at the first write.
 
 ## Vector search
 

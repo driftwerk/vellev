@@ -1,5 +1,7 @@
 use serde_json::{Map, Value as Json};
-use vellev_core::{Collection, CollectionName, Embedding, ObjectId, Property, RequestId, Value};
+use vellev_core::{
+    Collection, CollectionName, Embedding, ModelFault, ObjectId, Property, RequestId, Value,
+};
 
 use vellev_index::filter::Filter;
 
@@ -91,9 +93,9 @@ pub trait Vectorize: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Unembedded {
     pub reason: String,
-    /// Nothing will make them until the node or the collection is set up
-    /// otherwise.
-    pub lasting: bool,
+    /// Where the fault lies, if nothing will make them until the node or
+    /// the collection is set up otherwise.
+    pub lasting: Option<ModelFault>,
 }
 
 impl Unembedded {
@@ -101,15 +103,15 @@ impl Unembedded {
     pub fn for_now(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
-            lasting: false,
+            lasting: None,
         }
     }
 
-    /// A failure that will not pass by itself.
-    pub fn for_good(reason: impl Into<String>) -> Self {
+    /// A failure that will not pass until `fault` is put right.
+    pub fn for_good(fault: ModelFault, reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
-            lasting: true,
+            lasting: Some(fault),
         }
     }
 }

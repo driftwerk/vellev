@@ -115,8 +115,10 @@ Clients and nodes of different releases talk to each other.
   will not. `model_unavailable` is such a code with one difference a
   client must know it to use: another node may answer where one cannot. A
   client from before it stops at the first node that says so, where it
-  used to be told `unavailable` and go on to the next, so bring clients up
-  to this release before relying on nodes set up differently.
+  used to be told `unavailable` and try again, so bring clients up to this
+  release before the nodes.
+- A hybrid search's `degraded_by` and a failure's `reason` hold a code or a
+  name a client may not know, read as `unknown`.
 - The limits a node tells (`GET /v1/limits`) may gain fields. One added
   later is optional in the client's types, so that a node from before it
   still reads; the first five are always told.

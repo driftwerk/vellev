@@ -138,6 +138,7 @@ async fn an_answer_that_does_not_fit_is_refused_and_one_of_another_size_for_good
     let unusable = |reason: &str| EmbedError::Unusable {
         model: "fake".into(),
         reason: reason.into(),
+        fault: vellev_core::ModelFault::Provider,
     };
     for (answer, expected) in [
         (vec![], malformed("0 vectors for 1 texts")),
@@ -223,7 +224,11 @@ fn a_model_that_cannot_be_embedded_with_is_refused_when_asked_for() {
     };
     let refused = |embedding: Embedding| {
         let refused = embedders.embedder(&embedding).unwrap_err();
-        assert!(refused.lasting(), "{refused}");
+        assert_eq!(
+            refused.lasting(),
+            Some(vellev_core::ModelFault::Build),
+            "{refused}"
+        );
         refused
     };
     assert!(embedders

@@ -133,6 +133,21 @@ pub enum EmbeddingProvider {
     None,
 }
 
+/// Why a node cannot use a collection's embedding model until its setup is
+/// put right: where the fault lies, and so who is to put it right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelFault {
+    /// The node's build cannot run the model: another build may.
+    Build,
+    /// The node is set up wrong for the model: it may not write where the
+    /// model is kept, or what serves the model does not know its key.
+    Setup,
+    /// What serves the model says it has no such model, or gives vectors
+    /// that are not the collection's size: the collection names a model
+    /// that is not there to be had.
+    Provider,
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Embedding {

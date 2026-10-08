@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::header::RETRY_AFTER;
 use serde::Deserialize;
 use serde_json::json;
-use vellev_core::HttpApi;
+use vellev_core::{HttpApi, ModelFault};
 
 use crate::{EmbedError, Provider, Purpose, Result};
 
@@ -59,20 +59,22 @@ struct OpenaiError {
     code: String,
 }
 
-/// The codes with which OpenAI's API says that asking again cannot help
-/// until the setup is put right: it has no such model, the key is not one
-/// of its keys, or the account behind the key has nothing left to spend.
-const SETUP_CODES: [&str; 3] = ["model_not_found", "invalid_api_key", "insufficient_quota"];
-
-/// Whether a refusal says, in OpenAI's own code for it, that the setup is
-/// wrong. A status alone never says so: whatever stands in front of an
-/// endpoint, such as a firewall's rate rule or a proxy with nothing behind
-/// it for a moment, answers 401, 403 or 404 too, and other servers word
-/// their refusals in prose, which is not read.
-fn setup_is_wrong(api: HttpApi, refusal: &str) -> bool {
-    api == HttpApi::Openai
-        && serde_json::from_str::<OpenaiRefusal>(refusal)
-            .is_ok_and(|refusal| SETUP_CODES.contains(&refusal.error.code.as_str()))
+/// The fault a refusal names, in OpenAI's own code for it, if asking again
+/// cannot help until someone puts it right: it has no such model, or the
+/// key is not one of its keys. An account with nothing left to spend is
+/// not one: paying puts that right, with no change to the node, and until
+/// then it is throttling like any other. A status alone never names one
+/// either: whatever stands in front of an endpoint, such as a firewall's
+/// rate rule or a proxy with nothing behind it for a moment, answers 401,
+/// 403 or 404 too, and other servers word their refusals in prose, which
+/// is not read.
+fn fault(api: HttpApi, refusal: &str) -> Option<ModelFault> {
+    let refusal = serde_json::from_str::<OpenaiRefusal>(refusal).ok()?;
+    match (api, refusal.error.code.as_str()) {
+        (HttpApi::Openai, "model_not_found") => Some(ModelFault::Provider),
+        (HttpApi::Openai, "invalid_api_key") => Some(ModelFault::Setup),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -121,10 +123,11 @@ impl Http {
         }
     }
 
-    fn unusable(&self, reason: impl std::fmt::Display) -> EmbedError {
+    fn unusable(&self, fault: ModelFault, reason: impl std::fmt::Display) -> EmbedError {
         EmbedError::Unusable {
             model: self.model.clone(),
             reason: self.redacted(reason.to_string()),
+            fault,
         }
     }
 
@@ -162,15 +165,16 @@ impl Http {
                         .and_then(|value| value.to_str().ok()?.parse().ok())
                         .map(Duration::from_secs);
                     let refusal = response.text().await.unwrap_or_default();
-                    let lasting = setup_is_wrong(self.api, &refusal);
+                    let lasting = fault(self.api, &refusal);
                     let refusal = self.redacted(refusal);
                     let refusal: String = refusal.chars().take(REFUSAL_CHARS).collect();
-                    let passing = !lasting && (status.as_u16() == 429 || status.is_server_error());
+                    let passing =
+                        lasting.is_none() && (status.as_u16() == 429 || status.is_server_error());
                     let wait = asked.unwrap_or(backoff).min(LONGEST_BACKOFF);
                     let said = format!("{status}: {refusal}");
                     let failure = match lasting {
-                        true => self.unusable(said),
-                        false => self.failed(said),
+                        Some(fault) => self.unusable(fault, said),
+                        None => self.failed(said),
                     };
                     (failure, passing, wait)
                 }

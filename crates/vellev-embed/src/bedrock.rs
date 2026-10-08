@@ -140,6 +140,7 @@ impl Bedrock {
                     true => EmbedError::Unusable {
                         model: self.model.clone(),
                         reason: said,
+                        fault: vellev_core::ModelFault::Provider,
                     },
                     false => self.failed(said),
                 }

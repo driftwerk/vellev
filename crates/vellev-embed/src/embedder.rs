@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::OnceCell;
-use vellev_core::Embedding;
+use vellev_core::{Embedding, ModelFault};
 
 use crate::{EmbedError, Provider, Purpose, Result};
 
@@ -118,6 +118,7 @@ impl Embedder {
             return Err(EmbedError::Unusable {
                 model: self.embedding.model.clone(),
                 reason: format!("a vector of {} dimensions, not {dimensions}", wrong.len()),
+                fault: ModelFault::Provider,
             });
         }
         if !vectors.iter().flatten().all(|value| value.is_finite()) {

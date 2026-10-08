@@ -286,12 +286,16 @@ async fn a_commit_that_cannot_be_embedded_changes_nothing_and_the_writer_carries
     lengths.fault.store(AWAY, Ordering::SeqCst);
     let failed = writer.commit(fox()).await.unwrap_err();
     assert!(
-        matches!(&failed, StorageError::Embedding { model, reason, lasting: false } if model == "lengths" && reason == "the model is away"),
+        matches!(&failed, StorageError::Embedding { model, reason, lasting: None } if model == "lengths" && reason == "the model is away"),
         "{failed}"
     );
     // Vectors of another size than the collection's will not change by
     // asking again; too few, or one not finite, might.
-    for (fault, lasts) in [(TOO_LONG, true), (NOT_A_NUMBER, false), (TOO_FEW, false)] {
+    for (fault, lasts) in [
+        (TOO_LONG, Some(vellev_core::ModelFault::Provider)),
+        (NOT_A_NUMBER, None),
+        (TOO_FEW, None),
+    ] {
         lengths.fault.store(fault, Ordering::SeqCst);
         let failed = writer.commit(fox()).await.unwrap_err();
         assert!(
@@ -343,7 +347,13 @@ async fn a_writer_with_nothing_to_embed_with_refuses_only_what_needs_it() {
         .await
         .unwrap_err();
     assert!(
-        matches!(refused, StorageError::Embedding { lasting: true, .. }),
+        matches!(
+            refused,
+            StorageError::Embedding {
+                lasting: Some(vellev_core::ModelFault::Setup),
+                ..
+            }
+        ),
         "{refused}"
     );
 

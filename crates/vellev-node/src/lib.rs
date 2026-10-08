@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::future::join_all;
 use tokio::sync::{mpsc, OnceCell};
-use vellev_core::{CollectionName, Embedding, NodeId, Partition, TenantId};
+use vellev_core::{CollectionName, Embedding, ModelFault, NodeId, Partition, TenantId};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
@@ -210,7 +210,12 @@ impl Vectorize for Documents {
             .0
             .embedder(embedding)
             .map_err(unembedded)?
-            .ok_or_else(|| Unembedded::for_good("its collection's clients supply the vectors"))?;
+            .ok_or_else(|| {
+                Unembedded::for_good(
+                    ModelFault::Setup,
+                    "its collection's clients supply the vectors",
+                )
+            })?;
         let vectors = embedder.documents(&texts).await.map_err(unembedded)?;
         vectors
             .into_iter()
@@ -308,6 +313,9 @@ impl Tenant {
     /// the tenant now: one built or set up otherwise may take the tenant
     /// later and answer otherwise. Whatever only using the model would
     /// show, such as an endpoint that refuses the node, is not looked for.
+    ///
+    /// A collection there already, exactly as it is asked for, is not
+    /// looked at: making it again changes nothing, as it always has.
     fn can_embed(&self, mutations: &[Mutation]) -> Result<()> {
         mutations
             .iter()
@@ -315,8 +323,12 @@ impl Tenant {
                 Mutation::CreateCollection(schema) => Some(schema),
                 _ => None,
             })
+            .filter(|schema| {
+                let there = self.read(|state| state.collection(&schema.name) == Some(schema));
+                !there
+            })
             .try_for_each(|schema| match self.embedders.embedder(&schema.embedding) {
-                Err(error) if error.lasting() => Err(NodeError::Embed(error)),
+                Err(error) if error.lasting().is_some() => Err(NodeError::Embed(error)),
                 _ => Ok(()),
             })
     }
@@ -1142,6 +1154,7 @@ mod tests {
         assert_eq!(
             documents.vectors(&supplied, vec!["fox".into()]).await,
             Err(Unembedded::for_good(
+                ModelFault::Setup,
                 "its collection's clients supply the vectors"
             ))
         );

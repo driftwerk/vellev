@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use vellev_api::{Bounded, Code, Failure, Limit, Missing, Problem};
+use vellev_core::ModelFault;
 use vellev_node::NodeError;
 use vellev_storage::coordinator::CoordinatorError;
 use vellev_storage::{Lacking, Refused, StorageError};
@@ -78,19 +79,22 @@ impl ApiError {
     }
 
     /// What is said when a collection's embedding model cannot be used:
-    /// just now, or with `lasting`, by this node until its setup is put
+    /// just now, or with `lasting`, by this node until that fault is put
     /// right. The cause goes to the log, not to the caller: it may quote
-    /// whatever answered at the address the collection names.
-    fn unembedded(cause: impl std::fmt::Display, lasting: bool) -> Self {
+    /// whatever answered at the address the collection names. The caller
+    /// is told only where the fault lies.
+    fn unembedded(cause: impl std::fmt::Display, lasting: Option<ModelFault>) -> Self {
         match lasting {
-            true => {
-                tracing::error!(%cause, "the embedding model cannot be used");
-                Self::new(
+            Some(fault) => {
+                tracing::error!(%cause, ?fault, "the embedding model cannot be used");
+                let mut error = Self::new(
                     Code::ModelUnavailable,
                     "this node cannot use the collection's embedding model as it is set up",
-                )
+                );
+                error.problem.reason = Some(fault.into());
+                error
             }
-            false => {
+            None => {
                 tracing::warn!(%cause, "embedding failed");
                 Self::unavailable("the collection's embedding model could not be used just now")
             }
@@ -238,6 +242,7 @@ impl From<QueryRejection> for ApiError {
 mod tests {
     use std::sync::Arc;
 
+    use vellev_api::Reason;
     use vellev_core::{CollectionName, ObjectId, TenantId};
     use vellev_embed::EmbedError;
     use vellev_storage::Refusal;
@@ -269,7 +274,7 @@ mod tests {
         let unembedded = || StorageError::Embedding {
             model: "m".into(),
             reason: "away".into(),
-            lasting: false,
+            lasting: None,
         };
         assert_eq!(told(unembedded()), unavailable);
         assert_eq!(
@@ -285,7 +290,7 @@ mod tests {
         let lasting = || StorageError::Embedding {
             model: "m".into(),
             reason: "401 Unauthorized".into(),
-            lasting: true,
+            lasting: Some(ModelFault::Setup),
         };
         assert_eq!(told(lasting()), model_unavailable);
         assert_eq!(
@@ -302,6 +307,27 @@ mod tests {
         };
         assert_eq!(told(NodeError::Embed(failed)), unavailable);
 
+        let reason = |error: ApiError| error.problem.reason;
+        assert_eq!(reason(lasting().into()), Some(Reason::Setup));
+        let unsupported = || EmbedError::Unsupported("acme/unheard-of cannot be run".into());
+        assert_eq!(
+            reason(NodeError::Embed(unsupported()).into()),
+            Some(Reason::Build)
+        );
+        let elsewhere = EmbedError::Unusable {
+            model: "m".into(),
+            reason: "model_not_found".into(),
+            fault: ModelFault::Provider,
+        };
+        assert_eq!(
+            reason(NodeError::Embed(elsewhere).into()),
+            Some(Reason::Provider)
+        );
+        let passing = EmbedError::Failed {
+            model: "m".into(),
+            reason: "503".into(),
+        };
+        assert_eq!(reason(NodeError::Embed(passing).into()), None);
         let ApiError { problem, .. } = lasting().into();
         assert_eq!(
             problem.message,
