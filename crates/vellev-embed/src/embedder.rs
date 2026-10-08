@@ -83,10 +83,12 @@ struct Health {
     fault: Option<(Instant, EmbedError)>,
     /// How many times the model has answered well.
     answered: u64,
-    /// When a fault was last said. Nothing but time passing lets one be
-    /// said again: not the fault being lifted, which a model that answers
-    /// some calls and refuses others has done to it over and over.
-    said: Option<Instant>,
+    /// When a fault was last said, for each place one can lie: a fault of
+    /// one kind does not keep one of another from being said. Nothing but
+    /// time passing lets one be said again: not the fault being lifted,
+    /// which a model that answers some calls and refuses others has done
+    /// to it over and over.
+    said: HashMap<ModelFault, Instant>,
 }
 
 impl Embedder {
@@ -195,10 +197,10 @@ impl Embedder {
 
     /// Take note of how a call that went out when the model had answered
     /// well `before` times came back. The lasting fault it met, with
-    /// where that lies, if it is to be said: which it is if none has been
-    /// said in the time a fault stands, whether or not this one does. So
-    /// a fault is said at most once in that time, whatever the model does
-    /// meanwhile.
+    /// where that lies, if it is to be said: which it is if none that lies
+    /// there has been said in the time a fault stands, whether or not
+    /// this one does. So a fault of each kind is said at most once in
+    /// that time, whatever the model does meanwhile.
     ///
     /// The model answering lifts whatever fault stands: a call that had
     /// yet to come back when the fault was met shows it has passed. A
@@ -222,9 +224,10 @@ impl Embedder {
                 }
                 let unsaid = health
                     .said
-                    .is_none_or(|said| now.duration_since(said) >= self.fault_stands);
+                    .get(&lies_in)
+                    .is_none_or(|said| now.duration_since(*said) >= self.fault_stands);
                 unsaid.then(|| {
-                    health.said = Some(now);
+                    health.said.insert(lies_in, now);
                     (error.clone(), lies_in)
                 })
             }

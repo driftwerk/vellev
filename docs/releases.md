@@ -38,7 +38,8 @@ is published from main before that.
   refused. Making again a collection that is there exactly so still
   changes nothing.
 - **A lasting embedding fault is logged at most once in 20 seconds** for
-  each way of embedding, whatever the model does meanwhile. A model that
+  each way of embedding and each `reason`, whatever the model does
+  meanwhile. A model that
   refuses every request is not asked again within 20 seconds of the first
   refusal, though requests on their way to it when the fault first shows
   each still reach it once. A model that answers some requests and

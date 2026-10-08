@@ -14,7 +14,8 @@ use vellev_embed::{EmbedError, Embedder, Provider, Purpose, Result, FAULT_STANDS
 
 /// A model that refuses every call for good, after a moment: a longer
 /// one for each call that is out at the same time. Until it is told to
-/// refuse, it answers; and it always answers a text that begins "ok".
+/// refuse, it answers; and it always answers a text that begins "ok". A
+/// text that begins "other" it refuses for a fault that lies elsewhere.
 #[derive(Debug, Default)]
 struct Refusing {
     calls: AtomicUsize,
@@ -33,10 +34,18 @@ impl Provider for Refusing {
         if ok || self.answering.load(Ordering::SeqCst) {
             return Ok(vec![vec![1.0, 2.0]; texts.len()]);
         }
-        Err(EmbedError::Unusable {
-            model: "fake".into(),
-            reason: "401 Unauthorized: no such key".into(),
-            fault: ModelFault::Setup,
+        let other = texts.iter().all(|text| text.starts_with("other"));
+        Err(match other {
+            true => EmbedError::Unusable {
+                model: "fake".into(),
+                reason: "404 Not Found: no such model".into(),
+                fault: ModelFault::Provider,
+            },
+            false => EmbedError::Unusable {
+                model: "fake".into(),
+                reason: "401 Unauthorized: no such key".into(),
+                fault: ModelFault::Setup,
+            },
         })
     }
 }
@@ -158,4 +167,12 @@ async fn logged_once() {
         }
         assert!(started.elapsed() < FAULT_STANDS * (time + 1));
     }
+
+    // A fault that lies elsewhere is not kept from being said by the one
+    // said just now: it is said too, and likewise once.
+    let (calls, said) = so_far();
+    let (one, another) = tokio::join!(embedder.query("other 1"), embedder.query("other 2"));
+    assert!(one.is_err() && another.is_err());
+    assert_eq!(so_far(), (calls + 2, said + 1));
+    assert!(started.elapsed() < FAULT_STANDS * 4);
 }

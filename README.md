@@ -241,10 +241,10 @@ send it again once the node is put right; one that brings its own vector
 needs no model. Three things are promised of a node that meets such a
 fault, and no more:
 
-- It logs the fault at most once in 20 seconds for each way of embedding,
-  however many requests meet it, at once or one after another, hybrid
-  searches that fall back among them, and whatever the model does
-  meanwhile.
+- It logs the fault at most once in 20 seconds for each way of embedding
+  and each `reason`, however many requests meet it, at once or one after
+  another, hybrid searches that fall back among them, and whatever the
+  model does meanwhile.
 - A model that refuses every request is not asked again within 20 seconds
   of the first refusal; so a setup put right takes effect within that.
 - A model that answers some requests and refuses others goes on being
@@ -255,16 +255,42 @@ the requests already on their way to the model when a fault first shows,
 or that set out before the first of them hears of it, each reach the
 model once and are each refused.
 
-What a model's server says is logged without what is shaped like a key in
-it, wherever in the text it lies, and before the text is cut short: a JSON
-web token; what follows `Bearer` or `Basic`, if it is 16 characters or
-more with a digit among them, or 24 or more and not only lower-case words
-joined by hyphens, underscores or full stops; whatever is given as `key`, `token`,
-`access_token` or `api_key` in a query string, a key or not; keys
-beginning `sk-` and Hugging Face's tokens, whole or masked; Google API
-keys; and AWS access key ids. Nothing is decoded to look for one: a key
-written with escapes inside it is not seen. Nor is a key with no shape of
-its own, such as an AWS secret or an Azure key.
+What a model's server says is logged, and passed on, without what is
+shaped like a key in it. In what an HTTP endpoint answers, keys are
+looked for in the first four kilobytes, before it is cut to the 300
+characters that are kept. Nothing is decoded to find one.
+
+A key known by how it begins is taken out anywhere but straight after a
+letter, unless that letter ends one of the escapes `\n`, `\r`, `\t`,
+`\uXXXX` and `%XX`:
+
+- a JSON web token: `eyJ`, a full stop and `eyJ` again, with more after
+  each, signed or not;
+- a key beginning `sk-`, with 40 characters or more after that; or 20 or
+  more with a letter and a digit among them; or 20 or more after
+  `sk-proj-` or `sk-ant-`; or with some of it masked by `…`, `...` or
+  asterisks and two characters or more left;
+- a Hugging Face token, `hf_` and 30 letters and digits or more, or 20 or
+  more with some of each, or masked likewise (three full stops at its end
+  do not count);
+- a Google API key, `AIza` and 35 characters, unless a letter or a digit
+  comes straight after;
+- an AWS access key id, `AKIA` or `ASIA` and 16 capitals and digits,
+  unless a capital or a digit comes straight after.
+
+Two more are known by what comes before them:
+
+- what follows `Bearer` or `Basic`, if it is 16 characters or more and
+  not only lower-case words joined by hyphens, underscores or full stops;
+- the whole value of `key`, `token`, `access_token`, `api_key`, `api-key`
+  or `apikey` in a query string, a key or not, up to the next `&`, space
+  or quote.
+
+Deliberately left: a key glued to the end of a word, since `task-…` and
+`shf_…` are words and no provider writes a key so; a credential after
+`Bearer` or `Basic` that is all lower-case letters; a key with no shape
+of its own, such as an AWS secret or an Azure key; and anything written
+with escapes inside it.
 
 The 20 seconds cut the other way too: something in front of an OpenAI
 endpoint that answers `model_not_found` or `invalid_api_key` for a moment,
