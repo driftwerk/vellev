@@ -542,12 +542,17 @@ pub async fn set_restore_window(
     Body(window): Body<RestoreWindow>,
 ) -> Result<StatusCode, ApiError> {
     let most = MAX_RESTORE_WINDOW.as_secs();
-    if window.secs.is_some_and(|secs| secs == 0 || secs > most) {
-        return Err(ApiError::beyond(
-            Bounded::RestoreWindowSecs,
-            most,
-            format!("a restore window is from 1 to {most} seconds"),
-        ));
+    let message = || format!("a restore window is from 1 to {most} seconds");
+    match window.secs {
+        Some(0) => return Err(ApiError::invalid(message())),
+        Some(secs) if secs > most => {
+            return Err(ApiError::beyond(
+                Bounded::RestoreWindowSecs,
+                most,
+                message(),
+            ))
+        }
+        _ => {}
     }
     let set = app
         .node()?

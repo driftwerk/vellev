@@ -127,25 +127,24 @@ impl App {
     /// The most a caller may ask of the node, as it is published and as
     /// its refusals say.
     pub(crate) fn allowed(&self) -> vellev_api::Limits {
-        vellev_api::Limits {
-            results: self.limits.results as u64,
-            candidates: self.limits.results.max(DEFAULT_CANDIDATES) as u64,
-            oversample: MAX_OVERSAMPLE.into(),
-            body_bytes: self.limits.body as u64,
-            restore_window_secs: MAX_RESTORE_WINDOW.as_secs(),
-        }
+        let mut allowed = vellev_api::Limits::default();
+        allowed.results = self.limits.results as u64;
+        allowed.candidates = self.limits.results.max(DEFAULT_CANDIDATES) as u64;
+        allowed.oversample = MAX_OVERSAMPLE.into();
+        allowed.body_bytes = self.limits.body as u64;
+        allowed.restore_window_secs = MAX_RESTORE_WINDOW.as_secs();
+        allowed
     }
 
-    /// `asked` of `name`, sent as `field`, if it is from 1 to `most`.
+    /// `asked` of `name`, sent as `field`, if it is from 1 to `most`. Only
+    /// a request for more is told the most: one for none is not helped by
+    /// it.
     fn within(name: Bounded, field: &str, asked: u32, most: u64) -> Result<usize, ApiError> {
-        if (1..=most).contains(&u64::from(asked)) {
-            Ok(asked as usize)
-        } else {
-            Err(ApiError::beyond(
-                name,
-                most,
-                format!("{field} must be from 1 to {most}, not {asked}"),
-            ))
+        let message = || format!("{field} must be from 1 to {most}, not {asked}");
+        match u64::from(asked) {
+            0 => Err(ApiError::invalid(message())),
+            more if more > most => Err(ApiError::beyond(name, most, message())),
+            _ => Ok(asked as usize),
         }
     }
 

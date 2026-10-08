@@ -48,6 +48,33 @@ struct OpenaiResponse {
     data: Vec<OpenaiEmbedding>,
 }
 
+/// A refusal as OpenAI words it: `{"error": {"code": "..."}}`.
+#[derive(Deserialize)]
+struct OpenaiRefusal {
+    error: OpenaiError,
+}
+
+#[derive(Deserialize)]
+struct OpenaiError {
+    code: String,
+}
+
+/// The codes with which OpenAI's API says that asking again cannot help
+/// until the setup is put right: it has no such model, the key is not one
+/// of its keys, or the account behind the key has nothing left to spend.
+const SETUP_CODES: [&str; 3] = ["model_not_found", "invalid_api_key", "insufficient_quota"];
+
+/// Whether a refusal says, in OpenAI's own code for it, that the setup is
+/// wrong. A status alone never says so: whatever stands in front of an
+/// endpoint, such as a firewall's rate rule or a proxy with nothing behind
+/// it for a moment, answers 401, 403 or 404 too, and other servers word
+/// their refusals in prose, which is not read.
+fn setup_is_wrong(api: HttpApi, refusal: &str) -> bool {
+    api == HttpApi::Openai
+        && serde_json::from_str::<OpenaiRefusal>(refusal)
+            .is_ok_and(|refusal| SETUP_CODES.contains(&refusal.error.code.as_str()))
+}
+
 #[derive(Deserialize)]
 struct OpenaiEmbedding {
     index: usize,
@@ -134,17 +161,16 @@ impl Http {
                         .get(RETRY_AFTER)
                         .and_then(|value| value.to_str().ok()?.parse().ok())
                         .map(Duration::from_secs);
-                    let refusal = self.redacted(response.text().await.unwrap_or_default());
+                    let refusal = response.text().await.unwrap_or_default();
+                    let lasting = setup_is_wrong(self.api, &refusal);
+                    let refusal = self.redacted(refusal);
                     let refusal: String = refusal.chars().take(REFUSAL_CHARS).collect();
-                    let passing = status.as_u16() == 429 || status.is_server_error();
+                    let passing = !lasting && (status.as_u16() == 429 || status.is_server_error());
                     let wait = asked.unwrap_or(backoff).min(LONGEST_BACKOFF);
                     let said = format!("{status}: {refusal}");
-                    // Refused the key, or has no such model: the node is
-                    // set up wrong for this endpoint, whatever the text.
-                    // Any other refusal may be about the texts sent.
-                    let failure = match status.as_u16() {
-                        401 | 403 | 404 => self.unusable(said),
-                        _ => self.failed(said),
+                    let failure = match lasting {
+                        true => self.unusable(said),
+                        false => self.failed(said),
                     };
                     (failure, passing, wait)
                 }

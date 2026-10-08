@@ -18,7 +18,7 @@ use async_trait::async_trait;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum EmbedError {
-    /// This build or this node cannot run the model at all.
+    /// This build cannot run the model at all.
     #[error("{0}")]
     Unsupported(String),
     /// Asking the model failed in a way that may pass.
@@ -26,17 +26,23 @@ pub enum EmbedError {
     Failed { model: String, reason: String },
     #[error("{model} returned {reason}")]
     Malformed { model: String, reason: String },
-    /// The model was reached and cannot be used as the collection asks:
-    /// whatever serves it refuses this node for good, or does not have
-    /// it, or its vectors are not the collection's size.
+    /// The model cannot be used as this node and the collection are set
+    /// up: the node may not write where the model is kept, whatever
+    /// serves it says in its own code for it that it has no such model or
+    /// will not serve this key's account, or its vectors are not the
+    /// collection's size.
     #[error("{model} cannot be used: {reason}")]
     Unusable { model: String, reason: String },
 }
 
 impl EmbedError {
-    /// Whether asking again cannot help until the node or the collection
-    /// is set up otherwise. A failure that may be this one text's, or that
-    /// may pass, is not lasting.
+    /// Whether asking this node again cannot help until its setup is put
+    /// right: something settled by how the node is built and set up, or
+    /// said outright by whatever serves the model. Nothing else is
+    /// lasting, however likely: a failure taken for lasting when it would
+    /// have passed is the costlier mistake. So a bare refusal of a key, a
+    /// model's input, or a node with no credentials or no network to
+    /// fetch a model over, may pass, and is not.
     pub fn lasting(&self) -> bool {
         match self {
             Self::Unsupported(_) | Self::Unusable { .. } => true,

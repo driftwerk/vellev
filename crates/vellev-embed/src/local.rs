@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use hf_hub::api::sync::ApiError as FetchError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{EmbedError, Provider, Purpose, Result};
@@ -36,8 +37,9 @@ struct Work {
 /// A model run in this process on a thread of its own, so that inference
 /// never holds up the async runtime. Waiting callers' texts are run
 /// together, queries before documents, and a caller that has gone away is
-/// dropped before its next run. The model is fetched into the cache
-/// directory and loaded when first needed, and again after a failure.
+/// dropped before its next run. The model is fetched into the directory
+/// models are [`kept_in`] and loaded when first needed, and again after a
+/// failure.
 #[derive(Debug)]
 pub struct Local {
     model: String,
@@ -49,6 +51,7 @@ impl Local {
     pub fn new(model: &str, dimensions: u32, cache: &Path) -> Result<Self> {
         let known = known(model, dimensions)?;
         let cache = cache.to_path_buf();
+        let kept = kept_in(&cache, std::env::var("HF_HOME").ok());
         let threads = std::thread::available_parallelism().map_or(1, |cores| cores.get());
         let name = model.to_string();
         Self::spawn(
@@ -58,8 +61,8 @@ impl Local {
                     .with_cache_dir(cache.clone())
                     .with_intra_threads(threads.saturating_sub(1).max(1))
                     .with_show_download_progress(false);
-                let mut session =
-                    TextEmbedding::try_new(options).map_err(|error| unloaded(&name, &error))?;
+                let mut session = TextEmbedding::try_new(options)
+                    .map_err(|error| unloaded(&name, &kept, &error))?;
                 Ok(Box::new(move |texts: Vec<&str>| {
                     let together = texts.len();
                     session
@@ -87,27 +90,37 @@ impl Local {
     }
 }
 
-/// Why `model` could not be loaded. A cache directory the node may not
-/// write, where the model is fetched to, keeps it from ever loading until
-/// the node is set up otherwise. Anything else, such as a network the
-/// model cannot be fetched over just now, may pass.
-fn unloaded(model: &str, error: &fastembed::Error) -> EmbedError {
+/// The directory models are fetched to and loaded from: the one the node
+/// is given, unless `HF_HOME` is set, which what fetches them puts first.
+fn kept_in(cache: &Path, hf_home: Option<String>) -> PathBuf {
+    hf_home.map_or_else(|| cache.to_path_buf(), PathBuf::from)
+}
+
+/// Why `model`, kept in `kept`, could not be loaded. A directory the node
+/// may not write keeps it from ever loading until the node is set up
+/// otherwise: that is a failure of the fetcher's own to make or write a
+/// file, found wherever it lies under what was said of it. Anything else
+/// may pass, such as a network the model cannot be fetched over just now,
+/// which a node that is never to have one cannot be told from. So may a
+/// fetch given up after several tries, were tries ever asked for: by then
+/// the file was open, and what failed was the fetching.
+fn unloaded(model: &str, kept: &Path, error: &fastembed::Error) -> EmbedError {
     let barred = error
         .chain()
-        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(|cause| {
-            matches!(
+        .filter_map(|cause| cause.downcast_ref::<FetchError>())
+        .any(|cause| match cause {
+            FetchError::IoError(cause) => matches!(
                 cause.kind(),
                 ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
-            )
+            ),
+            _ => false,
         });
-    let reason = format!("{error:#}");
     match barred {
         true => EmbedError::Unusable {
             model: model.to_string(),
-            reason,
+            reason: format!("the node may not write {}: {error:#}", kept.display()),
         },
-        false => failure(model, reason),
+        false => failure(model, format!("{error:#}")),
     }
 }
 
@@ -454,31 +467,58 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_the_node_may_not_write_keeps_a_model_from_loading_and_a_network_does_not() {
-        let fetching = |cause: std::io::Error| {
+    fn a_directory_the_node_may_not_write_keeps_a_model_from_loading_and_a_network_does_not() {
+        // As fastembed reports a fetch that failed: what failed, under
+        // what it was doing.
+        let fetching = |cause: FetchError| {
             fastembed::Error::new(cause).context("Failed to retrieve model.onnx")
         };
+        let kept = Path::new("/models");
         for kind in [ErrorKind::PermissionDenied, ErrorKind::ReadOnlyFilesystem] {
-            let error = fetching(kind.into());
+            let error = fetching(FetchError::IoError(kind.into()));
             assert_eq!(
-                unloaded("m", &error),
+                unloaded("m", kept, &error),
                 EmbedError::Unusable {
                     model: "m".into(),
-                    reason: format!("{error:#}")
+                    reason: format!("the node may not write /models: {error:#}")
                 },
                 "{kind:?}"
             );
         }
-        for kind in [
-            ErrorKind::ConnectionRefused,
-            ErrorKind::TimedOut,
-            ErrorKind::StorageFull,
-        ] {
-            let error = fetching(kind.into());
-            assert!(!unloaded("m", &error).lasting(), "{kind:?}");
+        let passing = [
+            fetching(FetchError::IoError(ErrorKind::StorageFull.into())),
+            fetching(FetchError::IoError(ErrorKind::TimedOut.into())),
+            fetching(FetchError::TooManyRetries(Box::new(FetchError::IoError(
+                ErrorKind::PermissionDenied.into(),
+            )))),
+            fetching(FetchError::InvalidResume),
+            // Not the fetcher's own: a connection refused leave to be made,
+            // or anything else that happens to be an I/O error.
+            fastembed::Error::new(std::io::Error::from(ErrorKind::PermissionDenied))
+                .context("Failed to retrieve model.onnx"),
+            fastembed::Error::msg("request error: dns failed"),
+        ];
+        for error in passing {
+            assert_eq!(
+                unloaded("m", kept, &error),
+                failed_as("m", &format!("{error:#}")),
+                "{error:#}"
+            );
         }
-        let unreached = fastembed::Error::msg("request error: dns failed");
-        assert!(!unloaded("m", &unreached).lasting());
+    }
+
+    fn failed_as(model: &str, reason: &str) -> EmbedError {
+        EmbedError::Failed {
+            model: model.into(),
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn models_are_kept_where_the_node_says_unless_hf_home_says_otherwise() {
+        let cache = Path::new("/var/lib/vellev/models");
+        assert_eq!(kept_in(cache, None), cache);
+        assert_eq!(kept_in(cache, Some("/hf".into())), Path::new("/hf"));
     }
 
     #[test]

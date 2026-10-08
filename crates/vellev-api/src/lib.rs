@@ -104,6 +104,7 @@ impl std::str::FromStr for Consistency {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Code {
     /// The request is malformed or asks for something that cannot be.
     Invalid,
@@ -122,11 +123,14 @@ pub enum Code {
     /// A write failed at a point where nobody can say whether it took
     /// effect. Read before deciding to send it again.
     Uncertain,
-    /// The collection's embedding model cannot be used by this node until
-    /// the node or the collection is set up otherwise: this build cannot
-    /// run it, whatever serves it refuses the node or does not have it,
-    /// or its vectors are not the collection's size. Sending the same
-    /// request again will not help; one that brings its own vector will.
+    /// This node cannot use the collection's embedding model until its
+    /// setup is put right: the build cannot run the model, the node may
+    /// not write where the model is kept, whatever serves it says it has
+    /// no such model or will not serve this account, or its vectors are
+    /// not the collection's size. The request had no effect. Another node
+    /// may be able to do it now, and this one once it is put right, so
+    /// the request is to be kept and sent again, never dropped; one that
+    /// brings its own vector needs no model.
     ModelUnavailable,
     Internal,
     /// A code this client does not know, from a newer node.
@@ -134,13 +138,37 @@ pub enum Code {
     Unknown,
 }
 
+impl Code {
+    /// The HTTP status a failure of this kind is answered with, unless
+    /// HTTP has a status of its own for it.
+    pub fn status(self) -> u16 {
+        match self {
+            Code::Invalid => 400,
+            Code::Unauthorized => 401,
+            Code::Forbidden => 403,
+            Code::NotFound => 404,
+            Code::Conflict => 409,
+            Code::Limited => 429,
+            Code::Unavailable | Code::Uncertain => 503,
+            // The node's failing, not the caller's, so a server error; and
+            // of those the one that says the node cannot do what is asked
+            // as it is set up, which HTTP clients and proxies do not send
+            // again of their own accord as they do 500, 502, 503 and 504.
+            Code::ModelUnavailable => 501,
+            Code::Internal | Code::Unknown => 500,
+        }
+    }
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Problem {
     pub code: Code,
     pub message: String,
     /// On a refusal of a request that asks for more than the node allows:
-    /// what it asked too much of, and the most it may ask.
+    /// what it asked too much of, and the most it may ask. A request that
+    /// asks for none at all is refused without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<Limit>,
     /// On `not_found`: what the request names that does not exist, when
@@ -166,6 +194,7 @@ impl Problem {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Bounded {
     /// Results of a search or a page, asked for as `limit`.
     Results,
@@ -195,6 +224,7 @@ pub struct Limit {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Missing {
     /// Also what a tenant's key is told of every other tenant.
     Tenant,
@@ -205,7 +235,9 @@ pub enum Missing {
     Backup,
     /// A state of the tenant within its restore window.
     RestorePoint,
-    /// The route itself: a node of an older release, say.
+    /// The route itself: the node has none for the request. A node from
+    /// before a route was added says so too, and one from before this
+    /// field says `not_found` without it.
     Route,
     /// Something this client does not know, from a newer node.
     #[serde(other)]
@@ -213,9 +245,12 @@ pub enum Missing {
 }
 
 /// The most a caller may ask of the node, each named as [`Bounded`]
-/// names it.
+/// names it. A node always says all of these; zero stands for one it did
+/// not say.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct Limits {
     pub results: u64,
     pub candidates: u64,
@@ -225,16 +260,18 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// The most of `name` a request may ask for, if this client knows it.
+    /// The most of `name` a request may ask for, if the node said and
+    /// this client knows it.
     pub fn max(&self, name: Bounded) -> Option<u64> {
-        match name {
-            Bounded::Results => Some(self.results),
-            Bounded::Candidates => Some(self.candidates),
-            Bounded::Oversample => Some(self.oversample),
-            Bounded::BodyBytes => Some(self.body_bytes),
-            Bounded::RestoreWindowSecs => Some(self.restore_window_secs),
-            Bounded::Unknown => None,
-        }
+        let said = match name {
+            Bounded::Results => self.results,
+            Bounded::Candidates => self.candidates,
+            Bounded::Oversample => self.oversample,
+            Bounded::BodyBytes => self.body_bytes,
+            Bounded::RestoreWindowSecs => self.restore_window_secs,
+            Bounded::Unknown => 0,
+        };
+        (said > 0).then_some(said)
     }
 }
 
@@ -865,14 +902,64 @@ mod tests {
                 ..Problem::new(Code::Unknown, "?")
             }
         );
+    }
+
+    #[test]
+    fn each_limit_is_told_under_its_own_name_and_one_not_said_is_not_known() {
         let limits = Limits {
-            results: 1_000,
-            candidates: 1_000,
-            oversample: 1_024,
-            body_bytes: 1 << 20,
-            restore_window_secs: 60,
+            results: 1,
+            candidates: 2,
+            oversample: 3,
+            body_bytes: 4,
+            restore_window_secs: 5,
         };
-        assert_eq!(limits.max(Bounded::Oversample), Some(1_024));
-        assert_eq!(limits.max(Bounded::Unknown), None);
+        let told = json!({
+            "results": 1,
+            "candidates": 2,
+            "oversample": 3,
+            "body_bytes": 4,
+            "restore_window_secs": 5,
+        });
+        assert_eq!(serde_json::to_value(limits).unwrap(), told);
+        for (name, max) in [
+            (Bounded::Results, Some(1)),
+            (Bounded::Candidates, Some(2)),
+            (Bounded::Oversample, Some(3)),
+            (Bounded::BodyBytes, Some(4)),
+            (Bounded::RestoreWindowSecs, Some(5)),
+            (Bounded::Unknown, None),
+        ] {
+            assert_eq!(limits.max(name), max, "{name:?}");
+            let written = serde_json::to_value(name).unwrap();
+            assert_eq!(
+                written.as_str().and_then(|field| told.get(field)?.as_u64()),
+                max,
+                "a limit's name is its field: {name:?}"
+            );
+        }
+        // A node of another release may say fewer, or more.
+        let fewer: Limits = serde_json::from_value(json!({ "results": 7, "later": 9 })).unwrap();
+        assert_eq!(fewer.max(Bounded::Results), Some(7));
+        assert_eq!(fewer.max(Bounded::Oversample), None);
+    }
+
+    #[test]
+    fn every_code_has_its_status_and_a_model_that_cannot_be_used_is_not_one_retried_blindly() {
+        let statuses = [
+            (Code::Invalid, 400),
+            (Code::Unauthorized, 401),
+            (Code::Forbidden, 403),
+            (Code::NotFound, 404),
+            (Code::Conflict, 409),
+            (Code::Limited, 429),
+            (Code::Unavailable, 503),
+            (Code::Uncertain, 503),
+            (Code::ModelUnavailable, 501),
+            (Code::Internal, 500),
+            (Code::Unknown, 500),
+        ];
+        for (code, status) in statuses {
+            assert_eq!(code.status(), status, "{code:?}");
+        }
     }
 }

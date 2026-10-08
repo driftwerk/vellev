@@ -57,6 +57,22 @@ impl Cluster {
         served
     }
 
+    /// As [`Self::serve_embedding_through`], with the bearer token this
+    /// node sends the endpoint at `url`.
+    pub async fn serve_embedding_keyed(&self, url: &str, key: &str) -> Served {
+        let embedding = vellev_embed::Settings {
+            keys: [(url.to_string(), key.to_string())].into(),
+            ..Default::default()
+        };
+        let served = self
+            .unstarted_as(&[url.to_string()], None, &[], embedding, |settings| {
+                settings
+            })
+            .await;
+        served.app.start(served.node.clone());
+        served
+    }
+
     /// A node that tells other nodes it can be reached at `address`
     /// rather than where it listens.
     pub async fn serve_advertising(&self, address: &str) -> Served {
@@ -113,12 +129,24 @@ impl Cluster {
         trusted: &[String],
         adjusted: impl FnOnce(Settings) -> Settings,
     ) -> Served {
+        self.unstarted_as(urls, advertised, trusted, Default::default(), adjusted)
+            .await
+    }
+
+    async fn unstarted_as(
+        &self,
+        urls: &[String],
+        advertised: Option<&str>,
+        trusted: &[String],
+        embedding: vellev_embed::Settings,
+        adjusted: impl FnOnce(Settings) -> Settings,
+    ) -> Served {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let node = Arc::new(Node::new(
             self.coordinator.clone(),
             self.blobs.clone(),
-            Arc::new(Embedders::new(Default::default())),
+            Arc::new(Embedders::new(embedding)),
             adjusted(Settings {
                 purge_after: Duration::ZERO,
                 ..Settings::new(NodeId::reachable_at(advertised.unwrap_or(&url), "node"))
@@ -249,6 +277,36 @@ impl Served {
         self.stop.take().unwrap().send(()).unwrap();
         self.served.take().unwrap().await.unwrap().unwrap();
     }
+}
+
+/// An embedding endpoint that speaks as OpenAI does and serves only a
+/// caller with `key`: any other is told, in OpenAI's code for it, that its
+/// key is not one. A text's vector is its length and its number of words.
+pub async fn keyed_embedding_server(key: &'static str) -> String {
+    let embed = move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+        let presented = headers
+            .get("authorization")
+            .and_then(|key| key.to_str().ok());
+        if presented != Some(format!("Bearer {key}").as_str()) {
+            let refusal =
+                json!({ "error": { "message": "no such key", "code": "invalid_api_key" } });
+            return Err((axum::http::StatusCode::UNAUTHORIZED, axum::Json(refusal)));
+        }
+        let data: Vec<Value> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|text| text.as_str().unwrap())
+            .enumerate()
+            .map(|(index, text)| json!({ "index": index, "embedding": [text.len(), text.split_whitespace().count()] }))
+            .collect();
+        Ok(axum::Json(json!({ "data": data })))
+    };
+    let router = axum::Router::new().route("/v1/embeddings", axum::routing::post(embed));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    url
 }
 
 pub const NOTES: &str = "/v1/tenants/acme/collections/notes";

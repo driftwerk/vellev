@@ -9,8 +9,8 @@ use common::*;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use vellev_api::{
-    Bounded, Change, Changes, Code, Content, Hybrid, Keyword, Limit, Limits, Missing, Nearest,
-    OnlyIf, Outcome, Page, AFTER, REQUEST,
+    Bounded, Change, Changes, Code, Content, Hybrid, Keyword, Limit, Missing, Nearest, OnlyIf,
+    Outcome, Page, AFTER, REQUEST,
 };
 use vellev_client::api::After;
 use vellev_client::{Client, Error, Options};
@@ -918,20 +918,24 @@ async fn a_failure_says_what_was_asked_too_much_of_or_is_missing_and_any_key_lea
         ..quick(3)
     };
     let client = Client::connect(&[&served.url], KEY, options).unwrap();
-    let limits = client.limits().await.unwrap();
+    let limits = client
+        .limits()
+        .await
+        .unwrap()
+        .expect("this node tells them");
     assert_eq!(
-        limits,
-        Limits {
-            results: MAX_LIMIT as u64,
-            candidates: 100,
-            oversample: 1_024,
-            body_bytes: MAX_BODY as u64,
-            restore_window_secs: 10 * 366 * 24 * 60 * 60,
-        }
+        serde_json::to_value(limits).unwrap(),
+        json!({
+            "results": MAX_LIMIT,
+            "candidates": 100,
+            "oversample": 1_024,
+            "body_bytes": MAX_BODY,
+            "restore_window_secs": 10 * 366 * 24 * 60 * 60,
+        })
     );
     let issued = client.tenant(&tenant("acme")).issue_key().await.unwrap();
     let tenants_own = Client::connect(&[&served.url], &issued.key, quick(1)).unwrap();
-    assert_eq!(tenants_own.limits().await.unwrap(), limits);
+    assert_eq!(tenants_own.limits().await.unwrap(), Some(limits));
 
     let notes = client.tenant(&tenant("acme")).collection(&notes_named());
     let page = |limit: u64| Page {
@@ -951,6 +955,12 @@ async fn a_failure_says_what_was_asked_too_much_of_or_is_missing_and_any_key_lea
     assert_eq!(too_many.limit_max(Bounded::Results), Some(limits.results));
     assert_eq!(too_many.limit_max(Bounded::Oversample), None);
     assert_eq!(too_many.missing(), None);
+    let none = notes.list(&page(0)).await.unwrap_err();
+    assert_eq!(
+        (none.code(), none.limit()),
+        (Some(Code::Invalid), None),
+        "asking for none is not asking too much"
+    );
     let large = content(&"x".repeat(MAX_BODY), 1, Some([1.0, 0.0]));
     let unsent = notes.store_all([(oid(1), large)]).await.unwrap_err();
     assert!(
@@ -986,4 +996,147 @@ async fn a_failure_says_what_was_asked_too_much_of_or_is_missing_and_any_key_lea
         None,
         "a missing object is still none"
     );
+}
+
+#[tokio::test]
+async fn a_node_from_before_the_limits_were_told_has_none_to_tell() {
+    // As a release before the route answers an admin key, and a tenant's.
+    let no_route = json!({ "error": { "code": "not_found", "message": "no such route" } });
+    let not_for_it =
+        json!({ "error": { "code": "forbidden", "message": "only an admin key may do this" } });
+    for (status, answer) in [(404, no_route), (403, not_for_it)] {
+        let older = Stub::answering(move |_, _| (status, answer.clone())).await;
+        let client = Client::connect(&[&older.url], KEY, tries(3)).unwrap();
+        assert_eq!(client.limits().await.unwrap(), None, "{status}");
+        assert_eq!(older.asked("/v1/limits"), 1);
+    }
+    let away = Stub::answering(|_, _| (503, failure("unavailable"))).await;
+    let client = Client::connect(&[&away.url], KEY, tries(1)).unwrap();
+    let failed = client.limits().await.unwrap_err();
+    assert_eq!(
+        failed.code(),
+        Some(Code::Unavailable),
+        "not every failure is none"
+    );
+}
+
+/// A stand-in node that cannot use the model, or answers as `otherwise`
+/// says once it is told it can.
+async fn modelless(otherwise: (u16, Value)) -> (Stub, Arc<std::sync::atomic::AtomicBool>) {
+    let able = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked = able.clone();
+    let stub = Stub::answering(move |_, _| match asked.load(Ordering::SeqCst) {
+        true => otherwise.clone(),
+        false => (501, failure("model_unavailable")),
+    })
+    .await;
+    (stub, able)
+}
+
+#[tokio::test]
+async fn a_request_one_node_cannot_do_as_it_is_set_up_is_asked_of_each_other_node_once() {
+    let found = || (200, json!({ "collections": [] }));
+    let (unable, _) = modelless(found()).await;
+    let (other, _) = modelless(found()).await;
+    let able = Stub::answering(move |_, _| found()).await;
+    let ask = |client: &Client| {
+        let acme = client.tenant(&tenant("acme"));
+        async move { acme.collections().await.map(|_| ()) }
+    };
+
+    // One try, and a wait that would never end: the other nodes are asked
+    // at once, for nothing but the first's being unable.
+    let nodes = [unable.url.as_str(), other.url.as_str(), able.url.as_str()];
+    let client = Client::connect(&nodes, KEY, tries(1)).unwrap();
+    ask(&client).await.unwrap();
+    ask(&client).await.unwrap();
+    assert_eq!(
+        (
+            unable.asked("acme"),
+            other.asked("acme"),
+            able.asked("acme")
+        ),
+        (1, 1, 2),
+        "and the node that could is asked first from then on"
+    );
+
+    let client = Client::connect(&[&unable.url, &other.url], KEY, tries(4)).unwrap();
+    let before = (unable.asked("acme"), other.asked("acme"));
+    let failed = ask(&client).await.unwrap_err();
+    assert!(failed.is_model_unavailable(), "{failed}");
+    assert!(!failed.is_unknown_outcome());
+    assert_eq!(
+        (unable.asked("acme"), other.asked("acme")),
+        (before.0 + 1, before.1 + 1),
+        "final once every node has said so, each asked once"
+    );
+
+    let alone = Client::connect(&[&unable.url], KEY, tries(4)).unwrap();
+    assert!(ask(&alone).await.unwrap_err().is_model_unavailable());
+    assert_eq!(unable.asked("acme"), before.0 + 2, "one node is asked once");
+}
+
+#[tokio::test]
+async fn a_node_that_cannot_is_left_out_while_the_others_are_tried_again() {
+    let (unable, _) = modelless((200, json!(null))).await;
+    let away = Stub::answering(|_, _| (503, failure("unavailable"))).await;
+    let client = Client::connect(&[&unable.url, &away.url], KEY, quick(3)).unwrap();
+    let failed = client.tenant(&tenant("acme")).collections().await;
+    assert_eq!(failed.unwrap_err().code(), Some(Code::Unavailable));
+    assert_eq!(
+        (unable.asked("acme"), away.asked("acme")),
+        (1, 3),
+        "every try is spent on the node that may yet answer"
+    );
+
+    // The other way about: away first, then unable, then away again.
+    let (unable, _) = modelless((200, json!(null))).await;
+    let away = Stub::answering(|_, _| (503, failure("unavailable"))).await;
+    let client = Client::connect(&[&away.url, &unable.url], KEY, quick(3)).unwrap();
+    let failed = client.tenant(&tenant("acme")).collections().await;
+    assert_eq!(failed.unwrap_err().code(), Some(Code::Unavailable));
+    assert_eq!((unable.asked("acme"), away.asked("acme")), (1, 3));
+}
+
+#[tokio::test]
+async fn a_search_a_node_cannot_embed_for_is_answered_by_one_that_can() {
+    let url = keyed_embedding_server("sk-right").await;
+    let cluster = Cluster::new();
+    let right = cluster.serve_embedding_keyed(&url, "sk-right").await;
+    let wrong = cluster.serve_embedding_keyed(&url, "sk-wrong").await;
+    let embedding = json!({
+        "provider": "http",
+        "api": "openai",
+        "url": url,
+        "model": "stand-in",
+        "dimensions": 2,
+        "properties": ["title"],
+    });
+    right.with_notes(embedding).await;
+    // Asked of the node set up wrong first, with one try and no waiting.
+    let client = Client::connect(&[&wrong.url, &right.url], KEY, tries(1)).unwrap();
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let fox = Content {
+        properties: json!({ "title": "a red fox" }).as_object().unwrap().clone(),
+        vector: None,
+    };
+    notes.put(oid(1), &fox).await.unwrap();
+    let nearest = Nearest {
+        vector: None,
+        text: Some("a red fox".into()),
+        limit: 1,
+        filter: None,
+        oversample: None,
+        vectors: true,
+    };
+    let found = notes.nearest(&nearest).await.unwrap();
+    assert_eq!(found.results[0].object.vector, Some(vec![9.0, 3.0]));
+
+    // With no node set up right, the search fails as final, and says so.
+    let only_wrong = Client::connect(&[&wrong.url], KEY, tries(3)).unwrap();
+    let notes = only_wrong
+        .tenant(&tenant("acme"))
+        .collection(&notes_named());
+    let failed = notes.nearest(&nearest).await.unwrap_err();
+    assert!(failed.is_model_unavailable(), "{failed}");
 }

@@ -178,7 +178,9 @@ collection may only name an embedding endpoint listed in
 `GET /v1/limits` tells any key the most a request may ask for: results of a
 search or a page (`VELLEV_MAX_LIMIT`), candidates each side of a hybrid
 search offers, `oversample`, bytes of a body (`VELLEV_MAX_BODY_BYTES`) and
-seconds of a restore window.
+seconds of a restore window. A node of a release before this answers that
+it has no such route (404, or 403 to a tenant's key), for which the Rust
+client's `limits()` gives `None`.
 
 ```sh
 call http://127.0.0.1:8080/v1/limits
@@ -187,28 +189,64 @@ call http://127.0.0.1:8080/v1/limits
 
 Every failure is `{"error":{"code":…,"message":…}}`, and the code, not the
 message, says what to do. A request for more than the node allows says
-which limit and its most, as those names; a failure to find something says
-what is missing, `tenant`, `collection`, `object`, `key`, `backup`,
-`restore_point` or `route`, except for a write refused before and named
-again, which is refused as it was. A tenant's key is told `tenant` of every
-other tenant.
+which limit and its most, as those names; one that asks for none at all,
+`limit: 0`, is refused without it. A failure to find something says what
+is missing: `tenant`, `collection`, `object`, `key`, `backup`,
+`restore_point` or `route`. A tenant's key is told `tenant` of every other
+tenant. A write refused and then named again is refused as it was, with
+what was missing then, unless a node of a release before this kept the
+refusal meanwhile, which keeps only that something was.
 
 ```json
 {"error":{"code":"invalid","message":"limit must be from 1 to 1000, not 5000","limit":{"name":"results","max":1000}}}
 {"error":{"code":"not_found","message":"collection notes does not exist","missing":"collection"}}
 ```
 
-When a collection's text cannot be embedded, `unavailable` (503) means it
-may work later, as when an embedding endpoint is down, overloaded or slow.
-`model_unavailable` (501) means this node cannot use the model until it or
-the collection is set up otherwise: the build cannot run it, the node may
-not write `VELLEV_MODEL_DIR` to fetch it, the endpoint or Bedrock refuses
-the node's key or credentials or has no such model, or its vectors are not
-the collection's size. A node that cannot reach where a local model is
-fetched from answers `unavailable`, as a network that may come back. Sending the request again will
-not help; sending the vector with it will. The cause is in the node's log.
-A hybrid search that cannot embed its text ranks by the words alone either
-way, and says `degraded`.
+When a collection's text cannot be embedded, the answer is one of two, and
+in both nothing was done. A hybrid search ranks by the words alone
+instead, and says `degraded`.
+
+`unavailable` (503) means it may work later, on this node or another: send
+the request again. Everything that might pass is answered so, including
+much that will not pass by itself, because a node cannot tell it from what
+will: an endpoint or Bedrock refusing the node's key or credentials with
+no more than a status (a firewall or a proxy answers 401, 403 and 404 too,
+and a permission just granted takes a while to hold), a refusal worded
+only in prose or in codes other than OpenAI's, which are not read, a
+model's input refused, which may be that text's alone, a node with no
+AWS credentials, and a node with no network to fetch a local model over.
+The cause is in the node's log each time; if it goes on, look there.
+
+`model_unavailable` (501) means the node that answered cannot use the
+model as it is set up, and will not until someone puts that right. It is
+said only of what the node's own build and setup settle, or what serves
+the model says outright in its own code for it:
+
+- the build cannot run the model: its name or size is not one it knows,
+  or it was built without local models;
+- the node may not write the directory local models are kept in, which is
+  `HF_HOME` if that is set and `VELLEV_MODEL_DIR` otherwise;
+- an OpenAI endpoint answers `model_not_found`, `invalid_api_key` or
+  `insufficient_quota`;
+- Bedrock answers that the region has no such model;
+- the model's vectors are not the collection's size.
+
+It never means the request is at fault or may be dropped. Keep it, and
+send it again once the node is put right. Another node may be able to
+answer meanwhile: a search is embedded for by the node it reaches, so the
+Rust client asks each other node it knows once, at once, and fails only
+when every one says the same. A write is embedded for by the one node that
+holds its tenant, whichever node it reaches, so every node answers a write
+alike. A client that knows only a load balancer cannot choose a node: give
+it the nodes' own addresses. A request that brings its own vector needs no
+model.
+
+A collection whose model the node's build cannot run is refused when it is
+made, with `model_unavailable`, by the node that holds the tenant then;
+a node of another build may hold it later and answer otherwise, so run one
+build, and during a rolling deploy expect either answer. What only using a
+model shows, such as an endpoint that refuses the node, is found at the
+first write.
 
 ## Vector search
 

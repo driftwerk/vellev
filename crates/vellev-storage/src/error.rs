@@ -91,6 +91,18 @@ pub enum StorageError {
 pub struct Refusal {
     pub kind: Refused,
     pub message: String,
+    /// What the request named that was not there. A release from before
+    /// this was kept neither reads nor keeps it, and a refusal that has
+    /// been through one says only that something was not found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lacking: Option<Lacking>,
+}
+
+/// What a request named that was not there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Lacking {
+    Collection,
+    Object,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +137,11 @@ impl StorageError {
     /// so would be the same however often the request were made: not a
     /// failure that may pass.
     pub fn refusal(&self) -> Option<Refusal> {
+        let lacking = match self.root() {
+            Self::UnknownCollection(_) => Some(Lacking::Collection),
+            Self::UnknownObject { .. } => Some(Lacking::Object),
+            _ => None,
+        };
         let kind = match self.root() {
             Self::UnknownCollection(_) | Self::UnknownObject { .. } => Refused::NotFound,
             Self::CollectionExists(_)
@@ -141,6 +158,7 @@ impl StorageError {
         Some(Refusal {
             kind,
             message: self.root().to_string(),
+            lacking,
         })
     }
 

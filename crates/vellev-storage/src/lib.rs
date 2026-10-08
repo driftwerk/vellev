@@ -19,7 +19,7 @@ mod search;
 mod state;
 
 pub use answers::KEPT_FOR as ANSWERS_KEPT_FOR;
-pub use error::{Refusal, Refused, Result, StorageError};
+pub use error::{Lacking, Refusal, Refused, Result, StorageError};
 pub use group::GroupCommitter;
 pub use hybrid::{Fused, Hybrid, DEFAULT_ALPHA, DEFAULT_CANDIDATES};
 pub use keyword::{Keywords, Scored, MAX_WEIGHT};

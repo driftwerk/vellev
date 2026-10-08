@@ -8,7 +8,7 @@ use axum::Json;
 use vellev_api::{Bounded, Code, Failure, Limit, Missing, Problem};
 use vellev_node::NodeError;
 use vellev_storage::coordinator::CoordinatorError;
-use vellev_storage::{Refused, StorageError};
+use vellev_storage::{Lacking, Refused, StorageError};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -19,22 +19,8 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    /// A model this node cannot use is the node's failing, not the
-    /// caller's, so its status is a server error; and of those, the one
-    /// that says the node cannot do what is asked at all, which HTTP
-    /// clients and proxies do not retry as they do 500, 502, 503 and 504.
     pub fn new(code: Code, message: impl Into<String>) -> Self {
-        let status = match code {
-            Code::Invalid => StatusCode::BAD_REQUEST,
-            Code::Unauthorized => StatusCode::UNAUTHORIZED,
-            Code::Forbidden => StatusCode::FORBIDDEN,
-            Code::NotFound => StatusCode::NOT_FOUND,
-            Code::Conflict => StatusCode::CONFLICT,
-            Code::Limited => StatusCode::TOO_MANY_REQUESTS,
-            Code::Unavailable | Code::Uncertain => StatusCode::SERVICE_UNAVAILABLE,
-            Code::ModelUnavailable => StatusCode::NOT_IMPLEMENTED,
-            Code::Internal | Code::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        let status = StatusCode::from_u16(code.status()).expect("every code's status is one");
         Self {
             status,
             problem: Problem::new(code, message),
@@ -92,17 +78,16 @@ impl ApiError {
     }
 
     /// What is said when a collection's embedding model cannot be used:
-    /// just now, or with `lasting`, by this node at all until it or the
-    /// collection is set up otherwise. The cause goes to the log, not to
-    /// the caller: it may quote whatever answered at the address the
-    /// collection names.
+    /// just now, or with `lasting`, by this node until its setup is put
+    /// right. The cause goes to the log, not to the caller: it may quote
+    /// whatever answered at the address the collection names.
     fn unembedded(cause: impl std::fmt::Display, lasting: bool) -> Self {
         match lasting {
             true => {
                 tracing::error!(%cause, "the embedding model cannot be used");
                 Self::new(
                     Code::ModelUnavailable,
-                    "the collection's embedding model cannot be used by this node",
+                    "this node cannot use the collection's embedding model as it is set up",
                 )
             }
             false => {
@@ -175,13 +160,19 @@ fn code(error: &StorageError) -> Code {
 }
 
 /// What a storage error says does not exist. A refusal answered again as
-/// it was kept no more than that something was not found.
+/// it was says what it kept: nothing, if it was kept by a release from
+/// before that was.
 fn missing(error: &StorageError) -> Option<Missing> {
-    match error {
-        StorageError::UnknownCollection(_) => Some(Missing::Collection),
-        StorageError::UnknownObject { .. } => Some(Missing::Object),
+    let lacking = match error {
+        StorageError::UnknownCollection(_) => Some(Lacking::Collection),
+        StorageError::UnknownObject { .. } => Some(Lacking::Object),
+        StorageError::Refused(refusal) => refusal.lacking,
         _ => None,
-    }
+    };
+    lacking.map(|lacking| match lacking {
+        Lacking::Collection => Missing::Collection,
+        Lacking::Object => Missing::Object,
+    })
 }
 
 impl From<StorageError> for ApiError {
@@ -313,7 +304,8 @@ mod tests {
 
         let ApiError { problem, .. } = lasting().into();
         assert_eq!(
-            problem.message, "the collection's embedding model cannot be used by this node",
+            problem.message,
+            "this node cannot use the collection's embedding model as it is set up",
             "the cause stays in the log"
         );
     }
@@ -351,11 +343,26 @@ mod tests {
             id: ObjectId(uuid::Uuid::nil()),
         };
         assert_eq!(missing(object.into()), (not_found, Some(Missing::Object)));
-        let answered_again = StorageError::Refused(Refusal {
-            kind: Refused::NotFound,
-            message: format!("collection {collection} does not exist"),
-        });
-        assert_eq!(missing(answered_again.into()), (not_found, None));
+        let answered_again = |lacking| {
+            StorageError::Refused(Refusal {
+                kind: Refused::NotFound,
+                message: format!("collection {collection} does not exist"),
+                lacking,
+            })
+        };
+        assert_eq!(
+            missing(answered_again(Some(Lacking::Collection)).into()),
+            (not_found, Some(Missing::Collection))
+        );
+        assert_eq!(
+            missing(answered_again(Some(Lacking::Object)).into()),
+            (not_found, Some(Missing::Object))
+        );
+        assert_eq!(
+            missing(answered_again(None).into()),
+            (not_found, None),
+            "kept by a release from before what was missing was"
+        );
         assert_eq!(
             missing(StorageError::Closed.into()),
             (StatusCode::SERVICE_UNAVAILABLE, None)

@@ -31,6 +31,11 @@ A release may, without a new format:
 - read anything old formats wrote in a new way, as long as the result is
   the same data.
 
+A refusal's `lacking`, what a refused request named that was not there,
+is such a field: a node of the release before reads past it, and drops it
+when it writes the manifest again, after which a try of that request is
+still refused alike and says only that something was not found.
+
 Anything else is a new format:
 
 - a new kind of file;
@@ -107,7 +112,14 @@ Clients and nodes of different releases talk to each other.
   not know as `unknown`, and takes an unknown code as final: it does not
   send the request again. A failure that may pass keeps `unavailable` or
   `uncertain`, which every client retries; a new code is only for one that
-  will not.
+  will not. `model_unavailable` is such a code with one difference a
+  client must know it to use: another node may answer where one cannot. A
+  client from before it stops at the first node that says so, where it
+  used to be told `unavailable` and go on to the next, so bring clients up
+  to this release before relying on nodes set up differently.
+- The limits a node tells (`GET /v1/limits`) may gain fields. One added
+  later is optional in the client's types, so that a node from before it
+  still reads; the first five are always told.
 - A request may gain optional fields. A node refuses a field it does not
   understand, at any depth, so a client using a new field against an older
   node is told so rather than ignored.

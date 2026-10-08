@@ -337,6 +337,7 @@ mod tests {
                     answer: Answer::Refused(Refusal {
                         kind: crate::Refused::Conflict,
                         message: "object 7 already exists in notes".into(),
+                        lacking: None,
                     }),
                 },
             ],
@@ -445,6 +446,45 @@ mod tests {
         assert_eq!(
             decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, FORMAT_VERSION, &body)).unwrap(),
             log()
+        );
+    }
+
+    #[test]
+    fn what_a_refusal_found_missing_is_kept_and_a_release_from_before_it_reads_past_it() {
+        /// A refusal as the release before this field kept it.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct OlderRefusal {
+            kind: crate::Refused,
+            message: String,
+        }
+        let refusal = |lacking| Refusal {
+            kind: crate::Refused::NotFound,
+            message: "collection notes does not exist".into(),
+            lacking,
+        };
+        let older = || OlderRefusal {
+            kind: crate::Refused::NotFound,
+            message: "collection notes does not exist".into(),
+        };
+        let kept = rmp_serde::to_vec_named(&refusal(Some(crate::Lacking::Collection))).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<Refusal>(&kept).unwrap(),
+            refusal(Some(crate::Lacking::Collection))
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<OlderRefusal>(&kept).unwrap(),
+            older(),
+            "the release before reads past what it does not know"
+        );
+        let before = rmp_serde::to_vec_named(&older()).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<Refusal>(&before).unwrap(),
+            refusal(None)
+        );
+        assert_eq!(
+            rmp_serde::to_vec_named(&refusal(None)).unwrap(),
+            before,
+            "a refusal that found nothing missing is written as it always was"
         );
     }
 

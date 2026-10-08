@@ -210,7 +210,7 @@ impl Vectorize for Documents {
             .0
             .embedder(embedding)
             .map_err(unembedded)?
-            .ok_or_else(|| Unembedded::for_now("its collection's clients supply the vectors"))?;
+            .ok_or_else(|| Unembedded::for_good("its collection's clients supply the vectors"))?;
         let vectors = embedder.documents(&texts).await.map_err(unembedded)?;
         vectors
             .into_iter()
@@ -302,6 +302,27 @@ impl Tenant {
             .collect()
     }
 
+    /// Refuse to make a collection whose embedding model this node cannot
+    /// run however it is asked, rather than make one every write to which
+    /// would be refused. That is this node's answer, the node that writes
+    /// the tenant now: one built or set up otherwise may take the tenant
+    /// later and answer otherwise. Whatever only using the model would
+    /// show, such as an endpoint that refuses the node, is not looked for,
+    /// and a collection there already is left to be answered as it was.
+    fn can_embed(&self, mutations: &[Mutation]) -> Result<()> {
+        mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                Mutation::CreateCollection(schema) => Some(schema),
+                _ => None,
+            })
+            .filter(|schema| self.read(|state| state.collection(&schema.name).is_none()))
+            .try_for_each(|schema| match self.embedders.embedder(&schema.embedding) {
+                Err(error) if error.lasting() => Err(NodeError::Embed(error)),
+                _ => Ok(()),
+            })
+    }
+
     /// Commit a batch as one atomic step, sharing the commit with whoever
     /// else is writing. A batch naming a request answered lately is
     /// answered as it was, and not made again.
@@ -315,6 +336,7 @@ impl Tenant {
         if !answered {
             self.limits
                 .admit(&self.id, Asked::Write, batch.mutations.len())?;
+            self.can_embed(&batch.mutations)?;
         }
         let made = match answered {
             true => Embedded::new(),
@@ -1099,5 +1121,31 @@ impl Inner {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vellev_core::EmbeddingProvider;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_collection_whose_clients_supply_the_vectors_is_never_embedded_for() {
+        let supplied = Embedding {
+            provider: EmbeddingProvider::None,
+            model: "client".into(),
+            dimensions: 2,
+            query_prefix: None,
+            document_prefix: None,
+            properties: vec!["title".into()],
+        };
+        let documents = Documents(Arc::new(Embedders::new(Default::default())));
+        assert_eq!(
+            documents.vectors(&supplied, vec!["fox".into()]).await,
+            Err(Unembedded::for_good(
+                "its collection's clients supply the vectors"
+            ))
+        );
     }
 }

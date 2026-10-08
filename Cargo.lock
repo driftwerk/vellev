@@ -4264,6 +4264,7 @@ dependencies = [
  "axum",
  "fastembed",
  "futures",
+ "hf-hub",
  "reqwest",
  "serde",
  "serde_json",

@@ -2,7 +2,9 @@
 //!
 //! A [`Client`] knows several nodes and asks whichever serves a tenant. A
 //! request that fails in a way that may pass is sent again, on the next
-//! node, as long as that cannot make a change twice. Each write is named,
+//! node, as long as that cannot make a change twice. One a node cannot do
+//! as it is set up is asked of each other node once, and fails only when
+//! none of them can. Each write is named,
 //! the same on every try, and a node answers a try of a write it has
 //! already made as it did then, so a write whose fate is unknown is sent
 //! again like a read.
@@ -36,6 +38,7 @@ pub enum Error {
     Http(#[from] reqwest::Error),
     /// The node answered with a failure of its own.
     #[error("vellev answered {status}: {message}")]
+    #[non_exhaustive]
     Api {
         status: StatusCode,
         code: Code,
@@ -75,6 +78,9 @@ enum Fate {
     NoEffect,
     /// It may or may not have been carried out.
     Unknown,
+    /// It had no effect, and the node that answered cannot do it as it is
+    /// set up, however often it is asked; another node may.
+    NotByThisNode,
     /// It was refused for good.
     Final,
 }
@@ -92,6 +98,13 @@ impl Error {
 
     pub fn is_not_found(&self) -> bool {
         self.code() == Some(Code::NotFound)
+    }
+
+    /// Whether no node asked can use the collection's embedding model as
+    /// it is set up. Nothing was done. Keep the request, and send it again
+    /// once a node has been put right; do not drop it.
+    pub fn is_model_unavailable(&self) -> bool {
+        self.code() == Some(Code::ModelUnavailable)
     }
 
     /// What the request asked too much of, and the most it may ask, if the
@@ -137,15 +150,19 @@ impl Error {
             Self::Api { code, .. } => match code {
                 Code::Unavailable => Fate::NoEffect,
                 Code::Uncertain => Fate::Unknown,
+                Code::ModelUnavailable => Fate::NotByThisNode,
                 Code::Invalid
                 | Code::Unauthorized
                 | Code::Forbidden
                 | Code::NotFound
                 | Code::Conflict
                 | Code::Limited
-                | Code::ModelUnavailable
                 | Code::Internal
                 | Code::Unknown => Fate::Final,
+                // A code added after this client was built. A failure that
+                // may pass keeps a code every client knows, so one this
+                // client does not know is final.
+                _ => Fate::Final,
             },
             Self::Status { status, .. } if status.is_server_error() => Fate::Unknown,
             Self::Status { .. } | Self::Unusable(_) => Fate::Final,
@@ -306,11 +323,23 @@ impl Client {
         Ok(())
     }
 
-    /// The most a caller may ask of the node; any key may ask.
-    pub async fn limits(&self) -> Result<Limits> {
+    /// The most a caller may ask of the node; any key may ask. `None`
+    /// from a node of a release before it told them, which answers an
+    /// admin key that there is no such route and a tenant's key that the
+    /// route is not for it. Then go by what a refusal says: see
+    /// [`Error::limit`].
+    pub async fn limits(&self) -> Result<Option<Limits>> {
         let path = format!("{ROOT}/limits");
-        self.ask(Kind::Read, Method::GET, &path, None::<&()>, None)
-            .await
+        let told = self
+            .ask(Kind::Read, Method::GET, &path, None::<&()>, None)
+            .await;
+        match told {
+            Ok(limits) => Ok(Some(limits)),
+            Err(error) if matches!(error.code(), Some(Code::NotFound | Code::Forbidden)) => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Up to `limit` tenants after `after`, in id order.
@@ -348,6 +377,12 @@ impl Client {
     /// Send a request, and again while it fails in a way that may pass
     /// and sending it again is safe, starting from the node that last
     /// answered for the tenant. Every node is tried before any wait.
+    ///
+    /// A node that cannot do the request as it is set up is not asked
+    /// again: the next node that has not said so is asked at once, which
+    /// spends none of the tries, and the request fails that way only once
+    /// every node has said so. A write is made by the one node that holds
+    /// its tenant whichever node is asked, so each then answers alike.
     async fn ask<T: DeserializeOwned>(
         &self,
         kind: Kind,
@@ -360,7 +395,15 @@ impl Client {
         let first = self.known(tenant).node;
         let mut backoff = options.backoff;
         let (mut node, mut moved) = (first, 0);
-        for attempt in 0..options.attempts as usize {
+        let mut unable = vec![false; nodes.len()];
+        // The next node after `node` that has not said it cannot.
+        let next = |node: usize, unable: &[bool]| {
+            (1..=nodes.len())
+                .map(|step| (node + step) % nodes.len())
+                .find(|&other| !unable[other])
+        };
+        let mut attempt = 0;
+        while attempt < options.attempts as usize {
             let (after, request) = match kind {
                 Kind::Read => (tenant.and_then(|tenant| self.after(tenant)), None),
                 Kind::Repeatable => (None, None),
@@ -373,7 +416,16 @@ impl Client {
                 }
                 Err(failure) => failure,
             };
-            if failure.fate() == Fate::Final || attempt + 1 == options.attempts as usize {
+            if failure.fate() == Fate::NotByThisNode {
+                unable[node] = true;
+                match next(node, &unable) {
+                    Some(able) => node = able,
+                    None => return Err(failure),
+                }
+                continue;
+            }
+            attempt += 1;
+            if failure.fate() == Fate::Final || attempt == options.attempts as usize {
                 return Err(failure);
             }
             // Turned away for asking too much: the same of any node, so ask
@@ -383,9 +435,10 @@ impl Client {
                 backoff = backoff.saturating_mul(2).min(LONGEST_BACKOFF);
                 continue;
             }
-            node = (node + 1) % nodes.len();
+            let able = unable.iter().filter(|unable| !**unable).count();
+            node = next(node, &unable).unwrap_or(node);
             moved += 1;
-            if moved % nodes.len() == 0 {
+            if moved % able == 0 {
                 tokio::time::sleep(backoff).await;
                 backoff = backoff.saturating_mul(2).min(LONGEST_BACKOFF);
             }

@@ -128,13 +128,14 @@ impl Bedrock {
                     (Some(said), None) | (None, Some(said)) => said.to_string(),
                     (None, None) => error.to_string(),
                 };
-                // The node's credentials may not invoke the model, or the
-                // region does not have it: nothing passes until the setup
-                // changes. A refused input may be this text's alone.
-                let lasting = error.as_service_error().is_some_and(|refused| {
-                    refused.is_access_denied_exception()
-                        || refused.is_resource_not_found_exception()
-                });
+                // Bedrock says the region has no such model: nothing passes
+                // until the collection or the region is another. Access
+                // denied is not taken so, being also what is said while a
+                // permission just granted spreads; nor a refused input,
+                // which may be this text's alone.
+                let lasting = error
+                    .as_service_error()
+                    .is_some_and(|refused| refused.is_resource_not_found_exception());
                 match lasting {
                     true => EmbedError::Unusable {
                         model: self.model.clone(),

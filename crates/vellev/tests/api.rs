@@ -1315,6 +1315,52 @@ async fn a_write_named_again_is_answered_as_it_was_and_made_once() {
     let (status, refused) = send("not-a-uuid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(code(&refused), "invalid");
+
+    // A refusal answered again says what it said, with what was missing,
+    // even once what was missing is there.
+    for (name, change, message, missing) in [
+        (
+            "6f1c2b9e-1d0a-4c55-9a3e-2f6c4d8b7a11",
+            json!({ "op": "patch", "collection": "notes", "id": id(7), "properties": { "n": 1 } }),
+            format!("object {} does not exist in notes", id(7)),
+            "object",
+        ),
+        (
+            "6f1c2b9e-1d0a-4c55-9a3e-2f6c4d8b7a12",
+            json!({ "op": "delete", "collection": "later", "id": id(7) }),
+            "collection later does not exist".to_string(),
+            "collection",
+        ),
+    ] {
+        let named = [(REQUEST, name)];
+        let send = || {
+            let batch = json!({ "changes": [change] });
+            served.call_headed(Some(KEY), Method::POST, changes, Some(batch), &named)
+        };
+        let expected = (
+            StatusCode::NOT_FOUND,
+            failed("not_found", &message, json!({ "missing": missing })),
+        );
+        assert_eq!(send().await, expected, "{missing}");
+        let mut later = notes(supplied());
+        later["name"] = json!("later");
+        served
+            .ok(
+                Method::PUT,
+                "/v1/tenants/acme/collections/later",
+                Some(later),
+            )
+            .await;
+        let seven = json!({ "properties": { "n": 7 }, "vector": [1, 0] });
+        served
+            .ok(Method::PUT, &common::object(7), Some(seven))
+            .await;
+        assert_eq!(send().await, expected, "{missing}, answered again");
+        served.ok(Method::DELETE, &common::object(7), None).await;
+        served
+            .ok(Method::DELETE, "/v1/tenants/acme/collections/later", None)
+            .await;
+    }
 }
 
 async fn as_key(
@@ -1733,16 +1779,6 @@ async fn a_request_for_more_than_the_node_allows_says_the_most_it_may_ask() {
             ),
         ),
         (
-            Method::POST,
-            format!("{NOTES}/list"),
-            Some(json!({ "limit": 0 })),
-            failed(
-                "invalid",
-                "limit must be from 1 to 50, not 0",
-                limit("results", 50),
-            ),
-        ),
-        (
             Method::GET,
             "/v1/tenants?limit=51".to_string(),
             None,
@@ -1796,6 +1832,42 @@ async fn a_request_for_more_than_the_node_allows_says_the_most_it_may_ask() {
             "what is refused is what is published"
         );
     }
+    // A request for none at all is not helped by the most it may ask.
+    for (method, path, body, expected) in [
+        (
+            Method::POST,
+            format!("{NOTES}/list"),
+            json!({ "limit": 0 }),
+            failed("invalid", "limit must be from 1 to 50, not 0", json!({})),
+        ),
+        (
+            Method::POST,
+            format!("{NOTES}/hybrid"),
+            json!({ "text": "fox", "limit": 1, "candidates": 0 }),
+            failed(
+                "invalid",
+                "candidates must be from 1 to 100, not 0",
+                json!({}),
+            ),
+        ),
+        (
+            Method::PUT,
+            "/v1/tenants/acme/restore-window".to_string(),
+            json!({ "secs": 0 }),
+            failed(
+                "invalid",
+                &format!("a restore window is from 1 to {window} seconds"),
+                json!({}),
+            ),
+        ),
+    ] {
+        let answer = served.call(method.clone(), &path, Some(body)).await;
+        assert_eq!(
+            answer,
+            (StatusCode::BAD_REQUEST, expected),
+            "{method} {path}"
+        );
+    }
     let (status, body) = served
         .post(
             &format!("{NOTES}/nearest"),
@@ -1844,40 +1916,90 @@ async fn the_limits_are_told_to_every_key_and_to_no_caller_without_one() {
     );
 }
 
+/// What a node that cannot use a collection's model answers.
+fn model_unavailable() -> (StatusCode, Value) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        failed(
+            "model_unavailable",
+            "this node cannot use the collection's embedding model as it is set up",
+            json!({}),
+        ),
+    )
+}
+
 #[tokio::test]
-async fn a_model_the_node_cannot_run_is_final_and_a_search_falls_back_to_words() {
+async fn a_collection_whose_model_the_node_cannot_run_is_not_made() {
     let served = Served::new().await;
+    served.ok(Method::PUT, "/v1/tenants/acme", None).await;
     let unheard_of = json!({
         "provider": "local",
         "model": "acme/unheard-of",
         "dimensions": 2,
         "properties": ["title"],
     });
-    served.with_notes(unheard_of).await;
-    let model_unavailable = (
-        StatusCode::NOT_IMPLEMENTED,
-        failed(
-            "model_unavailable",
-            "the collection's embedding model cannot be used by this node",
-            json!({}),
-        ),
+    assert_eq!(
+        served.put(NOTES, notes(unheard_of.clone())).await,
+        model_unavailable()
     );
-    let fox = json!({ "properties": { "title": "a red fox" } });
-    assert_eq!(served.put(&object(1), fox).await, model_unavailable);
-    let batched = json!({ "changes": [{ "op": "upsert", "collection": "notes", "id": id(1), "properties": { "title": "a red fox" } }] });
+    let batched = json!({ "changes": [
+        { "op": "create_collection", "schema": notes(supplied()) },
+        { "op": "drop_collection", "collection": "notes" },
+        { "op": "create_collection", "schema": notes(unheard_of) },
+    ] });
     assert_eq!(
         served.post("/v1/tenants/acme/changes", batched).await,
-        model_unavailable
+        model_unavailable(),
+        "nor in a batch, none of which is made"
     );
-    let nearest = json!({ "text": "fox", "limit": 1 });
     assert_eq!(
-        served.post(&format!("{NOTES}/nearest"), nearest).await,
-        model_unavailable
+        served.get("/v1/tenants/acme/collections").await.1,
+        json!({ "collections": [] })
     );
+    let wrong_size = json!({ "provider": "bedrock", "region": "eu-west-2", "model": "amazon.titan-embed-text-v2:0", "dimensions": 2 });
+    assert_eq!(
+        served.put(NOTES, notes(wrong_size)).await,
+        model_unavailable()
+    );
+    served.ok(Method::PUT, NOTES, Some(notes(supplied()))).await;
+}
 
-    let supplied = json!({ "properties": { "title": "a red fox" }, "vector": [1.0, 0.0] });
-    served.ok(Method::PUT, &object(1), Some(supplied)).await;
-    let by_words = served
+#[tokio::test]
+async fn a_node_set_up_wrong_for_a_model_says_so_and_one_set_up_right_answers() {
+    let url = keyed_embedding_server("sk-right").await;
+    let cluster = Cluster::new();
+    let right = cluster.serve_embedding_keyed(&url, "sk-right").await;
+    let wrong = cluster.serve_embedding_keyed(&url, "sk-wrong").await;
+    let embedding = json!({
+        "provider": "http",
+        "api": "openai",
+        "url": url,
+        "model": "stand-in",
+        "dimensions": 2,
+        "properties": ["title"],
+    });
+    // The node set up right holds the tenant, and so makes its writes
+    // whichever node they reach.
+    right.with_notes(embedding).await;
+    let fox = json!({ "properties": { "title": "a red fox" } });
+    wrong.ok(Method::PUT, &object(1), Some(fox)).await;
+    assert_eq!(right.get(&object(1)).await.1["vector"], json!([9.0, 3.0]));
+
+    // A search is embedded for by the node it reaches.
+    let nearest = json!({ "text": "a red fox", "limit": 1 });
+    let found = right
+        .ok(
+            Method::POST,
+            &format!("{NOTES}/nearest"),
+            Some(nearest.clone()),
+        )
+        .await;
+    assert_eq!(ids(&found), [id(1)]);
+    assert_eq!(
+        wrong.post(&format!("{NOTES}/nearest"), nearest).await,
+        model_unavailable()
+    );
+    let by_words = wrong
         .ok(
             Method::POST,
             &format!("{NOTES}/hybrid"),
@@ -1886,4 +2008,58 @@ async fn a_model_the_node_cannot_run_is_final_and_a_search_falls_back_to_words()
         .await;
     assert_eq!(ids(&by_words), [id(1)]);
     assert_eq!(by_words["degraded"], true);
+    let supplied = json!({ "vector": [9.0, 3.0], "limit": 1 });
+    let found = wrong
+        .ok(Method::POST, &format!("{NOTES}/nearest"), Some(supplied))
+        .await;
+    assert_eq!(
+        ids(&found),
+        [id(1)],
+        "a search that brings its vector needs no model"
+    );
+}
+
+#[tokio::test]
+async fn a_write_the_holding_node_cannot_embed_is_refused_by_every_node_and_makes_nothing() {
+    let url = keyed_embedding_server("sk-right").await;
+    let cluster = Cluster::new();
+    let wrong = cluster.serve_embedding_keyed(&url, "sk-wrong").await;
+    let right = cluster.serve_embedding_keyed(&url, "sk-right").await;
+    let embedding = json!({
+        "provider": "http",
+        "api": "openai",
+        "url": url,
+        "model": "stand-in",
+        "dimensions": 2,
+        "properties": ["title"],
+    });
+    wrong.with_notes(embedding).await;
+    let fox = json!({ "properties": { "title": "a red fox" } });
+    let named = [(REQUEST, "6f1c2b9e-1d0a-4c55-9a3e-2f6c4d8b7a13")];
+    for node in [&wrong, &right, &wrong] {
+        let refused = node
+            .call_headed(
+                Some(KEY),
+                Method::PUT,
+                &object(1),
+                Some(fox.clone()),
+                &named,
+            )
+            .await;
+        assert_eq!(refused, model_unavailable());
+    }
+    assert_eq!(wrong.get(&object(1)).await.0, StatusCode::NOT_FOUND);
+    let batched = json!({ "changes": [{ "op": "upsert", "collection": "notes", "id": id(1), "properties": { "title": "a red fox" } }] });
+    assert_eq!(
+        right.post("/v1/tenants/acme/changes", batched).await,
+        model_unavailable()
+    );
+    // Nothing of the refusal is kept: the same write, named the same,
+    // is made once it brings what the node could not make.
+    let supplied = json!({ "properties": { "title": "a red fox" }, "vector": [9.0, 3.0] });
+    let made = right
+        .call_headed(Some(KEY), Method::PUT, &object(1), Some(supplied), &named)
+        .await;
+    assert_eq!(made.0, StatusCode::OK, "{}", made.1);
+    assert_eq!(wrong.get(&object(1)).await.0, StatusCode::OK);
 }
