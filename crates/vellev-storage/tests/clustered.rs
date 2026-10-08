@@ -369,14 +369,15 @@ async fn an_index_file_that_does_not_fit_the_segments_vectors_is_not_used() {
         found_by_a_scan(format!("an index of {what}")).await;
     }
 
-    for probes in [0, usize::MAX] {
-        let mut stored: StoredIndexes = format::decode(&index, Kind::Index, &original).unwrap();
-        stored.vectors[0].1.probes = probes;
-        let frame = format::encode(Kind::Index, &stored).unwrap();
-        cluster.blobs.delete(&index).await.unwrap();
-        cluster.blobs.put(&index, frame).await.unwrap();
-        found_by_a_scan(format!("an index to scan {probes} clusters")).await;
-    }
+    // More clusters than any index has: used, it overflows where a query
+    // works out what a scan visits. An index to scan none is refused too,
+    // which the index's own tests tell; here it would find the same.
+    let mut stored: StoredIndexes = format::decode(&index, Kind::Index, &original).unwrap();
+    stored.vectors[0].1.probes = usize::MAX;
+    let frame = format::encode(Kind::Index, &stored).unwrap();
+    cluster.blobs.delete(&index).await.unwrap();
+    cluster.blobs.put(&index, frame).await.unwrap();
+    found_by_a_scan("an index to scan more clusters than it has".to_string()).await;
 }
 
 #[tokio::test]
