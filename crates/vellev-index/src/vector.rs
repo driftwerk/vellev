@@ -1083,13 +1083,16 @@ mod tests {
 
     /// Scoring a vector by cosine reads it once, as the inner product does,
     /// and costs little more: a shape of its sums that defeats the
-    /// compiler's vectorising has made it three times as slow before, and a
-    /// zero row, which takes a path of its own, five times. The vectors fit
-    /// in the processor's cache, so that it is the arithmetic that is timed
-    /// and not the memory it is read from, and each kind is timed at its
-    /// fastest of many rounds, which whatever else the machine is doing
-    /// slows least. Timings mean nothing unoptimised, so this runs only in
-    /// a release build.
+    /// compiler's vectorising has made it three times as slow before. A
+    /// zero row, which takes a path of its own, costs little more than any
+    /// other row by cosine, and is held to that rather than to the inner
+    /// product, as the two differ less from one processor to another: it
+    /// has cost three times as much. The vectors fit in the processor's
+    /// cache, so that it is the arithmetic that is timed and not the memory
+    /// it is read from, and each kind is timed at its fastest of many
+    /// rounds, which whatever else the machine is doing slows least.
+    /// Timings mean nothing unoptimised, so this runs only in a release
+    /// build.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "timings mean nothing unoptimised")]
     fn scoring_by_cosine_costs_little_more_than_by_inner_product() {
@@ -1113,14 +1116,20 @@ mod tests {
                 .map_or(0.0, |fastest| fastest.as_secs_f64())
         };
         let inner = fastest(Distance::Dot, &vectors);
-        let cosine = fastest(Distance::Cosine, &vectors) / inner;
-        let over_zero = fastest(Distance::Cosine, &zero) / inner;
+        let cosine = fastest(Distance::Cosine, &vectors);
+        let over_zero = fastest(Distance::Cosine, &zero);
+        let (by_cosine, zero_by_cosine) = (cosine / inner, over_zero / cosine);
         println!(
-            "a cosine score takes {cosine:.2} times an inner product's, \
-             and {over_zero:.2} times over a zero row"
+            "a cosine score takes {by_cosine:.2} times an inner product's; over a zero row \
+             it takes {zero_by_cosine:.2} times its own over any other, and {:.2} times an \
+             inner product's",
+            over_zero / inner
         );
-        assert!(cosine < 3.0, "{cosine:.2} times an inner product's");
-        assert!(over_zero < 4.0, "{over_zero:.2} times over a zero row");
+        assert!(by_cosine < 3.0, "{by_cosine:.2} times an inner product's");
+        assert!(
+            zero_by_cosine < 2.5,
+            "{zero_by_cosine:.2} times a cosine score over any other row"
+        );
     }
 
     /// A vector is at no cosine distance from itself, and so of certainty
