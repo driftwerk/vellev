@@ -306,6 +306,27 @@ async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be
             "only an OpenAI endpoint is taken at OpenAI's word: {code}"
         );
     }
+    // A key the endpoint quotes back, with its middle masked as some do,
+    // is not passed on to be logged.
+    let quoting = json!({ "error": {
+        "message": "Incorrect API key provided: sk-ab…wxyz. Find yours at example.test.",
+        "code": "invalid_api_key",
+    } });
+    let seen = Arc::new(Seen::default());
+    let url = refusing_as_openai(401, quoting, seen.clone()).await;
+    let refused = Http::new(&url, HttpApi::Openai, "m", None)
+        .unwrap()
+        .embed(numbered(1), Purpose::Document)
+        .await
+        .unwrap_err();
+    let said = refused.to_string();
+    assert!(
+        said.contains("Incorrect API key provided: <redacted> Find yours")
+            && !said.contains("wxyz"),
+        "{said}"
+    );
+    assert_eq!(refused.lasting(), Some(ModelFault::Setup));
+
     // Whatever else is said, however plainly, may pass: an account with
     // nothing left to spend is paid up without a change to the node.
     for (status, said) in [

@@ -388,7 +388,8 @@ fn settings_never_print_a_key() {
 }
 
 /// A model that answers each text as the text says: "refused" is refused
-/// for good, "held" waits to be let go first, and "never" never answers.
+/// for good, "failing" fails in a way that may pass, "held" waits to be
+/// let go first, and "never" never answers.
 /// While `refusing`, every text is refused for good, after `slow`.
 #[derive(Debug, Default)]
 struct Told {
@@ -430,6 +431,12 @@ impl Provider for Told {
             self.let_go.notified().await;
         }
         self.in_flight.fetch_sub(1, SeqCst);
+        if says("failing") {
+            return Err(EmbedError::Failed {
+                model: "fake".into(),
+                reason: "503 Service Unavailable".into(),
+            });
+        }
         match self.refusing.load(SeqCst) || says("refused") {
             true => Err(Self::refused()),
             false => Ok(vec![vec![1.0, 2.0]; texts.len()]),
@@ -497,16 +504,19 @@ async fn a_fault_met_by_many_at_once_is_asked_about_once_while_it_stands() {
 
 #[tokio::test(start_paused = true)]
 async fn a_model_that_fails_in_a_way_that_may_pass_is_asked_by_every_call() {
-    // A failure that may pass says nothing of whether the model can be
-    // used: after the first, nobody waits on anybody.
-    let (fake, embedder) = embedder(Fake {
-        failures: Mutex::new(9),
-        ..Fake::default()
+    // A failure that may pass says nothing against the model: after the
+    // first, nobody waits on anybody.
+    let (model, embedder) = told(Told {
+        slow: std::time::Duration::from_millis(50),
+        ..Told::default()
     });
-    let embedder = Arc::new(embedder);
-    let answers = at_once(&embedder, &numbered("fox", 8)).await;
+    let answers = at_once(&embedder, &numbered("failing", 8)).await;
     assert!(answers.iter().all(Result::is_err));
-    assert_eq!(fake.purposes.lock().unwrap().len(), 8);
+    assert_eq!(model.calls(), 8);
+    let most = model
+        .most_in_flight
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(most, 7, "one found out, and the seven went together");
 }
 
 #[tokio::test]

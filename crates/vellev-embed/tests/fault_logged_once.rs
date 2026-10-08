@@ -3,7 +3,7 @@
 //! thread, and tests beside it that log from the same place would decide
 //! between them whether that place is listened to at all.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,17 +12,26 @@ use tracing_subscriber::layer::SubscriberExt;
 use vellev_core::{Embedding, EmbeddingProvider, ModelFault};
 use vellev_embed::{EmbedError, Embedder, Provider, Purpose, Result, FAULT_STANDS};
 
-/// A model that refuses every call for good, after a moment.
+/// A model that refuses every call for good, after a moment: a longer
+/// one for each call that is out at the same time. Until it is told to
+/// refuse, it answers.
 #[derive(Debug, Default)]
 struct Refusing {
     calls: AtomicUsize,
+    out: AtomicUsize,
+    answering: AtomicBool,
 }
 
 #[async_trait]
 impl Provider for Refusing {
-    async fn embed(&self, _: Vec<String>, _: Purpose) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: Vec<String>, _: Purpose) -> Result<Vec<Vec<f32>>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let out = self.out.fetch_add(1, Ordering::SeqCst) as u32 + 1;
+        tokio::time::sleep(Duration::from_millis(50) * out).await;
+        self.out.fetch_sub(1, Ordering::SeqCst);
+        if self.answering.load(Ordering::SeqCst) {
+            return Ok(vec![vec![1.0, 2.0]; texts.len()]);
+        }
         Err(EmbedError::Unusable {
             model: "fake".into(),
             reason: "401 Unauthorized: no such key".into(),
@@ -103,4 +112,31 @@ async fn a_fault_met_by_many_at_once_is_logged_once_in_each_time_it_stands() {
     tokio::time::advance(FAULT_STANDS).await;
     eight("and again").await;
     assert_eq!(so_far(), (3, 3));
+
+    // A model that has been answering is asked by every call as it comes.
+    // Refusing all at once, it is asked by all that were out already, but
+    // the fault is said once, and stands from the first to hear of it,
+    // not the last.
+    model.answering.store(true, Ordering::SeqCst);
+    tokio::time::advance(FAULT_STANDS).await;
+    assert!(embedder.query("it answers").await.is_ok());
+    assert!(embedder.query("and again").await.is_ok());
+    model.answering.store(false, Ordering::SeqCst);
+    let before = so_far();
+    let started = tokio::time::Instant::now();
+    eight("all at once").await;
+    assert_eq!(so_far(), (before.0 + 8, before.1 + 1));
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(50 * 8),
+        "the last heard of it eight times as late as the first"
+    );
+    // The first heard of it 50 ms in: from then it stands, to the moment.
+    tokio::time::advance(FAULT_STANDS - Duration::from_millis(50 * 7) - Duration::from_millis(1))
+        .await;
+    eight("still").await;
+    assert_eq!(so_far(), (before.0 + 8, before.1 + 1));
+    tokio::time::advance(Duration::from_millis(1)).await;
+    eight("no longer").await;
+    assert_eq!(so_far(), (before.0 + 9, before.1 + 2));
 }
