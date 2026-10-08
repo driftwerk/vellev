@@ -1245,3 +1245,29 @@ async fn a_change_is_caught_up_with_however_far_behind_weaviates_clock_is() {
     assert_eq!(importing.counts().await, ([0, 1, 0, 0], [10; 3]));
     importing.assert_same().await;
 }
+
+#[tokio::test]
+async fn the_object_with_the_last_id_of_all_is_deleted_when_weaviate_deletes_it() {
+    let Some(importing) = Importing::new("VellevImportLast", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    let last = (0..10).max_by_key(|n| oid(*n)).unwrap();
+    importing.weaviate.delete(importing.class, last).await;
+    assert_eq!(importing.counts().await, ([0, 0, 1, 0], [9; 3]));
+    assert!(importing.get(last).await.is_none());
+}
+
+#[tokio::test]
+async fn an_import_begun_again_does_not_bring_back_what_another_writer_deleted() {
+    let Some(importing) = Importing::new("VellevImportBegunAgain", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    importing.records.delete(oid(2)).await.unwrap();
+    // With its state lost the import walks every page again, and finds
+    // nothing in the collection under note 2's id.
+    std::fs::remove_file(&importing.options.state).unwrap();
+    assert_eq!(importing.counts().await, ([0, 0, 0, 0], [10, 10, 9]));
+    assert!(importing.get(2).await.is_none());
+}
