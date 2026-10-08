@@ -225,7 +225,7 @@ struct Rule {
     skip: usize,
     act: Box<dyn FnOnce(String) -> Doing + Send>,
     /// What to answer in place of passing it on.
-    answer: Option<StatusCode>,
+    answer: Option<(StatusCode, Value)>,
 }
 
 /// Passes requests on to a Weaviate, doing what its rules say first.
@@ -264,9 +264,10 @@ impl Proxy {
         self.rule(skip, has, Box::new(|line| Box::pin(act(line))), None);
     }
 
-    /// Answer such a request with `status`, once.
-    fn refuse(&self, skip: usize, has: &[&str], status: StatusCode) {
-        self.rule(skip, has, Box::new(|_| Box::pin(async {})), Some(status));
+    /// Answer such a request with `status` and `body`, once.
+    fn answer(&self, skip: usize, has: &[&str], status: StatusCode, body: Value) {
+        let nothing = Box::new(|_| Box::pin(async {}) as Doing);
+        self.rule(skip, has, nothing, Some((status, body)));
     }
 
     fn rule(
@@ -274,7 +275,7 @@ impl Proxy {
         skip: usize,
         has: &[&str],
         act: Box<dyn FnOnce(String) -> Doing + Send>,
-        answer: Option<StatusCode>,
+        answer: Option<(StatusCode, Value)>,
     ) {
         self.rules.lock().unwrap().push(Rule {
             has: has.iter().map(|has| has.to_string()).collect(),
@@ -314,8 +315,8 @@ impl Proxy {
         };
         if let Some(rule) = due {
             (rule.act)(line.clone()).await;
-            if let Some(status) = rule.answer {
-                return status.into_response();
+            if let Some((status, body)) = rule.answer {
+                return (status, axum::Json(body)).into_response();
             }
         }
         let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
@@ -1014,14 +1015,37 @@ async fn a_weaviate_that_turns_requests_away_or_fails_for_a_while_is_asked_again
     };
     let page = importing.page(true);
     let page: Vec<&str> = page.iter().map(String::as_str).collect();
-    importing
-        .proxy
-        .refuse(0, &page, StatusCode::TOO_MANY_REQUESTS);
-    importing
-        .proxy
-        .refuse(0, &page, StatusCode::SERVICE_UNAVAILABLE);
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        importing.proxy.answer(0, &page, status, json!({}));
+    }
     assert_eq!(importing.counts().await, ([120, 0, 0, 0], [120; 3]));
     assert!(importing.proxy.spent());
+}
+
+#[tokio::test]
+async fn a_weaviate_that_lists_its_ids_out_of_order_is_not_caught_up_with() {
+    let Some(importing) = Importing::new("VellevImportUnordered", 120).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+
+    // Walked beside the ledger, a listing out of order would make
+    // objects that are there look gone.
+    let page = importing.page(false);
+    let page: Vec<&str> = page.iter().map(String::as_str).collect();
+    let unordered = json!({ "objects": [{ "id": uuid(3) }, { "id": uuid(2) }] });
+    importing.proxy.answer(0, &page, StatusCode::OK, unordered);
+    let refused = importing.run().await.unwrap_err();
+    assert!(importing.proxy.spent());
+    assert!(
+        refused.to_string().contains("its ids are not in order"),
+        "{refused}"
+    );
+    assert_eq!(importing.records.count(None).await.unwrap(), 120);
+    assert_eq!(importing.counts().await, ([0, 0, 0, 0], [120; 3]));
 }
 
 #[tokio::test]

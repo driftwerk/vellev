@@ -1947,6 +1947,46 @@ mod tests {
     }
 
     #[test]
+    fn an_object_is_read_as_the_collection_holds_one_or_refused_saying_why() {
+        let plan = plan(vec![Property::new("title", DataType::Text)], Copy::Vector);
+        let item = |object: Value| {
+            let object: Object = serde_json::from_value(object).unwrap();
+            object
+                .item(&plan, &options())
+                .map_err(|error| error.to_string())
+        };
+        let read = item(json!({
+            "id": id(1),
+            "properties": { "title": "a red fox", "unset": null },
+            "vector": [],
+            "lastUpdateTimeUnix": "1791489111510",
+        }))
+        .unwrap();
+        assert_eq!(
+            read.content.properties,
+            *json!({ "title": "a red fox" }).as_object().unwrap()
+        );
+        assert_eq!(read.content.vector, None, "an empty vector is none");
+        assert_eq!(read.updated, Some(1_791_489_111_510));
+
+        let gained = item(json!({ "id": id(2), "properties": { "mood": "glad" } }));
+        assert_eq!(
+            gained.err().unwrap(),
+            format!("object {} of Memory has a property mood that the class did not have when this run began; run again", id(2))
+        );
+        let longer = item(json!({ "id": id(3), "vector": [1.0, 2.0] }));
+        assert!(longer.err().unwrap().starts_with(&format!(
+            "object {} of Memory has a vector of 2 dimensions, not the collection's 4",
+            id(3)
+        )));
+        let mistyped = item(json!({ "id": id(4), "properties": { "title": 4 } }));
+        assert!(mistyped
+            .err()
+            .unwrap()
+            .starts_with(&format!("object {} of Memory: ", id(4))));
+    }
+
+    #[test]
     fn objects_go_to_a_request_until_it_is_full_and_a_large_one_goes_alone() {
         let item = |n: u8, bytes: usize| {
             let properties = json!({ "title": "x".repeat(bytes) });
