@@ -15,6 +15,19 @@ use crate::{EmbedError, Provider, Purpose, Result};
 /// right takes effect within it.
 pub const FAULT_STANDS: Duration = Duration::from_secs(20);
 
+/// The shortest and the longest a fault can be told to stand. With no
+/// time at all it would be said on every call that met it, which is what
+/// its standing is there to prevent; and one standing for days would keep
+/// a node whose setup had been put right from finding that out.
+const SHORTEST_STANDING: Duration = Duration::from_secs(1);
+const LONGEST_STANDING: Duration = Duration::from_secs(60 * 60);
+
+/// `asked`, as long as a fault can be told to stand: no less than a
+/// second, and no more than an hour.
+pub(crate) fn standing(asked: Duration) -> Duration {
+    asked.clamp(SHORTEST_STANDING, LONGEST_STANDING)
+}
+
 /// How many query vectors an embedder keeps: one request often searches
 /// several times with the same text.
 const QUERY_CACHE: usize = 1_024;
@@ -70,6 +83,10 @@ struct Health {
     fault: Option<(Instant, EmbedError)>,
     /// How many times the model has answered well.
     answered: u64,
+    /// When a fault was last said. Nothing but time passing lets one be
+    /// said again: not the fault being lifted, which a model that answers
+    /// some calls and refuses others has done to it over and over.
+    said: Option<Instant>,
 }
 
 impl Embedder {
@@ -84,11 +101,12 @@ impl Embedder {
     }
 
     /// This embedder, taking a lasting fault to stand for `fault_stands`
-    /// rather than [`FAULT_STANDS`].
+    /// rather than [`FAULT_STANDS`]: no less than a second, and no more
+    /// than an hour, whatever is asked.
     #[must_use]
     pub fn standing_for(self, fault_stands: Duration) -> Self {
         Self {
-            fault_stands,
+            fault_stands: standing(fault_stands),
             ..self
         }
     }
@@ -136,12 +154,13 @@ impl Embedder {
         let before = self.standing()?;
         let made = self.made(texts, wanted, purpose).await;
         if let Some((fault, lies_in)) = self.heard(before, &made) {
-            // Said here, once for as long as it stands, with nothing held.
+            // Said here, with nothing held, and no more often than once
+            // in the time a fault stands.
             tracing::error!(
                 model = %self.embedding.model,
                 ?lies_in,
                 cause = %fault,
-                "the embedding model cannot be used; not asking it again for {:?}",
+                "the embedding model cannot be used; this is said no more than once in {:?}",
                 self.fault_stands
             );
         }
@@ -154,10 +173,11 @@ impl Embedder {
     /// Nothing else keeps a call from the model: no call waits on another
     /// to find out whether the model can be used. So the calls that are
     /// out when a fault first shows, or go out before the first of them
-    /// hears of it, each ask the model once and are each refused. What is
-    /// kept to is that the fault is said once for as long as it stands,
-    /// and that the model is not asked again while it does: not that it
-    /// is asked once.
+    /// hears of it, each ask the model once and are each refused. And a
+    /// model that answers some calls and refuses others goes on being
+    /// asked: each answer lifts the fault. What is kept to is that a
+    /// model that refuses every call is not asked again while the fault
+    /// stands: not that it is asked once.
     fn standing(&self) -> Result<u64> {
         let mut health = self.health.lock().expect("health lock");
         if health
@@ -174,15 +194,18 @@ impl Embedder {
     }
 
     /// Take note of how a call that went out when the model had answered
-    /// well `before` times came back. The fault it met, with where that
-    /// lies, if it is one that now stands and is to be said.
+    /// well `before` times came back. The lasting fault it met, with
+    /// where that lies, if it is to be said: which it is if none has been
+    /// said in the time a fault stands, whether or not this one does. So
+    /// a fault is said at most once in that time, whatever the model does
+    /// meanwhile.
     ///
     /// The model answering lifts whatever fault stands: a call that had
     /// yet to come back when the fault was met shows it has passed. A
     /// fault met by a call the model has answered another well since is
     /// one put right meanwhile, and does not stand, however late the news
-    /// of it comes. And one that stands already is not said again, nor
-    /// made to stand the longer.
+    /// of it comes. And one that stands already is not made to stand the
+    /// longer.
     fn heard<T>(&self, before: u64, made: &Result<T>) -> Option<(EmbedError, ModelFault)> {
         let mut health = self.health.lock().expect("health lock");
         match made {
@@ -193,9 +216,15 @@ impl Embedder {
             }
             Err(error) => {
                 let lies_in = error.lasting()?;
-                let stands = health.answered == before && health.fault.is_none();
-                stands.then(|| {
-                    health.fault = Some((Instant::now(), error.clone()));
+                let now = Instant::now();
+                if health.answered == before && health.fault.is_none() {
+                    health.fault = Some((now, error.clone()));
+                }
+                let unsaid = health
+                    .said
+                    .is_none_or(|said| now.duration_since(said) >= self.fault_stands);
+                unsaid.then(|| {
+                    health.said = Some(now);
                     (error.clone(), lies_in)
                 })
             }

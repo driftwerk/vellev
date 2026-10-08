@@ -327,6 +327,31 @@ async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be
     );
     assert_eq!(refused.lasting(), Some(ModelFault::Setup));
 
+    // What is said is cut short, and a key that lies across the cut is
+    // taken out whole: no part of it is left at the end.
+    let key = "sk-proj-AbCd1234EfGh5678IjKl9012MnOp";
+    for kept in [1, 3, 7, 8, 10, 19, 20, 30, key.len()] {
+        let said = format!("{} {key} is not a key of ours", "é".repeat(298 - kept));
+        let seen = Arc::new(Seen::default());
+        let url = refusing_as_openai(400, json!(said), seen.clone()).await;
+        let refused = Http::new(&url, HttpApi::Openai, "m", None)
+            .unwrap()
+            .embed(numbered(1), Purpose::Document)
+            .await
+            .unwrap_err();
+        let whole = json!(said).to_string().replace(key, "<redacted>");
+        let cut: String = whole.chars().take(300).collect();
+        assert_eq!(
+            refused,
+            EmbedError::Failed {
+                model: "m".into(),
+                reason: format!("400 Bad Request: {cut}"),
+            },
+            "with {kept} of the key before the cut"
+        );
+        assert!(!refused.to_string().contains("sk-"), "{refused}");
+    }
+
     // Whatever else is said, however plainly, may pass: an account with
     // nothing left to spend is paid up without a change to the node.
     for (status, said) in [

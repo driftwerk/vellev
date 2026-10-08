@@ -14,7 +14,7 @@ use vellev_embed::{EmbedError, Embedder, Provider, Purpose, Result, FAULT_STANDS
 
 /// A model that refuses every call for good, after a moment: a longer
 /// one for each call that is out at the same time. Until it is told to
-/// refuse, it answers.
+/// refuse, it answers; and it always answers a text that begins "ok".
 #[derive(Debug, Default)]
 struct Refusing {
     calls: AtomicUsize,
@@ -29,7 +29,8 @@ impl Provider for Refusing {
         let out = self.out.fetch_add(1, Ordering::SeqCst) as u32 + 1;
         tokio::time::sleep(Duration::from_millis(50) * out).await;
         self.out.fetch_sub(1, Ordering::SeqCst);
-        if self.answering.load(Ordering::SeqCst) {
+        let ok = texts.iter().all(|text| text.starts_with("ok"));
+        if ok || self.answering.load(Ordering::SeqCst) {
             return Ok(vec![vec![1.0, 2.0]; texts.len()]);
         }
         Err(EmbedError::Unusable {
@@ -133,4 +134,28 @@ async fn logged_once() {
     assert_eq!(so_far(), (16 + 1 + 8, 3));
     eight("meanwhile").await;
     assert_eq!(so_far(), (16 + 1 + 8, 3));
+
+    // A model that answers one call and refuses the next, asked by many
+    // at once and over and over: each answer lifts the fault, so it goes
+    // on being asked, by every call. And the fault is still said once in
+    // each time one stands, and no more.
+    tokio::time::advance(FAULT_STANDS * 2).await;
+    let (calls, said) = so_far();
+    let started = tokio::time::Instant::now();
+    let mut asked = 0;
+    for time in 0..4 {
+        tokio::time::sleep_until(started + FAULT_STANDS * time).await;
+        for _ in 0..3 {
+            let texts: Vec<String> = (asked..asked + 64)
+                .map(|n| format!("{} {n}", ["no", "ok"][n % 2]))
+                .collect();
+            asked += texts.len();
+            let answers =
+                futures::future::join_all(texts.iter().map(|text| embedder.query(text))).await;
+            let refused = answers.iter().filter(|answer| answer.is_err()).count();
+            assert_eq!(refused, 32, "every other call");
+            assert_eq!(so_far(), (calls + asked, said + time as usize + 1));
+        }
+        assert!(started.elapsed() < FAULT_STANDS * (time + 1));
+    }
 }

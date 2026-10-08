@@ -211,6 +211,29 @@ async fn a_model_that_cannot_be_used_is_not_asked_again_while_the_fault_stands()
     assert_eq!(embedder.query("fox").await, Ok(Some(vec![9.0, 1.0])));
     assert_eq!(asked(), 2);
 
+    // However long it is told to stand, it stands no less than a second
+    // and no more than an hour.
+    let second = std::time::Duration::from_secs(1);
+    let ms = std::time::Duration::from_millis(1);
+    for (told, stands) in [
+        (std::time::Duration::ZERO, second),
+        (ms, second),
+        (std::time::Duration::MAX, second * 3_600),
+    ] {
+        let fake = Arc::new(Fake::default());
+        *fake.refusing.lock().unwrap() = Some(unusable.clone());
+        let embedder =
+            Embedder::new(fake.clone(), embedding(EmbeddingProvider::Local)).standing_for(told);
+        let asked = || fake.purposes.lock().unwrap().len();
+        assert_eq!(embedder.query("fox").await, Err(unusable.clone()));
+        tokio::time::advance(stands - ms).await;
+        assert_eq!(embedder.query("fox").await, Err(unusable.clone()));
+        assert_eq!(asked(), 1, "told {told:?}, it still stands");
+        tokio::time::advance(ms).await;
+        assert_eq!(embedder.query("fox").await, Err(unusable.clone()));
+        assert_eq!(asked(), 2, "told {told:?}, it stands no longer");
+    }
+
     // A fault of the model's own making stands likewise: vectors of
     // another size than the collection's.
     let wrong_size = Fake {
@@ -445,6 +468,19 @@ impl Provider for Told {
     }
 }
 
+/// Wait, with the clock where it is, for `model` to have been called
+/// `calls` times. Should it never be, this fails rather than waits for
+/// ever.
+async fn called(model: &Told, calls: usize) {
+    for _ in 0..10_000 {
+        if model.calls() >= calls {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the model was called {} times, not {calls}", model.calls());
+}
+
 fn told(model: Told) -> (Arc<Told>, Arc<Embedder>) {
     let model = Arc::new(model);
     let embedder = Embedder::new(model.clone(), embedding(EmbeddingProvider::Local));
@@ -505,9 +541,7 @@ async fn a_call_never_waits_on_another_whatever_the_other_is_about() {
         let embedder = embedder.clone();
         tokio::spawn(async move { embedder.documents(&["held".to_string()]).await })
     };
-    while model.calls() < 1 {
-        tokio::task::yield_now().await;
-    }
+    called(&model, 1).await;
     // A query meanwhile is answered in its own time: at once.
     let started = tokio::time::Instant::now();
     let answered = tokio::time::timeout(std::time::Duration::from_secs(1), embedder.query("fox"));
@@ -532,9 +566,7 @@ async fn a_fault_that_comes_to_light_after_the_model_has_answered_well_since_doe
         let embedder = embedder.clone();
         tokio::spawn(async move { embedder.query("refused, once held").await })
     };
-    while model.calls() < 2 {
-        tokio::task::yield_now().await;
-    }
+    called(&model, 2).await;
     // The setup is put right, and the model answers, before the earlier
     // call hears that it was refused.
     assert!(embedder.query("asked since").await.is_ok());
@@ -555,9 +587,7 @@ async fn a_fault_that_stands_is_lifted_by_the_model_answering_well_however_late(
         let embedder = embedder.clone();
         tokio::spawn(async move { embedder.query("held").await })
     };
-    while model.calls() < 2 {
-        tokio::task::yield_now().await;
-    }
+    called(&model, 2).await;
     assert_eq!(embedder.query("refused").await, Err(Told::refused()));
     assert_eq!(
         embedder.query("asked while it stands").await,

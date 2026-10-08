@@ -107,46 +107,98 @@ impl EmbedError {
 /// What stands where a key was.
 const REDACTED: &str = "<redacted>";
 
-/// The shapes a key is known by, each with what is put in its place. They
-/// are looked for anywhere in what is said, not word by word: a key comes
-/// in a path, in markup, or with a full stop after it as readily as alone.
-static KEYS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
-    // What an OpenAI or Anthropic key, or a Hugging Face token, is made of.
+/// A shape a key is known by. What `found` finds is a key if what it
+/// names `key` passes `is_key` and is not followed by a character that
+/// `goes_on` it into something longer; whatever it names `kept`, before
+/// the key, is left.
+struct Shape {
+    found: Regex,
+    is_key: fn(&str) -> bool,
+    goes_on: fn(char) -> bool,
+}
+
+/// The shapes keys are known by. They are looked for anywhere in what is
+/// said, as it is said and with nothing decoded: a key comes in a path, in
+/// markup, before a full stop, and straight after an escape such as `\n`
+/// or `\u0026` in a body quoted as JSON, as readily as alone. So no shape
+/// asks for anything in particular to come before it: what a key begins
+/// with, and how long it is, is what tells it.
+static KEYS: LazyLock<Vec<Shape>> = LazyLock::new(|| {
+    // What an OpenAI, Anthropic or Google key is made of, and a Hugging
+    // Face token.
     const KEY: &str = "[A-Za-z0-9_-]";
     const TOKEN: &str = "[A-Za-z0-9]";
     // How the middle of a key is masked by whoever quotes it back.
-    const MASK: &str = r"(?:\u{2026}|\.{3}|\*{2,})";
-    let whole = REDACTED.to_string();
-    let after = |kept: &str| format!("{kept}{REDACTED}");
+    const MASK: &str = r"(?:\u{2026}|\.{3}|\*+)";
+    // What a name in a query string, or a scheme, may come straight after:
+    // nothing, anything that is not part of a name, or an escape.
+    const BEFORE: &str = r"(?:^|[^A-Za-z0-9_]|\\u[0-9A-Fa-f]{4}|\\[nrt]|%[0-9A-Fa-f]{2})";
+    let any: fn(&str) -> bool = |_| true;
+    let never: fn(char) -> bool = |_| false;
+    let key_char: fn(char) -> bool = |c| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    // A run of letters and digits both: a word of prose, however long and
+    // hyphenated, has no digit in it.
+    let mixed: fn(&str) -> bool = |key| {
+        key.chars().any(|c| c.is_ascii_digit()) && key.chars().any(|c| c.is_ascii_alphabetic())
+    };
+    // A credential and not a word said after the scheme's name: it has a
+    // digit, or is long and is not lower-case words joined together.
+    let credential: fn(&str) -> bool = |key| {
+        let words = |c: char| c.is_ascii_lowercase() || "-_.".contains(c);
+        key.chars().any(|c| c.is_ascii_digit()) || (key.len() >= 24 && !key.chars().all(words))
+    };
     [
         // A JSON web token: three runs of base64url, the first of a header.
         (
-            format!(r"\beyJ{KEY}{{4,}}\.{KEY}{{4,}}\.{KEY}{{4,}}"),
-            whole.clone(),
+            format!(r"(?P<key>eyJ{KEY}{{4,}}\.{KEY}{{4,}}\.{KEY}{{4,}})"),
+            any,
+            never,
         ),
-        // What is sent as a bearer or basic credential, if it is as long
-        // as one: the word is also said of credentials in passing.
+        // What is sent as a bearer or basic credential.
         (
-            r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]{16,}".to_string(),
-            after("${1}"),
+            format!(r"(?i)(?P<kept>{BEFORE}(?:bearer|basic)\s+)(?P<key>[A-Za-z0-9._~+/=-]{{16,}})"),
+            credential,
+            never,
         ),
         // A key or token given in a query string, up to the next part.
         (
-            r#"(?i)\b((?:api[_-]?key|access_token|token|key)=)[^&\s"'<>]+"#.to_string(),
-            after("${1}"),
+            format!(
+                r#"(?i)(?P<kept>{BEFORE}(?:api[_-]?key|access_token|token|key)=)(?P<key>[^&\s"'<>\\]+)"#
+            ),
+            any,
+            never,
         ),
         // OpenAI's and Anthropic's keys, `sk-`, `sk-proj-` and `sk-ant-`
-        // among them: masked, or at their length.
-        (format!(r"\bsk-{KEY}*{MASK}{KEY}*"), whole.clone()),
-        (format!(r"\bsk-{KEY}{{20,}}"), whole.clone()),
+        // among them: masked, with something of the key to either side of
+        // the mask, or at their length.
+        (
+            format!(r"(?P<key>sk-(?:{KEY}{{2,}}{MASK}{KEY}*|{KEY}*{MASK}{KEY}{{2,}}))"),
+            any,
+            never,
+        ),
+        (format!(r"(?P<key>sk-{KEY}{{20,}})"), mixed, never),
         // Hugging Face's tokens, likewise.
-        (format!(r"\bhf_{TOKEN}*{MASK}{TOKEN}*"), whole.clone()),
-        (format!(r"\bhf_{TOKEN}{{20,}}"), whole.clone()),
+        (
+            format!(r"(?P<key>hf_(?:{TOKEN}{{2,}}{MASK}{TOKEN}*|{TOKEN}*{MASK}{TOKEN}{{2,}}))"),
+            any,
+            never,
+        ),
+        (format!(r"(?P<key>hf_{TOKEN}{{20,}})"), mixed, never),
+        // A Google API key.
+        (format!(r"(?P<key>AIza{KEY}{{35}})"), any, key_char),
         // An AWS access key id.
-        (r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b".to_string(), whole),
+        (
+            r"(?P<key>(?:AKIA|ASIA)[A-Z0-9]{16})".to_string(),
+            any,
+            |c| c.is_ascii_uppercase() || c.is_ascii_digit(),
+        ),
     ]
     .into_iter()
-    .map(|(shape, instead)| (Regex::new(&shape).expect("a key's shape"), instead))
+    .map(|(found, is_key, goes_on)| Shape {
+        found: Regex::new(&found).expect("a key's shape"),
+        is_key,
+        goes_on,
+    })
     .collect()
 });
 
@@ -154,28 +206,46 @@ static KEYS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
 /// taken out, wherever in it the key lies:
 ///
 /// - a JSON web token;
-/// - sixteen characters or more of a credential after `Bearer` or `Basic`;
+/// - a credential of sixteen characters or more after `Bearer` or `Basic`,
+///   if it has a digit in it, or is of twenty-four or more and not
+///   lower-case words joined by `-`, `_` or `.`;
 /// - the value of `api_key`, `api-key`, `key`, `token` or `access_token`
-///   in a query string;
-/// - a key beginning `sk-`, of twenty characters or more after that, or
-///   with its middle masked by `…`, `...` or asterisks;
-/// - a Hugging Face token, `hf_` and twenty letters and digits or more, or
-///   masked likewise;
+///   in a query string, whatever the value is;
+/// - a key beginning `sk-`: of twenty characters or more after that, with
+///   a letter and a digit among them, or with its middle masked by `…`,
+///   `...` or asterisks and two characters or more of it left on a side;
+/// - a Hugging Face token, `hf_` and twenty letters and digits or more,
+///   some of each, or masked likewise;
+/// - a Google API key, `AIza` and thirty-five characters;
 /// - an AWS access key id, `AKIA` or `ASIA` and sixteen capitals and
 ///   digits.
 ///
 /// Nothing else is: not a key with no shape of its own, such as an Azure
 /// key of thirty-two hex digits or an AWS secret of forty characters,
 /// which nothing tells from a hash or an id, and taking which for keys
-/// would take much else. A model's name is left as it is.
+/// would take much else. Nor is anything decoded to look inside it. A
+/// model's name is left as it is. What is not a key and is taken for one,
+/// such as a word of twenty characters with a digit in it that happens to
+/// follow `sk-`, costs a detail of what went wrong and no more.
 pub(crate) fn without_keys(said: &str) -> String {
-    KEYS.iter()
-        .fold(said.to_string(), |said, (shape, instead)| {
-            match shape.replace_all(&said, instead.as_str()) {
-                std::borrow::Cow::Borrowed(_) => said,
-                std::borrow::Cow::Owned(without) => without,
+    KEYS.iter().fold(said.to_string(), |said, shape| {
+        let mut without = String::with_capacity(said.len());
+        let mut copied = 0;
+        for found in shape.found.captures_iter(&said) {
+            let (Some(whole), Some(key)) = (found.get(0), found.name("key")) else {
+                continue;
+            };
+            let goes_on = said[key.end()..].chars().next().is_some_and(shape.goes_on);
+            if goes_on || !(shape.is_key)(key.as_str()) {
+                continue;
             }
-        })
+            without.push_str(&said[copied..key.start()]);
+            without.push_str(REDACTED);
+            copied = whole.end();
+        }
+        without.push_str(&said[copied..]);
+        without
+    })
 }
 
 /// What texts are embedded for. Someone is waiting on a query, so where a
@@ -203,94 +273,144 @@ mod tests {
         const ANT: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
         const HF: &str = "hf_abcdefghij0123456789ABCD";
         const AWS: &str = "AKIAIOSFODNN7EXAMPLE";
+        const GOOGLE: &str = "AIzaSyA-0123456789abcdefghijklmnopqrstu";
         const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl";
+        assert_eq!(GOOGLE.len(), 4 + 35);
+        let r = REDACTED;
         let cases = [
             // Alone, and as servers quote them back.
             (
                 format!("Incorrect API key provided: {SK}."),
-                "Incorrect API key provided: <redacted>.".to_string(),
+                format!("Incorrect API key provided: {r}."),
             ),
-            (
-                format!("key {ANT} refused"),
-                "key <redacted> refused".into(),
-            ),
+            (format!("key {ANT} refused"), format!("key {r} refused")),
             (
                 "Incorrect API key provided: sk-\u{2026}abcd".into(),
-                "Incorrect API key provided: <redacted>".into(),
+                format!("Incorrect API key provided: {r}"),
             ),
             (
                 "key sk-ab...wxyz refused".into(),
-                "key <redacted> refused".into(),
+                format!("key {r} refused"),
             ),
             (
                 "key 'sk-****abcd' refused".into(),
-                "key '<redacted>' refused".into(),
+                format!("key '{r}' refused"),
             ),
+            ("key sk-ab*Wq9Z refused".into(), format!("key {r} refused")),
             // In a path, in markup, after a full stop.
             (
                 format!("GET /v1/keys/{SK} failed"),
-                "GET /v1/keys/<redacted> failed".into(),
+                format!("GET /v1/keys/{r} failed"),
             ),
-            (format!("<{SK}>"), "<<redacted>>".into()),
+            (format!("<{SK}>"), format!("<{r}>")),
             (
                 format!("key.{SK} is not one"),
-                "key.<redacted> is not one".into(),
+                format!("key.{r} is not one"),
             ),
             (
                 format!("token {HF} is not valid"),
-                "token <redacted> is not valid".into(),
+                format!("token {r} is not valid"),
             ),
-            (format!("token {HF}."), "token <redacted>.".into()),
+            (format!("token {HF}."), format!("token {r}.")),
             (
                 "token hf_ab\u{2026}wxyz is not valid".into(),
-                "token <redacted> is not valid".into(),
+                format!("token {r} is not valid"),
             ),
             (
                 "token hf_ab***wxyz is not valid".into(),
-                "token <redacted> is not valid".into(),
+                format!("token {r} is not valid"),
+            ),
+            (
+                "token hf_ab*wxyz is not valid".into(),
+                format!("token {r} is not valid"),
             ),
             (
                 format!("The security token {AWS} is not valid"),
-                "The security token <redacted> is not valid".into(),
+                format!("The security token {r} is not valid"),
             ),
-            (format!("{AWS}."), "<redacted>.".into()),
+            (format!("{AWS}."), format!("{r}.")),
             (
                 format!("Credential={AWS}/20261008/eu-west-2/bedrock/aws4_request"),
-                "Credential=<redacted>/20261008/eu-west-2/bedrock/aws4_request".into(),
+                format!("Credential={r}/20261008/eu-west-2/bedrock/aws4_request"),
             ),
             (
                 format!("<AWSAccessKeyId>{AWS}</AWSAccessKeyId>"),
-                "<AWSAccessKeyId><redacted></AWSAccessKeyId>".into(),
+                format!("<AWSAccessKeyId>{r}</AWSAccessKeyId>"),
             ),
             (
                 "id ASIA0123456789ABCDEF, expired".into(),
-                "id <redacted>, expired".into(),
+                format!("id {r}, expired"),
             ),
+            (
+                format!("API key not valid: {GOOGLE}."),
+                format!("API key not valid: {r}."),
+            ),
+            // Straight after an escape, a word, or anything else: in a body
+            // quoted as JSON, with its backslashes as they were written.
+            (
+                format!(r"Traceback:\n  File x\n{SK}"),
+                format!(r"Traceback:\n  File x\n{r}"),
+            ),
+            (
+                format!(r"line one\n{HF}\nline three"),
+                format!(r"line one\n{r}\nline three"),
+            ),
+            (format!(r"\t{AWS}\r\n"), format!(r"\t{r}\r\n")),
+            (
+                format!(r"https://e.test/v1?alt=json\u0026key={GOOGLE}"),
+                format!(r"https://e.test/v1?alt=json\u0026key={r}"),
+            ),
+            (
+                r"?alt=json\u0026key=abc123\u0026x=1".into(),
+                format!(r"?alt=json\u0026key={r}\u0026x=1"),
+            ),
+            (
+                r"failed:\ntoken=abc123".into(),
+                format!(r"failed:\ntoken={r}"),
+            ),
+            (format!("api_key%3D{SK}"), format!("api_key%3D{r}")),
+            (
+                "redirect%26key=abc123&next=1".into(),
+                format!("redirect%26key={r}&next=1"),
+            ),
+            (format!("prefix_{SK}"), format!("prefix_{r}")),
+            (format!("was{SK}"), format!("was{r}")),
+            (format!("7{HF}"), format!("7{r}")),
+            (format!("x{AWS}"), format!("x{r}")),
+            (format!("x{GOOGLE}"), format!("x{r}")),
+            (format!("x{JWT}"), format!("x{r}")),
+            (format!("密钥{SK}无效"), format!("密钥{r}无效")),
+            (format!("密钥{AWS}无效"), format!("密钥{r}无效")),
             // Sent as a credential, or in a query string.
             (
-                "Authorization: Bearer abcdefghij.klmnop_qrst was refused".into(),
-                "Authorization: Bearer <redacted> was refused".into(),
+                "Authorization: Bearer abcdefghij.klmnop_qrst7 was refused".into(),
+                format!("Authorization: Bearer {r} was refused"),
+            ),
+            (
+                "Bearer ABCDEFGHIJKLMNOPQRSTUVWXYZ refused".into(),
+                format!("Bearer {r} refused"),
             ),
             (
                 "authorization: basic dXNlcjpwYXNzd29yZA== refused".into(),
-                "authorization: basic <redacted> refused".into(),
+                format!("authorization: basic {r} refused"),
             ),
             (
-                format!("token {JWT} expired"),
-                "token <redacted> expired".into(),
+                r"refused:\nBearer abcdefghijklmnop1234".into(),
+                format!(r"refused:\nBearer {r}"),
             ),
-            (format!("Bearer {JWT}"), "Bearer <redacted>".into()),
+            (format!("token {JWT} expired"), format!("token {r} expired")),
+            (format!("Bearer {JWT}"), format!("Bearer {r}")),
             (
                 "GET /embed?api_key=abc123&model=m&access_token=xyz failed".into(),
-                "GET /embed?api_key=<redacted>&model=m&access_token=<redacted> failed".into(),
+                format!("GET /embed?api_key={r}&model=m&access_token={r} failed"),
             ),
             (
                 "https://e.test/v1?key=abc123 refused".into(),
-                "https://e.test/v1?key=<redacted> refused".into(),
+                format!("https://e.test/v1?key={r} refused"),
             ),
             (
                 "?api-key=abc&token=def".into(),
-                "?api-key=<redacted>&token=<redacted>".into(),
+                format!("?api-key={r}&token={r}"),
             ),
         ];
         for (said, kept) in cases {
@@ -302,14 +422,21 @@ mod tests {
             r#"{"token_type":"bearer","expires_in":3600}"#,
             "Bearer realm=\"api\"",
             "use the Bearer scheme, or Basic if you must",
+            "Bearer authorization-header-missing",
+            "Bearer authentication_is_required_for_this_endpoint",
+            "Basic credentials.were.not.given",
             "model sk-embed-v2 not found",
             "model text-embedding-3-small not found",
             "BAAI/bge-base-en-v1.5 via hf_hub is not sk- shaped",
             "amazon.titan-embed-text-v2:0 in AKIAshort or a task-list",
             "AKIAIOSFODNN7EXAMPLEANDMORE is too long to be one",
             "a risk-assessment of ask-me-anything-about-embeddings-today",
+            "logs in disk-*.log and task-* queues, risk-...",
+            "hf_hub_download and hf_transfer are how models are fetched",
             "max_token=5 and monkey=banana",
             "eyJ is how a token begins, a.b.c is not one",
+            "AIza is how a Google key begins",
+            "AIzaSyA-0123456789abcdefghijklmnopqrstuvwxyz is too long to be one",
             "a hash 0123456789abcdef0123456789abcdef has no shape of its own",
             "<redacted>",
             "",

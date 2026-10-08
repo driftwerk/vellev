@@ -238,22 +238,33 @@ the model says outright in its own code for it, and `reason` says which:
 
 It never means the request is at fault or may be dropped. Keep it, and
 send it again once the node is put right; one that brings its own vector
-needs no model. A node that has met such a fault does not ask the model
-again for 20 seconds, and logs it once in that time however many requests
-meet it, at once or one after another, hybrid searches that fall back
-among them; so a setup put right takes effect within that. That is all
-that is promised: no request waits on another to find out whether a model
-can be used, so the requests already on their way to the model when a
-fault first shows, or that set out before the first of them hears of it,
-each reach the model once and are each refused. A model that answers a
-request lifts a fault at once.
+needs no model. Three things are promised of a node that meets such a
+fault, and no more:
+
+- It logs the fault at most once in 20 seconds for each way of embedding,
+  however many requests meet it, at once or one after another, hybrid
+  searches that fall back among them, and whatever the model does
+  meanwhile.
+- A model that refuses every request is not asked again within 20 seconds
+  of the first refusal; so a setup put right takes effect within that.
+- A model that answers some requests and refuses others goes on being
+  asked: an answer lifts the fault at once.
+
+No request waits on another to find out whether a model can be used, so
+the requests already on their way to the model when a fault first shows,
+or that set out before the first of them hears of it, each reach the
+model once and are each refused.
 
 What a model's server says is logged without what is shaped like a key in
-it: a JSON web token, what follows `Bearer` or `Basic` if it is as long as
-a credential, a key or token given in a query string, keys beginning `sk-`
-and Hugging Face's tokens, whole or masked, and AWS access key ids. A key
-with no shape of its own, such as an AWS secret or an Azure key, is not
-known for one.
+it, wherever in the text it lies, and before the text is cut short: a JSON
+web token; what follows `Bearer` or `Basic`, if it is 16 characters or
+more with a digit among them, or 24 or more and not only lower-case words
+joined by hyphens, underscores or full stops; whatever is given as `key`, `token`,
+`access_token` or `api_key` in a query string, a key or not; keys
+beginning `sk-` and Hugging Face's tokens, whole or masked; Google API
+keys; and AWS access key ids. Nothing is decoded to look for one: a key
+written with escapes inside it is not seen. Nor is a key with no shape of
+its own, such as an AWS secret or an Azure key.
 
 The 20 seconds cut the other way too: something in front of an OpenAI
 endpoint that answers `model_not_found` or `invalid_api_key` for a moment,

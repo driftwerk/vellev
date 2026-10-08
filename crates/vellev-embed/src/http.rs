@@ -155,7 +155,10 @@ impl Http {
                         .map(Duration::from_secs);
                     let refusal = response.text().await.unwrap_or_default();
                     let lasting = fault(self.api, &refusal);
-                    let refusal = self.redacted(refusal);
+                    // Keys are taken out of all of it before any of it is
+                    // cut off: a key cut short is no longer shaped like
+                    // one, and what was left of it would be passed on.
+                    let refusal = crate::without_keys(&self.redacted(refusal));
                     let refusal: String = refusal.chars().take(REFUSAL_CHARS).collect();
                     let passing =
                         lasting.is_none() && (status.as_u16() == 429 || status.is_server_error());

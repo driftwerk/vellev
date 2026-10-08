@@ -17,7 +17,8 @@ pub struct Settings {
     /// as collections give it. No other endpoint is sent a token.
     pub keys: HashMap<String, String>,
     /// How long a model found to be one that cannot be used is taken to
-    /// stay so, without being asked or logged again.
+    /// stay so, and how often at most that is logged. It is taken as no
+    /// less than a second and no more than an hour, whatever is given.
     pub fault_stands: Duration,
 }
 
@@ -78,6 +79,10 @@ impl Told {
 
 impl Embedders {
     pub fn new(settings: Settings) -> Self {
+        let settings = Settings {
+            fault_stands: crate::embedder::standing(settings.fault_stands),
+            ..settings
+        };
         Self {
             settings,
             providers: Mutex::default(),
@@ -240,6 +245,25 @@ mod tests {
             1,
             "what was last spoken of long ago is forgotten"
         );
+    }
+
+    #[test]
+    fn a_fault_is_taken_to_stand_no_less_than_a_second_and_no_more_than_an_hour() {
+        let taken = |fault_stands| {
+            let settings = Settings {
+                fault_stands,
+                ..Settings::default()
+            };
+            Embedders::new(settings).settings.fault_stands
+        };
+        assert_eq!(taken(Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(taken(Duration::from_millis(999)), Duration::from_secs(1));
+        assert_eq!(taken(FAULT_STANDS), FAULT_STANDS);
+        assert_eq!(
+            taken(Duration::from_secs(3_601)),
+            Duration::from_secs(3_600)
+        );
+        assert_eq!(taken(Duration::MAX), Duration::from_secs(3_600));
     }
 
     #[test]

@@ -37,9 +37,14 @@ is published from main before that.
   other is `invalid` (400), where it used to be made and every write to it
   refused. Making again a collection that is there exactly so still
   changes nothing.
-- **A lasting embedding fault is logged once in 20 seconds, and the model
-  not asked again while it stands.** Requests on their way to the model
-  when it first shows each still reach it once.
+- **A lasting embedding fault is logged at most once in 20 seconds** for
+  each way of embedding, whatever the model does meanwhile. A model that
+  refuses every request is not asked again within 20 seconds of the first
+  refusal, though requests on their way to it when the fault first shows
+  each still reach it once. A model that answers some requests and
+  refuses others goes on being asked.
+- What a model's server says is logged and passed on without what is
+  shaped like a key in it: see the README for the shapes.
 - An OpenAI endpoint's `model_not_found` and `invalid_api_key`, Bedrock's
   resource not found, a model directory the node may not write, and
   vectors of another size than the collection's are `model_unavailable`.
