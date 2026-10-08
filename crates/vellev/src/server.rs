@@ -20,9 +20,10 @@ use utoipa::openapi::OpenApi;
 use utoipa::{Modify, OpenApi as _};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
-use vellev_api::Code;
+use vellev_api::{Bounded, Code, Missing};
 use vellev_core::{Collection, EmbeddingProvider, TenantId};
 use vellev_node::{Node, NodeError};
+use vellev_storage::coordinator::MAX_RESTORE_WINDOW;
 use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE};
 
 use crate::api;
@@ -123,33 +124,47 @@ impl App {
             .ok_or_else(|| ApiError::unavailable("the node is still starting"))
     }
 
-    fn within(name: &str, asked: u32, most: usize) -> Result<usize, ApiError> {
-        let asked = asked as usize;
-        if (1..=most).contains(&asked) {
-            Ok(asked)
-        } else {
-            Err(ApiError::invalid(format!(
-                "{name} must be from 1 to {most}, not {asked}"
-            )))
+    /// The most a caller may ask of the node, as it is published and as
+    /// its refusals say.
+    pub(crate) fn allowed(&self) -> vellev_api::Limits {
+        let mut allowed = vellev_api::Limits::default();
+        allowed.results = self.limits.results as u64;
+        allowed.candidates = self.limits.results.max(DEFAULT_CANDIDATES) as u64;
+        allowed.oversample = MAX_OVERSAMPLE.into();
+        allowed.body_bytes = self.limits.body as u64;
+        allowed.restore_window_secs = MAX_RESTORE_WINDOW.as_secs();
+        allowed
+    }
+
+    /// `asked` of `name`, sent as `field`, if it is from 1 to `most`. Only
+    /// a request for more is told the most: one for none is not helped by
+    /// it.
+    fn within(name: Bounded, field: &str, asked: u32, most: u64) -> Result<usize, ApiError> {
+        let message = || format!("{field} must be from 1 to {most}, not {asked}");
+        match u64::from(asked) {
+            0 => Err(ApiError::invalid(message())),
+            more if more > most => Err(ApiError::beyond(name, most, message())),
+            _ => Ok(asked as usize),
         }
     }
 
     /// `asked` if it is a number of results the node will return.
     pub(crate) fn limit(&self, asked: u32) -> Result<usize, ApiError> {
-        Self::within("limit", asked, self.limits.results)
+        Self::within(Bounded::Results, "limit", asked, self.allowed().results)
     }
 
     /// How many results each side of a hybrid search offers.
     pub(crate) fn candidates(&self, asked: Option<u32>) -> Result<usize, ApiError> {
-        let most = self.limits.results.max(DEFAULT_CANDIDATES);
         asked.map_or(Ok(DEFAULT_CANDIDATES), |asked| {
-            Self::within("candidates", asked, most)
+            let most = self.allowed().candidates;
+            Self::within(Bounded::Candidates, "candidates", asked, most)
         })
     }
 
     pub(crate) fn oversample(&self, asked: Option<u32>) -> Result<usize, ApiError> {
         asked.map_or(Ok(DEFAULT_OVERSAMPLE), |asked| {
-            Self::within("oversample", asked, MAX_OVERSAMPLE as usize)
+            let most = self.allowed().oversample;
+            Self::within(Bounded::Oversample, "oversample", asked, most)
         })
     }
 
@@ -224,8 +239,8 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// The routes only an admin key reaches: the tenants themselves, their
-/// keys, backing them up and putting them back as they were. Every other route that needs
-/// a key is one tenant's.
+/// keys, backing them up and putting them back as they were. Every other
+/// route that needs a key is one tenant's, or one of [`EVERY_KEY`].
 pub const ADMIN_ONLY: [&str; 8] = [
     "/v1/tenants",
     "/v1/tenants/{tenant}",
@@ -236,6 +251,10 @@ pub const ADMIN_ONLY: [&str; 8] = [
     "/v1/tenants/{tenant}/restore",
     "/v1/tenants/{tenant}/backups",
 ];
+
+/// The routes every key reaches, which say nothing of any tenant: what the
+/// node allows every caller.
+pub const EVERY_KEY: [&str; 1] = ["/v1/limits"];
 
 /// The admin routes done where the request arrives, which need no writer:
 /// a backup is read from the store. A restore is sent on to the node that
@@ -282,9 +301,17 @@ async fn authorized(
         .key_tenant(presented)
         .await?
         .ok_or_else(unauthorized)?;
-    let route = request.extensions().get::<MatchedPath>();
-    if route.is_none_or(|route| ADMIN_ONLY.contains(&route.as_str())) {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str);
+    let for_every_key = route.is_some_and(|route| EVERY_KEY.contains(&route));
+    if route.is_none_or(|route| ADMIN_ONLY.contains(&route)) {
         return Err(forbidden());
+    }
+    if for_every_key {
+        request.extensions_mut().insert(Caller::Tenant(reaches));
+        return Ok(next.run(request).await);
     }
     // The tenant as the router read it, which is what the handler is given.
     let (mut parts, body) = request.into_parts();
@@ -302,9 +329,10 @@ async fn authorized(
             parts.extensions.insert(Caller::Tenant(reaches));
             Ok(next.run(Request::from_parts(parts, body)).await)
         }
-        Some(tenant) => Err(ApiError::not_found(format!(
-            "tenant {tenant} does not exist"
-        ))),
+        Some(tenant) => Err(ApiError::not_found(
+            Missing::Tenant,
+            format!("tenant {tenant} does not exist"),
+        )),
         None => Err(forbidden()),
     }
 }
@@ -404,7 +432,15 @@ async fn forwarded(
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, app.limits.body)
         .await
-        .map_err(|error| ApiError::refused(StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
+        .map_err(|error| {
+            let message = error.to_string();
+            match error.into_inner().is::<http_body_util::LengthLimitError>() {
+                true => ApiError::too_large(app.allowed().body_bytes, message),
+                false => {
+                    ApiError::invalid(format!("the request's body could not be read: {message}"))
+                }
+            }
+        })?;
     let url = format!(
         "{address}{}",
         parts.uri.path_and_query().map_or("", |pq| pq.as_str())
@@ -461,6 +497,7 @@ impl Modify for Keyed {
 /// The routes that need a key, with the description generated from them.
 fn described() -> (Router<App>, OpenApi) {
     OpenApiRouter::with_openapi(Described::openapi())
+        .routes(routes!(api::limits))
         .routes(routes!(api::tenants))
         .routes(routes!(api::create_tenant, api::drop_tenant))
         .routes(routes!(api::issue_key, api::tenant_keys))
@@ -512,7 +549,7 @@ pub fn router(app: App) -> Router {
             "/openapi.json",
             get(move || async move { Json(description.as_ref().clone()) }),
         )
-        .fallback(|| async { ApiError::not_found("no such route") })
+        .fallback(|| async { ApiError::not_found(Missing::Route, "no such route") })
         .method_not_allowed_fallback(|| async {
             ApiError::refused(
                 StatusCode::METHOD_NOT_ALLOWED,

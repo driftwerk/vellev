@@ -235,10 +235,7 @@ async fn main() -> Result<ExitCode> {
                 tenant,
                 action,
             } = *backup;
-            let options = vellev_client::Options {
-                timeout: BACKUP_TIMEOUT,
-                ..Default::default()
-            };
+            let options = vellev_client::Options::default().timeout(BACKUP_TIMEOUT);
             let client = vellev_client::Client::connect(&[&node], &key, options)?;
             let tenant = client.tenant(&tenant);
             let answer = match action {

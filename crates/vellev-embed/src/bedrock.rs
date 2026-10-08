@@ -43,17 +43,24 @@ struct Answer {
 }
 
 impl Bedrock {
-    pub fn new(region: &str, model: &str, dimensions: u32) -> Result<Self> {
+    /// Whether `model` at `dimensions` is one that can be embedded with
+    /// through Bedrock, as far as can be told without asking it.
+    pub fn admits(model: &str, dimensions: u32) -> Result<()> {
         if !model.starts_with(MODEL) {
-            return Err(EmbedError::Unsupported(format!(
+            return Err(EmbedError::NoSuchModel(format!(
                 "{model} is not {MODEL}, the one Bedrock model that can be embedded with"
             )));
         }
         if !DIMENSIONS.contains(&dimensions) {
-            return Err(EmbedError::Unsupported(format!(
+            return Err(EmbedError::NoSuchModel(format!(
                 "{model} has 256, 512 or 1024 dimensions, not {dimensions}"
             )));
         }
+        Ok(())
+    }
+
+    pub fn new(region: &str, model: &str, dimensions: u32) -> Result<Self> {
+        Self::admits(model, dimensions)?;
         Ok(Self {
             region: region.to_string(),
             model: model.to_string(),
@@ -98,10 +105,7 @@ impl Bedrock {
     }
 
     fn failed(&self, reason: impl std::fmt::Display) -> EmbedError {
-        EmbedError::Failed {
-            model: self.model.clone(),
-            reason: reason.to_string(),
-        }
+        EmbedError::failed(&self.model, reason)
     }
 
     async fn one(&self, text: &str) -> Result<Vec<f32>> {
@@ -122,16 +126,31 @@ impl Bedrock {
             .body(Blob::new(body.to_string()))
             .send()
             .await
-            .map_err(|error| match (error.code(), error.message()) {
-                (Some(code), Some(message)) => self.failed(format!("{code}: {message}")),
-                (Some(said), None) | (None, Some(said)) => self.failed(said),
-                (None, None) => self.failed(&error),
+            .map_err(|error| {
+                let said = match (error.code(), error.message()) {
+                    (Some(code), Some(message)) => format!("{code}: {message}"),
+                    (Some(said), None) | (None, Some(said)) => said.to_string(),
+                    (None, None) => error.to_string(),
+                };
+                // Bedrock says the region has no such model: nothing passes
+                // until the collection or the region is another. Access
+                // denied is not taken so, being also what is said while a
+                // permission just granted spreads; nor a refused input,
+                // which may be this text's alone.
+                let lasting = error
+                    .as_service_error()
+                    .is_some_and(|refused| refused.is_resource_not_found_exception());
+                match lasting {
+                    true => {
+                        EmbedError::unusable(&self.model, vellev_core::ModelFault::Provider, said)
+                    }
+                    false => self.failed(said),
+                }
             })?;
         serde_json::from_slice::<Answer>(answer.body().as_ref())
             .map(|answer| answer.embedding)
-            .map_err(|error| EmbedError::Malformed {
-                model: self.model.clone(),
-                reason: format!("an unreadable answer: {error}"),
+            .map_err(|error| {
+                EmbedError::malformed(&self.model, format!("an unreadable answer: {error}"))
             })
     }
 }

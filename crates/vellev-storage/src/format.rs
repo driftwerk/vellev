@@ -337,6 +337,7 @@ mod tests {
                     answer: Answer::Refused(Refusal {
                         kind: crate::Refused::Conflict,
                         message: "object 7 already exists in notes".into(),
+                        lacking: None,
                     }),
                 },
             ],
@@ -445,6 +446,148 @@ mod tests {
         assert_eq!(
             decode::<LogSegment>("k", Kind::Log, &frame(Kind::Log, FORMAT_VERSION, &body)).unwrap(),
             log()
+        );
+    }
+
+    #[test]
+    fn what_a_refusal_found_missing_is_kept_and_a_release_from_before_it_reads_past_it() {
+        /// A log as the release before `lacking` was kept reads and
+        /// writes it.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct OlderLog {
+            position: LogPosition,
+            prev: Option<String>,
+            ops: Vec<Op>,
+            answered: Vec<OlderAnswered>,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct OlderAnswered {
+            request: RequestId,
+            at: u64,
+            answer: OlderAnswer,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum OlderAnswer {
+            Made(Vec<Outcome>),
+            Refused(OlderRefusal),
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct OlderRefusal {
+            kind: crate::Refused,
+            message: String,
+        }
+        let message = "collection notes does not exist";
+        let request = RequestId(uuid::Uuid::from_u128(11));
+        let refused = |lacking| LogSegment {
+            answered: vec![Answered {
+                request,
+                at: 1_791_300_000_000,
+                answer: Answer::Refused(Refusal {
+                    kind: crate::Refused::NotFound,
+                    message: message.into(),
+                    lacking,
+                }),
+            }],
+            ..log()
+        };
+        let older = || {
+            let LogSegment {
+                position,
+                prev,
+                ops,
+                ..
+            } = log();
+            OlderLog {
+                position,
+                prev,
+                ops,
+                answered: vec![OlderAnswered {
+                    request,
+                    at: 1_791_300_000_000,
+                    answer: OlderAnswer::Refused(OlderRefusal {
+                        kind: crate::Refused::NotFound,
+                        message: message.into(),
+                    }),
+                }],
+            }
+        };
+        let lacking = refused(Some(crate::Lacking::Collection));
+        let kept = encode(Kind::Log, &lacking).unwrap();
+        assert_eq!(
+            decode::<LogSegment>("k", Kind::Log, &kept).unwrap(),
+            lacking
+        );
+        assert_eq!(
+            decode::<OlderLog>("k", Kind::Log, &kept).unwrap(),
+            older(),
+            "the release before reads past what it does not know"
+        );
+        let before = encode(Kind::Log, &older()).unwrap();
+        assert_eq!(
+            decode::<LogSegment>("k", Kind::Log, &before).unwrap(),
+            refused(None),
+            "and what it wrote reads as a refusal that kept nothing"
+        );
+        assert_eq!(
+            encode(Kind::Log, &refused(None)).unwrap(),
+            before,
+            "a refusal that found nothing missing is written as it always was"
+        );
+        assert_ne!(kept, before);
+
+        // A release after this one may name another kind of thing: read
+        // here, after a rollback, its refusal is one that kept nothing.
+        #[derive(Debug, Serialize)]
+        enum LaterLacking {
+            Property,
+        }
+        #[derive(Debug, Serialize)]
+        struct LaterRefusal {
+            kind: crate::Refused,
+            message: String,
+            lacking: Option<LaterLacking>,
+        }
+        #[derive(Debug, Serialize)]
+        enum LaterAnswer {
+            Refused(LaterRefusal),
+        }
+        #[derive(Debug, Serialize)]
+        struct LaterAnswered {
+            request: RequestId,
+            at: u64,
+            answer: LaterAnswer,
+        }
+        #[derive(Debug, Serialize)]
+        struct LaterLog {
+            position: LogPosition,
+            prev: Option<String>,
+            ops: Vec<Op>,
+            answered: Vec<LaterAnswered>,
+        }
+        let LogSegment {
+            position,
+            prev,
+            ops,
+            ..
+        } = log();
+        let later = LaterLog {
+            position,
+            prev,
+            ops,
+            answered: vec![LaterAnswered {
+                request,
+                at: 1_791_300_000_000,
+                answer: LaterAnswer::Refused(LaterRefusal {
+                    kind: crate::Refused::NotFound,
+                    message: message.into(),
+                    lacking: Some(LaterLacking::Property),
+                }),
+            }],
+        };
+        let from_later = encode(Kind::Log, &later).unwrap();
+        assert_eq!(
+            decode::<LogSegment>("k", Kind::Log, &from_later).unwrap(),
+            refused(None)
         );
     }
 

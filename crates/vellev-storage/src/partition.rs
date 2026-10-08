@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
 use tokio::sync::Mutex;
-use vellev_core::Embedding;
+use vellev_core::{Embedding, ModelFault, ObjectError};
 
 use crate::blobs::{is_plain, Author, Blobs, Layout, Listed};
 use crate::catalog::Catalog;
@@ -21,7 +21,7 @@ use crate::format::{
     decode, decode_head, encode, Answer, Answered, Head, Kind, LogSegment, Manifest, Op,
     SegmentFile, SegmentIndex, SegmentMeta,
 };
-use crate::mutation::{Batch, Mutation, Receipt, Vectorize};
+use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize};
 use crate::state::{self, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored};
 use crate::{Refusal, Result, StorageError};
 
@@ -541,6 +541,25 @@ impl Writer {
         self.commit_group_with(batches, Embedded::new()).await
     }
 
+    /// The collections `mutations` would make, were they committed now:
+    /// none for one that is there already exactly so, and none at all if
+    /// the batch would be refused, since none of a batch that is refused
+    /// joins the draft. A commit made meanwhile may change that, and the
+    /// commit of these still decides what is made.
+    pub fn creates(&self, mutations: &[Mutation]) -> Vec<vellev_core::Collection> {
+        self.partition.read(|state| {
+            let mut draft = Draft::new(state);
+            let _ = draft.batch(mutations.to_vec());
+            let (ops, _) = draft.finish();
+            ops.into_iter()
+                .filter_map(|op| match op {
+                    Op::CreateCollection { schema, .. } => Some(*schema),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
     /// The texts `mutations` would leave to be embedded if they were
     /// committed now, with how each is embedded. A caller can make their
     /// vectors ahead of the commit and hand them to
@@ -623,7 +642,7 @@ impl Writer {
                 })
                 .collect()
         });
-        let mut unembedded: Vec<Option<(String, String)>> = vec![None; batches.len()];
+        let mut unembedded: Vec<Option<(String, Unembedded)>> = vec![None; batches.len()];
         let mut made: Embedded = made
             .into_iter()
             .filter_map(|((embedding, text), vector)| {
@@ -631,7 +650,7 @@ impl Writer {
                 Some(((embedding, text), vector))
             })
             .collect();
-        let mut failed: HashMap<Embedding, String> = HashMap::new();
+        let mut failed: HashMap<Embedding, Unembedded> = HashMap::new();
         let ((position, prev), outcomes, ops) = loop {
             let (at, outcomes, (mut ops, wanted)) = self.partition.read(|state| {
                 let mut draft = Draft::new(state);
@@ -667,16 +686,16 @@ impl Writer {
             let rejected = |unembedded: &[Option<_>]| unembedded.iter().flatten().count();
             let before = rejected(&unembedded);
             for wanted in wanted.iter().filter(unmade) {
-                let reason = failed[&wanted.embedding].clone();
-                unembedded[wanted.batch] = Some((wanted.embedding.model.clone(), reason));
+                let why = failed[&wanted.embedding].clone();
+                unembedded[wanted.batch] = Some((wanted.embedding.model.clone(), why));
             }
             if rejected(&unembedded) == before {
-                let (model, reason) = failed
+                let (model, why) = failed
                     .into_iter()
                     .next()
-                    .map(|(embedding, reason)| (embedding.model, reason))
+                    .map(|(embedding, why)| (embedding.model, why))
                     .unwrap_or_default();
-                return Err(StorageError::Embedding { model, reason });
+                return Err(StorageError::unembedded(model, why));
             }
         };
         let now = std::time::SystemTime::now()
@@ -739,7 +758,7 @@ impl Writer {
             .enumerate()
             .map(|(at, (outcomes, unembedded))| {
                 let result = match unembedded {
-                    Some((model, reason)) => Err(StorageError::Embedding { model, reason }),
+                    Some((model, why)) => Err(StorageError::unembedded(model, why)),
                     None => outcomes.map(|outcomes| receipt(position, outcomes)),
                 };
                 result.map_err(|error| match repeated.contains(&at) {
@@ -773,7 +792,7 @@ impl Writer {
         &self,
         wanted: &[Wanted],
         made: &mut Embedded,
-        failed: &mut HashMap<Embedding, String>,
+        failed: &mut HashMap<Embedding, Unembedded>,
     ) {
         let mut missing: HashMap<&Embedding, Vec<&String>> = HashMap::new();
         for Wanted {
@@ -803,33 +822,47 @@ impl Writer {
                         .zip(vectors)
                         .map(|(text, vector)| ((embedding.clone(), text), vector)),
                 ),
-                Err(reason) => {
-                    failed.insert(embedding.clone(), reason);
+                Err(why) => {
+                    failed.insert(embedding.clone(), why);
                 }
             }
         }
     }
 
     /// A vector the collection can hold for each of `texts`, or why not.
+    /// A vector of another size than the collection's means the model is
+    /// not the one it was made for; one that is not finite may be one
+    /// text's misfortune.
     async fn vectors(
         &self,
         embedding: &Embedding,
         texts: Vec<String>,
-    ) -> std::result::Result<Vec<Vec<f32>>, String> {
-        let vectorize = self
-            .vectorize
-            .as_ref()
-            .ok_or("this writer has nothing to embed with")?;
+    ) -> std::result::Result<Vec<Vec<f32>>, Unembedded> {
+        let vectorize = self.vectorize.as_ref().ok_or_else(|| {
+            Unembedded::for_good(ModelFault::Setup, "this writer has nothing to embed with")
+        })?;
         let asked = texts.len();
         let vectors = tokio::time::timeout(EMBEDDING_TIMEOUT, vectorize.vectors(embedding, texts))
             .await
-            .map_err(|_| format!("no vectors within {EMBEDDING_TIMEOUT:?}"))??;
+            .map_err(|_| {
+                Unembedded::for_now(format!("no vectors within {EMBEDDING_TIMEOUT:?}"))
+            })??;
         if vectors.len() != asked {
-            return Err(format!("{} vectors for {asked} texts", vectors.len()));
+            return Err(Unembedded::for_now(format!(
+                "{} vectors for {asked} texts",
+                vectors.len()
+            )));
         }
         vectors
             .into_iter()
-            .map(|vector| embedding.checked(vector).map_err(|error| error.to_string()))
+            .map(|vector| {
+                embedding.checked(vector).map_err(|error| match error {
+                    ObjectError::VectorLength { .. } => {
+                        Unembedded::for_good(ModelFault::Provider, error.to_string())
+                    }
+                    _ => Unembedded::for_now(error.to_string()),
+                })
+            })
             .collect()
     }
 

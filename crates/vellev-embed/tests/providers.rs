@@ -9,7 +9,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use vellev_core::HttpApi;
-use vellev_core::{Embedding, EmbeddingProvider};
+use vellev_core::{Embedding, EmbeddingProvider, ModelFault};
 use vellev_embed::{Bedrock, EmbedError, Embedders, Http, Provider, Purpose, Settings};
 
 /// What a stand-in server was sent, and how many of its first requests it
@@ -201,7 +201,190 @@ async fn throttling_and_server_errors_are_tried_again_but_a_refusal_is_final() {
             reason: "400 Bad Request: refused Bearer <redacted>".into()
         }
     );
+    assert_eq!(refused.lasting(), None, "a refusal may be about the texts");
     assert_eq!(seen.bodies().len(), 1);
+}
+
+#[tokio::test]
+async fn a_bare_refusal_of_the_key_or_the_route_may_pass_whatever_stands_in_front_says_it_too() {
+    for (status, said) in [
+        (401, "401 Unauthorized"),
+        (403, "403 Forbidden"),
+        (404, "404 Not Found"),
+    ] {
+        let seen = Seen::refusing(usize::MAX, status);
+        let provider = Http::new(
+            &openai(seen.clone()).await,
+            HttpApi::Openai,
+            "m",
+            Some("sk-secret".into()),
+        )
+        .unwrap();
+        let refused = provider
+            .embed(numbered(1), Purpose::Document)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            EmbedError::Failed {
+                model: "m".into(),
+                reason: format!("{said}: refused Bearer <redacted>")
+            }
+        );
+        assert_eq!(refused.lasting(), None, "{status}");
+        assert_eq!(seen.bodies().len(), 1, "{status} is not tried again");
+    }
+}
+
+/// An endpoint that refuses every request as OpenAI words a refusal.
+async fn refusing_as_openai(status: u16, error: Value, seen: Arc<Seen>) -> String {
+    let embed =
+        move |State(seen): State<Arc<Seen>>, headers: HeaderMap, Json(body): Json<Value>| {
+            let error = error.clone();
+            async move {
+                seen.record(&headers, &body);
+                (StatusCode::from_u16(status).unwrap(), Json(error))
+            }
+        };
+    let embeddings = Router::new().route("/v1/embeddings", post(embed.clone()));
+    serve(embeddings.route("/embed", post(embed)).with_state(seen)).await
+}
+
+#[tokio::test]
+async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be_used() {
+    let coded = |code: &str| json!({ "error": { "message": "no", "type": "t", "code": code } });
+    for (status, code, said, fault) in [
+        (
+            404,
+            "model_not_found",
+            "404 Not Found",
+            ModelFault::Provider,
+        ),
+        (
+            401,
+            "invalid_api_key",
+            "401 Unauthorized",
+            ModelFault::Setup,
+        ),
+        // Said with a status that is otherwise worth another try, it is
+        // still said: the endpoint is not asked again.
+        (
+            503,
+            "model_not_found",
+            "503 Service Unavailable",
+            ModelFault::Provider,
+        ),
+        (
+            429,
+            "invalid_api_key",
+            "429 Too Many Requests",
+            ModelFault::Setup,
+        ),
+    ] {
+        let seen = Arc::new(Seen::default());
+        let url = refusing_as_openai(status, coded(code), seen.clone()).await;
+        let refused = Http::new(&url, HttpApi::Openai, "m", None)
+            .unwrap()
+            .embed(numbered(1), Purpose::Document)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            EmbedError::Unusable {
+                model: "m".into(),
+                reason: format!("{said}: {}", coded(code)),
+                fault,
+            }
+        );
+        assert_eq!(refused.lasting(), Some(fault), "{code}");
+        assert_eq!(seen.bodies().len(), 1, "{code} is not tried again");
+
+        let tei = Http::new(&url, HttpApi::Tei, "m", None).unwrap();
+        let refused = tei.embed(numbered(1), Purpose::Document).await;
+        assert!(
+            matches!(refused, Err(EmbedError::Failed { .. })),
+            "only an OpenAI endpoint is taken at OpenAI's word: {code}"
+        );
+    }
+    // A key the endpoint quotes back, with its middle masked as some do,
+    // is not passed on to be logged.
+    let quoting = json!({ "error": {
+        "message": "Incorrect API key provided: sk-ab…wxyz. Find yours at example.test.",
+        "code": "invalid_api_key",
+    } });
+    let seen = Arc::new(Seen::default());
+    let url = refusing_as_openai(401, quoting, seen.clone()).await;
+    let refused = Http::new(&url, HttpApi::Openai, "m", None)
+        .unwrap()
+        .embed(numbered(1), Purpose::Document)
+        .await
+        .unwrap_err();
+    let said = refused.to_string();
+    assert!(
+        said.contains("Incorrect API key provided: <redacted>. Find yours")
+            && !said.contains("wxyz"),
+        "{said}"
+    );
+    assert_eq!(refused.lasting(), Some(ModelFault::Setup));
+
+    // What is said is cut short, and a key that lies across the cut is
+    // taken out whole: no part of it is left at the end.
+    let key = "sk-proj-AbCd1234EfGh5678IjKl9012MnOp";
+    for kept in [1, 3, 7, 8, 10, 19, 20, 30, key.len()] {
+        let said = format!("{} {key} is not a key of ours", "é".repeat(298 - kept));
+        let seen = Arc::new(Seen::default());
+        let url = refusing_as_openai(400, json!(said), seen.clone()).await;
+        let refused = Http::new(&url, HttpApi::Openai, "m", None)
+            .unwrap()
+            .embed(numbered(1), Purpose::Document)
+            .await
+            .unwrap_err();
+        let whole = json!(said).to_string().replace(key, "<redacted>");
+        let cut: String = whole.chars().take(300).collect();
+        assert_eq!(
+            refused,
+            EmbedError::Failed {
+                model: "m".into(),
+                reason: format!("400 Bad Request: {cut}"),
+            },
+            "with {kept} of the key before the cut"
+        );
+        assert!(!refused.to_string().contains("sk-"), "{refused}");
+    }
+
+    // Whatever else is said, however plainly, may pass: an account with
+    // nothing left to spend is paid up without a change to the node.
+    for (status, said) in [
+        (429, coded("rate_limit_exceeded")),
+        (429, coded("insufficient_quota")),
+        (403, coded("insufficient_quota")),
+        (
+            404,
+            json!({ "error": { "message": "model \"m\" not found", "code": null } }),
+        ),
+        (
+            404,
+            json!({ "object": "error", "message": "The model `m` does not exist.", "code": 404 }),
+        ),
+        (400, json!({ "error": "model_not_found" })),
+        (403, json!("insufficient_quota")),
+    ] {
+        let seen = Arc::new(Seen::default());
+        let url = refusing_as_openai(status, said.clone(), seen.clone()).await;
+        let provider = Http::new(&url, HttpApi::Openai, "m", None).unwrap();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.embed(numbered(1), Purpose::Document),
+        )
+        .await;
+        match status {
+            429 => assert!(refused.is_err(), "throttling is waited out: {said}"),
+            _ => assert!(
+                matches!(refused, Ok(Err(EmbedError::Failed { .. }))),
+                "{said}: {refused:?}"
+            ),
+        }
+    }
 }
 
 #[tokio::test]
@@ -269,9 +452,16 @@ async fn bedrock(seen: Arc<Seen>) -> Bedrock {
             let kind = match status.as_u16() {
                 429 => "ThrottlingException",
                 400 => "ValidationException",
+                403 => "AccessDeniedException",
+                404 => "ResourceNotFoundException",
                 _ => "InternalServerException",
             };
-            let refusal = Json(json!({ "message": "not now" }));
+            // A refusal that quotes back how the request was signed.
+            let message = match status.as_u16() {
+                400 => "not now: Credential=AKIAIOSFODNN7EXAMPLE/20261008/eu-west-2",
+                _ => "not now",
+            };
+            let refusal = Json(json!({ "message": message }));
             return Err((status, [("x-amzn-errortype", kind)], refusal));
         }
         let text = body["inputText"].as_str().unwrap();
@@ -352,11 +542,50 @@ async fn titan_is_tried_again_when_throttled_and_long_text_is_cut() {
         .embed(vec!["fox".into()], Purpose::Document)
         .await
         .unwrap_err();
-    assert!(
-        matches!(&failed, EmbedError::Failed { model, .. } if model == TITAN),
-        "{failed}"
+    assert_eq!(
+        failed,
+        EmbedError::Failed {
+            model: TITAN.into(),
+            reason: "ValidationException: not now: Credential=<redacted>/20261008/eu-west-2".into()
+        },
+        "with the key it was signed with taken out"
+    );
+    assert_eq!(
+        failed.lasting(),
+        None,
+        "a refused input may be this text's alone"
     );
     assert_eq!(seen.bodies().len(), 1);
+}
+
+#[tokio::test]
+async fn a_region_without_titan_cannot_be_used_and_access_denied_may_pass() {
+    let refused = |status: u16| async move {
+        let seen = Seen::refusing(usize::MAX, status);
+        let provider = bedrock(seen.clone()).await;
+        let failed = provider
+            .embed(vec!["fox".into()], Purpose::Document)
+            .await
+            .unwrap_err();
+        assert_eq!(seen.bodies().len(), 1, "{status} is not tried again");
+        failed
+    };
+    assert_eq!(
+        refused(404).await,
+        EmbedError::Unusable {
+            model: TITAN.into(),
+            reason: "ResourceNotFoundException: not now".into(),
+            fault: ModelFault::Provider,
+        }
+    );
+    assert_eq!(
+        refused(403).await,
+        EmbedError::Failed {
+            model: TITAN.into(),
+            reason: "AccessDeniedException: not now".into()
+        },
+        "as is said while a permission just granted spreads"
+    );
 }
 
 #[tokio::test]

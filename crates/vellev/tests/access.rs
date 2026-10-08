@@ -392,3 +392,26 @@ async fn a_collection_without_a_rule_and_an_admin_key_are_not_narrowed() {
         "an admin key reads all whatever token comes with it"
     );
 }
+
+#[tokio::test]
+async fn an_object_the_rule_hides_is_missing_just_as_one_never_stored() {
+    let signer = Signer::new("hub-1");
+    let (served, key) = ruled(std::slice::from_ref(&signer.trusted)).await;
+    let ada = signer.token("acme", "ada", &[], 300);
+    let (served, key, ada) = (&served, key.as_str(), ada.as_str());
+    let get = |n: u64| async move {
+        let path = format!("{MEMORIES}/objects/{}", id(n));
+        served
+            .call_headed(Some(key), Method::GET, &path, None, &[(IDENTITY, ada)])
+            .await
+    };
+    let absent = |n: u64| {
+        let message = format!("object {} does not exist in memories", id(n));
+        let body =
+            json!({ "error": { "code": "not_found", "message": message, "missing": "object" } });
+        (StatusCode::NOT_FOUND, body)
+    };
+    assert_eq!(get(1).await.0, StatusCode::OK, "ada's own");
+    assert_eq!(get(2).await, absent(2), "bob's own, hidden from ada");
+    assert_eq!(get(9).await, absent(9), "never stored");
+}

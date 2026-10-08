@@ -1,5 +1,7 @@
 use serde_json::{Map, Value as Json};
-use vellev_core::{Collection, CollectionName, Embedding, ObjectId, Property, RequestId, Value};
+use vellev_core::{
+    Collection, CollectionName, Embedding, ModelFault, ObjectId, Property, RequestId, Value,
+};
 
 use vellev_index::filter::Filter;
 
@@ -84,7 +86,34 @@ pub trait Vectorize: std::fmt::Debug + Send + Sync {
         &self,
         embedding: &Embedding,
         texts: Vec<String>,
-    ) -> std::result::Result<Vec<Vec<f32>>, String>;
+    ) -> std::result::Result<Vec<Vec<f32>>, Unembedded>;
+}
+
+/// Why vectors could not be made, and whether asking again could help.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unembedded {
+    pub reason: String,
+    /// Where the fault lies, if nothing will make them until the node or
+    /// the collection is set up otherwise.
+    pub lasting: Option<ModelFault>,
+}
+
+impl Unembedded {
+    /// A failure that may pass.
+    pub fn for_now(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            lasting: None,
+        }
+    }
+
+    /// A failure that will not pass until `fault` is put right.
+    pub fn for_good(fault: ModelFault, reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            lasting: Some(fault),
+        }
+    }
 }
 
 /// Holds when the stored object's `property` equals `equals`, where JSON

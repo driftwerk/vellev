@@ -148,10 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::connect(
         &[&vellev_url],
         &key,
-        Options {
-            timeout: Duration::from_secs(120),
-            ..Options::default()
-        },
+        Options::default().timeout(Duration::from_secs(120)),
     )?;
     let tenant = client.tenant(&TenantId::new("versus")?);
     let _ = tenant.drop().await;
@@ -171,10 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loading = Instant::now();
     records
         .store_all(data.iter().enumerate().map(|(n, vector)| {
-            let content = Content {
-                properties: properties(n, groups),
-                vector: Some(vector.clone()),
-            };
+            let content = Content::new(properties(n, groups)).vector(vector.clone());
             (id(n), content)
         }))
         .await?;
@@ -238,14 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for query in &asked {
             let started = Instant::now();
             let results = records
-                .nearest(&Nearest {
-                    vector: Some(query.clone()),
-                    text: None,
-                    limit: LIMIT as u32,
-                    filter: None,
-                    oversample: Some(oversample),
-                    vectors: false,
-                })
+                .nearest(&Nearest::to_vector(query.clone(), LIMIT as u32).oversample(oversample))
                 .await?;
             latencies.push(started.elapsed());
             found.push(results.results.iter().map(|r| r.object.id).collect());

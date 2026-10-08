@@ -55,7 +55,8 @@ pub struct Config {
     /// The most bytes a request's body may have.
     #[arg(long, env = "VELLEV_MAX_BODY_BYTES", default_value_t = 32 * 1024 * 1024)]
     pub max_body_bytes: usize,
-    /// Where local embedding models are kept once fetched.
+    /// Where local embedding models are kept once fetched, unless
+    /// `HF_HOME` is set, which what fetches them uses instead.
     #[arg(
         long,
         env = "VELLEV_MODEL_DIR",
@@ -271,6 +272,7 @@ impl Config {
         let embedders = Embedders::new(vellev_embed::Settings {
             cache: self.model_dir.clone(),
             keys: self.embedding_keys()?,
+            ..Default::default()
         });
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "vellev".into());
         let address = self

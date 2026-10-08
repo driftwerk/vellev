@@ -175,6 +175,177 @@ running node. Every route under `/v1` needs one of the configured keys. A
 collection may only name an embedding endpoint listed in
 `VELLEV_EMBEDDING_URLS` or given a key in `VELLEV_EMBEDDING_KEYS`.
 
+`GET /v1/limits` tells any key the most a request may ask for: results of a
+search or a page (`VELLEV_MAX_LIMIT`), candidates each side of a hybrid
+search offers, `oversample`, bytes of a body (`VELLEV_MAX_BODY_BYTES`) and
+seconds of a restore window. A node of a release before this answers that
+it has no such route (404, or 403 to a tenant's key), for which the Rust
+client's `limits()` gives `None`.
+
+```sh
+call http://127.0.0.1:8080/v1/limits
+# {"results":1000,"candidates":1000,"oversample":1024,"body_bytes":33554432,"restore_window_secs":316224000}
+```
+
+Every failure is `{"error":{"code":…,"message":…}}`, and the code, not the
+message, says what to do. A request for more than the node allows says
+which limit and its most, as those names; one that asks for none at all,
+`limit: 0`, is refused without it. A failure to find something says what
+is missing: `tenant`, `collection`, `object`, `key`, `backup`,
+`restore_point` or `route`. A tenant's key is told `tenant` of every other
+tenant. A write refused and then named again is refused as it was, with
+what was missing then, unless a node of a release before this kept the
+refusal meanwhile, which keeps only that something was.
+
+```json
+{"error":{"code":"invalid","message":"limit must be from 1 to 1000, not 5000","limit":{"name":"results","max":1000}}}
+{"error":{"code":"not_found","message":"collection notes does not exist","missing":"collection"}}
+```
+
+When a collection's text cannot be embedded, the answer is one of two, and
+in both nothing was done.
+
+`unavailable` (503) means it may work later, on this node or another: send
+the request again. Everything that might pass is answered so, including
+much that will not pass by itself, because a node cannot tell it from what
+will: an endpoint or Bedrock refusing the node's key or credentials with
+no more than a status (a firewall or a proxy answers 401, 403 and 404 too,
+and a permission just granted takes a while to hold), a refusal worded
+only in prose or in codes other than OpenAI's, which are not read, an
+account with nothing left to spend (`insufficient_quota`, which paying
+puts right), a model's input refused, which may be that text's alone, a
+node with no AWS credentials, and a node with no network to fetch a local
+model over. The cause is in the node's log each time; if it goes on, look
+there.
+
+`model_unavailable` (501) means the node that answered cannot use the
+model as it is set up, and will not until someone puts that right. It is
+said only of what the node's own build and setup settle, or what serves
+the model says outright in its own code for it, and `reason` says which:
+
+- `build`: the node's release does not run the model: the collection was
+  made by a release that knew a model this one does not;
+- `setup`: the node may not write the directory local models are kept in,
+  which is `HF_HOME` if that is set and `VELLEV_MODEL_DIR` otherwise; or
+  an OpenAI endpoint answers `invalid_api_key`;
+- `provider`: an OpenAI endpoint answers `model_not_found`, Bedrock that
+  the region has no such model, or the model's vectors are not the
+  collection's size.
+
+```json
+{"error":{"code":"model_unavailable","message":"this node cannot use the collection's embedding model as it is set up","reason":"setup"}}
+```
+
+It never means the request is at fault or may be dropped. Keep it, and
+send it again once the node is put right; one that brings its own vector
+needs no model. Three things are promised of a node that meets such a
+fault, and no more:
+
+- It logs the fault at most once in 20 seconds for each way of embedding
+  and each `reason`, however many requests meet it, at once or one after
+  another, hybrid searches that fall back among them, and whatever the
+  model does meanwhile.
+- A model that refuses every request is not asked again within 20 seconds
+  of the first refusal; so a setup put right takes effect within that.
+- A model that answers some requests and refuses others goes on being
+  asked: an answer lifts the fault at once.
+
+No request waits on another to find out whether a model can be used, so
+the requests already on their way to the model when a fault first shows,
+or that set out before the first of them hears of it, each reach the
+model once and are each refused.
+
+What a model's server says is logged, and passed on, without what is
+shaped like a key in it. In what an HTTP endpoint answers, keys are
+looked for in the first four kilobytes, before it is cut to the 300
+characters that are kept. Nothing is decoded to find one.
+
+A key known by how it begins is taken out anywhere but straight after a
+letter, unless that letter ends one of the escapes `\n`, `\r`, `\t`,
+`\uXXXX` and `%XX`:
+
+- a JSON web token: `eyJ`, a full stop and `eyJ` again, with more after
+  each, signed or not;
+- a key beginning `sk-`, with 40 characters or more after that; or 20 or
+  more with a letter and a digit among them; or 20 or more after
+  `sk-proj-` or `sk-ant-`; or with some of it masked by `…`, `...` or
+  asterisks and two characters or more left;
+- a Hugging Face token, `hf_` and 30 letters and digits or more, or 20 or
+  more with some of each, or masked likewise (three full stops at its end
+  do not count);
+- a Google API key, `AIza` and 35 characters, unless a letter or a digit
+  comes straight after;
+- an AWS access key id, `AKIA` or `ASIA` and 16 capitals and digits,
+  unless a capital or a digit comes straight after.
+
+Two more are known by what comes before them:
+
+- what follows `Bearer` or `Basic`, if it is 16 characters or more and
+  not only lower-case words joined by hyphens, underscores or full stops;
+- the whole value of `key`, `token`, `access_token`, `api_key`, `api-key`
+  or `apikey` in a query string, a key or not, up to the next `&`, space
+  or quote.
+
+Deliberately left: a key glued to the end of a word, since `task-…` and
+`shf_…` are words and no provider writes a key so; a credential after
+`Bearer` or `Basic` that is all lower-case letters; a key with no shape
+of its own, such as an AWS secret or an Azure key; and anything written
+with escapes inside it.
+
+The 20 seconds cut the other way too: something in front of an OpenAI
+endpoint that answers `model_not_found` or `invalid_api_key` for a moment,
+in OpenAI's own form, costs 20 seconds of `model_unavailable`. Nothing
+reloads a node's settings while it runs, so most faults of setup are put
+right by starting the node again. Meanwhile
+another node may be able to answer, and which node embeds depends on the
+request:
+
+- A search is embedded for by the node it reaches. Another node, set up
+  right, answers it.
+- A write is embedded for by the one node that holds its tenant, whichever
+  node it reaches. If that node cannot use the model, every node answers
+  every such write `model_unavailable` until it is put right, or is
+  stopped and so lets the tenant go to another node. No node sends a
+  request on to one that can embed it.
+
+So the Rust client does not treat the two alike. A write answered
+`model_unavailable` fails at once: no other address would say otherwise.
+A search is asked of every other address the client knows first, at once,
+and then tried again as it is after `unavailable`, with the same tries and
+waits, failing with `model_unavailable` only when they are spent. A client
+given one address, a load balancer's or a service's, is so sent to another
+node by whatever is behind that address, and needs no more than that; the
+nodes' own addresses only find a node that can sooner.
+
+A hybrid search that cannot embed its text ranks by the words alone
+instead, and says `degraded`, with why in `degraded_by`: `unavailable` or
+`model_unavailable`, as it would have been refused. A Rust client of one
+address gives that answer as it comes. One of several, told
+`model_unavailable`, first asks each address it has not yet asked, once and
+at once, and gives the first answer ranked in full, or failing one the
+answer by the words. Each is given `Options::better_within` to answer, two
+seconds unless set otherwise: a node that takes longer to embed a text
+does not get to better the answer, and with none no address has time to.
+The
+address that answered in full is the one asked first from then on.
+
+A collection can only be made with a model this release runs: for a local
+model, one of those fastembed lists, at its own size; on Bedrock, Titan
+text embeddings v2 at 256, 512 or 1024 dimensions. Anything else is the
+request's fault, `invalid`, as is whatever else is wrong with the schema,
+which is said first; a release that knows more models may be running on
+another node during a rolling deploy, and answers for itself. Making again
+a collection that is there exactly so changes nothing, as ever, and one
+that is there otherwise is a `conflict`, whatever the model. What only
+using a model shows, such as an endpoint that refuses the node, is found at
+the first write.
+
+A request is sent at most as many times as the client has tries
+(`Options::attempts`) and one less than it has addresses, each for no
+longer than its timeout, with a wait before any address is asked again
+that doubles up to five seconds; a node that turns a request away with
+`Retry-After` is waited on that long, up to a minute.
+
 ## Vector search
 
 A layer with up to a few thousand vectors is scored exactly. Above that a
@@ -222,7 +393,8 @@ CI: bump the workspace version, then push a tag `v<version>`. The release
 runs every CI gate first, refuses to start if any of the crates' versions is
 on crates.io from another commit, and publishes them in dependency order. It
 needs a `CARGO_REGISTRY_TOKEN` secret allowed to publish new crates. The
-server's crates are not published.
+server's crates are not published. What each release changes for whoever
+uses the crates is in [docs/releases.md](docs/releases.md).
 
 ## Simulation
 

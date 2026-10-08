@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::future::join_all;
 use tokio::sync::{mpsc, OnceCell};
-use vellev_core::{CollectionName, Embedding, NodeId, Partition, TenantId};
+use vellev_core::{CollectionName, Embedding, ModelFault, NodeId, Partition, TenantId};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
@@ -18,7 +18,8 @@ use vellev_storage::coordinator::{
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
-    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Vectorize, Writer,
+    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Unembedded, Vectorize,
+    Writer,
 };
 
 mod backing;
@@ -163,6 +164,10 @@ pub enum NodeError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Embed(#[from] EmbedError),
+    /// A collection was to be made with a model no build of this release
+    /// runs.
+    #[error("{0}")]
+    NoSuchModel(String),
 }
 
 impl From<CoordinatorError> for NodeError {
@@ -204,20 +209,30 @@ impl Vectorize for Documents {
         &self,
         embedding: &Embedding,
         texts: Vec<String>,
-    ) -> std::result::Result<Vec<Vec<f32>>, String> {
+    ) -> std::result::Result<Vec<Vec<f32>>, Unembedded> {
         let embedder = self
             .0
             .embedder(embedding)
-            .map_err(|error| error.to_string())?
-            .ok_or("its collection's clients supply the vectors")?;
-        let vectors = embedder
-            .documents(&texts)
-            .await
-            .map_err(|error| error.to_string())?;
+            .map_err(unembedded)?
+            .ok_or_else(|| {
+                Unembedded::for_good(
+                    ModelFault::Setup,
+                    "its collection's clients supply the vectors",
+                )
+            })?;
+        let vectors = embedder.documents(&texts).await.map_err(unembedded)?;
         vectors
             .into_iter()
             .collect::<Option<_>>()
-            .ok_or_else(|| "no vector for a text that is not blank".to_string())
+            .ok_or_else(|| Unembedded::for_now("no vector for a text that is not blank"))
+    }
+}
+
+/// An embedding failure as a writer is told it.
+fn unembedded(error: EmbedError) -> Unembedded {
+    Unembedded {
+        reason: error.to_string(),
+        lasting: error.lasting(),
     }
 }
 
@@ -296,6 +311,37 @@ impl Tenant {
             .collect()
     }
 
+    /// Refuse to make a collection that could not be embedded for, rather
+    /// than make one every write to which would be refused. Only the
+    /// collections the batch would in fact make are looked at, once the
+    /// batch is known to be one that would be made: a batch that is
+    /// invalid or clashes with what is stored is refused as that, and one
+    /// that makes again a collection there exactly so changes nothing, as
+    /// ever.
+    ///
+    /// A model this release does not run is the request's fault. That is
+    /// this node's answer, the node that writes the tenant now: one of a
+    /// release that knows other models may do so later and answer
+    /// otherwise. Whatever only using the model would show, such as an
+    /// endpoint that refuses the node, is not looked for.
+    fn can_embed(&self, mutations: &[Mutation]) -> Result<()> {
+        let makes = |mutation: &Mutation| matches!(mutation, Mutation::CreateCollection(_));
+        if !mutations.iter().any(makes) {
+            return Ok(());
+        }
+        self.writer
+            .creates(mutations)
+            .iter()
+            .try_for_each(|schema| {
+                self.embedders
+                    .admits(&schema.embedding)
+                    .map_err(|refused| match refused {
+                        EmbedError::NoSuchModel(reason) => NodeError::NoSuchModel(reason),
+                        other => NodeError::Embed(other),
+                    })
+            })
+    }
+
     /// Commit a batch as one atomic step, sharing the commit with whoever
     /// else is writing. A batch naming a request answered lately is
     /// answered as it was, and not made again.
@@ -309,6 +355,7 @@ impl Tenant {
         if !answered {
             self.limits
                 .admit(&self.id, Asked::Write, batch.mutations.len())?;
+            self.can_embed(&batch.mutations)?;
         }
         let made = match answered {
             true => Embedded::new(),
@@ -1093,5 +1140,32 @@ impl Inner {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vellev_core::EmbeddingProvider;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_collection_whose_clients_supply_the_vectors_is_never_embedded_for() {
+        let supplied = Embedding {
+            provider: EmbeddingProvider::None,
+            model: "client".into(),
+            dimensions: 2,
+            query_prefix: None,
+            document_prefix: None,
+            properties: vec!["title".into()],
+        };
+        let documents = Documents(Arc::new(Embedders::new(Default::default())));
+        assert_eq!(
+            documents.vectors(&supplied, vec!["fox".into()]).await,
+            Err(Unembedded::for_good(
+                ModelFault::Setup,
+                "its collection's clients supply the vectors"
+            ))
+        );
     }
 }

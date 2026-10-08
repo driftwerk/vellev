@@ -300,15 +300,9 @@ async fn catch_up(
     }
     let mut after = None;
     loop {
-        let listed = plan
-            .records
-            .list(&Page {
-                filter: None,
-                after,
-                limit: options.page as u32,
-                vectors: false,
-            })
-            .await?;
+        let mut page = Page::new(options.page as u32);
+        page.after = after;
+        let listed = plan.records.list(&page).await?;
         let unseen = listed
             .objects
             .iter()
@@ -735,7 +729,9 @@ impl Object {
                 plan.dimensions
             );
         }
-        Ok((id, Content { properties, vector }))
+        let mut content = Content::new(properties);
+        content.vector = vector;
+        Ok((id, content))
     }
 }
 

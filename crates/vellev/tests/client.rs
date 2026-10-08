@@ -9,7 +9,8 @@ use common::*;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use vellev_api::{
-    Change, Changes, Code, Content, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, AFTER, REQUEST,
+    Bounded, Change, Changes, Code, Content, Hybrid, Keyword, Limit, Missing, Nearest, OnlyIf,
+    Outcome, Page, Reason, AFTER, REQUEST,
 };
 use vellev_client::api::After;
 use vellev_client::{Client, Error, Options};
@@ -20,20 +21,15 @@ use vellev_index::filter::Filter;
 const NEVER: Duration = Duration::from_secs(600);
 
 fn tries(attempts: u32) -> Options {
-    Options {
-        timeout: Duration::from_secs(10),
-        attempts,
-        backoff: NEVER,
-        ..Options::default()
-    }
+    Options::default()
+        .timeout(Duration::from_secs(10))
+        .attempts(attempts)
+        .backoff(NEVER)
 }
 
 /// As [`tries`], for a client of one node, which waits between tries.
 fn quick(attempts: u32) -> Options {
-    Options {
-        backoff: Duration::from_millis(1),
-        ..tries(attempts)
-    }
+    tries(attempts).backoff(Duration::from_millis(1))
 }
 
 fn tenant(id: &str) -> TenantId {
@@ -53,13 +49,10 @@ fn oid(n: u64) -> ObjectId {
 }
 
 fn content(title: &str, n: u64, vector: Option<[f32; 2]>) -> Content {
-    Content {
-        properties: json!({ "title": title, "n": n })
-            .as_object()
-            .unwrap()
-            .clone(),
-        vector: vector.map(Vec::from),
-    }
+    let properties = json!({ "title": title, "n": n });
+    let mut content = Content::new(properties.as_object().unwrap().clone());
+    content.vector = vector.map(Vec::from);
+    content
 }
 
 fn increment() -> Vec<Change> {
@@ -148,6 +141,8 @@ fn by_tenant(_: &Asked, path: &str) -> (u16, Value) {
         () if named("wrong") => (400, failure("invalid")),
         () if named("locked") => (401, failure("unauthorized")),
         () if named("broken") => (500, failure("internal")),
+        () if named("modelless") => (501, failure("model_unavailable")),
+        () if named("newer") => (503, failure("something_new")),
         () if named("garbled") => (200, json!("not what was asked for")),
         () => (
             200,
@@ -197,14 +192,10 @@ async fn the_whole_api_is_reached_through_the_client() {
         .unwrap();
     let stored = notes.get(oid(1)).await.unwrap().unwrap();
     assert_eq!((stored.id, stored.vector), (oid(1), Some(vec![1.0, 0.0])));
-    let patched = Changes {
-        properties: json!({ "n": 5 }).as_object().unwrap().clone(),
-        vector: None,
-        only_if: Some(OnlyIf {
-            property: "n".into(),
-            equals: json!(1),
-        }),
-    };
+    let patched = Changes::new(json!({ "n": 5 }).as_object().unwrap().clone()).only_if(OnlyIf {
+        property: "n".into(),
+        equals: json!(1),
+    });
     notes.patch(oid(1), &patched).await.unwrap();
     let clash = notes.patch(oid(1), &patched).await.unwrap_err();
     assert_eq!(clash.code(), Some(Code::Conflict));
@@ -229,53 +220,23 @@ async fn the_whole_api_is_reached_through_the_client() {
     );
     assert_eq!(client.after(&tenant("acme")), Some(changed.after()));
 
-    let nearest = Nearest {
-        vector: Some(vec![1.0, 0.0]),
-        text: None,
-        limit: 1,
-        filter: None,
-        oversample: None,
-        vectors: true,
-    };
+    let nearest = Nearest::to_vector(vec![1.0, 0.0], 1).vectors(true);
     let found = notes.nearest(&nearest).await.unwrap();
     assert_eq!(
         (found.results[0].object.id, found.results[0].distance),
         (oid(1), Some(0.0))
     );
     assert_eq!(found.results[0].object.vector, Some(vec![1.0, 0.0]));
-    let keyword = Keyword {
-        text: "hen".into(),
-        properties: vec![],
-        limit: 5,
-        filter: None,
-        vectors: false,
-    };
+    let keyword = Keyword::new("hen", 5);
     let found = notes.keyword(&keyword).await.unwrap();
     assert_eq!(found.results.len(), 1);
     assert!(found.results[0].keyword.unwrap() > 0.0);
-    let hybrid = Hybrid {
-        text: "fox".into(),
-        vector: Some(vec![1.0, 0.0]),
-        alpha: None,
-        fusion: Default::default(),
-        properties: vec![],
-        limit: 5,
-        candidates: None,
-        filter: None,
-        oversample: None,
-        vectors: false,
-    };
+    let hybrid = Hybrid::new("fox", 5).vector(vec![1.0, 0.0]);
     let fused = notes.hybrid(&hybrid).await.unwrap();
     assert_eq!(fused.results[0].object.id, oid(1));
     assert!(!fused.degraded);
 
-    let page = Page {
-        filter: None,
-        after: None,
-        limit: 1,
-        vectors: false,
-    };
-    let first = notes.list(&page).await.unwrap();
+    let first = notes.list(&Page::new(1)).await.unwrap();
     assert_eq!((first.objects.len(), first.next), (1, Some(oid(1))));
     let big = Filter::Gte {
         property: "n".into(),
@@ -283,7 +244,7 @@ async fn the_whole_api_is_reached_through_the_client() {
     };
     assert_eq!(notes.count(None).await.unwrap(), 2);
     assert_eq!(notes.count(Some(&big)).await.unwrap(), 1);
-    let none = notes.list(&Page { limit: 0, ..page }).await.unwrap_err();
+    let none = notes.list(&Page::new(0)).await.unwrap_err();
     assert_eq!(none.code(), Some(Code::Invalid));
 
     notes.delete(oid(2)).await.unwrap();
@@ -357,6 +318,8 @@ async fn a_request_is_sent_again_unless_it_was_refused_for_good() {
         ("wrong", 1, false),
         ("locked", 1, false),
         ("broken", 1, false),
+        ("modelless", 1, false),
+        ("newer", 1, false),
         ("garbled", 3, true),
     ] {
         let failed = write(name).await.unwrap_err();
@@ -380,6 +343,8 @@ async fn a_request_is_sent_again_unless_it_was_refused_for_good() {
         ("wrong", 1),
         ("locked", 1),
         ("broken", 1),
+        ("modelless", 3),
+        ("newer", 1),
     ] {
         let failed = read(name).await.unwrap_err();
         assert_eq!(asked(name, "GET"), sends, "a read of {name}: {failed}");
@@ -391,11 +356,7 @@ async fn a_request_is_sent_again_unless_it_was_refused_for_good() {
     };
     let patch = |name: &'static str| {
         let notes = client.tenant(&tenant(name)).collection(&notes_named());
-        let changes = Changes {
-            properties: json!({ "n": 2 }).as_object().unwrap().clone(),
-            vector: None,
-            only_if: None,
-        };
+        let changes = Changes::new(json!({ "n": 2 }).as_object().unwrap().clone());
         async move { notes.patch(oid(1), &changes).await }
     };
     for (name, sends) in [("torn", 3), ("proxied", 3), ("garbled", 3), ("wrong", 1)] {
@@ -479,10 +440,7 @@ async fn each_tenant_is_asked_of_the_node_that_last_answered_for_it() {
 #[tokio::test]
 async fn a_node_still_starting_is_waited_for() {
     let served = Cluster::new().unstarted(&[], None).await;
-    let patient = Options {
-        backoff: Duration::from_millis(50),
-        ..tries(8)
-    };
+    let patient = tries(8).backoff(Duration::from_millis(50));
     let client = Client::connect(&[&served.url], KEY, patient).unwrap();
     let (app, node) = (served.app.clone(), served.node.clone());
     tokio::spawn(async move {
@@ -651,10 +609,7 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     };
     let start = 1;
 
-    let by_count = notes_of(Options {
-        batch_objects: 10,
-        ..tries(1)
-    });
+    let by_count = notes_of(tries(1).batch_objects(10));
     assert_eq!(
         by_count.store_all(objects()).await.unwrap(),
         Some(start + 3)
@@ -673,10 +628,7 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
     served
         .ok(reqwest::Method::PUT, NOTES, Some(notes(supplied())))
         .await;
-    let one_each = notes_of(Options {
-        batch_bytes: 1,
-        ..tries(1)
-    });
+    let one_each = notes_of(tries(1).batch_bytes(1));
     assert_eq!(
         one_each.store_all(objects()).await.unwrap(),
         Some(start + 4 + 2 + 25)
@@ -687,13 +639,7 @@ async fn many_objects_are_stored_a_few_requests_at_a_time() {
         .ok(reqwest::Method::PUT, NOTES, Some(notes(supplied())))
         .await;
     let spoilt = objects().map(|(id, content)| match id == oid(14) {
-        true => (
-            id,
-            Content {
-                vector: Some(vec![1.0; 3]),
-                ..content
-            },
-        ),
+        true => (id, content.vector(vec![1.0; 3])),
         false => (id, content),
     });
     let failed = by_count.store_all(spoilt).await.unwrap_err();
@@ -900,4 +846,561 @@ async fn a_request_turned_away_for_asking_too_much_is_asked_again_once_the_wait_
         "waited as told: {:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn a_failure_says_what_was_asked_too_much_of_or_is_missing_and_any_key_learns_the_limits() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    let options = quick(3).batch_bytes(usize::MAX);
+    let client = Client::connect(&[&served.url], KEY, options).unwrap();
+    let limits = client
+        .limits()
+        .await
+        .unwrap()
+        .expect("this node tells them");
+    assert_eq!(
+        serde_json::to_value(limits).unwrap(),
+        json!({
+            "results": MAX_LIMIT,
+            "candidates": 100,
+            "oversample": 1_024,
+            "body_bytes": MAX_BODY,
+            "restore_window_secs": 10 * 366 * 24 * 60 * 60,
+        })
+    );
+    let issued = client.tenant(&tenant("acme")).issue_key().await.unwrap();
+    let tenants_own = Client::connect(&[&served.url], &issued.key, quick(1)).unwrap();
+    assert_eq!(tenants_own.limits().await.unwrap(), Some(limits));
+
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let page = |limit: u64| Page::new(limit as u32);
+    let too_many = notes.list(&page(limits.results + 1)).await.unwrap_err();
+    assert_eq!(
+        too_many.limit(),
+        Some(Limit::new(Bounded::Results, limits.results))
+    );
+    assert_eq!(too_many.limit_max(Bounded::Results), Some(limits.results));
+    assert_eq!(too_many.limit_max(Bounded::Oversample), None);
+    assert_eq!(too_many.missing(), None);
+    let none = notes.list(&page(0)).await.unwrap_err();
+    assert_eq!(
+        (none.code(), none.limit()),
+        (Some(Code::Invalid), None),
+        "asking for none is not asking too much"
+    );
+    let large = content(&"x".repeat(MAX_BODY), 1, Some([1.0, 0.0]));
+    let unsent = notes.store_all([(oid(1), large)]).await.unwrap_err();
+    assert!(
+        matches!(unsent, Error::Partial { stored: 0, .. }),
+        "{unsent}"
+    );
+    assert_eq!(
+        unsent.limit_max(Bounded::BodyBytes),
+        Some(limits.body_bytes)
+    );
+
+    let ghost = client.tenant(&tenant("ghost")).collections().await;
+    assert_eq!(ghost.unwrap_err().missing(), Some(Missing::Tenant));
+    let absent = client
+        .tenant(&tenant("acme"))
+        .collection(&CollectionName::new("absent").unwrap());
+    let unlisted = absent.list(&page(1)).await.unwrap_err();
+    assert_eq!(
+        (unlisted.missing(), unlisted.limit()),
+        (Some(Missing::Collection), None)
+    );
+    let unstored = absent
+        .store_all([(oid(1), content("fox", 1, Some([1.0, 0.0])))])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(unstored, Error::Partial { stored: 0, .. }),
+        "{unstored}"
+    );
+    assert_eq!(unstored.missing(), Some(Missing::Collection));
+    assert_eq!(
+        notes.get(oid(9)).await.unwrap(),
+        None,
+        "a missing object is still none"
+    );
+}
+
+#[tokio::test]
+async fn a_node_from_before_the_limits_were_told_has_none_to_tell() {
+    let answered = |code: &str, message: &str, more: Value| {
+        let mut problem = json!({ "code": code, "message": message });
+        let more = more.as_object().unwrap().clone();
+        problem.as_object_mut().unwrap().extend(more);
+        json!({ "error": problem })
+    };
+    let limits = |status: u16, answer: Value| async move {
+        let node = Stub::answering(move |_, _| (status, answer.clone())).await;
+        let client = Client::connect(&[&node.url], KEY, tries(1)).unwrap();
+        let told = client.limits().await;
+        assert_eq!(node.asked("/v1/limits"), 1);
+        told
+    };
+    let admins_only = "only an admin key may do this";
+    // As a release before the route answers an admin key, and a tenant's;
+    // and as one since would, were the route taken out.
+    for (status, answer) in [
+        (404, answered("not_found", "no such route", json!({}))),
+        (403, answered("forbidden", admins_only, json!({}))),
+        (
+            404,
+            answered("not_found", "no such route", json!({ "missing": "route" })),
+        ),
+    ] {
+        let told = limits(status, answer.clone()).await;
+        assert_eq!(told.unwrap(), None, "{answer}");
+    }
+    // Nothing else is a node with none to tell: least of all anything
+    // else that is forbidden.
+    for (status, answer, code) in [
+        (
+            401,
+            answered("unauthorized", "a valid API key is required", json!({})),
+            Some(Code::Unauthorized),
+        ),
+        (
+            403,
+            answered("forbidden", "this key may not read limits", json!({})),
+            Some(Code::Forbidden),
+        ),
+        (
+            403,
+            answered("forbidden", admins_only, json!({ "missing": "tenant" })),
+            Some(Code::Forbidden),
+        ),
+        (403, json!("<html>Forbidden</html>"), None),
+        (
+            404,
+            answered(
+                "not_found",
+                "tenant acme does not exist",
+                json!({ "missing": "tenant" }),
+            ),
+            Some(Code::NotFound),
+        ),
+        (
+            503,
+            answered("unavailable", "not now", json!({})),
+            Some(Code::Unavailable),
+        ),
+        (
+            500,
+            answered("internal", "the node failed", json!({})),
+            Some(Code::Internal),
+        ),
+    ] {
+        let failed = limits(status, answer.clone()).await.unwrap_err();
+        assert_eq!(failed.code(), code, "{answer}");
+    }
+}
+
+#[tokio::test]
+async fn a_write_no_node_can_embed_fails_at_the_first_to_say_so_and_says_where_the_fault_lies() {
+    // Every address says what the node holding the tenant said: there is
+    // nothing to be had from asking another, or the same again.
+    let cannot = || {
+        let refusal = json!({ "error": {
+            "code": "model_unavailable", "message": "stand-in", "reason": "setup",
+        } });
+        Stub::answering(move |_, _| (501, refusal.clone()))
+    };
+    let (first, second) = (cannot().await, cannot().await);
+    let client = Client::connect(&[&first.url, &second.url], KEY, tries(4)).unwrap();
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let fox = content("fox", 1, None);
+    let failed = tokio::time::timeout(Duration::from_secs(30), notes.put(oid(1), &fox))
+        .await
+        .expect("failed at once, with no wait")
+        .unwrap_err();
+    assert!(failed.is_model_unavailable(), "{failed}");
+    assert!(!failed.is_unknown_outcome());
+    assert_eq!(failed.reason(), Some(Reason::Setup));
+    assert_eq!((first.asked("acme"), second.asked("acme")), (1, 0));
+
+    let stored = notes
+        .store_all([(oid(1), content("fox", 1, None))])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(stored, Error::Partial { stored: 0, .. }),
+        "{stored}"
+    );
+    assert!(stored.is_model_unavailable());
+    assert_eq!(
+        stored.reason(),
+        Some(Reason::Setup),
+        "told of the objects not stored as of any request"
+    );
+    assert_eq!((first.asked("acme"), second.asked("acme")), (2, 0));
+
+    // A read of the same nodes is another matter: each embeds for itself.
+    let client = Client::connect(&[&first.url, &second.url], KEY, tries(1)).unwrap();
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let failed = notes.count(None).await.unwrap_err();
+    assert!(failed.is_model_unavailable());
+    assert_eq!((first.asked("count"), second.asked("count")), (1, 1));
+}
+
+/// A stand-in node that cannot use the model, or answers as `otherwise`
+/// says once it is told it can.
+async fn modelless(otherwise: (u16, Value)) -> (Stub, Arc<std::sync::atomic::AtomicBool>) {
+    let able = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked = able.clone();
+    let stub = Stub::answering(move |_, _| match asked.load(Ordering::SeqCst) {
+        true => otherwise.clone(),
+        false => (501, failure("model_unavailable")),
+    })
+    .await;
+    (stub, able)
+}
+
+#[tokio::test]
+async fn a_request_one_node_cannot_do_as_it_is_set_up_is_asked_of_each_other_node_once() {
+    let found = || (200, json!({ "collections": [] }));
+    let (unable, _) = modelless(found()).await;
+    let (other, _) = modelless(found()).await;
+    let able = Stub::answering(move |_, _| found()).await;
+    let ask = |client: &Client| {
+        let acme = client.tenant(&tenant("acme"));
+        async move { acme.collections().await.map(|_| ()) }
+    };
+
+    // One try, and a wait that would never end: the other nodes are asked
+    // at once, for nothing but the first's being unable.
+    let nodes = [unable.url.as_str(), other.url.as_str(), able.url.as_str()];
+    let client = Client::connect(&nodes, KEY, tries(1)).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), ask(&client))
+        .await
+        .expect("no wait before another node is asked")
+        .unwrap();
+    ask(&client).await.unwrap();
+    assert_eq!(
+        (
+            unable.asked("acme"),
+            other.asked("acme"),
+            able.asked("acme")
+        ),
+        (1, 1, 2),
+        "and the node that could is asked first from then on"
+    );
+
+    // Once every address has said so, the tries are spent as on any
+    // failure that may pass: behind an address there may be another node.
+    let client = Client::connect(&[&unable.url, &other.url], KEY, quick(3)).unwrap();
+    let before = (unable.asked("acme"), other.asked("acme"));
+    let failed = ask(&client).await.unwrap_err();
+    assert!(failed.is_model_unavailable(), "{failed}");
+    assert!(!failed.is_unknown_outcome());
+    assert_eq!(
+        (unable.asked("acme"), other.asked("acme")),
+        (before.0 + 2, before.1 + 2),
+        "one send more than there are tries, for two addresses"
+    );
+
+    let alone = Client::connect(&[&unable.url], KEY, quick(4)).unwrap();
+    assert!(ask(&alone).await.unwrap_err().is_model_unavailable());
+    assert_eq!(
+        unable.asked("acme"),
+        before.0 + 2 + 4,
+        "one address is asked as often as there are tries"
+    );
+}
+
+#[tokio::test]
+async fn one_address_with_a_node_behind_it_that_can_answers_on_a_later_try() {
+    // A load balancer in front of two nodes, one of which cannot use the
+    // model: every other request reaches it.
+    let sent = Arc::new(AtomicUsize::new(0));
+    let counted = sent.clone();
+    let balancer = Stub::answering(
+        move |_, _| match counted.fetch_add(1, Ordering::SeqCst) % 2 {
+            0 => (501, failure("model_unavailable")),
+            _ => (200, json!({ "collections": [] })),
+        },
+    )
+    .await;
+    let options = tries(4).backoff(Duration::from_millis(300));
+    let client = Client::connect(&[&balancer.url], KEY, options).unwrap();
+    let acme = client.tenant(&tenant("acme"));
+    let started = Instant::now();
+    acme.collections().await.unwrap();
+    assert_eq!(balancer.asked("acme"), 2);
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "after the wait any other try has: {:?}",
+        started.elapsed()
+    );
+
+    // With only the node that cannot behind it, the request fails once
+    // its tries are spent, and says how.
+    let (unable, _) = modelless((200, json!(null))).await;
+    let client = Client::connect(&[&unable.url], KEY, quick(4)).unwrap();
+    let failed = client
+        .tenant(&tenant("acme"))
+        .collections()
+        .await
+        .unwrap_err();
+    assert!(failed.is_model_unavailable(), "{failed}");
+    assert_eq!(unable.asked("acme"), 4);
+}
+
+/// A hybrid search's answer by the words alone, for the reason given.
+fn by_words(degraded_by: &str) -> (u16, Value) {
+    (
+        200,
+        json!({ "results": [], "degraded": true, "degraded_by": degraded_by }),
+    )
+}
+
+/// A hybrid search for foxes through `client`.
+async fn foxes(client: &Client) -> vellev_client::Result<vellev_api::Results> {
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let asked = Hybrid::new("fox", 5);
+    // Nothing here is to wait: a search that does has gone wrong.
+    tokio::time::timeout(Duration::from_secs(30), notes.hybrid(&asked))
+        .await
+        .expect("a search answered without the waits a failure has")
+}
+
+#[tokio::test]
+async fn a_search_answered_by_the_words_alone_is_given_at_once_unless_an_address_not_yet_asked_does_better(
+) {
+    let cannot = || Stub::answering(|_, _| by_words("model_unavailable"));
+    let full = Stub::answering(|_, _| (200, json!({ "results": [] }))).await;
+    let later = Stub::answering(|_, _| by_words("unavailable")).await;
+    let by_the_words = |found: &vellev_api::Results| {
+        assert_eq!(
+            (found.degraded, found.degraded_by),
+            (true, Some(Code::ModelUnavailable))
+        );
+    };
+
+    // One address: its answer is the answer, there and then, whatever
+    // tries and waits a failure would have had.
+    let alone = cannot().await;
+    let client = Client::connect(&[&alone.url], KEY, tries(4)).unwrap();
+    by_the_words(&foxes(&client).await.unwrap());
+    assert_eq!(alone.asked("hybrid"), 1);
+
+    // Several: each other address is asked once, at once, and the first
+    // whole answer is the answer, which the client then asks first.
+    let (first, second) = (cannot().await, cannot().await);
+    let nodes = [first.url.as_str(), second.url.as_str(), full.url.as_str()];
+    let client = Client::connect(&nodes, KEY, tries(1)).unwrap();
+    let found = foxes(&client).await.unwrap();
+    assert_eq!((found.degraded, found.degraded_by), (false, None));
+    foxes(&client).await.unwrap();
+    assert_eq!(
+        (
+            first.asked("hybrid"),
+            second.asked("hybrid"),
+            full.asked("hybrid")
+        ),
+        (1, 1, 2)
+    );
+
+    // Where none does better, the answer by the words is the answer,
+    // not a failure, whatever the others said; and none is asked twice.
+    for (status, said) in [
+        (503, failure("unavailable")),
+        (404, failure("not_found")),
+        (501, failure("model_unavailable")),
+        (429, failure("limited")),
+        (200, by_words("model_unavailable").1),
+    ] {
+        let first = cannot().await;
+        let answer = said.clone();
+        let other = Stub::answering(move |_, _| (status, answer.clone())).await;
+        let third = cannot().await;
+        let nodes = [first.url.as_str(), other.url.as_str(), third.url.as_str()];
+        let client = Client::connect(&nodes, KEY, tries(4)).unwrap();
+        by_the_words(&foxes(&client).await.unwrap());
+        assert_eq!(
+            (
+                first.asked("hybrid"),
+                other.asked("hybrid"),
+                third.asked("hybrid")
+            ),
+            (1, 1, 1),
+            "{said}"
+        );
+    }
+
+    // An address that failed before the answer came is not asked again.
+    let away = Stub::answering(|_, _| (503, failure("unavailable"))).await;
+    let first = cannot().await;
+    let before = full.asked("hybrid");
+    let nodes = [away.url.as_str(), first.url.as_str(), full.url.as_str()];
+    let client = Client::connect(&nodes, KEY, tries(4)).unwrap();
+    let found = foxes(&client).await.unwrap();
+    assert_eq!((found.degraded, found.degraded_by), (false, None));
+    assert_eq!(
+        (
+            away.asked("hybrid"),
+            first.asked("hybrid"),
+            full.asked("hybrid") - before
+        ),
+        (1, 1, 1)
+    );
+
+    // A text that may be embedded later is not worth another address now.
+    let before = full.asked("hybrid");
+    let client = Client::connect(&[&later.url, &full.url], KEY, tries(3)).unwrap();
+    let found = foxes(&client).await.unwrap();
+    assert_eq!(found.degraded_by, Some(Code::Unavailable));
+    assert_eq!(
+        (later.asked("hybrid"), full.asked("hybrid") - before),
+        (1, 0)
+    );
+}
+
+#[tokio::test]
+async fn an_address_that_never_answers_does_not_keep_back_the_answer_in_hand() {
+    let cannot = Stub::answering(|_, _| by_words("model_unavailable")).await;
+    let silent = axum::Router::new().fallback(std::future::pending::<()>);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hung = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, silent).await.unwrap() });
+
+    // Each try may take a minute; the answer in hand waits two seconds,
+    // unless the client says otherwise.
+    let options = tries(4).timeout(Duration::from_secs(60));
+    let client = Client::connect(&[&cannot.url, &hung], KEY, options).unwrap();
+    let started = Instant::now();
+    let found = foxes(&client).await.unwrap();
+    assert_eq!(found.degraded_by, Some(Code::ModelUnavailable));
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(1_900) && took < Duration::from_secs(10),
+        "the other address was given two seconds, not its minute: {took:?}"
+    );
+    assert_eq!(cannot.asked("hybrid"), 1);
+
+    let brief = tries(4)
+        .timeout(Duration::from_secs(60))
+        .better_within(Duration::from_millis(200));
+    let client = Client::connect(&[&cannot.url, &hung], KEY, brief).unwrap();
+    let started = Instant::now();
+    foxes(&client).await.unwrap();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(190) && took < Duration::from_millis(1_500),
+        "as long as the client gives, and no longer: {took:?}"
+    );
+
+    // Given no time at all, no other address has time to better it.
+    let at_once = tries(4)
+        .timeout(Duration::from_secs(60))
+        .better_within(Duration::ZERO);
+    let client = Client::connect(&[&cannot.url, &hung], KEY, at_once).unwrap();
+    let started = Instant::now();
+    let found = foxes(&client).await.unwrap();
+    assert_eq!(found.degraded_by, Some(Code::ModelUnavailable));
+    assert!(started.elapsed() < Duration::from_millis(150));
+}
+
+#[tokio::test]
+async fn an_answer_by_the_words_alone_does_not_teach_the_client_which_node_to_ask_first() {
+    // One node lists collections and cannot embed; the other is the
+    // other way about.
+    let lists = Stub::answering(|_, path| match path.ends_with("/hybrid") {
+        true => (503, failure("unavailable")),
+        false => (200, json!({ "collections": [] })),
+    })
+    .await;
+    let ranks = Stub::answering(|_, path| match path.ends_with("/hybrid") {
+        true => by_words("model_unavailable"),
+        false => (503, failure("unavailable")),
+    })
+    .await;
+    let client = Client::connect(&[&ranks.url, &lists.url], KEY, quick(3)).unwrap();
+    let acme = client.tenant(&tenant("acme"));
+    acme.collections().await.unwrap();
+    assert_eq!((ranks.asked("GET "), lists.asked("GET ")), (1, 1));
+    let found = foxes(&client).await.unwrap();
+    assert_eq!(found.degraded_by, Some(Code::ModelUnavailable));
+    acme.collections().await.unwrap();
+    assert_eq!(
+        (ranks.asked("GET "), lists.asked("GET ")),
+        (1, 2),
+        "the node that listed is still the one asked first"
+    );
+}
+
+#[tokio::test]
+async fn a_node_that_cannot_is_left_out_while_the_others_are_tried_again() {
+    let (unable, _) = modelless((200, json!(null))).await;
+    let away = Stub::answering(|_, _| (503, failure("unavailable"))).await;
+    let client = Client::connect(&[&unable.url, &away.url], KEY, quick(3)).unwrap();
+    let failed = client.tenant(&tenant("acme")).collections().await;
+    assert_eq!(failed.unwrap_err().code(), Some(Code::Unavailable));
+    assert_eq!(
+        (unable.asked("acme"), away.asked("acme")),
+        (1, 3),
+        "every try is spent on the node that may yet answer"
+    );
+
+    // The other way about: away first, then unable, then away again.
+    let (unable, _) = modelless((200, json!(null))).await;
+    let away = Stub::answering(|_, _| (503, failure("unavailable"))).await;
+    let client = Client::connect(&[&away.url, &unable.url], KEY, quick(3)).unwrap();
+    let failed = client.tenant(&tenant("acme")).collections().await;
+    assert_eq!(failed.unwrap_err().code(), Some(Code::Unavailable));
+    assert_eq!((unable.asked("acme"), away.asked("acme")), (1, 3));
+}
+
+#[tokio::test]
+async fn a_search_a_node_cannot_embed_for_is_answered_by_one_that_can() {
+    let url = keyed_embedding_server("sk-right").await;
+    let cluster = Cluster::new();
+    let right = cluster.serve_embedding_keyed(&url, "sk-right").await;
+    let wrong = cluster.serve_embedding_keyed(&url, "sk-wrong").await;
+    let embedding = json!({
+        "provider": "http",
+        "api": "openai",
+        "url": url,
+        "model": "stand-in",
+        "dimensions": 2,
+        "properties": ["title"],
+    });
+    right.with_notes(embedding).await;
+    // Asked of the node set up wrong first, with one try and no waiting.
+    let client = Client::connect(&[&wrong.url, &right.url], KEY, tries(1)).unwrap();
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let fox = Content::new(json!({ "title": "a red fox" }).as_object().unwrap().clone());
+    notes.put(oid(1), &fox).await.unwrap();
+    let nearest = Nearest::to_text("a red fox", 1).vectors(true);
+    let found = notes.nearest(&nearest).await.unwrap();
+    assert_eq!(found.results[0].object.vector, Some(vec![9.0, 3.0]));
+
+    let hybrid = Hybrid::new("a red fox", 1);
+    // A client that has yet to learn which node can: it asks the node set
+    // up wrong first, and goes on past its answer by the words alone.
+    let fresh = Client::connect(&[&wrong.url, &right.url], KEY, tries(1)).unwrap();
+    let fresh = fresh.tenant(&tenant("acme")).collection(&notes_named());
+    let fused = fresh.hybrid(&hybrid).await.unwrap();
+    assert_eq!((fused.degraded, fused.degraded_by), (false, None));
+    assert!(fused.results[0].distance.is_some(), "ranked by meaning too");
+
+    // With no node set up right, the search fails once its tries are
+    // spent, and says how and where the fault lies; a hybrid search is
+    // answered by the words alone.
+    let only_wrong = Client::connect(&[&wrong.url], KEY, quick(3)).unwrap();
+    let notes = only_wrong
+        .tenant(&tenant("acme"))
+        .collection(&notes_named());
+    let failed = notes.nearest(&nearest).await.unwrap_err();
+    assert!(failed.is_model_unavailable(), "{failed}");
+    assert_eq!(failed.reason(), Some(Reason::Setup));
+    let by_words = notes.hybrid(&hybrid).await.unwrap();
+    assert_eq!(
+        (by_words.degraded, by_words.degraded_by),
+        (true, Some(Code::ModelUnavailable))
+    );
+    assert!(by_words.results[0].distance.is_none());
 }

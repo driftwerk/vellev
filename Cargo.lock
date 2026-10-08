@@ -4189,6 +4189,7 @@ dependencies = [
  "chrono",
  "clap",
  "eyre",
+ "http-body-util",
  "jsonwebtoken",
  "object_store",
  "reqwest",
@@ -4263,12 +4264,15 @@ dependencies = [
  "axum",
  "fastembed",
  "futures",
+ "hf-hub",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "vellev-core",
 ]
 

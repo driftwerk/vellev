@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use vellev_core::{CollectionName, ObjectError, ObjectId, SchemaError};
+use vellev_core::{CollectionName, ModelFault, ObjectError, ObjectId, SchemaError};
 
 use crate::coordinator::CoordinatorError;
+use crate::mutation::Unembedded;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -50,8 +51,14 @@ pub enum StorageError {
     InvalidMutation(String),
     #[error("{0}")]
     InvalidQuery(String),
+    /// Vectors the commit needed could not be made; with `lasting`, not
+    /// until that fault is put right.
     #[error("embedding with {model} failed: {reason}")]
-    Embedding { model: String, reason: String },
+    Embedding {
+        model: String,
+        reason: String,
+        lasting: Option<ModelFault>,
+    },
     #[error(transparent)]
     Schema(#[from] SchemaError),
     #[error(transparent)]
@@ -84,6 +91,40 @@ pub enum StorageError {
 pub struct Refusal {
     pub kind: Refused,
     pub message: String,
+    /// What the request named that was not there. A release from before
+    /// this was kept neither reads nor keeps it, and a refusal that has
+    /// been through one says only that something was not found. So does
+    /// one that lacked a kind of thing this release has no name for,
+    /// kept by a later one: it reads as nothing kept, not as a file that
+    /// cannot be read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lacking_if_known"
+    )]
+    pub lacking: Option<Lacking>,
+}
+
+fn lacking_if_known<'de, D: serde::Deserializer<'de>>(
+    kept: D,
+) -> std::result::Result<Option<Lacking>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Kept {
+        Known(Lacking),
+        Unknown(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Kept>::deserialize(kept)? {
+        Some(Kept::Known(lacking)) => Some(lacking),
+        Some(Kept::Unknown(_)) | None => None,
+    })
+}
+
+/// What a request named that was not there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Lacking {
+    Collection,
+    Object,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +138,15 @@ pub enum Refused {
 }
 
 impl StorageError {
+    /// The failure to make vectors with `model`.
+    pub fn unembedded(model: String, why: Unembedded) -> Self {
+        Self::Embedding {
+            model,
+            reason: why.reason,
+            lasting: why.lasting,
+        }
+    }
+
     /// The failure itself, looking through [`StorageError::Shared`].
     pub fn root(&self) -> &StorageError {
         match self {
@@ -109,6 +159,11 @@ impl StorageError {
     /// so would be the same however often the request were made: not a
     /// failure that may pass.
     pub fn refusal(&self) -> Option<Refusal> {
+        let lacking = match self.root() {
+            Self::UnknownCollection(_) => Some(Lacking::Collection),
+            Self::UnknownObject { .. } => Some(Lacking::Object),
+            _ => None,
+        };
         let kind = match self.root() {
             Self::UnknownCollection(_) | Self::UnknownObject { .. } => Refused::NotFound,
             Self::CollectionExists(_)
@@ -125,6 +180,7 @@ impl StorageError {
         Some(Refusal {
             kind,
             message: self.root().to_string(),
+            lacking,
         })
     }
 

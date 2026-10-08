@@ -20,6 +20,7 @@ chrono.workspace = true
 clap.workspace = true
 base64.workspace = true
 eyre.workspace = true
+http-body-util.workspace = true
 jsonwebtoken.workspace = true
 object_store.workspace = true
 reqwest.workspace = true
