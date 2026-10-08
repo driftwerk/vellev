@@ -1882,13 +1882,20 @@ async fn a_collection_the_node_cannot_embed_for_is_not_made_but_one_there_alread
         .await
         .unwrap();
     assert_eq!(made.outcomes, [Outcome::Applied]);
+    // Not the collection just made, which would clash, but one that is
+    // not there and could not be made.
+    elsewhere.name = CollectionName::new("third").unwrap();
     let again = acme
         .write(Batch {
             request,
-            mutations: vec![Mutation::CreateCollection(elsewhere)],
+            mutations: vec![Mutation::CreateCollection(elsewhere.clone())],
         })
         .await
         .unwrap();
+    assert!(no_such_model(
+        acme.write(vec![Mutation::CreateCollection(elsewhere)])
+            .await
+    ));
     assert_eq!(
         (again.position, again.outcomes),
         (made.position, made.outcomes)

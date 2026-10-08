@@ -1999,22 +1999,43 @@ async fn a_collection_with_a_model_no_build_runs_is_refused_as_the_requests_faul
     );
 
     // A request answered already is answered as it was, whatever it is
-    // sent with the second time.
+    // sent with the second time: even a collection that is not there,
+    // with a model that could not be run, which is not looked at.
     let named = [(REQUEST, "6f1c2b9e-1d0a-4c55-9a3e-2f6c4d8b7a14")];
-    let others = "/v1/tenants/acme/collections/others";
-    let schema = |embedding: Value| {
+    let making = |name: &str, embedding: Value| {
         let mut schema = notes(embedding);
-        schema["name"] = json!("others");
-        Some(schema)
+        schema["name"] = json!(name);
+        Some(json!({ "changes": [{ "op": "create_collection", "schema": schema }] }))
     };
+    let changes = "/v1/tenants/acme/changes";
     let made = served
-        .call_headed(Some(KEY), Method::PUT, others, schema(supplied()), &named)
+        .call_headed(
+            Some(KEY),
+            Method::POST,
+            changes,
+            making("others", supplied()),
+            &named,
+        )
         .await;
     assert_eq!(made.0, StatusCode::OK, "{}", made.1);
     let again = served
-        .call_headed(Some(KEY), Method::PUT, others, schema(unheard_of), &named)
+        .call_headed(
+            Some(KEY),
+            Method::POST,
+            changes,
+            making("third", unheard_of.clone()),
+            &named,
+        )
         .await;
     assert_eq!(again, made);
+    let unnamed = served
+        .post(changes, making("third", unheard_of).unwrap())
+        .await;
+    assert_eq!(
+        unnamed,
+        invalid("acme/unheard-of cannot be run locally"),
+        "sent as a request of its own, it is refused"
+    );
 }
 
 #[tokio::test]
