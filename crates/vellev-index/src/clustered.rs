@@ -43,7 +43,7 @@ const TRAINING_PER_CLUSTER: usize = 64;
 
 /// Vectors clustered around centroids, each kept as a one-bit code.
 #[derive(Clone, Deserialize)]
-#[serde(from = "Wire")]
+#[serde(try_from = "Wire")]
 pub struct ClusteredIndex {
     metric: Distance,
     dimensions: usize,
@@ -75,7 +75,7 @@ impl fmt::Debug for ClusteredIndex {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "ClusterWire", into = "ClusterWire")]
+#[serde(try_from = "ClusterWire", into = "ClusterWire")]
 struct Cluster {
     rows: Vec<u32>,
     codes: Vec<u64>,
@@ -147,8 +147,42 @@ struct Wire {
     probes: usize,
 }
 
-impl From<Wire> for ClusteredIndex {
-    fn from(wire: Wire) -> Self {
+impl Wire {
+    /// What is wrong with the index as read, if its parts do not fit one
+    /// another: a file that is corrupt, which would otherwise be found out
+    /// by a panic at some later query.
+    fn fault(&self) -> Option<String> {
+        let width = self.rotation.width;
+        if self.dimensions > width {
+            return Some(format!(
+                "{} dimensions in a rotation {width} wide",
+                self.dimensions
+            ));
+        }
+        if self.clusters.is_empty() {
+            return Some("no clusters".to_string());
+        }
+        if self.centroids.len() != self.clusters.len() * width {
+            return Some(format!(
+                "{} centroid values for {} clusters {width} wide",
+                self.centroids.len(),
+                self.clusters.len()
+            ));
+        }
+        self.clusters
+            .iter()
+            .position(|cluster| cluster.codes.len() != cluster.rows.len() * (width / 64))
+            .map(|cluster| format!("cluster {cluster}'s codes are not {width} bits a row"))
+    }
+}
+
+impl TryFrom<Wire> for ClusteredIndex {
+    type Error = String;
+
+    fn try_from(wire: Wire) -> Result<Self, Self::Error> {
+        if let Some(fault) = wire.fault() {
+            return Err(fault);
+        }
         let mut rows: Vec<(u32, (u32, u32))> = wire
             .clusters
             .iter()
@@ -163,7 +197,7 @@ impl From<Wire> for ClusteredIndex {
             .collect();
         rows.sort_unstable();
         let (rows, at) = rows.into_iter().unzip();
-        Self {
+        Ok(Self {
             metric: wire.metric,
             dimensions: wire.dimensions,
             unmeasured: unmeasured(&wire.clusters, &wire.centroids, wire.rotation.width),
@@ -173,7 +207,7 @@ impl From<Wire> for ClusteredIndex {
             rows,
             at,
             probes: wire.probes,
-        }
+        })
     }
 }
 
@@ -227,8 +261,15 @@ impl From<Cluster> for ClusterWire {
     }
 }
 
-impl From<ClusterWire> for Cluster {
-    fn from(wire: ClusterWire) -> Self {
+/// A cluster is read back only if each of its rows has all its factors.
+impl TryFrom<ClusterWire> for Cluster {
+    type Error = String;
+
+    fn try_from(wire: ClusterWire) -> Result<Self, Self::Error> {
+        let rows = wire.rows.len();
+        if [wire.norms.len(), wire.aligns.len(), wire.alongs.len()] != [rows; 3] {
+            return Err(format!("a cluster of {rows} rows without factors for each"));
+        }
         let factors = wire
             .norms
             .into_iter()
@@ -236,11 +277,11 @@ impl From<ClusterWire> for Cluster {
             .zip(wire.alongs)
             .map(|((norm, align), along)| Factor { norm, align, along })
             .collect();
-        Self {
+        Ok(Self {
             rows: wire.rows,
             codes: wire.codes,
             factors,
-        }
+        })
     }
 }
 
@@ -528,6 +569,8 @@ impl ClusteredIndex {
         let coded: Vec<(usize, Vec<u64>, Factor)> = vectors
             .par_iter()
             .map(|(_, vector)| {
+                // Defence in depth: its length, worked out again from its
+                // factors, would set such a row apart even if it were coded.
                 if !measurable(metric, vector) {
                     return (0, vec![0; width / 64], Factor::UNMEASURED);
                 }
@@ -1308,6 +1351,54 @@ mod tests {
             .collect();
         rows.sort_unstable();
         assert_eq!(rows, [7, 9]);
+    }
+
+    /// An index whose stored parts do not fit one another is refused when
+    /// read, not left to panic at a query, or to take all memory for a
+    /// rotation as wide as a corrupt file says.
+    #[test]
+    fn an_index_whose_parts_do_not_fit_is_refused_on_load() {
+        let index = indexed(Distance::L2, &grouped(21, 1000, 48, 8, 0.4));
+        let bytes = rmp_serde::to_vec_named(&index).unwrap();
+        type Corrupt = fn(&mut Wire);
+        let reread = |corrupt: Corrupt| {
+            let mut wire: Wire = rmp_serde::from_slice(&bytes).unwrap();
+            corrupt(&mut wire);
+            let bytes = rmp_serde::to_vec_named(&wire).unwrap();
+            rmp_serde::from_slice::<ClusteredIndex>(&bytes).map(|index| index.len())
+        };
+        assert_eq!(reread(|_| {}).unwrap(), 1000);
+        let corruptions: [(&str, Corrupt); 9] = [
+            ("no width", |wire| wire.rotation.width = 0),
+            ("a width that is no power of two", |wire| {
+                wire.rotation.width = 100
+            }),
+            ("a width beyond memory", |wire| {
+                wire.rotation.width = 1 << 40
+            }),
+            ("a width the centroids and codes are not of", |wire| {
+                wire.rotation.width = 128
+            }),
+            ("more dimensions than the width", |wire| {
+                wire.dimensions = 65
+            }),
+            ("a centroid cut short", |wire| {
+                wire.centroids.pop();
+            }),
+            ("a code cut short", |wire| {
+                wire.clusters[0].codes.pop();
+            }),
+            ("a row without factors", |wire| {
+                wire.clusters[0].factors.pop();
+            }),
+            ("no clusters", |wire| {
+                wire.clusters.clear();
+                wire.centroids.clear();
+            }),
+        ];
+        for (what, corrupt) in corruptions {
+            assert!(reread(corrupt).is_err(), "an index with {what} was read");
+        }
     }
 
     #[test]

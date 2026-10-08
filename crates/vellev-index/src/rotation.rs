@@ -10,12 +10,19 @@
 //! every stored index answer wrongly. The golden tests below hold them to it.
 
 use serde::{Deserialize, Serialize};
+use vellev_core::MAX_DIMENSIONS;
+
+/// The narrowest rotation: one word of code.
+const NARROWEST: usize = 64;
+/// The widest rotation a stored index can have: that of the most dimensions
+/// a collection may declare.
+const WIDEST: usize = (MAX_DIMENSIONS as usize).next_power_of_two();
 
 /// A random orthogonal rotation: random signs followed by a Walsh-Hadamard
 /// transform, over the dimensions padded to a power of two. Stored as its
 /// width and seed alone; the signs follow from the seed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "Spec", into = "Spec")]
+#[serde(try_from = "Spec", into = "Spec")]
 pub(crate) struct Rotation {
     pub width: usize,
     seed: u64,
@@ -29,13 +36,19 @@ struct Spec {
     seed: u64,
 }
 
-impl From<Spec> for Rotation {
-    fn from(Spec { width, seed }: Spec) -> Self {
-        let mut random = Random(seed);
-        let signs = (0..width)
-            .map(|_| if random.next() & 1 == 0 { 1.0 } else { -1.0 })
-            .collect();
-        Self { width, seed, signs }
+/// A stored rotation is read back only if its width is one [`Rotation::new`]
+/// gives a collection's vectors. A file that says otherwise is corrupt, and
+/// is refused before anything is sized by what it says.
+impl TryFrom<Spec> for Rotation {
+    type Error = String;
+
+    fn try_from(Spec { width, seed }: Spec) -> Result<Self, Self::Error> {
+        match width.is_power_of_two() && (NARROWEST..=WIDEST).contains(&width) {
+            true => Ok(Self::of(width, seed)),
+            false => Err(format!(
+                "a rotation {width} wide, not a power of two from {NARROWEST} to {WIDEST}"
+            )),
+        }
     }
 }
 
@@ -50,11 +63,15 @@ impl From<Rotation> for Spec {
 
 impl Rotation {
     pub fn new(dimensions: usize, seed: u64) -> Self {
-        Spec {
-            width: dimensions.next_power_of_two().max(64),
-            seed,
-        }
-        .into()
+        Self::of(dimensions.next_power_of_two().max(NARROWEST), seed)
+    }
+
+    fn of(width: usize, seed: u64) -> Self {
+        let mut random = Random(seed);
+        let signs = (0..width)
+            .map(|_| if random.next() & 1 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        Self { width, seed, signs }
     }
 
     pub fn apply(&self, vector: &[f32]) -> Vec<f32> {
@@ -218,6 +235,23 @@ mod tests {
                 (rotated.len(), fingerprint(&rotated)),
                 (rotation.width, golden)
             );
+        }
+    }
+
+    /// A stored width no rotation of a collection's vectors has is refused,
+    /// not sized by: nothing, an odd number, a width too narrow, and one
+    /// that would take all memory to give signs to.
+    #[test]
+    fn a_stored_rotation_of_no_possible_width_is_refused() {
+        for width in [0, 1, 32, 100, 16_384, 1 << 40] {
+            let bytes = rmp_serde::to_vec_named(&Spec { width, seed: 7 }).unwrap();
+            let read = rmp_serde::from_slice::<Rotation>(&bytes);
+            assert!(read.is_err(), "a width of {width} was read");
+        }
+        for width in [64, 1024, 8192] {
+            let bytes = rmp_serde::to_vec_named(&Spec { width, seed: 7 }).unwrap();
+            let read: Rotation = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(read.apply(&[1.0]).len(), width);
         }
     }
 
