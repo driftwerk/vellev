@@ -1048,7 +1048,10 @@ async fn a_request_one_node_cannot_do_as_it_is_set_up_is_asked_of_each_other_nod
     // at once, for nothing but the first's being unable.
     let nodes = [unable.url.as_str(), other.url.as_str(), able.url.as_str()];
     let client = Client::connect(&nodes, KEY, tries(1)).unwrap();
-    ask(&client).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), ask(&client))
+        .await
+        .expect("no wait before another node is asked")
+        .unwrap();
     ask(&client).await.unwrap();
     assert_eq!(
         (
