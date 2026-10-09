@@ -3627,3 +3627,110 @@ async fn an_object_weaviate_holds_after_all_is_stored_only_of_the_class_that_was
     );
     assert_eq!(importing.get(5).await.unwrap().properties["n"], json!(5));
 }
+
+#[tokio::test]
+async fn a_comparison_of_some_pages_does_not_always_look_at_the_first() {
+    let Some(importing) = Importing::new("VellevImportSampled", 0).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    for n in (0..800u64).step_by(8) {
+        weaviate.post(class, n, object(n), vector(n)).await;
+    }
+    importing.run().await.unwrap();
+    // Another writer spoils the ten objects of the ledger's first page,
+    // and no others.
+    for n in (0..80u64).step_by(8) {
+        let patch = Changes::new(map(json!({ "n": -1 })));
+        importing.records.patch(oid(n), &patch).await.unwrap();
+    }
+    let verify = Options {
+        mode: Mode::Verify { pages: Some(1) },
+        page: 10,
+        ..importing.options.clone()
+    };
+    // One page of ten, looked at twelve times: were it always the first,
+    // every look would find the ten different; by chance, all twelve do
+    // so once in a million million.
+    let mut spoiled = Vec::new();
+    for _ in 0..12 {
+        let report = importing.run_as(&verify).await.unwrap();
+        let verified = report.classes[class].verified.clone().unwrap();
+        assert_eq!(verified.looked, 10);
+        spoiled.push(verified.different);
+    }
+    assert!(spoiled.contains(&10) || spoiled.contains(&0), "{spoiled:?}");
+    assert!(
+        spoiled.iter().any(|different| *different == 0),
+        "{spoiled:?}"
+    );
+}
+
+/// The note of where the class came from, as the tenant keeps it.
+async fn binding(importing: &Importing) -> Map<String, Value> {
+    let imports = CollectionName::new("vellev_imports").unwrap();
+    let listed = importing
+        .tenant
+        .collection(&imports)
+        .list(&Page::new(10))
+        .await
+        .unwrap();
+    let class = json!(importing.class);
+    let bound = listed
+        .objects
+        .into_iter()
+        .find(|bound| bound.properties["class"] == class);
+    bound.unwrap().properties
+}
+
+/// Begin taking the collection up without a ledger, and stop after the
+/// first page.
+async fn half_taken_up(importing: &Importing) {
+    importing.run().await.unwrap();
+    importing.unledgered().await;
+    let page = importing.page(true);
+    let fault = StatusCode::BAD_REQUEST;
+    importing.proxy.answer(0, &strs(&page), fault, json!({}));
+    let stopped = importing.run().await.unwrap_err();
+    assert!(stopped.to_string().contains("400"), "{stopped}");
+    assert_eq!(binding(importing).await["census"], json!(true));
+}
+
+#[tokio::test]
+async fn a_taking_up_begun_again_after_its_ledger_is_lost_part_way_notes_nothing() {
+    let Some(importing) = Importing::new("VellevImportCensusLost", 120).await else {
+        return;
+    };
+    let class = importing.class;
+    half_taken_up(&importing).await;
+    // The ledger is lost, and something else writes to the collection:
+    // among Weaviate's ids, and past them.
+    importing.ledger().drop().await.unwrap();
+    for n in [1_000, 4_003] {
+        importing.records.put(oid(n), &foreign(n)).await.unwrap();
+    }
+    let report = importing.run().await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!((copied.unknown, copied.vellev), (0, 122));
+    assert_eq!(binding(&importing).await.get("census"), None);
+    for n in [1_000, 4_003] {
+        assert_eq!(importing.entry(n).await, None);
+    }
+    // Which is why nothing is deleted for them, however a run is told.
+    let report = importing.run_as(&sweeping(&importing.options)).await;
+    assert_eq!(report.unwrap().classes[class].deleted, 0);
+    assert_eq!(importing.records.count(None).await.unwrap(), 122);
+}
+
+#[tokio::test]
+async fn ending_an_import_ends_its_taking_up_too() {
+    let Some(importing) = Importing::new("VellevImportEndedHalfway", 120).await else {
+        return;
+    };
+    half_taken_up(&importing).await;
+    import::finalise(&importing.tenant, &[]).await.unwrap();
+    let bound = binding(&importing).await;
+    assert_eq!(bound["finalised"], json!(true));
+    assert_eq!(bound.get("adopting"), None);
+    assert_eq!(bound.get("census"), None);
+}
