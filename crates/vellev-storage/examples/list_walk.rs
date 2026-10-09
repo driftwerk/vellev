@@ -6,7 +6,8 @@
 //! Environment: ROWS (1000000) rows are written in commits of 8192, with a
 //! flush every FLUSH (500000) rows so the collection lies in several
 //! segments and a memtable; ids are random, so id order is not write order.
-//! PAGE (100) is the page size of the full walk, made only with WALK set:
+//! Vectors have DIMS (2) dimensions, which only what a version costs
+//! depends on. PAGE (100) is the page size of the full walk, made only with WALK set:
 //! on a release before this one it costs the collection's size per page.
 //! Each timing is the best of three.
 
@@ -30,7 +31,7 @@ fn setting(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn collection() -> Collection {
+fn collection(dimensions: u32) -> Collection {
     Collection {
         name: CollectionName::new("Walked").expect("valid name"),
         properties: vec![
@@ -40,7 +41,7 @@ fn collection() -> Collection {
         embedding: Embedding {
             provider: EmbeddingProvider::None,
             model: "supplied".into(),
-            dimensions: 2,
+            dimensions,
             query_prefix: None,
             document_prefix: None,
             properties: vec![],
@@ -54,8 +55,10 @@ fn collection() -> Collection {
 /// One in ten thousand rows has `k == "x"`.
 const SPARSE: u64 = 10_000;
 
-fn row(collection: &CollectionName, n: u64) -> Mutation {
+fn row(collection: &CollectionName, n: u64, dimensions: u32) -> Mutation {
     let k = if n.is_multiple_of(SPARSE) { "x" } else { "y" };
+    let mut vector = vec![1.0; dimensions as usize];
+    vector[0] = n as f32;
     Mutation::Upsert {
         collection: collection.clone(),
         id: ObjectId::generate(),
@@ -63,7 +66,7 @@ fn row(collection: &CollectionName, n: u64) -> Mutation {
             .as_object()
             .expect("an object")
             .clone(),
-        vector: Some(vec![n as f32, 1.0]),
+        vector: Some(vector),
         only_if_version: None,
     }
 }
@@ -84,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rows = setting("ROWS", 1_000_000);
     let flush_every = setting("FLUSH", 500_000);
     let page = setting("PAGE", 100) as usize;
+    let dimensions = setting("DIMS", 2) as u32;
     let walk = std::env::var_os("WALK").is_some();
 
     let key = PartitionKey {
@@ -105,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fanout: 2,
             ..Merging::default()
         });
-    let schema = collection();
+    let schema = collection(dimensions);
     let name = schema.name.clone();
     writer
         .commit(vec![Mutation::CreateCollection(Box::new(schema))])
@@ -116,7 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut since_flush = 0;
     while written < rows {
         let size = 8_192.min(rows - written);
-        let mutations = (written..written + size).map(|n| row(&name, n)).collect();
+        let mutations = (written..written + size)
+            .map(|n| row(&name, n, dimensions))
+            .collect();
         writer.commit(mutations).await?;
         written += size;
         since_flush += size;
@@ -194,8 +200,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
     println!("page 1000 from the start, with versions: {versions:?}");
+    let near = vec![0.5; dimensions as usize];
     let searched = best_of_three(|| {
-        let query = Query::nearest(&[0.5, 1.0], 100);
+        let query = Query::nearest(&near, 100);
         partition.read(|state| {
             state
                 .search(&name, &query)

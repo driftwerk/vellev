@@ -92,8 +92,14 @@ impl Version {
             Some(vector) => {
                 hasher.update([1]);
                 hasher.update((vector.len() as u64).to_le_bytes());
-                for n in vector {
-                    hasher.update(f32_bits(*n));
+                // Fed a block at a time: a hasher given four bytes at a
+                // time spends longer taking them in than hashing them.
+                let mut block = [0_u8; 1_024];
+                for numbers in vector.chunks(block.len() / 4) {
+                    for (bytes, n) in block.chunks_exact_mut(4).zip(numbers) {
+                        bytes.copy_from_slice(&f32_bits(*n));
+                    }
+                    hasher.update(&block[..numbers.len() * 4]);
                 }
             }
         }
