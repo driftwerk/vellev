@@ -22,7 +22,7 @@ use vellev_storage::coordinator::{KeyHash, Point, Restore, RestorePoint, Restore
 
 use common::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
-use vellev_storage::{Batch, Embedded, Merging, Outcome};
+use vellev_storage::{Batch, Embedded, Live, Merging, Outcome};
 
 const COLLECTION: &str = "sim";
 
@@ -521,18 +521,94 @@ type Rows = BTreeMap<ObjectId, (i64, Vec<f32>)>;
 /// A partition's rows and the position they are at.
 type Snapshot = (LogPosition, Rows);
 
+fn n_of(found: &Live<'_>) -> i64 {
+    match found.object.properties.get("n") {
+        Some(Value::Int(n)) => *n,
+        other => panic!("{other:?}"),
+    }
+}
+
 fn snapshot(state: &State) -> Snapshot {
     let rows = state
         .scan(&name(COLLECTION))
-        .map(|found| match found.object.properties.get("n") {
-            Some(Value::Int(n)) => {
-                let vector = found.vector.map(<[f32]>::to_vec).unwrap_or_default();
-                (found.id(), (*n, vector))
-            }
-            other => panic!("{other:?}"),
+        .map(|found| {
+            let vector = found.vector.map(<[f32]>::to_vec).unwrap_or_default();
+            (found.id(), (n_of(&found), vector))
         })
         .collect();
     (state.position(), rows)
+}
+
+/// The rows as a walk of pages lists them, `page` at a time from the
+/// start, with `filter`, which must be every row that passes in id order:
+/// what `scan` finds, which the snapshot is checked by.
+fn walked(state: &State, page: usize, filter: Option<&Filter>, step: usize) -> Violation {
+    // A copy from before the collection was made has nothing to page.
+    if state.collection(&name(COLLECTION)).is_none() {
+        return Ok(());
+    }
+    let passes = |n: i64| match filter {
+        None => true,
+        Some(Filter::Gte { value, .. }) => n >= value.as_i64().unwrap(),
+        Some(Filter::Eq { value, .. }) => n == value.as_i64().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let expected: Vec<(ObjectId, i64)> = state
+        .scan(&name(COLLECTION))
+        .map(|found| (found.id(), n_of(&found)))
+        .filter(|(_, n)| passes(*n))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    let mut listed = Vec::new();
+    let mut after = None;
+    loop {
+        let found = state
+            .list(&name(COLLECTION), filter, after, page)
+            .map_err(|error| format!("a page could not be listed: {error}"))?;
+        check(found.len() <= page, || {
+            format!("a page of {page} held {} rows", found.len())
+        })?;
+        listed.extend(found.iter().map(|found| (found.id(), n_of(found))));
+        if found.len() < page {
+            break;
+        }
+        after = listed.last().map(|(id, _)| *id);
+    }
+    check(listed == expected, || {
+        format!(
+            "at step {step} a walk of pages of {page} with {filter:?} listed {listed:?}, \
+             and the rows are {expected:?}"
+        )
+    })
+}
+
+/// The pages of a walk made at `step`: a size and a filter that vary
+/// with it, so that over a history every size from one up, no filter, a
+/// filter most rows pass and one few pass are all walked, and the way a
+/// filtered page is taken, by sorting the few or by meeting the many in
+/// order, is both.
+fn walk_at(step: usize) -> (usize, Option<Filter>) {
+    let page = 1 + step % 5;
+    let filter = match step % 3 {
+        0 => None,
+        1 => Some(Filter::Gte {
+            property: "n".into(),
+            value: json!((step % 7) as i64),
+        }),
+        _ => Some(Filter::Eq {
+            property: "n".into(),
+            value: json!((step / 3) as i64),
+        }),
+    };
+    (page, filter)
+}
+
+/// A snapshot of `state`, once its pages are seen to list the same rows.
+fn snapshot_walked(state: &State, step: usize) -> std::result::Result<Snapshot, String> {
+    let (page, filter) = walk_at(step);
+    walked(state, page, filter.as_ref(), step)?;
+    Ok(snapshot(state))
 }
 
 /// A writer, and whether it can still commit. Any failed write closes one,
@@ -996,14 +1072,16 @@ impl World {
     /// The committed state as a node starting with nothing reads it from a
     /// healthy store.
     async fn truth(&self, committed: &Committed) -> std::result::Result<Snapshot, String> {
-        Follower::open(
+        let fresh = Follower::open(
             self.cluster.key.clone(),
             self.blobs.clean.clone(),
             committed,
         )
         .await
-        .map(|fresh| fresh.partition().read(snapshot))
-        .map_err(|error| format!("the committed state cannot be read: {error}"))
+        .map_err(|error| format!("the committed state cannot be read: {error}"))?;
+        fresh
+            .partition()
+            .read(|state| snapshot_walked(state, self.step))
     }
 
     async fn verify(&mut self) -> Violation {
@@ -1052,14 +1130,17 @@ impl World {
             self.points.push((self.step, committed));
         }
 
-        let copies = self
+        let mut copies = self
             .seats
             .iter()
             .map(|seat| seat.writer.partition())
             .chain([self.follower.partition()]);
-        copies.map(|copy| copy.read(snapshot)).try_for_each(|(position, held)| {
+        copies.try_for_each(|copy| {
+            let (position, held) = copy.read(|state| snapshot_walked(state, self.step))?;
             check(self.history.get(&position) == Some(&held), || {
-                format!("a copy at {position:?} holds rows that were never committed there: {held:?}")
+                format!(
+                    "a copy at {position:?} holds rows that were never committed there: {held:?}"
+                )
             })
         })
     }

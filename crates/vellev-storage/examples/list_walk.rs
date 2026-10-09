@@ -180,21 +180,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("get: {got:?}");
     let searched = best_of_three(|| {
         let query = Query::nearest(&[0.5, 1.0], 100);
-        partition.read(|state| state.search(&name, &query).expect("a known collection").len());
+        partition.read(|state| {
+            state
+                .search(&name, &query)
+                .expect("a known collection")
+                .len()
+        });
     });
     println!("nearest top 100: {searched:?}");
     timed("page 50 from the start", None, None, 50);
     timed("page 1000 from the start", None, None, 1_000);
     timed("page 50 from the middle", None, Some(middle), 50);
     timed("page 50 past the end", None, Some(ids[ids.len() - 1]), 50);
-    timed("page 50, dense filter (n >= rows/2)", Some(&dense), None, 50);
+    timed(
+        "page 50, dense filter (n >= rows/2)",
+        Some(&dense),
+        None,
+        50,
+    );
     timed(
         "page 50, dense filter, from the middle",
         Some(&dense),
         Some(middle),
         50,
     );
-    timed("page 50, sparse filter (1 in 10000)", Some(&sparse), None, 50);
+    timed(
+        "page 50, sparse filter (1 in 10000)",
+        Some(&sparse),
+        None,
+        50,
+    );
     timed(
         "page 50, sparse filter, from the middle",
         Some(&sparse),
@@ -203,7 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if walk {
-        for (what, filter) in [("whole walk", None), ("whole walk, dense filter", Some(&dense))] {
+        for (what, filter) in [
+            ("whole walk", None),
+            ("whole walk, dense filter", Some(&dense)),
+        ] {
             let started = Instant::now();
             let mut after = None;
             let mut pages = 0;
