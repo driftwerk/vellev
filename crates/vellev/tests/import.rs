@@ -2691,12 +2691,12 @@ async fn a_comparison_of_some_of_a_class_whose_ids_lie_together_looks_at_them() 
     };
     let (class, weaviate) = (importing.class, &importing.weaviate);
     // Ids that all begin 00000000-: as time-ordered or counted ids lie.
-    for n in (0..400u64).step_by(4) {
+    for n in (0..800u64).step_by(8) {
         weaviate.post(class, n, object(n), vector(n)).await;
     }
     importing.run().await.unwrap();
     // Another writer spoils every object.
-    for n in (0..400u64).step_by(4) {
+    for n in (0..800u64).step_by(8) {
         let patch = Changes::new(map(json!({ "n": -1 })));
         importing.records.patch(oid(n), &patch).await.unwrap();
     }
@@ -2717,6 +2717,17 @@ async fn a_comparison_of_some_of_a_class_whose_ids_lie_together_looks_at_them() 
     let report = importing.run_as(&verify(50)).await.unwrap();
     let verified = report.classes[class].verified.clone().unwrap();
     assert_eq!((verified.looked, verified.different), (100, 100));
+    // What Weaviate has gained since, among the ids the ledger has, is
+    // looked at once, with the page of the ledger it falls on.
+    for n in (4..164u64).step_by(8) {
+        weaviate.post(class, n, object(n), vector(n)).await;
+    }
+    let report = importing.run_as(&verify(50)).await.unwrap();
+    let verified = report.classes[class].verified.clone().unwrap();
+    assert_eq!(
+        (verified.looked, verified.different, verified.unaccounted),
+        (120, 100, 20)
+    );
 
     // With nothing in the ledger to look at, of a class that holds
     // objects, it has compared nothing, and says so.
@@ -2981,4 +2992,25 @@ async fn a_class_made_again_under_its_first_walk_is_not_gone_on_storing() {
             assert_eq!(properties["n"], json!(n as f64));
         }
     }
+}
+
+#[tokio::test]
+async fn a_page_taken_up_is_read_whole_however_much_else_the_collection_holds_there() {
+    let Some(importing) = Importing::new("VellevImportAdoptCrowded", 60).await else {
+        return;
+    };
+    let class = importing.class;
+    importing.run().await.unwrap();
+    importing.ledger().drop().await.unwrap();
+    // Another writer's objects lie among the ids of Weaviate's first
+    // page, so that the collection holds more there than one reading of
+    // it brings.
+    for n in (1_000..1_040).step_by(4) {
+        importing.records.put(oid(n), &foreign(n)).await.unwrap();
+    }
+    let report = importing.run().await.unwrap();
+    assert_eq!(
+        (counts(&report, class), withheld(&report, class)),
+        (([0; 5], [60, 60, 70]), 0)
+    );
 }
