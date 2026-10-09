@@ -26,8 +26,15 @@ ignore = true
 
 # `paste` is finished rather than abandoned: a small macro crate with no
 # known fault, used by the tokenizer the local model needs.
+#
+# `quick-xml` 0.38, which `object_store` 0.12 pins, takes quadratic time on
+# a start tag with many attributes and unbounded memory on one with many
+# namespace declarations. It parses only what the node's own object store
+# answers, which the node trusts with its data already; a store that sent
+# such XML could withhold the data outright. The fixed `quick-xml` comes
+# with the next `object_store`.
 [advisories]
-ignore = ["RUSTSEC-2024-0436"]
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
 
 [bans]
 multiple-versions = "allow"

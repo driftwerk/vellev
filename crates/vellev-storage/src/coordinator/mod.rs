@@ -55,6 +55,34 @@ pub struct Generation(pub u64);
 #[serde(transparent)]
 pub struct Incarnation(pub u64);
 
+/// Which cluster a cluster is: an id it is given once, when its database is
+/// first made, and keeps. It is written into the backups the cluster takes
+/// and into where they lie, so that no cluster deletes what another took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClusterId(pub Uuid);
+
+impl fmt::Display for ClusterId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.simple())
+    }
+}
+
+/// Which tenant a tenant is, wherever it is: given it when it is first
+/// made, kept for as long as it lives, and written into its backups, so
+/// that a tenant made later under the same name is never taken for it. It
+/// is not the incarnation, which is one cluster's own count: a cluster that
+/// lost a tenant and adopts a backup of it takes its lineage up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Lineage(pub Uuid);
+
+impl fmt::Display for Lineage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.simple())
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
@@ -188,10 +216,20 @@ pub enum CoordinatorError {
     #[error("partition {0} is not registered")]
     UnknownPartition(PartitionKey),
     #[error(
-        "tenant {0} was removed and what was kept of it is being deleted; \
+        "tenant {tenant} was removed and what was kept of it is being deleted; \
          it can be made again, empty, once that is done"
     )]
-    Purging(TenantId),
+    Purging {
+        tenant: TenantId,
+        /// How long ago its purge was asked for.
+        asked: Duration,
+    },
+    #[error(
+        "tenant {0} is taking up a backup, and until that is done or given up \
+         commits nothing else; nor does it take one up once it has keys or has \
+         been written to"
+    )]
+    Adopting(TenantId),
     #[error(
         "lease on {key} at generation {held:?} is fenced; the current generation is {current:?}"
     )]
@@ -236,10 +274,39 @@ fn checked_ttl(ttl: Duration) -> Result<Duration> {
 
 #[async_trait]
 pub trait Coordinator: fmt::Debug + Send + Sync {
-    /// Create the partition's row at a fresh generation. Registering an
+    /// Which cluster this is.
+    async fn cluster(&self) -> Result<ClusterId>;
+
+    /// Create the partition's row at a fresh generation, of its tenant's
+    /// lineage, or of a new one if it is the tenant's first. Registering an
     /// existing partition changes nothing; one of a tenant whose files are
     /// still to be purged is refused.
     async fn register(&self, key: &PartitionKey) -> Result<()>;
+
+    /// Which tenant `tenant` is now, if there is one.
+    async fn identity(&self, tenant: &TenantId) -> Result<Option<Identity>>;
+
+    /// Have the partition's tenant become the tenant `adoption` says with
+    /// the commit that restores it, and not before: as a cluster that lost
+    /// a tenant takes it up again from a backup. Until then the tenant is
+    /// as it was. The commit at the position `adoption` names, by the
+    /// holder of the lease at `generation`, makes the tenant of that
+    /// lineage, with that restore window and those keys, all at once with
+    /// the commit or not at all; any other commit of the partition is
+    /// refused meanwhile, and so is that one if the tenant has since been
+    /// given a key or written to elsewhere. An adoption asked for again
+    /// takes the place of the one before; one whose lease has moved on is
+    /// no more. Returns whether it was noted: not for no partition, another
+    /// generation, or a tenant that has committed or has keys.
+    async fn adopt_on_commit(
+        &self,
+        key: &PartitionKey,
+        generation: Generation,
+        adoption: &Adoption,
+    ) -> Result<bool>;
+
+    /// Give up whatever adoption the partition was to make with a commit.
+    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<()>;
 
     /// Delete the partition's row. Returns whether it existed. With the
     /// tenant's last partition go its keys, so that none reaches a tenant
@@ -296,7 +363,10 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     async fn ping(&self) -> Result<()>;
 
     /// Record that `node` is running now and reads up to `versions`.
-    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()>;
+    /// Returns the file format the cluster writes once the node counts: a
+    /// format no newer than the node reads never rises past it while it
+    /// stays registered, and a newer one was raised before it counted.
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<u16>;
 
     /// Forget `node`, which has stopped.
     async fn depart(&self, node: &NodeId) -> Result<()>;
@@ -309,7 +379,8 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     async fn format(&self) -> Result<u16>;
 
     /// Raise the file format the cluster writes to `format`, if every node
-    /// registered reads it; it never falls. Returns the format after.
+    /// registered reads it, counting any whose [`Self::announce`] is under
+    /// way; it never falls. Returns the format after.
     async fn raise_format(&self, format: u16) -> Result<u16>;
 
     /// Keep a key that reaches `tenant`, by the hash of its secret. `None`
@@ -363,16 +434,24 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// partition, kept up or not. Returns how many.
     async fn forget_restores(&self) -> Result<u64>;
 
-    /// Take the right to back `tenant` up, or restore it from a backup,
-    /// for `hold`: if nobody holds it, and with `due` only if its last
-    /// backup is at least that old. Returns the claim, by which it is let
-    /// go, if it was taken.
+    /// Take the right to back `tenant` up, or restore it from a backup, as
+    /// `claim`, an id the caller picks, for `hold` from now: if nobody
+    /// holds it, and with `due` only if its last backup is at least that
+    /// old. A claim already held is held for `hold` from now, whether or
+    /// not it is due, so that a caller who never heard whether it was
+    /// taken can ask again. Returns whether `claim` is held.
     async fn claim_backup(
         &self,
         tenant: &TenantId,
+        claim: Uuid,
         due: Option<Duration>,
         hold: Duration,
-    ) -> Result<Option<Uuid>>;
+    ) -> Result<bool>;
+
+    /// Hold `claim` for `hold` from now, if it is still held. One let go,
+    /// or taken over once it ran out, is not taken again. Returns whether
+    /// `claim` is held.
+    async fn renew_backup(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool>;
 
     /// Let go of `claim`, noting that the tenant was backed up now if
     /// `made`. A claim that ran out and was taken by another is left be.
@@ -383,13 +462,44 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     async fn purges(&self, due: Duration, lately: Duration) -> Result<Purges>;
 
     /// Take the right to purge `tenant` for `hold`, if its purge is still
-    /// to be done and nobody holds it. Returns the claim if it was taken.
-    async fn claim_purge(&self, tenant: &TenantId, hold: Duration) -> Result<Option<Uuid>>;
+    /// to be done, it was removed at least `due` ago, and nobody holds the
+    /// right. Returns the claim, and which tenant it was, if it was taken.
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        due: Duration,
+        hold: Duration,
+    ) -> Result<Option<PurgeClaim>>;
 
-    /// Note that `tenant`'s files are purged under `claim`, so that it may
-    /// be made again, and forget purges done over `forget_after` ago. A
-    /// claim that ran out, or a purge done already, is left be.
+    /// Hold `claim` to purge `tenant` for `hold` from now, if it is still
+    /// held, the purge is still to be done, and the tenant has not been
+    /// made again. Returns whether it is: once it is not, nothing more of
+    /// the tenant may be deleted under it.
+    async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool>;
+
+    /// Note that `tenant`'s files are purged under `claim`, and so looked
+    /// over now, so that it may be made again, and forget purges done over
+    /// `forget_after` ago. A claim that ran out, or a purge done already,
+    /// is left be.
     async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()>;
+
+    /// Take up again the purge of `tenant`, done already, if the tenant has
+    /// not been made again since: it is to be purged once more, at once,
+    /// and until that is done cannot be made again, so that what was found
+    /// left of it is deleted with nothing new. Returns whether it was taken
+    /// up.
+    async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool>;
+
+    /// Take up to `limit` of the tenants purged within `lately` that no
+    /// node has looked over within `every`, to look for anything written
+    /// for them since: each is noted as looked over now, so that one node
+    /// at a time looks at a tenant, now and then.
+    async fn look_overs(
+        &self,
+        lately: Duration,
+        every: Duration,
+        limit: usize,
+    ) -> Result<Vec<Removed>>;
 
     /// How far back `tenant` may be restored, if it is not the default.
     async fn restore_window(&self, tenant: &TenantId) -> Result<Option<Duration>>;
@@ -460,6 +570,43 @@ pub enum Point {
     At(DateTime<Utc>),
     /// The one committed at a position.
     Position(LogPosition),
+}
+
+/// Which tenant a tenant is: what tells it from any other of its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    pub lineage: Lineage,
+    /// Whether any partition of it has ever committed anything.
+    pub committed: bool,
+}
+
+/// What a tenant becomes with the commit that restores it from a backup
+/// it adopts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Adoption {
+    /// The tenant the backup is of.
+    pub lineage: Lineage,
+    /// The position of the commit that restores it.
+    pub at: LogPosition,
+    /// The keys it is given: those the backup kept, if they were asked
+    /// for.
+    pub keys: Vec<TenantKey>,
+    /// How far back it may be restored, if not the default.
+    pub restore_window: Option<Duration>,
+}
+
+/// A tenant that was removed, and which it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    pub tenant: TenantId,
+    pub lineage: Lineage,
+}
+
+/// The right to purge a removed tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgeClaim {
+    pub id: Uuid,
+    pub removed: Removed,
 }
 
 /// Tenants removed whose files are, or lately were, to be purged.

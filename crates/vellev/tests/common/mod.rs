@@ -14,7 +14,7 @@ use vellev_core::NodeId;
 use vellev_embed::Embedders;
 use vellev_node::{Node, Settings};
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
-use vellev_storage::coordinator::MemoryCoordinator;
+use vellev_storage::coordinator::{Clock, MemoryCoordinator};
 
 pub const KEY: &str = "test-key";
 pub const MAX_LIMIT: usize = 50;
@@ -22,21 +22,40 @@ pub const MAX_BODY: usize = 64 * 1024;
 /// How many reads a node under test answers at once.
 pub const READS: usize = 4;
 
+/// How long a node holds a claim on a tenant's backups unless told
+/// otherwise.
+pub fn backup_claim() -> Duration {
+    Settings::new(NodeId::generate("node")).backup_claim
+}
+
 pub fn memory() -> Arc<dyn Blobs> {
     Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))
+}
+
+/// The time of day, and however much further a test has moved it on.
+#[derive(Debug, Default)]
+struct Passing(std::sync::Mutex<Duration>);
+
+impl Clock for Passing {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + *self.0.lock().unwrap()
+    }
 }
 
 /// What the nodes of one cluster share.
 #[derive(Clone)]
 pub struct Cluster {
+    clock: Arc<Passing>,
     coordinator: Arc<MemoryCoordinator>,
     blobs: Arc<dyn Blobs>,
 }
 
 impl Cluster {
     pub fn new() -> Self {
+        let clock = Arc::new(Passing::default());
         Self {
-            coordinator: Arc::new(MemoryCoordinator::default()),
+            coordinator: Arc::new(MemoryCoordinator::new(clock.clone())),
+            clock,
             blobs: memory(),
         }
     }
@@ -44,9 +63,15 @@ impl Cluster {
     /// The same cluster as a node reaches it through another store.
     pub fn through(&self, blobs: Arc<dyn Blobs>) -> Self {
         Self {
+            clock: self.clock.clone(),
             coordinator: self.coordinator.clone(),
             blobs,
         }
+    }
+
+    /// Have `passed` go by for the cluster's coordinator.
+    pub fn pass(&self, passed: Duration) {
+        *self.clock.0.lock().unwrap() += passed;
     }
 
     /// The store the cluster's tenants are kept in.
@@ -109,6 +134,23 @@ impl Cluster {
             .unstarted_with(&[], None, &[], |settings| Settings {
                 backups: Some(store),
                 backups_scheduled: false,
+                ..settings
+            })
+            .await;
+        assert!(served.app.serve_from(served.node.clone()));
+        served
+    }
+
+    /// A node started as one is run, that backs tenants up to `store` and
+    /// purges those removed of its own accord, looking for either every
+    /// few milliseconds.
+    pub async fn serve_started_backing_up_to(&self, store: Arc<dyn Blobs>) -> Served {
+        let often = Duration::from_millis(20);
+        let served = self
+            .unstarted_with(&[], None, &[], |settings| Settings {
+                backups: Some(store),
+                backups_looked_for_every: often,
+                purges_looked_for_every: often,
                 ..settings
             })
             .await;

@@ -168,14 +168,23 @@ impl App {
         }
     }
 
-    /// Serve from `node` from now on. Only the first node given is kept.
+    /// Serve from `node` from now on, and have it do what a node does of
+    /// its own accord: say that it runs, let idle tenants go, back tenants
+    /// up and purge those removed. Only the first node given is kept.
     pub fn start(&self, node: Arc<Node>) {
-        if self.node.set(node.clone()).is_ok() {
+        if self.serve_from(node.clone()) {
             node.announcing();
             node.sweeping();
             node.backing_up();
             node.purging();
         }
+    }
+
+    /// Serve from `node` from now on, leaving what a node does of its own
+    /// accord to whoever asks it to. Returns whether it is the node served
+    /// from: only the first given is kept.
+    pub fn serve_from(&self, node: Arc<Node>) -> bool {
+        self.node.set(node).is_ok()
     }
 
     /// Report not ready from now on: the node is about to stop.

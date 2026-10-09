@@ -129,19 +129,60 @@ call -X PUT "http://127.0.0.1:8080/v1/tenants/acme/restore-window" -d '{"secs":2
 ```
 
 With `VELLEV_BACKUP_STORE` set, each tenant is also backed up once a day
-(`VELLEV_BACKUP_EVERY_SECS`), whether or not any node holds it, and backups
-are kept 35 days (`VELLEV_BACKUPS_KEPT_SECS`), the newest always. A backup
+(`VELLEV_BACKUP_EVERY_SECS`), whether or not any node holds it, unless the
+node is told not to look for backups to take of its own accord
+(`VELLEV_BACKUPS_SCHEDULED=false`, for a cluster whose backups some nodes
+take and others do not; such a node still backs up when asked and purges
+removed tenants), and backups
+are kept 35 days (`VELLEV_BACKUPS_KEPT_SECS`), the newest always. One node
+at a time backs a tenant up or restores it, by a claim it renews while it
+works; `VELLEV_BACKUP_CLAIM_SECS` (fifteen minutes, at least three times
+what one request to the store may take with its tries, nine and a half
+minutes by default) is how long a node that died holding one keeps others from the
+tenant's backups. A backup
 copies only the files no earlier one has, so keeping many costs little more
 than keeping one. Everything of a tenant lies under its own prefix of the
-one bucket, `{tenant}/`. A tenant is put back from a backup in its own
-cluster, keeping the keys it has now, or in a new one that lost it, which
-gets back its keys and restore window too:
+one bucket, `{tenant}/`.
+
+A tenant's backups are its own. Each tenant is given a lineage when it is
+first made, an id it keeps for as long as it lives, and each cluster has an
+id of its own. A backup says both, and lies under them in the backup store:
+its record under `_backups/{tenant}/backups/{lineage}/{cluster}/`, its files
+under `_backups/{tenant}/files/{lineage}/{cluster}/`. A tenant made later
+under the same id is another tenant, of another lineage: it neither lists
+nor restores from the backups of the one before, and is given none of its
+keys. A tenant is put back from one of its own backups, keeping the keys it
+has now, so that a key revoked since stays revoked:
 
 ```sh
 call -X POST "http://127.0.0.1:8080/v1/tenants/acme/backups"              # back up now
 call "http://127.0.0.1:8080/v1/tenants/acme/backups"                      # list them
 call -X POST "http://127.0.0.1:8080/v1/tenants/acme/restore" -d '{"backup":"<id>"}'
 ```
+
+A cluster that has lost a tenant takes it up again from a backup only when
+told to adopt it. Listing the backups of a tenant the cluster does not
+have, or has and has never written to, lists every backup kept under that
+id, each with the lineage it is of and the cluster that took it. Adopting
+one makes the tenant, if there is none, and restores it; with the commit
+that restores it, and not before, the tenant becomes the tenant the backup
+is of, with its lineage and its restore window. A restore that fails leaves
+the tenant as it was, with nothing of the backup: ask again, or adopt
+another. The tenant is given no key unless `with_keys` asks for those the
+backup kept, which are the keys it had when the backup was taken: a key
+revoked since then reaches the tenant again.
+
+```sh
+call -X POST "http://127.0.0.1:8080/v1/tenants/acme/restore" -d '{"adopt":{"backup":"<id>"}}'
+call -X POST "http://127.0.0.1:8080/v1/tenants/acme/restore" -d '{"adopt":{"backup":"<id>","with_keys":true}}'
+```
+
+Only a tenant that has never been written to and has no key can adopt a
+backup. One that has been written to is some other tenant of that id; a key
+issued to an empty tenant was issued for whatever was to be put in it,
+which may not be this, and is to be revoked first. Both are refused as a
+conflict. Once it has adopted a backup the tenant is restored from its own
+backups as any other.
 
 The same from the command line, with an admin key in `VELLEV_API_KEY`:
 
@@ -150,30 +191,63 @@ vellev backup --tenant acme take
 vellev backup --tenant acme list
 vellev backup --tenant acme points
 vellev backup --tenant acme restore --at 2026-10-07T08:00:00Z   # or --position N, or --backup ID
+vellev backup --tenant acme restore --adopt ID                  # with --with-keys, the keys the backup kept
 vellev backup --tenant acme window 2592000                      # no number for the default
 ```
 
 The backup store is trusted: a backup lists key hashes and files, and
-whoever can write to the store can shape what a restore brings back. A
-restore into a cluster that lost a tenant brings back every key the backup
-held, including any revoked since.
+whoever can write to the store can shape what a restore brings back.
 
-Removing a tenant removes everything kept of it. Its restore points go at
-once; `VELLEV_PURGE_AFTER_SECS` (ten minutes, at least two leases) later,
-once any node that held it has stopped committing, one node deletes its
-files and its backups, and every node drops its cached copies. A file a
-stopped writer was still uploading may outlive the purge, but none can
-belong to a tenant made later under the same id, which is refused until the
-purge is done. A backup finishing after the removal discards itself. Removal
-is final: a removed tenant cannot be restored. Its history in Postgres goes
-a batch at a time after the removal, and what is left of it with its purge.
+A cluster writes, prunes and purges only the backups it took itself, under
+its own id. So one backup store may serve several clusters, and a cluster
+may be given another's to adopt tenants from, as a new cluster is after the
+old one is lost, or one set up to rehearse that: whatever it then does with
+a tenant it adopted, removing it included, deletes nothing the other
+cluster took. From there on it backs the tenant up under the tenant's
+lineage and its own id, copying every file once, and the tenant is restored
+from what either cluster took of it. To bring tenants back in a new
+cluster, start it with `VELLEV_BACKUP_STORE` set to the old one's backup
+store, or to a copy of it, and for each tenant list its backups and adopt
+the one wanted.
 
-Several nodes may run against the same Postgres and store. Each tenant is
-written by one node at a time; a write that reaches another node is sent
-on to the holder, so set `VELLEV_ADVERTISE_URL` to each node's own address
-(never a load balancer's) wherever the default of this host's name and port
-would not reach it.
+Removing a tenant removes everything the cluster keeps of it. Its keys and
+restore points go at once; `VELLEV_PURGE_AFTER_SECS` (ten minutes, at least
+two leases) later, once any node that held it has stopped committing, one
+node deletes its files and the backups this cluster took of it, forgets its
+history in Postgres a batch at a time, and every node drops its cached
+copies. With a backup store the purge waits at least
+`VELLEV_BACKUP_CLAIM_SECS` (fifteen minutes), so that no backup of the
+tenant still holds its claim. The purge is done, and a tenant may be made
+again under the same id, only once a pass over its files and backups finds
+nothing left; until then making one is refused with the code `purging` and
+a `Retry-After` of how long that may be. One node at a time purges a
+tenant, by a claim it renews before every listing and every batch of
+deletes, and which is renewed only while the purge is still that node's to
+do and no tenant of the id has been made: a node that stalls in the middle
+of a purge deletes nothing of a tenant made since.
 
+A node that stalled may still land a file after that: a writer's upload,
+or a backup's copy. So for a day after a purge the tenant is looked over
+again every fifteen minutes, by one node at a time. Whatever is found among
+the backups this cluster took of its lineage is deleted, whether or not a
+tenant of the id has been made since. Whatever is found among its files in
+the store is deleted only while there is no tenant of the id, by purging it
+as before, and no tenant of the id can be made meanwhile. What is never
+deleted is a file that lands more than a day after the purge, or one that
+lands among the tenant's files in the store once a tenant of the id has
+been made again, which lies there until that tenant's cleaning up takes it;
+neither can be reached, a backup left so being of a lineage no tenant has.
+A backup finishing after the removal forgets itself.
+
+Removal is final. Nothing is kept in the cluster from which a removed
+tenant could be restored: the backups it took go with it, and a tenant made
+under its id afterwards is not given them even if a copy turns up. A tenant
+removed here can be brought back only from backups this cluster did not
+take, or from a copy made elsewhere beforehand, by adopting one. For a day
+after the purge the cluster deletes whatever appears under the removed
+tenant's lineage and its own id in the backup store, so a copy of its own
+backups is adopted in another cluster, or put back only once that day has
+passed.
 A node gives up on whatever stops answering, so that a tenant held up by a
 dead connection passes to another node rather than waiting with it:
 

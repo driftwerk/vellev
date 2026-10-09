@@ -14,9 +14,12 @@ Bring clients up to this release before the nodes: see
 The workspace's version is 0.2.0 from the change that added what follows
 on restores, deletes and reads. Upgrade every node before asking for a
 restore or sending a delete with a `limit`: see `docs/compatibility.md`.
-Migration `0009_restores.sql` adds the table restores are recorded in; it
-is applied as a node of this release starts, and a node of the release
-before runs on the migrated database.
+Migration `0009_restores.sql` adds the table restores are recorded in, and
+`0010_lineage.sql` gives the cluster an id and each tenant a lineage; both
+are applied as a node of this release starts, and a node of the release
+before runs on the migrated database. Postgres 13 or newer is needed for
+`0010`. While both releases run, remove no tenant and ask for no restore
+from a backup: see `docs/compatibility.md`.
 
 ### What a node answers
 
@@ -74,6 +77,41 @@ before runs on the migrated database.
   to. A node of the release before sends none, which reads as 0.
 - **Writes are refused as `unavailable` (503) while a restore runs**, and
   nothing of them is made.
+- **A tenant's backups are its own, and a cluster's backups are its own.**
+  Each tenant has a lineage, given when it is first made; each cluster an
+  id. A backup says both and lies under both in the backup store
+  (`_backups/{tenant}/backups/{lineage}/{cluster}/`). A tenant made again
+  under a removed tenant's id is another tenant: it neither lists nor
+  restores from the backups of the one before, and is given none of its
+  keys. A cluster prunes and purges only the backups it took, so one
+  backup store may serve several clusters. Backups taken before this
+  release say neither and are not carried over.
+- **Restoring `{"backup": id}` restores only the tenant's own backup**,
+  and no longer makes a tenant the cluster does not have: both are
+  `not_found`. A cluster that lost a tenant asks to
+  `{"adopt": {"backup": id, "with_keys": false}}` instead (`--adopt ID`,
+  `--with-keys` on the command line): the tenant is made if there is none
+  and, with the commit that restores it, becomes the tenant the backup is
+  of. Nothing of the backup is the tenant's if the restore fails. The
+  tenant is given the backup's keys only with `with_keys`, which brings
+  back a key revoked after the backup was taken. Only a tenant never
+  written to and without keys adopts; any other is a `conflict` (409).
+- **Two new codes, both 409**: `empty`, for backing up a tenant that has
+  committed nothing, which answered 201 with a backup of nothing; and
+  `purging`, with a `Retry-After` of how long the purge may still take,
+  for making a tenant whose id is still being purged, which was
+  `conflict`. A client of the release before reads either as `unknown`.
+  Neither is one to send again at once: the Rust client takes both as
+  final, and whoever makes a tenant again waits the `Retry-After` out.
+- **A removed tenant is purged under a renewed claim**, by one node, which
+  deletes nothing of a tenant made again under the id meanwhile; and the
+  tenant is looked over again for a day after, for files that landed
+  late. A backup claim is held for `VELLEV_BACKUP_CLAIM_SECS` (15 minutes,
+  at least 10 and a half) and renewed, where it was held for six hours.
+- **`Backup` says its `lineage` and its `cluster`.**
+- **New settings**: `VELLEV_BACKUP_CLAIM_SECS` and
+  `VELLEV_BACKUPS_SCHEDULED` (true; false has a node back up only when
+  asked); see the README.
 - **A delete by filter deletes at most 8,192 objects.** With no `limit`
   it is refused as `invalid` (400), deleting nothing, if more pass; it
   used to delete however many did. With `limit` (1 to 8,192) it deletes up
@@ -250,6 +288,10 @@ Breaking:
 - `Restored` gains `incarnation`, and `Restored::new` takes it:
   `new(from, incarnation, position)`. `Restored::after()` is what to send
   as `x-vellev-after` to read past the restore.
+- `RestoreTo` gains `Adopt(Adopt)`, with `Adopt { backup, with_keys }`:
+  a `match` on `RestoreTo` needs the arm. `Code` gains `Empty` (11) and
+  `Purging` (12), which 0.1 read as `Unknown`. `Backup` gains `lineage`
+  and `cluster`, each `Option<Uuid>`, `None` from a node of 0.1.
 - `Change::DeleteWhere` gains `limit: Option<u32>`, so writing the variant
   out needs the field. `Change::delete_where(collection, filter)` and
   `Change::delete_up_to(collection, filter, limit)` build it.
@@ -270,7 +312,9 @@ Not changed, and why: `Change`, `RestoreTo` and `Consistency` stay
 exhaustive, and `OnlyIf` and `Weighted` stay plain structs. A caller only
 ever builds the three enums, which `#[non_exhaustive]` does not bear on,
 and the only `match` on them is the node's, where an op not handled should
-not build. A new op, or a new field of an op, will be a breaking change.
+not build. A new op, or a new field of an op, will be a breaking change,
+as `RestoreTo::Adopt` is in this release, which lands before 0.2.0 is
+published.
 `OnlyIf::new` and `Weighted::new` are there for whoever would rather not
 write the two out.
 

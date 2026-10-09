@@ -5,16 +5,16 @@ use tokio::time::Instant;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions};
-use sqlx::query::QueryAs;
+use sqlx::query::{Query, QueryAs};
 use sqlx::{Executor, FromRow, Postgres};
 use uuid::Uuid;
 use vellev_core::{NodeId, Partition, RequestId, TenantId};
 
 use super::{
-    checked_hold, checked_ttl, checked_window, Acquired, Commit, Committed, Coordinator,
-    CoordinatorError, Forgotten, Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef,
-    PartitionKey, Point, Purges, Restore, RestorePoint, Restored, Result, TenantKey, Versions,
-    RESTORES_KEPT_FOR,
+    checked_hold, checked_ttl, checked_window, Acquired, Adoption, ClusterId, Commit, Committed,
+    Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation, KeyHash, Lease,
+    Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges, Removed, Restore,
+    RestorePoint, Restored, Result, TenantKey, Versions, RESTORES_KEPT_FOR,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -27,15 +27,23 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (7, include_str!("../../migrations/0007_backups.sql")),
     (8, include_str!("../../migrations/0008_purges.sql")),
     (9, include_str!("../../migrations/0009_restores.sql")),
+    (10, include_str!("../../migrations/0010_lineage.sql")),
 ];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
 /// so it is released with the transaction and never pins an RDS Proxy session.
 const MIGRATION_LOCK: i64 = 0x76656c_6c6576;
-/// The class of the transaction locks that serialise registering and
-/// removing a tenant, each taken with the hash of the tenant's id, so that
-/// a tenant is never registered while its removal marks it to be purged.
+/// The class of the transaction locks taken with the hash of a tenant's id
+/// by every write to more than one of its rows, and by registering and
+/// removing its partitions: so that a tenant is never registered while its
+/// removal marks it to be purged, and so that writes across its rows take
+/// turns.
 const TENANT_LOCK: i32 = 0x766c;
+
+/// How long a raise of the format waits for the announces under way.
+const RAISE_LOCK_TIMEOUT: &str = "1s";
+/// What Postgres answers a lock not taken within its `lock_timeout`.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
 
 /// How many times `acquire` re-reads a row that changed under it before
 /// giving up; each retry needs a release to land between its two statements.
@@ -84,6 +92,106 @@ impl PostgresCoordinator {
         .await?)
     }
 
+    /// Run `statement`, a write to any number of `tenant`'s rows, under the
+    /// tenant's lock, which every such write takes first: so they take
+    /// turns, each seeing the one before it done, and never wait on each
+    /// other's rows in different orders. A write to one row needs no turn:
+    /// it holds no row while it waits for another.
+    async fn tenant_wide(
+        &self,
+        tenant: &TenantId,
+        statement: Query<'_, Postgres, PgArguments>,
+    ) -> Result<u64> {
+        let mut transaction = self.pool.begin().await?;
+        lock_tenant(&mut transaction, tenant).await?;
+        let done = statement.execute(&mut *transaction).await?;
+        transaction.commit().await?;
+        Ok(done.rows_affected())
+    }
+
+    /// `commit` by `lease`, the first of a partition that may be to make an
+    /// adoption with it: made, with the adoption, under the tenant's lock,
+    /// or refused. `None` if it is refused for what any commit is, or if
+    /// there is no such partition.
+    ///
+    /// The adoption is made only by the commit it names, of the lease it
+    /// was noted for, of a tenant that has still committed nothing and has
+    /// no key: its lineage, its restore window and its keys are then
+    /// written with the commit. An adoption noted for a lease since moved
+    /// on is forgotten, and the commit made as any other.
+    async fn committed_adopting(&self, lease: &Lease, commit: &Commit) -> Result<Option<Snapshot>> {
+        let tenant = &lease.key.tenant;
+        let mut transaction = self.pool.begin().await?;
+        lock_tenant(&mut transaction, tenant).await?;
+        let row: Option<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT generation, adopting FROM vellev.partitions
+             WHERE tenant = $1 AND partition = $2 AND log_position = 0 AND manifest IS NULL
+             FOR UPDATE",
+        )
+        .bind(tenant.as_str())
+        .bind(i64::from(lease.key.partition.0))
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((generation, Some(adopting))) = row else {
+            return Ok(None);
+        };
+        let adopting: Adopting =
+            serde_json::from_str(&adopting).map_err(|e| invariant(e.to_string()))?;
+        let adoption = (bigint(adopting.generation.0)? == generation).then_some(adopting.adoption);
+        if let Some(adoption) = &adoption {
+            let restores = adoption.at == commit.log_position && commit.manifest.is_some();
+            let elsewhere: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM vellev.partitions
+                     WHERE tenant = $1 AND (manifest IS NOT NULL OR log_position <> 0))",
+            )
+            .bind(tenant.as_str())
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !restores || elsewhere || keyed(&mut transaction, tenant).await? {
+                return Err(CoordinatorError::Adopting(tenant.clone()));
+            }
+        }
+        let done = committing(COMMIT_HELD, lease, commit)?
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if done.is_none() {
+            return Ok(None);
+        }
+        let (lineage, window) = match &adoption {
+            Some(adoption) => (
+                Some(adoption.lineage.0),
+                window_secs(adoption.restore_window)?,
+            ),
+            None => (None, None),
+        };
+        sqlx::query(
+            "UPDATE vellev.partitions
+             SET adopting = NULL, lineage = COALESCE($2, lineage),
+                 restore_window_secs = CASE WHEN $2 IS NULL THEN restore_window_secs ELSE $3 END
+             WHERE tenant = $1",
+        )
+        .bind(tenant.as_str())
+        .bind(lineage)
+        .bind(window)
+        .execute(&mut *transaction)
+        .await?;
+        for key in adoption.iter().flat_map(|adoption| &adoption.keys) {
+            sqlx::query(
+                "INSERT INTO vellev.tenant_keys (id, tenant, hash, created_at)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            )
+            .bind(key.id)
+            .bind(tenant.as_str())
+            .bind(key.hash.as_slice())
+            .bind(key.created)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(done)
+    }
+
     /// Why a fenced statement on `lease` changed no row. `Ok` means the
     /// generation is still current, so the statement failed on another clause.
     async fn refusal(&self, lease: &Lease) -> Result<Snapshot> {
@@ -93,6 +201,45 @@ impl PostgresCoordinator {
             Some(row) => Ok(row),
         }
     }
+}
+
+/// `commit` by `lease`, as the statement `sql`.
+fn committing<'q>(
+    sql: &'static str,
+    lease: &'q Lease,
+    commit: &'q Commit,
+) -> Result<QueryAs<'q, Postgres, Snapshot, PgArguments>> {
+    let (restore, after) = (commit.restore.as_ref(), commit.after.as_ref());
+    Ok(snapshot(sql, &lease.key)
+        .bind(bigint(lease.generation.0)?)
+        .bind(bigint(commit.log_position.0)?)
+        .bind(commit.manifest.as_ref().map(|head| head.0.as_str()))
+        .bind(restore.map(|restore| restore.request.0))
+        .bind(restore.map(|restore| bigint(restore.from.0)).transpose()?)
+        .bind(restore.map(|restore| restore.from_at))
+        .bind(restore.map(|restore| restore.asked.to_vec()))
+        .bind(after.map(|after| bigint(after.position.0)).transpose()?)
+        .bind(after.and_then(|after| after.head.as_ref().map(|head| head.0.as_str()))))
+}
+
+/// Whether `tenant` has any key.
+async fn keyed(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    tenant: &TenantId,
+) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM vellev.tenant_keys WHERE tenant = $1)")
+            .bind(tenant.as_str())
+            .fetch_one(&mut **transaction)
+            .await?,
+    )
+}
+
+/// The seconds of a restore window as they are kept.
+fn window_secs(window: Option<Duration>) -> Result<Option<i64>> {
+    window
+        .map(|window| bigint(checked_window(window)?.as_secs().max(1)))
+        .transpose()
 }
 
 fn snapshot<'q>(
@@ -172,7 +319,9 @@ fn pending<'a>(
             None if *version > newest_known => {}
             _ => {
                 return Err(format!(
-                    "migration {version} differs from the one applied; recreate the database"
+                    "migration {version} as applied to this database is not the one this \
+                     release has; the database was migrated by another build of vellev. \
+                     Nothing was changed. Run the release that migrated it, or one after it"
                 ))
             }
         }
@@ -188,7 +337,9 @@ fn pending<'a>(
         .collect();
     match pending.first() {
         Some((version, _)) if *version < newest_applied => Err(format!(
-            "migration {version} was never applied, though {newest_applied} was"
+            "migration {version} was never applied to this database, though \
+             {newest_applied} was; the database was migrated by another build of vellev. \
+             Nothing was changed. Run the release that migrated it, or one after it"
         )),
         _ => Ok(pending),
     }
@@ -236,6 +387,76 @@ impl Noted {
         })
     }
 }
+
+/// A removed tenant as its purge keeps it.
+#[derive(FromRow)]
+struct RemovedRow {
+    tenant: String,
+    lineage: Uuid,
+}
+
+impl RemovedRow {
+    fn removed(self) -> Result<Removed> {
+        Ok(Removed {
+            tenant: TenantId::new(self.tenant).map_err(|error| invariant(error.to_string()))?,
+            lineage: Lineage(self.lineage),
+        })
+    }
+}
+
+/// What a partition's row keeps of an adoption to be made with a commit.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Adopting {
+    /// The generation of the lease that is to make the commit.
+    generation: Generation,
+    adoption: Adoption,
+}
+
+/// A commit, as one statement: fenced by the lease's generation, and
+/// advancing the partition or repeating what is committed. `$guard` is
+/// what more the row must satisfy.
+macro_rules! commit {
+    ($guard:literal) => {
+        concat!(
+            "WITH done AS (
+                 UPDATE vellev.partitions
+                 SET log_position = $4, manifest = $5
+                 WHERE tenant = $1 AND partition = $2 AND generation = $3
+                   AND ((log_position < $4
+                         AND ($10::bigint IS NULL
+                              OR (log_position = $10 AND manifest IS NOT DISTINCT FROM $11)))
+                        OR (log_position = $4 AND manifest IS NOT DISTINCT FROM $5))",
+            $guard,
+            "    RETURNING generation, incarnation, lease_holder, lease_expires_at, log_position, manifest
+             ), noted AS (
+                 INSERT INTO vellev.commits (tenant, partition, incarnation, position, head)
+                 SELECT $1, $2, incarnation, log_position, manifest FROM done
+                 WHERE manifest IS NOT NULL
+                 ON CONFLICT DO NOTHING
+             ), restored AS (
+                 INSERT INTO vellev.restores
+                     (tenant, partition, request, asked, incarnation, position, from_position, from_at)
+                 SELECT $1, $2, $6, $9, incarnation, log_position, $7, $8 FROM done
+                 WHERE $6::uuid IS NOT NULL
+                 ON CONFLICT (tenant, partition, incarnation, request) DO UPDATE
+                 SET asked = EXCLUDED.asked, position = EXCLUDED.position,
+                     from_position = EXCLUDED.from_position, from_at = EXCLUDED.from_at,
+                     made_at = now()
+             )
+             SELECT * FROM done"
+        )
+    };
+}
+
+/// A commit of a partition that is not to make an adoption with its first:
+/// the one statement nearly every commit is. The guard is on the row
+/// itself, so that a commit that waited on the row while an adoption was
+/// noted on it sees it.
+const COMMIT: &str =
+    commit!(" AND NOT (adopting IS NOT NULL AND log_position = 0 AND manifest IS NULL)");
+/// A commit of a partition whose row is held and whose adoption, if any,
+/// has been looked at.
+const COMMIT_HELD: &str = commit!("");
 
 #[derive(FromRow)]
 struct Snapshot {
@@ -333,17 +554,28 @@ impl From<sqlx::Error> for CoordinatorError {
 
 #[async_trait]
 impl Coordinator for PostgresCoordinator {
+    async fn cluster(&self) -> Result<ClusterId> {
+        let id: Uuid = sqlx::query_scalar("SELECT id FROM vellev.cluster")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(ClusterId(id))
+    }
+
     async fn register(&self, key: &PartitionKey) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
         lock_tenant(&mut transaction, &key.tenant).await?;
-        let purging: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM vellev.purges WHERE tenant = $1 AND purged_at IS NULL",
+        let purging: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM now() - requested_at)::float8
+             FROM vellev.purges WHERE tenant = $1 AND purged_at IS NULL",
         )
         .bind(key.tenant.as_str())
         .fetch_optional(&mut *transaction)
         .await?;
-        if purging.is_some() {
-            return Err(CoordinatorError::Purging(key.tenant.clone()));
+        if let Some(asked) = purging {
+            return Err(CoordinatorError::Purging {
+                tenant: key.tenant.clone(),
+                asked: Duration::try_from_secs_f64(asked).unwrap_or_default(),
+            });
         }
         sqlx::query(
             "INSERT INTO vellev.partitions (tenant, partition, generation)
@@ -361,6 +593,8 @@ impl Coordinator for PostgresCoordinator {
     async fn remove(&self, key: &PartitionKey) -> Result<bool> {
         let mut transaction = self.pool.begin().await?;
         lock_tenant(&mut transaction, &key.tenant).await?;
+        // Its tenant's purge, once this is the last of its partitions, is
+        // noted by a trigger on the row's going.
         let done =
             sqlx::query("DELETE FROM vellev.partitions WHERE tenant = $1 AND partition = $2")
                 .bind(key.tenant.as_str())
@@ -374,17 +608,78 @@ impl Coordinator for PostgresCoordinator {
         .bind(key.tenant.as_str())
         .execute(&mut *transaction)
         .await?;
-        sqlx::query(
-            "INSERT INTO vellev.purges (tenant)
-             SELECT $1 WHERE $2 AND NOT EXISTS (SELECT 1 FROM vellev.partitions WHERE tenant = $1)
-             ON CONFLICT (tenant) DO UPDATE SET requested_at = now(), purged_at = NULL",
+        transaction.commit().await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn identity(&self, tenant: &TenantId) -> Result<Option<Identity>> {
+        let found: Option<(Uuid, bool)> = sqlx::query_as(
+            "SELECT (array_agg(lineage ORDER BY partition))[1],
+                    bool_or(manifest IS NOT NULL OR log_position <> 0)
+             FROM vellev.partitions WHERE tenant = $1
+             HAVING count(*) > 0",
+        )
+        .bind(tenant.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.map(|(lineage, committed)| Identity {
+            lineage: Lineage(lineage),
+            committed,
+        }))
+    }
+
+    async fn adopt_on_commit(
+        &self,
+        key: &PartitionKey,
+        generation: Generation,
+        adoption: &Adoption,
+    ) -> Result<bool> {
+        let adopting = Adopting {
+            generation,
+            adoption: adoption.clone(),
+        };
+        let adopting = serde_json::to_string(&adopting).map_err(|e| invariant(e.to_string()))?;
+        let mut transaction = self.pool.begin().await?;
+        lock_tenant(&mut transaction, &key.tenant).await?;
+        // The tenant's rows are held while they are looked at: a commit to
+        // any of them either came first, and is seen, or waits, and then
+        // finds what is noted here on the row it waited for.
+        let rows: Vec<(i64, i64, bool)> = sqlx::query_as(
+            "SELECT partition, generation, manifest IS NOT NULL OR log_position <> 0
+             FROM vellev.partitions WHERE tenant = $1 ORDER BY partition FOR UPDATE",
         )
         .bind(key.tenant.as_str())
-        .bind(done.rows_affected() > 0)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let held = (i64::from(key.partition.0), bigint(generation.0)?);
+        let its = rows
+            .iter()
+            .any(|(partition, at, _)| (*partition, *at) == held);
+        let committed = rows.iter().any(|(.., committed)| *committed);
+        if !its || committed || keyed(&mut transaction, &key.tenant).await? {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE vellev.partitions SET adopting = $3 WHERE tenant = $1 AND partition = $2",
+        )
+        .bind(key.tenant.as_str())
+        .bind(held.0)
+        .bind(adopting)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(done.rows_affected() > 0)
+        Ok(true)
+    }
+
+    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<()> {
+        sqlx::query(
+            "UPDATE vellev.partitions SET adopting = NULL WHERE tenant = $1 AND partition = $2",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn acquire(
@@ -488,62 +783,13 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
-        let done = snapshot(
-            "WITH done AS (
-                 UPDATE vellev.partitions
-                 SET log_position = $4, manifest = $5
-                 WHERE tenant = $1 AND partition = $2 AND generation = $3
-                   AND ((log_position < $4
-                         AND ($10::bigint IS NULL
-                              OR (log_position = $10 AND manifest IS NOT DISTINCT FROM $11)))
-                        OR (log_position = $4 AND manifest IS NOT DISTINCT FROM $5))
-                 RETURNING generation, incarnation, lease_holder, lease_expires_at, log_position, manifest
-             ), noted AS (
-                 INSERT INTO vellev.commits (tenant, partition, incarnation, position, head)
-                 SELECT $1, $2, incarnation, log_position, manifest FROM done
-                 WHERE manifest IS NOT NULL
-                 ON CONFLICT DO NOTHING
-             ), restored AS (
-                 INSERT INTO vellev.restores
-                     (tenant, partition, request, asked, incarnation, position, from_position, from_at)
-                 SELECT $1, $2, $6, $9, incarnation, log_position, $7, $8 FROM done
-                 WHERE $6::uuid IS NOT NULL
-                 ON CONFLICT (tenant, partition, incarnation, request) DO UPDATE
-                 SET asked = EXCLUDED.asked, position = EXCLUDED.position,
-                     from_position = EXCLUDED.from_position, from_at = EXCLUDED.from_at,
-                     made_at = now()
-             )
-             SELECT * FROM done",
-            &lease.key,
-        )
-        .bind(bigint(lease.generation.0)?)
-        .bind(bigint(commit.log_position.0)?)
-        .bind(commit.manifest.as_ref().map(|m| m.0.as_str()))
-        .bind(commit.restore.as_ref().map(|restore| restore.request.0))
-        .bind(
-            commit
-                .restore
-                .as_ref()
-                .map(|restore| bigint(restore.from.0))
-                .transpose()?,
-        )
-        .bind(commit.restore.as_ref().map(|restore| restore.from_at))
-        .bind(commit.restore.as_ref().map(|restore| restore.asked.to_vec()))
-        .bind(
-            commit
-                .after
-                .as_ref()
-                .map(|after| bigint(after.position.0))
-                .transpose()?,
-        )
-        .bind(
-            commit
-                .after
-                .as_ref()
-                .and_then(|after| after.head.as_ref().map(|head| head.0.as_str())),
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let done = committing(COMMIT, lease, &commit)?
+            .fetch_optional(&self.pool)
+            .await?;
+        let done = match done {
+            Some(row) => Some(row),
+            None => self.committed_adopting(lease, &commit).await?,
+        };
         match done {
             Some(row) => Ok(row.committed()),
             None => {
@@ -608,7 +854,10 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
-    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()> {
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<u16> {
+        // Committed on its own, before the format is read: a raise either
+        // committed before this insert could be made, and is read below,
+        // or took its lock after, and counts this node.
         sqlx::query(
             "INSERT INTO vellev.nodes (node, format, protocol, seen_at)
              VALUES ($1, $2, $3, now())
@@ -623,7 +872,7 @@ impl Coordinator for PostgresCoordinator {
         sqlx::query("DELETE FROM vellev.nodes WHERE seen_at < now() - interval '1 day'")
             .execute(&self.pool)
             .await?;
-        Ok(())
+        self.format().await
     }
 
     async fn depart(&self, node: &NodeId) -> Result<()> {
@@ -656,15 +905,69 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn raise_format(&self, format: u16) -> Result<u16> {
-        sqlx::query(
-            "UPDATE vellev.cluster SET format = $1
-             WHERE format < $1
-               AND NOT EXISTS (SELECT 1 FROM vellev.nodes WHERE format < $1)",
-        )
-        .bind(i32::from(format))
-        .execute(&self.pool)
-        .await?;
-        self.format().await
+        // Every node asks this every few seconds, and the format is seldom
+        // to be raised: the table of nodes is locked only when it is, and
+        // as far as the nodes that have announced can tell, it may be. A
+        // node registered that reads less, though it may have gone quiet,
+        // keeps the format where it is until it is forgotten a day after it
+        // was last seen, so that its silence never lets the format rise
+        // past it; meanwhile no lock is taken.
+        let current = self.format().await?;
+        let lagging: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM vellev.nodes WHERE format < $1)")
+                .bind(i32::from(format))
+                .fetch_one(&self.pool)
+                .await?;
+        if current >= format || lagging {
+            return Ok(current);
+        }
+        // SHARE conflicts with the lock an announce's insert or update
+        // takes, and with no lock a reader takes. So the nodes are looked
+        // at once every announce under way has committed, and an announce
+        // that comes meanwhile waits for the raise to commit, then reads
+        // the format raised. One row locked FOR SHARE by every announce
+        // would order them the same way, at the cost of a row lock written
+        // by every node every few seconds. The lock is waited for only so
+        // long: announces that hold it up longer leave the format as it is,
+        // to be raised when the node asks again.
+        let raised = async {
+            let mut transaction = self.pool.begin().await?;
+            sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+                .bind(RAISE_LOCK_TIMEOUT)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("LOCK TABLE vellev.nodes IN SHARE MODE")
+                .execute(&mut *transaction)
+                .await?;
+            // Another raise may hold the format's row meanwhile, and is
+            // waited for as long as the lock above.
+            sqlx::query(
+                "UPDATE vellev.cluster SET format = $1
+                 WHERE format < $1
+                   AND NOT EXISTS (SELECT 1 FROM vellev.nodes WHERE format < $1)",
+            )
+            .bind(i32::from(format))
+            .execute(&mut *transaction)
+            .await?;
+            let after: i32 = sqlx::query_scalar("SELECT format FROM vellev.cluster")
+                .fetch_one(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+            Ok::<_, sqlx::Error>(after)
+        };
+        match raised.await {
+            Ok(after) => version(after),
+            Err(sqlx::Error::Database(error))
+                if error.code().as_deref() == Some(LOCK_NOT_AVAILABLE) =>
+            {
+                tracing::info!(
+                    format,
+                    "the format was held up; it is raised when next asked"
+                );
+                Ok(current)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn issue_key(
@@ -919,26 +1222,68 @@ impl Coordinator for PostgresCoordinator {
             })
     }
 
-    async fn claim_purge(&self, tenant: &TenantId, hold: Duration) -> Result<Option<Uuid>> {
-        let claim = Uuid::new_v4();
-        let done = sqlx::query(
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        due: Duration,
+        hold: Duration,
+    ) -> Result<Option<PurgeClaim>> {
+        let id = Uuid::new_v4();
+        // Under the tenant's lock, as every change to its purge is.
+        let mut transaction = self.pool.begin().await?;
+        lock_tenant(&mut transaction, tenant).await?;
+        let claimed: Option<RemovedRow> = sqlx::query_as(
             "UPDATE vellev.purges
              SET claim = $2, claimed_until = now() + make_interval(secs => $3)
              WHERE tenant = $1 AND purged_at IS NULL
-               AND (claimed_until IS NULL OR claimed_until < now())",
+               AND requested_at <= now() - make_interval(secs => $4)
+               AND (claimed_until IS NULL OR claimed_until < now())
+             RETURNING tenant, lineage",
         )
         .bind(tenant.as_str())
-        .bind(claim)
+        .bind(id)
         .bind(checked_hold(hold)?.as_secs_f64())
-        .execute(&self.pool)
+        .bind(due.as_secs_f64())
+        .fetch_optional(&mut *transaction)
         .await?;
-        Ok((done.rows_affected() > 0).then_some(claim))
+        transaction.commit().await?;
+        claimed
+            .map(|removed| {
+                Ok(PurgeClaim {
+                    id,
+                    removed: removed.removed()?,
+                })
+            })
+            .transpose()
+    }
+
+    async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
+        let hold = checked_hold(hold)?;
+        // Under the tenant's lock, as registering is: either the tenant is
+        // made again first, and the claim is not renewed, or it is refused
+        // until the purge is done.
+        let renewed = self
+            .tenant_wide(
+                tenant,
+                sqlx::query(
+                    "UPDATE vellev.purges
+                     SET claimed_until = now() + make_interval(secs => $3)
+                     WHERE tenant = $1 AND claim = $2 AND purged_at IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM vellev.partitions WHERE tenant = $1)",
+                )
+                .bind(tenant.as_str())
+                .bind(claim)
+                .bind(hold.as_secs_f64()),
+            )
+            .await?;
+        Ok(renewed > 0)
     }
 
     async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
-            "UPDATE vellev.purges SET purged_at = now(), claim = NULL, claimed_until = NULL
+            "UPDATE vellev.purges
+             SET purged_at = now(), looked_at = now(), claim = NULL, claimed_until = NULL
              WHERE tenant = $1 AND claim = $2 AND purged_at IS NULL",
         )
         .bind(tenant.as_str())
@@ -955,44 +1300,123 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
+    async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool> {
+        // Under the tenant's lock, as registering is: the tenant is either
+        // made again first, and its purge left done, or refused until the
+        // purge taken up again is done.
+        let reopened = self
+            .tenant_wide(
+                tenant,
+                sqlx::query(
+                    "UPDATE vellev.purges
+                     SET purged_at = NULL, claim = NULL, claimed_until = NULL
+                     WHERE tenant = $1 AND purged_at IS NOT NULL
+                       AND NOT EXISTS (SELECT 1 FROM vellev.partitions WHERE tenant = $1)",
+                )
+                .bind(tenant.as_str()),
+            )
+            .await?;
+        Ok(reopened > 0)
+    }
+
+    async fn look_overs(
+        &self,
+        lately: Duration,
+        every: Duration,
+        limit: usize,
+    ) -> Result<Vec<Removed>> {
+        // Rows another node is taking are passed over, so that nodes
+        // looking together take different tenants.
+        let taken: Vec<RemovedRow> = sqlx::query_as(
+            "UPDATE vellev.purges SET looked_at = now()
+             WHERE tenant IN (
+                 SELECT tenant FROM vellev.purges
+                 WHERE purged_at >= now() - make_interval(secs => $1)
+                   AND (looked_at IS NULL OR looked_at <= now() - make_interval(secs => $2))
+                 ORDER BY looked_at NULLS FIRST, tenant
+                 LIMIT $3
+                 FOR UPDATE SKIP LOCKED)
+             RETURNING tenant, lineage",
+        )
+        .bind(lately.as_secs_f64())
+        .bind(every.as_secs_f64())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        taken.into_iter().map(RemovedRow::removed).collect()
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,
+        claim: Uuid,
         due: Option<Duration>,
         hold: Duration,
-    ) -> Result<Option<Uuid>> {
-        let claim = Uuid::new_v4();
-        let done = sqlx::query(
-            "UPDATE vellev.partitions
-             SET backup_claim = $2, backup_claimed_until = now() + make_interval(secs => $4)
-             WHERE tenant = $1
-               AND NOT EXISTS (
-                   SELECT 1 FROM vellev.partitions
-                   WHERE tenant = $1
-                     AND NOT ((backup_claimed_until IS NULL OR backup_claimed_until < now())
-                              AND ($3::float8 IS NULL OR backed_up_at IS NULL
-                                   OR backed_up_at <= now() - make_interval(secs => $3))))",
-        )
-        .bind(tenant.as_str())
-        .bind(claim)
-        .bind(due.map(|due| due.as_secs_f64()))
-        .bind(checked_hold(hold)?.as_secs_f64())
-        .execute(&self.pool)
-        .await?;
-        Ok((done.rows_affected() > 0).then_some(claim))
+    ) -> Result<bool> {
+        let hold = checked_hold(hold)?;
+        // Whether every partition is free is decided over all of the
+        // tenant's rows, which one statement does not hold still: under READ
+        // COMMITTED a statement that waited on a row re-checks only that
+        // row's own clauses, with the others as they were before. Under the
+        // tenant's lock, every change to who holds the tenant has committed
+        // before this statement starts, and none starts until it commits.
+        let done = self
+            .tenant_wide(
+                tenant,
+                sqlx::query(
+                    "UPDATE vellev.partitions
+                     SET backup_claim = $2,
+                         backup_claimed_until = now() + make_interval(secs => $4)
+                     WHERE tenant = $1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM vellev.partitions
+                           WHERE tenant = $1
+                             AND backup_claim IS DISTINCT FROM $2
+                             AND NOT ((backup_claimed_until IS NULL
+                                       OR backup_claimed_until < now())
+                                      AND ($3::float8 IS NULL OR backed_up_at IS NULL
+                                           OR backed_up_at <= now() - make_interval(secs => $3))))",
+                )
+                .bind(tenant.as_str())
+                .bind(claim)
+                .bind(due.map(|due| due.as_secs_f64()))
+                .bind(hold.as_secs_f64()),
+            )
+            .await?;
+        Ok(done > 0)
+    }
+
+    async fn renew_backup(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
+        let hold = checked_hold(hold)?;
+        let done = self
+            .tenant_wide(
+                tenant,
+                sqlx::query(
+                    "UPDATE vellev.partitions
+                     SET backup_claimed_until = now() + make_interval(secs => $3)
+                     WHERE tenant = $1 AND backup_claim = $2",
+                )
+                .bind(tenant.as_str())
+                .bind(claim)
+                .bind(hold.as_secs_f64()),
+            )
+            .await?;
+        Ok(done > 0)
     }
 
     async fn release_backup(&self, tenant: &TenantId, claim: Uuid, made: bool) -> Result<()> {
-        sqlx::query(
-            "UPDATE vellev.partitions
-             SET backup_claim = NULL, backup_claimed_until = NULL,
-                 backed_up_at = CASE WHEN $3 THEN now() ELSE backed_up_at END
-             WHERE tenant = $1 AND backup_claim = $2",
+        self.tenant_wide(
+            tenant,
+            sqlx::query(
+                "UPDATE vellev.partitions
+                 SET backup_claim = NULL, backup_claimed_until = NULL,
+                     backed_up_at = CASE WHEN $3 THEN now() ELSE backed_up_at END
+                 WHERE tenant = $1 AND backup_claim = $2",
+            )
+            .bind(tenant.as_str())
+            .bind(claim)
+            .bind(made),
         )
-        .bind(tenant.as_str())
-        .bind(claim)
-        .bind(made)
-        .execute(&self.pool)
         .await?;
         Ok(())
     }
@@ -1017,16 +1441,18 @@ impl Coordinator for PostgresCoordinator {
         tenant: &TenantId,
         window: Option<Duration>,
     ) -> Result<bool> {
-        let secs = window
-            .map(|window| bigint(checked_window(window)?.as_secs().max(1)))
-            .transpose()?;
-        let done =
-            sqlx::query("UPDATE vellev.partitions SET restore_window_secs = $2 WHERE tenant = $1")
+        let secs = window_secs(window)?;
+        let done = self
+            .tenant_wide(
+                tenant,
+                sqlx::query(
+                    "UPDATE vellev.partitions SET restore_window_secs = $2 WHERE tenant = $1",
+                )
                 .bind(tenant.as_str())
-                .bind(secs)
-                .execute(&self.pool)
-                .await?;
-        Ok(done.rows_affected() > 0)
+                .bind(secs),
+            )
+            .await?;
+        Ok(done > 0)
     }
 }
 
@@ -1070,7 +1496,10 @@ mod tests {
 
     #[test]
     fn migrations_are_in_strictly_increasing_order() {
-        assert!(MIGRATIONS.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        assert_eq!(MIGRATIONS.first().map(|(version, _)| *version), Some(1));
+        // Numbered from one with none left out: a release's migrations are
+        // applied in this order, and a gap would be one never applied.
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
+        let newest = *versions.last().unwrap();
+        assert_eq!(versions, (1..=newest).collect::<Vec<i64>>());
     }
 }

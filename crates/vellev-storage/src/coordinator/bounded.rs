@@ -7,8 +7,9 @@ use uuid::Uuid;
 use vellev_core::{NodeId, RequestId, TenantId};
 
 use super::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, Forgotten, KeyHash, Lease,
-    PartitionKey, Point, Purges, RestorePoint, Restored, Result, TenantKey, Versions,
+    Acquired, Adoption, ClusterId, Commit, Committed, Coordinator, CoordinatorError, Forgotten,
+    Generation, Identity, KeyHash, Lease, PartitionKey, Point, PurgeClaim, Purges, Removed,
+    RestorePoint, Restored, Result, TenantKey, Versions,
 };
 
 /// A coordinator whose every call is given up once it has gone unanswered
@@ -86,7 +87,7 @@ impl Coordinator for Bounded {
         self.bounded(self.inner.ping()).await
     }
 
-    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()> {
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<u16> {
         self.bounded(self.inner.announce(node, versions)).await
     }
 
@@ -167,13 +168,41 @@ impl Coordinator for Bounded {
         self.bounded(self.inner.forget_restores()).await
     }
 
+    async fn identity(&self, tenant: &TenantId) -> Result<Option<Identity>> {
+        self.bounded(self.inner.identity(tenant)).await
+    }
+
+    async fn cluster(&self) -> Result<ClusterId> {
+        self.bounded(self.inner.cluster()).await
+    }
+
+    async fn adopt_on_commit(
+        &self,
+        key: &PartitionKey,
+        generation: Generation,
+        adoption: &Adoption,
+    ) -> Result<bool> {
+        self.bounded(self.inner.adopt_on_commit(key, generation, adoption))
+            .await
+    }
+
+    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<()> {
+        self.bounded(self.inner.adopt_no_more(key)).await
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,
+        claim: Uuid,
         due: Option<Duration>,
         hold: Duration,
-    ) -> Result<Option<Uuid>> {
-        self.bounded(self.inner.claim_backup(tenant, due, hold))
+    ) -> Result<bool> {
+        self.bounded(self.inner.claim_backup(tenant, claim, due, hold))
+            .await
+    }
+
+    async fn renew_backup(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
+        self.bounded(self.inner.renew_backup(tenant, claim, hold))
             .await
     }
 
@@ -186,8 +215,33 @@ impl Coordinator for Bounded {
         self.bounded(self.inner.purges(due, lately)).await
     }
 
-    async fn claim_purge(&self, tenant: &TenantId, hold: Duration) -> Result<Option<Uuid>> {
-        self.bounded(self.inner.claim_purge(tenant, hold)).await
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        due: Duration,
+        hold: Duration,
+    ) -> Result<Option<PurgeClaim>> {
+        self.bounded(self.inner.claim_purge(tenant, due, hold))
+            .await
+    }
+
+    async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
+        self.bounded(self.inner.renew_purge(tenant, claim, hold))
+            .await
+    }
+
+    async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool> {
+        self.bounded(self.inner.reopen_purge(tenant)).await
+    }
+
+    async fn look_overs(
+        &self,
+        lately: Duration,
+        every: Duration,
+        limit: usize,
+    ) -> Result<Vec<Removed>> {
+        self.bounded(self.inner.look_overs(lately, every, limit))
+            .await
     }
 
     async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()> {

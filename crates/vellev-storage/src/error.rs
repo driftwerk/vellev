@@ -91,6 +91,23 @@ pub enum StorageError {
     Encode(String),
     #[error("work off the async threads did not finish: {0}")]
     Background(String),
+    /// The right to delete the files of a tenant's backups was no longer
+    /// held when they were to be deleted.
+    #[error("the claim on the backups of tenant {0} was lost, so none of their files was deleted")]
+    Unheld(vellev_core::TenantId),
+    /// Records of a tenant's backups that cannot be used, each with why,
+    /// what they list unknown, so that no file of its backups is deleted
+    /// until each is mended or removed.
+    #[error(
+        "{} backup records of tenant {tenant} cannot be used, so no file of its backups is \
+         deleted until each is mended or removed: {}",
+        records.len(),
+        records.join("; ")
+    )]
+    UnusableRecords {
+        tenant: vellev_core::TenantId,
+        records: Vec<String>,
+    },
     /// A failure of a commit shared by several callers, as each of them sees it.
     #[error(transparent)]
     Shared(Arc<StorageError>),

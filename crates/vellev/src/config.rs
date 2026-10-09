@@ -12,7 +12,7 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use vellev_core::NodeId;
 use vellev_embed::Embedders;
-use vellev_node::{Node, Settings};
+use vellev_node::{Node, RequestBounds, Settings};
 
 use crate::server::Limits;
 use object_store::aws::AmazonS3ConfigKey;
@@ -128,8 +128,23 @@ pub struct Config {
     /// How long a backup is kept, in seconds; a tenant's newest always is.
     #[arg(long, env = "VELLEV_BACKUPS_KEPT_SECS", default_value_t = 35 * 24 * 60 * 60)]
     pub backups_kept_secs: u64,
+    /// Whether this node looks for tenants due a backup of its own accord.
+    /// Off, it backs a tenant up only when asked to, and purges removed
+    /// tenants as any node does: for a cluster whose backups are to be
+    /// taken by some of its nodes and not others.
+    #[arg(long, env = "VELLEV_BACKUPS_SCHEDULED", default_value_t = true, action = clap::ArgAction::Set)]
+    pub backups_scheduled: bool,
+    /// How long a node's claim to back a tenant up or restore it lasts
+    /// unless renewed, in seconds: a node that dies holding one blocks the
+    /// tenant's backups and restores for no longer. A third of it must
+    /// outlast one request to object storage, tries and all
+    /// (`VELLEV_STORE_TIMEOUT_SECS` and the rest), so it is at least three
+    /// times that: nine and a half minutes as a node is set up by default.
+    #[arg(long, env = "VELLEV_BACKUP_CLAIM_SECS", default_value_t = 15 * 60, value_parser = clap::value_parser!(u64).range(1..=24 * 60 * 60))]
+    pub backup_claim_secs: u64,
     /// How long after a tenant is removed its files, backups and cached
     /// copies are deleted, in seconds; it cannot be made again until then.
+    /// With a backup store it is no sooner than `VELLEV_BACKUP_CLAIM_SECS`.
     #[arg(long, env = "VELLEV_PURGE_AFTER_SECS", default_value_t = 10 * 60)]
     pub purge_after_secs: u64,
     /// How long one try of a request to object storage may go unanswered, in
@@ -398,6 +413,7 @@ impl Config {
         {
             bail!("tenants cannot be backed up to the store they are kept in");
         }
+        self.settings(NodeId::generate("checked"), None)?;
         if let Some(url) = &self.advertise_url {
             let parsed = reqwest::Url::parse(url).ok();
             let usable = parsed.is_some_and(|url| {
@@ -452,21 +468,40 @@ impl Config {
             .advertise_url
             .clone()
             .unwrap_or_else(|| format!("http://{host}:{port}"));
+        let backups = self
+            .backup_store
+            .as_deref()
+            .map(|url| self::store(url, self.store_client()))
+            .transpose()
+            .wrap_err("opening the backup store")?
+            .map(|store| Arc::new(store) as Arc<dyn Blobs>);
+        let node = NodeId::reachable_at(address.trim_end_matches('/'), &host);
+        Ok(Node::new(
+            Arc::new(Bounded::new(Arc::new(coordinator), within)),
+            blobs,
+            Arc::new(embedders),
+            self.settings(node, backups)?,
+        ))
+    }
+
+    /// How `node` is to run, backing tenants up to `backups` if anywhere:
+    /// refused if a node could not run so.
+    fn settings(&self, node: NodeId, backups: Option<Arc<dyn Blobs>>) -> Result<Settings> {
         let settings = Settings {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
             restore_window: Duration::from_secs(self.restore_window_secs),
-            backups: self
-                .backup_store
-                .as_deref()
-                .map(|url| self::store(url, self.store_client()))
-                .transpose()
-                .wrap_err("opening the backup store")?
-                .map(|store| Arc::new(store) as Arc<dyn Blobs>),
+            backups,
             backup_every: Duration::from_secs(self.backup_every_secs),
             backups_kept: Duration::from_secs(self.backups_kept_secs),
+            backups_scheduled: self.backups_scheduled,
+            backup_claim: Duration::from_secs(self.backup_claim_secs),
             purge_after: Duration::from_secs(self.purge_after_secs),
             transfers: self.store_client().transfers(),
+            request_bounds: RequestBounds {
+                store: self.store_client().transfers().request_within,
+                coordinator: Duration::from_secs(self.database_timeout_secs),
+            },
             grace: Duration::from_secs(self.grace_secs),
             max_format: self.max_format,
             tenant_idle: Duration::from_secs(self.tenant_idle_secs),
@@ -475,14 +510,12 @@ impl Config {
             memory: self
                 .memory_mb
                 .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
-            ..Settings::new(NodeId::reachable_at(address.trim_end_matches('/'), &host))
+            ..Settings::new(node)
         };
-        Ok(Node::new(
-            Arc::new(Bounded::new(Arc::new(coordinator), within)),
-            blobs,
-            Arc::new(embedders),
-            settings,
-        ))
+        settings
+            .check()
+            .wrap_err("VELLEV_BACKUP_CLAIM_SECS cannot be as it is set")?;
+        Ok(settings)
     }
 }
 
@@ -697,6 +730,45 @@ mod tests {
             asked.load(std::sync::atomic::Ordering::SeqCst),
             1 + STORE_RETRIES as usize
         );
+    }
+
+    #[test]
+    fn a_node_backs_up_of_its_own_accord_unless_told_not_to() {
+        let scheduled = |args: &[&str]| {
+            let config = config(args);
+            let node = NodeId::generate("node");
+            config.settings(node, None).unwrap().backups_scheduled
+        };
+        assert!(scheduled(&[]));
+        assert!(!scheduled(&["--backups-scheduled", "false"]));
+        assert!(scheduled(&["--backups-scheduled", "true"]));
+    }
+
+    #[test]
+    fn a_backup_claim_too_short_to_hold_or_too_long_is_refused() {
+        assert!(config(&[]).checked().is_ok());
+        assert_eq!(config(&[]).backup_claim_secs, 900);
+        let claimed = |secs: &str| config(&["--backup-claim-secs", secs]).checked();
+        // Three times what one request to the store may take, as the node
+        // is set up to make them.
+        let least = 3 * StoreClient::default().transfers().request_within.as_secs();
+        assert!(claimed(&least.to_string()).is_ok());
+        let refused = format!(
+            "{:#}",
+            claimed(&(least - 1).to_string()).map(drop).unwrap_err()
+        );
+        assert!(refused.contains("VELLEV_BACKUP_CLAIM_SECS"), "{refused}");
+        assert!(refused.contains("a third of it"), "{refused}");
+        let too_long = [
+            "vellev",
+            "--database-url",
+            "x",
+            "--store",
+            "memory://",
+            "--backup-claim-secs",
+            "86401",
+        ];
+        assert!(Parsed::try_parse_from(too_long).is_err());
     }
 
     #[test]

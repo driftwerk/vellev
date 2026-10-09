@@ -1,15 +1,20 @@
-use std::sync::Arc;
+use std::future::Future;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use futures::future::join_all;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vellev_core::{NodeId, Partition, RequestId, TenantId};
 use vellev_storage::coordinator::{
-    Acquired, Bounded, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease,
-    LogPosition, ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, Point,
-    PostgresCoordinator, Prior, Purges, Restore, RestorePoint, Restored, Versions,
-    MAX_RESTORE_WINDOW, MAX_TTL, RESTORES_KEPT_FOR,
+    Acquired, Adoption, Bounded, Commit, Committed, Coordinator, CoordinatorError, Generation,
+    Identity, Lease, Lineage, LogPosition, ManifestRef, ManualClock, MemoryCoordinator,
+    PartitionKey, Point, PostgresCoordinator, Prior, PurgeClaim, Purges, Removed, Restore,
+    RestorePoint, Restored, TenantKey, Versions, MAX_BACKUP_HOLD, MAX_RESTORE_WINDOW, MAX_TTL,
+    RESTORES_KEPT_FOR,
 };
 
 const TTL: Duration = Duration::from_secs(30);
@@ -48,9 +53,51 @@ impl Harness for Memory {
     }
 }
 
+/// How many connections to Postgres the tests here hold between them at
+/// once: well under what a server allows, a hundred unless it is told
+/// otherwise, which other suites may be drawing on meanwhile. A test waits
+/// its turn for its connections rather than be refused them.
+const CONNECTIONS: u32 = 24;
+/// How many connections a harness holds: one for the coordinator under
+/// test, and one to move time with or look on with while it works.
+const HARNESS: u32 = 2;
+/// How long anything here is waited for before it is taken to have hung:
+/// what stops a broken test, not what a slow one is held to.
+const HUNG: Duration = Duration::from_secs(120);
+
+static BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(CONNECTIONS as usize)));
+
+/// The right to hold `connections` connections to Postgres until it is
+/// dropped: all a test needs, taken at once, so that no two tests wait on
+/// connections the other holds.
+async fn granted(connections: u32) -> OwnedSemaphorePermit {
+    assert!(connections <= CONNECTIONS, "more than there are to grant");
+    BUDGET
+        .clone()
+        .acquire_many_owned(connections)
+        .await
+        .expect("the budget is never closed")
+}
+
+/// A pool of at most `connections` by `options`, which must be granted.
+async fn pool(options: PgConnectOptions, connections: u32) -> sqlx::PgPool {
+    PgPoolOptions::new()
+        .max_connections(connections)
+        .acquire_timeout(HUNG)
+        .connect_with(options)
+        .await
+        .expect("connect to test database")
+}
+
+/// A Postgres coordinator on a database of its own: the server is shared
+/// with whatever else is being tested, of this release and of others, whose
+/// migrations and tenants are not this test's.
 struct Pg {
     coordinator: PostgresCoordinator,
     pool: sqlx::PgPool,
+    scratch: ScratchDatabase,
+    _granted: OwnedSemaphorePermit,
 }
 
 fn database_url() -> Option<String> {
@@ -63,14 +110,30 @@ fn database_url() -> Option<String> {
 
 impl Pg {
     async fn connect() -> Option<Self> {
-        let url = database_url()?;
-        let pool = sqlx::PgPool::connect(&url)
-            .await
-            .expect("connect to test database");
+        Self::connect_beside(0).await
+    }
+
+    /// A harness, with `others` more connections granted for pools the
+    /// test opens beside it.
+    async fn connect_beside(others: u32) -> Option<Self> {
+        let options = database_options()?;
+        let granted = granted(HARNESS + others + 1).await;
+        let scratch = ScratchDatabase::create(options).await;
+        let pool = pool(scratch.options(), HARNESS).await;
         let coordinator = PostgresCoordinator::with_pool(pool.clone())
             .await
             .expect("migrate");
-        Some(Self { coordinator, pool })
+        Some(Self {
+            coordinator,
+            pool,
+            scratch,
+            _granted: granted,
+        })
+    }
+
+    /// The options to connect to this harness's database by.
+    fn options(&self) -> PgConnectOptions {
+        self.scratch.options()
     }
 }
 
@@ -119,7 +182,8 @@ impl Harness for Pg {
             "UPDATE vellev.purges
              SET requested_at = requested_at - make_interval(secs => $2),
                  purged_at = purged_at - make_interval(secs => $2),
-                 claimed_until = claimed_until - make_interval(secs => $2)
+                 claimed_until = claimed_until - make_interval(secs => $2),
+                 looked_at = looked_at - make_interval(secs => $2)
              WHERE tenant = $1",
         )
         .bind(key.tenant.as_str())
@@ -722,14 +786,476 @@ async fn a_key_reaches_its_tenant_until_revoked_or_the_tenant_goes(h: &dyn Harne
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
-/// Purge a removed tenant as a node would, so that it may be made again.
-async fn purge(coordinator: &dyn Coordinator, tenant: &TenantId) {
-    let claim = coordinator
-        .claim_purge(tenant, HOUR)
+/// The claim to purge `tenant`, removed however lately, if it is there to
+/// take.
+async fn purge_claimed(coordinator: &dyn Coordinator, tenant: &TenantId) -> Option<PurgeClaim> {
+    coordinator
+        .claim_purge(tenant, Duration::ZERO, HOUR)
         .await
         .unwrap()
+}
+
+/// Purge a removed tenant as a node would, so that it may be made again.
+async fn purge(coordinator: &dyn Coordinator, tenant: &TenantId) {
+    let claim = purge_claimed(coordinator, tenant).await.unwrap();
+    coordinator
+        .purged(tenant, claim.id, 24 * HOUR)
+        .await
         .unwrap();
-    coordinator.purged(tenant, claim, 24 * HOUR).await.unwrap();
+}
+
+/// Which tenant `tenant` is now.
+async fn identity(h: &dyn Harness, tenant: &TenantId) -> Option<Identity> {
+    h.coordinator().identity(tenant).await.unwrap()
+}
+
+/// Another partition of the tenant of `key`.
+fn beside(key: &PartitionKey, partition: u32) -> PartitionKey {
+    PartitionKey {
+        tenant: key.tenant.clone(),
+        partition: Partition(partition),
+    }
+}
+
+async fn a_tenant_keeps_its_lineage_until_it_is_removed_and_one_made_again_has_another(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    assert_eq!(identity(h, &key().tenant).await, None, "no tenant");
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let first = identity(h, tenant).await.unwrap();
+    assert!(!first.committed);
+
+    let other = beside(&key, 1);
+    c.register(&other).await.unwrap();
+    c.register(&key).await.unwrap();
+    assert_eq!(
+        identity(h, tenant).await,
+        Some(first),
+        "its partitions are of one"
+    );
+    let (held, _) = lease(h, &other, &node("a")).await;
+    c.commit(&held, commit(1, "m1")).await.unwrap();
+    c.release(&held).await.unwrap();
+    let written = Identity {
+        committed: true,
+        ..first
+    };
+    assert_eq!(identity(h, tenant).await, Some(written));
+    assert_ne!(
+        identity(h, &registered(h).await.tenant)
+            .await
+            .unwrap()
+            .lineage,
+        first.lineage,
+        "another tenant has its own"
+    );
+
+    assert!(c.remove(&key).await.unwrap());
+    assert_eq!(
+        identity(h, tenant).await.unwrap().lineage,
+        first.lineage,
+        "while any partition of it is left"
+    );
+    assert!(c.remove(&other).await.unwrap());
+    assert_eq!(identity(h, tenant).await, None);
+    let claim = purge_claimed(c, tenant).await.unwrap();
+    assert_eq!(claim.removed.tenant, *tenant);
+    assert_eq!(claim.removed.lineage, first.lineage);
+    c.purged(tenant, claim.id, 24 * HOUR).await.unwrap();
+
+    c.register(&key).await.unwrap();
+    let again = identity(h, tenant).await.unwrap();
+    assert_ne!(again.lineage, first.lineage, "made again, it is another");
+    assert!(!again.committed);
+}
+
+async fn partitions_first_registered_together_are_of_one_lineage(h: &dyn Harness) {
+    let c = h.coordinator();
+    for _ in 0..20 {
+        let key = key();
+        let (other, third) = (beside(&key, 1), beside(&key, 2));
+        let (a, b, d) = tokio::join!(c.register(&key), c.register(&other), c.register(&third));
+        for registered in [a, b, d] {
+            registered.unwrap();
+        }
+        let lineage = identity(h, &key.tenant).await.unwrap().lineage;
+        for removed in [&key, &other] {
+            assert!(c.remove(removed).await.unwrap());
+            assert_eq!(
+                identity(h, &key.tenant).await.unwrap().lineage,
+                lineage,
+                "every partition of {} is of one",
+                key.tenant
+            );
+        }
+    }
+}
+
+/// What a tenant is to become with the commit at `at`: of a lineage of
+/// its own, with one key and a restore window of an hour.
+fn adoption(at: u64) -> Adoption {
+    let id = uuid::Uuid::new_v4();
+    Adoption {
+        lineage: Lineage(uuid::Uuid::new_v4()),
+        at: LogPosition(at),
+        keys: vec![TenantKey {
+            id,
+            created: Utc.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).unwrap(),
+            hash: hash_of(id),
+        }],
+        restore_window: Some(HOUR),
+    }
+}
+
+/// Thirty-two bytes that differ with `id`, as the hashes of keys do.
+fn hash_of(id: uuid::Uuid) -> [u8; 32] {
+    let mut hash = [0; 32];
+    hash[..16].copy_from_slice(id.as_bytes());
+    hash
+}
+
+/// The lineage, key ids and restore window `tenant` has now.
+async fn taken_up(
+    h: &dyn Harness,
+    tenant: &TenantId,
+) -> (Lineage, Vec<uuid::Uuid>, Option<Duration>) {
+    let c = h.coordinator();
+    let keys = c.keys(tenant).await.unwrap();
+    (
+        identity(h, tenant).await.unwrap().lineage,
+        keys.iter().map(|key| key.id).collect(),
+        c.restore_window(tenant).await.unwrap(),
+    )
+}
+
+fn adopting(refused: &Result<Committed, CoordinatorError>) -> bool {
+    matches!(refused, Err(CoordinatorError::Adopting(_)))
+}
+
+async fn a_tenant_takes_a_backup_up_with_the_commit_that_restores_it_and_nothing_before(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let own = taken_up(h, tenant).await;
+    let to_be = adoption(5);
+    assert!(c
+        .adopt_on_commit(&key, held.generation, &to_be)
+        .await
+        .unwrap());
+    assert_eq!(taken_up(h, tenant).await, own, "nothing is taken yet");
+
+    // No commit but the one named is made meanwhile, and it takes nothing.
+    assert!(adopting(&c.commit(&held, commit(1, "m1")).await));
+    let emptied = Commit {
+        after: None,
+        log_position: LogPosition(5),
+        manifest: None,
+        restore: None,
+    };
+    assert!(adopting(&c.commit(&held, emptied).await));
+    assert_eq!(taken_up(h, tenant).await, own);
+    assert!(!identity(h, tenant).await.unwrap().committed);
+
+    let restored = c.commit(&held, commit(5, "restored")).await.unwrap();
+    assert_eq!(restored.log_position, LogPosition(5));
+    let key_ids = vec![to_be.keys[0].id];
+    assert_eq!(
+        taken_up(h, tenant).await,
+        (to_be.lineage, key_ids, Some(HOUR)),
+        "all of it, with the commit"
+    );
+    let kept = c.keys(tenant).await.unwrap();
+    assert_eq!(kept, to_be.keys, "as the backup kept them");
+    let reached = c.key_tenant(&to_be.keys[0].hash).await.unwrap();
+    assert_eq!(reached.as_ref(), Some(tenant));
+    assert_eq!(
+        c.commit(&held, commit(5, "restored")).await.unwrap(),
+        restored
+    );
+
+    // Once and no more: what is changed after stays changed.
+    assert!(c.revoke_key(tenant, to_be.keys[0].id).await.unwrap());
+    c.commit(&held, commit(6, "m6")).await.unwrap();
+    assert_eq!(
+        taken_up(h, tenant).await,
+        (to_be.lineage, Vec::new(), Some(HOUR))
+    );
+    assert!(!c
+        .adopt_on_commit(&key, held.generation, &adoption(9))
+        .await
+        .unwrap());
+}
+
+async fn an_adoption_is_noted_only_for_an_empty_tenant_without_keys_by_the_lease_named(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let to_be = adoption(3);
+    let noted = |key: PartitionKey, generation: Generation| {
+        let to_be = to_be.clone();
+        async move { c.adopt_on_commit(&key, generation, &to_be).await.unwrap() }
+    };
+    assert!(!noted(key(), Generation(1)).await, "no partition");
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let moved = Generation(held.generation.0 + 1);
+    assert!(!noted(key.clone(), moved).await, "not the lease held");
+
+    let issued = c.issue_key(tenant, uuid::Uuid::new_v4(), &[9; 32]).await;
+    let issued = issued.unwrap().unwrap();
+    assert!(!noted(key.clone(), held.generation).await, "it has a key");
+    assert!(c.revoke_key(tenant, issued.id).await.unwrap());
+
+    let other = beside(&key, 1);
+    c.register(&other).await.unwrap();
+    let (elsewhere, _) = lease(h, &other, &node("a")).await;
+    c.commit(&elsewhere, commit(1, "m1")).await.unwrap();
+    assert!(
+        !noted(key.clone(), held.generation).await,
+        "another partition of it has committed"
+    );
+    assert!(c.remove(&other).await.unwrap());
+    assert!(noted(key.clone(), held.generation).await);
+
+    assert!(c.commit(&held, commit(3, "restored")).await.is_ok());
+    assert_eq!(identity(h, tenant).await.unwrap().lineage, to_be.lineage);
+    assert!(
+        !noted(key.clone(), held.generation).await,
+        "it has committed"
+    );
+}
+
+async fn an_adoption_is_given_up_replaced_or_outlived_by_its_lease(h: &dyn Harness) {
+    let c = h.coordinator();
+    // Given up: the tenant commits as any other, and is as it was.
+    let key = registered(h).await;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let own = taken_up(h, &key.tenant).await;
+    let to_be = adoption(4);
+    let noted = c.adopt_on_commit(&key, held.generation, &to_be);
+    assert!(noted.await.unwrap());
+    c.adopt_no_more(&key).await.unwrap();
+    c.commit(&held, commit(4, "m4")).await.unwrap();
+    assert_eq!(taken_up(h, &key.tenant).await, own);
+
+    // Asked again, for another backup: only the last is made.
+    let key = registered(h).await;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let (first, second) = (adoption(4), adoption(7));
+    for to_be in [&first, &second] {
+        let noted = c.adopt_on_commit(&key, held.generation, to_be);
+        assert!(noted.await.unwrap());
+    }
+    assert!(adopting(&c.commit(&held, commit(4, "first")).await));
+    c.commit(&held, commit(7, "second")).await.unwrap();
+    let key_ids = vec![second.keys[0].id];
+    assert_eq!(
+        taken_up(h, &key.tenant).await,
+        (second.lineage, key_ids, Some(HOUR)),
+        "nothing of the first is stacked on it"
+    );
+
+    // Outlived: the lease it was noted for is let go, and whoever takes
+    // the partition next commits as to any other.
+    let key = registered(h).await;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let own = taken_up(h, &key.tenant).await;
+    let to_be = adoption(4);
+    let noted = c.adopt_on_commit(&key, held.generation, &to_be);
+    assert!(noted.await.unwrap());
+    c.release(&held).await.unwrap();
+    let (next, _) = lease(h, &key, &node("b")).await;
+    c.commit(&next, commit(4, "m4")).await.unwrap();
+    assert_eq!(taken_up(h, &key.tenant).await, own);
+    c.commit(&next, commit(5, "m5")).await.unwrap();
+}
+
+async fn a_tenant_given_a_key_or_written_to_elsewhere_meanwhile_takes_nothing_up(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let other = beside(&key, 1);
+    c.register(&other).await.unwrap();
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let own = identity(h, tenant).await.unwrap().lineage;
+    let to_be = adoption(2);
+    let noted = c.adopt_on_commit(&key, held.generation, &to_be);
+    assert!(noted.await.unwrap());
+
+    let issued = c.issue_key(tenant, uuid::Uuid::new_v4(), &[9; 32]).await;
+    let issued = issued.unwrap().unwrap();
+    assert!(adopting(&c.commit(&held, commit(2, "restored")).await));
+    assert_eq!(identity(h, tenant).await.unwrap().lineage, own);
+    assert!(c.revoke_key(tenant, issued.id).await.unwrap());
+
+    let (elsewhere, _) = lease(h, &other, &node("a")).await;
+    c.commit(&elsewhere, commit(1, "m1")).await.unwrap();
+    assert!(adopting(&c.commit(&held, commit(2, "restored")).await));
+    assert_eq!(
+        taken_up(h, tenant).await,
+        (own, Vec::new(), None),
+        "written to, it is some tenant already"
+    );
+    c.adopt_no_more(&key).await.unwrap();
+    c.commit(&held, commit(2, "m2")).await.unwrap();
+    assert_eq!(identity(h, tenant).await.unwrap().lineage, own);
+}
+
+async fn a_tenant_removed_before_it_took_a_backup_up_is_purged_as_the_tenant_it_was(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let own = identity(h, &key.tenant).await.unwrap().lineage;
+    let to_be = adoption(2);
+    let noted = c.adopt_on_commit(&key, held.generation, &to_be);
+    assert!(noted.await.unwrap());
+    assert!(c.remove(&key).await.unwrap());
+    let claim = purge_claimed(c, &key.tenant).await.unwrap();
+    assert_eq!(claim.removed.lineage, own, "not the one it was to take up");
+    c.purged(&key.tenant, claim.id, 24 * HOUR).await.unwrap();
+
+    // Made again, nothing is left noted for it.
+    c.register(&key).await.unwrap();
+    let (held, _) = lease(h, &key, &node("a")).await;
+    c.commit(&held, commit(2, "m2")).await.unwrap();
+    assert_ne!(
+        identity(h, &key.tenant).await.unwrap().lineage,
+        to_be.lineage
+    );
+    assert_eq!(c.keys(&key.tenant).await.unwrap(), []);
+}
+
+async fn a_cluster_keeps_the_id_it_was_given(h: &dyn Harness) {
+    let c = h.coordinator();
+    let id = c.cluster().await.unwrap();
+    registered(h).await;
+    assert_eq!(c.cluster().await.unwrap(), id);
+}
+
+async fn a_tenant_still_being_purged_is_refused_saying_how_long_ago_that_was_asked(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    assert!(c.remove(&key).await.unwrap());
+    h.pass(&key, HOUR).await;
+    let refused = c.register(&key).await;
+    let Err(CoordinatorError::Purging { tenant, asked }) = refused else {
+        panic!("{refused:?}");
+    };
+    assert_eq!(tenant, key.tenant);
+    assert!(
+        asked >= HOUR && asked < HOUR + Duration::from_secs(60),
+        "{asked:?}"
+    );
+}
+
+async fn a_purge_is_claimed_only_once_due_and_renewed_only_while_it_is_the_claims_to_do(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let renewed =
+        |claim: uuid::Uuid| async move { c.renew_purge(tenant, claim, HOUR).await.unwrap() };
+    assert!(!renewed(uuid::Uuid::new_v4()).await, "never removed");
+    assert!(c.remove(&key).await.unwrap());
+    assert_eq!(
+        c.claim_purge(tenant, HOUR, HOUR).await.unwrap(),
+        None,
+        "not removed an hour ago yet"
+    );
+    h.pass(&key, 2 * HOUR).await;
+    let first = c.claim_purge(tenant, HOUR, HOUR).await.unwrap().unwrap();
+    assert!(renewed(first.id).await);
+    assert!(!renewed(uuid::Uuid::new_v4()).await, "not the claim held");
+
+    h.pass(&key, HOUR / 2).await;
+    assert!(renewed(first.id).await, "held on from when it is renewed");
+    h.pass(&key, HOUR * 3 / 4).await;
+    assert_eq!(purge_claimed(c, tenant).await, None, "it was renewed");
+    h.pass(&key, HOUR).await;
+    let second = purge_claimed(c, tenant).await.unwrap();
+    assert_eq!(second.removed, first.removed);
+    assert!(!renewed(first.id).await, "another took the purge");
+    assert!(renewed(second.id).await);
+
+    c.purged(tenant, second.id, 24 * HOUR).await.unwrap();
+    assert!(!renewed(second.id).await, "the purge is done");
+    c.register(&key).await.unwrap();
+    assert!(!renewed(second.id).await, "and the tenant made again");
+    assert!(!renewed(first.id).await);
+    assert!(matches!(
+        c.renew_purge(tenant, second.id, MAX_BACKUP_HOLD + Duration::from_secs(1))
+            .await,
+        Err(CoordinatorError::InvalidArgument(_))
+    ));
+}
+
+async fn a_purged_tenant_is_looked_over_by_one_node_now_and_then_while_remembered(h: &dyn Harness) {
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let every = HOUR / 4;
+    let c = h.coordinator();
+    let looked = |limit: usize| async move { c.look_overs(DAY, every, limit).await.unwrap() };
+    let mut removed = Vec::new();
+    for _ in 0..3 {
+        let key = registered(h).await;
+        let lineage = identity(h, &key.tenant).await.unwrap().lineage;
+        assert!(c.remove(&key).await.unwrap());
+        removed.push((key, lineage));
+    }
+    assert_eq!(looked(8).await, [], "none is purged yet");
+    for (key, _) in &removed[..2] {
+        purge(c, &key.tenant).await;
+    }
+    assert_eq!(looked(8).await, [], "purging them looked them over");
+    for (key, _) in &removed[..2] {
+        h.pass(key, every).await;
+    }
+    let (first, second) = (looked(1).await, looked(8).await);
+    assert_eq!((first.len(), second.len()), (1, 1), "as many as asked for");
+    let mut seen: Vec<&Removed> = first.iter().chain(&second).collect();
+    seen.sort_by(|a, b| a.tenant.cmp(&b.tenant));
+    let mut purged: Vec<(TenantId, Lineage)> = removed[..2]
+        .iter()
+        .map(|(key, lineage)| (key.tenant.clone(), *lineage))
+        .collect();
+    purged.sort();
+    assert_eq!(
+        seen.iter()
+            .map(|removed| (removed.tenant.clone(), removed.lineage))
+            .collect::<Vec<_>>(),
+        purged,
+        "each is taken once, as the tenant it was"
+    );
+    assert_eq!(looked(8).await, [], "each was looked over just now");
+
+    // Time is moved for the first alone, where it can be.
+    let (first, _) = &removed[0];
+    let due = |looked: Vec<Removed>| looked.iter().any(|removed| removed.tenant == first.tenant);
+    h.pass(first, every / 2).await;
+    assert_eq!(looked(8).await, []);
+    h.pass(first, every).await;
+    assert!(due(looked(8).await), "due again");
+    assert!(!due(looked(8).await));
+
+    // One made again is still looked over, for its backups.
+    c.register(first).await.unwrap();
+    h.pass(first, 2 * every).await;
+    assert!(due(looked(8).await));
+    h.pass(first, DAY).await;
+    let left = looked(8).await;
+    assert!(!due(left.clone()), "no longer remembered");
+    let unpurged = &removed[2].0.tenant;
+    assert!(left.iter().all(|removed| &removed.tenant != unpurged));
 }
 
 /// The positions of the earliest and latest states a restore reaching back
@@ -963,39 +1489,49 @@ async fn a_tenant_keeps_its_own_restore_window_until_told_otherwise(h: &dyn Harn
         .unwrap());
 }
 
+/// A new claim on backing `tenant` up, if it was taken.
+async fn claimed(
+    coordinator: &dyn Coordinator,
+    tenant: &TenantId,
+    due: Option<Duration>,
+) -> Option<uuid::Uuid> {
+    let claim = uuid::Uuid::new_v4();
+    coordinator
+        .claim_backup(tenant, claim, due, HOUR)
+        .await
+        .unwrap()
+        .then_some(claim)
+}
+
 async fn one_node_at_a_time_backs_a_tenant_up_and_only_when_due(h: &dyn Harness) {
     let key = registered(h).await;
     let tenant = &key.tenant;
     let coordinator = h.coordinator();
     let day = Some(24 * HOUR);
-    let first = coordinator.claim_backup(tenant, day, HOUR).await.unwrap();
+    let first = claimed(coordinator, tenant, day).await;
     let first = first.expect("never backed up, so due");
-    assert_eq!(
-        coordinator.claim_backup(tenant, None, HOUR).await.unwrap(),
-        None,
-        "held"
-    );
+    assert_eq!(claimed(coordinator, tenant, None).await, None, "held");
     coordinator
         .release_backup(tenant, first, true)
         .await
         .unwrap();
     assert_eq!(
-        coordinator.claim_backup(tenant, day, HOUR).await.unwrap(),
+        claimed(coordinator, tenant, day).await,
         None,
         "backed up just now"
     );
-    let asked = coordinator.claim_backup(tenant, None, HOUR).await.unwrap();
+    let asked = claimed(coordinator, tenant, None).await;
     let asked = asked.expect("asked for, a backup need not be due");
 
     h.pass(&key, 2 * HOUR).await;
-    let taken_over = coordinator.claim_backup(tenant, None, HOUR).await.unwrap();
+    let taken_over = claimed(coordinator, tenant, None).await;
     let taken_over = taken_over.expect("a claim that ran out is taken over");
     coordinator
         .release_backup(tenant, asked, false)
         .await
         .unwrap();
     assert_eq!(
-        coordinator.claim_backup(tenant, None, HOUR).await.unwrap(),
+        claimed(coordinator, tenant, None).await,
         None,
         "a stale release leaves the newer claim be"
     );
@@ -1003,19 +1539,67 @@ async fn one_node_at_a_time_backs_a_tenant_up_and_only_when_due(h: &dyn Harness)
         .release_backup(tenant, taken_over, false)
         .await
         .unwrap();
-    assert!(coordinator
-        .claim_backup(tenant, None, HOUR)
-        .await
-        .unwrap()
-        .is_some());
+    assert!(claimed(coordinator, tenant, None).await.is_some());
     assert_eq!(
-        coordinator
-            .claim_backup(&self::key().tenant, None, HOUR)
-            .await
-            .unwrap(),
+        claimed(coordinator, &self::key().tenant, None).await,
         None,
         "no such tenant"
     );
+}
+
+async fn a_claim_asked_for_again_is_still_held_and_only_its_holder_renews_it(h: &dyn Harness) {
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let coordinator = h.coordinator();
+    let day = Some(24 * HOUR);
+    let (claim, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let take = |claim, due| coordinator.claim_backup(tenant, claim, due, HOUR);
+    let renew = |claim| coordinator.renew_backup(tenant, claim, HOUR);
+    assert!(take(claim, day).await.unwrap());
+    assert!(
+        take(claim, day).await.unwrap(),
+        "asked for again, as when the answer was lost, it is still held"
+    );
+    assert!(!take(other, None).await.unwrap(), "held by the first");
+
+    h.pass(&key, HOUR * 3 / 4).await;
+    assert!(renew(claim).await.unwrap());
+    assert!(!renew(other).await.unwrap(), "only the holder renews it");
+    h.pass(&key, HOUR / 2).await;
+    assert!(
+        !take(other, None).await.unwrap(),
+        "renewed, it has not run out"
+    );
+    h.pass(&key, HOUR).await;
+    assert!(
+        take(other, None).await.unwrap(),
+        "run out, it is taken over"
+    );
+    assert!(
+        !renew(claim).await.unwrap(),
+        "one taken over is not renewed"
+    );
+    assert!(!take(claim, None).await.unwrap());
+    coordinator
+        .release_backup(tenant, other, true)
+        .await
+        .unwrap();
+    assert!(
+        !renew(other).await.unwrap(),
+        "one let go is not taken again by renewing it"
+    );
+    assert!(!take(claim, day).await.unwrap(), "backed up just now");
+    assert!(take(claim, None).await.unwrap());
+    assert!(!coordinator
+        .renew_backup(&self::key().tenant, claim, HOUR)
+        .await
+        .unwrap());
+    assert!(matches!(
+        coordinator
+            .renew_backup(tenant, claim, MAX_BACKUP_HOLD + HOUR)
+            .await,
+        Err(CoordinatorError::InvalidArgument(_))
+    ));
 }
 
 async fn a_removed_tenant_is_purged_before_it_is_made_again(h: &dyn Harness) {
@@ -1028,11 +1612,11 @@ async fn a_removed_tenant_is_purged_before_it_is_made_again(h: &dyn Harness) {
         .purges(Duration::ZERO, HOUR)
         .await
         .unwrap()));
-    assert_eq!(coordinator.claim_purge(tenant, HOUR).await.unwrap(), None);
+    assert_eq!(purge_claimed(coordinator, tenant).await, None);
     assert!(coordinator.remove(&key).await.unwrap());
     assert!(matches!(
         coordinator.register(&key).await,
-        Err(CoordinatorError::Purging(_))
+        Err(CoordinatorError::Purging { .. })
     ));
     assert!(
         !due(coordinator.purges(HOUR, HOUR).await.unwrap()),
@@ -1040,22 +1624,14 @@ async fn a_removed_tenant_is_purged_before_it_is_made_again(h: &dyn Harness) {
     );
     assert!(due(coordinator.purges(Duration::ZERO, HOUR).await.unwrap()));
 
-    let first = coordinator
-        .claim_purge(tenant, HOUR)
-        .await
-        .unwrap()
-        .unwrap();
+    let first = purge_claimed(coordinator, tenant).await.unwrap().id;
     assert_eq!(
-        coordinator.claim_purge(tenant, HOUR).await.unwrap(),
+        purge_claimed(coordinator, tenant).await,
         None,
         "one node purges at a time"
     );
     h.pass(&key, 2 * HOUR).await;
-    let second = coordinator
-        .claim_purge(tenant, HOUR)
-        .await
-        .unwrap()
-        .unwrap();
+    let second = purge_claimed(coordinator, tenant).await.unwrap().id;
     coordinator.purged(tenant, first, 24 * HOUR).await.unwrap();
     assert!(
         due(coordinator.purges(Duration::ZERO, HOUR).await.unwrap()),
@@ -1065,7 +1641,7 @@ async fn a_removed_tenant_is_purged_before_it_is_made_again(h: &dyn Harness) {
     let purges = coordinator.purges(Duration::ZERO, HOUR).await.unwrap();
     assert!(!due(purges.clone()) && lately(purges));
     assert_eq!(
-        coordinator.claim_purge(tenant, HOUR).await.unwrap(),
+        purge_claimed(coordinator, tenant).await,
         None,
         "a purge done is not claimed again"
     );
@@ -1078,6 +1654,50 @@ async fn a_removed_tenant_is_purged_before_it_is_made_again(h: &dyn Harness) {
         !coordinator.remove(&self::key()).await.unwrap(),
         "removing what was never there purges nothing"
     );
+}
+
+async fn a_purge_done_is_taken_up_again_only_while_its_tenant_is_not_made_again(h: &dyn Harness) {
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let coordinator = h.coordinator();
+    let reopen = || coordinator.reopen_purge(tenant);
+    let purge = || async {
+        let claim = purge_claimed(coordinator, tenant).await;
+        let claim = claim.expect("a purge to be done is claimed");
+        coordinator
+            .purged(tenant, claim.id, 24 * HOUR)
+            .await
+            .unwrap();
+    };
+    assert!(!reopen().await.unwrap(), "never removed");
+    assert!(coordinator.remove(&key).await.unwrap());
+    assert!(!reopen().await.unwrap(), "still to be done");
+    h.pass(&key, 2 * HOUR).await;
+    purge().await;
+
+    assert!(
+        reopen().await.unwrap(),
+        "done, and the tenant not made again"
+    );
+    assert!(
+        matches!(
+            coordinator.register(&key).await,
+            Err(CoordinatorError::Purging { .. })
+        ),
+        "not made again while it is purged again"
+    );
+    let purges = coordinator.purges(HOUR, HOUR).await.unwrap();
+    assert!(
+        purges.due.contains(tenant) && !purges.lately.contains(tenant),
+        "to be purged at once: it has waited already"
+    );
+    purge().await;
+
+    coordinator.register(&key).await.unwrap();
+    assert!(!reopen().await.unwrap(), "made again, it is left be");
+    let purges = coordinator.purges(Duration::ZERO, HOUR).await.unwrap();
+    assert!(purges.lately.contains(tenant) && !purges.due.contains(tenant));
+    assert!(!coordinator.reopen_purge(&self::key().tenant).await.unwrap());
 }
 
 async fn registering_and_removing_together_never_leave_a_tenant_to_be_purged(h: &dyn Harness) {
@@ -1157,19 +1777,531 @@ conformance! {
     restores_a_day_old_are_forgotten_whether_or_not_their_partition_is_kept_up,
     a_tenant_keeps_its_own_restore_window_until_told_otherwise,
     one_node_at_a_time_backs_a_tenant_up_and_only_when_due,
+    a_claim_asked_for_again_is_still_held_and_only_its_holder_renews_it,
     a_removed_tenant_is_purged_before_it_is_made_again,
+    a_purge_done_is_taken_up_again_only_while_its_tenant_is_not_made_again,
     registering_and_removing_together_never_leave_a_tenant_to_be_purged,
+    a_tenant_keeps_its_lineage_until_it_is_removed_and_one_made_again_has_another,
+    partitions_first_registered_together_are_of_one_lineage,
+    a_tenant_takes_a_backup_up_with_the_commit_that_restores_it_and_nothing_before,
+    an_adoption_is_noted_only_for_an_empty_tenant_without_keys_by_the_lease_named,
+    an_adoption_is_given_up_replaced_or_outlived_by_its_lease,
+    a_tenant_given_a_key_or_written_to_elsewhere_meanwhile_takes_nothing_up,
+    a_tenant_removed_before_it_took_a_backup_up_is_purged_as_the_tenant_it_was,
+    a_cluster_keeps_the_id_it_was_given,
+    a_tenant_still_being_purged_is_refused_saying_how_long_ago_that_was_asked,
+    a_purge_is_claimed_only_once_due_and_renewed_only_while_it_is_the_claims_to_do,
+    a_purged_tenant_is_looked_over_by_one_node_now_and_then_while_remembered,
     ping_succeeds,
+}
+
+/// The test database's connection options.
+fn database_options() -> Option<PgConnectOptions> {
+    database_url().map(|url| PgConnectOptions::from_str(&url).expect("database url"))
+}
+
+/// A pool of `connections` by `options`, each named `application`, so
+/// that what they wait on can be told apart from what other tests do
+/// meanwhile.
+async fn named_pool(
+    options: PgConnectOptions,
+    application: &str,
+    connections: u32,
+) -> sqlx::PgPool {
+    pool(options.application_name(application), connections).await
+}
+
+/// How many connections named `application` are waiting on a lock.
+async fn waiting_on_a_lock(pool: &sqlx::PgPool, application: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE application_name = $1 AND wait_event_type = 'Lock'",
+    )
+    .bind(application)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Wait until `count` connections named `application` are waiting on a
+/// lock, or until `done`.
+async fn waiting_on_locks(
+    pool: &sqlx::PgPool,
+    application: &str,
+    count: i64,
+    done: impl Fn() -> bool,
+) {
+    let deadline = std::time::Instant::now() + HUNG;
+    loop {
+        let waiting = waiting_on_a_lock(pool, application).await;
+        if waiting >= count || done() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{waiting} of {count} are waiting on a lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Do `work`, and say whether a connection named `application` was seen
+/// waiting on a lock meanwhile. A wait may go unseen, if this was kept from
+/// looking while it lasted; none is seen that was not there.
+async fn seen_waiting_on_a_lock<T>(
+    pool: &sqlx::PgPool,
+    application: &str,
+    work: impl Future<Output = T>,
+) -> (T, bool) {
+    tokio::pin!(work);
+    let mut seen = false;
+    loop {
+        tokio::select! {
+            done = &mut work => return (done, seen),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {
+                seen |= waiting_on_a_lock(pool, application).await > 0;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn postgres_backup_claims_made_together_are_won_by_exactly_one() {
+    const CLAIMS: usize = 8;
+    let Some(pg) = Pg::connect_beside(CLAIMS as u32 + 2).await else {
+        return;
+    };
+    let application = format!("claims-{}", uuid::Uuid::new_v4().simple());
+    let claiming = PostgresCoordinator::with_pool(
+        named_pool(pg.options(), &application, CLAIMS as u32 + 2).await,
+    )
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        let tenant = key().tenant;
+        for partition in 0..3 {
+            let key = PartitionKey {
+                tenant: tenant.clone(),
+                partition: Partition(partition),
+            };
+            pg.coordinator.register(&key).await.unwrap();
+        }
+        // Every claim starts while another transaction holds the rows, so
+        // that all of them look before any has taken the tenant.
+        let mut holding = pg.pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM vellev.partitions WHERE tenant = $1 FOR UPDATE")
+            .bind(tenant.as_str())
+            .execute(&mut *holding)
+            .await
+            .unwrap();
+        let claims: Vec<_> = (0..CLAIMS)
+            .map(|_| {
+                let (claiming, tenant, claim) =
+                    (claiming.clone(), tenant.clone(), uuid::Uuid::new_v4());
+                tokio::spawn(async move {
+                    let won = claiming.claim_backup(&tenant, claim, None, HOUR).await;
+                    won.map(|won| won.then_some(claim))
+                })
+            })
+            .collect();
+        waiting_on_locks(&pg.pool, &application, CLAIMS as i64, || false).await;
+        holding.commit().await.unwrap();
+
+        let mut won = Vec::new();
+        for claim in join_all(claims).await {
+            won.extend(claim.unwrap().unwrap());
+        }
+        assert_eq!(won.len(), 1, "claims won: {won:?}");
+        let held: Vec<Option<uuid::Uuid>> = sqlx::query_scalar(
+            "SELECT DISTINCT backup_claim FROM vellev.partitions WHERE tenant = $1",
+        )
+        .bind(tenant.as_str())
+        .fetch_all(&pg.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            held,
+            [Some(won[0])],
+            "every partition is held by the one claim won"
+        );
+    }
+}
+
+#[tokio::test]
+async fn postgres_a_late_renewal_and_a_takeover_never_both_hold_a_claim() {
+    let Some(pg) = Pg::connect_beside(4).await else {
+        return;
+    };
+    let application = format!("renewal-{}", uuid::Uuid::new_v4().simple());
+    let claiming = PostgresCoordinator::with_pool(named_pool(pg.options(), &application, 4).await)
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        let tenant = key().tenant;
+        for partition in 0..3 {
+            let key = PartitionKey {
+                tenant: tenant.clone(),
+                partition: Partition(partition),
+            };
+            pg.coordinator.register(&key).await.unwrap();
+        }
+        let (renewed, taking) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert!(pg
+            .coordinator
+            .claim_backup(&tenant, renewed, None, HOUR)
+            .await
+            .unwrap());
+        sqlx::query(
+            "UPDATE vellev.partitions SET backup_claimed_until = now() - interval '1 second'
+             WHERE tenant = $1",
+        )
+        .bind(tenant.as_str())
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+        // The renewal comes as the claim runs out, and the takeover while
+        // it is under way: both wait on another transaction holding the
+        // rows, the renewal first.
+        let mut holding = pg.pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM vellev.partitions WHERE tenant = $1 FOR UPDATE")
+            .bind(tenant.as_str())
+            .execute(&mut *holding)
+            .await
+            .unwrap();
+        let renewal = {
+            let (claiming, tenant) = (claiming.clone(), tenant.clone());
+            tokio::spawn(async move { claiming.renew_backup(&tenant, renewed, HOUR).await })
+        };
+        waiting_on_locks(&pg.pool, &application, 1, || false).await;
+        let takeover = {
+            let (claiming, tenant) = (claiming.clone(), tenant.clone());
+            tokio::spawn(async move { claiming.claim_backup(&tenant, taking, None, HOUR).await })
+        };
+        waiting_on_locks(&pg.pool, &application, 2, || false).await;
+        holding.commit().await.unwrap();
+
+        let renewal = renewal.await.unwrap().unwrap();
+        let takeover = takeover.await.unwrap().unwrap();
+        let held: Vec<Option<uuid::Uuid>> = sqlx::query_scalar(
+            "SELECT DISTINCT backup_claim FROM vellev.partitions WHERE tenant = $1",
+        )
+        .bind(tenant.as_str())
+        .fetch_all(&pg.pool)
+        .await
+        .unwrap();
+        match (renewal, takeover) {
+            (true, false) => assert_eq!(held, [Some(renewed)]),
+            (false, true) => assert_eq!(held, [Some(taking)]),
+            both => panic!("renewed and taken over: {both:?}, held by {held:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn postgres_writes_across_a_tenants_partitions_made_together_all_succeed() {
+    const WRITES: usize = 64;
+    const AT_ONCE: u32 = 8;
+    let Some(options) = database_options() else {
+        return;
+    };
+    let _granted = granted(AT_ONCE + 1).await;
+    let scratch = ScratchDatabase::create(options).await;
+    let coordinator = PostgresCoordinator::with_pool(pool(scratch.options(), AT_ONCE).await)
+        .await
+        .unwrap();
+    let tenant = key().tenant;
+    for partition in [2, 0, 1] {
+        let key = PartitionKey {
+            tenant: tenant.clone(),
+            partition: Partition(partition),
+        };
+        coordinator.register(&key).await.unwrap();
+    }
+    let claims: Vec<uuid::Uuid> = (0..4).map(|_| uuid::Uuid::new_v4()).collect();
+    let writes = (0..WRITES).map(|write| {
+        let (coordinator, tenant, claim) = (
+            coordinator.clone(),
+            tenant.clone(),
+            claims[write % claims.len()],
+        );
+        tokio::spawn(async move {
+            match write % 4 {
+                0 => coordinator
+                    .claim_backup(&tenant, claim, None, HOUR)
+                    .await
+                    .map(drop),
+                1 => coordinator
+                    .renew_backup(&tenant, claim, HOUR)
+                    .await
+                    .map(drop),
+                2 => coordinator.release_backup(&tenant, claim, true).await,
+                _ => coordinator
+                    .set_restore_window(&tenant, Some(HOUR * write as u32))
+                    .await
+                    .map(drop),
+            }
+        })
+    });
+    for written in join_all(writes).await {
+        written
+            .unwrap()
+            .expect("no write across the partitions fails, by deadlock or otherwise");
+    }
+}
+
+/// How many connections a test with a database of its own is granted: a
+/// pool of [`SCRATCH_POOL`] on it, and one to make it and to drop it with.
+const SCRATCH: u32 = SCRATCH_POOL + 1;
+const SCRATCH_POOL: u32 = 4;
+
+/// A database of its own for one test, dropped however the test ends.
+struct ScratchDatabase {
+    admin: PgConnectOptions,
+    name: String,
+}
+
+/// What every scratch database's name starts with, before the second it
+/// was made in and an id.
+const SCRATCH_NAMED: &str = "vellev_scratch_";
+/// How long after it was made a scratch database nobody is connected to
+/// is taken for left behind by a run that was killed: far longer than any
+/// test here runs.
+const SCRATCH_LEFT_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Drop the scratch databases left behind by runs that were killed, once
+/// for this run: those made over [`SCRATCH_LEFT_AFTER`] ago that nobody is
+/// connected to. Another run's are its own to drop, and are in use.
+async fn sweep_scratch_databases(admin: &sqlx::PgPool) {
+    static SWEPT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    let swept = || async {
+        for name in scratch_databases_left_behind(admin).await {
+            // Not forced: one in use after all is left to whoever uses it.
+            let drop = format!("DROP DATABASE IF EXISTS {name}");
+            if let Err(error) = sqlx::query(&drop).execute(admin).await {
+                eprintln!("could not drop the scratch database {name}: {error}");
+            }
+        }
+    };
+    SWEPT.get_or_init(swept).await;
+}
+
+/// The scratch databases made over [`SCRATCH_LEFT_AFTER`] ago that nobody
+/// is connected to.
+async fn scratch_databases_left_behind(admin: &sqlx::PgPool) -> Vec<String> {
+    let idle: Vec<String> = sqlx::query_scalar(
+        "SELECT datname::text FROM pg_database d
+         WHERE starts_with(datname::text, $1)
+           AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
+    )
+    .bind(SCRATCH_NAMED)
+    .fetch_all(admin)
+    .await
+    .unwrap();
+    let now = Utc::now().timestamp();
+    let left = idle.into_iter().filter(|name| left_behind(name, now));
+    left.collect()
+}
+
+/// Whether the scratch database `name` was made over
+/// [`SCRATCH_LEFT_AFTER`] before `now`, by the second its name says.
+fn left_behind(name: &str, now: i64) -> bool {
+    let made = name
+        .strip_prefix(SCRATCH_NAMED)
+        .and_then(|rest| rest.split('_').next())
+        .and_then(|secs| secs.parse::<i64>().ok());
+    made.is_some_and(|made| now - made > SCRATCH_LEFT_AFTER.as_secs() as i64)
+}
+
+impl ScratchDatabase {
+    async fn create(admin: PgConnectOptions) -> Self {
+        let made = Utc::now().timestamp();
+        let name = format!("{SCRATCH_NAMED}{made}_{}", uuid::Uuid::new_v4().simple());
+        let creating = pool(admin.clone(), 1).await;
+        sweep_scratch_databases(&creating).await;
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&creating)
+            .await
+            .unwrap();
+        creating.close().await;
+        Self { admin, name }
+    }
+
+    fn options(&self) -> PgConnectOptions {
+        self.admin.clone().database(&self.name)
+    }
+}
+
+impl Drop for ScratchDatabase {
+    fn drop(&mut self) {
+        let (admin, name) = (self.admin.clone(), self.name.clone());
+        // The test's own runtime cannot be blocked on from within it, so the
+        // database is dropped from a runtime of its own on another thread.
+        let dropped = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime to drop the database with");
+            runtime.block_on(async {
+                let admin = sqlx::PgPool::connect_with(admin).await?;
+                sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                    .execute(&admin)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .join();
+        if !matches!(dropped, Ok(Ok(()))) {
+            eprintln!("could not drop the scratch database {}", self.name);
+        }
+    }
+}
+
+#[tokio::test]
+async fn postgres_raises_no_format_past_a_node_announcing_meanwhile() {
+    let Some(options) = database_options() else {
+        return;
+    };
+    // The format is the cluster's, and never falls, so this raises it in a
+    // database of its own.
+    let _granted = granted(SCRATCH).await;
+    let scratch = ScratchDatabase::create(options).await;
+    let application = format!("raise-{}", uuid::Uuid::new_v4().simple());
+    let pool = named_pool(scratch.options(), &application, SCRATCH_POOL).await;
+    let coordinator = PostgresCoordinator::with_pool(pool.clone()).await.unwrap();
+
+    let mut announcing = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO vellev.nodes (node, format, protocol, seen_at) VALUES ('older', 1, 1, now())",
+    )
+    .execute(&mut *announcing)
+    .await
+    .unwrap();
+    let (unraised, waited) =
+        seen_waiting_on_a_lock(&pool, &application, coordinator.raise_format(1)).await;
+    assert_eq!(unraised.unwrap(), 1);
+    assert!(!waited, "a format already written waits on no announce");
+    let raising = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.raise_format(2).await })
+    };
+    waiting_on_locks(&pool, &application, 1, || raising.is_finished()).await;
+    announcing.commit().await.unwrap();
+    let raised = raising.await.unwrap().unwrap();
+    assert_eq!(
+        (raised, coordinator.format().await.unwrap()),
+        (1, 1),
+        "a node that reads only 1 announced"
+    );
+    assert_eq!(
+        coordinator
+            .announce(
+                &node("newer"),
+                Versions {
+                    format: 2,
+                    protocol: 1
+                }
+            )
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn postgres_a_raise_waits_on_announces_only_briefly_and_not_at_all_for_one_it_cannot_make() {
+    let Some(options) = database_options() else {
+        return;
+    };
+    let _granted = granted(SCRATCH).await;
+    let scratch = ScratchDatabase::create(options).await;
+    let application = format!("raise-{}", uuid::Uuid::new_v4().simple());
+    let pool = named_pool(scratch.options(), &application, SCRATCH_POOL).await;
+    let coordinator = PostgresCoordinator::with_pool(pool.clone()).await.unwrap();
+    let newer = Versions {
+        format: 2,
+        protocol: 1,
+    };
+    let announcing = || async {
+        let mut announcing = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO vellev.nodes (node, format, protocol, seen_at)
+             VALUES ($1, 2, 1, now())",
+        )
+        .bind(node("announcing").as_str())
+        .execute(&mut *announcing)
+        .await
+        .unwrap();
+        announcing
+    };
+
+    let held_up = announcing().await;
+    let started = std::time::Instant::now();
+    let raised = tokio::time::timeout(HUNG, coordinator.raise_format(2)).await;
+    assert!(
+        matches!(raised, Ok(Ok(1))),
+        "a raise held up gives up, leaving the format: {raised:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(900), "it waited");
+    held_up.commit().await.unwrap();
+
+    let older = node("older");
+    coordinator
+        .announce(&older, Versions { format: 1, ..newer })
+        .await
+        .unwrap();
+    let held_up = announcing().await;
+    let (unraised, waited) =
+        seen_waiting_on_a_lock(&pool, &application, coordinator.raise_format(2)).await;
+    assert_eq!(unraised.unwrap(), 1);
+    assert!(!waited, "a raise a node registered rules out takes no lock");
+    held_up.commit().await.unwrap();
+
+    coordinator.depart(&older).await.unwrap();
+    assert_eq!(
+        coordinator.raise_format(2).await.unwrap(),
+        2,
+        "asked again, it is raised"
+    );
+}
+
+#[tokio::test]
+async fn postgres_a_raise_held_up_by_another_raise_gives_up_as_briefly() {
+    let Some(options) = database_options() else {
+        return;
+    };
+    let _granted = granted(SCRATCH).await;
+    let scratch = ScratchDatabase::create(options).await;
+    let pool = pool(scratch.options(), SCRATCH_POOL).await;
+    let coordinator = PostgresCoordinator::with_pool(pool.clone()).await.unwrap();
+
+    // Another raise holds the format's row, as one under way does.
+    let mut raising = pool.begin().await.unwrap();
+    sqlx::query("SELECT format FROM vellev.cluster FOR UPDATE")
+        .execute(&mut *raising)
+        .await
+        .unwrap();
+    let raised = tokio::time::timeout(HUNG, coordinator.raise_format(2)).await;
+    assert!(
+        matches!(raised, Ok(Ok(1))),
+        "the raise gives up, leaving the format: {raised:?}"
+    );
+    raising.commit().await.unwrap();
+    assert_eq!(coordinator.raise_format(2).await.unwrap(), 2);
 }
 
 #[tokio::test]
 async fn postgres_migrations_are_idempotent_under_concurrent_starts() {
-    let Some(url) = database_url() else { return };
-    let starts: Vec<_> = (0..6)
+    const STARTS: u32 = 6;
+    let Some(options) = database_options() else {
+        return;
+    };
+    let _granted = granted(STARTS * HARNESS + 1).await;
+    let scratch = ScratchDatabase::create(options).await;
+    let starts: Vec<_> = (0..STARTS)
         .map(|_| {
-            let url = url.clone();
+            let options = scratch.options();
             tokio::spawn(async move {
-                PostgresCoordinator::connect(&url, 2, Duration::from_secs(30)).await
+                PostgresCoordinator::with_pool(pool(options, HARNESS).await).await
             })
         })
         .collect();
@@ -1180,7 +2312,7 @@ async fn postgres_migrations_are_idempotent_under_concurrent_starts() {
 
 #[tokio::test]
 async fn a_node_starts_on_a_database_a_newer_release_has_migrated() {
-    let Some(pg) = Pg::connect().await else {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
         return;
     };
     let ahead = 1_000_000 + i64::from(rand_suffix());
@@ -1189,14 +2321,353 @@ async fn a_node_starts_on_a_database_a_newer_release_has_migrated() {
         .execute(&pg.pool)
         .await
         .unwrap();
-    let started =
-        PostgresCoordinator::connect(&database_url().unwrap(), 2, Duration::from_secs(30)).await;
+    let started = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await).await;
     sqlx::query("DELETE FROM vellev.schema_version WHERE version = $1")
         .bind(ahead)
         .execute(&pg.pool)
         .await
         .unwrap();
     started.expect("a node of the older release starts");
+}
+
+#[tokio::test]
+async fn postgres_tenants_there_before_lineages_are_each_given_one() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let (one, other) = (key(), key());
+    let keys = [
+        beside(&one, 0),
+        beside(&one, 1),
+        beside(&one, 2),
+        other.clone(),
+    ];
+    for key in &keys {
+        pg.coordinator.register(key).await.unwrap();
+    }
+    // As the release before left it: no lineage anywhere.
+    sqlx::raw_sql(
+        "DROP TRIGGER removed_tenant ON vellev.partitions;
+         DROP FUNCTION vellev.removed_tenant();
+         DROP TRIGGER registered_lineage ON vellev.partitions;
+         DROP FUNCTION vellev.registered_lineage();
+         ALTER TABLE vellev.partitions DROP COLUMN lineage, DROP COLUMN adopting;
+         ALTER TABLE vellev.purges DROP COLUMN lineage, DROP COLUMN looked_at;
+         ALTER TABLE vellev.cluster DROP COLUMN id;
+         DELETE FROM vellev.schema_version WHERE version = 10;",
+    )
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+
+    let migrated = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let lineages: Vec<(String, uuid::Uuid)> = sqlx::query_as(
+        "SELECT tenant, lineage FROM vellev.partitions WHERE tenant = ANY($1) ORDER BY tenant",
+    )
+    .bind(vec![one.tenant.as_str(), other.tenant.as_str()])
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+    let of = |tenant: &TenantId| -> Vec<uuid::Uuid> {
+        let of = lineages
+            .iter()
+            .filter(|(named, _)| named == tenant.as_str());
+        of.map(|(_, lineage)| *lineage).collect()
+    };
+    let (ones, others) = (of(&one.tenant), of(&other.tenant));
+    assert_eq!(ones.len(), 3);
+    assert!(ones.iter().all(|lineage| *lineage == ones[0]), "{ones:?}");
+    assert_ne!(ones[0], others[0], "each tenant has its own");
+    assert_eq!(
+        migrated
+            .identity(&one.tenant)
+            .await
+            .unwrap()
+            .unwrap()
+            .lineage,
+        Lineage(ones[0])
+    );
+}
+
+#[tokio::test]
+async fn postgres_a_tenant_another_node_is_taking_to_look_over_is_passed_over_not_waited_for() {
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let c = &pg.coordinator;
+    let (taken, free) = (registered(&pg).await, registered(&pg).await);
+    for key in [&taken, &free] {
+        assert!(c.remove(key).await.unwrap());
+        purge(c, &key.tenant).await;
+        pg.pass(key, HOUR).await;
+    }
+    // Another node has the first: its row is locked until that one is done.
+    let mut taking = pg.pool.begin().await.unwrap();
+    sqlx::query("SELECT tenant FROM vellev.purges WHERE tenant = $1 FOR UPDATE")
+        .bind(taken.tenant.as_str())
+        .execute(&mut *taking)
+        .await
+        .unwrap();
+    let looked = |limit: usize| async move {
+        let looking = c.look_overs(DAY, HOUR / 4, limit);
+        let looked = tokio::time::timeout(Duration::from_secs(10), looking).await;
+        let looked = looked.expect("a tenant being taken is not waited for");
+        let tenants = looked.unwrap().into_iter().map(|removed| removed.tenant);
+        tenants.collect::<Vec<_>>()
+    };
+    assert_eq!(looked(8).await, std::slice::from_ref(&free.tenant));
+    assert_eq!(looked(8).await, []);
+    taking.commit().await.unwrap();
+    assert_eq!(looked(8).await, std::slice::from_ref(&taken.tenant));
+}
+
+#[test]
+fn a_scratch_database_is_left_behind_an_hour_after_its_name_says_it_was_made() {
+    let now = 1_800_000_000;
+    let named = |made: i64| format!("{SCRATCH_NAMED}{made}_0123abcd");
+    assert!(left_behind(&named(now - 3_601), now));
+    assert!(!left_behind(&named(now - 3_599), now));
+    assert!(!left_behind(&named(now), now));
+    assert!(!left_behind("vellev_scratch_0123abcd", now), "says no time");
+    assert!(!left_behind("vellev", now));
+}
+
+#[tokio::test]
+async fn postgres_a_scratch_database_left_behind_is_dropped_and_one_in_use_is_not() {
+    let Some(options) = database_options() else {
+        return;
+    };
+    let _granted = granted(3).await;
+    let admin = pool(options.clone(), 1).await;
+    let long_ago = Utc::now().timestamp() - 2 * SCRATCH_LEFT_AFTER.as_secs() as i64;
+    let named = |suffix: &str| {
+        let id = uuid::Uuid::new_v4().simple();
+        format!("{SCRATCH_NAMED}{long_ago}_{id}{suffix}")
+    };
+    let (left, used) = (named("left"), named("used"));
+    for name in [&left, &used] {
+        let make = format!("CREATE DATABASE {name}");
+        sqlx::query(&make).execute(&admin).await.unwrap();
+    }
+    let using = pool(options.clone().database(&used), 1).await;
+    sqlx::query("SELECT 1").execute(&using).await.unwrap();
+
+    // What the first harness of a run drops, whichever that was.
+    let found = scratch_databases_left_behind(&admin).await;
+    assert!(found.contains(&left), "{found:?}");
+    assert!(!found.contains(&used), "one in use is not left behind");
+    using.close().await;
+    for name in [&left, &used] {
+        let drop = format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)");
+        sqlx::query(&drop).execute(&admin).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn postgres_a_purge_is_not_renewed_once_done_or_its_tenant_there_whatever_its_claim() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let c = &pg.coordinator;
+    let renewed = |tenant: TenantId, claim: uuid::Uuid| async move {
+        c.renew_purge(&tenant, claim, HOUR).await.unwrap()
+    };
+    // What registering refuses, done to the rows all the same: a partition
+    // of the tenant there while its purge is claimed.
+    let key = registered(&pg).await;
+    assert!(c.remove(&key).await.unwrap());
+    let claim = purge_claimed(c, &key.tenant).await.unwrap().id;
+    assert!(renewed(key.tenant.clone(), claim).await);
+    sqlx::query(
+        "INSERT INTO vellev.partitions (tenant, partition, generation)
+         VALUES ($1, 0, nextval('vellev.generations'))",
+    )
+    .bind(key.tenant.as_str())
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+    assert!(
+        !renewed(key.tenant.clone(), claim).await,
+        "a tenant of the name is there"
+    );
+
+    // And a purge noted done with its claim left on it.
+    let key = registered(&pg).await;
+    assert!(c.remove(&key).await.unwrap());
+    let claim = purge_claimed(c, &key.tenant).await.unwrap().id;
+    sqlx::query("UPDATE vellev.purges SET purged_at = now() WHERE tenant = $1")
+        .bind(key.tenant.as_str())
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    assert!(!renewed(key.tenant.clone(), claim).await, "it is done");
+}
+
+#[tokio::test]
+async fn postgres_a_purge_is_claimed_in_turn_with_the_other_writes_to_its_tenant() {
+    let Some(pg) = Pg::connect_beside(2).await else {
+        return;
+    };
+    let application = format!("purging-{}", uuid::Uuid::new_v4().simple());
+    let claiming = PostgresCoordinator::with_pool(named_pool(pg.options(), &application, 2).await)
+        .await
+        .unwrap();
+    let key = registered(&pg).await;
+    assert!(pg.coordinator.remove(&key).await.unwrap());
+
+    // Another write to the tenant is under way: it holds the tenant's lock.
+    let mut writing = pg.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(0x766c)
+        .bind(key.tenant.as_str())
+        .execute(&mut *writing)
+        .await
+        .unwrap();
+    let claim = {
+        let tenant = key.tenant.clone();
+        tokio::spawn(async move { claiming.claim_purge(&tenant, Duration::ZERO, HOUR).await })
+    };
+    waiting_on_locks(&pg.pool, &application, 1, || claim.is_finished()).await;
+    assert!(!claim.is_finished(), "the claim waits its turn");
+    writing.commit().await.unwrap();
+    assert!(claim.await.unwrap().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn postgres_a_first_commit_that_waited_while_an_adoption_was_noted_does_not_slip_past() {
+    let Some(pg) = Pg::connect_beside(2).await else {
+        return;
+    };
+    let application = format!("adopting-{}", uuid::Uuid::new_v4().simple());
+    let committing =
+        PostgresCoordinator::with_pool(named_pool(pg.options(), &application, 2).await)
+            .await
+            .unwrap();
+    let key = registered(&pg).await;
+    let (held, _) = lease(&pg, &key, &node("a")).await;
+    let own = identity(&pg, &key.tenant).await.unwrap().lineage;
+
+    // An adoption is being noted: the row is held, and what is noted on
+    // it not yet committed.
+    let to_be = serde_json::json!({ "generation": held.generation, "adoption": adoption(7) });
+    let mut noting = pg.pool.begin().await.unwrap();
+    sqlx::query("UPDATE vellev.partitions SET adopting = $2 WHERE tenant = $1")
+        .bind(key.tenant.as_str())
+        .bind(to_be.to_string())
+        .execute(&mut *noting)
+        .await
+        .unwrap();
+    let racing = {
+        let held = held.clone();
+        tokio::spawn(async move { committing.commit(&held, commit(1, "m1")).await })
+    };
+    waiting_on_locks(&pg.pool, &application, 1, || racing.is_finished()).await;
+    assert!(!racing.is_finished(), "the commit waits on the row");
+    noting.commit().await.unwrap();
+
+    let raced = racing.await.unwrap();
+    assert!(adopting(&raced), "it finds the adoption noted: {raced:?}");
+    let now = identity(&pg, &key.tenant).await.unwrap();
+    assert_eq!((now.lineage, now.committed), (own, false));
+}
+
+#[tokio::test]
+async fn postgres_registering_removing_and_adopting_together_leave_a_tenant_one_lineage() {
+    const TASKS: u32 = 12;
+    let Some(pg) = Pg::connect_beside(TASKS).await else {
+        return;
+    };
+    let together = PostgresCoordinator::with_pool(pool(pg.options(), TASKS).await)
+        .await
+        .unwrap();
+    let key = key();
+    let tasks = (0..TASKS).map(|n| {
+        let (c, key, looking) = (together.clone(), key.clone(), pg.pool.clone());
+        tokio::spawn(async move {
+            for round in 0..12 {
+                let part = beside(&key, (n + round) % 3);
+                match (n + round) % 4 {
+                    0 | 1 => drop(c.register(&part).await),
+                    2 => {
+                        if let Ok(Acquired::Lease { lease, .. }) =
+                            c.acquire(&part, &node("a"), TTL).await
+                        {
+                            let to_be = adoption(u64::from(round) + 2);
+                            let noted = c.adopt_on_commit(&part, lease.generation, &to_be).await;
+                            if noted.is_ok_and(|noted| noted) {
+                                drop(c.commit(&lease, commit(u64::from(round) + 2, "m")).await);
+                            }
+                            drop(c.release(&lease).await);
+                        }
+                    }
+                    _ => {
+                        if c.remove(&part).await.unwrap() {
+                            let claimed = c.claim_purge(&key.tenant, Duration::ZERO, HOUR).await;
+                            if let Some(claim) = claimed.unwrap() {
+                                c.purged(&key.tenant, claim.id, 24 * HOUR).await.unwrap();
+                            }
+                        }
+                    }
+                }
+                let lineages: i64 = sqlx::query_scalar(
+                    "SELECT count(DISTINCT lineage) FROM vellev.partitions WHERE tenant = $1",
+                )
+                .bind(key.tenant.as_str())
+                .fetch_one(&looking)
+                .await
+                .unwrap();
+                assert!(lineages <= 1, "{lineages} lineages in one tenant");
+            }
+        })
+    });
+    for task in join_all(tasks).await {
+        task.unwrap();
+    }
+}
+
+/// What the release before does to remove a tenant's only partition: it
+/// knows nothing of lineages, and notes the purge itself.
+#[tokio::test]
+async fn postgres_a_tenant_removed_by_the_release_before_is_purged_as_the_tenant_it_was() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let c = &pg.coordinator;
+    let pool = &pg.pool;
+    let remove_as_before = |key: PartitionKey| async move {
+        let mut removing = pool.begin().await.unwrap();
+        for sql in [
+            "DELETE FROM vellev.partitions WHERE tenant = $1 AND partition = 0",
+            "INSERT INTO vellev.purges (tenant)
+             SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM vellev.partitions WHERE tenant = $1)
+             ON CONFLICT (tenant) DO UPDATE SET requested_at = now(), purged_at = NULL",
+        ] {
+            sqlx::query(sql)
+                .bind(key.tenant.as_str())
+                .execute(&mut *removing)
+                .await
+                .unwrap();
+        }
+        removing.commit().await.unwrap();
+    };
+    let key = registered(&pg).await;
+    let first = identity(&pg, &key.tenant).await.unwrap();
+    remove_as_before(key.clone()).await;
+    let claim = purge_claimed(c, &key.tenant).await.unwrap();
+    assert_eq!(claim.removed.lineage, first.lineage);
+    c.purged(&key.tenant, claim.id, 24 * HOUR).await.unwrap();
+
+    // Made and removed again while its purge is remembered, it is purged
+    // as the tenant it was then, not the one before.
+    c.register(&key).await.unwrap();
+    let second = identity(&pg, &key.tenant).await.unwrap();
+    remove_as_before(key.clone()).await;
+    let claim = purge_claimed(c, &key.tenant).await.unwrap();
+    assert_eq!(claim.removed.lineage, second.lineage);
+    assert_ne!(second.lineage, first.lineage);
 }
 
 fn rand_suffix() -> u16 {
@@ -1401,18 +2872,19 @@ async fn a_restore_asked_for_again_after_its_record_lapsed_is_recorded_again(h: 
 
 #[tokio::test]
 async fn a_call_waiting_for_a_connection_gives_up_within_its_bound() {
-    let Some(pg) = Pg::connect().await else {
+    let Some(pg) = Pg::connect_beside(1).await else {
         return;
     };
     let key = registered(&pg).await;
     let within = Duration::from_millis(500);
-    let url = database_url().unwrap();
     let named = format!("vellev-test-{}", uuid::Uuid::new_v4().simple());
-    let joined = if url.contains('?') { '&' } else { '?' };
-    let one =
-        PostgresCoordinator::connect(&format!("{url}{joined}application_name={named}"), 1, within)
-            .await
-            .unwrap();
+    let one = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(within)
+        .connect_with(pg.options().application_name(&named))
+        .await
+        .unwrap();
+    let one = PostgresCoordinator::with_pool(one).await.unwrap();
 
     // Another session holds the partition's row, so removing it through
     // `one` waits, on the only connection `one` has.
@@ -1486,8 +2958,8 @@ async fn the_written_format_rises_only_when_every_node_reads_it_and_never_falls(
         protocol: 1,
     };
     let (newer, older) = (node("newer"), node("older"));
-    c.announce(&newer, at(2)).await.unwrap();
-    c.announce(&older, at(1)).await.unwrap();
+    assert_eq!(c.announce(&newer, at(2)).await.unwrap(), 1);
+    assert_eq!(c.announce(&older, at(1)).await.unwrap(), 1);
     assert_eq!(
         c.raise_format(2).await.unwrap(),
         1,
@@ -1496,7 +2968,11 @@ async fn the_written_format_rises_only_when_every_node_reads_it_and_never_falls(
     assert_eq!(c.oldest().await.unwrap(), Some(at(1)));
     c.depart(&older).await.unwrap();
     assert_eq!(c.raise_format(2).await.unwrap(), 2);
-    c.announce(&older, at(1)).await.unwrap();
+    assert_eq!(
+        c.announce(&older, at(1)).await.unwrap(),
+        2,
+        "a node announcing learns the format was raised past it"
+    );
     assert_eq!(c.raise_format(1).await.unwrap(), 2, "it never falls");
     assert_eq!(c.format().await.unwrap(), 2);
 }

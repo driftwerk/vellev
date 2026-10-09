@@ -8,6 +8,48 @@ wrote. This page says what a release may change so that both hold.
 A release here is a version of the `vellev` node. The client crate is
 published separately and follows the same rules for the API.
 
+## Notes for the release that gave tenants a lineage
+
+While nodes of this release and of the one before run side by side, remove
+no tenant and ask for no restore from a backup. A node of the release
+before purges everything kept under a removed tenant's id, whichever
+tenant's or cluster's it is, and restores a backup into a tenant of the id
+whoever the backup is of; a restore is done by whichever node writes the
+tenant, which the caller does not choose.
+
+- Backups taken before this release are not carried over. They lie where
+  this release never looks, and say neither the lineage nor the cluster
+  this release goes by: it does not list them, restore from them, adopt
+  them, prune them or purge them, and says so in its log when it meets one
+  while looking for backups to adopt. Take a backup of every tenant once
+  the upgrade is done, and delete what lies directly under
+  `_backups/{tenant}/backups/` and `_backups/{tenant}/files/`, beside the
+  lineages, by hand when it is no longer wanted. No cluster had been
+  deployed when this was decided.
+- Restoring `{"backup": id}` no longer makes a tenant the cluster does not
+  have, nor restores a backup that is not the tenant's own: both are not
+  found. A cluster that lost a tenant asks to `{"adopt": {"backup": id}}`
+  instead, `--adopt` on the command line, which a node of the release
+  before refuses as a field it does not know. Adopting gives the tenant no
+  key unless `with_keys` asks for those the backup kept.
+- Two refusals have codes of their own, both 409: `empty`, for backing up
+  a tenant that has committed nothing, which answered 201 with a backup of
+  nothing; and `purging`, with a `Retry-After`, for making a tenant whose
+  id is still being purged, which was `conflict`. A client of the release
+  before reads either as `unknown`, and this release's Rust client reads
+  both as final, as it does any code it is not told to retry: the request
+  as sent will not pass by being sent again at once, and `purging` says
+  in `Retry-After` how long that is, minutes rather than seconds, for
+  whoever makes the tenant again to wait out.
+- Migration `0010_lineage.sql` follows `0009_restores.sql`. A database
+  migrated to `0009` by the release before takes `0010` as a node of this
+  release starts.
+- A backup as the API lists it says its `lineage` and its `cluster`.
+- Postgres 13 or newer is needed: the migration calls `gen_random_uuid()`.
+- A node of the release before does not see the backups this release
+  takes; after a rollback they are kept, and seen again once this release
+  runs.
+
 ## Files
 
 Every file in object storage is a frame: a magic number, the kind of
@@ -92,16 +134,132 @@ earlier than the release after the one that first registers.
 Each release's migrations leave the release before working:
 
 - add columns with a default, or with a trigger that fills them when the
-  older release inserts without them (as `incarnation` does);
+  older release inserts without them (as `incarnation` and `lineage` do),
+  or notes what the older release would not when it deletes (as the
+  trigger that records which tenant a purge is of does);
 - never rename or drop a column or table, or change what one means, in
   the same release that stops using it. Drop it a release later;
 - run inside the migration's transaction: nothing that cannot, such as
   `CREATE INDEX CONCURRENTLY`, so that a migration that fails leaves the
   database as it was.
 
+The migration that gives tenants a lineage calls `gen_random_uuid()`,
+which Postgres has had built in since version 13.
+
+A release's migrations are numbered from one with none left out, and a
+database is only ever migrated forwards. A node that finds one of its
+migrations applied otherwise than it has it, or left out below one that
+was applied, was started on a database another build of vellev migrated:
+it changes nothing and says so. Run the release that migrated the
+database, or a later one; never drop or recreate the database to get past
+it.
+
 A node starts on a database a newer release has migrated: it checks the
 migrations it knows were applied as it knows them and leaves newer ones
 alone. It refuses one where a migration it knows was skipped.
+
+## Backup records
+
+A backup is a JSON record in the backup store listing the files it
+needs, which backups share. Each record carries a `version`
+(`vellev_storage::backups::RECORD_VERSION`); a record without one is of
+version 1. Pruning deletes only the files no record lists, so a node must
+never delete around a record it cannot read.
+
+A record says which tenant it is of, by the lineage the tenant was given
+when it was first made, and which cluster took it, by the id the cluster
+was given when its database was made (`vellev.cluster.id`, which anything
+else that must tell clusters apart reads too). It lies under
+`_backups/{tenant}/backups/{lineage}/{cluster}/`, and the files it lists
+under `_backups/{tenant}/files/{lineage}/{cluster}/`. A tenant lists and
+restores from the records of its own lineage, whichever cluster took them.
+A cluster writes, prunes and purges only under its own id, and shares no
+file with another: one that adopts a tenant another cluster backed up
+copies every file it needs once more, under its own id. A record that
+names another tenant, lineage or cluster than where it lies, or none, is
+one that cannot be used. A cluster that has lost a tenant takes up its
+lineage with the commit that restores it from a backup it was asked to
+adopt, and only then.
+
+A backup is taken only of a tenant one of whose partitions has
+committed; it records every partition it takes, one that never committed
+as empty, so that restoring it empties that partition too. Pruning keeps,
+whatever their age, the newest backup and the newest that holds data, and
+holding data means having committed: a tenant whose every object was
+deleted since has still committed, so its backups hold data, and its last
+backup with objects in it ages out as any other.
+
+A release may, without a new record version:
+
+- add a field with a default, so that records written before it still
+  read, as long as the release before may ignore the field and still
+  restore and prune correctly.
+
+Anything else raises the version: a field the release before would
+misread, a change to where files are kept or what a list of them means,
+or making an existing field optional.
+
+A node that finds, among the records its cluster took of a tenant, a
+complete one it cannot use (unreadable, of a newer version, or naming
+another tenant, lineage or cluster than where it lies), or a pending one
+written less
+than a day ago, which may be of a backup under way, lists the backups it
+can use but deletes no file of the tenant's backups. It logs every such
+record at error level and keeps refusing until each is mended or
+removed. A pending record older than a day is forgotten whether it can
+be read or not, as no backup is still writing it.
+
+Releases before the one that added `version` pass over a record they
+cannot read and delete the files only it lists. So a release that writes
+a record of a new version must not run beside any of those: it may be
+deployed only once every node runs a release that refuses instead.
+Within a rolling deploy of a new version, the older nodes refuse to prune
+the tenants the newer ones backed up until they are replaced.
+
+### Backups taken before tenants had a lineage
+
+Releases before the one that gave tenants a lineage kept every backup of
+a tenant id under `_backups/{tenant}/backups/` and `_backups/{tenant}/files/`
+themselves, whichever tenant of that id it was of, and their records say
+neither lineage nor cluster. They are nobody's to this release: not
+listed, restored from, adopted, pruned or purged. Nothing tells which
+tenant of an id such a record is of but an incarnation, which is one
+cluster's own count and the same in any two clusters, so going by it would
+hand one customer's backup to another's tenant. The record version is not
+raised for the new layout, as no release reads the other's place.
+
+### Upgrading from a release before claims were renewed
+
+Releases before the one that renews backup claims (DW-665) differ in ways
+that matter while both run:
+
+- they take a claim for six hours and never renew it, and do so without
+  the tenant's lock, so two of them, or one of them and a newer node, can
+  both believe they hold a tenant;
+- when a tenant is removed while they back it up, they discard the backup
+  with every file it lists, files its older backups share among them
+  (a newer node only forgets such a backup, and leaves its files to the
+  tenant's purge);
+- they back up a tenant that holds nothing, and prune by that backup;
+- they pass over a record they cannot read and delete what only it lists.
+
+A newer node honours an older node's claim, which simply runs out, but
+nothing makes the older node honour the newer node's rules. So, during a
+rolling deploy from such a release:
+
+1. Prefer to keep the older release from backing up at all while the newer
+   one runs: first roll the older release out again without a backup store
+   (`VELLEV_BACKUP_STORE` unset), then roll out the newer release with it.
+   No node of the older release then backs up, prunes or discards beside a
+   newer one.
+2. If that is not possible, keep the mixed window short, and while it lasts
+   ask for no backups or restores and remove no tenants: the older nodes'
+   daily backups are then the only backup work they do, and their discard
+   runs only when a tenant is removed mid-backup.
+3. Once every node runs the newer release, a claim an older node took
+   before it stopped may hold its tenant for up to six hours; it runs out
+   by itself. A backup of nothing an older node took stays listed, and
+   pruning keeps the newest backup that holds data beside it.
 
 ## The API
 
@@ -129,6 +287,9 @@ Clients and nodes of different releases talk to each other.
   understand, at any depth, so a client using a new field against an older
   node is told so rather than ignored.
 - A route is never removed or changed in meaning; a new one may be added.
+
+What changed in the API with the release that gave tenants a lineage is
+listed in its notes above.
 
 ## Object versions
 
