@@ -382,8 +382,12 @@ impl Coordinator for SimCoordinator {
         self.clean.adopt_on_commit(key, generation, adoption).await
     }
 
-    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<(), CoordinatorError> {
-        self.clean.adopt_no_more(key).await
+    async fn adopt_no_more(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+    ) -> Result<(), CoordinatorError> {
+        self.clean.adopt_no_more(key, generation).await
     }
 
     async fn claim_purge(
@@ -402,6 +406,14 @@ impl Coordinator for SimCoordinator {
         hold: Duration,
     ) -> Result<bool, CoordinatorError> {
         self.clean.renew_purge(tenant, claim, hold).await
+    }
+
+    async fn release_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+    ) -> Result<(), CoordinatorError> {
+        self.clean.release_purge(tenant, claim).await
     }
 
     async fn look_overs(
@@ -1165,7 +1177,7 @@ impl World {
             from: point.log_position,
             from_at: Utc::now(),
         };
-        let restoring = writer.restore_recorded(point.manifest.as_ref(), restore);
+        let restoring = writer.restore_recorded(point.manifest.as_ref(), restore, None);
         // Only the partition's own writer cleans with no grace.
         let grace = match who {
             Who::Current => Duration::ZERO,

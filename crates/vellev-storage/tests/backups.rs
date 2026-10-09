@@ -46,7 +46,7 @@ fn records(owner: &Owner) -> String {
         lineage,
         cluster,
     } = owner;
-    format!("_backups/{tenant}/backups/{lineage}/{cluster}/")
+    format!("_backups/{tenant}/records/{lineage}/{cluster}/")
 }
 
 /// Where the files of the backups `owner`'s cluster took of it lie.
@@ -56,7 +56,7 @@ fn files(owner: &Owner) -> String {
         lineage,
         cluster,
     } = owner;
-    format!("_backups/{tenant}/files/{lineage}/{cluster}/")
+    format!("_backups/{tenant}/data/{lineage}/{cluster}/")
 }
 
 /// Whether `key` is of what `owner`'s cluster keeps of it.
@@ -986,7 +986,7 @@ struct Losing {
 #[async_trait]
 impl Blobs for Losing {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
-        if key.contains("/files/") && !self.lost.swap(true, Ordering::SeqCst) {
+        if key.contains("/data/") && !self.lost.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         self.inner.put(key, bytes).await
@@ -1146,7 +1146,7 @@ async fn a_cluster_restores_from_what_another_took_of_its_tenant_and_deletes_non
         "every file it needs is copied under its own id, sharing none: {ours:?}"
     );
     assert_eq!(
-        ours.iter().filter(|key| key.contains("/files/")).count(),
+        ours.iter().filter(|key| key.contains("/data/")).count(),
         taken_drill.files().count()
     );
     assert_eq!(
@@ -1200,6 +1200,7 @@ async fn a_record_that_says_no_lineage_or_cluster_is_nobodys() {
         std::slice::from_ref(&backup),
         "it is not there to be taken up"
     );
+    assert_eq!(backups.find(&own, backup.id).await.unwrap(), Some(backup));
     let pruned = backups.prune(&own, Duration::ZERO, &Claimed(true)).await;
     assert_eq!(pruned.unwrap(), 0);
     assert_eq!(keys(&store, "").await, kept);
@@ -1209,6 +1210,46 @@ async fn a_record_that_says_no_lineage_or_cluster_is_nobodys() {
         BTreeSet::from(old),
         "nor purged with any tenant of the name"
     );
+}
+
+/// The release before lineages lists `_backups/{tenant}/backups/` and
+/// `_backups/{tenant}/files/` to their ends as its own, and deletes under
+/// them whatever no record it reads lists: so nothing of this release may
+/// lie under either, or a node of that release, run beside this one or
+/// after a rollback, prunes the files of every backup this one takes.
+#[tokio::test]
+async fn nothing_this_release_keeps_lies_where_the_release_before_looks() {
+    let cluster = Cluster::new().await;
+    let store = memory();
+    let backups = Backups::new(store.clone());
+    written(&cluster).await;
+    let own = owner(&cluster).await;
+    let backup = take(&backups, &cluster).await;
+    let Owner {
+        tenant,
+        lineage,
+        cluster: by,
+    } = &own;
+    let (before_records, before_files) = (
+        format!("_backups/{tenant}/backups/"),
+        format!("_backups/{tenant}/files/"),
+    );
+    let kept = keys(&store, &format!("_backups/{tenant}/")).await;
+    assert!(!kept.is_empty());
+    let record = complete_key(&records(&own), &backup);
+    assert!(kept.contains(&record), "{kept:?}");
+    assert!(record.starts_with(&format!("_backups/{tenant}/records/{lineage}/{by}/")));
+    let file = format!("{}{}", files(&own), backup.files().next().unwrap());
+    assert!(kept.contains(&file), "{kept:?}");
+    assert!(file.starts_with(&format!("_backups/{tenant}/data/{lineage}/{by}/")));
+    for key in &kept {
+        assert!(
+            !key.starts_with(&before_records) && !key.starts_with(&before_files),
+            "{key} lies where the release before looks"
+        );
+    }
+    assert!(keys(&store, &before_records).await.is_empty());
+    assert!(keys(&store, &before_files).await.is_empty());
 }
 
 #[tokio::test]
@@ -1299,7 +1340,7 @@ impl Blobs for LosingAsFetched {
         self.inner.put(key, bytes).await
     }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
-        if key.contains("/files/") {
+        if key.contains("/data/") {
             self.lost.store(true, Ordering::SeqCst);
         }
         self.inner.get(key).await

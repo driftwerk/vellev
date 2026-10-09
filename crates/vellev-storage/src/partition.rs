@@ -14,8 +14,8 @@ use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Listed, Local, Transfe
 use crate::catalog::Catalog;
 use crate::column::{self, Column};
 use crate::coordinator::{
-    Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation, Lease, LogPosition,
-    ManifestRef, PartitionKey, Prior, Restore,
+    Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation, Lease, Lineage,
+    LogPosition, ManifestRef, PartitionKey, Prior, Restore,
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
@@ -1026,7 +1026,8 @@ impl Writer {
                     })
                     .await??;
                 let (encoded, bytes) = (turn.taken.elapsed(), frame.len());
-                self.publish(&turn, &key, frame, position, None).await?;
+                self.publish(&turn, &key, frame, position, None, None)
+                    .await?;
                 let published = turn.taken.elapsed();
                 // Applied to its end even if whoever waits here stops
                 // waiting, which closes the writer: the commit is made.
@@ -1202,7 +1203,8 @@ impl Writer {
     ) -> Result<()> {
         let discarded = self
             .attempt(async {
-                self.publish(&turn, key, frame, position, None).await?;
+                self.publish(&turn, key, frame, position, None, None)
+                    .await?;
                 let adopting = Instant::now();
                 let adopted = adopt(&mut self.partition.state.write().expect("partition lock"));
                 tracing::debug!(
@@ -1262,18 +1264,22 @@ impl Writer {
         head: Option<&ManifestRef>,
         position: LogPosition,
     ) -> Result<LogPosition> {
-        self.put_back(head, position, None).await
+        self.put_back(head, position, None, None).await
     }
 
     /// As [`Self::restore`] to `head` at `restore.from`, recording `restore`
     /// with the commit that makes it, so that the coordinator answers its
-    /// request as it was from then on.
+    /// request as it was from then on; and, `adopting`, making the tenant
+    /// of that lineage with it, as the coordinator was told it would, or
+    /// not committing at all.
     pub async fn restore_recorded(
         &self,
         head: Option<&ManifestRef>,
         restore: Restore,
+        adopting: Option<Lineage>,
     ) -> Result<LogPosition> {
-        self.put_back(head, restore.from, Some(restore)).await
+        self.put_back(head, restore.from, Some(restore), adopting)
+            .await
     }
 
     async fn put_back(
@@ -1281,6 +1287,7 @@ impl Writer {
         head: Option<&ManifestRef>,
         position: LogPosition,
         restore: Option<Restore>,
+        adopting: Option<Lineage>,
     ) -> Result<LogPosition> {
         let _building = self.building.lock().await;
         let _refusing = Refusing::writes(self).await;
@@ -1338,7 +1345,8 @@ impl Writer {
         staged.keep();
         let replaced = self
             .attempt(async {
-                self.publish(&turn, &key, frame, restored, restore).await?;
+                self.publish(&turn, &key, frame, restored, restore, adopting)
+                    .await?;
                 Ok(std::mem::replace(
                     &mut *self.partition.state.write().expect("partition lock"),
                     state,
@@ -1760,7 +1768,8 @@ impl Writer {
     }
 
     /// Upload the head file under `key` and commit it at `position`, with
-    /// the restore it makes if it makes one. The upload is given up as the
+    /// the restore it makes if it makes one, and the lineage it is
+    /// `adopting` if it takes a backup up. The upload is given up as the
     /// store says, and each try to commit after [`Self::commit_within`];
     /// one given up is as unknown as one whose answer was lost.
     async fn publish(
@@ -1770,6 +1779,7 @@ impl Writer {
         frame: Bytes,
         position: LogPosition,
         restore: Option<Restore>,
+        adopting: Option<Lineage>,
     ) -> Result<()> {
         turn.allow(self.publish_within(frame.len()));
         self.partition.blobs.put(key, frame).await?;
@@ -1784,6 +1794,7 @@ impl Writer {
             log_position: position,
             manifest: Some(ManifestRef(key.to_string())),
             restore,
+            adopting,
         };
         let within = self.commit_within();
         let unanswered = || {

@@ -60,7 +60,7 @@ use uuid::Uuid;
 use vellev_core::TenantId;
 use vellev_storage::backups::{self, Held, Owner};
 use vellev_storage::blobs::Blobs;
-use vellev_storage::coordinator::{Coordinator, Removed};
+use vellev_storage::coordinator::{Coordinator, PurgeClaim, Removed};
 use vellev_storage::StorageError;
 
 use crate::backing::{claimed, Claim, Claimed, Right, Within};
@@ -303,14 +303,35 @@ impl Inner {
         let Some(purge) = claimed else {
             return Ok(None);
         };
+        // The claim is let go whichever way this ends, and left to run out
+        // only if the coordinator does not answer: a purge not done is
+        // taken up again by the next pass, not a claim later.
         let claim = self.purge_claim(tenant, purge.id, hold).renewed(asked);
+        match self.purged_under(&purge, &claim).await {
+            Ok(Some(deleted)) => {
+                claim.ended();
+                Ok(Some(deleted))
+            }
+            not_done => {
+                claim.let_go(false).await;
+                not_done
+            }
+        }
+    }
+
+    /// The purge `claimed`, under `claim`: everything found kept of the
+    /// tenant deleted, its history forgotten and the purge noted done, in
+    /// which case the coordinator has ended the claim. Returns how many
+    /// files went, or nothing if the tenant is still being written to.
+    async fn purged_under(&self, claimed: &PurgeClaim, claim: &Claim) -> Result<Option<usize>> {
+        let tenant = &claimed.removed.tenant;
         let mut deleted = 0;
         for _ in 0..ROUNDS {
-            let found = claim.during(self.deleted(&purge.removed, &claim)).await?;
+            let found = claim.during(self.deleted(&claimed.removed, claim)).await?;
             if found == 0 {
-                claim.during(self.forgotten(tenant, &claim)).await?;
+                claim.during(self.forgotten(tenant, claim)).await?;
                 self.coordinator
-                    .purged(tenant, purge.id, REMEMBERED)
+                    .purged(tenant, claimed.id, REMEMBERED)
                     .await?;
                 return Ok(Some(deleted));
             }

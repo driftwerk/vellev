@@ -27,12 +27,16 @@ ignore = true
 # `paste` is finished rather than abandoned: a small macro crate with no
 # known fault, used by the tokenizer the local model needs.
 #
-# `quick-xml` 0.38, which `object_store` 0.12 pins, takes quadratic time on
-# a start tag with many attributes and unbounded memory on one with many
-# namespace declarations. It parses only what the node's own object store
-# answers, which the node trusts with its data already; a store that sent
-# such XML could withhold the data outright. The fixed `quick-xml` comes
-# with the next `object_store`.
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195 are each a denial of service of
+# the node by its own object store, through `quick_xml::de`, which
+# `object_store` 0.12.5 uses to read the store's answers to a listing, a
+# multipart upload and an error: 0194, a quadratic check for repeated
+# attributes on one start tag, pins a worker thread for as long as the tag
+# is long; 0195, an unbounded allocation per namespace declaration, takes
+# the node's memory. Neither reads or alters data. The store is the node's
+# own, trusted with its data already, and `object_store` 0.12.5 pins
+# `quick-xml` 0.38, so nothing short of the next `object_store` fixes it;
+# `cargo update` cannot. Revisit by 2026-11-09: DW-670.
 [advisories]
 ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
 

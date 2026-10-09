@@ -139,7 +139,7 @@ pub struct Config {
     /// tenant's backups and restores for no longer. A third of it must
     /// outlast one request to object storage, tries and all
     /// (`VELLEV_STORE_TIMEOUT_SECS` and the rest), so it is at least three
-    /// times that: nine and a half minutes as a node is set up by default.
+    /// times that: 9 minutes 21 seconds as a node is set up by default.
     #[arg(long, env = "VELLEV_BACKUP_CLAIM_SECS", default_value_t = 15 * 60, value_parser = clap::value_parser!(u64).range(1..=24 * 60 * 60))]
     pub backup_claim_secs: u64,
     /// How long after a tenant is removed its files, backups and cached
@@ -752,6 +752,16 @@ mod tests {
         // Three times what one request to the store may take, as the node
         // is set up to make them.
         let least = 3 * StoreClient::default().transfers().request_within.as_secs();
+        assert_eq!(
+            least,
+            9 * 60 + 21,
+            "as the README and the release notes say"
+        );
+        assert_eq!(
+            Duration::from_secs(least / 3),
+            vellev_node::RequestBounds::default().store,
+            "the one default the node and the store client share"
+        );
         assert!(claimed(&least.to_string()).is_ok());
         let refused = format!(
             "{:#}",

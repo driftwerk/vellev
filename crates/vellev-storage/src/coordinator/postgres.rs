@@ -123,34 +123,61 @@ impl PostgresCoordinator {
         let tenant = &lease.key.tenant;
         let mut transaction = self.pool.begin().await?;
         lock_tenant(&mut transaction, tenant).await?;
-        let row: Option<(i64, Option<String>)> = sqlx::query_as(
-            "SELECT generation, adopting FROM vellev.partitions
-             WHERE tenant = $1 AND partition = $2 AND log_position = 0 AND manifest IS NULL
-             FOR UPDATE",
+        let row: Option<Held> = sqlx::query_as(
+            "SELECT generation, adopting, lineage, log_position, manifest FROM vellev.partitions
+             WHERE tenant = $1 AND partition = $2 FOR UPDATE",
         )
         .bind(tenant.as_str())
         .bind(i64::from(lease.key.partition.0))
         .fetch_optional(&mut *transaction)
         .await?;
-        let Some((generation, Some(adopting))) = row else {
+        let Some(Held {
+            generation,
+            adopting,
+            lineage,
+            log_position: position,
+            manifest,
+        }) = row
+        else {
             return Ok(None);
         };
-        let adopting: Adopting =
-            serde_json::from_str(&adopting).map_err(|e| invariant(e.to_string()))?;
-        let adoption = (bigint(adopting.generation.0)? == generation).then_some(adopting.adoption);
-        if let Some(adoption) = &adoption {
-            let restores = adoption.at == commit.log_position && commit.manifest.is_some();
-            let elsewhere: bool = sqlx::query_scalar(
-                "SELECT EXISTS (
-                     SELECT 1 FROM vellev.partitions
-                     WHERE tenant = $1 AND (manifest IS NOT NULL OR log_position <> 0))",
-            )
-            .bind(tenant.as_str())
-            .fetch_one(&mut *transaction)
-            .await?;
-            if !restores || elsewhere || keyed(&mut transaction, tenant).await? {
-                return Err(CoordinatorError::Adopting(tenant.clone()));
+        // What is noted for this lease, on a partition that has yet to
+        // commit: anything else noted is of a lease moved on, and no more.
+        let committed = position != 0 || manifest.is_some();
+        let noted: Option<Adopting> = adopting
+            .filter(|_| !committed)
+            .map(|noted| serde_json::from_str(&noted).map_err(|e| invariant(e.to_string())))
+            .transpose()?;
+        let adoption = noted
+            .filter(|noted| bigint(noted.generation.0).ok() == Some(generation))
+            .map(|noted| noted.adoption);
+        match (&adoption, commit.adopting) {
+            (Some(adoption), says) => {
+                let restores = says == Some(adoption.lineage)
+                    && adoption.at == commit.log_position
+                    && commit.manifest.is_some();
+                let elsewhere: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM vellev.partitions
+                         WHERE tenant = $1 AND (manifest IS NOT NULL OR log_position <> 0))",
+                )
+                .bind(tenant.as_str())
+                .fetch_one(&mut *transaction)
+                .await?;
+                if !restores || elsewhere || keyed(&mut transaction, tenant).await? {
+                    return Err(CoordinatorError::Adopting(tenant.clone()));
+                }
             }
+            (None, Some(says)) => {
+                // Only the very commit that made the adoption, asked again.
+                let made = says.0 == lineage
+                    && bigint(commit.log_position.0)? == position
+                    && commit.manifest.as_ref().map(|head| head.0.as_str()) == manifest.as_deref();
+                if !made {
+                    return Err(CoordinatorError::Unadopted(tenant.clone()));
+                }
+            }
+            (None, None) => {}
         }
         let done = committing(COMMIT_HELD, lease, commit)?
             .fetch_optional(&mut *transaction)
@@ -402,6 +429,16 @@ impl RemovedRow {
             lineage: Lineage(self.lineage),
         })
     }
+}
+
+/// A partition's row as a commit that may make an adoption holds it.
+#[derive(FromRow)]
+struct Held {
+    generation: i64,
+    adopting: Option<String>,
+    lineage: Uuid,
+    log_position: i64,
+    manifest: Option<String>,
 }
 
 /// What a partition's row keeps of an adoption to be made with a commit.
@@ -671,12 +708,15 @@ impl Coordinator for PostgresCoordinator {
         Ok(true)
     }
 
-    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<()> {
+    async fn adopt_no_more(&self, key: &PartitionKey, generation: Generation) -> Result<()> {
         sqlx::query(
-            "UPDATE vellev.partitions SET adopting = NULL WHERE tenant = $1 AND partition = $2",
+            "UPDATE vellev.partitions SET adopting = NULL
+             WHERE tenant = $1 AND partition = $2
+               AND (adopting::jsonb ->> 'generation')::bigint = $3",
         )
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
+        .bind(bigint(generation.0)?)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -783,9 +823,16 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
-        let done = committing(COMMIT, lease, &commit)?
-            .fetch_optional(&self.pool)
-            .await?;
+        // A commit that says it adopts goes straight to the row, held, to
+        // be made with what is noted there or refused.
+        let done = match commit.adopting {
+            None => {
+                committing(COMMIT, lease, &commit)?
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
+            Some(_) => None,
+        };
         let done = match done {
             Some(row) => Some(row),
             None => self.committed_adopting(lease, &commit).await?,
@@ -1255,6 +1302,18 @@ impl Coordinator for PostgresCoordinator {
                 })
             })
             .transpose()
+    }
+
+    async fn release_purge(&self, tenant: &TenantId, claim: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE vellev.purges SET claim = NULL, claimed_until = NULL
+             WHERE tenant = $1 AND claim = $2 AND purged_at IS NULL",
+        )
+        .bind(tenant.as_str())
+        .bind(claim)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {

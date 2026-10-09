@@ -4,8 +4,8 @@
 //! A backup is of one tenant, taken by one cluster, and says both: the
 //! tenant's lineage, which tells it from any other tenant of its name, and
 //! the cluster's id. Its record lies under
-//! `_backups/{tenant}/backups/{lineage}/{cluster}/`, and the files it lists
-//! under `_backups/{tenant}/files/{lineage}/{cluster}/`. So:
+//! `_backups/{tenant}/records/{lineage}/{cluster}/`, and the files it lists
+//! under `_backups/{tenant}/data/{lineage}/{cluster}/`. So:
 //!
 //! - A tenant lists and restores from the backups of its own lineage,
 //!   whichever cluster took them, and none of any other tenant of its name.
@@ -15,8 +15,13 @@
 //!   shared with it: each cluster copies every file it needs once, under
 //!   its own id, and each backup lists the ones it needs. Files never
 //!   change, so a backup costs what changed since the cluster's one before.
-//! - Every record kept under a name lies under `backups/`, apart from the
+//! - Every record kept under a name lies under `records/`, apart from the
 //!   files, so that finding them lists no file.
+//! - Neither lies under `_backups/{tenant}/backups/` or
+//!   `_backups/{tenant}/files/`, where the release before lineages kept
+//!   what it took, so that a node of that release, pruning what lies there
+//!   as its own, never lists, deletes or restores from what this one
+//!   keeps, nor this one from what it kept.
 //!
 //! A record is written as pending before any file is copied, so that
 //! pruning, which keeps every file any record beside it lists, leaves them
@@ -244,7 +249,7 @@ impl Home {
             lineage,
             cluster,
         } = self;
-        format!("{}files/{lineage}/{cluster}/", named(tenant))
+        format!("{}data/{lineage}/{cluster}/", named(tenant))
     }
 
     fn records(&self) -> String {
@@ -452,7 +457,7 @@ impl Backups {
     /// tenant of that name and taken by whichever cluster, oldest first:
     /// what a cluster that has lost a tenant may take it up again from.
     pub async fn of_any(&self, tenant: &TenantId) -> Result<Vec<Backup>> {
-        let under = format!("{}backups/", named(tenant));
+        let under = format!("{}records/", named(tenant));
         self.complete_under(&under, tenant).await
     }
 
@@ -897,7 +902,7 @@ fn named(tenant: &TenantId) -> String {
 /// Where the records of the backups of the tenant of `lineage` named
 /// `tenant` lie, whichever cluster took them.
 fn of_lineage(tenant: &TenantId, lineage: Lineage) -> String {
-    format!("{}backups/{lineage}/", named(tenant))
+    format!("{}records/{lineage}/", named(tenant))
 }
 
 fn record(backup: &Backup, suffix: &str) -> String {

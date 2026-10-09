@@ -19,7 +19,10 @@ Migration `0009_restores.sql` adds the table restores are recorded in, and
 are applied as a node of this release starts, and a node of the release
 before runs on the migrated database. Postgres 13 or newer is needed for
 `0010`. While both releases run, remove no tenant and ask for no restore
-from a backup: see `docs/compatibility.md`.
+from a backup; backups go on, each release keeping its own where the other
+never looks, so that a tenant backed up by both has two sets until the
+window ends, and nothing either release keeps is pruned by the other: see
+`docs/compatibility.md`.
 
 ### What a node answers
 
@@ -80,7 +83,9 @@ from a backup: see `docs/compatibility.md`.
 - **A tenant's backups are its own, and a cluster's backups are its own.**
   Each tenant has a lineage, given when it is first made; each cluster an
   id. A backup says both and lies under both in the backup store
-  (`_backups/{tenant}/backups/{lineage}/{cluster}/`). A tenant made again
+  (`_backups/{tenant}/records/{lineage}/{cluster}/`, its files under
+  `_backups/{tenant}/data/{lineage}/{cluster}/`, beside where the release
+  before kept its own). A tenant made again
   under a removed tenant's id is another tenant: it neither lists nor
   restores from the backups of the one before, and is given none of its
   keys. A cluster prunes and purges only the backups it took, so one
@@ -106,8 +111,10 @@ from a backup: see `docs/compatibility.md`.
 - **A removed tenant is purged under a renewed claim**, by one node, which
   deletes nothing of a tenant made again under the id meanwhile; and the
   tenant is looked over again for a day after, for files that landed
-  late. A backup claim is held for `VELLEV_BACKUP_CLAIM_SECS` (15 minutes,
-  at least 10 and a half) and renewed, where it was held for six hours.
+  late. A backup claim is held for `VELLEV_BACKUP_CLAIM_SECS` (15 minutes;
+  at least three times what one request to the store may take with its
+  tries, 9 minutes 21 seconds as a node is set up by default) and renewed,
+  where it was held for six hours.
 - **`Backup` says its `lineage` and its `cluster`.**
 - **New settings**: `VELLEV_BACKUP_CLAIM_SECS` and
   `VELLEV_BACKUPS_SCHEDULED` (true; false has a node back up only when

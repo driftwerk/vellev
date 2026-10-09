@@ -191,7 +191,7 @@ async fn a_lost_tenant_whose_restore_failed_is_restored_when_asked_again() {
     let issued = lost.ok(Method::POST, "/v1/tenants/acme/keys", None).await;
     let backup = lost.ok(Method::POST, BACKUPS, None).await;
     let kept_of = store.list("_backups/acme/").await.unwrap();
-    let mut files = kept_of.iter().filter(|kept| kept.key.contains("/files/"));
+    let mut files = kept_of.iter().filter(|kept| kept.key.contains("/data/"));
     let hidden = files.next().unwrap();
     let kept = store.get(&hidden.key).await.unwrap();
     store.delete(&hidden.key).await.unwrap();

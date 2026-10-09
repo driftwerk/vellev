@@ -19,8 +19,8 @@ use vellev_core::{Embedding, ModelFault, NodeId, Partition, RequestId, TenantId}
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
-    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, ManifestRef, PartitionKey, Point,
-    Restore, RestorePoint, Restored, TenantKey, Versions, MAX_RESTORE_WINDOW,
+    Acquired, Coordinator, CoordinatorError, Generation, Lease, Lineage, LogPosition, ManifestRef,
+    PartitionKey, Point, Restore, RestorePoint, Restored, TenantKey, Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
@@ -200,12 +200,12 @@ pub struct RequestBounds {
 }
 
 impl Default for RequestBounds {
-    /// What an S3 store of `object_store`'s defaults takes at most, retrying
-    /// for three minutes and then one last request of thirty seconds; and a
+    /// What one request to object storage may take as the store client is
+    /// set up unless told otherwise ([`vellev_storage::Transfers`]), and a
     /// coordinator request of ten seconds.
     fn default() -> Self {
         Self {
-            store: Duration::from_secs(3 * 60 + 30),
+            store: vellev_storage::Transfers::default().request_within,
             coordinator: Duration::from_secs(10),
         }
     }
@@ -696,16 +696,27 @@ impl Tenant {
         self.compact(window.saturating_add(grace)).await
     }
 
+    /// The generation of the lease this node writes the tenant under.
+    pub(crate) fn generation(&self) -> Generation {
+        self.writer.lease().generation
+    }
+
     /// Put the tenant back as it stood at `head`, as `restore` asks, and
-    /// as [`Writer::restore_recorded`] does. A failure that closes the
+    /// as [`Writer::restore_recorded`] does, `adopting` the lineage of the
+    /// backup it takes up if it takes one up. A failure that closes the
     /// writer is only told here: the hold is lost by whoever runs this on
     /// a task (see [`Self::restoring`]), once the task has ended, since
     /// losing it stops that task wherever it is, with whatever it had
     /// still to say and to tidy up.
-    async fn restored(&self, head: Option<ManifestRef>, restore: Restore) -> Result<Restored> {
+    async fn restored(
+        &self,
+        head: Option<ManifestRef>,
+        restore: Restore,
+        adopting: Option<Lineage>,
+    ) -> Result<Restored> {
         let position = self
             .writer
-            .restore_recorded(head.as_ref(), restore.clone())
+            .restore_recorded(head.as_ref(), restore.clone(), adopting)
             .await
             .map_err(|error| self.told(error))?;
         Ok(Restored {
@@ -1118,7 +1129,7 @@ impl Node {
                     .await?
                     .ok_or_else(|| NodeError::NoRestorePoint(id.clone()))?;
                 let restore = asking.to(target.position, target.at);
-                opened.restored(Some(target.head), restore).await
+                opened.restored(Some(target.head), restore, None).await
             })
             .await?;
         tracing::info!(%tenant, ?restored, "restored");

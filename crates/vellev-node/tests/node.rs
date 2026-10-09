@@ -1220,6 +1220,9 @@ struct Unrenewing {
     renewals_failing: AtomicUsize,
     /// Whether renewals of claims on backups are refused outright.
     renewals_refused: AtomicBool,
+    /// How many renewals of a claim are answered before the rest are
+    /// refused, if any are to be.
+    renewals_refused_after: std::sync::Mutex<Option<usize>>,
     /// Whether each renewal and release of a claim on a backup first looks
     /// for the claim having lapsed meanwhile, by taking it with an id of
     /// no one's.
@@ -1233,6 +1236,17 @@ struct Unrenewing {
     /// What happens once, just after an adoption is next noted for a
     /// tenant, as a restore asked to adopt has it be before its commit.
     adoption_noted: Hook,
+    /// Whether two adoptions of one tenant are raced: then how many were
+    /// noted is counted, a signal is given once a second is, and a commit
+    /// by the lease that noted it waits, as over a slow link, until an
+    /// adoption is next given up, which is signalled too.
+    adoptions_raced: AtomicBool,
+    adoptions_noted: AtomicUsize,
+    second_adoption_noted: tokio::sync::Notify,
+    commit_waits_for_giving_up: std::sync::Mutex<Option<vellev_storage::coordinator::Generation>>,
+    adoption_given_up: tokio::sync::Notify,
+    /// How many claims to purge were let go.
+    purge_releases: AtomicUsize,
     /// How long each renewal of a claim on a backup or a purge that is
     /// answered takes to be.
     claim_renewals_slowly: Duration,
@@ -1269,11 +1283,18 @@ impl Unrenewing {
             renewals_answered: AtomicUsize::new(usize::MAX),
             renewals_failing: AtomicUsize::new(0),
             renewals_refused: AtomicBool::new(false),
+            renewals_refused_after: std::sync::Mutex::new(None),
             watching: AtomicBool::new(false),
             lapsed: AtomicBool::new(false),
             disowning_on_commit: AtomicBool::new(false),
             commits_slowly: Duration::ZERO,
             adoption_noted: Hook::default(),
+            adoptions_raced: AtomicBool::new(false),
+            adoptions_noted: AtomicUsize::new(0),
+            second_adoption_noted: tokio::sync::Notify::new(),
+            commit_waits_for_giving_up: std::sync::Mutex::new(None),
+            adoption_given_up: tokio::sync::Notify::new(),
+            purge_releases: AtomicUsize::new(0),
             claim_renewals_slowly: Duration::ZERO,
             commits_failing: AtomicBool::new(false),
             backup_claimed: Hook::default(),
@@ -1306,7 +1327,10 @@ impl Unrenewing {
         if answered.is_err() {
             tokio::time::sleep(Duration::from_secs(60 * 60)).await;
         }
-        if self.renewals_refused.load(Ordering::SeqCst) {
+        let asked = self.renewals.load(Ordering::SeqCst);
+        let refused = self.renewals_refused.load(Ordering::SeqCst)
+            || (*self.renewals_refused_after.lock().unwrap()).is_some_and(|after| asked > after);
+        if refused {
             return Err(CoordinatorError::InvalidArgument("refused".into()));
         }
         tokio::time::sleep(self.claim_renewals_slowly).await;
@@ -1355,6 +1379,13 @@ impl Coordinator for Unrenewing {
         self.inner.release(lease).await
     }
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed, CoordinatorError> {
+        let waits = *self.commit_waits_for_giving_up.lock().unwrap() == Some(lease.generation);
+        if waits {
+            let given_up = self.adoption_given_up.notified();
+            tokio::time::timeout(Duration::from_secs(60), given_up)
+                .await
+                .expect("an adoption is given up");
+        }
         if self.disowning_on_commit.swap(false, Ordering::SeqCst) {
             self.disowning.store(true, Ordering::SeqCst);
             tokio::time::sleep(self.commits_slowly).await;
@@ -1543,12 +1574,23 @@ impl Coordinator for Unrenewing {
             .inner
             .adopt_on_commit(key, generation, adoption)
             .await?;
+        let raced = noted && self.adoptions_raced.load(Ordering::SeqCst);
+        if raced && self.adoptions_noted.fetch_add(1, Ordering::SeqCst) == 1 {
+            *self.commit_waits_for_giving_up.lock().unwrap() = Some(generation);
+            self.second_adoption_noted.notify_one();
+        }
         self.adoption_noted.run().await;
         Ok(noted)
     }
 
-    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<(), CoordinatorError> {
-        self.inner.adopt_no_more(key).await
+    async fn adopt_no_more(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+    ) -> Result<(), CoordinatorError> {
+        let given_up = self.inner.adopt_no_more(key, generation).await;
+        self.adoption_given_up.notify_one();
+        given_up
     }
 
     async fn claim_purge(
@@ -1570,6 +1612,15 @@ impl Coordinator for Unrenewing {
     ) -> Result<bool, CoordinatorError> {
         self.renewal_let_through().await?;
         self.inner.renew_purge(tenant, claim, hold).await
+    }
+
+    async fn release_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+    ) -> Result<(), CoordinatorError> {
+        self.purge_releases.fetch_add(1, Ordering::SeqCst);
+        self.inner.release_purge(tenant, claim).await
     }
 
     async fn look_overs(
@@ -1998,8 +2049,12 @@ async fn a_tenant_dropped_while_its_history_cannot_be_forgotten_is_dropped_and_i
         node.create_tenant(&tenant("acme")).await.is_err(),
         "not purged while its history cannot be forgotten"
     );
+    assert_eq!(
+        coordinator.purge_releases.load(Ordering::SeqCst),
+        1,
+        "the claim of a purge that failed is let go, not left to run out"
+    );
     coordinator.failing_forgets.store(false, Ordering::SeqCst);
-    cluster.clock.advance(hold() + Duration::from_secs(1));
     node.purge_due().await.unwrap();
     assert!(coordinator.forgets.load(Ordering::SeqCst) > asked);
     node.create_tenant(&tenant("acme")).await.unwrap();
@@ -3046,7 +3101,7 @@ impl Blobs for SlowStore {
         self.inner.put(key, bytes).await
     }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
-        if key.contains("/files/") {
+        if key.contains("/data/") {
             let delay = *self.file_reads.lock().unwrap();
             tokio::time::sleep(delay).await;
             if self.stalls.swap(false, Ordering::SeqCst) {
@@ -3303,7 +3358,7 @@ impl Blobs for Watched {
             self.written.run().await;
             if self.losing_files.swap(false, Ordering::SeqCst) {
                 let kept = self.inner.list("_backups/acme/").await?;
-                for file in kept.iter().filter(|kept| kept.key.contains("/files/")) {
+                for file in kept.iter().filter(|kept| kept.key.contains("/data/")) {
                     self.inner.delete(&file.key).await?;
                 }
             }
@@ -3555,7 +3610,7 @@ fn files_of(backup: &Backup) -> String {
         cluster,
         ..
     } = backup;
-    format!("_backups/{tenant}/files/{lineage}/{cluster}/")
+    format!("_backups/{tenant}/data/{lineage}/{cluster}/")
 }
 
 /// Whether `key` is of what the cluster that took `backup` keeps of its
@@ -3567,7 +3622,7 @@ fn kept_with(backup: &Backup, key: &str) -> bool {
         cluster,
         ..
     } = backup;
-    let records = format!("_backups/{tenant}/backups/{lineage}/{cluster}/");
+    let records = format!("_backups/{tenant}/records/{lineage}/{cluster}/");
     key.starts_with(&records) || key.starts_with(&files_of(backup))
 }
 
@@ -4073,7 +4128,7 @@ async fn backed_up_while_removed(made_again: bool) -> (Cluster, Node, Arc<dyn Bl
     assert_eq!(node.backups(&tenant("acme")).await.unwrap(), []);
     let left = listed(&store, "_backups/acme/").await;
     assert!(
-        !left.is_empty() && left.iter().all(|key| key.contains("/files/")),
+        !left.is_empty() && left.iter().all(|key| key.contains("/data/")),
         "its record is forgotten, and its files left where they lie: {left:?}"
     );
     (cluster, node, store)
@@ -4486,7 +4541,7 @@ impl Hooked {
 #[async_trait]
 impl Blobs for Hooked {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
-        if key.contains("/files/") {
+        if key.contains("/data/") {
             self.before_file.run().await;
         }
         self.inner.put(key, bytes).await
@@ -5289,6 +5344,7 @@ async fn a_look_over_stops_deleting_a_lineage_once_the_tenant_of_its_name_takes_
             log_position: LogPosition(1),
             manifest: Some(vellev_storage::coordinator::ManifestRef("restored".into())),
             restore: None,
+            adopting: Some(lineage),
         };
         coordinator.commit(&lease, restored).await.unwrap();
         coordinator.release(&lease).await.unwrap();
@@ -5336,7 +5392,8 @@ async fn a_purge_whose_machine_sleeps_past_its_claim_deletes_nothing_more_until_
         "its purge is not done"
     );
 
-    cluster.clock.advance(hold() + Duration::from_secs(1));
+    // The claim, lost to the node, is let go with the coordinator, which
+    // held it still: the purge is taken up again at once.
     node.purge_due().await.unwrap();
     assert!(keys_under(&store.inner, "_backups/acme/").await.is_empty());
     node.create_tenant(&tenant("acme")).await.unwrap();
@@ -6013,4 +6070,348 @@ async fn a_restore_asked_of_a_tenant_since_made_again_restores_nothing_into_the_
     );
     let now = cluster.coordinator.committed(&self::acme()).await.unwrap();
     assert_eq!(now.and_then(|now| now.manifest), None, "nothing restored");
+}
+
+#[tokio::test]
+async fn an_adoption_given_up_by_a_node_whose_lease_ran_out_leaves_anothers_to_be_made() {
+    let (store, backup) = backed_up_elsewhere().await;
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node_through = || {
+        Node::new(
+            coordinator.clone(),
+            cluster.store.clone(),
+            Arc::new(Embedders::new(EmbedSettings::default())),
+            Settings {
+                backups: Some(store.clone()),
+                ..cluster.settings()
+            },
+        )
+    };
+    let (stalled, other) = (node_through(), node_through());
+    let acme = tenant("acme");
+    // The first node notes its adoption, then stalls past its lease and
+    // its claim by the coordinator's clock. Meanwhile the other takes the
+    // tenant, notes an adoption of its own under the new lease, and is
+    // about to commit; its commit is slow to arrive, and lands only once
+    // the first node, going on, has had its restore refused and given up
+    // the adoption it noted. That is nothing to the other's.
+    coordinator.adoptions_raced.store(true, Ordering::SeqCst);
+    let (sending, adopting_elsewhere) = tokio::sync::oneshot::channel();
+    let (clock, through) = (cluster.clock.clone(), coordinator.clone());
+    let (elsewhere, taken) = (other.clone(), backup.id);
+    coordinator.adoption_noted.set(async move {
+        clock.advance(hold() + Duration::from_secs(1));
+        let adopting = tokio::spawn(async move {
+            let request = RequestId::generate();
+            elsewhere
+                .adopt_backup(&tenant("acme"), taken, true, request)
+                .await
+        });
+        let second = through.second_adoption_noted.notified();
+        tokio::time::timeout(Duration::from_secs(60), second)
+            .await
+            .expect("the other node notes its adoption");
+        assert!(sending.send(adopting).is_ok());
+    });
+    let stale = stalled
+        .adopt_backup(&acme, backup.id, true, RequestId::generate())
+        .await;
+    assert!(stale.is_err(), "{stale:?}");
+    assert!(!coordinator.adoption_noted.is_set());
+    let adopted = adopting_elsewhere.await.unwrap().await.unwrap().unwrap();
+    assert_eq!(adopted.restore.from, backup.position());
+    let now = cluster.coordinator.identity(&acme).await.unwrap().unwrap();
+    assert!(now.committed, "{now:?}");
+    assert_eq!(
+        now.lineage, backup.lineage,
+        "the tenant is the one the backup is of"
+    );
+    let keys = cluster.coordinator.keys(&acme).await.unwrap();
+    assert_eq!(
+        key_ids(&keys),
+        key_ids(&backup.keys),
+        "with the keys asked for"
+    );
+    assert_eq!(
+        cluster.coordinator.restore_window(&acme).await.unwrap(),
+        backup.restore_window,
+        "and its window"
+    );
+    assert_eq!(notes_held(&other).await, [true, false]);
+}
+
+#[tokio::test]
+async fn a_request_to_adopt_made_again_the_other_way_about_keys_is_told_it_is_reused() {
+    let (store, backup) = backed_up_elsewhere().await;
+    let cluster = Cluster::new();
+    let node = backing_up_to(&cluster, store.clone());
+    let acme = tenant("acme");
+    let request = RequestId::generate();
+    let adopted = node
+        .adopt_backup(&acme, backup.id, false, request)
+        .await
+        .unwrap();
+    let again = node.adopt_backup(&acme, backup.id, false, request).await;
+    assert_eq!(again.unwrap(), adopted, "as it was");
+    let other_way = node.adopt_backup(&acme, backup.id, true, request).await;
+    assert!(
+        matches!(other_way, Err(NodeError::Reused { .. })),
+        "{other_way:?}"
+    );
+    assert_eq!(node.keys(&acme).await.unwrap(), [], "and it gives no key");
+}
+
+#[tokio::test]
+async fn a_purge_forgets_a_tenants_history_only_under_a_claim_renewed_just_before() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        cluster.settings(),
+    );
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    noted(&node, 1, "fox").await;
+    let files = keys_under(cluster.store.as_ref(), "acme/").await.len();
+    assert!(files > 0);
+    node.drop_tenant(&tenant("acme")).await.unwrap();
+
+    // The purge renews its claim before it lists the tenant's files, before
+    // each batch it deletes, before it lists again and finds none, and
+    // then before the first batch of history it forgets: that renewal is
+    // refused, and nothing is forgotten.
+    let before_forgetting = 2 + files.div_ceil(DELETED_AT_ONCE);
+    coordinator.renewals.store(0, Ordering::SeqCst);
+    *coordinator.renewals_refused_after.lock().unwrap() = Some(before_forgetting);
+    node.purge_due().await.unwrap();
+    assert_eq!(
+        coordinator.renewals.load(Ordering::SeqCst),
+        before_forgetting + 1,
+        "the renewal just before forgetting was asked for and refused"
+    );
+    assert_eq!(coordinator.forgets.load(Ordering::SeqCst), 0);
+    assert!(
+        node.create_tenant(&tenant("acme")).await.is_err(),
+        "the purge is not done"
+    );
+    assert_eq!(coordinator.purge_releases.load(Ordering::SeqCst), 1);
+
+    // Renewed, it forgets, and the purge is done: at once, the claim let
+    // go rather than left to run out.
+    *coordinator.renewals_refused_after.lock().unwrap() = None;
+    node.purge_due().await.unwrap();
+    assert!(coordinator.forgets.load(Ordering::SeqCst) > 0);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_look_over_of_a_tenant_that_took_its_purged_lineage_up_again_lists_nothing() {
+    let cluster = Cluster::new();
+    let backups = Listing::of(backup_store(), Duration::ZERO);
+    let node = cluster.node_from(Settings {
+        backups: Some(backups.clone()),
+        ..cluster.settings()
+    });
+    let old = written_and_backed_up(&node).await;
+    node.drop_tenant(&tenant("acme")).await.unwrap();
+    cluster.clock.advance(hold());
+    node.purge_due().await.unwrap();
+    assert!(keys_under(backups.inner.as_ref(), "_backups/acme/")
+        .await
+        .is_empty());
+
+    // A tenant of the name is made and takes the purged lineage up, as one
+    // adopting a backup of it another cluster took would; then a file
+    // lands late under that lineage, as one of a backup this cluster began
+    // before the purge might. It is the tenant's own now, and the look
+    // over leaves it be without so much as a listing.
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let holder = NodeId::generate("adopting");
+    let leased = cluster
+        .coordinator
+        .acquire(&acme(), &holder, LEASE)
+        .await
+        .unwrap();
+    let Acquired::Lease { lease, .. } = leased else {
+        panic!("{leased:?}");
+    };
+    let adoption = Adoption {
+        lineage: old.lineage,
+        at: LogPosition(1),
+        keys: Vec::new(),
+        restore_window: None,
+    };
+    let key = acme();
+    let noted = cluster
+        .coordinator
+        .adopt_on_commit(&key, lease.generation, &adoption);
+    assert!(noted.await.unwrap());
+    let restored = Commit {
+        after: None,
+        log_position: LogPosition(1),
+        manifest: Some(vellev_storage::coordinator::ManifestRef("restored".into())),
+        restore: None,
+        adopting: Some(old.lineage),
+    };
+    cluster.coordinator.commit(&lease, restored).await.unwrap();
+    cluster.coordinator.release(&lease).await.unwrap();
+    let late = format!("{}late", files_of(&old));
+    backups.inner.put(&late, Bytes::from("late")).await.unwrap();
+    backups.listed();
+
+    cluster.clock.advance(LOOKED_OVER_EVERY);
+    node.purge_due().await.unwrap();
+    assert_eq!(backups.listed(), [] as [String; 0]);
+    assert_eq!(
+        keys_under(backups.inner.as_ref(), "_backups/acme/").await,
+        [late]
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_restored_or_taken_up_is_as_due_a_backup_as_before() {
+    let (store, backup) = backed_up_elsewhere().await;
+    let cluster = Cluster::new();
+    let node = backing_up_to(&cluster, store.clone());
+    let acme = tenant("acme");
+    node.adopt_backup(&acme, backup.id, true, RequestId::generate())
+        .await
+        .unwrap();
+    assert_eq!(
+        node.backups(&acme).await.unwrap(),
+        std::slice::from_ref(&backup)
+    );
+
+    // Taken up, the tenant has no backup by this cluster: it is backed up
+    // the next time backups due are looked for, not a day on.
+    node.back_up_due().await.unwrap();
+    let kept = node.backups(&acme).await.unwrap();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    let own = &kept[1];
+    assert_ne!(own.cluster, backup.cluster);
+
+    // Restored from one of its own just before its next backup is due, it
+    // is due it still: a restore is no backup.
+    let every = Settings::new(NodeId::generate("node")).backup_every;
+    cluster.clock.advance(every - Duration::from_secs(60));
+    node.restore_backup(&acme, own.id, RequestId::generate())
+        .await
+        .unwrap();
+    cluster.clock.advance(Duration::from_secs(61));
+    node.back_up_due().await.unwrap();
+    assert_eq!(node.backups(&acme).await.unwrap().len(), 3);
+}
+
+/// The adoption path end to end on the Postgres coordinator, as the node
+/// tests otherwise run it on the memory one alone: adopt with keys, the
+/// request made again answered as it was and the other way refused,
+/// back up under the lineage, restore its own, refuse a second adoption,
+/// and purge only what this cluster took. Skipped without
+/// `VELLEV_TEST_DATABASE_URL`, on a scratch database of its own.
+#[tokio::test]
+async fn adoption_runs_end_to_end_on_postgres() {
+    let Ok(url) = std::env::var("VELLEV_TEST_DATABASE_URL") else {
+        eprintln!("VELLEV_TEST_DATABASE_URL is not set; skipping a Postgres node test");
+        return;
+    };
+    let name = format!(
+        "vellev_scratch_{}_{}",
+        Utc::now().timestamp(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let scratch = url
+        .rsplit_once('/')
+        .map(|(head, _)| format!("{head}/{name}"))
+        .unwrap();
+    let (store, backup) = backed_up_elsewhere().await;
+    let coordinator = Arc::new(
+        vellev_storage::coordinator::PostgresCoordinator::connect(
+            &scratch,
+            8,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap(),
+    );
+    let node = Node::new(
+        coordinator.clone(),
+        Arc::new(ObjectBlobs::new(Arc::new(InMemory::new()))),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            backups: Some(store.clone()),
+            lease: LEASE,
+            restore_window: Duration::ZERO,
+            grace: Duration::ZERO,
+            purge_after: Duration::ZERO,
+            ..Settings::new(NodeId::generate("pg"))
+        },
+    );
+    let acme = tenant("acme");
+    let request = RequestId::generate();
+    let adopted = node
+        .adopt_backup(&acme, backup.id, true, request)
+        .await
+        .unwrap();
+    assert_eq!(adopted.restore.from, backup.position());
+    let now = coordinator.identity(&acme).await.unwrap().unwrap();
+    assert_eq!((now.lineage, now.committed), (backup.lineage, true));
+    let keys = node.keys(&acme).await.unwrap();
+    assert_eq!(key_ids(&keys), key_ids(&backup.keys));
+    assert_eq!(
+        coordinator.restore_window(&acme).await.unwrap(),
+        backup.restore_window
+    );
+    assert_eq!(notes_held(&node).await, [true, false]);
+
+    // Asked again: as it was; the other way: reused.
+    let again = node.adopt_backup(&acme, backup.id, true, request).await;
+    assert_eq!(again.unwrap(), adopted);
+    let other = node.adopt_backup(&acme, backup.id, false, request).await;
+    assert!(matches!(other, Err(NodeError::Reused { .. })), "{other:?}");
+
+    // A second adoption is refused; its own backups and restores work.
+    let refused = node
+        .adopt_backup(&acme, backup.id, false, RequestId::generate())
+        .await;
+    assert!(matches!(refused, Err(NodeError::NotLost(_))), "{refused:?}");
+    let next = node.back_up(&acme).await.unwrap();
+    assert_eq!(next.lineage, backup.lineage);
+    assert_ne!(next.cluster, backup.cluster);
+    assert_eq!(
+        node.backups(&acme).await.unwrap(),
+        [backup.clone(), next.clone()]
+    );
+    noted(&node, 2, "later").await;
+    node.restore_backup(&acme, backup.id, RequestId::generate())
+        .await
+        .unwrap();
+    assert_eq!(notes_held(&node).await, [true, false]);
+
+    // Removed and purged, once the purge is due: what this cluster took
+    // goes, and what the other took stays.
+    node.drop_tenant(&acme).await.unwrap();
+    let on_scratch = sqlx::PgPool::connect(&scratch).await.unwrap();
+    sqlx::query("UPDATE vellev.purges SET requested_at = requested_at - interval '1 day'")
+        .execute(&on_scratch)
+        .await
+        .unwrap();
+    on_scratch.close().await;
+    node.purge_due().await.unwrap();
+    let left = node.backups(&acme).await.unwrap();
+    assert_eq!(left, std::slice::from_ref(&backup), "{left:?}");
+    node.shutdown().await;
+    drop(node);
+    drop(coordinator);
+    sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }

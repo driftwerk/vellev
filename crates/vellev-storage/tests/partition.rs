@@ -711,6 +711,7 @@ async fn a_writer_reopened_on_a_live_lease_cannot_replace_a_commit_that_landed_l
         log_position: position,
         manifest: Some(ManifestRef(late.clone())),
         restore: None,
+        adopting: None,
     };
     cluster.coordinator.commit(&lease, landed).await.unwrap();
     let follower = cluster.open().await;

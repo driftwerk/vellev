@@ -514,8 +514,12 @@ impl Coordinator for Unreliable {
         self.inner.adopt_on_commit(key, generation, adoption).await
     }
 
-    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<(), CoordinatorError> {
-        self.inner.adopt_no_more(key).await
+    async fn adopt_no_more(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.adopt_no_more(key, generation).await
     }
 
     async fn claim_purge(
@@ -534,6 +538,14 @@ impl Coordinator for Unreliable {
         hold: Duration,
     ) -> Result<bool, CoordinatorError> {
         self.inner.renew_purge(tenant, claim, hold).await
+    }
+
+    async fn release_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.release_purge(tenant, claim).await
     }
 
     async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool, CoordinatorError> {

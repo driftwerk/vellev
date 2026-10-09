@@ -271,9 +271,14 @@ impl Coordinator for MemoryCoordinator {
         Ok(noted)
     }
 
-    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<()> {
+    async fn adopt_no_more(&self, key: &PartitionKey, generation: Generation) -> Result<()> {
         let mut rows = self.rows.lock().expect("coordinator lock");
-        if let Some(row) = rows.get_mut(key) {
+        let noted = rows.get_mut(key).filter(|row| {
+            row.adopting
+                .as_ref()
+                .is_some_and(|(by, _)| *by == generation)
+        });
+        if let Some(row) = noted {
             row.adopting = None;
         }
         Ok(())
@@ -396,17 +401,27 @@ impl Coordinator for MemoryCoordinator {
             });
         }
         // An adoption is made by the first commit of the lease it was noted
-        // for, or not at all; one of a lease since moved on is no more.
+        // for, saying so, or not at all; one of a lease since moved on is
+        // no more. A commit that says it adopts and finds none noted is
+        // refused, unless it is the very commit that made it, asked again.
         let adopting = row
             .adopting
             .take()
             .filter(|(generation, _)| *generation == row.generation && !row.has_committed());
-        if let Some((generation, adoption)) = &adopting {
-            let restores = adoption.at == commit.log_position && commit.manifest.is_some();
-            if !restores || elsewhere || self.keyed(tenant) {
-                row.adopting = Some((*generation, adoption.clone()));
-                return Err(CoordinatorError::Adopting(tenant.clone()));
+        match (&adopting, commit.adopting) {
+            (Some((generation, adoption)), says) => {
+                let restores = says == Some(adoption.lineage)
+                    && adoption.at == commit.log_position
+                    && commit.manifest.is_some();
+                if !restores || elsewhere || self.keyed(tenant) {
+                    row.adopting = Some((*generation, adoption.clone()));
+                    return Err(CoordinatorError::Adopting(tenant.clone()));
+                }
             }
+            (None, Some(lineage)) if !(repeats && row.lineage == lineage) => {
+                return Err(CoordinatorError::Unadopted(tenant.clone()));
+            }
+            (None, _) => {}
         }
         if let (true, Some(head)) = (advances, &commit.manifest) {
             row.history.push(RestorePoint {
@@ -682,6 +697,17 @@ impl Coordinator for MemoryCoordinator {
         }))
     }
 
+    async fn release_purge(&self, tenant: &TenantId, claim: Uuid) -> Result<()> {
+        let mut purges = self.purges.lock().expect("coordinator lock");
+        let held = purges.get_mut(tenant).filter(|purge| {
+            purge.purged.is_none() && purge.claim.is_some_and(|(held, _)| held == claim)
+        });
+        if let Some(purge) = held {
+            purge.claim = None;
+        }
+        Ok(())
+    }
+
     async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
         let until = expiry(self.clock.now(), checked_hold(hold)?)?;
         let rows = self.rows.lock().expect("coordinator lock");
@@ -839,5 +865,76 @@ impl Coordinator for MemoryCoordinator {
             found = true;
         }
         Ok(found)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An adoption is noted only on a tenant that has not committed, and
+    /// the commit that makes it is the first: should one be found noted on
+    /// a partition that has committed since, as nothing writes it, it is
+    /// a note of a lease that is no more, and no commit makes it.
+    #[tokio::test]
+    async fn an_adoption_noted_on_a_partition_that_has_committed_is_never_made() {
+        let clock = Arc::new(ManualClock::starting_at(Utc::now()));
+        let c = MemoryCoordinator::new(clock);
+        let key = PartitionKey {
+            tenant: TenantId::new("acme").unwrap(),
+            partition: vellev_core::Partition::DEFAULT,
+        };
+        c.register(&key).await.unwrap();
+        let holder = NodeId::generate("a");
+        let Acquired::Lease { lease, .. } = c
+            .acquire(&key, &holder, Duration::from_secs(30))
+            .await
+            .unwrap()
+        else {
+            panic!("not leased");
+        };
+        let own = c.identity(&key.tenant).await.unwrap().unwrap().lineage;
+        let to_be = Adoption {
+            lineage: Lineage(Uuid::new_v4()),
+            at: LogPosition(2),
+            keys: Vec::new(),
+            restore_window: None,
+        };
+        assert!(c
+            .adopt_on_commit(&key, lease.generation, &to_be)
+            .await
+            .unwrap());
+        {
+            let mut rows = c.rows.lock().unwrap();
+            let row = rows.get_mut(&key).unwrap();
+            row.log_position = LogPosition(1);
+            assert!(row.adopting.is_some());
+        }
+        let restoring = Commit {
+            after: None,
+            log_position: LogPosition(2),
+            manifest: Some(ManifestRef("restored".into())),
+            restore: None,
+            adopting: Some(to_be.lineage),
+        };
+        let refused = c.commit(&lease, restoring).await;
+        assert!(
+            matches!(refused, Err(CoordinatorError::Unadopted(_))),
+            "{refused:?}"
+        );
+        assert_eq!(c.identity(&key.tenant).await.unwrap().unwrap().lineage, own);
+        let plain = Commit {
+            after: None,
+            log_position: LogPosition(2),
+            manifest: Some(ManifestRef("m2".into())),
+            restore: None,
+            adopting: None,
+        };
+        c.commit(&lease, plain).await.unwrap();
+        assert_eq!(c.identity(&key.tenant).await.unwrap().unwrap().lineage, own);
+        assert_eq!(
+            c.committed(&key).await.unwrap().map(|at| at.log_position),
+            Some(LogPosition(2))
+        );
     }
 }

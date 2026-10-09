@@ -240,6 +240,16 @@ fn commit(position: u64, manifest: &str) -> Commit {
         log_position: LogPosition(position),
         manifest: Some(ManifestRef(manifest.into())),
         restore: None,
+        adopting: None,
+    }
+}
+
+/// The commit at `position` that takes up the backup of `lineage`, as a
+/// restore asked to adopt makes it.
+fn adopting_commit(position: u64, manifest: &str, lineage: Lineage) -> Commit {
+    Commit {
+        adopting: Some(lineage),
+        ..commit(position, manifest)
     }
 }
 
@@ -425,6 +435,7 @@ async fn commits_advance_the_position_and_followers_see_them(h: &dyn Harness) {
             log_position: LogPosition(11),
             manifest: None,
             restore: None,
+            adopting: None,
         },
     )
     .await
@@ -934,6 +945,10 @@ fn adopting(refused: &Result<Committed, CoordinatorError>) -> bool {
     matches!(refused, Err(CoordinatorError::Adopting(_)))
 }
 
+fn unadopted(refused: &Result<Committed, CoordinatorError>) -> bool {
+    matches!(refused, Err(CoordinatorError::Unadopted(_)))
+}
+
 async fn a_tenant_takes_a_backup_up_with_the_commit_that_restores_it_and_nothing_before(
     h: &dyn Harness,
 ) {
@@ -956,12 +971,17 @@ async fn a_tenant_takes_a_backup_up_with_the_commit_that_restores_it_and_nothing
         log_position: LogPosition(5),
         manifest: None,
         restore: None,
+        adopting: None,
     };
     assert!(adopting(&c.commit(&held, emptied).await));
+    // Nor the commit at the position named, unless it says it adopts: a
+    // restore meant to take the backup up never lands as a plain one.
+    assert!(adopting(&c.commit(&held, commit(5, "restored")).await));
     assert_eq!(taken_up(h, tenant).await, own);
     assert!(!identity(h, tenant).await.unwrap().committed);
 
-    let restored = c.commit(&held, commit(5, "restored")).await.unwrap();
+    let restoring = adopting_commit(5, "restored", to_be.lineage);
+    let restored = c.commit(&held, restoring.clone()).await.unwrap();
     assert_eq!(restored.log_position, LogPosition(5));
     let key_ids = vec![to_be.keys[0].id];
     assert_eq!(
@@ -973,6 +993,9 @@ async fn a_tenant_takes_a_backup_up_with_the_commit_that_restores_it_and_nothing
     assert_eq!(kept, to_be.keys, "as the backup kept them");
     let reached = c.key_tenant(&to_be.keys[0].hash).await.unwrap();
     assert_eq!(reached.as_ref(), Some(tenant));
+    // Asked again, as a writer whose answer was lost asks, it is answered
+    // as it was: saying it adopts, or not.
+    assert_eq!(c.commit(&held, restoring).await.unwrap(), restored);
     assert_eq!(
         c.commit(&held, commit(5, "restored")).await.unwrap(),
         restored
@@ -1023,7 +1046,8 @@ async fn an_adoption_is_noted_only_for_an_empty_tenant_without_keys_by_the_lease
     assert!(c.remove(&other).await.unwrap());
     assert!(noted(key.clone(), held.generation).await);
 
-    assert!(c.commit(&held, commit(3, "restored")).await.is_ok());
+    let restoring = adopting_commit(3, "restored", to_be.lineage);
+    assert!(c.commit(&held, restoring).await.is_ok());
     assert_eq!(identity(h, tenant).await.unwrap().lineage, to_be.lineage);
     assert!(
         !noted(key.clone(), held.generation).await,
@@ -1040,7 +1064,9 @@ async fn an_adoption_is_given_up_replaced_or_outlived_by_its_lease(h: &dyn Harne
     let to_be = adoption(4);
     let noted = c.adopt_on_commit(&key, held.generation, &to_be);
     assert!(noted.await.unwrap());
-    c.adopt_no_more(&key).await.unwrap();
+    c.adopt_no_more(&key, held.generation).await.unwrap();
+    let restoring = adopting_commit(4, "m4", to_be.lineage);
+    assert!(unadopted(&c.commit(&held, restoring).await));
     c.commit(&held, commit(4, "m4")).await.unwrap();
     assert_eq!(taken_up(h, &key.tenant).await, own);
 
@@ -1052,8 +1078,10 @@ async fn an_adoption_is_given_up_replaced_or_outlived_by_its_lease(h: &dyn Harne
         let noted = c.adopt_on_commit(&key, held.generation, to_be);
         assert!(noted.await.unwrap());
     }
-    assert!(adopting(&c.commit(&held, commit(4, "first")).await));
-    c.commit(&held, commit(7, "second")).await.unwrap();
+    let restoring = adopting_commit(4, "first", first.lineage);
+    assert!(adopting(&c.commit(&held, restoring).await));
+    let restoring = adopting_commit(7, "second", second.lineage);
+    c.commit(&held, restoring).await.unwrap();
     let key_ids = vec![second.keys[0].id];
     assert_eq!(
         taken_up(h, &key.tenant).await,
@@ -1062,7 +1090,8 @@ async fn an_adoption_is_given_up_replaced_or_outlived_by_its_lease(h: &dyn Harne
     );
 
     // Outlived: the lease it was noted for is let go, and whoever takes
-    // the partition next commits as to any other.
+    // the partition next commits as to any other, and adopts nothing it
+    // did not note itself.
     let key = registered(h).await;
     let (held, _) = lease(h, &key, &node("a")).await;
     let own = taken_up(h, &key.tenant).await;
@@ -1071,9 +1100,97 @@ async fn an_adoption_is_given_up_replaced_or_outlived_by_its_lease(h: &dyn Harne
     assert!(noted.await.unwrap());
     c.release(&held).await.unwrap();
     let (next, _) = lease(h, &key, &node("b")).await;
+    let restoring = adopting_commit(4, "m4", to_be.lineage);
+    assert!(unadopted(&c.commit(&next, restoring).await));
     c.commit(&next, commit(4, "m4")).await.unwrap();
     assert_eq!(taken_up(h, &key.tenant).await, own);
     c.commit(&next, commit(5, "m5")).await.unwrap();
+}
+
+async fn an_adoption_is_given_up_only_by_the_lease_it_was_noted_for(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    // A node notes an adoption, stalls past its lease, and another takes
+    // the partition and notes its own. The first, going on, gives its
+    // adoption up: that is nothing to the second's, which it makes.
+    let (stale, _) = lease(h, &key, &node("a")).await;
+    let first = adoption(4);
+    let noted = c.adopt_on_commit(&key, stale.generation, &first);
+    assert!(noted.await.unwrap());
+    h.pass(&key, TTL + Duration::from_secs(1)).await;
+    let (held, _) = lease(h, &key, &node("b")).await;
+    assert_ne!(held.generation, stale.generation);
+    let to_be = adoption(6);
+    let noted = c.adopt_on_commit(&key, held.generation, &to_be);
+    assert!(noted.await.unwrap());
+    c.adopt_no_more(&key, stale.generation).await.unwrap();
+    assert!(
+        adopting(&c.commit(&held, commit(6, "plain")).await),
+        "the second's adoption is noted still"
+    );
+    let restoring = adopting_commit(6, "restored", to_be.lineage);
+    c.commit(&held, restoring).await.unwrap();
+    let key_ids = vec![to_be.keys[0].id];
+    assert_eq!(
+        taken_up(h, tenant).await,
+        (to_be.lineage, key_ids, Some(HOUR))
+    );
+
+    // Given up by the lease that noted it, it is gone.
+    let key = registered(h).await;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let own = taken_up(h, &key.tenant).await;
+    let to_be = adoption(2);
+    let noted = c.adopt_on_commit(&key, held.generation, &to_be);
+    assert!(noted.await.unwrap());
+    c.adopt_no_more(&key, held.generation).await.unwrap();
+    let restoring = adopting_commit(2, "restored", to_be.lineage);
+    assert!(unadopted(&c.commit(&held, restoring).await));
+    assert_eq!(taken_up(h, &key.tenant).await, own);
+}
+
+async fn a_commit_that_says_it_adopts_is_refused_unless_that_adoption_is_noted_for_its_lease(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let tenant = &key.tenant;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    let own = taken_up(h, tenant).await;
+    // Nothing noted: refused, and nothing is committed.
+    let unasked = Lineage(uuid::Uuid::new_v4());
+    let restoring = adopting_commit(1, "m1", unasked);
+    assert!(unadopted(&c.commit(&held, restoring).await));
+    assert!(!identity(h, tenant).await.unwrap().committed);
+    assert_eq!(taken_up(h, tenant).await, own);
+
+    // Noted: made only by the commit that says that lineage, at that
+    // position.
+    let to_be = adoption(3);
+    let noted = c.adopt_on_commit(&key, held.generation, &to_be);
+    assert!(noted.await.unwrap());
+    let restoring = adopting_commit(3, "m3", unasked);
+    assert!(adopting(&c.commit(&held, restoring).await));
+    let restoring = adopting_commit(2, "m2", to_be.lineage);
+    assert!(adopting(&c.commit(&held, restoring).await));
+    assert_eq!(taken_up(h, tenant).await, own);
+    let restoring = adopting_commit(3, "m3", to_be.lineage);
+    let made = c.commit(&held, restoring.clone()).await.unwrap();
+    assert_eq!(taken_up(h, tenant).await.0, to_be.lineage);
+
+    // Made, the very commit asked again is answered as it was; any other
+    // that says it adopts is refused, the adoption being made already.
+    assert_eq!(c.commit(&held, restoring).await.unwrap(), made);
+    let restoring = adopting_commit(3, "m3", unasked);
+    assert!(unadopted(&c.commit(&held, restoring).await));
+    let restoring = adopting_commit(4, "m4", to_be.lineage);
+    assert!(unadopted(&c.commit(&held, restoring).await));
+    assert_eq!(
+        c.committed(&key).await.unwrap().unwrap().log_position,
+        LogPosition(3)
+    );
+    c.commit(&held, commit(4, "m4")).await.unwrap();
 }
 
 async fn a_tenant_given_a_key_or_written_to_elsewhere_meanwhile_takes_nothing_up(h: &dyn Harness) {
@@ -1090,21 +1207,58 @@ async fn a_tenant_given_a_key_or_written_to_elsewhere_meanwhile_takes_nothing_up
 
     let issued = c.issue_key(tenant, uuid::Uuid::new_v4(), &[9; 32]).await;
     let issued = issued.unwrap().unwrap();
-    assert!(adopting(&c.commit(&held, commit(2, "restored")).await));
+    let restoring = adopting_commit(2, "restored", to_be.lineage);
+    assert!(adopting(&c.commit(&held, restoring.clone()).await));
     assert_eq!(identity(h, tenant).await.unwrap().lineage, own);
     assert!(c.revoke_key(tenant, issued.id).await.unwrap());
 
     let (elsewhere, _) = lease(h, &other, &node("a")).await;
     c.commit(&elsewhere, commit(1, "m1")).await.unwrap();
-    assert!(adopting(&c.commit(&held, commit(2, "restored")).await));
+    assert!(adopting(&c.commit(&held, restoring.clone()).await));
     assert_eq!(
         taken_up(h, tenant).await,
         (own, Vec::new(), None),
         "written to, it is some tenant already"
     );
-    c.adopt_no_more(&key).await.unwrap();
+    c.adopt_no_more(&key, held.generation).await.unwrap();
     c.commit(&held, commit(2, "m2")).await.unwrap();
     assert_eq!(identity(h, tenant).await.unwrap().lineage, own);
+}
+
+async fn a_purge_claim_let_go_is_taken_again_at_once_and_any_other_is_left_be(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let tenant = key.tenant.clone();
+    assert!(c.remove(&key).await.unwrap());
+    let first = purge_claimed(c, &tenant).await.unwrap();
+    assert!(purge_claimed(c, &tenant).await.is_none(), "held");
+
+    // Let go by another id, it is held still; by its own, it is free.
+    c.release_purge(&tenant, uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    assert!(purge_claimed(c, &tenant).await.is_none());
+    c.release_purge(&tenant, first.id).await.unwrap();
+    let second = purge_claimed(c, &tenant).await.unwrap();
+    assert_ne!(second.id, first.id);
+    assert!(
+        !c.renew_purge(&tenant, first.id, HOUR).await.unwrap(),
+        "the one let go is not taken up again"
+    );
+
+    // Run out and taken over, the old holder's release leaves the new
+    // claim be.
+    h.pass(&key, HOUR + Duration::from_secs(1)).await;
+    let third = purge_claimed(c, &tenant).await.unwrap();
+    c.release_purge(&tenant, second.id).await.unwrap();
+    assert!(c.renew_purge(&tenant, third.id, HOUR).await.unwrap());
+    assert!(purge_claimed(c, &tenant).await.is_none());
+
+    // Done, it is left be, and the tenant may be made again.
+    c.purged(&tenant, third.id, 24 * HOUR).await.unwrap();
+    c.release_purge(&tenant, third.id).await.unwrap();
+    assert!(purge_claimed(c, &tenant).await.is_none());
+    c.register(&key).await.unwrap();
 }
 
 async fn a_tenant_removed_before_it_took_a_backup_up_is_purged_as_the_tenant_it_was(
@@ -1786,7 +1940,10 @@ conformance! {
     a_tenant_takes_a_backup_up_with_the_commit_that_restores_it_and_nothing_before,
     an_adoption_is_noted_only_for_an_empty_tenant_without_keys_by_the_lease_named,
     an_adoption_is_given_up_replaced_or_outlived_by_its_lease,
+    an_adoption_is_given_up_only_by_the_lease_it_was_noted_for,
+    a_commit_that_says_it_adopts_is_refused_unless_that_adoption_is_noted_for_its_lease,
     a_tenant_given_a_key_or_written_to_elsewhere_meanwhile_takes_nothing_up,
+    a_purge_claim_let_go_is_taken_again_at_once_and_any_other_is_left_be,
     a_tenant_removed_before_it_took_a_backup_up_is_purged_as_the_tenant_it_was,
     a_cluster_keeps_the_id_it_was_given,
     a_tenant_still_being_purged_is_refused_saying_how_long_ago_that_was_asked,
@@ -2598,7 +2755,9 @@ async fn postgres_registering_removing_and_adopting_together_leave_a_tenant_one_
                             let to_be = adoption(u64::from(round) + 2);
                             let noted = c.adopt_on_commit(&part, lease.generation, &to_be).await;
                             if noted.is_ok_and(|noted| noted) {
-                                drop(c.commit(&lease, commit(u64::from(round) + 2, "m")).await);
+                                let at = u64::from(round) + 2;
+                                let restoring = adopting_commit(at, "m", to_be.lineage);
+                                drop(c.commit(&lease, restoring).await);
                             }
                             drop(c.release(&lease).await);
                         }

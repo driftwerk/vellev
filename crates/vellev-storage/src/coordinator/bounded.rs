@@ -186,8 +186,9 @@ impl Coordinator for Bounded {
             .await
     }
 
-    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<()> {
-        self.bounded(self.inner.adopt_no_more(key)).await
+    async fn adopt_no_more(&self, key: &PartitionKey, generation: Generation) -> Result<()> {
+        self.bounded(self.inner.adopt_no_more(key, generation))
+            .await
     }
 
     async fn claim_backup(
@@ -228,6 +229,10 @@ impl Coordinator for Bounded {
     async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
         self.bounded(self.inner.renew_purge(tenant, claim, hold))
             .await
+    }
+
+    async fn release_purge(&self, tenant: &TenantId, claim: Uuid) -> Result<()> {
+        self.bounded(self.inner.release_purge(tenant, claim)).await
     }
 
     async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool> {

@@ -89,8 +89,8 @@ use vellev_core::{RequestId, TenantId};
 use vellev_storage::backups::{Backup, Backups, Held, Owner};
 use vellev_storage::blobs::{unanswered, Blobs, Listed};
 use vellev_storage::coordinator::{
-    Adoption, Coordinator, CoordinatorError, Identity, LogPosition, ManifestRef, PartitionKey,
-    Restored, MAX_BACKUP_HOLD,
+    Adoption, Coordinator, CoordinatorError, Generation, Identity, LogPosition, ManifestRef,
+    PartitionKey, Restored, MAX_BACKUP_HOLD,
 };
 use vellev_storage::StorageError;
 
@@ -283,12 +283,14 @@ impl Node {
                     .restored_from(&backups, &opened, &backup, asked, asking, &claim)
                     .await;
                 if restored.is_err() {
-                    node.0.adopting_no_more(tenant, asked).await;
+                    let generation = opened.generation();
+                    node.0.adopting_no_more(tenant, asked, generation).await;
                 }
-                // A tenant restored is as the backup took it. One a restore
-                // failed is still due a backup; if the restore left it
-                // empty, there is nothing to back up, and none is taken.
-                claim.let_go(restored.is_ok()).await;
+                // A restore is no backup: a tenant put back as a backup
+                // took it, its own or one it has taken up, is as due one
+                // of its own as before, and one whose restore failed is
+                // too. If it was left empty, none is taken.
+                claim.let_go(false).await;
                 restored
             }
         })
@@ -331,12 +333,19 @@ impl Node {
             let copied = claim
                 .during(async { fetching.await.map_err(claimed) })
                 .await?;
+            let adopting = matches!(asked, Asked::ToAdopt { .. }).then_some(backup.lineage);
             if let Asked::ToAdopt { with_keys } = asked {
-                let adopting = self.0.adopting(backup, taken.position, with_keys);
-                claim.during(adopting).await?;
+                let generation = opened.generation();
+                let noting = self
+                    .0
+                    .adopting(backup, taken.position, with_keys, generation);
+                claim.during(noting).await?;
             }
             claim.still()?;
-            match opened.restored(head.clone(), restore.clone()).await {
+            match opened
+                .restored(head.clone(), restore.clone(), adopting)
+                .await
+            {
                 Err(NodeError::Storage(StorageError::Missing { key })) if attempt < ATTEMPTS => {
                     tracing::info!(%tenant, key, "a file went before it was restored; again");
                     attempt += 1;
@@ -451,18 +460,17 @@ impl Inner {
 
     /// Have the tenant `backup` is of become that tenant with the commit
     /// that restores its partition from `position`, by the lease this node
-    /// holds on it now, and with no other: its lineage, its restore window
-    /// and, `with_keys`, its keys.
+    /// holds on it now, at `generation`, and with no other: its lineage,
+    /// its restore window and, `with_keys`, its keys.
     async fn adopting(
         &self,
         backup: &Backup,
         position: LogPosition,
         with_keys: bool,
+        generation: Generation,
     ) -> Result<()> {
         let tenant = &backup.tenant;
         let key = key(tenant);
-        let held = self.coordinator.committed(&key).await?;
-        let held = held.ok_or_else(|| NodeError::UnknownTenant(tenant.clone()))?;
         let at = position.next().ok_or_else(|| StorageError::Corrupt {
             key: backup.id.to_string(),
             reason: format!("backup {} is at the last position there is", backup.id),
@@ -475,7 +483,7 @@ impl Inner {
         };
         let noted = self
             .coordinator
-            .adopt_on_commit(&key, held.generation, &adoption);
+            .adopt_on_commit(&key, generation, &adoption);
         if noted.await? {
             return Ok(());
         }
@@ -483,13 +491,17 @@ impl Inner {
         Err(NodeError::Lost(tenant.clone()))
     }
 
-    /// Give up the adoption `asked` for, if one was, noted or not: its
-    /// restore failed.
-    async fn adopting_no_more(&self, tenant: &TenantId, asked: Asked) {
+    /// Give up the adoption `asked` for, if one was, noted or not, by the
+    /// lease at `generation`: its restore failed. One noted since by
+    /// another lease, which took the tenant over meanwhile, is that
+    /// lease's to make.
+    async fn adopting_no_more(&self, tenant: &TenantId, asked: Asked, generation: Generation) {
         if asked == Asked::ItsOwn {
             return;
         }
-        if let Err(error) = self.coordinator.adopt_no_more(&key(tenant)).await {
+        let key = key(tenant);
+        let given_up = self.coordinator.adopt_no_more(&key, generation);
+        if let Err(error) = given_up.await {
             tracing::warn!(%tenant, %error, "an adoption given up was left noted");
         }
     }
@@ -534,28 +546,25 @@ impl Inner {
     /// takes it with `due`; `None` if it was not taken. One whose every
     /// answer was lost is let go, as it may have been taken.
     async fn claim(&self, tenant: &TenantId, due: Option<Duration>) -> Result<Option<Claim>> {
-        let (id, hold) = (Uuid::new_v4(), self.settings.backup_claim);
-        let within = self.settings.request_bounds.coordinator;
+        let claimed = Claimed {
+            right: Right::BackUp,
+            coordinator: self.coordinator.clone(),
+            clock: self.settings.claim_clock.clone(),
+            tenant: tenant.clone(),
+            id: Uuid::new_v4(),
+            hold: self.settings.backup_claim,
+            within: self.settings.request_bounds.coordinator,
+        };
         let asked = self.settings.claim_clock.now();
+        let (id, hold, within) = (claimed.id, claimed.hold, claimed.within);
         match retried(within, || {
             self.coordinator.claim_backup(tenant, id, due, hold)
         })
         .await
         {
-            Ok(taken) => Ok(taken.then(|| {
-                Claimed {
-                    right: Right::BackUp,
-                    coordinator: self.coordinator.clone(),
-                    clock: self.settings.claim_clock.clone(),
-                    tenant: tenant.clone(),
-                    id,
-                    hold,
-                    within,
-                }
-                .renewed(asked)
-            })),
+            Ok(taken) => Ok(taken.then(|| claimed.renewed(asked))),
             Err(error) => {
-                released(self.coordinator.as_ref(), tenant, id, within, false).await;
+                claimed.released(false).await;
                 Err(error.into())
             }
         }
@@ -754,6 +763,23 @@ impl Claimed {
         asked + self.hold - self.hold / 3
     }
 
+    /// Let the claim go, each attempt given up after `within`, noting a
+    /// backup made now if `made`, which is nothing to a claim to purge.
+    /// Harmless if it was never taken; one that cannot be let go runs out
+    /// by itself.
+    async fn released(&self, made: bool) {
+        let (tenant, id) = (&self.tenant, self.id);
+        let release = || async move {
+            match self.right {
+                Right::BackUp => self.coordinator.release_backup(tenant, id, made).await,
+                Right::Purge => self.coordinator.release_purge(tenant, id).await,
+            }
+        };
+        if let Err(error) = retried(self.within, release).await {
+            tracing::warn!(%tenant, %error, "a claim was left to run out");
+        }
+    }
+
     /// The claim, asked for at `asked` on its clock and taken, renewed from
     /// now on.
     pub(crate) fn renewed(self, asked: Duration) -> Claim {
@@ -867,12 +893,25 @@ impl Claim {
     }
 
     /// Stop renewing the claim and let it go, noting a backup made now if
-    /// `made`.
-    async fn let_go(mut self, made: bool) {
+    /// `made`. The release runs on a task of its own, as a dropped claim's
+    /// does, so that whoever stops waiting here does not leave the claim
+    /// to run out.
+    pub(crate) async fn let_go(mut self, made: bool) {
         self.renewing.abort();
         self.let_go = true;
-        let of = &self.of;
-        released(of.coordinator.as_ref(), &of.tenant, of.id, of.within, made).await;
+        let of = self.of.clone();
+        let releasing = tokio::spawn(async move { of.released(made).await });
+        if releasing.await.is_err() {
+            tracing::warn!(tenant = %self.of.tenant, "a claim's release did not run to its end");
+        }
+    }
+
+    /// Stop renewing a claim the coordinator has ended already, as it has
+    /// a claim to purge once the purge is noted done: there is nothing to
+    /// let go.
+    pub(crate) fn ended(mut self) {
+        self.renewing.abort();
+        self.let_go = true;
     }
 }
 
@@ -889,9 +928,7 @@ impl Drop for Claim {
         }
         let of = self.of.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                released(of.coordinator.as_ref(), &of.tenant, of.id, of.within, false).await;
-            });
+            runtime.spawn(async move { of.released(false).await });
         }
     }
 }
@@ -961,22 +998,6 @@ async fn renewing(claim: Claimed, asked: Duration, deadline: Arc<watch::Sender<D
         }
     }
     lost(&deadline, claim.clock.now());
-}
-
-/// Let claim `id` on `tenant` go, each attempt given up after `within`,
-/// noting a backup made now if `made`. Harmless if it was never taken; one
-/// that cannot be let go runs out by itself.
-async fn released(
-    coordinator: &dyn Coordinator,
-    tenant: &TenantId,
-    id: Uuid,
-    within: Duration,
-    made: bool,
-) {
-    let released = retried(within, || coordinator.release_backup(tenant, id, made)).await;
-    if let Err(error) = released {
-        tracing::warn!(%tenant, %error, "a backup claim was left to run out");
-    }
 }
 
 /// `call` made, each attempt given up after `within`, and made again while

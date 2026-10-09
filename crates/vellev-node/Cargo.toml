@@ -27,5 +27,6 @@ axum.workspace = true
 
 object_store.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

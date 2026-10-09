@@ -140,6 +140,11 @@ pub struct Commit {
     /// The restore the commit makes, if it makes one, to be recorded with
     /// it.
     pub restore: Option<Restore>,
+    /// The lineage the commit makes its tenant, if it takes a backup up:
+    /// the one noted by [`Coordinator::adopt_on_commit`] for the lease
+    /// that commits, or the commit is refused, so that a restore meant to
+    /// adopt never lands as a plain one.
+    pub adopting: Option<Lineage>,
 }
 
 /// The last commit of a removed partition forgotten, from where to go on.
@@ -231,6 +236,11 @@ pub enum CoordinatorError {
     )]
     Adopting(TenantId),
     #[error(
+        "the commit says it takes a backup up for tenant {0}, and no adoption is noted \
+         for the lease that makes it"
+    )]
+    Unadopted(TenantId),
+    #[error(
         "lease on {key} at generation {held:?} is fenced; the current generation is {current:?}"
     )]
     Fenced {
@@ -290,14 +300,15 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// the commit that restores it, and not before: as a cluster that lost
     /// a tenant takes it up again from a backup. Until then the tenant is
     /// as it was. The commit at the position `adoption` names, by the
-    /// holder of the lease at `generation`, makes the tenant of that
-    /// lineage, with that restore window and those keys, all at once with
-    /// the commit or not at all; any other commit of the partition is
-    /// refused meanwhile, and so is that one if the tenant has since been
-    /// given a key or written to elsewhere. An adoption asked for again
-    /// takes the place of the one before; one whose lease has moved on is
-    /// no more. Returns whether it was noted: not for no partition, another
-    /// generation, or a tenant that has committed or has keys.
+    /// holder of the lease at `generation`, saying it adopts that lineage
+    /// ([`Commit::adopting`]), makes the tenant of that lineage, with that
+    /// restore window and those keys, all at once with the commit or not
+    /// at all; any other commit of the partition is refused meanwhile, and
+    /// so is that one if the tenant has since been given a key or written
+    /// to elsewhere. An adoption asked for again takes the place of the
+    /// one before; one whose lease has moved on is no more. Returns
+    /// whether it was noted: not for no partition, another generation, or
+    /// a tenant that has committed or has keys.
     async fn adopt_on_commit(
         &self,
         key: &PartitionKey,
@@ -305,8 +316,11 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
         adoption: &Adoption,
     ) -> Result<bool>;
 
-    /// Give up whatever adoption the partition was to make with a commit.
-    async fn adopt_no_more(&self, key: &PartitionKey) -> Result<()>;
+    /// Give up the adoption the partition was to make with a commit by the
+    /// lease at `generation`, if that is the one noted: one noted since,
+    /// for the lease that took the partition over, is left for its holder
+    /// to make or give up.
+    async fn adopt_no_more(&self, key: &PartitionKey, generation: Generation) -> Result<()>;
 
     /// Delete the partition's row. Returns whether it existed. With the
     /// tenant's last partition go its keys, so that none reaches a tenant
@@ -476,6 +490,11 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// made again. Returns whether it is: once it is not, nothing more of
     /// the tenant may be deleted under it.
     async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool>;
+
+    /// Let go of `claim` to purge `tenant`, the purge not done: it may be
+    /// claimed again at once. A claim that ran out and was taken by
+    /// another, or a purge noted done, is left be.
+    async fn release_purge(&self, tenant: &TenantId, claim: Uuid) -> Result<()>;
 
     /// Note that `tenant`'s files are purged under `claim`, and so looked
     /// over now, so that it may be made again, and forget purges done over

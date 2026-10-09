@@ -137,9 +137,9 @@ removed tenants), and backups
 are kept 35 days (`VELLEV_BACKUPS_KEPT_SECS`), the newest always. One node
 at a time backs a tenant up or restores it, by a claim it renews while it
 works; `VELLEV_BACKUP_CLAIM_SECS` (fifteen minutes, at least three times
-what one request to the store may take with its tries, nine and a half
-minutes by default) is how long a node that died holding one keeps others from the
-tenant's backups. A backup
+what one request to the store may take with its tries: 9 minutes 21
+seconds as a node is set up by default) is how long a node that died
+holding one keeps others from the tenant's backups. A backup
 copies only the files no earlier one has, so keeping many costs little more
 than keeping one. Everything of a tenant lies under its own prefix of the
 one bucket, `{tenant}/`.
@@ -147,8 +147,8 @@ one bucket, `{tenant}/`.
 A tenant's backups are its own. Each tenant is given a lineage when it is
 first made, an id it keeps for as long as it lives, and each cluster has an
 id of its own. A backup says both, and lies under them in the backup store:
-its record under `_backups/{tenant}/backups/{lineage}/{cluster}/`, its files
-under `_backups/{tenant}/files/{lineage}/{cluster}/`. A tenant made later
+its record under `_backups/{tenant}/records/{lineage}/{cluster}/`, its files
+under `_backups/{tenant}/data/{lineage}/{cluster}/`. A tenant made later
 under the same id is another tenant, of another lineage: it neither lists
 nor restores from the backups of the one before, and is given none of its
 keys. A tenant is put back from one of its own backups, keeping the keys it

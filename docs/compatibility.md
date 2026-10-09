@@ -13,19 +13,34 @@ published separately and follows the same rules for the API.
 While nodes of this release and of the one before run side by side, remove
 no tenant and ask for no restore from a backup. A node of the release
 before purges everything kept under a removed tenant's id, whichever
-tenant's or cluster's it is, and restores a backup into a tenant of the id
-whoever the backup is of; a restore is done by whichever node writes the
-tenant, which the caller does not choose.
+tenant's or cluster's it is, this release's backups among it, and restores
+a backup into a tenant of the id whoever the backup is of; a restore is
+done by whichever node writes the tenant, which the caller does not
+choose.
+
+Backups go on through the window, each release's beside the other's. A
+node of the release before keeps what it takes under
+`_backups/{tenant}/backups/` and `_backups/{tenant}/files/`, lists those
+two prefixes to their ends as its own, prunes under them whatever no
+record it reads lists, and restores from the records it finds there. A
+node of this release keeps what it takes under `_backups/{tenant}/records/`
+and `_backups/{tenant}/data/`, and lists, prunes, purges and restores from
+those alone. Neither lists the other's place, so neither deletes, nor
+restores from, what the other took: a tenant backed up by a node of each
+has two sets of backups, each seen by the nodes of the release that took
+it. Were this release's layout nested under the old prefixes instead, a
+node of the release before would list this release's records as its own,
+look for their files under its own prefix, find them unlisted there, and
+delete them in its daily prune. After a rollback, this release's backups
+stay where they are, unseen, and are seen again once this release runs.
 
 - Backups taken before this release are not carried over. They lie where
   this release never looks, and say neither the lineage nor the cluster
   this release goes by: it does not list them, restore from them, adopt
-  them, prune them or purge them, and says so in its log when it meets one
-  while looking for backups to adopt. Take a backup of every tenant once
-  the upgrade is done, and delete what lies directly under
-  `_backups/{tenant}/backups/` and `_backups/{tenant}/files/`, beside the
-  lineages, by hand when it is no longer wanted. No cluster had been
-  deployed when this was decided.
+  them, prune them or purge them. Take a backup of every tenant once the
+  upgrade is done, and delete `_backups/{tenant}/backups/` and
+  `_backups/{tenant}/files/` by hand when what the release before took is
+  no longer wanted. No cluster had been deployed when this was decided.
 - Restoring `{"backup": id}` no longer makes a tenant the cluster does not
   have, nor restores a backup that is not the tenant's own: both are not
   found. A cluster that lost a tenant asks to `{"adopt": {"backup": id}}`
@@ -170,8 +185,8 @@ A record says which tenant it is of, by the lineage the tenant was given
 when it was first made, and which cluster took it, by the id the cluster
 was given when its database was made (`vellev.cluster.id`, which anything
 else that must tell clusters apart reads too). It lies under
-`_backups/{tenant}/backups/{lineage}/{cluster}/`, and the files it lists
-under `_backups/{tenant}/files/{lineage}/{cluster}/`. A tenant lists and
+`_backups/{tenant}/records/{lineage}/{cluster}/`, and the files it lists
+under `_backups/{tenant}/data/{lineage}/{cluster}/`. A tenant lists and
 restores from the records of its own lineage, whichever cluster took them.
 A cluster writes, prunes and purges only under its own id, and shares no
 file with another: one that adopts a tenant another cluster backed up
@@ -226,7 +241,10 @@ listed, restored from, adopted, pruned or purged. Nothing tells which
 tenant of an id such a record is of but an incarnation, which is one
 cluster's own count and the same in any two clusters, so going by it would
 hand one customer's backup to another's tenant. The record version is not
-raised for the new layout, as no release reads the other's place.
+raised for the new layout, as no release reads the other's place: this
+release's lies beside those prefixes, not under them, since a release
+before lists each to its end and deletes under it whatever the records it
+reads do not list.
 
 ### Upgrading from a release before claims were renewed
 
