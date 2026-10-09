@@ -68,9 +68,28 @@ pub enum Mutation {
     /// including rows it wrote earlier, excluding rows it already deleted.
     /// A filter with no condition is refused, so that a caller who built an
     /// empty one by accident does not empty the collection.
+    ///
+    /// With no `limit`, one that more than [`DELETED_AT_MOST`] objects pass
+    /// is refused, and deletes nothing: it would be a commit of any size,
+    /// made with every other write waiting, and a delete of some and not
+    /// the rest is not what was asked for. With a `limit`, of one to
+    /// [`DELETED_AT_MOST`], it is asked for: up to so many of the objects
+    /// that pass are deleted, whichever are found first, and how many is
+    /// told. Fewer than the limit means none were left, so a caller deletes
+    /// however many pass by asking again, each time as a request of its
+    /// own, under a name of its own, until it is told fewer; each is one
+    /// commit, made or not, and a caller that stops part way has only to
+    /// go on. What goes in the end is whatever passes until nothing does,
+    /// not what passed at first.
+    ///
+    /// The deletes by filter of one batch count together, each for its
+    /// limit and one without for [`DELETED_AT_MOST`], since each sees what
+    /// those before it deleted: a batch of them that may delete more than
+    /// one may is refused.
     DeleteWhere {
         collection: CollectionName,
         filter: Filter,
+        limit: Option<usize>,
     },
 }
 
@@ -142,6 +161,116 @@ pub enum Outcome {
 pub struct Batch {
     pub request: Option<RequestId>,
     pub mutations: Vec<Mutation>,
+}
+
+/// The most objects one [`Mutation::DeleteWhere`] deletes: as many
+/// mutations as a commit takes from callers writing together.
+pub const DELETED_AT_MOST: usize = 8_192;
+
+/// About how much a commit has to carry: the mutations it is asked to
+/// make, and the bytes they take, by which the commits that take long are
+/// told from the rest before they are made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Weight {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
+impl Weight {
+    /// Whether this is within `most` both in rows and in bytes.
+    pub fn within(&self, most: &Weight) -> bool {
+        self.rows <= most.rows && self.bytes <= most.bytes
+    }
+}
+
+impl std::ops::Add for Weight {
+    type Output = Weight;
+
+    fn add(self, other: Weight) -> Weight {
+        Weight {
+            rows: self.rows.saturating_add(other.rows),
+            bytes: self.bytes.saturating_add(other.bytes),
+        }
+    }
+}
+
+impl std::iter::Sum for Weight {
+    fn sum<I: Iterator<Item = Weight>>(weights: I) -> Weight {
+        weights.fold(Weight::default(), std::ops::Add::add)
+    }
+}
+
+/// About how many bytes `value` takes: its text, and a word for anything
+/// else.
+fn json_bytes(value: &Json) -> usize {
+    match value {
+        Json::String(text) => text.len(),
+        Json::Array(values) => values.iter().map(json_bytes).sum(),
+        Json::Object(values) => properties_bytes(values),
+        _ => 8,
+    }
+}
+
+fn properties_bytes(properties: &Map<String, Json>) -> usize {
+    properties
+        .iter()
+        .map(|(name, value)| name.len() + json_bytes(value))
+        .sum()
+}
+
+impl Mutation {
+    /// About how many bytes the mutation takes in the log: its properties
+    /// and its vector, each number of which takes five there, and a little
+    /// for whatever else it names.
+    pub fn bytes(&self) -> usize {
+        const NAMED: usize = 64;
+        const NUMBER: usize = 5;
+        let vector_bytes =
+            |vector: &Option<Vec<f32>>| vector.as_ref().map_or(0, |vector| vector.len() * NUMBER);
+        NAMED
+            + match self {
+                Mutation::Upsert {
+                    properties, vector, ..
+                }
+                | Mutation::Insert {
+                    properties, vector, ..
+                }
+                | Mutation::Patch {
+                    properties, vector, ..
+                } => properties_bytes(properties) + vector_bytes(vector),
+                Mutation::Append { values, .. } => values.iter().map(String::len).sum(),
+                Mutation::CreateCollection(_)
+                | Mutation::AddProperty { .. }
+                | Mutation::DropCollection(_)
+                | Mutation::Increment { .. }
+                | Mutation::Delete { .. }
+                | Mutation::DeleteWhere { .. } => 0,
+            }
+    }
+}
+
+impl Mutation {
+    /// How many rows the mutation may change: one, or for a delete by
+    /// filter as many as one may delete, since how many it will is not
+    /// known until it is resolved.
+    pub fn rows(&self) -> usize {
+        match self {
+            Mutation::DeleteWhere { limit, .. } => {
+                limit.map_or(DELETED_AT_MOST, |limit| limit.min(DELETED_AT_MOST))
+            }
+            _ => 1,
+        }
+    }
+}
+
+impl Batch {
+    /// About how much the batch is to commit.
+    pub fn weight(&self) -> Weight {
+        Weight {
+            rows: self.mutations.iter().map(Mutation::rows).sum(),
+            bytes: self.mutations.iter().map(Mutation::bytes).sum(),
+        }
+    }
 }
 
 impl From<Vec<Mutation>> for Batch {

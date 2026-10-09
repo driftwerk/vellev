@@ -247,6 +247,14 @@ pub enum Bounded {
     BodyBytes,
     /// Seconds of a tenant's restore window.
     RestoreWindowSecs,
+    /// Objects one request deletes by filter: a delete's `limit`, and
+    /// the limits of every delete by filter of one request together, one
+    /// without a limit counting for the most.
+    Deleted,
+    /// Searches, listings and counts a node answers at once. No one
+    /// request asks for more of these than it may: a node answering as
+    /// many says `unavailable`, to be asked again.
+    ReadsAtOnce,
     /// Something this client does not know, from a newer node.
     #[serde(other)]
     Unknown,
@@ -305,6 +313,8 @@ pub struct Limits {
     pub oversample: u64,
     pub body_bytes: u64,
     pub restore_window_secs: u64,
+    pub deleted: u64,
+    pub reads_at_once: u64,
 }
 
 impl Limits {
@@ -317,6 +327,8 @@ impl Limits {
             Bounded::Oversample => self.oversample,
             Bounded::BodyBytes => self.body_bytes,
             Bounded::RestoreWindowSecs => self.restore_window_secs,
+            Bounded::Deleted => self.deleted,
+            Bounded::ReadsAtOnce => self.reads_at_once,
             Bounded::Unknown => 0,
         };
         (said > 0).then_some(said)
@@ -449,14 +461,28 @@ pub struct Backups {
     pub backups: Vec<Backup>,
 }
 
-/// A restore done: the state gone back to, and the position of the commit
-/// that put it back.
+/// A restore done: the state gone back to, and the commit that put it
+/// back.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Restored {
     pub from: RestorePoint,
+    /// The tenant's incarnation the restore was made in; see [`After`].
+    /// Zero from a node too old to say, which a read treats as reached.
+    #[serde(default)]
+    pub incarnation: u64,
     pub position: u64,
+}
+
+impl Restored {
+    /// What a read must have caught up to for this restore to be in it.
+    pub fn after(&self) -> After {
+        After {
+            incarnation: self.incarnation,
+            position: self.position,
+        }
+    }
 }
 
 /// How far back a tenant may be restored, in seconds; with none, the
@@ -607,10 +633,27 @@ pub enum Change {
         collection: CollectionName,
         id: ObjectId,
     },
-    /// Delete every object passing `filter`, which must have a condition.
+    /// Delete the objects passing `filter`, which must have a condition.
+    ///
+    /// With no `limit`, every one of them, of which there may be at most
+    /// 8,192: with more the request is refused as invalid and nothing is
+    /// deleted. With a `limit`, of 1 to 8,192, up to so many of them,
+    /// whichever are found first; the outcome says how many, and fewer
+    /// than the limit means none were left. The deletes of one request
+    /// count together, one with no limit for 8,192, and a request whose
+    /// deletes may come to more than 8,192 is refused.
+    ///
+    /// To delete however many pass, send the delete with a limit until it
+    /// deletes fewer than the limit. **Each must be a new request, under
+    /// a new `x-vellev-request`:** one sent again under the name it had is
+    /// answered as it was, and deletes nothing more. What is deleted in
+    /// the end is whatever passes until none does, objects written
+    /// meanwhile included, not what passed when the first was sent.
     DeleteWhere {
         collection: CollectionName,
         filter: Filter,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
 }
 
@@ -1176,8 +1219,35 @@ impl Backups {
 }
 
 impl Restored {
-    pub fn new(from: RestorePoint, position: u64) -> Self {
-        Self { from, position }
+    pub fn new(from: RestorePoint, incarnation: u64, position: u64) -> Self {
+        Self {
+            from,
+            incarnation,
+            position,
+        }
+    }
+}
+
+impl Change {
+    /// Delete every object of `collection` that passes `filter`: refused
+    /// if more than 8,192 do.
+    pub fn delete_where(collection: CollectionName, filter: Filter) -> Self {
+        Self::DeleteWhere {
+            collection,
+            filter,
+            limit: None,
+        }
+    }
+
+    /// Delete up to `limit` of the objects of `collection` that pass
+    /// `filter`, 8,192 at the most; to be sent again, each time as a
+    /// request of its own, until fewer than `limit` are deleted.
+    pub fn delete_up_to(collection: CollectionName, filter: Filter, limit: u32) -> Self {
+        Self::DeleteWhere {
+            collection,
+            filter,
+            limit: Some(limit),
+        }
     }
 }
 
@@ -1558,6 +1628,14 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_answered_by_a_node_that_says_no_incarnation_reads_as_none() {
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_791_300_000, 0).unwrap();
+        let older = json!({ "from": { "position": 4, "at": at }, "position": 5 });
+        let restored: Restored = serde_json::from_value(older).unwrap();
+        assert_eq!(restored, Restored::new(RestorePoint::new(4, at), 0, 5));
+    }
+
+    #[test]
     fn an_answer_is_made_whole() {
         let id = uuid::Uuid::from_u128(7);
         let at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_791_300_000, 0).unwrap();
@@ -1583,8 +1661,8 @@ mod tests {
                 json!({ "backups": [{ "id": id, "taken_at": at, "position": 4, "files": 9 }] }),
             ),
             (
-                serde_json::to_value(Restored::new(point(), 5)).unwrap(),
-                json!({ "from": { "position": 4, "at": at }, "position": 5 }),
+                serde_json::to_value(Restored::new(point(), 2, 5)).unwrap(),
+                json!({ "from": { "position": 4, "at": at }, "incarnation": 2, "position": 5 }),
             ),
             (
                 serde_json::to_value(Tenants::new(vec![tenant.clone()], Some(tenant))).unwrap(),
@@ -1617,6 +1695,45 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_by_filter_is_built_with_the_limit_it_is_given_or_none() {
+        let notes = CollectionName::new("notes").unwrap();
+        let old = || Filter::Lt {
+            property: "n".into(),
+            value: json!(5),
+        };
+        let filter = json!({ "lt": { "property": "n", "value": 5 } });
+        let unlimited = Change::delete_where(notes.clone(), old());
+        assert_eq!(
+            unlimited,
+            Change::DeleteWhere {
+                collection: notes.clone(),
+                filter: old(),
+                limit: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&unlimited).unwrap(),
+            json!({ "op": "delete_where", "collection": "notes", "filter": filter })
+        );
+        for limit in [1, 500, u32::MAX] {
+            let limited = Change::delete_up_to(notes.clone(), old(), limit);
+            assert_eq!(
+                limited,
+                Change::DeleteWhere {
+                    collection: notes.clone(),
+                    filter: old(),
+                    limit: Some(limit),
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(&limited).unwrap(),
+                json!({ "op": "delete_where", "collection": "notes", "filter": filter,
+                    "limit": limit })
+            );
+        }
+    }
+
+    #[test]
     fn each_limit_is_told_under_its_own_name_and_one_not_said_is_not_known() {
         let limits = Limits {
             results: 1,
@@ -1624,6 +1741,8 @@ mod tests {
             oversample: 3,
             body_bytes: 4,
             restore_window_secs: 5,
+            deleted: 6,
+            reads_at_once: 7,
         };
         let told = json!({
             "results": 1,
@@ -1631,6 +1750,8 @@ mod tests {
             "oversample": 3,
             "body_bytes": 4,
             "restore_window_secs": 5,
+            "deleted": 6,
+            "reads_at_once": 7,
         });
         assert_eq!(serde_json::to_value(limits).unwrap(), told);
         for (name, max) in [
@@ -1639,6 +1760,8 @@ mod tests {
             (Bounded::Oversample, Some(3)),
             (Bounded::BodyBytes, Some(4)),
             (Bounded::RestoreWindowSecs, Some(5)),
+            (Bounded::Deleted, Some(6)),
+            (Bounded::ReadsAtOnce, Some(7)),
             (Bounded::Unknown, None),
         ] {
             assert_eq!(limits.max(name), max, "{name:?}");

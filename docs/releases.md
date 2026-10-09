@@ -11,8 +11,12 @@ cannot see.
 Bring clients up to this release before the nodes: see
 `model_unavailable` below.
 
-The workspace's version is raised to 0.2.0 by a later change, and nothing
-is published from main before that.
+The workspace's version is 0.2.0 from the change that added what follows
+on restores, deletes and reads. Upgrade every node before asking for a
+restore or sending a delete with a `limit`: see `docs/compatibility.md`.
+Migration `0009_restores.sql` adds the table restores are recorded in; it
+is applied as a node of this release starts, and a node of the release
+before runs on the migrated database.
 
 ### What a node answers
 
@@ -28,7 +32,10 @@ is published from main before that.
   the node allows, `missing` when something it names does not exist
   (`tenant`, `collection`, `object`, `key`, `backup`, `restore_point`,
   `route`), and `reason` as above.
-- **`GET /v1/limits`** tells any key the most a request may ask for.
+- **`GET /v1/limits`** tells any key the most a request may ask for:
+  `results`, `candidates`, `oversample`, `body_bytes`,
+  `restore_window_secs`, `deleted` (objects one request deletes by filter)
+  and `reads_at_once` (reads the node answers at once).
 - **A hybrid search that ranked by the words alone says why**, in
   `degraded_by`: `unavailable` or `model_unavailable`.
 - **A request for none**, `limit: 0`, is refused as before, without a
@@ -51,6 +58,59 @@ is published from main before that.
   vectors of another size than the collection's are `model_unavailable`.
   Everything else that stops a text being embedded is `unavailable`, as
   before.
+
+- **A restore is made once.** `POST /v1/tenants/{tenant}/restore` takes
+  `x-vellev-request`, as writes do: asked for again under the same name
+  within a day, on any node, it is answered as it was and restores
+  nothing more. The client crate names every restore. One that fails, or
+  is cut short by its node, once its commit was begun is answered as made
+  if it was, and otherwise `uncertain` (503): ask again by the same name.
+- **New answers to a restore**: `conflict` (409) while another restore of
+  the tenant runs, or while it is being backed up or restored from a
+  backup; and 422 with `invalid` when a request name is used again for a
+  restore to another state.
+- **`Restored` carries `incarnation`**, the tenant's incarnation the
+  restore was made in, with `position`: what a read must have caught up
+  to. A node of the release before sends none, which reads as 0.
+- **Writes are refused as `unavailable` (503) while a restore runs**, and
+  nothing of them is made.
+- **A delete by filter deletes at most 8,192 objects.** With no `limit`
+  it is refused as `invalid` (400), deleting nothing, if more pass; it
+  used to delete however many did. With `limit` (1 to 8,192) it deletes up
+  to that many and says how many; fewer than the limit means none were
+  left. Send it again, **each time under a new `x-vellev-request`**, until
+  it deletes fewer than the limit. The deletes by filter of one request
+  count together, one with no limit for 8,192, and a request whose
+  deletes may come to more is refused. A refusal for asking to delete
+  too many, by a limit past the most, by limits that come to more, or by
+  a delete with no limit that more pass, says so in
+  `limit: {name: "deleted", max: 8192}`.
+- **A read may be turned away** as `unavailable` (503) with
+  `Retry-After: 1`, when the node is answering as many searches, listings
+  and counts as it does at once. One tenant may have all of them while no
+  other asks; while a read waits whose tenant has less than half, no
+  tenant with half or more is given another. A read turned away does not
+  count against its tenant's rate, unless it had something costly done
+  first: the coordinator asked (a `strong` read, or one after a position
+  the node had not reached), a copy of the tenant opened, or its text
+  sent to a model. What it only waited for another read to have done is
+  counted for that read alone. A text of up to 1,024 bytes embedded
+  lately is not sent again, so a search by a new text that is turned
+  away is counted once for that; further turn-aways of the same text are
+  free, while its vector is kept (a text of up to 1,024 bytes whose
+  embedding succeeded, among the 1,024 asked last); and the search answered at last is counted like any other. Ask
+  again after the wait.
+- **A search waits at most two minutes for its text to be embedded**,
+  by a model the node runs itself as by one it calls. `nearest` is then
+  refused as `unavailable` (503); `hybrid` answers by the words alone,
+  with `degraded_by: "unavailable"`.
+- **New settings**: `VELLEV_READS_AT_ONCE` (256), `VELLEV_READS_WAIT_MS`
+  (500), `VELLEV_CACHE_LOADS` (2), `VELLEV_STORE_TIMEOUT_SECS`,
+  `VELLEV_STORE_MIN_BYTES_PER_SEC`, `VELLEV_UPLOAD_PART_MIB` and
+  `VELLEV_DATABASE_TIMEOUT_SECS`; see the README.
+- **Vectors are never held in memory by a node with a cache directory.**
+  A tenant whose vectors the cache cannot take, or whose disk does not
+  answer, does not open, and is `unavailable` until it does.
 
 ### vellev-client
 
@@ -79,7 +139,10 @@ Breaking:
   (two seconds unless set; with none, no address has time to). A client of one address gets
   the answer as before.
 - An address that turns a request away is waited on for the `Retry-After`
-  it gives, up to a minute.
+  it gives, up to a minute. So is one that answers `unavailable` with a
+  `Retry-After`, as a node does that is answering as many reads as it
+  does at once: every other address is asked first, and the wait before
+  any is asked a second time is no shorter than the one given.
 
 New:
 
@@ -87,6 +150,8 @@ New:
   route.
 - `Error::limit()`, `Error::limit_max(Bounded)`, `Error::missing()`,
   `Error::reason()`, `Error::is_model_unavailable()`.
+- `Error::Api` has `wait`: how long the node said to leave it before
+  asking again, if it said.
 - `Options::better_within`.
 
 ### vellev-api
@@ -125,6 +190,12 @@ Breaking:
   Their fields are public still, and can be read and assigned.
 - `Problem` gains `limit`, `missing` and `reason`; `Results` gains
   `degraded_by`.
+- `Restored` gains `incarnation`, and `Restored::new` takes it:
+  `new(from, incarnation, position)`. `Restored::after()` is what to send
+  as `x-vellev-after` to read past the restore.
+- `Change::DeleteWhere` gains `limit: Option<u32>`, so writing the variant
+  out needs the field. `Change::delete_where(collection, filter)` and
+  `Change::delete_up_to(collection, filter, limit)` build it.
 
 New: `Bounded`, `Limit`, `Limits`, `Missing`, `Reason`, `Code::status()`.
 

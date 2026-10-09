@@ -8,7 +8,7 @@ mod local;
 mod registry;
 
 pub use bedrock::Bedrock;
-pub use embedder::{Embedder, FAULT_STANDS};
+pub use embedder::{Embedder, FAULT_STANDS, QUERY_WITHIN};
 pub use http::Http;
 #[cfg(feature = "local")]
 pub use local::Local;

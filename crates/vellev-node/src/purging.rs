@@ -28,7 +28,9 @@ const AT_ONCE: usize = 16;
 
 impl Node {
     /// Purge the tenants removed at least as long ago as the node waits,
-    /// and drop what this node cached of those purged lately.
+    /// drop what this node cached of those purged lately, and forget the
+    /// restores recorded too long ago to be asked for again, whatever
+    /// became of their tenants.
     pub async fn purge_due(&self) -> Result<()> {
         self.0.purge_due().await
     }
@@ -53,6 +55,10 @@ impl Node {
 
 impl Inner {
     async fn purge_due(&self) -> Result<()> {
+        let forgotten = self.coordinator.forget_restores().await?;
+        if forgotten > 0 {
+            tracing::info!(forgotten, "forgot old restores");
+        }
         let purges = self
             .coordinator
             .purges(self.settings.purge_after, REMEMBERED)
@@ -110,6 +116,7 @@ impl Inner {
             Some(store) => Backups::new(store).purge(tenant).await?,
             None => 0,
         };
+        self.forget_removed(tenant).await?;
         self.coordinator.purged(tenant, claim, REMEMBERED).await?;
         Ok(Some(deleted + backed_up))
     }

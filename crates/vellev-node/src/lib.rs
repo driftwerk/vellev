@@ -2,24 +2,30 @@
 //! when first asked for and written to through one shared queue.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::future::join_all;
-use tokio::sync::{mpsc, OnceCell};
-use vellev_core::{CollectionName, Embedding, ModelFault, NodeId, Partition, TenantId};
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, watch, OnceCell};
+use tokio::task::AbortHandle;
+use vellev_core::{Embedding, ModelFault, NodeId, Partition, RequestId, TenantId};
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
     Acquired, Coordinator, CoordinatorError, Lease, LogPosition, ManifestRef, PartitionKey, Point,
-    RestorePoint, TenantKey, Versions, MAX_RESTORE_WINDOW,
+    Restore, RestorePoint, Restored, TenantKey, Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
-    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Unembedded, Vectorize,
-    Writer,
+    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Transfers, Unembedded,
+    Vectorize, Writer,
 };
 
 mod backing;
@@ -44,6 +50,9 @@ pub const PROTOCOL: u16 = 1;
 /// A key nothing is kept under, asked for to tell that object storage
 /// answers: that it is missing is the answer.
 const READINESS: &str = "vellev-readiness";
+
+/// How many commits and restores of a removed tenant are forgotten at once.
+const FORGOTTEN_AT_ONCE: usize = 10_000;
 
 /// How long object storage having answered counts for readiness, so that
 /// health checks do not ask it every few seconds.
@@ -98,12 +107,21 @@ pub struct Settings {
     pub backups: Option<Arc<dyn Blobs>>,
     /// How often each tenant is backed up.
     pub backup_every: Duration,
+    /// Whether the node looks for tenants due a backup of its own accord
+    /// (see [`Node::backing_up`]). Without it a tenant is backed up when
+    /// that is asked for and not otherwise, by [`Node::back_up`] or
+    /// [`Node::back_up_due`]: for whoever times backups itself, as a test
+    /// does that counts them.
+    pub backups_scheduled: bool,
     /// How long a backup is kept; the newest of a tenant always is.
     pub backups_kept: Duration,
     /// How long after a tenant is removed everything kept of it is
     /// deleted: long enough for any node that held it to notice and stop
     /// committing. A file a stopped writer uploads later still lingers.
     pub purge_after: Duration,
+    /// How files go to and come from object storage, and when a request is
+    /// given up.
+    pub transfers: Transfers,
 }
 
 impl Settings {
@@ -126,8 +144,10 @@ impl Settings {
             memory: None,
             backups: None,
             backup_every: Duration::from_secs(24 * 60 * 60),
+            backups_scheduled: true,
             backups_kept: Duration::from_secs(35 * 24 * 60 * 60),
             purge_after: Duration::from_secs(10 * 60),
+            transfers: Transfers::default(),
         }
     }
 }
@@ -144,7 +164,7 @@ pub enum NodeError {
     Busy,
     #[error("tenant {tenant} is asking too much of this node; try again in {wait:?}")]
     Limited { tenant: TenantId, wait: Duration },
-    #[error("the hold on tenant {0} ran out while it was being opened")]
+    #[error("this node's hold on tenant {0} was lost; ask again")]
     Lost(TenantId),
     #[error("this node has not caught up with tenant {0} as far as asked")]
     Behind(TenantId),
@@ -156,6 +176,13 @@ pub enum NodeError {
     NoBackups,
     #[error("tenant {0} is being backed up or restored from a backup already")]
     BackingUp(TenantId),
+    #[error("tenant {0} is being restored already, as another request asked")]
+    Restoring(TenantId),
+    #[error("request {request} asked for another restore of tenant {tenant} before")]
+    Reused {
+        tenant: TenantId,
+        request: RequestId,
+    },
     #[error("tenant {0} has no backup {1}")]
     UnknownBackup(TenantId, uuid::Uuid),
     #[error("the cluster writes file format {cluster}, and this release reads only up to {reads}")]
@@ -245,15 +272,161 @@ pub struct Tenant {
     embedders: Arc<Embedders>,
     flush_rows: usize,
     flushes: mpsc::Sender<()>,
-    /// Set once the writer can no longer write, so that the node opens the
-    /// tenant afresh for the next caller.
-    broken: Arc<AtomicBool>,
+    /// Lost once the writer can no longer write or the node lets the tenant
+    /// go, so that the node opens the tenant afresh for the next caller.
+    hold: Arc<Hold>,
     /// When the hold on the tenant runs out unless renewed, by this node's
     /// own clock.
     deadline: Arc<Mutex<Instant>>,
     /// When the tenant was last asked for.
     used: Mutex<Instant>,
     limits: Arc<Limits>,
+    /// The restore running here, if any.
+    running: Mutex<Option<Running>>,
+}
+
+/// A node's hold on a tenant, as everything that works on the tenant sees
+/// it. Once it is lost, for whatever reason, the tasks working on the
+/// tenant are stopped, so that none stuck on something that never answers
+/// goes on holding the tenant's data in memory.
+#[derive(Debug, Default)]
+struct Hold {
+    lost: AtomicBool,
+    /// The tenant's queue of writes, once it is open.
+    commits: OnceLock<GroupCommitter>,
+    tasks: Mutex<Vec<AbortHandle>>,
+}
+
+impl Hold {
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    /// Lose the hold, stopping every task working on the tenant: its
+    /// writes, a commit under way being answered as unknown, and whatever
+    /// maintains or restores it.
+    fn lose(&self) {
+        self.lost.store(true, Ordering::SeqCst);
+        if let Some(commits) = self.commits.get() {
+            commits.stop();
+        }
+        let stopped = std::mem::take(&mut *self.tasks.lock().expect("tasks lock"));
+        stopped.iter().for_each(AbortHandle::abort);
+    }
+
+    /// Have `task` stopped when the hold is lost, at once if it is already.
+    fn stops(&self, task: AbortHandle) {
+        let mut tasks = self.tasks.lock().expect("tasks lock");
+        match self.is_lost() {
+            true => task.abort(),
+            false => {
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task);
+            }
+        }
+    }
+}
+
+impl Drop for Tenant {
+    fn drop(&mut self) {
+        self.hold.lose();
+    }
+}
+
+/// A restore running on a tenant: as it was asked for, and what ends as
+/// the restore ends.
+#[derive(Debug)]
+struct Running {
+    asking: Asking,
+    ended: watch::Receiver<()>,
+}
+
+/// A restore as one request asks for it: the request, and a digest of the
+/// state it asks to go back to, the same on every try of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Asking {
+    request: RequestId,
+    digest: [u8; 32],
+}
+
+/// Which state a restore goes back to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Target {
+    Point(Point),
+    Backup(uuid::Uuid),
+}
+
+impl Asking {
+    fn of(request: RequestId, target: Target) -> Self {
+        let mut digest = Sha256::new();
+        match target {
+            Target::Point(Point::At(at)) => {
+                digest.update(b"at");
+                digest.update(at.timestamp().to_be_bytes());
+                digest.update(at.timestamp_subsec_nanos().to_be_bytes());
+            }
+            Target::Point(Point::Position(position)) => {
+                digest.update(b"position");
+                digest.update(position.0.to_be_bytes());
+            }
+            Target::Backup(id) => {
+                digest.update(b"backup");
+                digest.update(id.as_bytes());
+            }
+        }
+        Self {
+            request,
+            digest: digest.finalize().into(),
+        }
+    }
+
+    /// The restore this asks for, going back to `from`, which was
+    /// committed or backed up at `from_at`.
+    pub(crate) fn to(self, from: LogPosition, from_at: DateTime<Utc>) -> Restore {
+        Restore {
+            request: self.request,
+            asked: self.digest,
+            from,
+            from_at,
+        }
+    }
+
+    /// The restore of `tenant` this request made lately, here or on any
+    /// node, if it made one; a refusal if what it made was another.
+    async fn recorded(
+        &self,
+        coordinator: &dyn Coordinator,
+        tenant: &TenantId,
+    ) -> Result<Option<Restored>> {
+        match coordinator.restored(&key(tenant), self.request).await? {
+            Some(done) if done.restore.asked == self.digest => Ok(Some(done)),
+            Some(_) => Err(self.reused(tenant)),
+            None => Ok(None),
+        }
+    }
+
+    /// The refusal of this request for asking another restore of `tenant`
+    /// than it asked before.
+    fn reused(&self, tenant: &TenantId) -> NodeError {
+        NodeError::Reused {
+            tenant: tenant.clone(),
+            request: self.request,
+        }
+    }
+}
+
+/// The end of a restore, however it ends, even before it began: the tenant
+/// is free to restore again, and then whatever waited for it learns that
+/// it ended.
+struct Ending {
+    tenant: Arc<Tenant>,
+    _ends: watch::Sender<()>,
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        *self.tenant.running.lock().expect("running lock") = None;
+    }
 }
 
 impl Tenant {
@@ -264,7 +437,7 @@ impl Tenant {
     /// Whether this node still holds the tenant, as far as it can tell
     /// without asking: its hold has not run out and nothing has failed.
     fn held(&self) -> bool {
-        !self.broken.load(Ordering::SeqCst) && Instant::now() < *self.deadline()
+        !self.hold.is_lost() && Instant::now() < *self.deadline()
     }
 
     fn deadline(&self) -> std::sync::MutexGuard<'_, Instant> {
@@ -277,6 +450,11 @@ impl Tenant {
 
     fn idle(&self) -> Duration {
         self.used.lock().expect("used lock").elapsed()
+    }
+
+    /// The tenant's data as this node holds it in memory.
+    pub fn partition(&self) -> &Arc<vellev_storage::Partition> {
+        self.writer.partition()
     }
 
     /// Run `f` against the tenant's data as of its last commit.
@@ -365,7 +543,18 @@ impl Tenant {
             .commits
             .submit_batch(batch, made)
             .await
-            .map_err(|error| self.lost(error))?;
+            .map_err(|error| self.failed(error))?;
+        // A delete by filter was let through as one write: every object
+        // it deleted is one more, owed from now on.
+        if !answered {
+            let deleted = receipt.outcomes.iter().map(|outcome| match outcome {
+                vellev_storage::Outcome::Deleted(deleted) => {
+                    usize::try_from(*deleted).unwrap_or(usize::MAX)
+                }
+                _ => 0,
+            });
+            self.limits.owe(&self.id, Asked::Write, deleted.sum());
+        }
         if self.read(State::unflushed) >= self.flush_rows {
             let _ = self.flushes.try_send(());
         }
@@ -381,7 +570,8 @@ impl Tenant {
     }
 
     /// Merge segments until a merge finds nothing to do, and then delete
-    /// the files nothing needs any more, as [`Writer::clean`] with `grace`.
+    /// the files nothing needs any more, as [`Writer::clean`] with `grace`,
+    /// which deletes so many at once, until one finds fewer than that.
     pub async fn compact(&self, grace: Duration) -> Result<usize> {
         while self
             .writer
@@ -390,10 +580,15 @@ impl Tenant {
             .map_err(|error| self.failed(error))?
             .is_some()
         {}
-        self.writer
-            .clean(grace)
-            .await
-            .map_err(|error| self.closed(error))
+        let mut deleted = 0;
+        loop {
+            let cleaned = self.writer.clean(grace).await;
+            let more = cleaned.map_err(|error| self.failed(error))?;
+            deleted += more;
+            if more < Writer::CLEANED_AT_ONCE {
+                return Ok(deleted);
+            }
+        }
     }
 
     /// Forget the commits the tenant can no longer go back to, then merge
@@ -410,70 +605,166 @@ impl Tenant {
         self.compact(window.saturating_add(grace)).await
     }
 
-    /// Put the tenant back as it stood at `head`, as
-    /// [`Writer::restore`] does, running to the end even if the caller
-    /// stops waiting.
-    async fn restored(
-        self: &Arc<Self>,
-        head: Option<ManifestRef>,
-        position: LogPosition,
-    ) -> Result<LogPosition> {
-        let tenant = self.clone();
-        tokio::spawn(async move {
-            tenant
-                .writer
-                .restore(head.as_ref(), position)
-                .await
-                .map_err(|error| tenant.closed(error))
+    /// Put the tenant back as it stood at `head`, as `restore` asks, and
+    /// as [`Writer::restore_recorded`] does. A failure that closes the
+    /// writer is only told here: the hold is lost by whoever runs this on
+    /// a task (see [`Self::restoring`]), once the task has ended, since
+    /// losing it stops that task wherever it is, with whatever it had
+    /// still to say and to tidy up.
+    async fn restored(&self, head: Option<ManifestRef>, restore: Restore) -> Result<Restored> {
+        let position = self
+            .writer
+            .restore_recorded(head.as_ref(), restore.clone())
+            .await
+            .map_err(|error| self.told(error))?;
+        Ok(Restored {
+            restore,
+            incarnation: self.writer.partition().incarnation(),
+            position,
         })
-        .await
-        .map_err(|error| StorageError::Background(error.to_string()))?
     }
 
-    /// An error from something that leaves the writer open unless it says
-    /// it is closed.
-    fn closed(&self, error: StorageError) -> NodeError {
-        match error {
-            StorageError::Closed => self.failed(error),
-            other => other.into(),
+    /// Restore the tenant as `work` does, as `asking` asks, on a task of
+    /// its own that goes on whoever stops waiting, until it ends or this
+    /// node's hold on the tenant is lost. A request whose restore was
+    /// recorded lately, here or on any node, is answered as it was and not
+    /// made again, or refused if it asked for another. While one restore
+    /// runs here, another of the same request waits for it to end and
+    /// returns `None`, to be asked again of the tenant as it is then; one
+    /// of any other request is refused.
+    ///
+    /// A restore that fails or is stopped is not thereby one that was not
+    /// made: see [`Self::unfinished`].
+    async fn restoring<F>(
+        self: &Arc<Self>,
+        coordinator: &Arc<dyn Coordinator>,
+        asking: Asking,
+        work: F,
+    ) -> Result<Option<Restored>>
+    where
+        F: Future<Output = Result<Restored>> + Send + 'static,
+    {
+        let started = {
+            let mut running = self.running.lock().expect("running lock");
+            match &*running {
+                Some(same) if same.asking == asking => Err(same.ended.clone()),
+                Some(other) if other.asking.request == asking.request => {
+                    return Err(asking.reused(&self.id))
+                }
+                Some(_) => return Err(NodeError::Restoring(self.id.clone())),
+                None => {
+                    let (ends, ended) = watch::channel(());
+                    *running = Some(Running { asking, ended });
+                    Ok(ends)
+                }
+            }
+        };
+        let ending = match started {
+            Ok(ends) => Ending {
+                tenant: self.clone(),
+                _ends: ends,
+            },
+            Err(mut ended) => {
+                // Only its end is waited for: nothing is ever sent.
+                let _ = ended.changed().await;
+                return Ok(None);
+            }
+        };
+        let asked = coordinator.clone();
+        // The task hands the restore's end back with what it came to, so
+        // that whoever waits for that end learns of it only once a writer
+        // the restore closed has cost this node its hold: they then find
+        // the tenant opened afresh, not this one again.
+        let restoring = tokio::spawn(async move {
+            let recorded = asking.recorded(asked.as_ref(), &ending.tenant.id).await;
+            let restored = match recorded {
+                Ok(Some(done)) => Ok(done),
+                Ok(None) => work.await,
+                Err(failure) => Err(failure),
+            };
+            (restored, ending)
+        });
+        self.hold.stops(restoring.abort_handle());
+        // Whoever asked may stop waiting, and losing the hold stops the
+        // task above wherever it is: so a task of its own, which neither
+        // reaches, sees it end, and only then loses the hold if the
+        // restore closed the writer, which is gone for good.
+        let tenant = self.clone();
+        let ended = tokio::spawn(async move {
+            let ended = restoring.await;
+            if tenant.writer.is_closed() {
+                tenant.hold.lose();
+            }
+            ended.map(|(restored, _ending)| restored)
+        });
+        let failure = match ended.await {
+            Ok(Ok(Ok(restored))) => return Ok(Some(restored)),
+            Ok(Ok(Err(failure))) => failure,
+            Ok(Err(stopped)) if stopped.is_cancelled() => NodeError::Lost(self.id.clone()),
+            Ok(Err(stopped)) | Err(stopped) => StorageError::Background(stopped.to_string()).into(),
+        };
+        self.unfinished(coordinator.as_ref(), asking, failure).await
+    }
+
+    /// What a restore asked for as `asking` that ended in `failure`, or
+    /// was stopped, came to. Its commit may have been made all the same:
+    /// stopped while its answer was awaited, or failed in what follows it.
+    /// So the coordinator is asked, and a restore it has recorded is
+    /// answered as made. One it has not is told as it failed if no commit
+    /// of it can yet be made: the writer is still open, or said it was
+    /// closed before anything was tried, so none was begun; or the
+    /// coordinator refused the commit outright, as it does one by a lease
+    /// since taken. Otherwise a commit was begun whose answer never came,
+    /// which may yet be made, and the caller is told that whether it was
+    /// is unknown, to ask again by the same name.
+    async fn unfinished(
+        &self,
+        coordinator: &dyn Coordinator,
+        asking: Asking,
+        failure: NodeError,
+    ) -> Result<Option<Restored>> {
+        let unmade = match &failure {
+            NodeError::Storage(StorageError::Closed) => true,
+            NodeError::UnknownTenant(_) => true,
+            NodeError::Storage(failure) => matches!(
+                failure.root(),
+                StorageError::Coordinator(refused) if !refused.is_retryable()
+            ),
+            _ => false,
+        };
+        match asking.recorded(coordinator, &self.id).await {
+            Ok(Some(done)) => Ok(Some(done)),
+            Ok(None) if unmade || !self.writer.is_closed() => Err(failure),
+            Err(reused @ NodeError::Reused { .. }) => Err(reused),
+            Ok(None) | Err(_) => Err(NodeError::Storage(match failure {
+                NodeError::Storage(shared @ StorageError::Shared(_)) => shared,
+                NodeError::Storage(failure) => StorageError::Shared(Arc::new(failure)),
+                _ => StorageError::Shared(Arc::new(StorageError::Closed)),
+            })),
         }
     }
 
-    /// Note that the writer failed at something that leaves it closed.
+    /// A failure of the writer's, as its caller should see it, noting
+    /// that the tenant must be opened afresh if the writer is closed now:
+    /// whether it is, not how the failure reads, says so, as a refusal or
+    /// a restore under way leave it open, and a commit that failed for
+    /// any reason closes it. A writer, or the committer in front of it,
+    /// that says it is closed is gone for good too.
     fn failed(&self, error: StorageError) -> NodeError {
-        self.broken.store(true, Ordering::SeqCst);
-        error.into()
+        if self.writer.is_closed() || matches!(error.root(), StorageError::Closed) {
+            self.hold.lose();
+        }
+        self.told(error)
     }
 
-    /// A write's failure as its caller should see it. A failure of the
-    /// commit itself, rather than of one caller's batch, leaves the writer
-    /// closed or without its lease.
-    fn lost(&self, error: StorageError) -> NodeError {
-        if matches!(error, StorageError::Shared(_) | StorageError::Closed) {
-            self.broken.store(true, Ordering::SeqCst);
-        }
+    /// A failure of the writer's as its caller should see it.
+    fn told(&self, error: StorageError) -> NodeError {
         match error.root() {
             StorageError::Coordinator(CoordinatorError::UnknownPartition(_)) => {
                 NodeError::UnknownTenant(self.id.clone())
             }
             _ => error.into(),
         }
-    }
-
-    /// The vector to search `collection` with for `text`, or `None` if the
-    /// text is blank or the collection's clients supply its vectors.
-    pub async fn query_vector(
-        &self,
-        collection: &CollectionName,
-        text: &str,
-    ) -> Result<Option<Vec<f32>>> {
-        let embedding = self.read(|state| {
-            state
-                .collection(collection)
-                .map(|schema| schema.embedding.clone())
-                .ok_or_else(|| StorageError::UnknownCollection(collection.clone()))
-        })?;
-        reading::query_vector(&self.embedders, &embedding, text).await
     }
 }
 
@@ -689,43 +980,81 @@ impl Node {
         Ok(self.0.coordinator.register(&key(tenant)).await?)
     }
 
-    /// Forget the tenant. Returns whether it existed. Its files stay in
-    /// object storage, where nothing refers to them any more. A node that
-    /// holds the tenant notices at its next renewal, within a third of the
-    /// lease.
+    /// Forget the tenant, and then its history, a batch at a time. Returns
+    /// whether it existed. Its files stay in object storage, where nothing
+    /// refers to them any more, until it is purged, which forgets whatever
+    /// of its history is left. A node that holds the tenant notices at its
+    /// next renewal, within a third of the lease.
     pub async fn drop_tenant(&self, tenant: &TenantId) -> Result<bool> {
         let existed = self.0.coordinator.remove(&key(tenant)).await?;
         self.0.keys.forget(tenant);
         self.0.opened().followers.remove(tenant);
         let opening = self.0.opened().tenants.remove(tenant);
         if let Some(opened) = opening.as_ref().and_then(|opening| opening.get()) {
-            opened.broken.store(true, Ordering::SeqCst);
+            opened.hold.lose();
+        }
+        // The tenant is gone whatever comes of this: what is left, the
+        // purge forgets.
+        if let Err(error) = self.0.forget_removed(tenant).await {
+            tracing::warn!(%tenant, %error, "a removed tenant's history is left for its purge");
         }
         Ok(existed)
     }
 
     /// Put `tenant` back as it stood at `point`, which must lie within its
-    /// restore window, as a new commit. Returns the state gone back to and
-    /// the position of the commit that restored it. The restore runs to its
-    /// end even if the caller stops waiting for it.
+    /// restore window, as a new commit, for `request`. Returns what it went
+    /// back to and the commit that put it back. The restore goes on even if
+    /// the caller stops waiting for it, until it ends or this node's hold
+    /// on the tenant is lost, and the request made again is answered as it
+    /// was, here or on any node, not made twice; another restore of the
+    /// tenant is refused while it runs. One that fails or is stopped once
+    /// its commit was begun is answered as made if the coordinator has it,
+    /// and otherwise as a failure shared, its outcome unknown.
     pub async fn restore(
         &self,
         tenant: &TenantId,
         point: Point,
-    ) -> Result<(RestorePoint, LogPosition)> {
-        let opened = self.tenant(tenant).await?;
-        let window = self.0.restore_window(tenant).await?;
-        let target = self
-            .0
-            .coordinator
-            .restore_point(&key(tenant), point, window)
-            .await?
-            .ok_or_else(|| NodeError::NoRestorePoint(tenant.clone()))?;
-        let restored = opened
-            .restored(Some(target.head.clone()), target.position)
+        request: RequestId,
+    ) -> Result<Restored> {
+        let asking = Asking::of(request, Target::Point(point));
+        let restored = self
+            .restoring(tenant, asking, move |node, opened| async move {
+                let id = opened.id();
+                let window = node.0.restore_window(id).await?;
+                let target = node
+                    .0
+                    .coordinator
+                    .restore_point(&key(id), point, window)
+                    .await?
+                    .ok_or_else(|| NodeError::NoRestorePoint(id.clone()))?;
+                let restore = asking.to(target.position, target.at);
+                opened.restored(Some(target.head), restore).await
+            })
             .await?;
-        tracing::info!(%tenant, from = ?target.position, at = %target.at, ?restored, "restored");
-        Ok((target, restored))
+        tracing::info!(%tenant, ?restored, "restored");
+        Ok(restored)
+    }
+
+    /// Restore `tenant` as `work` does with the tenant as it is opened, as
+    /// [`Tenant::restoring`] does, asking again of the tenant opened afresh
+    /// whenever a try of the same request that ran meanwhile ended without
+    /// being recorded, as one whose writer closed under it.
+    async fn restoring<F>(
+        &self,
+        tenant: &TenantId,
+        asking: Asking,
+        work: impl Fn(Node, Arc<Tenant>) -> F,
+    ) -> Result<Restored>
+    where
+        F: Future<Output = Result<Restored>> + Send + 'static,
+    {
+        loop {
+            let opened = self.tenant(tenant).await?;
+            let made = work(self.clone(), opened.clone());
+            if let Some(restored) = opened.restoring(&self.0.coordinator, asking, made).await? {
+                return Ok(restored);
+            }
+        }
     }
 
     /// The earliest and the latest state `tenant` may be restored to, with
@@ -786,8 +1115,10 @@ impl Node {
                 .tenants
                 .get(tenant)
                 .and_then(|opening| opening.get())
-                .is_some_and(|tenant| !tenant.held());
-            if lost {
+                .filter(|tenant| !tenant.held())
+                .cloned();
+            if let Some(lost) = lost {
+                lost.hold.lose();
                 open.tenants.remove(tenant);
             }
             open.tenants.entry(tenant.clone()).or_default().clone()
@@ -834,7 +1165,7 @@ impl Node {
         for opening in openings {
             let unopened = || async { Err(NodeError::Stopped) };
             if let Ok(tenant) = opening.get_or_try_init(unopened).await {
-                tenant.broken.store(true, Ordering::SeqCst);
+                tenant.hold.lose();
                 self.0.release(tenant.writer.lease()).await;
             }
         }
@@ -899,7 +1230,7 @@ impl Inner {
                     tracing::warn!(tenant = %tenant.id, %error, "flush before letting go failed");
                 }
             }
-            tenant.broken.store(true, Ordering::SeqCst);
+            tenant.hold.lose();
             self.release(tenant.writer.lease()).await;
             tracing::info!(tenant = %tenant.id, "let go of a tenant");
         }
@@ -1000,9 +1331,15 @@ impl Inner {
             }
             Err(error) => return Err(error.into()),
         };
-        let broken = Arc::new(AtomicBool::new(false));
+        let hold = Arc::new(Hold::default());
         let deadline = Arc::new(Mutex::new(lease.deadline()));
-        self.renewing(lease.clone(), broken.clone(), &deadline);
+        let opened_writer = Arc::new(OnceLock::new());
+        self.renewing(
+            lease.clone(),
+            hold.clone(),
+            &deadline,
+            opened_writer.clone(),
+        );
         let opened = Writer::open(
             self.blobs.clone(),
             self.coordinator.clone(),
@@ -1010,11 +1347,16 @@ impl Inner {
             &committed,
         )
         .await;
-        let still_held = !broken.load(Ordering::SeqCst)
-            && Instant::now() < *deadline.lock().expect("deadline lock");
+        let still_held =
+            !hold.is_lost() && Instant::now() < *deadline.lock().expect("deadline lock");
         let writer = match opened {
             Ok(writer) if !self.opened().stopped && still_held => {
-                Arc::new(writer.embedding_with(Arc::new(Documents(self.embedders.clone()))))
+                let documents = Arc::new(Documents(self.embedders.clone()));
+                Arc::new(
+                    writer
+                        .embedding_with(documents)
+                        .transferring(self.settings.transfers),
+                )
             }
             Ok(_) if self.opened().stopped => {
                 self.release(&lease).await;
@@ -1029,18 +1371,26 @@ impl Inner {
                 return Err(error.into());
             }
         };
+        opened_writer
+            .set(Arc::downgrade(&writer))
+            .expect("a tenant's writer is opened once");
         let (flushes, wanted) = mpsc::channel(1);
+        let commits = GroupCommitter::spawn(writer.clone(), *group, *queue);
+        hold.commits
+            .set(commits.clone())
+            .expect("a tenant's writes are queued once");
         let opened = Arc::new(Tenant {
             id: tenant.clone(),
-            commits: GroupCommitter::spawn(writer.clone(), *group, *queue),
+            commits,
             writer,
             embedders: self.embedders.clone(),
             flush_rows: *flush_rows,
             flushes,
-            broken,
+            hold,
             deadline,
             used: Mutex::new(Instant::now()),
             limits: self.limits.clone(),
+            running: Mutex::default(),
         });
         self.maintaining(&opened, wanted);
         Ok(opened)
@@ -1049,7 +1399,8 @@ impl Inner {
     /// Flush the tenant when asked to and it is still due, and merge and
     /// clean up its files after each flush and now and then regardless,
     /// for as long as the tenant is open and held. The task holds no
-    /// reference of its own, so dropping the tenant ends it.
+    /// reference of its own between rounds, so dropping the tenant ends
+    /// it, and losing the hold stops it wherever it is.
     fn maintaining(&self, tenant: &Arc<Tenant>, mut wanted: mpsc::Receiver<()>) {
         let Settings {
             restore_window,
@@ -1059,8 +1410,9 @@ impl Inner {
         let every =
             (restore_window / 24).clamp(Duration::from_secs(60), Duration::from_secs(60 * 60));
         let coordinator = self.coordinator.clone();
+        let hold = tenant.hold.clone();
         let tenant = Arc::downgrade(tenant);
-        tokio::spawn(async move {
+        let maintaining = tokio::spawn(async move {
             loop {
                 let flush = match tokio::time::timeout(every, wanted.recv()).await {
                     Ok(Some(())) => true,
@@ -1087,6 +1439,22 @@ impl Inner {
                 }
             }
         });
+        hold.stops(maintaining.abort_handle());
+    }
+
+    /// Forget what is kept of the removed `tenant`'s history, a batch at a
+    /// time, each well within any bound on one call to the coordinator.
+    async fn forget_removed(&self, tenant: &TenantId) -> Result<()> {
+        let mut after = None;
+        loop {
+            after = self
+                .coordinator
+                .forget_removed(&key(tenant), after, FORGOTTEN_AT_ONCE)
+                .await?;
+            if after.is_none() {
+                return Ok(());
+            }
+        }
     }
 
     /// How far back `tenant` may be restored.
@@ -1103,7 +1471,19 @@ impl Inner {
     /// is held, from the opening on, and note when the hold is lost. Each
     /// renewal is timed from when the one before was asked for, so a slow
     /// answer does not let the hold run out.
-    fn renewing(&self, lease: Lease, broken: Arc<AtomicBool>, deadline: &Arc<Mutex<Instant>>) {
+    ///
+    /// The hold is given up once `writer`, when it is open, is closed, as
+    /// by an attempt that failed or a caller that stopped waiting part way,
+    /// or has been publishing a commit for longer than its bounds allow:
+    /// a writer that can write no more would otherwise keep the tenant
+    /// from every other node.
+    fn renewing(
+        &self,
+        lease: Lease,
+        hold: Arc<Hold>,
+        deadline: &Arc<Mutex<Instant>>,
+        writer: Arc<OnceLock<Weak<Writer>>>,
+    ) {
         let coordinator = self.coordinator.clone();
         let ttl = self.settings.lease;
         let every = ttl / 3;
@@ -1111,11 +1491,20 @@ impl Inner {
         tokio::spawn(async move {
             let mut next = lease.requested_at + every;
             loop {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
+                tokio::time::sleep_until(next).await;
                 let Some(deadline) = deadline.upgrade() else {
                     return;
                 };
-                if broken.load(Ordering::SeqCst) {
+                if hold.is_lost() {
+                    return;
+                }
+                let unusable = writer
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|writer| writer.is_closed() || writer.stalled());
+                if unusable {
+                    tracing::warn!(partition = %lease.key, "the writer is closed or stuck; the hold on the tenant is given up");
+                    hold.lose();
                     return;
                 }
                 let asked = Instant::now();
@@ -1126,7 +1515,7 @@ impl Inner {
                     }
                     Ok(Err(error)) if !error.is_retryable() => {
                         tracing::warn!(partition = %lease.key, %error, "hold on the tenant lost");
-                        broken.store(true, Ordering::SeqCst);
+                        hold.lose();
                         return;
                     }
                     Ok(Err(error)) => {

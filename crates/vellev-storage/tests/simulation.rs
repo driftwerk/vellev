@@ -1,19 +1,28 @@
 //! A deterministic simulation of one partition under failure.
 //!
 //! Random histories interleave writes from a current writer and from stalled
-//! ones, checkpoints, takeovers and follower catch-ups with faults in the
-//! store and the coordinator. After every step the committed state is read
-//! through fault-free handles and checked against what the coordinator
-//! really recorded, whatever the writers were told.
+//! ones, each a named request that inserts rows with vectors and may delete
+//! one, the same requests made again, checkpoints, merges, restores alone
+//! and beside a flush, a merge or a clean, cleaning up with and without
+//! grace, takeovers and follower catch-ups, with faults in the store and
+//! the coordinator. After every step the committed state is read through
+//! fault-free handles and checked against what the coordinator really
+//! recorded, whatever the writers were told.
+//!
+//! A step stands for an hour in the age of a file: the store says each was
+//! written as many hours ago as there have been steps since, so that
+//! cleaning up with a grace of some hours deletes what is older and keeps
+//! what is not, as it does where files age by the clock.
 
 mod common;
 
 use std::collections::VecDeque;
-use vellev_storage::coordinator::{KeyHash, Point, RestorePoint, TenantKey};
+use vellev_core::RequestId;
+use vellev_storage::coordinator::{KeyHash, Point, Restore, RestorePoint, Restored, TenantKey};
 
 use common::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
-use vellev_storage::Outcome;
+use vellev_storage::{Batch, Embedded, Merging, Outcome};
 
 const COLLECTION: &str = "sim";
 
@@ -63,7 +72,9 @@ struct Faults {
 }
 
 /// A store that fails on command and records every file it was given, so a
-/// second write to one key is noticed.
+/// second write to one key is noticed. Whoever asks anything of it waits a
+/// moment for the answer, as of any store, so that what is done at once
+/// takes turns.
 #[derive(Debug)]
 struct SimBlobs {
     clean: Arc<dyn Blobs>,
@@ -72,13 +83,26 @@ struct SimBlobs {
     written: Mutex<BTreeSet<String>>,
     delayed: Mutex<Vec<(String, Bytes)>>,
     rewritten: Mutex<Vec<String>>,
+    /// How many steps the history has taken, and at which each file landed.
+    step: AtomicUsize,
+    landed: Mutex<BTreeMap<String, usize>>,
 }
+
+/// How long a step is, in the age of a file.
+const STEP: Duration = Duration::from_secs(60 * 60);
+/// How many steps back a restore may go.
+const WINDOW: usize = 6;
+/// How many steps old a file is before a clean with grace deletes it: the
+/// window and some more, as a node cleans.
+const GRACE: usize = WINDOW + 2;
 
 impl SimBlobs {
     async fn land(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         if !self.written.lock().unwrap().insert(key.to_string()) {
             self.rewritten.lock().unwrap().push(key.to_string());
         }
+        let step = self.step.load(Ordering::SeqCst);
+        self.landed.lock().unwrap().insert(key.to_string(), step);
         match self.canary {
             Some(Canary::DropsSegments) if key.contains("/segment/") => Ok(()),
             _ => self.clean.put(key, bytes).await,
@@ -96,6 +120,7 @@ impl SimBlobs {
 #[async_trait]
 impl Blobs for SimBlobs {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        tokio::task::yield_now().await;
         let fault = self.faults.lock().unwrap().puts.pop_front();
         match fault {
             None => self.land(key, bytes).await,
@@ -109,6 +134,7 @@ impl Blobs for SimBlobs {
     }
 
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        tokio::task::yield_now().await;
         let failing = {
             let mut faults = self.faults.lock().unwrap();
             let failing = faults.failing_gets > 0;
@@ -125,9 +151,21 @@ impl Blobs for SimBlobs {
         &self,
         prefix: &str,
     ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
-        self.clean.list(prefix).await
+        tokio::task::yield_now().await;
+        let mut listed = self.clean.list(prefix).await?;
+        let (now, step) = (Utc::now(), self.step.load(Ordering::SeqCst));
+        let landed = self.landed.lock().unwrap();
+        for file in &mut listed {
+            let steps = step - landed.get(&file.key).copied().unwrap_or(step);
+            file.modified = now - STEP * steps as u32;
+        }
+        Ok(listed)
     }
+    /// A delete is answered only once nothing else has anything to do, on
+    /// the simulation's clock, which moves only then: whatever may run
+    /// while files are being deleted does, to its end.
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        tokio::time::sleep(Duration::from_millis(1)).await;
         self.clean.delete(key).await
     }
 }
@@ -140,6 +178,8 @@ struct SimCoordinator {
     faults: Arc<Mutex<Faults>>,
     canary: Option<Canary>,
     recorded: AtomicUsize,
+    /// How many of the commits recorded made a restore.
+    restores: AtomicUsize,
     unfenced: Mutex<Vec<String>>,
 }
 
@@ -175,6 +215,8 @@ impl Coordinator for SimCoordinator {
         match &outcome {
             Ok(committed) => {
                 self.recorded.fetch_add(1, Ordering::SeqCst);
+                let restores = usize::from(commit.restore.is_some());
+                self.restores.fetch_add(restores, Ordering::SeqCst);
                 if committed.generation != lease.generation {
                     let stale = format!("{:?} at {:?}", lease.generation, commit.log_position);
                     self.unfenced.lock().unwrap().push(stale);
@@ -278,6 +320,27 @@ impl Coordinator for SimCoordinator {
         self.clean.forget_history(key, window).await
     }
 
+    async fn restored(
+        &self,
+        key: &PartitionKey,
+        request: RequestId,
+    ) -> Result<Option<Restored>, CoordinatorError> {
+        self.clean.restored(key, request).await
+    }
+
+    async fn forget_removed(
+        &self,
+        key: &PartitionKey,
+        after: Option<Forgotten>,
+        limit: usize,
+    ) -> Result<Option<Forgotten>, CoordinatorError> {
+        self.clean.forget_removed(key, after, limit).await
+    }
+
+    async fn forget_restores(&self) -> Result<u64, CoordinatorError> {
+        self.clean.forget_restores().await
+    }
+
     async fn restore_window(
         &self,
         tenant: &TenantId,
@@ -345,14 +408,50 @@ enum Who {
     Any(usize),
 }
 
+/// What goes on beside a restore.
+#[derive(Debug, Clone, Copy)]
+enum Beside {
+    Flush,
+    Merge,
+    Clean,
+}
+
 #[derive(Debug, Clone)]
 enum Action {
+    /// A request of its own: insert so many rows and count them, and with
+    /// `delete` delete one of the rows there are.
     Write {
         who: Who,
         rows: u64,
+        delete: Option<usize>,
+    },
+    /// Make one of the requests made before again, as a caller that never
+    /// heard its answer would.
+    Again {
+        who: Who,
+        pick: usize,
     },
     Flush {
         who: Who,
+    },
+    Merge {
+        who: Who,
+    },
+    /// Delete what nothing needs. With `aged`, what was needed until some
+    /// hours ago is kept, as a node cleans. Without, the current writer
+    /// deletes whatever is not needed now; any other, which may be stale,
+    /// never cleans without that grace, here as in a real cluster.
+    Clean {
+        who: Who,
+        aged: bool,
+    },
+    /// Put the partition back as it stood so many commits ago, if that is
+    /// within the window, with `beside` going on at the same time, begun
+    /// just before it or just after.
+    Restore {
+        who: Who,
+        back: usize,
+        beside: Option<(Beside, bool)>,
     },
     /// The lease expires and another node takes it.
     Takeover,
@@ -376,11 +475,24 @@ fn action() -> impl Strategy<Value = Action> {
     let commit_fault = prop_oneof![Just(CommitFault::Refuse), Just(CommitFault::LoseResponse)];
     // Three failed tries close a writer, so most runs of faults stop short of that.
     let times = prop_oneof![3 => 1..3usize, 1 => 3..5usize];
+    let delete = prop_oneof![2 => Just(None), 1 => any::<usize>().prop_map(Some)];
+    let beside = prop_oneof![
+        3 => Just(None),
+        1 => any::<bool>().prop_map(|first| Some((Beside::Flush, first))),
+        1 => any::<bool>().prop_map(|first| Some((Beside::Merge, first))),
+        2 => any::<bool>().prop_map(|first| Some((Beside::Clean, first))),
+    ];
+    let write = |(who, rows, delete)| Action::Write { who, rows, delete };
+    let restore = |(who, back, beside)| Action::Restore { who, back, beside };
     prop_oneof![
-        14 => (who(), 1..4u64).prop_map(|(who, rows)| Action::Write { who, rows }),
+        14 => (who(), 1..4u64, delete).prop_map(write),
+        2 => (who(), any::<usize>()).prop_map(|(who, pick)| Action::Again { who, pick }),
         4 => who().prop_map(|who| Action::Flush { who }),
+        3 => who().prop_map(|who| Action::Merge { who }),
+        3 => (who(), any::<bool>()).prop_map(|(who, aged)| Action::Clean { who, aged }),
+        3 => (who(), 0..8usize, beside).prop_map(restore),
         2 => Just(Action::Takeover),
-        1 => Just(Action::Reopen),
+        3 => Just(Action::Reopen),
         2 => put_fault.prop_map(Action::FailUpload),
         2 => (commit_fault, times).prop_map(|(fault, times)| Action::FailCommits(fault, times)),
         1 => (1..4usize).prop_map(Action::FailReads),
@@ -390,30 +502,41 @@ fn action() -> impl Strategy<Value = Action> {
     ]
 }
 
-/// One attempt to commit: the rows it tried to insert, what the writer was
-/// told, and whether the coordinator recorded it.
+/// One request: the rows it inserts and the one it deletes, as it was
+/// asked, what its writer was told, and whether the coordinator recorded
+/// it or it was refused, which is its answer for good.
 #[derive(Debug)]
 struct Attempt {
+    batch: Batch,
     rows: Vec<u64>,
+    deleted: Option<ObjectId>,
     acknowledged: bool,
     recorded: bool,
+    refused: bool,
 }
 
-/// A partition's rows as a checker compares them: position, and `n` by id.
-type Snapshot = (LogPosition, BTreeMap<ObjectId, i64>);
+/// Rows as a checker compares them: `n` and the vector by id.
+type Rows = BTreeMap<ObjectId, (i64, Vec<f32>)>;
+
+/// A partition's rows and the position they are at.
+type Snapshot = (LogPosition, Rows);
 
 fn snapshot(state: &State) -> Snapshot {
     let rows = state
         .scan(&name(COLLECTION))
         .map(|found| match found.object.properties.get("n") {
-            Some(Value::Int(n)) => (found.id(), *n),
+            Some(Value::Int(n)) => {
+                let vector = found.vector.map(<[f32]>::to_vec).unwrap_or_default();
+                (found.id(), (*n, vector))
+            }
             other => panic!("{other:?}"),
         })
         .collect();
     (state.position(), rows)
 }
 
-/// A writer, and whether it can still commit. Any failed write closes one.
+/// A writer, and whether it can still commit. Any failed write closes one,
+/// and so does anything else that leaves it saying it is closed.
 struct Seat {
     writer: Writer,
     open: bool,
@@ -429,11 +552,43 @@ struct World {
     seats: Vec<Seat>,
     follower: Follower,
     attempts: Vec<Attempt>,
+    /// The rows the last restore recorded went back to, and the attempts
+    /// recorded since, in the order they were: what is committed is those
+    /// rows with each of these made on them in turn.
+    base: Rows,
+    since: Vec<usize>,
     readings: Vec<Committed>,
     next_row: u64,
     /// What was committed at each position, as read when it was the newest.
-    history: BTreeMap<LogPosition, BTreeMap<ObjectId, i64>>,
+    history: BTreeMap<LogPosition, Rows>,
+    /// Every head there has been, each a state to go back to, with the
+    /// step it was first seen at.
+    points: Vec<(usize, Committed)>,
+    /// The step at which a clean last deleted anything.
+    cleaned_at: Option<usize>,
+    step: usize,
+    made: Made,
 }
+
+/// How much a history did of what could as well have found nothing to do:
+/// merges made, files cleaned away with no grace and for their age,
+/// restores recorded, and those of them made beside something else.
+#[derive(Debug, Clone, Copy, Default)]
+struct Made {
+    merges: usize,
+    cleaned: usize,
+    aged: usize,
+    restores: usize,
+    raced: usize,
+}
+
+/// Merges as soon as two segments lie side by side.
+const MERGING: Merging = Merging {
+    stale: 0.5,
+    fanout: 2,
+    rows: 1_000_000,
+    clustered_above: 200_000,
+};
 
 type Violation = std::result::Result<(), String>;
 
@@ -450,6 +605,7 @@ impl World {
             faults: faults.clone(),
             canary,
             recorded: AtomicUsize::new(0),
+            restores: AtomicUsize::new(0),
             unfenced: Mutex::default(),
         });
         let blobs = Arc::new(SimBlobs {
@@ -459,6 +615,8 @@ impl World {
             written: Mutex::default(),
             delayed: Mutex::default(),
             rewritten: Mutex::default(),
+            step: AtomicUsize::new(0),
+            landed: Mutex::default(),
         });
         let follower = Follower::open(
             cluster.key.clone(),
@@ -470,7 +628,8 @@ impl World {
         let (held, committed) = cluster.lease().await;
         let writer = Writer::open(blobs.clone(), coordinator.clone(), held.clone(), &committed)
             .await
-            .unwrap();
+            .unwrap()
+            .merging_with(MERGING);
         let setup = vec![
             create(COLLECTION),
             Mutation::Insert {
@@ -490,9 +649,15 @@ impl World {
             seats: vec![Seat { writer, open: true }],
             follower,
             attempts: Vec::new(),
+            base: BTreeMap::from([(counter(), (0, Vec::new()))]),
+            since: Vec::new(),
             readings: Vec::new(),
             next_row: 0,
             history: BTreeMap::from([(LogPosition(0), BTreeMap::new())]),
+            points: Vec::new(),
+            cleaned_at: None,
+            step: 0,
+            made: Made::default(),
         };
         world.verify().await.unwrap();
         world
@@ -517,6 +682,7 @@ impl World {
                 committed,
             );
             if let Ok(writer) = opened.await {
+                let writer = writer.merging_with(MERGING);
                 self.seats.push(Seat { writer, open: true });
                 return;
             }
@@ -538,8 +704,7 @@ impl World {
         }
     }
 
-    async fn write(&mut self, who: Who, rows: u64) -> Violation {
-        let seat = self.seat(who).await;
+    async fn write(&mut self, who: Who, rows: u64, delete: Option<usize>) -> Violation {
         let rows: Vec<u64> = (self.next_row..self.next_row + rows).collect();
         self.next_row += rows.len() as u64;
         let attempt = self.attempts.len() as i64;
@@ -547,7 +712,7 @@ impl World {
             collection: name(COLLECTION),
             id: row(*n),
             properties: json!({ "n": attempt }).as_object().unwrap().clone(),
-            vector: None,
+            vector: Some(vec![attempt as f32, 0.5]),
         };
         let count = Mutation::Increment {
             collection: name(COLLECTION),
@@ -555,41 +720,223 @@ impl World {
             property: "n".into(),
             by: 1.0,
         };
-        let mutations = rows.iter().map(insert).chain([count]).collect();
-        let before = self.coordinator.recorded.load(Ordering::SeqCst);
-        let outcome = self.seats[seat].writer.commit(mutations).await;
-        let recorded = self.coordinator.recorded.load(Ordering::SeqCst) > before;
-        self.seats[seat].open = outcome.is_ok();
-        self.attempts.push(Attempt {
-            rows,
-            acknowledged: outcome.is_ok(),
-            recorded,
+        // One of the rows there are, which a writer left behind may no
+        // longer have, or not yet: it then refuses the request.
+        let live = self.expected();
+        let deleted = delete.and_then(|pick| {
+            let rows = live.keys().filter(|id| **id != counter());
+            rows.clone().nth(pick % rows.count().max(1)).copied()
         });
+        let delete = deleted.map(|id| Mutation::Delete {
+            collection: name(COLLECTION),
+            id,
+        });
+        let mutations = rows.iter().map(insert).chain(delete).chain([count]);
+        self.attempts.push(Attempt {
+            batch: Batch {
+                request: Some(RequestId::generate()),
+                mutations: mutations.collect(),
+            },
+            rows,
+            deleted,
+            acknowledged: false,
+            recorded: false,
+            refused: false,
+        });
+        self.attempt(who, self.attempts.len() - 1).await
+    }
 
+    /// Make the request of attempt `made`, for the first time or again. One
+    /// recorded already is answered and makes nothing; one refused stays
+    /// refused; any other is made now if its commit is recorded.
+    async fn attempt(&mut self, who: Who, made: usize) -> Violation {
+        let seat = self.seat(who).await;
+        let before = self.coordinator.recorded.load(Ordering::SeqCst);
+        let batch = self.attempts[made].batch.clone();
+        let writer = &self.seats[seat].writer;
+        let outcome = writer.commit_batches(vec![batch], Embedded::new()).await;
+        let outcome = outcome.and_then(|mut answers| answers.pop().expect("one batch"));
+        let committed = self.coordinator.recorded.load(Ordering::SeqCst) > before;
+        self.seats[seat].open = !self.seats[seat].writer.is_closed();
+
+        let refused = matches!(&outcome, Err(error) if error.refusal().is_some());
+        let attempt = &mut self.attempts[made];
+        if attempt.recorded {
+            return check(!(committed && outcome.is_ok()), || {
+                format!("request {made}, answered before, was made again")
+            });
+        }
+        attempt.refused |= refused;
+        attempt.acknowledged |= outcome.is_ok();
+        if attempt.refused {
+            return check(outcome.is_err(), || {
+                format!("request {made}, refused before, was made after all")
+            });
+        }
+        if committed {
+            attempt.recorded = true;
+            self.since.push(made);
+        }
         let Ok(receipt) = outcome else { return Ok(()) };
-        let counted = self
-            .attempts
-            .iter()
-            .filter(|attempt| attempt.recorded)
-            .count() as i64;
+        let counted = self.expected()[&counter()].0;
         check(
             receipt.outcomes.last() == Some(&Outcome::Value(Value::Int(counted))),
             || {
                 format!(
-                    "a write was told the counter is {:?} after {counted} recorded attempts",
+                    "a write was told the counter is {:?} when it is {counted}",
                     receipt.outcomes.last()
                 )
             },
         )
     }
 
+    /// What is committed, by what was recorded: the rows the last restore
+    /// went back to, and each attempt recorded since made on them in turn.
+    fn expected(&self) -> Rows {
+        let mut rows = self.base.clone();
+        for made in &self.since {
+            let attempt = &self.attempts[*made];
+            let written = (*made as i64, vec![*made as f32, 0.5]);
+            rows.extend(attempt.rows.iter().map(|n| (row(*n), written.clone())));
+            if let Some(deleted) = attempt.deleted {
+                rows.remove(&deleted);
+            }
+            rows.get_mut(&counter()).expect("the counter").0 += 1;
+        }
+        rows
+    }
+
+    /// Flush, merge or clean from `writer`, and say how many files a clean
+    /// deleted.
+    async fn beside(writer: &Writer, beside: Beside, grace: Duration) -> (usize, usize) {
+        match beside {
+            Beside::Flush => writer.flush().await.map_or((0, 0), |_| (0, 0)),
+            Beside::Merge => (usize::from(matches!(writer.merge().await, Ok(Some(_)))), 0),
+            Beside::Clean => (0, writer.clean(grace).await.unwrap_or(0)),
+        }
+    }
+
+    /// Put the partition back as it stood at one of its last few heads,
+    /// with `beside` going on at once if anything. A restore recorded,
+    /// whatever its writer was told, is where everything committed goes on
+    /// from. One that fails must have a reason to: a fault in the store or
+    /// the coordinator, a writer no longer the partition's, or a state to
+    /// go back to that a clean has since deleted.
+    async fn restore(
+        &mut self,
+        who: Who,
+        back: usize,
+        beside: Option<(Beside, bool)>,
+    ) -> Violation {
+        let seat = self.seat(who).await;
+        let within = |(step, _): &&(usize, Committed)| step + WINDOW >= self.step;
+        let Some((seen_at, point)) = self.points.iter().rev().filter(within).nth(back).cloned()
+        else {
+            return Ok(());
+        };
+        let faulty = {
+            let faults = self.faults.lock().unwrap();
+            !faults.puts.is_empty() || !faults.commits.is_empty() || faults.failing_gets > 0
+        };
+        // The partition's own writer, and abreast of it: another on the
+        // same lease, as a node that started its writer again leaves, may
+        // have committed since.
+        let at = self.seats[seat].writer.partition().read(State::position);
+        let abreast = self.seats[seat].writer.lease().generation == self.held.generation
+            && self.cluster.committed().await.log_position == at;
+        let current = abreast && seat + 1 == self.seats.len() && self.seats[seat].open;
+        let before = self.coordinator.restores.load(Ordering::SeqCst);
+        let writer = &self.seats[seat].writer;
+        let restore = Restore {
+            request: RequestId::generate(),
+            asked: [0; 32],
+            from: point.log_position,
+            from_at: Utc::now(),
+        };
+        let restoring = writer.restore_recorded(point.manifest.as_ref(), restore);
+        // Only the partition's own writer cleans with no grace.
+        let grace = match who {
+            Who::Current => Duration::ZERO,
+            Who::Any(_) => STEP * GRACE as u32,
+        };
+        let (outcome, (merged, cleaned)) = match beside {
+            None => (restoring.await, (0, 0)),
+            Some((beside, false)) => tokio::join!(restoring, Self::beside(writer, beside, grace)),
+            Some((beside, true)) => {
+                let (made, outcome) = tokio::join!(Self::beside(writer, beside, grace), restoring);
+                (outcome, made)
+            }
+        };
+        let recorded = self.coordinator.restores.load(Ordering::SeqCst) > before;
+        self.seats[seat].open = !self.seats[seat].writer.is_closed();
+        self.made.merges += merged;
+        self.made.cleaned += cleaned;
+        self.made.raced += usize::from(beside.is_some() && recorded);
+        if cleaned > 0 {
+            self.cleaned_at = Some(self.step);
+        }
+        check(recorded || outcome.is_err(), || {
+            format!("a restore to {point:?} was acknowledged and never recorded")
+        })?;
+        // Whoever had not seen all that was committed must not put any of
+        // it back: its lease may be the partition's still, where a node
+        // started its writer again, but its commit follows nothing.
+        check(abreast || !recorded, || {
+            format!("a writer left behind at {at:?} had its restore to {point:?} recorded")
+        })?;
+        if let Err(error) = &outcome {
+            let deleted = self.cleaned_at.is_some_and(|cleaned| cleaned >= seen_at);
+            check(faulty || !current || deleted, || {
+                format!("a restore to {point:?} failed with nothing in its way: {error}")
+            })?;
+        }
+        if recorded {
+            self.made.restores += 1;
+            self.base = self.history[&point.log_position].clone();
+            self.since.clear();
+        }
+        Ok(())
+    }
+
     async fn step(&mut self, action: Action) -> Violation {
+        self.step += 1;
+        self.blobs.step.store(self.step, Ordering::SeqCst);
         match action {
-            Action::Write { who, rows } => return self.write(who, rows).await,
+            Action::Write { who, rows, delete } => return self.write(who, rows, delete).await,
+            Action::Again { who, pick } => {
+                if self.attempts.is_empty() {
+                    return Ok(());
+                }
+                return self.attempt(who, pick % self.attempts.len()).await;
+            }
             Action::Flush { who } => {
                 let seat = self.seat(who).await;
-                self.seats[seat].open = self.seats[seat].writer.flush().await.is_ok();
+                let _ = self.seats[seat].writer.flush().await;
+                self.seats[seat].open = !self.seats[seat].writer.is_closed();
             }
+            Action::Merge { who } => {
+                let seat = self.seat(who).await;
+                let merged = self.seats[seat].writer.merge().await;
+                self.made.merges += usize::from(matches!(merged, Ok(Some(_))));
+                self.seats[seat].open = !self.seats[seat].writer.is_closed();
+            }
+            Action::Clean { who, aged } => {
+                let seat = self.seat(who).await;
+                let grace = match (who, aged) {
+                    (Who::Current, false) => Duration::ZERO,
+                    _ => STEP * GRACE as u32,
+                };
+                let cleaned = self.seats[seat].writer.clean(grace).await.unwrap_or(0);
+                match grace.is_zero() {
+                    true => self.made.cleaned += cleaned,
+                    false => self.made.aged += cleaned,
+                }
+                if cleaned > 0 {
+                    self.cleaned_at = Some(self.step);
+                }
+                self.seats[seat].open = !self.seats[seat].writer.is_closed();
+            }
+            Action::Restore { who, back, beside } => return self.restore(who, back, beside).await,
             Action::Takeover => self.take_over().await,
             Action::Reopen => {
                 let committed = self.cluster.committed().await;
@@ -688,16 +1035,7 @@ impl World {
         })?;
 
         let (_, rows) = self.truth(&committed).await?;
-        let recorded = || {
-            self.attempts
-                .iter()
-                .enumerate()
-                .filter(|(_, attempt)| attempt.recorded)
-        };
-        let expected: BTreeMap<ObjectId, i64> = recorded()
-            .flat_map(|(n, attempt)| attempt.rows.iter().map(move |r| (row(*r), n as i64)))
-            .chain([(counter(), recorded().count() as i64)])
-            .collect();
+        let expected = self.expected();
         check(rows == expected, || {
             let missing: Vec<_> = expected
                 .iter()
@@ -710,6 +1048,9 @@ impl World {
             format!("committed rows differ from recorded attempts: missing {missing:?}, unexpected {extra:?}")
         })?;
         self.history.insert(committed.log_position, rows);
+        if self.points.last().map(|(_, point)| point) != Some(&committed) {
+            self.points.push((self.step, committed));
+        }
 
         let copies = self
             .seats
@@ -724,7 +1065,7 @@ impl World {
     }
 }
 
-async fn simulate(actions: Vec<Action>, canary: Option<Canary>) -> Violation {
+async fn simulate(actions: Vec<Action>, canary: Option<Canary>) -> Result<Made, String> {
     let mut world = World::new(canary).await;
     for (step, action) in actions.into_iter().enumerate() {
         let described = format!("step {step} ({action:?})");
@@ -746,10 +1087,11 @@ async fn simulate(actions: Vec<Action>, canary: Option<Canary>) -> Violation {
     world
         .follow()
         .await
-        .map_err(|violation| format!("at the end: {violation}"))
+        .map_err(|violation| format!("at the end: {violation}"))?;
+    Ok(world.made)
 }
 
-fn run(actions: Vec<Action>, canary: Option<Canary>) -> Violation {
+fn run(actions: Vec<Action>, canary: Option<Canary>) -> Result<Made, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
@@ -763,6 +1105,10 @@ fn histories() -> impl Strategy<Value = Vec<Action>> {
 }
 
 proptest! {
+    // Four times as many histories as by default: some faults want a
+    // writer left behind, a restore and a clean in just the right order.
+    #![proptest_config(ProptestConfig::with_cases(1_024))]
+
     #[test]
     fn no_history_of_faults_loses_an_acknowledged_write_or_shows_an_unrecorded_one(
         actions in histories()
@@ -772,8 +1118,9 @@ proptest! {
 }
 
 /// The first violation the simulation reports over a fixed set of histories
-/// when one of its dependencies is broken in the given way.
-fn first_violation(canary: Option<Canary>) -> Option<String> {
+/// when one of its dependencies is broken in the given way, and how much
+/// the histories without one made between them.
+fn first_violation(canary: Option<Canary>) -> (Option<String>, Made) {
     let config = Config {
         cases: 200,
         failure_persistence: None,
@@ -781,29 +1128,50 @@ fn first_violation(canary: Option<Canary>) -> Option<String> {
         ..Config::default()
     };
     let rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
-    let found = Mutex::new(None);
+    let found = Mutex::new((None, Made::default()));
     let _ = TestRunner::new_with_rng(config, rng).run(&histories(), |actions| {
-        run(actions, canary).map_err(|violation| {
-            found.lock().unwrap().get_or_insert(violation.clone());
-            TestCaseError::fail(violation)
-        })
+        let outcome = run(actions, canary);
+        let mut found = found.lock().unwrap();
+        match outcome {
+            Ok(made) => {
+                found.1.merges += made.merges;
+                found.1.cleaned += made.cleaned;
+                found.1.aged += made.aged;
+                found.1.restores += made.restores;
+                found.1.raced += made.raced;
+                Ok(())
+            }
+            Err(violation) => {
+                found.0.get_or_insert(violation.clone());
+                Err(TestCaseError::fail(violation))
+            }
+        }
     });
     found.into_inner().unwrap()
 }
 
 #[test]
 fn the_checker_passes_a_healthy_system_and_catches_a_broken_one() {
-    assert_eq!(first_violation(None), None);
+    let (violation, made) = first_violation(None);
+    assert_eq!(violation, None);
+    // Merges, cleaning up and restores are tried in earnest, not only asked
+    // for where there is nothing for them to do.
+    assert!(
+        made.merges > 100 && made.cleaned > 100 && made.restores > 100,
+        "{made:?}"
+    );
+    assert!(made.aged > 20 && made.raced > 20, "{made:?}");
 
     // A commit acknowledged without being recorded shows up as whichever of
     // its symptoms the history reaches first.
     let symptoms = ["never recorded", "never committed", "was told the counter"];
-    let unrecorded = first_violation(Some(Canary::AcknowledgesUnrecordedCommits)).unwrap();
+    let (unrecorded, _) = first_violation(Some(Canary::AcknowledgesUnrecordedCommits));
+    let unrecorded = unrecorded.unwrap();
     assert!(
         symptoms.iter().any(|symptom| unrecorded.contains(symptom)),
         "{unrecorded}"
     );
 
-    let dropped = first_violation(Some(Canary::DropsSegments)).unwrap();
+    let dropped = first_violation(Some(Canary::DropsSegments)).0.unwrap();
     assert!(dropped.contains("cannot be read"), "{dropped}");
 }

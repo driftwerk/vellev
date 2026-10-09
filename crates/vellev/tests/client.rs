@@ -10,7 +10,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use vellev_api::{
     Bounded, Change, Changes, Code, Content, Hybrid, Keyword, Limit, Missing, Nearest, OnlyIf,
-    Outcome, Page, Reason, AFTER, REQUEST,
+    Outcome, Page, Reason, RestoreTo, AFTER, REQUEST,
 };
 use vellev_client::api::After;
 use vellev_client::{Client, Error, Options};
@@ -832,6 +832,39 @@ async fn a_write_whose_answer_was_lost_is_answered_as_it_was_and_a_later_write_s
 }
 
 #[tokio::test]
+async fn a_restore_whose_answer_was_lost_is_answered_as_it_was_and_a_later_write_survives() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    let direct = Client::connect(&[&served.url], KEY, tries(1)).unwrap();
+    let notes = direct.tenant(&tenant("acme")).collection(&notes_named());
+    let kept = notes.put(oid(1), &content("fox", 1, None)).await.unwrap();
+    notes.put(oid(2), &content("hen", 2, None)).await.unwrap();
+
+    let other = notes.clone();
+    let lossy = losing_first_answer(&served.url, move || {
+        let other = other.clone();
+        Box::pin(async move {
+            other.put(oid(3), &content("owl", 3, None)).await.unwrap();
+        })
+    })
+    .await;
+    let client = Client::connect(&[&lossy], KEY, quick(3)).unwrap();
+    let restored = client
+        .tenant(&tenant("acme"))
+        .restore(RestoreTo::Position(kept.position))
+        .await
+        .unwrap();
+    assert_eq!(restored.from.position, kept.position);
+    assert!(notes.get(oid(2)).await.unwrap().is_none(), "it went back");
+    assert!(
+        notes.get(oid(3)).await.unwrap().is_some(),
+        "the later write survives"
+    );
+    assert_eq!(restored.incarnation, kept.incarnation);
+    assert_eq!(client.after(&tenant("acme")), Some(restored.after()));
+}
+
+#[tokio::test]
 async fn a_request_turned_away_for_asking_too_much_is_asked_again_once_the_wait_is_over() {
     let served = Cluster::new().serve_limited(2.0).await;
     served.with_notes(supplied()).await;
@@ -845,6 +878,57 @@ async fn a_request_turned_away_for_asking_too_much_is_asked_again_once_the_wait_
         started.elapsed() >= Duration::from_millis(900),
         "waited as told: {:?}",
         started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_read_a_busy_node_turns_away_is_asked_again_once_the_wait_it_gave_is_over() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    // Every turn the node has for a read is taken, for a while that is
+    // longer than the client's own backoff and shorter than the second
+    // the node says to wait.
+    let other = tenant("beta");
+    let mut taken = Vec::new();
+    for _ in 0..READS {
+        taken.push(served.app.reading(&other).await.unwrap());
+    }
+    let freeing = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drop(taken);
+    });
+    let client = Client::connect(&[&served.url], KEY, quick(2)).unwrap();
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let started = Instant::now();
+    notes
+        .list(&Page::new(1))
+        .await
+        .expect("answered on the second try");
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "waited as told: {:?}",
+        started.elapsed()
+    );
+    freeing.await.unwrap();
+
+    // With no try left, the failure says how long the node said to wait.
+    let mut taken = Vec::new();
+    for _ in 0..READS {
+        taken.push(served.app.reading(&other).await.unwrap());
+    }
+    let once = Client::connect(&[&served.url], KEY, quick(1)).unwrap();
+    let notes = once.tenant(&tenant("acme")).collection(&notes_named());
+    let refused = notes.list(&Page::new(1)).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            Error::Api {
+                code: Code::Unavailable,
+                wait: Some(wait),
+                ..
+            } if wait == Duration::from_secs(1)
+        ),
+        "{refused:?}"
     );
 }
 
@@ -867,8 +951,12 @@ async fn a_failure_says_what_was_asked_too_much_of_or_is_missing_and_any_key_lea
             "oversample": 1_024,
             "body_bytes": MAX_BODY,
             "restore_window_secs": 10 * 366 * 24 * 60 * 60,
+            "deleted": 8_192,
+            "reads_at_once": READS,
         })
     );
+    assert_eq!(limits.max(Bounded::Deleted), Some(8_192));
+    assert_eq!(limits.max(Bounded::ReadsAtOnce), Some(READS as u64));
     let issued = client.tenant(&tenant("acme")).issue_key().await.unwrap();
     let tenants_own = Client::connect(&[&served.url], &issued.key, quick(1)).unwrap();
     assert_eq!(tenants_own.limits().await.unwrap(), Some(limits));

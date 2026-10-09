@@ -7,3 +7,4 @@
 cc 34e815a4bdfd94d5257343c37f39fd6fa21a27504cf2a260c366643a45998d2f # shrinks to actions = [Commit([Create(0)]), Commit([Upsert(0, 0, 0)]), Commit([Create(1)]), Flush, Commit([Delete(0, 0), Upsert(1, 0, 0)]), Flush]
 cc 2adbb3c311b7af28c9c253b09ca1cad9a191217388b0c1b30aa60d4a03a7abc1 # shrinks to actions = [Commit([Upsert(1, 2, 0)]), Commit([Delete(1, 0)])]
 cc 77d66a2232caae7dbaa04191e59df49d1ffaa967e580c28a91d587cb1066a4eb # shrinks to actions = [Commit([Increment(1, 4, 2)]), Commit([Upsert(1, 4, 2)])]
+cc baa2b58253ac865e95b86aadaef399a69d185c5c69d00df875a75bb658a66e68 # shrinks to actions = [Commit([DeleteFrom(0, 0), DeleteFrom(0, 0)])]

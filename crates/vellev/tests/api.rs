@@ -1658,6 +1658,480 @@ async fn a_tenant_asking_too_much_is_answered_429_with_when_to_ask_again() {
     );
 }
 
+#[tokio::test]
+async fn reads_past_as_many_as_a_node_answers_at_once_are_turned_away_and_writes_go_on() {
+    let served = Served::new().await;
+    four_notes(&served).await;
+    let nearest = json!({ "vector": [1.0, 0.0], "limit": 1 });
+    let path = format!("{NOTES}/nearest");
+    let search = || async {
+        let asked = served.http.post(format!("{}{path}", served.url));
+        let answer = asked.bearer_auth(KEY).json(&nearest).send().await.unwrap();
+        let again = answer.headers().get("retry-after").cloned();
+        (
+            answer.status(),
+            again,
+            answer.json::<Value>().await.unwrap(),
+        )
+    };
+
+    // Every turn there is for a read is taken, as by reads that never
+    // end, of tenants other than the one asking.
+    let others = ["beta", "gamma"].map(|other| vellev_core::TenantId::new(other).unwrap());
+    let mut taken = Vec::new();
+    for other in others.iter().cycle().take(READS) {
+        taken.push(served.app.reading(other).await.unwrap());
+    }
+    let asked = std::time::Instant::now();
+    let (status, again, refused) = search().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+    assert_eq!(code(&refused), "unavailable", "to be asked again");
+    assert_eq!(again.unwrap(), "1", "and told when");
+    assert!(
+        asked.elapsed() >= std::time::Duration::from_millis(50),
+        "it waited a moment first"
+    );
+    // A write takes no such turn.
+    let note = json!({ "properties": { "title": "an owl", "n": 9 }, "vector": [0.0, 1.0] });
+    let (status, written) = served
+        .put(&format!("{NOTES}/objects/{}", id(9)), note)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{written}");
+
+    // A turn that comes free while a read waits for one is the read's.
+    let freeing = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        drop(taken);
+    });
+    let (status, _, found) = search().await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    freeing.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tenant_alone_may_have_every_read_a_node_answers_at_once() {
+    let served = Served::new().await;
+    four_notes(&served).await;
+    let acme = vellev_core::TenantId::new("acme").unwrap();
+    let nearest = json!({ "vector": [1.0, 0.0], "limit": 1 });
+    let search = || async {
+        served
+            .post(&format!("{NOTES}/nearest"), nearest.clone())
+            .await
+            .0
+    };
+
+    // With no other tenant asking, it is held to no share of the turns.
+    let mut all = Vec::new();
+    for _ in 0..READS {
+        all.push(served.app.reading(&acme).await.expect("a turn"));
+    }
+    assert_eq!(search().await, StatusCode::SERVICE_UNAVAILABLE);
+    all.pop();
+    assert_eq!(search().await, StatusCode::OK);
+}
+
+/// What each kind of read is asked with, of a collection whose vectors
+/// its clients supply.
+fn reads() -> [(&'static str, Value); 5] {
+    [
+        ("nearest", json!({ "vector": [1.0, 0.0], "limit": 1 })),
+        ("keyword", json!({ "text": "fox", "limit": 1 })),
+        (
+            "hybrid",
+            json!({ "text": "fox", "vector": [1.0, 0.0], "limit": 1 }),
+        ),
+        ("list", json!({ "limit": 1 })),
+        ("count", json!({})),
+    ]
+}
+
+/// Tenant `tenant` with a `notes` collection and one note in it.
+async fn one_note(served: &Served, tenant: &str, embedding: Value) {
+    let at = format!("/v1/tenants/{tenant}");
+    served.ok(Method::PUT, &at, None).await;
+    let notes_at = format!("{at}/collections/notes");
+    let supplies = embedding["provider"] == "none";
+    served
+        .ok(Method::PUT, &notes_at, Some(notes(embedding)))
+        .await;
+    let mut note = json!({ "properties": { "title": "a red fox", "n": 1 } });
+    if supplies {
+        note["vector"] = json!([1.0, 0.0]);
+    }
+    let path = format!("{notes_at}/objects/{}", id(1));
+    served.ok(Method::PUT, &path, Some(note)).await;
+}
+
+/// Every kind of read of `tenant`, asked over and over for a while: the
+/// first that is not answered, if any.
+async fn unanswered(served: &Served, tenant: &str) -> Option<(&'static str, StatusCode, Value)> {
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < until {
+        for (kind, asked) in reads() {
+            let path = format!("/v1/tenants/{tenant}/collections/notes/{kind}");
+            let (status, body) = served.post(&path, asked).await;
+            if status != StatusCode::OK {
+                return Some((kind, status, body));
+            }
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn a_read_turned_away_for_want_of_a_turn_is_not_counted_against_its_tenant() {
+    // Two queries a second: a third within the second is turned away as
+    // one too many.
+    let served = Cluster::new().serve_limited(2.0).await;
+    four_notes(&served).await;
+    let other = vellev_core::TenantId::new("beta").unwrap();
+    let mut taken = Vec::new();
+    for _ in 0..READS {
+        taken.push(served.app.reading(&other).await.unwrap());
+    }
+    // However many are turned away for want of a turn, of whichever kind,
+    // none is one of the two.
+    for (kind, asked) in reads() {
+        for nth in 0..4 {
+            let (status, refused) = served.post(&format!("{NOTES}/{kind}"), asked.clone()).await;
+            assert_eq!(
+                (status, code(&refused)),
+                (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+                "{kind} {nth}: {refused}"
+            );
+        }
+    }
+    drop(taken);
+    for (kind, asked) in reads().into_iter().take(2) {
+        let (status, answered) = served.post(&format!("{NOTES}/{kind}"), asked).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {answered}");
+    }
+}
+
+/// The statuses of `asked` reads of one kind sent one after another, as
+/// fast as they are answered: far faster than two a second.
+async fn burst(
+    served: &Served,
+    asked: usize,
+    read: impl Fn(usize) -> (String, Value, &'static [(&'static str, &'static str)]),
+) -> Vec<StatusCode> {
+    let mut statuses = Vec::new();
+    for nth in 0..asked {
+        let (path, body, headers) = read(nth);
+        let answer = served.call_headed(Some(KEY), Method::POST, &path, Some(body), headers);
+        statuses.push(answer.await.0);
+    }
+    statuses
+}
+
+/// How many of `statuses` are each of the two, if they are all one of
+/// the two.
+fn either(statuses: &[StatusCode], one: StatusCode, other: StatusCode) -> (usize, usize) {
+    let count = |status| statuses.iter().filter(|told| **told == status).count();
+    assert_eq!(count(one) + count(other), statuses.len(), "{statuses:?}");
+    (count(one), count(other))
+}
+
+#[tokio::test]
+async fn a_read_that_had_its_turn_is_a_query_however_it_ends() {
+    // Two queries a second, and twenty reads in far less than ten: most
+    // are one too many, were each of them counted.
+    let nearest = || json!({ "vector": [1.0, 0.0], "limit": 1 });
+    let answered = Cluster::new().serve_limited(2.0).await;
+    four_notes(&answered).await;
+    let statuses = burst(&answered, 20, |_| {
+        (format!("{NOTES}/nearest"), nearest(), &[])
+    })
+    .await;
+    assert_eq!(statuses[..2], [StatusCode::OK; 2], "{statuses:?}");
+    let (_, too_many) = either(&statuses, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS);
+    assert!(too_many > 0, "a search answered is a query: {statuses:?}");
+
+    // One that fails once it has its turn, as a search of a collection
+    // that is not there does, is one as well.
+    let failing = Cluster::new().serve_limited(2.0).await;
+    four_notes(&failing).await;
+    let absent = "/v1/tenants/acme/collections/absent/nearest";
+    let statuses = burst(&failing, 20, |_| (absent.to_string(), nearest(), &[])).await;
+    assert_eq!(statuses[..2], [StatusCode::NOT_FOUND; 2], "{statuses:?}");
+    let (_, too_many) = either(
+        &statuses,
+        StatusCode::NOT_FOUND,
+        StatusCode::TOO_MANY_REQUESTS,
+    );
+    assert!(too_many > 0, "a search that failed is one: {statuses:?}");
+}
+
+#[tokio::test]
+async fn a_read_turned_away_after_something_costly_was_done_for_it_stays_counted() {
+    let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let url = embedding_server(down).await;
+    let served = Cluster::new()
+        .serve_limited_embedding_through(2.0, std::slice::from_ref(&url))
+        .await;
+    let embedding = json!({
+        "provider": "http", "url": format!("{url}/"), "model": "stand-in",
+        "dimensions": 2, "properties": ["title"],
+    });
+    one_note(&served, "acme", embedding).await;
+    let by_text = |text: String| {
+        (
+            format!("{NOTES}/nearest"),
+            json!({ "text": text, "limit": 1 }),
+            &[] as &[_],
+        )
+    };
+    // One search by a text, answered: its vector is kept.
+    assert_eq!(
+        burst(&served, 1, |_| by_text("fox".into())).await,
+        [StatusCode::OK]
+    );
+
+    // Every turn is taken. The same text again is sent to no model, and
+    // however often it is turned away it is not counted.
+    let other = vellev_core::TenantId::new("beta").unwrap();
+    let mut taken = Vec::new();
+    for _ in 0..READS {
+        taken.push(served.app.reading(&other).await.unwrap());
+    }
+    let turned_away = StatusCode::SERVICE_UNAVAILABLE;
+    let again = burst(&served, 12, |_| by_text("fox".into())).await;
+    assert_eq!(again, [turned_away; 12]);
+    // A text not asked before is sent to the model each time, and each
+    // is counted though it is turned away: the tenant is soon told it
+    // asks too much, and the model is asked no more for it.
+    let fresh = burst(&served, 20, |nth| {
+        by_text(format!("a text never asked {nth}"))
+    })
+    .await;
+    assert_eq!(fresh[0], turned_away, "{fresh:?}");
+    let (_, too_many) = either(&fresh, turned_away, StatusCode::TOO_MANY_REQUESTS);
+    assert!(too_many > 0, "a search embedded is a query: {fresh:?}");
+    drop(taken);
+
+    // So is a read the coordinator was asked for.
+    let served = Cluster::new().serve_limited(2.0).await;
+    four_notes(&served).await;
+    let mut taken = Vec::new();
+    for _ in 0..READS {
+        taken.push(served.app.reading(&other).await.unwrap());
+    }
+    type Headers = &'static [(&'static str, &'static str)];
+    let strong: Headers = &[("x-vellev-consistency", "strong")];
+    let count = |headers: Headers| (format!("{NOTES}/count"), json!({}), headers);
+    let eventual = burst(&served, 12, |_| count(&[])).await;
+    assert_eq!(eventual, [turned_away; 12]);
+    let asked = burst(&served, 20, |_| count(strong)).await;
+    assert_eq!(asked[0], turned_away, "{asked:?}");
+    let (_, too_many) = either(&asked, turned_away, StatusCode::TOO_MANY_REQUESTS);
+    assert!(too_many > 0, "a strong read is a query: {asked:?}");
+}
+
+/// A stand-in embedding server that keeps every text beginning `wait`
+/// unanswered while `held` is set, and counts those it is keeping.
+async fn holding_embedding_server(
+    held: tokio::sync::watch::Receiver<bool>,
+    keeping: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> String {
+    let embed = move |axum::Json(body): axum::Json<Value>| {
+        let (mut held, keeping) = (held.clone(), keeping.clone());
+        async move {
+            let texts: Vec<&str> = body["inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|text| text.as_str().unwrap())
+                .collect();
+            if texts.iter().any(|text| text.starts_with("wait")) {
+                keeping.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.wait_for(|held| !held).await.unwrap();
+            }
+            let vectors: Vec<[usize; 2]> = texts
+                .iter()
+                .map(|text| [text.len(), text.split_whitespace().count()])
+                .collect();
+            axum::Json(json!(vectors))
+        }
+    };
+    let router = axum::Router::new().route("/embed", axum::routing::post(embed));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    url
+}
+
+/// Wait until `count` is no longer nothing.
+async fn some(count: &std::sync::atomic::AtomicUsize) {
+    let counted = async {
+        while count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), counted)
+        .await
+        .expect("something to count");
+}
+
+#[tokio::test]
+async fn a_search_waiting_for_its_text_to_be_embedded_keeps_no_turn_from_other_reads() {
+    let (hold, held) = tokio::sync::watch::channel(false);
+    let keeping = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let url = holding_embedding_server(held, keeping.clone()).await;
+    let cluster = Cluster::new();
+    let served = cluster
+        .serve_embedding_through(std::slice::from_ref(&url))
+        .await;
+    let served = std::sync::Arc::new(served);
+    let embedding = json!({
+        "provider": "http", "url": format!("{url}/"), "model": "stand-in",
+        "dimensions": 2, "properties": ["title"],
+    });
+    one_note(&served, "acme", embedding.clone()).await;
+    one_note(&served, "beta", embedding).await;
+    one_note(&served, "gamma", supplied()).await;
+
+    for kind in ["nearest", "hybrid"] {
+        // The embedder stops answering, and more searches by text than
+        // the node has turns wait for it.
+        hold.send(true).unwrap();
+        keeping.store(0, std::sync::atomic::Ordering::SeqCst);
+        let waiting: Vec<_> = (0..2 * READS)
+            .map(|nth| {
+                let served = served.clone();
+                let tenant = ["acme", "beta"][nth % 2];
+                tokio::spawn(async move {
+                    let path = format!("/v1/tenants/{tenant}/collections/notes/{kind}");
+                    let asked = json!({ "text": format!("wait {kind} {nth}"), "limit": 1 });
+                    served.post(&path, asked).await
+                })
+            })
+            .collect();
+        some(&keeping).await;
+        // None of them is on a thread, and none has a turn: every read
+        // that needs no embedding is answered, of a tenant that searches
+        // by text and of one that does not.
+        for tenant in ["gamma", "acme"] {
+            let refused = unanswered(&served, tenant).await;
+            assert!(refused.is_none(), "{kind}, {tenant}: {refused:?}");
+        }
+        hold.send(false).unwrap();
+        for waited in waiting {
+            let (status, answer) = waited.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{kind}: {answer}");
+        }
+    }
+}
+
+/// A store that keeps what it is asked to get of one tenant unanswered
+/// while `held` is set, and counts what it is keeping.
+#[derive(Debug)]
+struct HoldingStore {
+    inner: std::sync::Arc<dyn vellev_storage::blobs::Blobs>,
+    of: &'static str,
+    held: tokio::sync::watch::Receiver<bool>,
+    keeping: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl vellev_storage::blobs::Blobs for HoldingStore {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        let mut held = self.held.clone();
+        if key.contains(self.of) && *held.borrow() {
+            self.keeping
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.wait_for(|held| !held).await.unwrap();
+        }
+        self.inner.get(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_read_waiting_for_its_tenant_to_be_opened_keeps_no_turn_from_another_tenants() {
+    let cluster = Cluster::new();
+    let holder = cluster.serve().await;
+    one_note(&holder, "acme", supplied()).await;
+    one_note(&holder, "gamma", supplied()).await;
+
+    for (kind, asked) in reads() {
+        // Another node, as one just started: it has opened one tenant,
+        // and its store is slow to give it the other's files.
+        let (hold, held) = tokio::sync::watch::channel(false);
+        let keeping = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = HoldingStore {
+            inner: cluster.blobs(),
+            of: "acme",
+            held,
+            keeping: keeping.clone(),
+        };
+        let other = cluster.through(std::sync::Arc::new(store)).serve().await;
+        let other = std::sync::Arc::new(other);
+        assert_eq!(unanswered(&other, "gamma").await, None);
+        hold.send(true).unwrap();
+        // More reads than the node has turns wait for the tenant to open.
+        let waiting: Vec<_> = (0..2 * READS)
+            .map(|_| {
+                let (other, asked) = (other.clone(), asked.clone());
+                let path = format!("{NOTES}/{kind}");
+                tokio::spawn(async move { other.post(&path, asked).await })
+            })
+            .collect();
+        some(&keeping).await;
+        let refused = unanswered(&other, "gamma").await;
+        assert!(refused.is_none(), "{kind}: {refused:?}");
+        hold.send(false).unwrap();
+        for waited in waiting {
+            let (status, answer) = waited.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{kind}: {answer}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_read_keeps_its_turn_until_it_is_done_whoever_stops_waiting_for_it() {
+    let served = Served::new().await;
+    let acme = vellev_core::TenantId::new("acme").unwrap();
+    // A read that takes its time, and whoever asked for it gone.
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    let turn = served.app.reading(&acme).await.unwrap();
+    let reading = tokio::spawn(turn.run(move || wait.recv()));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    reading.abort();
+    assert!(reading.await.unwrap_err().is_cancelled());
+
+    // It is being read still, and counts for one of the node's turns.
+    let mut rest = Vec::new();
+    for _ in 1..READS {
+        rest.push(served.app.reading(&acme).await.unwrap());
+    }
+    assert!(served.app.reading(&acme).await.is_err(), "all are taken");
+    drop(done);
+    let last = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Ok(turn) = served.app.reading(&acme).await {
+                break turn;
+            }
+        }
+    });
+    last.await.expect("free once the read is done");
+    drop(rest);
+}
+
 /// A failure's whole body, as the API writes it.
 fn failed(code: &str, message: &str, more: Value) -> Value {
     let mut problem = json!({ "code": code, "message": message });
@@ -1900,6 +2374,8 @@ async fn the_limits_are_told_to_every_key_and_to_no_caller_without_one() {
         "oversample": 1024,
         "body_bytes": MAX_BODY,
         "restore_window_secs": 10 * 366 * 24 * 60 * 60,
+        "deleted": 8_192,
+        "reads_at_once": READS,
     });
     for key in [KEY, tenants_key] {
         let told = served
@@ -1921,6 +2397,80 @@ async fn the_limits_are_told_to_every_key_and_to_no_caller_without_one() {
         (status, code(&body)),
         (StatusCode::METHOD_NOT_ALLOWED, "invalid")
     );
+}
+
+#[tokio::test]
+async fn a_request_to_delete_more_than_one_may_says_the_most_one_may() {
+    let served = Served::new().await;
+    four_notes(&served).await;
+    let (_, limits) = served.get("/v1/limits").await;
+    let most = limits["deleted"].as_u64().expect("the node says the most");
+    let delete = |limit: Option<u64>| {
+        let mut change = json!({ "op": "delete_where", "collection": "notes",
+            "filter": { "gte": { "property": "n", "value": 0 } } });
+        if let Some(limit) = limit {
+            change["limit"] = json!(limit);
+        }
+        change
+    };
+    let send = |changes: Vec<Value>| {
+        let served = &served;
+        async move {
+            let body = json!({ "changes": changes });
+            served.post("/v1/tenants/acme/changes", body).await
+        }
+    };
+    let too_many = |message: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            failed(
+                "invalid",
+                message,
+                json!({ "limit": { "name": "deleted", "max": most } }),
+            ),
+        )
+    };
+    let between_them = |may: u64| {
+        too_many(&format!(
+            "the deletes by filter of one request may delete {may} objects between them, each \
+             without a limit counting for {most}, which is the most one request may delete; \
+             send them in requests of their own, or with limits that come to no more"
+        ))
+    };
+
+    // A limit past the most, and limits that come to more between them,
+    // with or without one that has none.
+    assert_eq!(
+        send(vec![delete(Some(most + 1))]).await,
+        too_many(&format!("a delete takes a limit of 1 to {most}"))
+    );
+    assert_eq!(
+        send(vec![delete(Some(most)), delete(Some(1))]).await,
+        between_them(most + 1)
+    );
+    assert_eq!(
+        send(vec![delete(None), delete(None)]).await,
+        between_them(2 * most)
+    );
+    // A limit of none is no limit to give: it asks for nothing too much,
+    // and is told no most.
+    let (status, none) = send(vec![delete(Some(0))]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{none}");
+    assert_eq!(
+        none,
+        failed(
+            "invalid",
+            &format!("a delete takes a limit of 1 to {most}"),
+            json!({})
+        )
+    );
+    // Nothing was deleted by any of them, and the most itself is taken.
+    let (_, counted) = served.post(&format!("{NOTES}/count"), json!({})).await;
+    assert_eq!(counted["count"], 4);
+    let (status, deleted) = send(vec![delete(Some(most))]).await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    let (_, counted) = served.post(&format!("{NOTES}/count"), json!({})).await;
+    assert_eq!(counted["count"], 0);
 }
 
 /// What a node that cannot use a collection's model answers.

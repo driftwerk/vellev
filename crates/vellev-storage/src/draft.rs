@@ -11,9 +11,9 @@ use vellev_index::filter::Predicate;
 
 use crate::catalog::Catalog;
 use crate::format::{CollectionId, Op};
-use crate::mutation::{Condition, Mutation, Outcome};
+use crate::mutation::{Condition, Mutation, Outcome, DELETED_AT_MOST};
 use crate::state::{Live, State};
-use crate::{Result, StorageError};
+use crate::{Capped, Over, Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
 
@@ -83,6 +83,23 @@ impl<'a> Draft<'a> {
     }
 
     fn resolved(&mut self, mutations: Vec<Mutation>) -> Result<Vec<Outcome>> {
+        // Each delete by filter sees what those before it deleted, so the
+        // batch may delete as many as all of them may between them: no
+        // more than one of them may alone, or the batch is one commit of
+        // any size after all.
+        let deletes = mutations.iter().filter_map(|mutation| match mutation {
+            Mutation::DeleteWhere { .. } => Some(mutation.rows()),
+            _ => None,
+        });
+        let may_delete: usize = deletes.sum();
+        if may_delete > DELETED_AT_MOST {
+            return Err(too_many_deleted(format!(
+                "the deletes by filter of one request may delete {may_delete} objects between \
+                 them, each without a limit counting for {DELETED_AT_MOST}, which is the most \
+                 one request may delete; send them in requests of their own, or with limits \
+                 that come to no more"
+            )));
+        }
         let mut batch = Batch {
             draft: self,
             catalog: self.pending.catalog.clone(),
@@ -157,6 +174,17 @@ impl<'a> Draft<'a> {
 
 fn invalid(reason: String) -> StorageError {
     StorageError::InvalidMutation(reason)
+}
+
+/// A request that would delete more by filter than one may, or may.
+fn too_many_deleted(message: String) -> StorageError {
+    StorageError::TooMany {
+        over: Over {
+            capped: Capped::Deleted,
+            most: DELETED_AT_MOST as u64,
+        },
+        message,
+    }
 }
 
 impl Batch<'_> {
@@ -335,7 +363,11 @@ impl Batch<'_> {
                 self.delete(cid, id);
                 Ok(Outcome::Applied)
             }
-            Mutation::DeleteWhere { collection, filter } => {
+            Mutation::DeleteWhere {
+                collection,
+                filter,
+                limit,
+            } => {
                 let (cid, schema) = self.collection(&collection)?;
                 let predicate = filter.compile(&schema)?;
                 if predicate.is_unconditional() {
@@ -343,7 +375,25 @@ impl Batch<'_> {
                         "a delete from {collection} needs a condition; drop the collection to empty it"
                     )));
                 }
-                let doomed = self.passing(cid, &predicate);
+                // Only a limit past the most is told the most: one of
+                // none is not helped by it.
+                let out_of_range = format!("a delete takes a limit of 1 to {DELETED_AT_MOST}");
+                match limit {
+                    Some(0) => return Err(invalid(out_of_range)),
+                    Some(limit) if limit > DELETED_AT_MOST => {
+                        return Err(too_many_deleted(out_of_range))
+                    }
+                    _ => {}
+                }
+                let (doomed, more) =
+                    self.passing(cid, &predicate, limit.unwrap_or(DELETED_AT_MOST));
+                if more && limit.is_none() {
+                    return Err(too_many_deleted(format!(
+                        "more than {DELETED_AT_MOST} objects of {collection} pass the filter, \
+                         which is the most one delete takes; give the delete a limit, \
+                         and ask again until it deletes fewer than that"
+                    )));
+                }
                 doomed.iter().for_each(|id| self.delete(cid, *id));
                 Ok(Outcome::Deleted(doomed.len() as u64))
             }
@@ -357,9 +407,16 @@ impl Batch<'_> {
 
     /// The ids of the collection's rows, as this batch sees them, that pass
     /// `predicate`: stored rows nothing pending has replaced, and pending
-    /// rows, a batch's own taking precedence. In id order, so that the ops a
-    /// filter resolves to do not depend on how rows happen to be stored.
-    fn passing(&self, collection: CollectionId, predicate: &Predicate) -> BTreeSet<ObjectId> {
+    /// rows, a batch's own taking precedence. At most `most` of them,
+    /// whichever are found first as the rows happen to be stored, with
+    /// whether there are more, found without looking further; those found
+    /// are deleted in id order.
+    fn passing(
+        &self,
+        collection: CollectionId,
+        predicate: &Predicate,
+        most: usize,
+    ) -> (BTreeSet<ObjectId>, bool) {
         let pending = &self.draft.pending.rows;
         let overlaid = |id: ObjectId| {
             let key = (collection, id);
@@ -379,7 +436,10 @@ impl Batch<'_> {
             .filter_map(|(_, row)| row.as_ref())
             .filter(|object| predicate.matches(object))
             .map(|object| object.id);
-        stored.chain(written).collect()
+        let mut found = stored.chain(written);
+        let passing: BTreeSet<ObjectId> = found.by_ref().take(most).collect();
+        let more = found.next().is_some();
+        (passing, more)
     }
 }
 

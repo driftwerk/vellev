@@ -259,6 +259,78 @@ fn checksum(described: &[u8], body: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+/// How much of a body is summed between one word of progress and the next.
+pub(crate) const SUMMED_AT_ONCE: usize = 4 * 1024 * 1024;
+
+/// What a frame's checksum must come to, and of what besides its body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Sum<'a> {
+    described: &'a [u8],
+    expected: u32,
+}
+
+impl Sum<'_> {
+    /// Whether `body` sums to what the frame says, telling `summed` of
+    /// each piece of it as it is done, so that whoever waits on a body of
+    /// gigabytes on a slow disk can tell slow from stopped.
+    pub fn holds(&self, body: &[u8], mut summed: impl FnMut(usize)) -> bool {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(self.described);
+        for piece in body.chunks(SUMMED_AT_ONCE) {
+            hasher.update(piece);
+            summed(piece.len());
+        }
+        hasher.finalize() == self.expected
+    }
+}
+
+/// A frame's header and body, seen to be a vellev file of the length it
+/// says, with what its checksum must come to: not yet summed.
+fn parts<'a>(key: &str, frame: &'a [u8]) -> Result<(&'a [u8], &'a [u8], Sum<'a>)> {
+    let corrupt = |reason: &str| StorageError::corrupt(key, reason);
+    let (header, body) = frame
+        .split_at_checked(HEADER)
+        .ok_or_else(|| corrupt("shorter than a frame header"))?;
+    if header[..4] != MAGIC {
+        return Err(corrupt("not a vellev file"));
+    }
+    let length = u64::from_le_bytes(header[7..15].try_into().expect("eight bytes"));
+    if length != body.len() as u64 {
+        return Err(corrupt("body length does not match the header"));
+    }
+    let sum = Sum {
+        described: &header[MAGIC.len()..15],
+        expected: u32::from_le_bytes(header[15..19].try_into().expect("four bytes")),
+    };
+    Ok((header, body, sum))
+}
+
+/// The kind of file a header says it is, if it is of a format this
+/// release reads.
+fn kind(key: &str, header: &[u8]) -> Result<Kind> {
+    let corrupt = |reason: &str| StorageError::corrupt(key, reason);
+    let version = u16::from_le_bytes([header[5], header[6]]);
+    if version == 0 {
+        return Err(corrupt("format version zero"));
+    }
+    if version > FORMAT_VERSION {
+        return Err(StorageError::UnsupportedVersion {
+            key: key.to_string(),
+            found: version,
+            supported: FORMAT_VERSION,
+        });
+    }
+    Kind::from_byte(header[4]).ok_or_else(|| corrupt("unknown file kind"))
+}
+
+/// As [`open`], leaving the checksum to whoever asked: for a file read in
+/// place, too large to sum before anyone may be told how it goes. Until
+/// the sum is seen to hold, the body may be anything.
+pub(crate) fn open_unsummed<'a>(key: &str, frame: &'a [u8]) -> Result<(Kind, &'a [u8], Sum<'a>)> {
+    let (header, body, sum) = parts(key, frame)?;
+    Ok((kind(key, header)?, body, sum))
+}
+
 /// Check a frame's integrity without decoding its body.
 pub fn verify(key: &str, frame: &[u8]) -> Result<()> {
     open(key, frame).map(|_| ())
@@ -278,34 +350,11 @@ fn parse<T: DeserializeOwned>(key: &str, body: &[u8]) -> Result<T> {
 }
 
 pub(crate) fn open<'a>(key: &str, frame: &'a [u8]) -> Result<(Kind, &'a [u8])> {
-    let corrupt = |reason: &str| StorageError::corrupt(key, reason);
-    let (header, body) = frame
-        .split_at_checked(HEADER)
-        .ok_or_else(|| corrupt("shorter than a frame header"))?;
-    if header[..4] != MAGIC {
-        return Err(corrupt("not a vellev file"));
+    let (header, body, sum) = parts(key, frame)?;
+    if !sum.holds(body, |_| {}) {
+        return Err(StorageError::corrupt(key, "checksum mismatch"));
     }
-    let length = u64::from_le_bytes(header[7..15].try_into().expect("eight bytes"));
-    let crc = u32::from_le_bytes(header[15..19].try_into().expect("four bytes"));
-    if length != body.len() as u64 {
-        return Err(corrupt("body length does not match the header"));
-    }
-    if crc != checksum(&header[MAGIC.len()..15], body) {
-        return Err(corrupt("checksum mismatch"));
-    }
-    let version = u16::from_le_bytes([header[5], header[6]]);
-    if version == 0 {
-        return Err(corrupt("format version zero"));
-    }
-    if version > FORMAT_VERSION {
-        return Err(StorageError::UnsupportedVersion {
-            key: key.to_string(),
-            found: version,
-            supported: FORMAT_VERSION,
-        });
-    }
-    let kind = Kind::from_byte(header[4]).ok_or_else(|| corrupt("unknown file kind"))?;
-    Ok((kind, body))
+    Ok((kind(key, header)?, body))
 }
 
 #[cfg(test)]
@@ -338,6 +387,7 @@ mod tests {
                         kind: crate::Refused::Conflict,
                         message: "object 7 already exists in notes".into(),
                         lacking: None,
+                        over: None,
                     }),
                 },
             ],
@@ -486,6 +536,7 @@ mod tests {
                     kind: crate::Refused::NotFound,
                     message: message.into(),
                     lacking,
+                    over: None,
                 }),
             }],
             ..log()
@@ -587,6 +638,79 @@ mod tests {
         let from_later = encode(Kind::Log, &later).unwrap();
         assert_eq!(
             decode::<LogSegment>("k", Kind::Log, &from_later).unwrap(),
+            refused(None)
+        );
+    }
+
+    #[test]
+    fn what_a_refusal_found_asked_too_much_of_is_kept_and_other_releases_read_past_it() {
+        use crate::{Capped, Over, Refused};
+        /// A refusal as the release before `over` was kept reads and
+        /// writes it.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct OlderRefusal {
+            kind: Refused,
+            message: String,
+        }
+        let refused = |over| Refusal {
+            kind: Refused::Invalid,
+            message: "a delete takes a limit of 1 to 8192".into(),
+            lacking: None,
+            over,
+        };
+        let older = || OlderRefusal {
+            kind: Refused::Invalid,
+            message: "a delete takes a limit of 1 to 8192".into(),
+        };
+        fn pack<T: Serialize>(kept: &T) -> Vec<u8> {
+            rmp_serde::to_vec_named(kept).unwrap()
+        }
+        let over = refused(Some(Over {
+            capped: Capped::Deleted,
+            most: 8_192,
+        }));
+        let kept = pack(&over);
+        assert_eq!(rmp_serde::from_slice::<Refusal>(&kept).unwrap(), over);
+        assert_eq!(
+            rmp_serde::from_slice::<OlderRefusal>(&kept).unwrap(),
+            older(),
+            "the release before reads past what it does not know"
+        );
+        let before = pack(&older());
+        assert_eq!(
+            rmp_serde::from_slice::<Refusal>(&before).unwrap(),
+            refused(None),
+            "and what it wrote reads as a refusal that kept nothing"
+        );
+        assert_eq!(pack(&refused(None)), before, "written as it always was");
+
+        // A release after this one may cap another thing: read here,
+        // after a rollback, its refusal is one that kept nothing.
+        #[derive(Debug, Serialize)]
+        enum LaterCapped {
+            Written,
+        }
+        #[derive(Debug, Serialize)]
+        struct LaterOver {
+            capped: LaterCapped,
+            most: u64,
+        }
+        #[derive(Debug, Serialize)]
+        struct LaterRefusal {
+            kind: Refused,
+            message: String,
+            over: Option<LaterOver>,
+        }
+        let later = LaterRefusal {
+            kind: Refused::Invalid,
+            message: "a delete takes a limit of 1 to 8192".into(),
+            over: Some(LaterOver {
+                capped: LaterCapped::Written,
+                most: 5,
+            }),
+        };
+        assert_eq!(
+            rmp_serde::from_slice::<Refusal>(&pack(&later)).unwrap(),
             refused(None)
         );
     }

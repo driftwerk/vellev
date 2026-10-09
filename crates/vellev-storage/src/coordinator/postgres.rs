@@ -1,4 +1,6 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -6,12 +8,13 @@ use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions};
 use sqlx::query::QueryAs;
 use sqlx::{Executor, FromRow, Postgres};
 use uuid::Uuid;
-use vellev_core::{NodeId, Partition, TenantId};
+use vellev_core::{NodeId, Partition, RequestId, TenantId};
 
 use super::{
     checked_hold, checked_ttl, checked_window, Acquired, Commit, Committed, Coordinator,
-    CoordinatorError, Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef,
-    PartitionKey, Point, Purges, RestorePoint, Result, TenantKey, Versions,
+    CoordinatorError, Forgotten, Generation, Incarnation, KeyHash, Lease, LogPosition, ManifestRef,
+    PartitionKey, Point, Purges, Restore, RestorePoint, Restored, Result, TenantKey, Versions,
+    RESTORES_KEPT_FOR,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -23,6 +26,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("../../migrations/0006_commits.sql")),
     (7, include_str!("../../migrations/0007_backups.sql")),
     (8, include_str!("../../migrations/0008_purges.sql")),
+    (9, include_str!("../../migrations/0009_restores.sql")),
 ];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
@@ -46,10 +50,20 @@ pub struct PostgresCoordinator {
 }
 
 impl PostgresCoordinator {
-    /// Connect and bring the `vellev` schema up to date.
-    pub async fn connect(url: &str, max_connections: u32) -> Result<Self> {
+    /// Connect and bring the `vellev` schema up to date, waiting at most
+    /// `acquire_within` for a connection from the pool. A call given up
+    /// part way leaves its connection to be tested before it is used again,
+    /// which on a connection that stopped answering waits for TCP to give
+    /// up; with every connection held so, a call fails within this rather
+    /// than waiting with them.
+    pub async fn connect(
+        url: &str,
+        max_connections: u32,
+        acquire_within: Duration,
+    ) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(acquire_within)
             .connect(url)
             .await?;
         Self::with_pool(pool).await
@@ -254,6 +268,42 @@ impl Snapshot {
     }
 }
 
+/// A restore as recorded.
+#[derive(FromRow)]
+struct Recorded {
+    request: Uuid,
+    asked: Vec<u8>,
+    #[sqlx(try_from = "i64")]
+    incarnation: Incarnation,
+    #[sqlx(try_from = "i64")]
+    position: LogPosition,
+    #[sqlx(try_from = "i64")]
+    from_position: LogPosition,
+    from_at: DateTime<Utc>,
+}
+
+impl TryFrom<Recorded> for Restored {
+    type Error = CoordinatorError;
+    fn try_from(recorded: Recorded) -> Result<Self> {
+        let asked = recorded.asked.try_into().map_err(|asked: Vec<u8>| {
+            invariant(format!(
+                "a restore's digest has {} bytes, not 32",
+                asked.len()
+            ))
+        })?;
+        Ok(Restored {
+            restore: Restore {
+                request: RequestId(recorded.request),
+                asked,
+                from: recorded.from_position,
+                from_at: recorded.from_at,
+            },
+            incarnation: recorded.incarnation,
+            position: recorded.position,
+        })
+    }
+}
+
 impl TryFrom<i64> for Generation {
     type Error = std::num::TryFromIntError;
     fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
@@ -324,11 +374,6 @@ impl Coordinator for PostgresCoordinator {
         .bind(key.tenant.as_str())
         .execute(&mut *transaction)
         .await?;
-        sqlx::query("DELETE FROM vellev.commits WHERE tenant = $1 AND partition = $2")
-            .bind(key.tenant.as_str())
-            .bind(i64::from(key.partition.0))
-            .execute(&mut *transaction)
-            .await?;
         sqlx::query(
             "INSERT INTO vellev.purges (tenant)
              SELECT $1 WHERE $2 AND NOT EXISTS (SELECT 1 FROM vellev.partitions WHERE tenant = $1)
@@ -448,13 +493,25 @@ impl Coordinator for PostgresCoordinator {
                  UPDATE vellev.partitions
                  SET log_position = $4, manifest = $5
                  WHERE tenant = $1 AND partition = $2 AND generation = $3
-                   AND (log_position < $4 OR (log_position = $4 AND manifest IS NOT DISTINCT FROM $5))
+                   AND ((log_position < $4
+                         AND ($10::bigint IS NULL
+                              OR (log_position = $10 AND manifest IS NOT DISTINCT FROM $11)))
+                        OR (log_position = $4 AND manifest IS NOT DISTINCT FROM $5))
                  RETURNING generation, incarnation, lease_holder, lease_expires_at, log_position, manifest
              ), noted AS (
                  INSERT INTO vellev.commits (tenant, partition, incarnation, position, head)
                  SELECT $1, $2, incarnation, log_position, manifest FROM done
                  WHERE manifest IS NOT NULL
                  ON CONFLICT DO NOTHING
+             ), restored AS (
+                 INSERT INTO vellev.restores
+                     (tenant, partition, request, asked, incarnation, position, from_position, from_at)
+                 SELECT $1, $2, $6, $9, incarnation, log_position, $7, $8 FROM done
+                 WHERE $6::uuid IS NOT NULL
+                 ON CONFLICT (tenant, partition, incarnation, request) DO UPDATE
+                 SET asked = EXCLUDED.asked, position = EXCLUDED.position,
+                     from_position = EXCLUDED.from_position, from_at = EXCLUDED.from_at,
+                     made_at = now()
              )
              SELECT * FROM done",
             &lease.key,
@@ -462,6 +519,29 @@ impl Coordinator for PostgresCoordinator {
         .bind(bigint(lease.generation.0)?)
         .bind(bigint(commit.log_position.0)?)
         .bind(commit.manifest.as_ref().map(|m| m.0.as_str()))
+        .bind(commit.restore.as_ref().map(|restore| restore.request.0))
+        .bind(
+            commit
+                .restore
+                .as_ref()
+                .map(|restore| bigint(restore.from.0))
+                .transpose()?,
+        )
+        .bind(commit.restore.as_ref().map(|restore| restore.from_at))
+        .bind(commit.restore.as_ref().map(|restore| restore.asked.to_vec()))
+        .bind(
+            commit
+                .after
+                .as_ref()
+                .map(|after| bigint(after.position.0))
+                .transpose()?,
+        )
+        .bind(
+            commit
+                .after
+                .as_ref()
+                .and_then(|after| after.head.as_ref().map(|head| head.0.as_str())),
+        )
         .fetch_optional(&self.pool)
         .await?;
         match done {
@@ -720,6 +800,98 @@ impl Coordinator for PostgresCoordinator {
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
         .bind(window.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM vellev.restores
+             WHERE tenant = $1 AND partition = $2 AND made_at < now() - make_interval(secs => $3)",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(RESTORES_KEPT_FOR.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
+    async fn restored(&self, key: &PartitionKey, request: RequestId) -> Result<Option<Restored>> {
+        let recorded: Option<Recorded> = sqlx::query_as(
+            "SELECT r.request, r.asked, r.incarnation, r.position, r.from_position, r.from_at
+             FROM vellev.restores r JOIN vellev.partitions p USING (tenant, partition, incarnation)
+             WHERE r.tenant = $1 AND r.partition = $2 AND r.request = $3
+               AND r.made_at >= now() - make_interval(secs => $4)",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(request.0)
+        .bind(RESTORES_KEPT_FOR.as_secs_f64())
+        .fetch_optional(&self.pool)
+        .await?;
+        recorded.map(Restored::try_from).transpose()
+    }
+
+    async fn forget_removed(
+        &self,
+        key: &PartitionKey,
+        after: Option<Forgotten>,
+        limit: usize,
+    ) -> Result<Option<Forgotten>> {
+        sqlx::query(
+            "DELETE FROM vellev.restores r
+             WHERE r.tenant = $1 AND r.partition = $2
+               AND NOT EXISTS (SELECT 1 FROM vellev.partitions p
+                               WHERE p.tenant = $1 AND p.partition = $2
+                                 AND p.incarnation = r.incarnation)",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&self.pool)
+        .await?;
+        let (incarnation, position) = after.map_or((-1, -1), |after| {
+            (
+                i64::try_from(after.incarnation.0).unwrap_or(i64::MAX),
+                i64::try_from(after.position.0).unwrap_or(i64::MAX),
+            )
+        });
+        let last: Option<(i64, i64)> = sqlx::query_as(
+            "WITH gone AS (
+                 DELETE FROM vellev.commits
+                 WHERE ctid = ANY(ARRAY(
+                     SELECT kept.ctid FROM vellev.commits kept
+                     WHERE kept.tenant = $1 AND kept.partition = $2
+                       AND (kept.incarnation, kept.position) > ($3, $4)
+                       AND NOT EXISTS (SELECT 1 FROM vellev.partitions p
+                                       WHERE p.tenant = $1 AND p.partition = $2
+                                         AND p.incarnation = kept.incarnation)
+                     ORDER BY kept.incarnation, kept.position
+                     LIMIT $5))
+                 RETURNING incarnation, position
+             )
+             SELECT incarnation, position FROM gone
+             ORDER BY incarnation DESC, position DESC LIMIT 1",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(incarnation)
+        .bind(position)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_optional(&self.pool)
+        .await?;
+        last.map(|(incarnation, position)| {
+            let stored = || invariant(format!("{key} has a commit at ({incarnation}, {position})"));
+            Ok(Forgotten {
+                incarnation: Incarnation(u64::try_from(incarnation).map_err(|_| stored())?),
+                position: LogPosition(u64::try_from(position).map_err(|_| stored())?),
+            })
+        })
+        .transpose()
+    }
+
+    async fn forget_restores(&self) -> Result<u64> {
+        let done = sqlx::query(
+            "DELETE FROM vellev.restores WHERE made_at < now() - make_interval(secs => $1)",
+        )
+        .bind(RESTORES_KEPT_FOR.as_secs_f64())
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected())

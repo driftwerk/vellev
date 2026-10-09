@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7ff79ded602f44ba872fa64ea752bc075986eaf5cde5a36e3deaaaaa9fc418ff # shrinks to actions = [Takeover, Flush { who: Current }, Write { who: Current, rows: 1, delete: None }, Takeover, Merge { who: Current }, Reopen, Restore { who: Current, back: 3, beside: None }, Write { who: Current, rows: 1, delete: None }, Write { who: Current, rows: 1, delete: None }, Takeover, Write { who: Current, rows: 1, delete: None }, DeliverDelayed, Clean { who: Any(17503242421137290382), aged: false }]

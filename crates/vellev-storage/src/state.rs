@@ -306,8 +306,13 @@ impl Loaded {
         })
     }
 
-    /// The segment's indexes, built from its column if they were not
-    /// built already, once the column is seen to fit the rows.
+    /// The segment's indexes under the collections of `catalog`, once the
+    /// column is seen to fit the rows: those built already if they index
+    /// every collection there that the segment has rows of, and otherwise
+    /// built from its column. Indexes built while a collection was dropped
+    /// have nothing of its rows, and a restore to before the drop brings
+    /// the collection back: they are then built again, keeping whatever
+    /// clustered indexes they had.
     fn indexed(&self, key: &str, catalog: &Catalog) -> Result<Arc<Indexes>> {
         if self.vectors.len() != self.file.rows.len() {
             return Err(StorageError::corrupt(
@@ -315,7 +320,7 @@ impl Loaded {
                 "the vectors are not one per row",
             ));
         }
-        Ok(self.indexes.clone().unwrap_or_else(|| {
+        let built = |stored: &Stored| {
             let column = |row| self.vectors.get(row);
             // Said once, as the segment is loaded: it is searched by a scan
             // of its codes from now until it is next merged.
@@ -331,12 +336,55 @@ impl Loaded {
                 catalog,
                 &self.file.rows,
                 column,
-                &self.stored,
+                stored,
                 unused,
                 None,
             ))
-        }))
+        };
+        Ok(match &self.indexes {
+            Some(indexes) if self.lacking(indexes, catalog) => built(&stored(key, indexes).into()),
+            Some(indexes) => indexes.clone(),
+            None => built(&self.stored),
+        })
     }
+
+    /// Whether `indexes` have nothing of a collection of `catalog` that the
+    /// segment has rows of.
+    fn lacking(&self, indexes: &Indexes, catalog: &Catalog) -> bool {
+        let unindexed: Vec<CollectionId> = catalog
+            .collections()
+            .map(|(collection, _)| collection)
+            .filter(|collection| !indexes.contains_key(collection))
+            .collect();
+        let rows = &self.file.rows;
+        !unindexed.is_empty() && rows.iter().any(|row| unindexed.contains(&row.collection))
+    }
+
+    /// The segment as `meta` names it, seen to be fit to adopt, with its
+    /// indexes built under the collections of `catalog` if they were not
+    /// built already.
+    pub fn fit(self, meta: SegmentMeta, catalog: &Catalog) -> Result<Fit> {
+        let indexes = self.indexed(&meta.key, catalog)?;
+        let Loaded { file, vectors, .. } = self;
+        Ok(Fit {
+            meta,
+            file,
+            vectors,
+            indexes,
+        })
+    }
+}
+
+/// A segment the writer built and loaded back, checked while that could
+/// still fail and change nothing: its vectors are one per row and its
+/// indexes built, so the state adopts it, once the commit that names it is
+/// made, with nothing left that could fail part way.
+#[derive(Debug)]
+pub(crate) struct Fit {
+    pub meta: SegmentMeta,
+    file: Arc<SegmentFile>,
+    vectors: Arc<Column>,
+    indexes: Arc<Indexes>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,11 +493,29 @@ pub(crate) struct Snapshot {
     logs: usize,
 }
 
-fn live_rows<'a>(rows: &'a [Row], dead: &'a [bool]) -> impl Iterator<Item = &'a Row> {
-    rows.iter()
-        .zip(dead)
-        .filter(|(_, dead)| !**dead)
-        .map(|(row, _)| row)
+#[cfg(test)]
+impl State {
+    /// Move the state on to `position` with nothing committed there, as
+    /// nothing a writer lets happen does.
+    pub(crate) fn moved_to(&mut self, position: LogPosition) {
+        self.position = position;
+    }
+}
+
+#[cfg(test)]
+impl Snapshot {
+    /// As this, having taken none of the rows there were.
+    pub(crate) fn taking_none(self) -> Self {
+        Self {
+            at: Vec::new(),
+            ..self
+        }
+    }
+
+    /// As this, taken of a memtable of `held` rows.
+    pub(crate) fn of(self, held: usize) -> Self {
+        Self { held, ..self }
+    }
 }
 
 /// Index `rows` for filtering, keyword search and vector search, for the
@@ -556,6 +622,12 @@ impl State {
     pub fn resident(&self) -> usize {
         let segments: usize = self.segments.iter().map(|segment| segment.resident).sum();
         segments + self.memtable.bytes
+    }
+
+    /// How many rows are live. What a writer does in memory as it commits
+    /// a checkpoint takes about as long as there are of them.
+    pub fn rows(&self) -> usize {
+        self.live.len()
     }
 
     /// How many rows have been written since the last checkpoint, counting
@@ -1038,36 +1110,37 @@ impl State {
         })
     }
 
-    /// What a checkpoint at `position` that also carries out `merge`
-    /// writes: as [`Self::checkpoint`], with the run replaced by `merged`.
-    pub(crate) fn compaction(
+    /// The manifest a merge commits at `position`: as a flush built from
+    /// `snapshot` commits (see [`Self::flushed_manifest`]), with the run
+    /// replaced by `merged`. None if the run is no longer the segments the
+    /// merge was planned over, when `merged` describes nothing there is.
+    pub(crate) fn merged_manifest(
         &self,
         position: LogPosition,
-        names: &Names,
-        clustered_above: usize,
+        snapshot: &Snapshot,
+        flushed: Option<&Fit>,
         merge: &Merge,
         merged: SegmentMeta,
-    ) -> (Option<(SegmentMeta, SegmentFile)>, Manifest) {
-        let (flushed, mut manifest) = self.checkpoint(position, names, clustered_above);
+    ) -> Result<Option<Manifest>> {
+        if !self.unchanged(merge) {
+            return Ok(None);
+        }
+        let mut manifest = self.flushed_manifest(position, snapshot, flushed)?;
         manifest.segments.splice(merge.run.clone(), [merged]);
-        (flushed, manifest)
+        Ok(Some(manifest))
     }
 
-    /// Adopt a committed compaction made from this state by
-    /// [`Self::compaction`]: the run's segments go, and the merged one takes
-    /// their place. A row of the run that died since the merged file was
-    /// made is dead in it too.
-    pub(crate) fn compacted(
-        &mut self,
-        manifest_key: &str,
-        position: LogPosition,
-        flushed: Option<(SegmentMeta, Loaded)>,
-        merge: &Merge,
-        merged: (SegmentMeta, Loaded),
-    ) -> Result<()> {
-        let (meta, loaded) = merged;
-        let indexes = loaded.indexed(&meta.key, &self.catalog)?;
-        let Loaded { file, vectors, .. } = loaded;
+    /// Carry out a committed merge: the run's segments go, and the merged
+    /// one takes their place. A row of the run that died since the merged
+    /// file was made is dead in it too. The flush committed with it is
+    /// adopted after, by [`Self::flushed`].
+    pub(crate) fn compacted(&mut self, merge: &Merge, merged: Fit) {
+        let Fit {
+            meta,
+            file,
+            vectors,
+            indexes,
+        } = merged;
         let run = merge.run.clone();
         let gone = run.len() - 1;
         let at_row: HashMap<RowKey, usize> = file
@@ -1109,58 +1182,6 @@ impl State {
                 dead,
             }],
         );
-        self.checkpointed(manifest_key, position, flushed)
-    }
-
-    /// What a checkpoint at `position` writes: a segment under `segment_key`
-    /// holding the memtable's live rows and tombstones, if it has any, with
-    /// its clustered indexes under `index_key` if it is large enough to have
-    /// any, and a manifest listing it after the existing segments.
-    pub(crate) fn checkpoint(
-        &self,
-        position: LogPosition,
-        names: &Names,
-        clustered_above: usize,
-    ) -> (Option<(SegmentMeta, SegmentFile)>, Manifest) {
-        let rows: Vec<Row> = live_rows(&self.memtable.rows, &self.memtable.dead)
-            .cloned()
-            .collect();
-        let tombstones = self.memtable.tombstones.clone();
-        let segment = (!rows.is_empty() || !tombstones.is_empty()).then(|| {
-            let shape = Shape::of(&self.catalog, &rows, tombstones.len(), clustered_above);
-            let meta = names.meta(shape);
-            (
-                meta,
-                SegmentFile {
-                    position,
-                    rows,
-                    tombstones,
-                },
-            )
-        });
-        let flushed = segment.as_ref().map(|(meta, _)| meta.clone());
-        let manifest = self.manifest(position, &self.catalog, flushed);
-        (segment, manifest)
-    }
-
-    /// Adopt a committed checkpoint made from this state by [`Self::checkpoint`].
-    /// Attaching the segment repoints every live memtable row at it, which
-    /// leaves the memtable with nothing live to lose.
-    pub(crate) fn checkpointed(
-        &mut self,
-        manifest_key: &str,
-        position: LogPosition,
-        segment: Option<(SegmentMeta, Loaded)>,
-    ) -> Result<()> {
-        if let Some((meta, loaded)) = segment {
-            self.attach(meta, loaded)?;
-        }
-        self.memtable = Memtable::default();
-        self.position = position;
-        self.head = Some(manifest_key.to_string());
-        self.checkpoint = Some(manifest_key.to_string());
-        self.since.clear();
-        Ok(())
     }
 
     /// What a flush needs to build its segment without the writer, or
@@ -1168,13 +1189,16 @@ impl State {
     /// rows are left to be copied by [`Self::copy_rows`], a part at a time,
     /// so that commits are not held up while all of them are.
     pub(crate) fn snapshot(&self) -> Option<Snapshot> {
-        if self.since.is_empty() {
-            return None;
-        }
+        (!self.since.is_empty()).then(|| self.taken())
+    }
+
+    /// As [`Self::snapshot`], of whatever was committed since the last
+    /// checkpoint, be it nothing: what a merge flushes along with it.
+    pub(crate) fn taken(&self) -> Snapshot {
         let at: Vec<usize> = (0..self.memtable.rows.len())
             .filter(|row| !self.memtable.dead[*row])
             .collect();
-        Some(Snapshot {
+        Snapshot {
             position: self.position,
             checkpoint: self.checkpoint.clone(),
             catalog: self.catalog.clone(),
@@ -1183,7 +1207,7 @@ impl State {
             at,
             held: self.memtable.rows.len(),
             logs: self.since.len(),
-        })
+        }
     }
 
     /// Copy into `snapshot` up to `most` more of its rows. A memtable row
@@ -1203,17 +1227,48 @@ impl State {
     /// The manifest a flush built from `snapshot` commits at `position`:
     /// the segments there are, then the flushed one if any, the collections
     /// as at the snapshot, and the logs committed since to apply on top.
+    ///
+    /// It is made only for a flush this state can adopt (see
+    /// [`Self::unadoptable`]), and whoever makes it holds the writer from
+    /// here until [`Self::flushed`] adopts the flush, so that what held
+    /// here holds there, where nothing may fail any more.
     pub(crate) fn flushed_manifest(
         &self,
         position: LogPosition,
         snapshot: &Snapshot,
-        flushed: Option<SegmentMeta>,
-    ) -> Manifest {
-        debug_assert_eq!(self.checkpoint, snapshot.checkpoint);
-        Manifest {
+        flushed: Option<&Fit>,
+    ) -> Result<Manifest> {
+        if let Some(reason) = self.unadoptable(snapshot, flushed) {
+            let key = self.head.as_deref().unwrap_or_default();
+            return Err(StorageError::corrupt(key, reason));
+        }
+        let flushed = flushed.map(|fit| fit.meta.clone());
+        Ok(Manifest {
             replay: self.since[snapshot.logs..].to_vec(),
             replay_after: snapshot.position,
             ..self.manifest(position, &snapshot.catalog, flushed)
+        })
+    }
+
+    /// Why this state cannot adopt a flush built from `snapshot` with
+    /// `flushed` for its segment, if it cannot: none of which the writer
+    /// lets happen, and any of which would leave the state wrong once the
+    /// flush was committed. A memtable row only ever dies and the logs
+    /// since the checkpoint only grow until a checkpoint is adopted, so
+    /// what holds now holds until then.
+    fn unadoptable(&self, snapshot: &Snapshot, flushed: Option<&Fit>) -> Option<&'static str> {
+        let Memtable { rows, dead, .. } = &self.memtable;
+        let taken = |row: &usize| snapshot.at.binary_search(row).is_ok();
+        if self.checkpoint != snapshot.checkpoint {
+            Some("a checkpoint was committed since the flush was begun")
+        } else if snapshot.held > rows.len() || snapshot.logs > self.since.len() {
+            Some("the flush was begun from more than there is")
+        } else if flushed.map_or(0, |fit| fit.file.rows.len()) != snapshot.at.len() {
+            Some("the flushed segment does not hold the rows the flush took")
+        } else if !(0..snapshot.held).all(|row| dead[row] || taken(&row)) {
+            Some("a row the flush did not take is still live")
+        } else {
+            None
         }
     }
 
@@ -1269,18 +1324,26 @@ impl State {
     /// live; one replaced or deleted since is dead there too. The memtable
     /// then keeps only what was committed after the snapshot, indexed
     /// afresh: as much as was committed while the flush was built.
+    ///
+    /// The flush must be one [`Self::flushed_manifest`] made a manifest
+    /// for, with the writer held since: its segment then has a row for
+    /// each the snapshot took, and every row the memtable held by then is
+    /// one of those or dead.
     pub(crate) fn flushed(
         &mut self,
         manifest_key: &str,
         position: LogPosition,
         snapshot: Snapshot,
-        segment: Option<(SegmentMeta, Loaded)>,
-    ) -> Result<Discarded> {
-        if let Some((meta, loaded)) = segment {
-            let indexes = loaded.indexed(&meta.key, &self.catalog)?;
-            let Loaded { file, vectors, .. } = loaded;
+        segment: Option<Fit>,
+    ) -> Discarded {
+        if let Some(Fit {
+            meta,
+            file,
+            vectors,
+            indexes,
+        }) = segment
+        {
             let index = self.segments.len();
-            debug_assert_eq!(file.rows.len(), snapshot.at.len());
             let dead: Vec<bool> = file
                 .rows
                 .iter()
@@ -1316,14 +1379,13 @@ impl State {
         self.position = position;
         self.head = Some(manifest_key.to_string());
         self.checkpoint = Some(manifest_key.to_string());
-        Ok(discarded)
+        discarded
     }
 
     /// Take out the memtable's first `held` rows, every one of them dead,
     /// renumbering and indexing afresh those after them. Returns what was
     /// taken out, to be freed without holding the state.
     fn drop_flushed_rows(&mut self, held: usize) -> Discarded {
-        debug_assert!(self.memtable.dead[..held].iter().all(|dead| *dead));
         let Memtable {
             rows,
             dead,

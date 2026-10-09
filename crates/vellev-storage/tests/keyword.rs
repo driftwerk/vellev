@@ -622,7 +622,10 @@ proptest! {
 
     #[test]
     fn scores_never_drift_from_the_long_way(steps in prop::collection::vec(step(), 1..40)) {
-        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let cluster = Cluster::new().await;
             let writer = cluster.writer().await;

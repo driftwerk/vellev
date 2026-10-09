@@ -356,6 +356,30 @@ async fn a_writer_with_nothing_to_embed_with_refuses_only_what_needs_it() {
         ),
         "{refused}"
     );
+    // Named twice in one group, as by a caller that asked again before it
+    // was answered, it is told the same both times: the fault that
+    // stands, and not one that may pass.
+    let twice = || vellev_storage::Batch {
+        request: Some(vellev_core::RequestId(uuid::Uuid::from_u128(7))),
+        mutations: vec![note(3, json!({ "title": "fox" }), None)],
+    };
+    let told = writer
+        .commit_batches(vec![twice(), twice()], Default::default())
+        .await
+        .unwrap();
+    assert_eq!(told.len(), 2);
+    for told in told {
+        assert!(
+            matches!(
+                told,
+                Err(StorageError::Embedding {
+                    lasting: Some(vellev_core::ModelFault::Setup),
+                    ..
+                })
+            ),
+            "{told:?}"
+        );
+    }
 
     let plain = Mutation::Patch {
         collection: name("plain"),
@@ -568,6 +592,26 @@ async fn vectors_made_at_commit_survive_a_flush_and_a_new_writer_with_no_embedde
         .await
         .unwrap();
     assert_eq!(plain.partition().read(vectors), expected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_commit_waiting_for_its_vectors_to_be_made_is_not_taken_for_stuck() {
+    let (_cluster, writer, lengths) = embedding().await;
+    let writer = Arc::new(writer);
+    lengths.fault.store(SILENT, Ordering::SeqCst);
+    let committing = tokio::spawn({
+        let writer = writer.clone();
+        async move {
+            writer
+                .commit(vec![note(1, json!({ "title": "fox" }), None)])
+                .await
+        }
+    });
+    // The embedder is given five minutes, and the writer is held meanwhile.
+    tokio::time::sleep(Duration::from_secs(299)).await;
+    assert!(!committing.is_finished());
+    assert!(!writer.stalled());
+    assert!(committing.await.unwrap().is_err());
 }
 
 #[tokio::test(start_paused = true)]

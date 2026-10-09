@@ -12,20 +12,20 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 repository = "https://github.com/driftwerk/vellev"
 publish = false
 
 [workspace.dependencies]
 base64 = "0.22"
-vellev-api = { path = "crates/vellev-api", version = "0.1.0" }
-vellev-client = { path = "crates/vellev-client", version = "0.1.0" }
-vellev-core = { path = "crates/vellev-core", version = "0.1.0" }
-vellev-embed = { path = "crates/vellev-embed", version = "0.1.0" }
-vellev-index = { path = "crates/vellev-index", version = "0.1.0" }
-vellev-node = { path = "crates/vellev-node", version = "0.1.0" }
-vellev-storage = { path = "crates/vellev-storage", version = "0.1.0" }
+vellev-api = { path = "crates/vellev-api", version = "0.2.0" }
+vellev-client = { path = "crates/vellev-client", version = "0.2.0" }
+vellev-core = { path = "crates/vellev-core", version = "0.2.0" }
+vellev-embed = { path = "crates/vellev-embed", version = "0.2.0" }
+vellev-index = { path = "crates/vellev-index", version = "0.2.0" }
+vellev-node = { path = "crates/vellev-node", version = "0.2.0" }
+vellev-storage = { path = "crates/vellev-storage", version = "0.2.0" }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }

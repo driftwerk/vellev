@@ -238,6 +238,8 @@ mod tests {
                 results: 10,
                 body: 1024,
                 embedding_urls: Arc::from([]),
+                reads: 4,
+                reads_wait: std::time::Duration::ZERO,
             },
         );
         let (mut parts, ()) = axum::http::Request::new(()).into_parts();

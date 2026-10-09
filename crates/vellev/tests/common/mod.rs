@@ -19,6 +19,8 @@ use vellev_storage::coordinator::MemoryCoordinator;
 pub const KEY: &str = "test-key";
 pub const MAX_LIMIT: usize = 50;
 pub const MAX_BODY: usize = 64 * 1024;
+/// How many reads a node under test answers at once.
+pub const READS: usize = 4;
 
 pub fn memory() -> Arc<dyn Blobs> {
     Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))
@@ -36,6 +38,14 @@ impl Cluster {
         Self {
             coordinator: Arc::new(MemoryCoordinator::default()),
             blobs: memory(),
+        }
+    }
+
+    /// The same cluster as a node reaches it through another store.
+    pub fn through(&self, blobs: Arc<dyn Blobs>) -> Self {
+        Self {
+            coordinator: self.coordinator.clone(),
+            blobs,
         }
     }
 
@@ -91,11 +101,14 @@ impl Cluster {
         served
     }
 
-    /// A node that backs tenants up to `store`.
+    /// A node that backs tenants up to `store` when it is asked to, and
+    /// at no moment of its own choosing: so that a test has the backups
+    /// it took and no other.
     pub async fn serve_backing_up_to(&self, store: Arc<dyn Blobs>) -> Served {
         let served = self
             .unstarted_with(&[], None, &[], |settings| Settings {
                 backups: Some(store),
+                backups_scheduled: false,
                 ..settings
             })
             .await;
@@ -105,8 +118,14 @@ impl Cluster {
 
     /// A node limited to `queries` a second for each tenant.
     pub async fn serve_limited(&self, queries: f64) -> Served {
+        self.serve_limited_embedding_through(queries, &[]).await
+    }
+
+    /// As [`Self::serve_limited`], with collections allowed to name these
+    /// embedding endpoints.
+    pub async fn serve_limited_embedding_through(&self, queries: f64, urls: &[String]) -> Served {
         let served = self
-            .unstarted_with(&[], None, &[], |settings| Settings {
+            .unstarted_with(urls, None, &[], |settings| Settings {
                 queries_per_second: Some(queries),
                 ..settings
             })
@@ -166,6 +185,8 @@ impl Cluster {
             results: MAX_LIMIT,
             body: MAX_BODY,
             embedding_urls: urls.into(),
+            reads: READS,
+            reads_wait: Duration::from_millis(50),
         };
         let app = App::new([KEY.to_string(), "second-key".to_string()].into(), limits)
             .trusting(IdentityKeys::parse(trusted).unwrap());

@@ -49,6 +49,9 @@ pub enum StorageError {
     },
     #[error("{0}")]
     InvalidMutation(String),
+    /// A request for more of something than there may be at the most.
+    #[error("{message}")]
+    TooMany { over: Over, message: String },
     #[error("{0}")]
     InvalidQuery(String),
     /// Vectors the commit needed could not be made; with `lasting`, not
@@ -100,24 +103,49 @@ pub struct Refusal {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "lacking_if_known"
+        deserialize_with = "if_known"
     )]
     pub lacking: Option<Lacking>,
+    /// What the request asked too much of, and the most it may ask: kept,
+    /// and read by other releases, just as `lacking` is.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "if_known"
+    )]
+    pub over: Option<Over>,
 }
 
-fn lacking_if_known<'de, D: serde::Deserializer<'de>>(
-    kept: D,
-) -> std::result::Result<Option<Lacking>, D::Error> {
+/// What was kept, if it is something this release has a name for.
+fn if_known<'de, D, T>(kept: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
     #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Kept {
-        Known(Lacking),
+    #[serde(untagged, bound = "T: Deserialize<'de>")]
+    enum Kept<T> {
+        Known(T),
         Unknown(serde::de::IgnoredAny),
     }
-    Ok(match Option::<Kept>::deserialize(kept)? {
-        Some(Kept::Known(lacking)) => Some(lacking),
+    Ok(match Option::<Kept<T>>::deserialize(kept)? {
+        Some(Kept::Known(known)) => Some(known),
         Some(Kept::Unknown(_)) | None => None,
     })
+}
+
+/// What a request asked too much of, and the most it may ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Over {
+    pub capped: Capped,
+    pub most: u64,
+}
+
+/// Something a request may ask for only so much of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Capped {
+    /// The objects one request deletes by filter.
+    Deleted,
 }
 
 /// What a request named that was not there.
@@ -170,6 +198,7 @@ impl StorageError {
             | Self::ObjectExists { .. }
             | Self::ConditionFailed { .. } => Refused::Conflict,
             Self::InvalidMutation(_)
+            | Self::TooMany { .. }
             | Self::InvalidQuery(_)
             | Self::Schema(_)
             | Self::Filter(_)
@@ -181,6 +210,10 @@ impl StorageError {
             kind,
             message: self.root().to_string(),
             lacking,
+            over: match self.root() {
+                Self::TooMany { over, .. } => Some(*over),
+                _ => None,
+            },
         })
     }
 

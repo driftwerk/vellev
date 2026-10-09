@@ -221,7 +221,10 @@ async fn delete_where_removes_what_the_batch_sees_and_replays_identically() {
     writer.flush().await.unwrap();
     writer.commit(vec![upsert("notes", 4, 1)]).await.unwrap();
 
+    // Two in a batch, so each with a limit: between them they may delete
+    // no more than one may.
     let where_n = |value: i64| Mutation::DeleteWhere {
+        limit: Some(100),
         collection: name("notes"),
         filter: n("eq", value),
     };
@@ -275,6 +278,7 @@ async fn delete_where_is_atomic_with_its_batch_and_its_group() {
         .await
         .unwrap();
     let everything = || Mutation::DeleteWhere {
+        limit: None,
         collection: name("notes"),
         filter: n("gte", -1000),
     };
@@ -374,6 +378,7 @@ async fn a_filter_the_schema_cannot_answer_is_an_error_everywhere() {
         .commit(vec![
             upsert("notes", 2, 2),
             Mutation::DeleteWhere {
+                limit: None,
                 collection: name("notes"),
                 filter: unknown,
             },
@@ -397,6 +402,7 @@ async fn delete_where_sees_a_later_batch_over_an_earlier_one_in_the_same_group()
         .unwrap();
     writer.flush().await.unwrap();
     let ones = || Mutation::DeleteWhere {
+        limit: None,
         collection: name("notes"),
         filter: n("eq", 1),
     };
@@ -440,6 +446,7 @@ async fn a_delete_with_no_condition_is_refused() {
         .unwrap();
     let before = cluster.committed().await;
     let unconditional = Mutation::DeleteWhere {
+        limit: None,
         collection: name("notes"),
         filter: filter(json!({ "and": [] })),
     };

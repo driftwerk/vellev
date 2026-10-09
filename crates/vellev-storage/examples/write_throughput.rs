@@ -14,12 +14,12 @@ use object_store::memory::InMemory;
 use serde_json::json;
 use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, NodeId,
-    ObjectId, Partition, Property, TenantId,
+    ObjectId, Partition, Property, RequestId, TenantId,
 };
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
 use vellev_storage::coordinator::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, KeyHash, Lease, MemoryCoordinator,
-    PartitionKey, Point, RestorePoint, TenantKey, Versions,
+    Acquired, Commit, Committed, Coordinator, CoordinatorError, Forgotten, KeyHash, Lease,
+    MemoryCoordinator, PartitionKey, Point, RestorePoint, Restored, TenantKey, Versions,
 };
 use vellev_storage::{GroupCommitter, Mutation, Writer};
 
@@ -166,6 +166,27 @@ impl Coordinator for SlowCoordinator {
         window: Duration,
     ) -> Result<u64, CoordinatorError> {
         self.inner.forget_history(key, window).await
+    }
+
+    async fn restored(
+        &self,
+        key: &PartitionKey,
+        request: RequestId,
+    ) -> Result<Option<Restored>, CoordinatorError> {
+        self.inner.restored(key, request).await
+    }
+
+    async fn forget_removed(
+        &self,
+        key: &PartitionKey,
+        after: Option<Forgotten>,
+        limit: usize,
+    ) -> Result<Option<Forgotten>, CoordinatorError> {
+        self.inner.forget_removed(key, after, limit).await
+    }
+
+    async fn forget_restores(&self) -> Result<u64, CoordinatorError> {
+        self.inner.forget_restores().await
     }
 
     async fn restore_window(

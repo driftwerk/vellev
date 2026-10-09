@@ -13,35 +13,72 @@ use object_store::memory::InMemory;
 use serde_json::{json, Value};
 use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, HttpApi,
-    NodeId, ObjectId, Partition, Property, TenantId,
+    NodeId, ObjectId, Partition, Property, RequestId, TenantId,
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{Freshness, Node, NodeError, Reader, Settings};
+use vellev_storage::backups::Backups;
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, KeyHash, Lease, LogPosition,
-    ManualClock, MemoryCoordinator, PartitionKey, Point, RestorePoint, TenantKey, Versions,
+    Acquired, Commit, Committed, Coordinator, CoordinatorError, Forgotten, KeyHash, Lease,
+    LogPosition, ManualClock, MemoryCoordinator, PartitionKey, Point, RestorePoint, Restored,
+    TenantKey, Versions,
 };
-use vellev_storage::{Batch, Mutation, Outcome, State, StorageError, Writer};
+use vellev_storage::{Batch, Mutation, Outcome, Refused, State, StorageError, Transfers, Writer};
 
 const LEASE: Duration = Duration::from_secs(30);
+
+/// What goes wrong with writes of one kind of file.
+#[derive(Debug, Clone, Copy)]
+enum Fault {
+    Fails,
+    /// The next write fails, and then they go right again.
+    FailsOnce,
+    NeverAnswers,
+}
 
 /// Object storage whose writes can be made to fail.
 #[derive(Debug)]
 struct Store {
     inner: ObjectBlobs,
     failing: AtomicBool,
+    /// The kind of file, as its extension names it, whose writes go wrong,
+    /// and how.
+    faulty: std::sync::Mutex<Option<(&'static str, Fault)>>,
     unreadable: AtomicBool,
+    /// Set for the next read to fail, and no other.
+    failing_once: AtomicBool,
     /// How long each read takes, when reads are to be slow.
     slow: std::sync::Mutex<Option<Duration>>,
     /// The prefixes whose cached copies were dropped.
     forgotten: std::sync::Mutex<Vec<String>>,
 }
 
+impl Store {
+    /// Have writes of `kind` of file go wrong as `fault` says, or with
+    /// none go right again.
+    fn fault(&self, faulty: Option<(&'static str, Fault)>) {
+        *self.faulty.lock().unwrap() = faulty;
+    }
+}
+
 #[async_trait]
 impl Blobs for Store {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
-        if self.failing.load(Ordering::SeqCst) {
+        let fault = {
+            let mut faulty = self.faulty.lock().unwrap();
+            let fault = faulty
+                .filter(|(kind, _)| key.ends_with(&format!(".{kind}")))
+                .map(|(_, fault)| fault);
+            if let Some(Fault::FailsOnce) = fault {
+                *faulty = None;
+            }
+            fault
+        };
+        if let Some(Fault::NeverAnswers) = fault {
+            std::future::pending::<()>().await;
+        }
+        if self.failing.load(Ordering::SeqCst) || fault.is_some() {
             return Err(StorageError::Blob {
                 key: key.into(),
                 source: "connection reset".into(),
@@ -54,7 +91,8 @@ impl Blobs for Store {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        if self.unreadable.load(Ordering::SeqCst) {
+        let once = self.failing_once.swap(false, Ordering::SeqCst);
+        if self.unreadable.load(Ordering::SeqCst) || once {
             return Err(StorageError::Blob {
                 key: key.into(),
                 source: "connection reset".into(),
@@ -98,7 +136,9 @@ impl Cluster {
             store: Arc::new(Store {
                 inner: ObjectBlobs::new(Arc::new(InMemory::new())),
                 failing: AtomicBool::new(false),
+                faulty: std::sync::Mutex::new(None),
                 unreadable: AtomicBool::new(false),
+                failing_once: AtomicBool::new(false),
                 slow: std::sync::Mutex::new(None),
                 forgotten: std::sync::Mutex::default(),
             }),
@@ -147,6 +187,13 @@ impl Cluster {
 
 fn tenant(id: &str) -> TenantId {
     TenantId::new(id).unwrap()
+}
+
+fn key(id: &str) -> PartitionKey {
+    PartitionKey {
+        tenant: tenant(id),
+        partition: Partition::DEFAULT,
+    }
 }
 
 fn notes() -> CollectionName {
@@ -243,9 +290,10 @@ async fn tenants_are_created_listed_a_page_at_a_time_and_dropped() {
         node.tenant(&tenant("acme")).await,
         Err(NodeError::UnknownTenant(_))
     ));
+    // What still holds the tenant as it was writes to it no more.
     let orphaned = acme.write(vec![note(2, "hen", None)]).await.unwrap_err();
     assert!(
-        matches!(&orphaned, NodeError::UnknownTenant(id) if *id == tenant("acme")),
+        matches!(&orphaned, NodeError::Storage(StorageError::Closed)),
         "{orphaned}"
     );
     for n in 0..50 {
@@ -338,14 +386,12 @@ async fn a_tenant_is_written_by_one_node_until_it_lets_go_or_its_hold_runs_out()
     let taken = second.tenant(&tenant("acme")).await.unwrap();
     assert_eq!(taken.read(count), 1);
     taken.write(vec![note(2, "hen", None)]).await.unwrap();
-    let fenced = held.write(vec![note(3, "owl", None)]).await.unwrap_err();
+    // The node that let it go writes to it no more, whoever still holds
+    // the tenant as it was open there.
+    let let_go = held.write(vec![note(3, "owl", None)]).await.unwrap_err();
     assert!(
-        matches!(
-            &fenced,
-            NodeError::Storage(error)
-                if matches!(error.root(), StorageError::Coordinator(CoordinatorError::Fenced { .. }))
-        ),
-        "{fenced}"
+        matches!(&let_go, NodeError::Storage(StorageError::Closed)),
+        "{let_go}"
     );
     assert!(matches!(
         first.tenant(&tenant("acme")).await,
@@ -561,13 +607,20 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
     assert_eq!(vector(2), Some(vec![1.0, 0.0]));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    let query = acme.query_vector(&notes(), "red fox").await.unwrap();
+    let searching = node
+        .reader(&tenant("acme"), Freshness::Eventual)
+        .await
+        .unwrap();
+    let query = searching.query_vector(&notes(), "red fox").await.unwrap();
     assert_eq!(query, Some(vec![13.0, 3.0]));
-    assert_eq!(acme.query_vector(&notes(), "red fox").await.unwrap(), query);
-    assert_eq!(acme.query_vector(&notes(), "  ").await.unwrap(), None);
+    let again = searching.query_vector(&notes(), "red fox").await.unwrap();
+    assert_eq!(again, query);
+    let blank = searching.query_vector(&notes(), "  ").await.unwrap();
+    assert_eq!(blank, None);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(matches!(
-        acme.query_vector(&CollectionName::new("nope").unwrap(), "fox")
+        searching
+            .query_vector(&CollectionName::new("nope").unwrap(), "fox")
             .await,
         Err(NodeError::Storage(StorageError::UnknownCollection(_)))
     ));
@@ -610,7 +663,12 @@ async fn a_collection_that_embeds_its_objects_is_embedded_on_write_and_on_query(
         .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
         .await
         .unwrap();
-    assert_eq!(plain.query_vector(&notes(), "fox").await.unwrap(), None);
+    let searching = node
+        .reader(&tenant("plain"), Freshness::Eventual)
+        .await
+        .unwrap();
+    let supplied = searching.query_vector(&notes(), "fox").await.unwrap();
+    assert_eq!(supplied, None);
     assert_eq!(
         plain.read(|state| state
             .get(&notes(), id(1))
@@ -702,9 +760,19 @@ async fn a_writer_lost_to_a_failed_flush_is_replaced_on_the_next_call() {
     acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
         .await
         .unwrap();
+    // A segment that could not be uploaded was never to be committed: the
+    // writer carries on.
     cluster.store.failing.store(true, Ordering::SeqCst);
     assert!(acme.flush().await.is_err());
     cluster.store.failing.store(false, Ordering::SeqCst);
+    assert!(Arc::ptr_eq(
+        &acme,
+        &node.tenant(&tenant("acme")).await.unwrap()
+    ));
+
+    cluster.store.fault(Some(("manifest", Fault::Fails)));
+    assert!(acme.flush().await.is_err());
+    cluster.store.fault(None);
 
     let reopened = node.tenant(&tenant("acme")).await.unwrap();
     assert!(!Arc::ptr_eq(&acme, &reopened));
@@ -713,6 +781,300 @@ async fn a_writer_lost_to_a_failed_flush_is_replaced_on_the_next_call() {
 }
 
 #[tokio::test]
+async fn a_request_repeated_in_one_commit_is_refused_alike_and_the_tenant_kept() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+
+    // Both are queued before the committer runs, so they share a commit.
+    let batch = Batch {
+        request: Some(RequestId::generate()),
+        mutations: vec![Mutation::DropCollection(
+            CollectionName::new("nope").unwrap(),
+        )],
+    };
+    let refused = join_all([acme.write(batch.clone()), acme.write(batch)]).await;
+    for refused in refused {
+        let refused = refused.unwrap_err();
+        let NodeError::Storage(error) = &refused else {
+            panic!("{refused}");
+        };
+        assert!(!matches!(error, StorageError::Shared(_)), "{error:?}");
+        assert_eq!(
+            error.refusal().map(|refusal| refusal.kind),
+            Some(Refused::NotFound),
+            "{error:?}"
+        );
+    }
+    assert!(Arc::ptr_eq(
+        &acme,
+        &node.tenant(&tenant("acme")).await.unwrap()
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn writes_while_a_restore_runs_are_turned_away_and_the_restore_completes() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    assert!(node
+        .set_restore_window(&acme, Some(Duration::from_secs(60 * 60)))
+        .await
+        .unwrap());
+    let opened = node.tenant(&acme).await.unwrap();
+    let kept = opened
+        .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    opened.flush().await.unwrap();
+    opened.write(vec![note(2, "hen", None)]).await.unwrap();
+
+    // Reading the state gone back to takes a while, and writes go on.
+    *cluster.store.slow.lock().unwrap() = Some(Duration::from_millis(25));
+    let restoring = tokio::spawn({
+        let (node, acme) = (node.clone(), acme.clone());
+        async move {
+            node.restore(&acme, Point::Position(kept.position), RequestId::generate())
+                .await
+        }
+    });
+    let mut turned_away = 0;
+    let mut n = 3;
+    while !restoring.is_finished() {
+        let written = node.tenant(&acme).await.unwrap();
+        match written.write(vec![note(n, "owl", None)]).await {
+            Ok(_) => n += 1,
+            Err(NodeError::Storage(StorageError::Restoring)) => turned_away += 1,
+            Err(other) => panic!("{other}"),
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    *cluster.store.slow.lock().unwrap() = None;
+    restoring.await.unwrap().unwrap();
+    assert!(turned_away > 0, "some writes came while it ran");
+    assert!(
+        Arc::ptr_eq(&opened, &node.tenant(&acme).await.unwrap()),
+        "the tenant was not opened again"
+    );
+    opened.write(vec![note(n, "owl", None)]).await.unwrap();
+}
+
+/// A tenant on `node` that may be restored for an hour back, with notes 1
+/// and 2 written one after the other; returns the receipt of the first.
+async fn restorable(node: &Node, acme: &TenantId) -> vellev_storage::Receipt {
+    node.create_tenant(acme).await.unwrap();
+    assert!(node
+        .set_restore_window(acme, Some(Duration::from_secs(60 * 60)))
+        .await
+        .unwrap());
+    let opened = node.tenant(acme).await.unwrap();
+    let kept = opened
+        .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    opened.write(vec![note(2, "hen", None)]).await.unwrap();
+    kept
+}
+
+#[tokio::test]
+async fn a_restore_asked_for_again_is_answered_as_it_was_on_any_node_and_undoes_nothing_since() {
+    let cluster = Cluster::new();
+    let (first, second) = (cluster.node(), cluster.node());
+    let acme = tenant("acme");
+    let kept = restorable(&first, &acme).await;
+    let (point, request) = (Point::Position(kept.position), RequestId::generate());
+
+    let restored = first.restore(&acme, point, request).await.unwrap();
+    assert_eq!(restored.restore.from, kept.position);
+    let opened = first.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 1);
+    opened.write(vec![note(3, "owl", None)]).await.unwrap();
+
+    assert_eq!(
+        first.restore(&acme, point, request).await.unwrap(),
+        restored
+    );
+    assert_eq!(opened.read(count), 2, "the write since stays");
+
+    first.shutdown().await;
+    assert_eq!(
+        second.restore(&acme, point, request).await.unwrap(),
+        restored
+    );
+    assert_eq!(second.tenant(&acme).await.unwrap().read(count), 2);
+
+    let again = second
+        .restore(&acme, point, RequestId::generate())
+        .await
+        .unwrap();
+    assert!(again.position > restored.position);
+    assert_eq!(second.tenant(&acme).await.unwrap().read(count), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_asked_for_while_another_runs_is_refused_and_the_same_one_waits_for_it() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    node.tenant(&acme).await.unwrap().flush().await.unwrap();
+    let point = Point::Position(kept.position);
+    let request = RequestId::generate();
+
+    // Reading the state gone back to takes a while.
+    *cluster.store.slow.lock().unwrap() = Some(Duration::from_millis(25));
+    let restoring = |request| {
+        let (node, acme) = (node.clone(), acme.clone());
+        tokio::spawn(async move { node.restore(&acme, point, request).await })
+    };
+    let running = restoring(request);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(matches!(
+        node.restore(&acme, point, RequestId::generate()).await,
+        Err(NodeError::Restoring(_))
+    ));
+    let waiting = restoring(request);
+    let (ran, waited) = (running.await.unwrap(), waiting.await.unwrap());
+    *cluster.store.slow.lock().unwrap() = None;
+    let ran = ran.unwrap();
+    assert_eq!(waited.unwrap(), ran);
+    let (_, latest) = node
+        .restore_points(&acme)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .unwrap();
+    assert_eq!(latest.position, ran.position, "it was made once");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_asked_for_again_after_a_try_that_failed_is_made_on_the_tenant_opened_afresh() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    let opened = node.tenant(&acme).await.unwrap();
+    let point = Point::Position(kept.position);
+    let request = RequestId::generate();
+
+    // The first try reads slowly and then fails as it commits, closing the
+    // writer, while the second waits for it.
+    *cluster.store.slow.lock().unwrap() = Some(Duration::from_millis(25));
+    cluster.store.fault(Some(("manifest", Fault::FailsOnce)));
+    let restoring = || {
+        let (node, acme) = (node.clone(), acme.clone());
+        tokio::spawn(async move { node.restore(&acme, point, request).await })
+    };
+    let first = restoring();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = restoring();
+    assert!(first.await.unwrap().is_err());
+    let restored = second.await.unwrap().unwrap();
+    *cluster.store.slow.lock().unwrap() = None;
+    let reopened = node.tenant(&acme).await.unwrap();
+    assert!(!Arc::ptr_eq(&opened, &reopened));
+    assert_eq!(reopened.read(State::position), restored.position);
+    assert_eq!(reopened.read(count), 1);
+}
+
+#[tokio::test]
+async fn a_restore_whose_answer_was_lost_is_found_recorded_and_its_position_never_reused() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let node = node_leasing(&cluster, coordinator.clone(), LEASE);
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    let point = Point::Position(kept.position);
+    let request = RequestId::generate();
+
+    // Every try of the commit lands, and every answer is lost: it is
+    // looked for before its caller is told anything.
+    coordinator.lose_answers.store(3, Ordering::SeqCst);
+    let restored = node.restore(&acme, point, request).await.unwrap();
+    let landed = cluster
+        .coordinator
+        .committed(&key("acme"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.position, landed.log_position, "found as recorded");
+    assert_eq!(node.restore(&acme, point, request).await.unwrap(), restored);
+    let (_, latest) = node
+        .restore_points(&acme)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .unwrap();
+    assert_eq!(latest.position, restored.position, "it was made once");
+    let opened = node.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 1);
+    let written = opened.write(vec![note(3, "owl", None)]).await.unwrap();
+    assert_eq!(written.position, restored.position.next().unwrap());
+}
+
+#[tokio::test]
+async fn a_request_asking_for_another_restore_than_it_did_is_refused() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    let request = RequestId::generate();
+    let restored = node
+        .restore(&acme, Point::Position(kept.position), request)
+        .await
+        .unwrap();
+
+    let elsewhere = Point::Position(restored.position);
+    assert!(matches!(
+        node.restore(&acme, elsewhere, request).await,
+        Err(NodeError::Reused { .. })
+    ));
+    assert_eq!(
+        node.restore(&acme, Point::Position(kept.position), request)
+            .await
+            .unwrap(),
+        restored
+    );
+}
+
+#[tokio::test]
+async fn a_restore_that_fails_as_it_commits_has_the_tenant_opened_afresh() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    assert!(node
+        .set_restore_window(&acme, Some(Duration::from_secs(60 * 60)))
+        .await
+        .unwrap());
+    let opened = node.tenant(&acme).await.unwrap();
+    let kept = opened
+        .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    opened.write(vec![note(2, "hen", None)]).await.unwrap();
+
+    cluster.store.fault(Some(("manifest", Fault::Fails)));
+    assert!(node
+        .restore(&acme, Point::Position(kept.position), RequestId::generate())
+        .await
+        .is_err());
+    cluster.store.fault(None);
+
+    let reopened = node.tenant(&acme).await.unwrap();
+    assert!(!Arc::ptr_eq(&opened, &reopened));
+    reopened.write(vec![note(3, "owl", None)]).await.unwrap();
+    assert_eq!(reopened.read(count), 3);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_tenant_is_held_while_its_node_lives_and_passes_to_another_when_it_dies() {
     let cluster = Cluster::new();
     let lease = Duration::from_millis(300);
@@ -755,7 +1117,7 @@ async fn a_tenant_is_held_while_its_node_lives_and_passes_to_another_when_it_die
     taken.write(vec![note(9, "hen", None)]).await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_node_notices_that_another_took_its_tenant() {
     let cluster = Cluster::new();
     let lease = Duration::from_millis(1_500);
@@ -781,7 +1143,7 @@ async fn a_node_notices_that_another_took_its_tenant() {
     let taken = second.tenant(&tenant("acme")).await.unwrap();
     assert_eq!(taken.read(count), 1);
 
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let mut noticed = None;
     for _ in 0..40 {
         if matches!(
@@ -801,13 +1163,48 @@ async fn a_node_notices_that_another_took_its_tenant() {
     assert!(held.write(vec![note(2, "hen", None)]).await.is_err());
 }
 
-/// A coordinator whose renewals can be made to fail as a backend would.
+/// A coordinator whose renewals can be made to fail as a backend would,
+/// and whose commits can be made never to be answered, as over a
+/// connection that stopped answering without closing.
 #[derive(Debug)]
 struct Unrenewing {
     inner: Arc<MemoryCoordinator>,
     failing: AtomicBool,
     /// How long each renewal takes to be answered.
     slowly: Duration,
+    unanswered_commits: AtomicBool,
+    /// Commits land and then are never answered.
+    hang_after_commit: AtomicBool,
+    /// Told when a commit that is never answered has landed.
+    landed: tokio::sync::Notify,
+    /// Forgetting what is kept of a removed tenant fails.
+    failing_forgets: AtomicBool,
+    /// How many times forgetting it was asked for.
+    forgets: AtomicUsize,
+    /// How many commits land with their answers lost.
+    lose_answers: AtomicUsize,
+    /// How many renewals were asked for.
+    renewals: AtomicUsize,
+    /// Commits that make a restore are refused, as by a lease since taken.
+    refused_restores: AtomicBool,
+}
+
+impl Unrenewing {
+    fn new(inner: Arc<MemoryCoordinator>, slowly: Duration) -> Self {
+        Self {
+            inner,
+            failing: AtomicBool::new(false),
+            slowly,
+            unanswered_commits: AtomicBool::new(false),
+            hang_after_commit: AtomicBool::new(false),
+            landed: tokio::sync::Notify::new(),
+            failing_forgets: AtomicBool::new(false),
+            forgets: AtomicUsize::new(0),
+            lose_answers: AtomicUsize::new(0),
+            renewals: AtomicUsize::new(0),
+            refused_restores: AtomicBool::new(false),
+        }
+    }
 }
 
 #[async_trait]
@@ -827,6 +1224,7 @@ impl Coordinator for Unrenewing {
         self.inner.acquire(key, holder, ttl).await
     }
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease, CoordinatorError> {
+        self.renewals.fetch_add(1, Ordering::SeqCst);
         if self.failing.load(Ordering::SeqCst) {
             return Err(CoordinatorError::Backend("connection reset".into()));
         }
@@ -837,7 +1235,29 @@ impl Coordinator for Unrenewing {
         self.inner.release(lease).await
     }
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed, CoordinatorError> {
-        self.inner.commit(lease, commit).await
+        if self.unanswered_commits.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if commit.restore.is_some() && self.refused_restores.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::Fenced {
+                key: lease.key.clone(),
+                held: lease.generation,
+                current: lease.generation,
+            });
+        }
+        let committed = self.inner.commit(lease, commit).await?;
+        if self.hang_after_commit.load(Ordering::SeqCst) {
+            self.landed.notify_one();
+            std::future::pending::<()>().await;
+        }
+        let lost = self
+            .lose_answers
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        match lost {
+            true => Err(CoordinatorError::Backend("connection reset".into())),
+            false => Ok(committed),
+        }
     }
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
         self.inner.committed(key).await
@@ -918,6 +1338,31 @@ impl Coordinator for Unrenewing {
         self.inner.forget_history(key, window).await
     }
 
+    async fn restored(
+        &self,
+        key: &PartitionKey,
+        request: RequestId,
+    ) -> Result<Option<Restored>, CoordinatorError> {
+        self.inner.restored(key, request).await
+    }
+
+    async fn forget_removed(
+        &self,
+        key: &PartitionKey,
+        after: Option<Forgotten>,
+        limit: usize,
+    ) -> Result<Option<Forgotten>, CoordinatorError> {
+        self.forgets.fetch_add(1, Ordering::SeqCst);
+        if self.failing_forgets.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::Backend("connection reset".into()));
+        }
+        self.inner.forget_removed(key, after, limit).await
+    }
+
+    async fn forget_restores(&self) -> Result<u64, CoordinatorError> {
+        self.inner.forget_restores().await
+    }
+
     async fn restore_window(
         &self,
         tenant: &TenantId,
@@ -965,6 +1410,8 @@ impl Coordinator for Unrenewing {
         claim: uuid::Uuid,
         made: bool,
     ) -> Result<(), CoordinatorError> {
+        // As over a network: whoever asks waits for the answer.
+        tokio::task::yield_now().await;
         self.inner.release_backup(tenant, claim, made).await
     }
 
@@ -977,15 +1424,11 @@ impl Coordinator for Unrenewing {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_tenant_whose_hold_could_not_be_renewed_in_time_is_opened_afresh() {
     let cluster = Cluster::new();
     let lease = Duration::from_millis(300);
-    let coordinator = Arc::new(Unrenewing {
-        inner: cluster.coordinator.clone(),
-        failing: AtomicBool::new(false),
-        slowly: Duration::ZERO,
-    });
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
     let node = Node::new(
         coordinator.clone(),
         cluster.store.clone(),
@@ -1057,15 +1500,11 @@ async fn a_tenant_slow_to_load_is_held_throughout_and_not_handed_out_once_lost()
     ));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_renewal_answered_slowly_still_keeps_the_hold() {
     let cluster = Cluster::new();
     let lease = Duration::from_millis(600);
-    let coordinator = Arc::new(Unrenewing {
-        inner: cluster.coordinator.clone(),
-        failing: AtomicBool::new(false),
-        slowly: lease / 3,
-    });
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), lease / 3));
     let node = node_leasing(&cluster, coordinator, lease);
     node.create_tenant(&tenant("acme")).await.unwrap();
     let acme = node.tenant(&tenant("acme")).await.unwrap();
@@ -1077,12 +1516,430 @@ async fn a_renewal_answered_slowly_still_keeps_the_hold() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_commit_left_unanswered_closes_the_writer_within_a_lease_and_another_node_takes_over() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_secs(2);
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let first = node_leasing(&cluster, coordinator.clone(), lease);
+    let second = node_leasing(&cluster, cluster.coordinator.clone(), lease);
+    first.create_tenant(&tenant("acme")).await.unwrap();
+    let held = first.tenant(&tenant("acme")).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    coordinator.unanswered_commits.store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let failed = tokio::time::timeout(lease * 2, held.write(vec![note(2, "hen", None)]))
+        .await
+        .expect("the commit is given up")
+        .unwrap_err();
+    // Three tries of a quarter of the lease each, and the waits between.
+    let tries = lease / 4 * 3 + Duration::from_millis(50 + 100);
+    assert_eq!(started.elapsed(), tries);
+    assert!(
+        matches!(&failed, NodeError::Storage(error) if matches!(error.root(), StorageError::Coordinator(error) if error.is_retryable())),
+        "{failed}"
+    );
+    assert!(!Arc::ptr_eq(
+        &held,
+        &first.tenant(&tenant("acme")).await.unwrap()
+    ));
+
+    cluster.clock.advance(lease * 2);
+    let taken = second.tenant(&tenant("acme")).await.unwrap();
+    taken.write(vec![note(3, "owl", None)]).await.unwrap();
+    assert_eq!(taken.read(count), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_writer_closed_by_a_flush_given_up_part_way_is_read_from_no_more_nor_renewed() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_millis(600);
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let node = node_leasing(&cluster, coordinator.clone(), lease);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let held = node.tenant(&tenant("acme")).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    // The checkpoint's upload never ends, and its caller stops waiting.
+    cluster.store.fault(Some(("manifest", Fault::NeverAnswers)));
+    assert!(tokio::time::timeout(lease / 6, held.flush()).await.is_err());
+    cluster.store.fault(None);
+    let strong = node
+        .reader(&tenant("acme"), Freshness::Strong)
+        .await
+        .unwrap();
+    assert!(strong.follows(), "a closed writer answers no strong read");
+
+    tokio::time::sleep(lease).await;
+    let renewed = coordinator.renewals.load(Ordering::SeqCst);
+    tokio::time::sleep(lease).await;
+    assert_eq!(
+        coordinator.renewals.load(Ordering::SeqCst),
+        renewed,
+        "the hold is no longer renewed"
+    );
+    let reopened = node.tenant(&tenant("acme")).await.unwrap();
+    assert!(!Arc::ptr_eq(&held, &reopened));
+    reopened.write(vec![note(2, "hen", None)]).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_writer_publishing_past_every_bound_on_its_steps_is_renewed_no_more() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_millis(600);
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let transfers = Transfers {
+        part_bytes: 1024 * 1024,
+        request_within: Duration::from_millis(100),
+    };
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            lease,
+            transfers,
+            ..Settings::new(NodeId::generate("node"))
+        },
+    );
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let held = node.tenant(&tenant("acme")).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    // The log's upload is never answered, and nothing gives it up: the
+    // writer stays open, publishing for ever.
+    cluster.store.fault(Some(("log", Fault::NeverAnswers)));
+    let stuck = tokio::spawn({
+        let held = held.clone();
+        async move { held.write(vec![note(2, "hen", None)]).await }
+    });
+    // Well past every bound on what it began.
+    tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+    let renewed = coordinator.renewals.load(Ordering::SeqCst);
+    tokio::time::sleep(lease * 2).await;
+    assert_eq!(
+        coordinator.renewals.load(Ordering::SeqCst),
+        renewed,
+        "the hold is no longer renewed"
+    );
+    // The write is given up where it was, whether it was made unknown.
+    let given_up = soon(stuck).await.unwrap().unwrap_err();
+    assert!(
+        matches!(&given_up, NodeError::Storage(StorageError::Shared(shared)) if matches!(**shared, StorageError::Closed)),
+        "{given_up}"
+    );
+    cluster.store.fault(None);
+    let reopened = node.tenant(&tenant("acme")).await.unwrap();
+    assert!(!Arc::ptr_eq(&held, &reopened));
+}
+
+/// What `work` came to, failing the test rather than letting it hang if
+/// that took an hour, which on a paused clock means it would never end.
+async fn soon<T>(work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(60 * 60), work)
+        .await
+        .expect("done within the hour")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_under_way_when_the_hold_is_lost_is_stopped_and_its_caller_told() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    let data = Arc::downgrade(node.tenant(&acme).await.unwrap().partition());
+
+    // The upload of the segment gone back to is never answered.
+    cluster.store.fault(Some(("segment", Fault::NeverAnswers)));
+    let restoring = tokio::spawn({
+        let (node, acme) = (node.clone(), acme.clone());
+        async move {
+            node.restore(&acme, Point::Position(kept.position), RequestId::generate())
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!restoring.is_finished());
+    node.shutdown().await;
+    let stopped = soon(restoring).await.unwrap();
+    assert!(matches!(stopped, Err(NodeError::Lost(_))), "{stopped:?}");
+    assert!(data.upgrade().is_none(), "nothing holds the tenant's data");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tenant_given_up_again_and_again_leaves_none_of_its_data_in_memory() {
+    let cluster = Cluster::new();
+    let lease = Duration::from_millis(600);
+    let node = node_leasing(&cluster, cluster.coordinator.clone(), lease);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let mut given_up = Vec::new();
+    for round in 0..3 {
+        let held = node.tenant(&tenant("acme")).await.unwrap();
+        if round == 0 {
+            held.write(vec![schema(EmbeddingProvider::None)])
+                .await
+                .unwrap();
+        }
+        // A write whose upload is never answered and never given up holds
+        // the writer for good.
+        cluster.store.fault(Some(("log", Fault::NeverAnswers)));
+        let stuck = tokio::spawn({
+            let held = held.clone();
+            async move { held.write(vec![note(round, "owl", None)]).await }
+        });
+        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        assert!(soon(stuck).await.unwrap().is_err());
+        cluster.store.fault(None);
+        given_up.push(Arc::downgrade(held.partition()));
+    }
+    node.tenant(&tenant("acme")).await.unwrap();
+    let live = given_up
+        .iter()
+        .filter(|data| data.upgrade().is_some())
+        .count();
+    assert_eq!(live, 0, "of {} given up", given_up.len());
+}
+
+#[tokio::test]
+async fn a_strong_read_on_a_holder_whose_lease_another_took_reads_from_a_copy_before_any_write() {
+    let cluster = Cluster::new();
+    let (holding, other) = (cluster.node(), cluster.node());
+    holding.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = holding.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    // Taken over, with nothing written since: only the generation says
+    // the holder's lease is no longer its own.
+    cluster.clock.advance(LEASE * 2);
+    other.tenant(&tenant("acme")).await.unwrap();
+    let strong = holding
+        .reader(&tenant("acme"), Freshness::Strong)
+        .await
+        .unwrap();
+    assert!(strong.follows());
+}
+
+#[tokio::test]
+async fn a_tenant_dropped_while_its_history_cannot_be_forgotten_is_dropped_and_its_purge_forgets_it(
+) {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        cluster.settings(),
+    );
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    node.tenant(&tenant("acme"))
+        .await
+        .unwrap()
+        .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    coordinator.failing_forgets.store(true, Ordering::SeqCst);
+    assert!(node.drop_tenant(&tenant("acme")).await.unwrap());
+    assert!(coordinator.forgets.load(Ordering::SeqCst) > 0);
+    coordinator.failing_forgets.store(false, Ordering::SeqCst);
+
+    let asked = coordinator.forgets.load(Ordering::SeqCst);
+    node.purge_due().await.unwrap();
+    assert!(coordinator.forgets.load(Ordering::SeqCst) > asked);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_strong_read_on_a_holder_behind_its_own_commit_reads_it_from_a_copy() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let node = node_leasing(&cluster, coordinator.clone(), LEASE);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let held = node.tenant(&tenant("acme")).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    // The commit lands, and the writer waits on for its answer.
+    coordinator.hang_after_commit.store(true, Ordering::SeqCst);
+    let writing = tokio::spawn({
+        let held = held.clone();
+        async move { held.write(vec![note(2, "hen", None)]).await }
+    });
+    coordinator.landed.notified().await;
+    let strong = node
+        .reader(&tenant("acme"), Freshness::Strong)
+        .await
+        .unwrap();
+    assert!(strong.follows());
+    assert_eq!(counted(&strong), 2);
+    writing.abort();
+}
+
 fn after(receipt: &vellev_storage::Receipt) -> Freshness {
     Freshness::After(receipt.incarnation, receipt.position)
 }
 
 fn counted(reader: &Reader) -> usize {
     reader.read(count)
+}
+
+#[tokio::test]
+async fn a_reader_says_whether_anything_costly_was_done_to_give_it() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.node(), cluster.reading_node());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let url = embedding_server(calls.clone()).await;
+    writing.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = writing.tenant(&tenant("acme")).await.unwrap();
+    let first = acme
+        .write(vec![
+            schema(served_by(&url, "lengths")),
+            note(1, "fox", None),
+        ])
+        .await
+        .unwrap();
+    let reader = |node: &Node, fresh: Freshness| {
+        let node = node.clone();
+        async move { node.reader(&tenant("acme"), fresh).await.unwrap() }
+    };
+
+    // On the node that holds the tenant, only a strong read asks the
+    // coordinator anything.
+    assert!(!reader(&writing, Freshness::Eventual).await.worked());
+    assert!(!reader(&writing, after(&first)).await.worked());
+    assert!(reader(&writing, Freshness::Strong).await.worked());
+
+    // On another, the first read opens a copy; one after it finds the
+    // copy there, and asks nothing while the copy is as fresh as asked.
+    // Of two that come while there is none, the opening is one's, and
+    // the other only waits for it.
+    *cluster.store.slow.lock().unwrap() = Some(Duration::from_millis(50));
+    let (opening, waiting) = tokio::join!(
+        reader(&reading, Freshness::Eventual),
+        reader(&reading, Freshness::Eventual)
+    );
+    *cluster.store.slow.lock().unwrap() = None;
+    assert!(opening.follows() && waiting.follows());
+    assert!(opening.worked() != waiting.worked(), "one of the two");
+    assert!(!reader(&reading, Freshness::Eventual).await.worked());
+    assert!(!reader(&reading, after(&first)).await.worked());
+    assert!(reader(&reading, Freshness::Strong).await.worked());
+    let second = acme.write(vec![note(2, "hen", None)]).await.unwrap();
+    let caught_up = reader(&reading, after(&second)).await;
+    assert!(
+        caught_up.worked(),
+        "the coordinator was asked how far to go"
+    );
+    assert!(!reader(&reading, after(&second)).await.worked());
+
+    // A text the model is asked for is work; the same text again, whose
+    // vector is kept, is not, nor is a blank one, which no model is asked.
+    let embedded = calls.load(Ordering::SeqCst);
+    let asking = reader(&writing, Freshness::Eventual).await;
+    assert_eq!(asking.query_vector(&notes(), "  ").await.unwrap(), None);
+    assert!(!asking.worked());
+    asking.query_vector(&notes(), "red fox").await.unwrap();
+    assert!(asking.worked());
+    assert_eq!(calls.load(Ordering::SeqCst), embedded + 1);
+    let again = reader(&writing, Freshness::Eventual).await;
+    again.query_vector(&notes(), "red fox").await.unwrap();
+    assert!(!again.worked());
+    assert_eq!(calls.load(Ordering::SeqCst), embedded + 1);
+    // One too long to be kept is asked for every time.
+    let long = "x".repeat(2_000);
+    for _ in 0..2 {
+        let asking = reader(&writing, Freshness::Eventual).await;
+        asking.query_vector(&notes(), &long).await.unwrap();
+        assert!(asking.worked());
+    }
+}
+
+#[tokio::test]
+async fn a_copy_one_read_failed_to_open_is_opened_and_kept_by_the_read_waiting_on_it() {
+    let cluster = Cluster::new();
+    let (writing, reading) = (cluster.node(), cluster.reading_node());
+    writing.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = writing.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    let read = |node: &Node| {
+        let node = node.clone();
+        async move { node.reader(&tenant("acme"), Freshness::Eventual).await }
+    };
+
+    // Two reads come for a tenant not yet open, and the store fails the
+    // first thing it is asked for: one read's opening fails, and the
+    // other, which waited on it, opens the copy itself.
+    *cluster.store.slow.lock().unwrap() = Some(Duration::from_millis(50));
+    cluster.store.failing_once.store(true, Ordering::SeqCst);
+    let (one, other) = tokio::join!(read(&reading), read(&reading));
+    *cluster.store.slow.lock().unwrap() = None;
+    let (failed, opened) = match (one, other) {
+        (Err(failed), Ok(opened)) | (Ok(opened), Err(failed)) => (failed, opened),
+        (one, other) => panic!("one of the two fails: {one:?}, {other:?}"),
+    };
+    assert!(matches!(failed, NodeError::Storage(_)), "{failed}");
+    assert!(opened.worked(), "the opening is its own, taken over or not");
+    assert_eq!(counted(&opened), 1);
+
+    // The copy it opened is the one the node keeps: the next read finds
+    // it there, and opens nothing.
+    assert_eq!(reading.copies(), 1);
+    let next = read(&reading).await.unwrap();
+    assert!(!next.worked());
+    assert_eq!(reading.copies(), 1);
+
+    // An opening that fails with nobody waiting on it is let go of, and
+    // the read after it opens afresh.
+    let cold = cluster.reading_node();
+    cluster.store.failing_once.store(true, Ordering::SeqCst);
+    assert!(read(&cold).await.is_err());
+    assert_eq!(cold.copies(), 0);
+    assert!(read(&cold).await.unwrap().worked());
+    assert_eq!(cold.copies(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn tenants_due_a_backup_are_looked_for_unasked_unless_the_node_is_set_not_to() {
+    let cluster = Cluster::new();
+    let store: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let backing_up = |scheduled: bool| {
+        cluster.node_from(Settings {
+            backups: Some(store.clone()),
+            backups_scheduled: scheduled,
+            ..cluster.settings()
+        })
+    };
+    let (asked_only, unasked) = (backing_up(false), backing_up(true));
+    asked_only.create_tenant(&tenant("acme")).await.unwrap();
+    let backups = || async { asked_only.backups(&tenant("acme")).await.unwrap().len() };
+
+    // A node set not to looks at no moment of its own, however long it
+    // runs, and backs up what is due when it is asked to.
+    asked_only.backing_up();
+    tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+    assert_eq!(backups().await, 0);
+    asked_only.back_up_due().await.unwrap();
+    assert_eq!(backups().await, 1);
+
+    // As a node is set up unless told otherwise, it looks within ten
+    // minutes of starting, and finds the tenant due again a day on.
+    cluster.clock.advance(Duration::from_secs(25 * 60 * 60));
+    unasked.backing_up();
+    tokio::time::sleep(Duration::from_secs(11 * 60)).await;
+    assert_eq!(backups().await, 2);
+    assert!(Settings::new(NodeId::generate("node")).backups_scheduled);
 }
 
 #[tokio::test]
@@ -1099,7 +1956,7 @@ async fn another_node_answers_reads_as_fresh_as_asked_and_never_takes_the_tenant
         .reader(&tenant("acme"), Freshness::Eventual)
         .await
         .unwrap();
-    assert!(matches!(first, Reader::Follower(_)));
+    assert!(first.follows());
     assert_eq!(
         counted(&first),
         1,
@@ -1138,7 +1995,7 @@ async fn another_node_answers_reads_as_fresh_as_asked_and_never_takes_the_tenant
         .reader(&tenant("acme"), Freshness::Strong)
         .await
         .unwrap();
-    assert!(matches!(own, Reader::Writer(_)), "the holder reads its own");
+    assert!(!own.follows(), "the holder reads its own");
     acme.write(vec![note(4, "elk", None)]).await.unwrap();
     assert!(matches!(
         reading.tenant(&tenant("acme")).await,
@@ -1207,10 +2064,7 @@ async fn a_node_whose_hold_ran_out_answers_a_session_read_from_the_new_writer() 
         .reader(&tenant("acme"), after(&receipt))
         .await
         .unwrap();
-    assert!(
-        matches!(read, Reader::Follower(_)),
-        "a writer behind the point is not trusted"
-    );
+    assert!(read.follows(), "a writer behind the point is not trusted");
     assert_eq!(counted(&read), 2);
 }
 
@@ -1292,10 +2146,8 @@ async fn a_node_lets_its_copy_go_once_it_writes_the_tenant_itself() {
     let taken = reading.tenant(&tenant("acme")).await.unwrap();
     assert_eq!(reading.copies(), 0);
     assert_eq!(taken.read(count), 1);
-    assert!(matches!(
-        reading.reader(&tenant("acme"), Freshness::Strong).await,
-        Ok(Reader::Writer(_))
-    ));
+    let strong = reading.reader(&tenant("acme"), Freshness::Strong).await;
+    assert!(!strong.unwrap().follows());
 }
 
 #[tokio::test]
@@ -1367,16 +2219,37 @@ async fn a_strong_read_on_a_holder_of_a_tenant_since_recreated_reads_the_new_one
         .reader(&tenant("acme"), Freshness::Eventual)
         .await
         .unwrap();
-    assert!(
-        matches!(eventual, Reader::Writer(_)),
-        "eventual takes what it has"
-    );
+    assert!(!eventual.follows(), "eventual takes what it has");
     let strong = holding
         .reader(&tenant("acme"), Freshness::Strong)
         .await
         .unwrap();
-    assert!(matches!(strong, Reader::Follower(_)));
+    assert!(strong.follows());
     assert!(strong.read(|state| state.collection(&notes()).is_none()));
+}
+
+#[tokio::test]
+async fn a_strong_read_on_a_holder_whose_lease_was_taken_over_reads_the_new_writes() {
+    let cluster = Cluster::new();
+    let (holding, other) = (cluster.node(), cluster.node());
+    holding.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = holding.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+
+    // The database's clock runs ahead of the holder's: the lease is over
+    // there while the holder, by its own clock, still has it.
+    cluster.clock.advance(LEASE * 2);
+    let taken = other.tenant(&tenant("acme")).await.unwrap();
+    taken.write(vec![note(2, "hen", None)]).await.unwrap();
+
+    let strong = holding
+        .reader(&tenant("acme"), Freshness::Strong)
+        .await
+        .unwrap();
+    assert!(strong.follows());
+    assert_eq!(counted(&strong), 2);
 }
 
 #[tokio::test]
@@ -1693,15 +2566,22 @@ async fn a_tenant_is_restored_to_a_point_in_its_window_and_readers_follow() {
     assert_eq!(opened.read(count), 1);
 
     let half_an_hour_on = kept.at + chrono::Duration::minutes(30);
-    let (target, restored) = writing
-        .restore(&acme, Point::At(half_an_hour_on))
+    let restored = writing
+        .restore(&acme, Point::At(half_an_hour_on), RequestId::generate())
         .await
         .unwrap();
-    assert_eq!(target, kept);
-    assert!(restored > removed.position);
+    assert_eq!(
+        (restored.restore.from, restored.restore.from_at),
+        (kept.position, kept.at)
+    );
+    assert!(restored.position > removed.position);
+    assert_eq!(restored.incarnation, removed.incarnation);
     assert_eq!(opened.read(count), 2);
     let followed = reading
-        .reader(&acme, Freshness::After(removed.incarnation, restored))
+        .reader(
+            &acme,
+            Freshness::After(restored.incarnation, restored.position),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1712,7 +2592,9 @@ async fn a_tenant_is_restored_to_a_point_in_its_window_and_readers_follow() {
 
     cluster.clock.advance(2 * day);
     assert!(matches!(
-        writing.restore(&acme, Point::At(half_an_hour_on)).await,
+        writing
+            .restore(&acme, Point::At(half_an_hour_on), RequestId::generate())
+            .await,
         Err(NodeError::NoRestorePoint(_))
     ));
     let (_, latest) = writing
@@ -1722,18 +2604,60 @@ async fn a_tenant_is_restored_to_a_point_in_its_window_and_readers_follow() {
         .unwrap()
         .1
         .unwrap();
-    let (back_to, _) = writing
-        .restore(&acme, Point::Position(latest.position))
+    let back_to = writing
+        .restore(
+            &acme,
+            Point::Position(latest.position),
+            RequestId::generate(),
+        )
         .await
         .unwrap();
     assert_eq!(
-        back_to, latest,
+        (back_to.restore.from, back_to.restore.from_at),
+        (latest.position, latest.at),
         "how it stood when the window began is in reach"
     );
     assert_eq!(
         writing.restore_points(&tenant("nobody")).await.unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn a_restore_from_a_backup_pruned_since_is_answered_as_it_was() {
+    let cluster = Cluster::new();
+    let store: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let node = cluster.node_from(Settings {
+        backups: Some(store.clone()),
+        ..cluster.settings()
+    });
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let opened = node.tenant(&acme).await.unwrap();
+    opened
+        .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    let backup = node.back_up(&acme).await.unwrap();
+    opened.write(vec![note(2, "hen", None)]).await.unwrap();
+
+    let request = RequestId::generate();
+    let restored = node
+        .restore_backup(&acme, backup.id, request)
+        .await
+        .unwrap();
+    Backups::new(store).discard(&backup).await.unwrap();
+    assert_eq!(
+        node.restore_backup(&acme, backup.id, request)
+            .await
+            .unwrap(),
+        restored
+    );
+    assert!(matches!(
+        node.restore_backup(&acme, backup.id, RequestId::generate())
+            .await,
+        Err(NodeError::UnknownBackup(..))
+    ));
 }
 
 #[tokio::test]
@@ -1791,6 +2715,222 @@ async fn every_node_drops_what_it_cached_of_a_purged_tenant_not_made_again() {
         ["gone/"],
         "once, and not of the tenant made again"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_stopped_after_its_commit_landed_is_answered_as_made() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let node = node_leasing(&cluster, coordinator.clone(), LEASE);
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    let point = Point::Position(kept.position);
+    let committed = || async {
+        let committed = cluster.coordinator.committed(&key("acme")).await;
+        committed.unwrap().unwrap().log_position
+    };
+    let before = committed().await;
+
+    // The restore's commit lands and its answer never comes; the node lets
+    // the tenant go meanwhile.
+    coordinator.hang_after_commit.store(true, Ordering::SeqCst);
+    let request = RequestId::generate();
+    let restoring = tokio::spawn({
+        let (node, acme) = (node.clone(), acme.clone());
+        async move { node.restore(&acme, point, request).await }
+    });
+    soon(coordinator.landed.notified()).await;
+    let landed = committed().await;
+    assert!(landed > before, "the restore is committed");
+    node.shutdown().await;
+    let stopped = soon(restoring).await.unwrap().unwrap();
+    assert_eq!(stopped.position, landed, "told as it was made");
+
+    // Another node finds the tenant put back, and the request answered.
+    let second = cluster.node();
+    let opened = second.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 1);
+    opened.write(vec![note(3, "owl", None)]).await.unwrap();
+    assert_eq!(
+        second.restore(&acme, point, request).await.unwrap(),
+        stopped
+    );
+    assert_eq!(second.tenant(&acme).await.unwrap().read(count), 2);
+}
+
+/// Whether `failure` tells its caller that what it asked for may or may
+/// not have been made.
+fn unknown(failure: &NodeError) -> bool {
+    matches!(failure, NodeError::Storage(StorageError::Shared(_)))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_whose_commit_is_never_answered_is_told_as_unknown_not_as_unmade() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let node = node_leasing(&cluster, coordinator.clone(), LEASE);
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    let point = Point::Position(kept.position);
+    let request = RequestId::generate();
+
+    // Given up after every try of it: it was not made, which the node
+    // cannot know of a commit it has no answer to.
+    coordinator.unanswered_commits.store(true, Ordering::SeqCst);
+    let given_up = soon(node.restore(&acme, point, request)).await.unwrap_err();
+    assert!(unknown(&given_up), "{given_up:?}");
+    assert!(matches!(
+        &given_up,
+        NodeError::Storage(failure)
+            if matches!(failure.root(), StorageError::Coordinator(CoordinatorError::Backend(_)))
+    ));
+
+    // And stopped while it waits for the answer: unknown no less.
+    let restoring = tokio::spawn({
+        let (node, acme) = (node.clone(), acme.clone());
+        async move { node.restore(&acme, point, request).await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!restoring.is_finished());
+    node.shutdown().await;
+    let stopped = soon(restoring).await.unwrap().unwrap_err();
+    assert!(unknown(&stopped), "{stopped:?}");
+
+    // Asked again by its name it is made, once.
+    let second = cluster.node();
+    let restored = second.restore(&acme, point, request).await.unwrap();
+    assert_eq!(
+        second.restore(&acme, point, request).await.unwrap(),
+        restored
+    );
+    assert_eq!(second.tenant(&acme).await.unwrap().read(count), 1);
+}
+
+/// A node that backs up to a store of its own, over a coordinator that
+/// can be made to go wrong, with tenant acme backed up when it held one
+/// note and holding two since.
+async fn backed_up(cluster: &Cluster) -> (Node, Arc<Unrenewing>, Settings, uuid::Uuid) {
+    let store: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone(), Duration::ZERO));
+    let settings = Settings {
+        backups: Some(store),
+        ..cluster.settings()
+    };
+    let embedders = Arc::new(Embedders::new(EmbedSettings::default()));
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        embedders,
+        settings.clone(),
+    );
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let opened = node.tenant(&acme).await.unwrap();
+    opened
+        .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    let backup = node.back_up(&acme).await.unwrap();
+    opened.write(vec![note(2, "hen", None)]).await.unwrap();
+    (node, coordinator, settings, backup.id)
+}
+
+#[tokio::test]
+async fn a_restore_from_a_backup_whose_commit_is_refused_says_so_and_lets_its_claim_go() {
+    let cluster = Cluster::new();
+    let (node, coordinator, _, backup) = backed_up(&cluster).await;
+    let acme = tenant("acme");
+    let request = RequestId::generate();
+
+    coordinator.refused_restores.store(true, Ordering::SeqCst);
+    let refused = node.restore_backup(&acme, backup, request).await;
+    let refused = refused.unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            NodeError::Storage(StorageError::Coordinator(CoordinatorError::Fenced { .. }))
+        ),
+        "told as it was refused: {refused:?}"
+    );
+
+    // Nothing holds the tenant's backups: it is restored at once when
+    // asked again, and may be backed up.
+    coordinator.refused_restores.store(false, Ordering::SeqCst);
+    node.restore_backup(&acme, backup, request).await.unwrap();
+    assert_eq!(node.tenant(&acme).await.unwrap().read(count), 1);
+    node.back_up(&acme).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_from_a_backup_stopped_under_way_lets_its_claim_go() {
+    let cluster = Cluster::new();
+    let (node, coordinator, settings, backup) = backed_up(&cluster).await;
+    let acme = tenant("acme");
+    let request = RequestId::generate();
+
+    // The restore's commit is never answered, and the node lets the tenant
+    // go while it waits.
+    coordinator.unanswered_commits.store(true, Ordering::SeqCst);
+    let restoring = tokio::spawn({
+        let (node, acme) = (node.clone(), acme.clone());
+        async move { node.restore_backup(&acme, backup, request).await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!restoring.is_finished());
+    node.shutdown().await;
+    assert!(soon(restoring).await.unwrap().is_err());
+    coordinator
+        .unanswered_commits
+        .store(false, Ordering::SeqCst);
+
+    // The claim went with it, not hours later: another node restores the
+    // tenant as soon as it is asked.
+    let second = cluster.node_from(Settings {
+        node: NodeId::generate("node"),
+        ..settings
+    });
+    soon(second.restore_backup(&acme, backup, request))
+        .await
+        .unwrap();
+    assert_eq!(second.tenant(&acme).await.unwrap().read(count), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_delete_by_filter_is_charged_for_every_object_it_deleted() {
+    let cluster = Cluster::new();
+    let node = cluster.node_from(Settings {
+        writes_per_second: Some(100.0),
+        ..cluster.settings()
+    });
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let opened = node.tenant(&acme).await.unwrap();
+    opened
+        .write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    let foxes: Vec<_> = (0..40).map(|n| note(n, "fox", None)).collect();
+    opened.write(foxes).await.unwrap();
+
+    // Let through as one write, of the 59 it may still make this second,
+    // and then owing one for each of the forty it deleted.
+    let every_fox = Mutation::DeleteWhere {
+        limit: None,
+        collection: notes(),
+        filter: vellev_storage::Filter::Eq {
+            property: "title".into(),
+            value: json!("fox"),
+        },
+    };
+    let deleted = opened.write(vec![every_fox]).await.unwrap();
+    assert_eq!(deleted.outcomes, vec![vellev_storage::Outcome::Deleted(40)]);
+    let hens: Vec<_> = (0..30).map(|n| note(n, "hen", None)).collect();
+    let turned_away = opened.write(hens.clone()).await;
+    assert!(
+        matches!(turned_away, Err(NodeError::Limited { .. })),
+        "{turned_away:?}"
+    );
+    opened.write(hens[..10].to_vec()).await.unwrap();
 }
 
 #[tokio::test]

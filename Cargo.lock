@@ -2112,6 +2112,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3955,12 +3964,16 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "serde",
  "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
  "tracing-serde",
@@ -4182,10 +4195,12 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vellev"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "clap",
  "eyre",
@@ -4215,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "vellev-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4228,7 +4243,7 @@ dependencies = [
 
 [[package]]
 name = "vellev-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -4243,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "vellev-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4256,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "vellev-embed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4278,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "vellev-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -4296,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "vellev-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4317,7 +4332,7 @@ dependencies = [
 
 [[package]]
 name = "vellev-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytemuck",
@@ -4338,6 +4353,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "vellev-core",
  "vellev-index",
