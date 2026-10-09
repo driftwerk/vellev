@@ -309,7 +309,34 @@ async fn a_batch_with_one_stale_version_is_refused_whole_and_alike_when_named_ag
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(again, body);
 
+    // A stale version on the upsert alone, and on the delete alone,
+    // refuses the batch just the same.
     let v1 = version(&served.get(&object(1)).await.1);
+    served.ok(Method::PUT, &object(3), Some(fox(3))).await;
+    let v3 = version(&served.get(&object(3)).await.1);
+    let one_stale = |stale_on: &str| {
+        let at = |op: &str, fresh: &str| if op == stale_on { STALE } else { fresh }.to_string();
+        json!({ "changes": [
+            { "op": "upsert", "collection": "notes", "id": id(3), "properties": { "n": 30 }, "only_if_version": at("upsert", &v3) },
+            { "op": "patch", "collection": "notes", "id": id(1), "properties": { "n": 10 }, "only_if_version": at("patch", &v1) },
+            { "op": "delete", "collection": "notes", "id": id(2), "only_if_version": at("delete", &v2) },
+        ] })
+    };
+    for (stale_on, stored) in [("upsert", &v3), ("delete", &v2)] {
+        let (status, body) = served
+            .post("/v1/tenants/acme/changes", one_stale(stale_on))
+            .await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::CONFLICT, "conflict"),
+            "{stale_on}"
+        );
+        assert_eq!(body["error"]["version"], json!(stored), "{stale_on}");
+        assert_eq!(served.get(&object(3)).await.1["properties"]["n"], 3);
+        assert_eq!(served.get(&object(1)).await.1["properties"]["n"], 7);
+        assert_eq!(served.get(&object(2)).await.0, StatusCode::OK);
+    }
+    served.ok(Method::DELETE, &object(3), None).await;
     let made = served
         .ok(Method::POST, "/v1/tenants/acme/changes", Some(batch(&v1)))
         .await;
@@ -320,4 +347,130 @@ async fn a_batch_with_one_stale_version_is_refused_whole_and_alike_when_named_ag
     assert_eq!(served.get(&object(1)).await.1["properties"]["n"], 10);
     assert_eq!(served.get(&object(2)).await.0, StatusCode::NOT_FOUND);
     assert_eq!(served.get(&object(3)).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_version_is_the_same_once_the_object_is_flushed_to_a_segment() {
+    let served = Served::new().await;
+    served.with_notes(supplied()).await;
+    served.ok(Method::PUT, &object(1), Some(fox(1))).await;
+    let hen = json!({ "properties": { "title": "a hen", "n": 2 } });
+    served.ok(Method::PUT, &object(2), Some(hen)).await;
+    async fn read(served: &Served) -> Vec<String> {
+        let mut found = vec![
+            version(&served.get(&object(1)).await.1),
+            version(&served.get(&object(2)).await.1),
+        ];
+        let listed = served
+            .ok(
+                Method::POST,
+                &format!("{NOTES}/list"),
+                Some(json!({ "limit": 10 })),
+            )
+            .await;
+        found.extend(listed["objects"].as_array().unwrap().iter().map(version));
+        let near = served
+            .ok(
+                Method::POST,
+                &format!("{NOTES}/nearest"),
+                Some(json!({ "vector": [1.0, 0.0], "limit": 1 })),
+            )
+            .await;
+        found.push(version(&near["results"][0]));
+        found
+    }
+    let before = read(&served).await;
+    assert_eq!(before[0], before[2]);
+    assert_eq!(before[0], before[4]);
+    assert_eq!(before[1], before[3]);
+    let acme = vellev_core::TenantId::new("acme").unwrap();
+    served
+        .node
+        .tenant(&acme)
+        .await
+        .unwrap()
+        .flush()
+        .await
+        .unwrap();
+    // A row in a segment keeps its vector apart from the object: its
+    // version is of both still, for the one with a vector and the one
+    // without, and a write at it is made.
+    assert_eq!(read(&served).await, before);
+    let moved = served
+        .ok(
+            Method::PATCH,
+            &object(1),
+            Some(json!({ "properties": { "n": 5 }, "only_if_version": before[0] })),
+        )
+        .await;
+    assert_eq!(moved["outcomes"], json!([{ "outcome": "applied" }]));
+    let (status, body) = served
+        .delete(&format!("{}?only_if_version={}", object(2), before[0]))
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "conflict"));
+    assert_eq!(body["error"]["version"], json!(before[1]));
+}
+
+#[tokio::test]
+async fn a_version_covers_the_vector_a_node_embeds_and_a_conditional_write_passes_at_it() {
+    let url = keyed_embedding_server("sk-right").await;
+    let served = Cluster::new().serve_embedding_keyed(&url, "sk-right").await;
+    let embedding = json!({
+        "provider": "http",
+        "api": "openai",
+        "url": url,
+        "model": "stand-in",
+        "dimensions": 2,
+        "properties": ["title"],
+    });
+    served.with_notes(embedding).await;
+    let fox = json!({ "properties": { "title": "a red fox", "n": 1 } });
+    served.ok(Method::PUT, &object(1), Some(fox)).await;
+    let got = served.get(&object(1)).await.1;
+    assert_eq!(got["vector"], json!([9.0, 3.0]), "embedded by the node");
+    let v1 = version(&got);
+    // The same text keeps its vector, so a patch of another property at
+    // the version is made and moves it; a patch that changes the text
+    // changes the vector, and so the version, though nothing else of
+    // the object the client sent did.
+    let moved = served
+        .ok(
+            Method::PATCH,
+            &object(1),
+            Some(json!({ "properties": { "n": 2 }, "only_if_version": v1 })),
+        )
+        .await;
+    assert_eq!(moved["outcomes"], json!([{ "outcome": "applied" }]));
+    let v2 = version(&served.get(&object(1)).await.1);
+    assert_ne!(v2, v1);
+    let (status, body) = served
+        .patch(
+            &object(1),
+            json!({ "properties": { "n": 3 }, "only_if_version": v1 }),
+        )
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "conflict"));
+    assert_eq!(body["error"]["version"], json!(v2));
+    let retitled = served
+        .ok(
+            Method::PATCH,
+            &object(1),
+            Some(json!({ "properties": { "title": "a hen" }, "only_if_version": v2 })),
+        )
+        .await;
+    assert_eq!(retitled["outcomes"], json!([{ "outcome": "applied" }]));
+    let got = served.get(&object(1)).await.1;
+    assert_eq!(got["vector"], json!([5.0, 2.0]));
+    let v3 = version(&got);
+    assert_ne!(v3, v2);
+    let deleted = served
+        .ok(
+            Method::POST,
+            "/v1/tenants/acme/changes",
+            Some(json!({ "changes": [
+                { "op": "delete", "collection": "notes", "id": id(1), "only_if_version": v3 },
+            ] })),
+        )
+        .await;
+    assert_eq!(deleted["outcomes"], json!([{ "outcome": "applied" }]));
 }

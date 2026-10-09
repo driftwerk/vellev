@@ -943,9 +943,14 @@ impl Records {
     /// Delete the object only if it is stored and still at `version`:
     /// [`Code::Conflict`] otherwise, with [`Error::version`] the one it
     /// is at, and [`Code::NotFound`] if it is not stored.
+    ///
+    /// Sent as a batch of one change rather than as a `DELETE` with the
+    /// condition in its query: a node of 0.1 ignores a query it does not
+    /// know and would delete unconditionally, where it refuses a change
+    /// it does not know.
     pub async fn delete_if_version(&self, id: ObjectId, version: Version) -> Result<Written> {
-        let path = format!("{}?only_if_version={version}", self.object(id));
-        self.tenant.write(Method::DELETE, &path, None::<&()>).await
+        let delete = Change::delete_if_version(self.name.clone(), id, version);
+        self.tenant.batch(vec![delete]).await
     }
 
     /// Store every object whole, several to a request, each request one

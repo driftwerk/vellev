@@ -233,6 +233,24 @@ async fn the_whole_api_is_reached_through_the_client() {
     notes.patch(oid(1), &moved).await.unwrap();
     let now = notes.get(oid(1)).await.unwrap().unwrap().version.unwrap();
     assert_ne!(now, at);
+    // A store refused part of the way at a stale version says the
+    // version too, through the partial failure.
+    let partial = notes
+        .store_all([
+            (oid(3), content("owl", 3, None)),
+            (oid(1), content("a red fox", 7, None).only_if_version(stale)),
+        ])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(partial, Error::Partial { stored: 0, .. }),
+        "{partial:?}"
+    );
+    assert_eq!(
+        (partial.code(), partial.version()),
+        (Some(Code::Conflict), Some(now))
+    );
+    assert_eq!(notes.get(oid(3)).await.unwrap(), None);
     let deleted = notes.delete_if_version(oid(1), now).await.unwrap();
     assert_eq!(deleted.outcomes, vec![Outcome::Applied]);
     let gone = notes.delete_if_version(oid(1), now).await.unwrap_err();
@@ -1536,4 +1554,31 @@ async fn a_search_a_node_cannot_embed_for_is_answered_by_one_that_can() {
         (true, Some(Code::ModelUnavailable))
     );
     assert!(by_words.results[0].distance.is_none());
+}
+
+/// A node of 0.1 ignores a query it does not know on a `DELETE`, and
+/// would delete whatever the condition; it refuses a change it does not
+/// know. So the client sends a conditional delete as a batch.
+#[tokio::test]
+async fn a_conditional_delete_goes_as_a_change_a_node_of_0_1_refuses_rather_than_ignores() {
+    let stub = Stub::answering(|_, _| {
+        (
+            200,
+            json!({ "incarnation": 1, "position": 2, "outcomes": [{ "outcome": "applied" }] }),
+        )
+    })
+    .await;
+    let client = Client::connect(&[&stub.url], KEY, tries(1)).unwrap();
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let at = "0123456789abcdef0123456789abcdef".parse().unwrap();
+    notes.delete_if_version(oid(1), at).await.unwrap();
+    assert_eq!(stub.asked("POST /v1/tenants/acme/changes"), 1);
+    assert_eq!(stub.asked("DELETE"), 0);
+    notes.delete(oid(1)).await.unwrap();
+    assert_eq!(
+        stub.asked("DELETE /v1/tenants/acme/collections/notes/objects/"),
+        1,
+        "a plain delete is a DELETE still"
+    );
+    assert_eq!(stub.asked("POST"), 1);
 }

@@ -51,6 +51,14 @@ pub struct Hit<'a> {
     pub certainty: Option<f32>,
 }
 
+impl Hit<'_> {
+    /// The object's version: of its properties and the vector it was
+    /// found by, which is the one stored.
+    pub fn version(&self) -> vellev_core::Version {
+        vellev_core::Version::of(&self.object.properties, Some(self.vector))
+    }
+}
+
 impl State {
     /// The collection's live objects nearest `query.vector`, nearest first,
     /// those at one distance in object id order. Objects without a vector

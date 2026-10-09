@@ -227,13 +227,14 @@ impl<S: Send + Sync> FromRequestParts<S> for Fresh {
 }
 
 /// `object` as it is answered, with its vector if `vectors` and its
-/// version either way: of the vector it has, sent or not.
-fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool) -> Stored {
+/// `version` either way: what found the object says it is, of the vector
+/// stored, which a row in a segment keeps apart from the object.
+fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool, version: Version) -> Stored {
     Stored::new(
         object.id,
         object.properties_json(),
         vector.filter(|_| vectors).map(<[f32]>::to_vec),
-        Version::of(&object.properties, vector),
+        version,
     )
 }
 
@@ -856,7 +857,7 @@ pub async fn object(
             let found = state
                 .get(&collection, id)
                 .filter(|found| viewer.sees(&schema, found.object))
-                .map(|found| stored(found.object, found.vector, true));
+                .map(|found| stored(found.object, found.vector, true, found.version()));
             found.ok_or_else(|| {
                 ApiError::not_found(
                     Missing::Object,
@@ -970,20 +971,23 @@ pub async fn delete_object(
 }
 
 fn hit(hit: Hit<'_>, vectors: bool) -> Found {
-    let mut found = Found::new(stored(hit.object, Some(hit.vector), vectors));
+    let version = hit.version();
+    let mut found = Found::new(stored(hit.object, Some(hit.vector), vectors, version));
     found.distance = Some(hit.distance);
     found.certainty = hit.certainty;
     found
 }
 
 fn scored(scored: Scored<'_>, vectors: bool) -> Found {
-    let mut found = Found::new(stored(scored.object, scored.vector, vectors));
+    let version = scored.version();
+    let mut found = Found::new(stored(scored.object, scored.vector, vectors, version));
     found.keyword = Some(scored.score);
     found
 }
 
 fn fused(fused: Fused<'_>, vectors: bool) -> Found {
-    let mut found = Found::new(stored(fused.object, fused.vector, vectors));
+    let version = fused.version();
+    let mut found = Found::new(stored(fused.object, fused.vector, vectors, version));
     found.score = Some(fused.score);
     found.distance = fused.distance;
     found.certainty = fused.certainty;
@@ -1180,7 +1184,7 @@ pub async fn list(
         let objects = found
             .into_iter()
             .take(limit)
-            .map(|found| stored(found.object, found.vector, page.vectors))
+            .map(|found| stored(found.object, found.vector, page.vectors, found.version()))
             .collect();
         Ok(Json(Objects::new(objects, next)))
     })

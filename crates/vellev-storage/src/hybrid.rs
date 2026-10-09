@@ -66,6 +66,13 @@ pub struct Fused<'a> {
     pub keyword: Option<f32>,
 }
 
+impl Fused<'_> {
+    /// The object's version: of its properties and its stored vector.
+    pub fn version(&self) -> vellev_core::Version {
+        vellev_core::Version::of(&self.object.properties, self.vector)
+    }
+}
+
 impl<'a> Fused<'a> {
     fn of(object: &'a Object, vector: Option<&'a [f32]>) -> Self {
         Self {

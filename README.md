@@ -321,8 +321,9 @@ catches up that far before it answers (the Rust client does this for you).
 
 Every object read carries a `version`, and a `PUT`, `PATCH` or `DELETE` of
 an object can be made `only_if_version` it is still at (in the body, or
-`?only_if_version=` on a `DELETE`; in a batch, on `upsert`, `patch` and
-`delete`): two writers that read the same object cannot each overwrite the
+`?only_if_version=` on a `DELETE`, which a node of 0.1 ignores, so send a
+conditional delete in a batch until every node is 0.2; in a batch, on
+`upsert`, `patch` and `delete`): two writers that read the same object cannot each overwrite the
 other's change unknowing, as the one that comes second is refused with
 `conflict` and the version the object has now, and reads again. The
 version is of the object's content, properties and vector, so an object

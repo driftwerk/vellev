@@ -164,7 +164,9 @@ The version is the first 16 bytes of SHA-256 over, in this order:
    - bool (tag 5): one byte, 0 or 1;
    - date (tag 6): the instant as seconds since the Unix epoch, an i64
      little-endian, then its nanoseconds within the second, a u32
-     little-endian; the zone it was sent in does not count;
+     little-endian, so that an instant before the epoch has the second
+     floored and nanoseconds from 0 upward (`-0.25 s` is `-1` and
+     `750000000`); the zone it was sent in does not count;
 4. the vector: one byte 0 if the object has none, else one byte 1, the
    number of dimensions as a u64, then each f32's bits, little-endian, in
    order, with `-0.0` taken as `0.0`.
@@ -183,10 +185,16 @@ version, under any id, in any collection, on any node, after any restore.
 again outside the crate from this description; a change that gives those
 objects other versions fails the test, which is the point.
 
-A node of a release before versions refuses `only_if_version`, as it does
-any field it does not know, so a conditional write sent to one is refused
-rather than made unconditionally; it answers objects without `version`,
-which the client crate reads as `None`.
+A node of a release before versions refuses `only_if_version` in a body,
+as it does any field it does not know, so a conditional `PUT`, `PATCH` or
+change in `POST …/changes` sent to one is refused rather than made
+unconditionally. **Not so the `DELETE …/objects/{id}` route**: a node of
+0.1 ignores a query it does not know, so `?only_if_version=` sent to one
+deletes the object whatever the version. The client crate therefore sends
+`delete_if_version` as `POST …/changes` with one `delete`; raw HTTP must
+do the same until every node is 0.2, and may use the query after. A node
+of 0.1 answers objects without `version`, which the client crate reads as
+`None`.
 
 ## Between nodes
 

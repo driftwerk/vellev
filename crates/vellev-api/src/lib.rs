@@ -1835,6 +1835,72 @@ mod tests {
     }
 
     #[test]
+    fn a_change_built_from_a_body_carries_every_condition_the_body_names() {
+        let notes = CollectionName::new("notes").unwrap();
+        let id = ObjectId(uuid::Uuid::from_u128(7));
+        let at: Version = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let properties = Map::from_iter([("n".to_string(), json!(1))]);
+        let content = Content::new(properties.clone())
+            .vector(vec![1.0])
+            .only_if_version(at);
+        assert_eq!(
+            Change::upsert(notes.clone(), id, content),
+            Change::Upsert {
+                collection: notes.clone(),
+                id,
+                properties: properties.clone(),
+                vector: Some(vec![1.0]),
+                only_if_version: Some(at),
+            }
+        );
+        assert_eq!(
+            Change::upsert(notes.clone(), id, Content::new(Map::new())),
+            Change::Upsert {
+                collection: notes.clone(),
+                id,
+                properties: Map::new(),
+                vector: None,
+                only_if_version: None,
+            }
+        );
+        let changes = Changes::new(properties.clone())
+            .vector(vec![2.0])
+            .only_if(OnlyIf::new("n", json!(0)))
+            .only_if_version(at);
+        assert_eq!(
+            Change::patch(notes.clone(), id, changes),
+            Change::Patch {
+                collection: notes.clone(),
+                id,
+                properties,
+                vector: Some(vec![2.0]),
+                only_if: Some(OnlyIf::new("n", json!(0))),
+                only_if_version: Some(at),
+            }
+        );
+        assert_eq!(
+            Change::delete(notes.clone(), id),
+            Change::Delete {
+                collection: notes.clone(),
+                id,
+                only_if_version: None,
+            }
+        );
+        assert_eq!(
+            Change::delete_if_version(notes.clone(), id, at),
+            Change::Delete {
+                collection: notes.clone(),
+                id,
+                only_if_version: Some(at),
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(Change::delete_if_version(notes, id, at)).unwrap(),
+            json!({ "op": "delete", "collection": "notes", "id": id, "only_if_version": at })
+        );
+    }
+
+    #[test]
     fn each_limit_is_told_under_its_own_name_and_one_not_said_is_not_known() {
         let limits = Limits {
             results: 1,

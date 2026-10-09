@@ -143,7 +143,7 @@ impl std::str::FromStr for Version {
     /// case.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let malformed = || VersionError(text.to_string());
-        if text.len() != 32 || !text.is_ascii() {
+        if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(malformed());
         }
         let mut version = [0; 16];
@@ -218,6 +218,22 @@ mod tests {
             (
                 object(&[("n", Value::Int(1))], None),
                 "6d03f05d07799d71e6a72c9e5aef4fbd",
+            ),
+            (
+                object(
+                    &[
+                        ("n", Value::Int(1)),
+                        (
+                            "at",
+                            Value::Date(
+                                Utc.with_ymd_and_hms(2026, 10, 9, 12, 30, 15).unwrap()
+                                    + chrono::Duration::milliseconds(250),
+                            ),
+                        ),
+                    ],
+                    None,
+                ),
+                "9c9ebb0010a3b02ae9aa939cbd1c1761",
             ),
         ];
         for (object, version) in golden {
@@ -298,6 +314,9 @@ mod tests {
             serde_json::from_value::<Version>(serde_json::Value::String(written.clone())).unwrap(),
             version
         );
+        // A sign is not a digit, though a number parser takes one.
+        let signed = format!("+{}", &written[1..]);
+        let signed_later = format!("{}-{}", &written[..20], &written[21..]);
         for bad in [
             "",
             "abc",
@@ -305,6 +324,9 @@ mod tests {
             &format!("{written}0"),
             &format!("g{}", &written[1..]),
             "é".repeat(16).as_str(),
+            signed.as_str(),
+            signed_later.as_str(),
+            " ".repeat(32).as_str(),
         ] {
             assert!(bad.parse::<Version>().is_err(), "{bad:?}");
             assert!(
