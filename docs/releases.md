@@ -277,7 +277,10 @@ and say what the caller then answers for.
   full set of digits as a neighbouring double: `-2.3624865652539077e-47`
   came back `-2.3624865652539072e-47`. Every number property written
   through the API was open to it; vectors were not, an `f32` surviving
-  the older reader. Numbers stored before stay as they were stored.
+  the older reader. Numbers stored before stay as they were stored, so
+  a filter for a number equal to the one a client sent may miss an
+  object stored before this release, which holds its neighbour, and
+  find it once the object is stored again.
 - It costs time reading JSON: a request of 200 vectors of 768 dimensions
   parses in 7.7 ms where it took 4.1 ms, one of 1536 dimensions in
   15.3 ms where it took 7.9 ms. Against the rest of a write it does not
@@ -301,19 +304,27 @@ and say what the caller then answers for.
 - **Nothing is deleted until Weaviate has been walked, and then only
   within a bound**: `--max-deletes` (1000) and `--max-delete-fraction`
   (0.05) of a class, the fewer. A run that finds more gone deletes none
-  and fails. `--no-delete` deletes nothing. Each object is asked for
-  twice, `--confirm-secs` apart, with Weaviate ready and the class's
-  shards loaded, before it is deleted.
+  and fails, as does one told to delete nothing, `--no-delete`, while
+  anything is gone. The last object of a class is never deleted unless
+  a run may delete all of one. Each object is asked for twice,
+  `--confirm-secs` apart, with Weaviate ready and the class's shards
+  loaded, before it is deleted.
 - **A class made again in Weaviate is not taken for the one imported**:
   the run stops, unless given `--accept-remade`.
 - **A class that gained a property is caught up**, the property added to
   the collection, where a run used to fail. A class that no longer fits
   is refused with every reason.
-- **A collection without a ledger is taken up, and given nothing it
-  lacks** unless `--sole-writer` says nothing else wrote to it. That is
-  every collection imported by an earlier release. Because those hold
-  numbers read the old way, only `--sole-writer`, or importing again
-  into a collection made anew, brings them level with Weaviate.
+- **A collection an earlier release imported is not caught up by a
+  plain run of this one.** It has no ledger. The run takes it up: what
+  it holds exactly as Weaviate does becomes the import's, and
+  everything else of Weaviate's, which is whatever Weaviate gained or
+  changed since that import last caught up and whatever holds a number
+  read the old way, is **not copied**. It is counted as `withheld` and
+  the run fails, every time, saying so. The remedy is one run with
+  `--sole-writer`, if nothing but an import has written to the
+  collection: it stores and replaces what was withheld, and deletes,
+  within the usual bound, what Weaviate deleted meanwhile. Otherwise
+  import into a collection made anew.
 - **`vellev import finalise`** ends an import: it drops the ledgers and
   notes that the collections are no longer imported.
 - **The exit status says what is left**: 0 when everything that is the
@@ -324,10 +335,13 @@ and say what the caller then answers for.
 - **The report is exact, and the same every run.** An object deleted
   from Weaviate between being listed and being fetched is deleted in the
   same run. `changed` no longer counts objects stored again unchanged.
-  New fields: `kept`, `left`, `pending`, `budget`, `refused`,
-  `too_large`, `imported`, `verified`.
+  New fields: `kept`, `withheld`, `left`, `pending`, `budget`,
+  `refused`, `too_large`, `imported`, `verified`, and `ended` beside
+  the classes.
 - **`--verify` and `--verify-all`** compare what a collection holds with
   what Weaviate does, object by object, and change nothing.
+- A class whose import was ended is passed over by a run of every
+  class, and refused only when named.
 - **A collection is caught up only from the Weaviate it was imported
   from.** `--from-name` names one whose address changes between runs.
   `--created-as` and `--updated-as` must stay as they were.

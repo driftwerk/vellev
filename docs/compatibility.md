@@ -402,11 +402,16 @@ release before stopped.
 - **Numbers.** A node of this release reads the numbers in a request
   exactly. One of an earlier release read about three in ten doubles
   with a full set of digits as a neighbouring double, and stored that.
-  Whatever such a node stored stays as it stored it. Run no import that
-  keeps a ledger against nodes from before this release: the hashes it
-  would keep are of numbers the node did not store.
+  Whatever such a node stored stays as it stored it, so a filter for a
+  number equal to one a client sent then may not find it, the stored
+  number being its neighbour; one stored since is found. Storing the
+  object again puts it right. Run no import that keeps a ledger against
+  nodes from before this release: the hashes it would keep are of
+  numbers the node did not store.
 - A collection imported before there was a ledger is taken up, not
-  caught up as it was: see the README. Nothing is deleted from it.
+  caught up as it was: what it lacks or holds otherwise is withheld, not
+  copied, and the run fails until one is told that nothing else wrote
+  to it. See the README.
 - The report may gain fields. Its exit status is 0 when everything that
   is the import's is settled, 3 when another run is all it takes, and 1
   otherwise; before, it was 1 whenever the counts differed.
