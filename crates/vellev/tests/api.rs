@@ -5,6 +5,17 @@ use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 use vellev_api::REQUEST;
 
+/// An object as answered, without its version, which every object has
+/// and versions.rs checks.
+fn unversioned(mut object: Value) -> Value {
+    let version = object.as_object_mut().unwrap().remove("version");
+    assert!(
+        version.is_some_and(|version| version.is_string()),
+        "{object}"
+    );
+    object
+}
+
 #[tokio::test]
 async fn every_route_but_health_and_the_description_needs_a_key() {
     let served = Served::new().await;
@@ -214,8 +225,9 @@ async fn an_object_is_stored_read_patched_and_deleted() {
         stored,
         json!({ "incarnation": 1, "position": 2, "outcomes": [{ "outcome": "applied" }] })
     );
+    // Its version is checked in versions.rs; here, the rest of it.
     assert_eq!(
-        served.get(&object(1)).await.1,
+        unversioned(served.get(&object(1)).await.1),
         json!({ "id": id(1), "properties": { "title": "A red fox", "n": 1 }, "vector": [1.0, 0.0] })
     );
 
@@ -412,7 +424,7 @@ async fn the_three_searches_rank_and_score_and_obey_filters_and_limits() {
     let nearest = search("nearest", json!({ "vector": [1.0, 0.0], "limit": 10 })).await;
     assert_eq!(ids(&nearest), [id(1), id(2), id(3)]);
     assert_eq!(
-        nearest["results"][0],
+        unversioned(nearest["results"][0].clone()),
         json!({ "id": id(1), "properties": { "title": "a red fox", "n": 1 }, "distance": 0.0, "certainty": 1.0 })
     );
     let with_vectors = search(
@@ -531,7 +543,8 @@ async fn a_collection_is_listed_a_page_at_a_time_and_counted() {
     assert_eq!(listed, [&json!(id(1)), &json!(id(2)), &json!(id(3))]);
     assert_eq!(first["next"], json!(id(3)));
     assert!(first["objects"][0].get("vector").is_none());
-    let rest = list(json!({ "limit": 3, "after": first["next"], "vectors": true })).await;
+    let mut rest = list(json!({ "limit": 3, "after": first["next"], "vectors": true })).await;
+    rest["objects"][0] = unversioned(rest["objects"][0].clone());
     assert_eq!(
         rest,
         json!({ "objects": [{ "id": id(4), "properties": { "title": "the fox and the hen", "n": 4 } }] })

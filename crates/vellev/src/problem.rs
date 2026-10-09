@@ -143,9 +143,10 @@ fn code(error: &StorageError) -> Code {
     use StorageError as E;
     match error {
         E::UnknownCollection(_) | E::UnknownObject { .. } => Code::NotFound,
-        E::CollectionExists(_) | E::ObjectExists { .. } | E::ConditionFailed { .. } => {
-            Code::Conflict
-        }
+        E::CollectionExists(_)
+        | E::ObjectExists { .. }
+        | E::ConditionFailed { .. }
+        | E::StaleVersion { .. } => Code::Conflict,
         E::InvalidMutation(_)
         | E::TooMany { .. }
         | E::InvalidQuery(_)
@@ -225,6 +226,7 @@ impl From<StorageError> for ApiError {
             (code, root) => {
                 let mut told = Self::new(code, root.to_string());
                 told.problem.limit = limit(root);
+                told.problem.version = root.stored_version();
                 told
             }
         }
@@ -410,6 +412,7 @@ mod tests {
             message: "object 7 does not exist in notes".into(),
             lacking: None,
             over: None,
+            version: None,
         });
         let nested = StorageError::Shared(Arc::new(StorageError::Shared(Arc::new(refused))));
         assert_eq!(told(nested), Code::NotFound);
@@ -517,6 +520,7 @@ mod tests {
                 message: format!("collection {collection} does not exist"),
                 lacking,
                 over: None,
+                version: None,
             })
         };
         assert_eq!(

@@ -234,6 +234,7 @@ fn note(n: u64, title: &str, vector: Option<Vec<f32>>) -> Mutation {
             .unwrap()
             .clone(),
         vector,
+        only_if_version: None,
     }
 }
 
@@ -2094,6 +2095,7 @@ async fn a_copy_left_unread_catches_up_through_merges_and_cleanup() {
     acme.write(vec![Mutation::Delete {
         collection: notes(),
         id: id(0),
+        only_if_version: None,
     }])
     .await
     .unwrap();
@@ -2560,6 +2562,7 @@ async fn a_tenant_is_restored_to_a_point_in_its_window_and_readers_follow() {
         .write(vec![Mutation::Delete {
             collection: notes(),
             id: id(1),
+            only_if_version: None,
         }])
         .await
         .unwrap();

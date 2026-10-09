@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
-use vellev_core::{Collection, CollectionName, ModelFault, ObjectId, Property, TenantId};
+use vellev_core::{Collection, CollectionName, ModelFault, ObjectId, Property, TenantId, Version};
 use vellev_index::filter::Filter;
 use vellev_index::fusion::Fusion;
 
@@ -182,6 +182,11 @@ pub struct Problem {
     /// it right. It says nothing of what was asked or of what answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<Reason>,
+    /// On `conflict` from a write conditional on an object, by `only_if`
+    /// or `only_if_version`: the version the object is at now, so that
+    /// the caller can decide without reading it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<Version>,
 }
 
 impl Problem {
@@ -192,6 +197,7 @@ impl Problem {
             limit: None,
             missing: None,
             reason: None,
+            version: None,
         }
     }
 }
@@ -525,6 +531,11 @@ pub struct Content {
     /// to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<Vec<f32>>,
+    /// Store it only if an object is stored under the id and is at this
+    /// version: `conflict` (409) otherwise, with the version it is at,
+    /// and `not_found` (404) if none is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_if_version: Option<Version>,
 }
 
 /// Holds when the stored object's `property` equals `equals`, where null
@@ -550,6 +561,11 @@ pub struct Changes {
     pub vector: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_if: Option<OnlyIf>,
+    /// Only if the stored object is at this version; with `only_if` too,
+    /// both must hold. `conflict` (409) otherwise, with the version it
+    /// is at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_if_version: Option<Version>,
 }
 
 /// An object as it is stored.
@@ -562,6 +578,11 @@ pub struct Stored {
     pub properties: Map<String, Json>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<Vec<f32>>,
+    /// The version of the object's content, vector included whether or
+    /// not it is sent along: what to give as `only_if_version` to write
+    /// it only if it is still so. Absent from a node of 0.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<Version>,
 }
 
 /// One change. Several sent together are applied as one atomic step, each
@@ -580,7 +601,8 @@ pub enum Change {
     DropCollection {
         collection: CollectionName,
     },
-    /// Store the object whole, replacing any stored under its id.
+    /// Store the object whole, replacing any stored under its id. With
+    /// `only_if_version`, only if one is stored and is at that version.
     Upsert {
         collection: CollectionName,
         id: ObjectId,
@@ -589,6 +611,8 @@ pub enum Change {
         properties: Map<String, Json>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         vector: Option<Vec<f32>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        only_if_version: Option<Version>,
     },
     /// Store the object only if none is stored under its id.
     Insert {
@@ -601,6 +625,8 @@ pub enum Change {
         vector: Option<Vec<f32>>,
     },
     /// Merge into a stored object: a property sent as null is removed.
+    /// Only if the object passes `only_if` and is at `only_if_version`,
+    /// where given.
     Patch {
         collection: CollectionName,
         id: ObjectId,
@@ -611,6 +637,8 @@ pub enum Change {
         vector: Option<Vec<f32>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         only_if: Option<OnlyIf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        only_if_version: Option<Version>,
     },
     /// Add `by` to a number, counting no value as zero.
     Increment {
@@ -629,9 +657,14 @@ pub enum Change {
         #[serde(default)]
         unique: bool,
     },
+    /// Delete the object; deleting one that is not stored changes
+    /// nothing. With `only_if_version`, it must be stored, at that
+    /// version.
     Delete {
         collection: CollectionName,
         id: ObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        only_if_version: Option<Version>,
     },
     /// Delete the objects passing `filter`, which must have a condition.
     ///
@@ -917,12 +950,20 @@ impl Content {
         Self {
             properties,
             vector: None,
+            only_if_version: None,
         }
     }
 
     #[must_use]
     pub fn vector(mut self, vector: Vec<f32>) -> Self {
         self.vector = Some(vector);
+        self
+    }
+
+    /// Stored only if an object is stored under the id at `version`.
+    #[must_use]
+    pub fn only_if_version(mut self, version: Version) -> Self {
+        self.only_if_version = Some(version);
         self
     }
 }
@@ -934,6 +975,7 @@ impl Changes {
             properties,
             vector: None,
             only_if: None,
+            only_if_version: None,
         }
     }
 
@@ -946,6 +988,13 @@ impl Changes {
     #[must_use]
     pub fn only_if(mut self, only_if: OnlyIf) -> Self {
         self.only_if = Some(only_if);
+        self
+    }
+
+    /// Merged only if the stored object is at `version`.
+    #[must_use]
+    pub fn only_if_version(mut self, version: Version) -> Self {
+        self.only_if_version = Some(version);
         self
     }
 }
@@ -1229,6 +1278,50 @@ impl Restored {
 }
 
 impl Change {
+    /// Store `content` whole under `id`, replacing any object stored
+    /// there, or only if what is stored is at the version `content`
+    /// names.
+    pub fn upsert(collection: CollectionName, id: ObjectId, content: Content) -> Self {
+        Self::Upsert {
+            collection,
+            id,
+            properties: content.properties,
+            vector: content.vector,
+            only_if_version: content.only_if_version,
+        }
+    }
+
+    /// Merge `changes` into the object stored under `id`, on the
+    /// conditions `changes` names.
+    pub fn patch(collection: CollectionName, id: ObjectId, changes: Changes) -> Self {
+        Self::Patch {
+            collection,
+            id,
+            properties: changes.properties,
+            vector: changes.vector,
+            only_if: changes.only_if,
+            only_if_version: changes.only_if_version,
+        }
+    }
+
+    /// Delete the object stored under `id`, if any.
+    pub fn delete(collection: CollectionName, id: ObjectId) -> Self {
+        Self::Delete {
+            collection,
+            id,
+            only_if_version: None,
+        }
+    }
+
+    /// Delete the object stored under `id`, which must be at `version`.
+    pub fn delete_if_version(collection: CollectionName, id: ObjectId, version: Version) -> Self {
+        Self::Delete {
+            collection,
+            id,
+            only_if_version: Some(version),
+        }
+    }
+
     /// Delete every object of `collection` that passes `filter`: refused
     /// if more than 8,192 do.
     pub fn delete_where(collection: CollectionName, filter: Filter) -> Self {
@@ -1264,11 +1357,17 @@ impl Collections {
 }
 
 impl Stored {
-    pub fn new(id: ObjectId, properties: Map<String, Json>, vector: Option<Vec<f32>>) -> Self {
+    pub fn new(
+        id: ObjectId,
+        properties: Map<String, Json>,
+        vector: Option<Vec<f32>>,
+        version: Version,
+    ) -> Self {
         Self {
             id,
             properties,
             vector,
+            version: Some(version),
         }
     }
 }
@@ -1393,6 +1492,7 @@ mod tests {
                 id: ObjectId(Default::default()),
                 properties: Map::new(),
                 vector: None,
+                version: None,
             },
             score: None,
             distance: Some(0.5),
@@ -1641,7 +1741,8 @@ mod tests {
         let at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_791_300_000, 0).unwrap();
         let object = ObjectId(id);
         let tenant = TenantId::new("acme").unwrap();
-        let stored = || Stored::new(object, Map::new(), Some(vec![1.0]));
+        let version: Version = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let stored = || Stored::new(object, Map::new(), Some(vec![1.0]), version);
         let point = || RestorePoint::new(4, at);
         let cases = [
             (
@@ -1678,11 +1779,11 @@ mod tests {
             ),
             (
                 serde_json::to_value(Found::new(stored())).unwrap(),
-                json!({ "id": object, "properties": {}, "vector": [1.0] }),
+                json!({ "id": object, "properties": {}, "vector": [1.0], "version": version }),
             ),
             (
                 serde_json::to_value(Objects::new(vec![stored()], Some(object))).unwrap(),
-                json!({ "objects": [{ "id": object, "properties": {}, "vector": [1.0] }], "next": object }),
+                json!({ "objects": [{ "id": object, "properties": {}, "vector": [1.0], "version": version }], "next": object }),
             ),
             (
                 serde_json::to_value(Counted::new(9)).unwrap(),

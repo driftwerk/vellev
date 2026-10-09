@@ -201,6 +201,50 @@ async fn the_whole_api_is_reached_through_the_client() {
     assert_eq!(clash.code(), Some(Code::Conflict));
     assert!(!clash.is_unknown_outcome());
 
+    // Every object read says its version, a write can be made only at
+    // it, and a refusal says the one the object is at.
+    let at = notes.get(oid(1)).await.unwrap().unwrap().version.unwrap();
+    assert_eq!(clash.version(), Some(at));
+    let listed = notes.list(&Page::new(10)).await.unwrap();
+    assert_eq!(listed.objects[0].version, Some(at));
+    let found = notes
+        .nearest(&Nearest::to_vector(vec![1.0, 0.0], 1))
+        .await
+        .unwrap();
+    assert_eq!(found.results[0].object.version, Some(at));
+    let stale = "00000000000000000000000000000000".parse().unwrap();
+    let refused = notes
+        .put(
+            oid(1),
+            &content("a red fox", 6, Some([1.0, 0.0])).only_if_version(stale),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.version()),
+        (Some(Code::Conflict), Some(at))
+    );
+    let refused = notes.delete_if_version(oid(1), stale).await.unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.version()),
+        (Some(Code::Conflict), Some(at))
+    );
+    let moved = Changes::new(json!({ "n": 6 }).as_object().unwrap().clone()).only_if_version(at);
+    notes.patch(oid(1), &moved).await.unwrap();
+    let now = notes.get(oid(1)).await.unwrap().unwrap().version.unwrap();
+    assert_ne!(now, at);
+    let deleted = notes.delete_if_version(oid(1), now).await.unwrap();
+    assert_eq!(deleted.outcomes, vec![Outcome::Applied]);
+    let gone = notes.delete_if_version(oid(1), now).await.unwrap_err();
+    assert_eq!(
+        (gone.code(), gone.missing()),
+        (Some(Code::NotFound), Some(Missing::Object))
+    );
+    notes
+        .put(oid(1), &content("a red fox", 5, Some([1.0, 0.0])))
+        .await
+        .unwrap();
+
     let changed = acme
         .apply(
             [
@@ -208,6 +252,7 @@ async fn the_whole_api_is_reached_through_the_client() {
                 vec![Change::Delete {
                     collection: notes_named(),
                     id: oid(9),
+                    only_if_version: None,
                 }],
             ]
             .concat(),
