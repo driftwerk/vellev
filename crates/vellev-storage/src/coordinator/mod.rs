@@ -9,18 +9,22 @@
 //! generation is never seen twice, even after a partition is removed and
 //! registered again.
 
+mod bounded;
 mod memory;
 mod postgres;
 
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use vellev_core::{NodeId, Partition, TenantId};
+use vellev_core::{NodeId, Partition, RequestId, TenantId};
 
+pub use bounded::Bounded;
 pub use memory::{Clock, ManualClock, MemoryCoordinator, SystemClock};
 pub use postgres::PostgresCoordinator;
 
@@ -78,10 +82,66 @@ pub struct Committed {
     pub manifest: Option<ManifestRef>,
 }
 
+/// What a commit was built on: the position and the head committed just
+/// before it, as its writer had them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prior {
+    pub position: LogPosition,
+    pub head: Option<ManifestRef>,
+}
+
+/// A commit, and what it follows. A coordinator makes it only if `after`
+/// is what is committed still, in the one step in which it checks the
+/// lease, so that of two writers under one lease, or of a writer and
+/// whatever else moved the partition on, only the one that saw all there
+/// was commits: the other is told its commit does not follow. A lease is a
+/// fence between generations and not within one, and a commit that
+/// advances the position is no proof its writer saw the position before
+/// it, since a restore commits past whatever it goes back to.
+///
+/// The very commit made already is taken again as made, whatever it
+/// followed, so that a writer whose answer was lost may ask again.
+///
+/// With no `after` the commit is made on whatever is committed, as every
+/// commit was by releases before this one; a writer always says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
+    pub after: Option<Prior>,
     pub log_position: LogPosition,
     pub manifest: Option<ManifestRef>,
+    /// The restore the commit makes, if it makes one, to be recorded with
+    /// it.
+    pub restore: Option<Restore>,
+}
+
+/// The last commit of a removed partition forgotten, from where to go on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forgotten {
+    pub incarnation: Incarnation,
+    pub position: LogPosition,
+}
+
+/// A restore as the request that asked for it names it, recorded with the
+/// commit that makes it, so that the request made again, on any node, is
+/// answered as it was rather than made twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restore {
+    pub request: RequestId,
+    /// A digest of what the request asked to go back to, so that the same
+    /// request asking for another state is told so rather than answered.
+    pub asked: [u8; 32],
+    /// The position gone back to.
+    pub from: LogPosition,
+    /// When the state gone back to was committed, or backed up.
+    pub from_at: DateTime<Utc>,
+}
+
+/// A restore made: what it went back to, and the commit that put it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restored {
+    pub restore: Restore,
+    pub incarnation: Incarnation,
+    pub position: LogPosition,
 }
 
 /// The right to write a partition. `expires_at` is coordinator time; a holder
@@ -140,7 +200,9 @@ pub enum CoordinatorError {
         held: Generation,
         current: Generation,
     },
-    #[error("commit at {attempted:?} does not advance {key} past {committed:?}")]
+    #[error(
+        "commit at {attempted:?} does not follow what is committed to {key}, at {committed:?}"
+    )]
     Regressed {
         key: PartitionKey,
         committed: LogPosition,
@@ -179,11 +241,25 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// still to be purged is refused.
     async fn register(&self, key: &PartitionKey) -> Result<()>;
 
-    /// Delete the partition's row and its history. Returns whether it
-    /// existed. With the tenant's last partition go its keys, so that none
-    /// reaches a tenant made again under the same id, and its files are
-    /// marked to be purged.
+    /// Delete the partition's row. Returns whether it existed. With the
+    /// tenant's last partition go its keys, so that none reaches a tenant
+    /// made again under the same id, and its files are marked to be purged.
+    /// Its history and restores, however many, no longer reach it and are
+    /// deleted by [`Self::forget_removed`], a few at a time, so that this
+    /// takes as long for a busy partition as for an idle one.
     async fn remove(&self, key: &PartitionKey) -> Result<bool>;
+
+    /// Forget the restores kept of the partition from before it was last
+    /// removed, and up to `limit` of its commits from then, the earliest
+    /// first after `after`, where the call before got to. Returns where
+    /// this one got to, or `None` once none were left. Going on from where
+    /// the last call stopped, each takes as long as the first.
+    async fn forget_removed(
+        &self,
+        key: &PartitionKey,
+        after: Option<Forgotten>,
+        limit: usize,
+    ) -> Result<Option<Forgotten>>;
 
     /// Take the lease if nobody holds it, the holder's lease has expired, or
     /// the holder is `holder` itself (whose earlier lease is then fenced).
@@ -275,8 +351,17 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     ) -> Result<Option<(RestorePoint, RestorePoint)>>;
 
     /// Forget the commits a restore reaching back `window` can no longer go
-    /// to. Returns how many.
+    /// to, and the restores recorded over [`RESTORES_KEPT_FOR`] ago.
+    /// Returns how many commits.
     async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64>;
+
+    /// The restore of the partition, since it was last registered, that
+    /// `request` asked for, if it was recorded within [`RESTORES_KEPT_FOR`].
+    async fn restored(&self, key: &PartitionKey, request: RequestId) -> Result<Option<Restored>>;
+
+    /// Forget every restore recorded over [`RESTORES_KEPT_FOR`] ago, of any
+    /// partition, kept up or not. Returns how many.
+    async fn forget_restores(&self) -> Result<u64>;
 
     /// Take the right to back `tenant` up, or restore it from a backup,
     /// for `hold`: if nobody holds it, and with `due` only if its last
@@ -315,6 +400,14 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     async fn set_restore_window(&self, tenant: &TenantId, window: Option<Duration>)
         -> Result<bool>;
 }
+
+/// How long a restore is recorded, and the request that asked for it
+/// answered as it was: far longer than one try of a restore is waited for,
+/// an hour through the command line or when sent on to another node, so
+/// that a try sent again after one given up finds the first. A request made
+/// again later than this is a restore of its own and goes back again; its
+/// record then replaces the old one.
+pub const RESTORES_KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The longest a backup may be claimed for at once.
 pub const MAX_BACKUP_HOLD: Duration = Duration::from_secs(24 * 60 * 60);

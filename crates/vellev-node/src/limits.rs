@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use vellev_core::TenantId;
 
@@ -79,6 +81,37 @@ impl Limits {
         })
     }
 
+    /// Take `cost` more of what `tenant` may ask for, for something let
+    /// through already that turned out to cost more than was known when
+    /// it was, as a delete by filter does by each object it deletes. The
+    /// bucket is left owing it.
+    pub fn owe(&self, tenant: &TenantId, asked: Asked, cost: usize) {
+        if cost == 0 {
+            return;
+        }
+        let Some(rate) = self.rate(asked) else { return };
+        // A bucket full again may have been forgotten meanwhile, which is
+        // no reason to forget what is owed: it is made afresh, full.
+        let mut buckets = self.buckets.lock().expect("limits lock");
+        let bucket = buckets.entry((tenant.clone(), asked)).or_insert(Bucket {
+            tokens: rate,
+            at: Instant::now(),
+        });
+        bucket.tokens -= cost as f64;
+    }
+
+    /// Give `tenant` back `cost` it was let through for, for something
+    /// that was then not done for it: a read turned away for want of a
+    /// thread is no query. No bucket is left holding more than it holds
+    /// full, and one forgotten meanwhile is full already.
+    pub fn give_back(&self, tenant: &TenantId, asked: Asked, cost: usize) {
+        let Some(rate) = self.rate(asked) else { return };
+        let mut buckets = self.buckets.lock().expect("limits lock");
+        if let Some(bucket) = buckets.get_mut(&(tenant.clone(), asked)) {
+            bucket.tokens = (bucket.tokens + cost as f64).min(rate);
+        }
+    }
+
     /// Forget buckets full again, which cost nothing to make afresh.
     pub fn forget_idle(&self) {
         let now = Instant::now();
@@ -135,5 +168,73 @@ mod tests {
             owed >= Duration::from_secs(4),
             "{owed:?}: the 400 over is owed"
         );
+    }
+
+    #[test]
+    fn what_a_request_turns_out_to_cost_is_owed_too() {
+        let limits = Limits::new(None, Some(100.0));
+        let busy = TenantId::new("busy").unwrap();
+        limits.admit(&busy, Asked::Write, 1).unwrap();
+        limits.owe(&busy, Asked::Write, 0);
+        limits.admit(&busy, Asked::Write, 1).unwrap();
+        limits.owe(&busy, Asked::Write, 498);
+        let owed = match limits.admit(&busy, Asked::Write, 1) {
+            Err(NodeError::Limited { wait, .. }) => wait,
+            other => panic!("{other:?}"),
+        };
+        assert!(owed >= Duration::from_secs(4), "{owed:?}");
+        Limits::new(None, None).owe(&busy, Asked::Write, 1_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn what_is_given_back_may_be_asked_again_and_no_more_than_that() {
+        let limits = Limits::new(Some(2.0), None);
+        let busy = TenantId::new("busy").unwrap();
+        let asks = || limits.admit(&busy, Asked::Query, 1);
+        asks().unwrap();
+        asks().unwrap();
+        asks().unwrap_err();
+        limits.give_back(&busy, Asked::Query, 1);
+        asks().unwrap();
+        asks().unwrap_err();
+        // Given back more than was taken, a bucket holds what it holds
+        // full and no more.
+        limits.give_back(&busy, Asked::Query, 10);
+        asks().unwrap();
+        asks().unwrap();
+        asks().unwrap_err();
+        // Nor does the rest pay for what is owed after.
+        limits.give_back(&busy, Asked::Query, 10);
+        limits.owe(&busy, Asked::Query, 1);
+        asks().unwrap();
+        asks().unwrap_err();
+        // One forgotten meanwhile is full already, and is not made over
+        // full by it; nor is there anything to give back where nothing
+        // is limited.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        limits.forget_idle();
+        limits.give_back(&busy, Asked::Query, 1);
+        assert!(limits.buckets.lock().unwrap().is_empty());
+        asks().unwrap();
+        asks().unwrap();
+        asks().unwrap_err();
+        Limits::new(None, None).give_back(&busy, Asked::Query, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn what_is_owed_by_a_tenant_forgotten_meanwhile_is_owed_all_the_same() {
+        let limits = Limits::new(None, Some(100.0));
+        let busy = TenantId::new("busy").unwrap();
+        // Let through as one write; by the time it is known to have cost
+        // five hundred, its bucket is full again and forgotten.
+        limits.admit(&busy, Asked::Write, 1).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        limits.forget_idle();
+        limits.owe(&busy, Asked::Write, 500);
+        let owed = match limits.admit(&busy, Asked::Write, 1) {
+            Err(NodeError::Limited { wait, .. }) => wait,
+            other => panic!("{other:?}"),
+        };
+        assert!(owed >= Duration::from_secs(3), "{owed:?}");
     }
 }

@@ -693,3 +693,254 @@ async fn a_caller_that_gave_up_before_its_turn_is_skipped() {
         .unwrap();
     assert_eq!(receipt.outcomes, vec![Outcome::Value(Value::Int(2))]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_group_takes_no_more_than_its_bound_in_mutations_and_in_bytes() {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut seen) = Paused::new(&mut cluster, "/log/");
+    let writer = Arc::new(cluster.writer().await);
+    let committer = GroupCommitter::spawn(writer, 1024, 1024);
+    committer.submit(vec![create("notes")]).await.unwrap();
+
+    // A thousand small rows a batch: eight batches are within the bound on
+    // mutations, and a ninth is not.
+    let many = |batch: i64| -> Vec<Mutation> {
+        (0..1_000)
+            .map(|n| upsert("notes", (n % 200) as u8, batch * 1_000 + n))
+            .collect()
+    };
+    // One row of a mebibyte and a little a batch: eleven are within the
+    // bound on bytes, and a twelfth is not.
+    let large = |batch: i64| -> Vec<Mutation> {
+        let title = "x".repeat(1024 * 1024);
+        vec![Mutation::Upsert {
+            collection: name("notes"),
+            id: id(201),
+            properties: object(json!({ "title": title, "n": batch })),
+            vector: None,
+        }]
+    };
+    let rounds: [(Vec<Vec<Mutation>>, u64); 2] = [
+        ((0..12).map(many).collect(), 2),
+        ((0..14).map(large).collect(), 2),
+    ];
+    for (round, (batches, groups)) in rounds.into_iter().enumerate() {
+        // One commit is held up, and every batch waits behind it.
+        paused.armed.store(true, Ordering::SeqCst);
+        let start = cluster.committed().await.log_position;
+        let first = tokio::spawn({
+            let committer = committer.clone();
+            async move {
+                committer
+                    .submit(vec![upsert("notes", 202, round as i64)])
+                    .await
+            }
+        });
+        while seen.recv().await != Some("stored") {}
+        let waiting = tokio::spawn({
+            let committer = committer.clone();
+            let submitted = batches.into_iter().map(move |batch| {
+                let committer = committer.clone();
+                async move { committer.submit(batch).await }
+            });
+            join_all(submitted)
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        paused.armed.store(false, Ordering::SeqCst);
+        paused.release.notify_one();
+
+        first.await.unwrap().unwrap();
+        let receipts = waiting.await.unwrap();
+        assert!(receipts.iter().all(Result::is_ok));
+        let end = cluster.committed().await.log_position;
+        assert_eq!(end.0 - start.0, 1 + groups, "round {round}");
+    }
+}
+
+#[tokio::test]
+async fn a_delete_by_filter_takes_so_many_objects_and_is_refused_more() {
+    use vellev_storage::{Batch, DELETED_AT_MOST, GROUP_MOST};
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let row = |n: usize| Mutation::Upsert {
+        collection: name("notes"),
+        id: ObjectId(uuid::Uuid::from_u128(n as u128)),
+        properties: object(json!({ "n": 7 })),
+        vector: None,
+    };
+    let rows = (0..DELETED_AT_MOST).map(row);
+    let first = [create("notes")].into_iter().chain(rows).collect();
+    writer.commit(first).await.unwrap();
+    let sevens = || Mutation::DeleteWhere {
+        limit: None,
+        collection: name("notes"),
+        filter: Filter::Eq {
+            property: "n".into(),
+            value: json!(7),
+        },
+    };
+    // It counts for as many mutations as it may delete objects, which is
+    // as many as one commit takes: it shares its commit with no other.
+    let weight = Batch::from(vec![sevens()]).weight();
+    assert_eq!(weight.rows, DELETED_AT_MOST);
+    assert_eq!(weight.rows, GROUP_MOST.rows);
+
+    // One object more than a delete takes: none is deleted, nor anything
+    // else of the batch made.
+    writer.commit(vec![row(DELETED_AT_MOST)]).await.unwrap();
+    let before = cluster.committed().await;
+    let refused = writer.commit(vec![row(usize::MAX), sevens()]).await;
+    let refused = refused.unwrap_err();
+    assert!(
+        matches!(&refused, StorageError::TooMany { over, message }
+            if *over == most_deleted() && message.contains("8192")),
+        "{refused}"
+    );
+    assert_eq!(cluster.committed().await, before);
+    let count = |state: &State| state.count(&name("notes"));
+    assert_eq!(writer.partition().read(count), DELETED_AT_MOST + 1);
+
+    // With one fewer, every one of them goes.
+    let one = Mutation::Delete {
+        collection: name("notes"),
+        id: ObjectId(uuid::Uuid::from_u128(0)),
+    };
+    writer.commit(vec![one, row(0)]).await.unwrap();
+    writer
+        .commit(vec![Mutation::Delete {
+            collection: name("notes"),
+            id: ObjectId(uuid::Uuid::from_u128(DELETED_AT_MOST as u128)),
+        }])
+        .await
+        .unwrap();
+    let deleted = writer.commit(vec![sevens()]).await.unwrap();
+    let all = Outcome::Deleted(DELETED_AT_MOST as u64);
+    assert_eq!(deleted.outcomes, vec![all]);
+    assert_eq!(writer.partition().read(count), 0);
+    assert_eq!(cluster.open().await.partition().read(count), 0);
+}
+
+#[tokio::test]
+async fn a_delete_by_filter_with_a_limit_deletes_that_many_at_a_time_until_none_are_left() {
+    use vellev_storage::{Batch, DELETED_AT_MOST};
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let row = |n: usize| Mutation::Upsert {
+        collection: name("notes"),
+        id: ObjectId(uuid::Uuid::from_u128(n as u128)),
+        properties: object(json!({ "n": 7 })),
+        vector: None,
+    };
+    // More than a delete with no limit takes.
+    let rows = (0..DELETED_AT_MOST + 1_000).map(row);
+    let first = [create("notes")].into_iter().chain(rows).collect();
+    writer.commit(first).await.unwrap();
+    let sevens = |limit: Option<usize>| Mutation::DeleteWhere {
+        collection: name("notes"),
+        filter: Filter::Eq {
+            property: "n".into(),
+            value: json!(7),
+        },
+        limit,
+    };
+    assert!(writer.commit(vec![sevens(None)]).await.is_err());
+    // A limit of none is no limit to give, and says no more than that;
+    // one past the most is told the most.
+    let none = writer.commit(vec![sevens(Some(0))]).await;
+    assert!(
+        matches!(none, Err(StorageError::InvalidMutation(_))),
+        "{none:?}"
+    );
+    let over = writer.commit(vec![sevens(Some(DELETED_AT_MOST + 1))]).await;
+    assert!(
+        matches!(&over, Err(StorageError::TooMany { over, .. }) if *over == most_deleted()),
+        "{over:?}"
+    );
+    let unlimited = writer.commit(vec![sevens(None)]).await;
+    assert!(
+        matches!(&unlimited, Err(StorageError::TooMany { over, .. }) if *over == most_deleted()),
+        "{unlimited:?}"
+    );
+    // It counts for as many mutations as it may delete.
+    assert_eq!(Batch::from(vec![sevens(Some(5_000))]).weight().rows, 5_000);
+
+    // Asked again and again, as a caller does, until told fewer than the
+    // limit: each a commit of its own, and none left at the end.
+    let count = |state: &State| state.count(&name("notes"));
+    let mut deleted = Vec::new();
+    loop {
+        let receipt = writer.commit(vec![sevens(Some(5_000))]).await.unwrap();
+        let [Outcome::Deleted(some)] = receipt.outcomes[..] else {
+            panic!("{:?}", receipt.outcomes);
+        };
+        deleted.push(some);
+        let left = DELETED_AT_MOST + 1_000 - deleted.iter().sum::<u64>() as usize;
+        assert_eq!(writer.partition().read(count), left);
+        if some < 5_000 {
+            break;
+        }
+    }
+    assert_eq!(deleted, [5_000, 4_192]);
+    assert_eq!(cluster.open().await.partition().read(count), 0);
+    let none = writer.commit(vec![sevens(Some(5_000))]).await.unwrap();
+    assert_eq!(none.outcomes, vec![Outcome::Deleted(0)]);
+}
+
+#[tokio::test]
+async fn the_deletes_by_filter_of_one_batch_may_delete_no_more_between_them_than_one_may() {
+    use vellev_storage::DELETED_AT_MOST;
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let rows = (0..20).map(|n| upsert("notes", n, 7));
+    let first = [create("notes")].into_iter().chain(rows).collect();
+    writer.commit(first).await.unwrap();
+    let sevens = |limit: Option<usize>| Mutation::DeleteWhere {
+        collection: name("notes"),
+        filter: Filter::Eq {
+            property: "n".into(),
+            value: json!(7),
+        },
+        limit,
+    };
+    let count = |state: &State| state.count(&name("notes"));
+    let half = DELETED_AT_MOST / 2;
+
+    // Each sees what those before it deleted, so three of the most would
+    // delete three times the most in one commit. One with no limit counts
+    // for the most, and shares its batch with no other.
+    let too_many = [
+        vec![sevens(Some(DELETED_AT_MOST)); 3],
+        vec![sevens(Some(half)), sevens(Some(half + 1))],
+        vec![sevens(None), sevens(Some(1))],
+        vec![sevens(None), sevens(None)],
+    ];
+    for batch in too_many {
+        let refused = writer.commit(batch).await;
+        assert!(
+            matches!(&refused, Err(StorageError::TooMany { over, message })
+                if *over == most_deleted() && message.contains("8192")),
+            "{refused:?}"
+        );
+        assert_eq!(writer.partition().read(count), 20, "nothing was deleted");
+    }
+
+    // Up to the most between them is one batch like any other.
+    let within = vec![
+        sevens(Some(half)),
+        sevens(Some(half)),
+        upsert("notes", 30, 1),
+    ];
+    let made = writer.commit(within).await.unwrap();
+    let deleted = [Outcome::Deleted(20), Outcome::Deleted(0), Outcome::Applied];
+    assert_eq!(made.outcomes, deleted);
+    assert_eq!(writer.partition().read(count), 1);
+    writer.commit(vec![sevens(None)]).await.unwrap();
+}
+
+/// What a refusal to delete so many says was asked too much of.
+fn most_deleted() -> vellev_storage::Over {
+    vellev_storage::Over {
+        capped: vellev_storage::Capped::Deleted,
+        most: vellev_storage::DELETED_AT_MOST as u64,
+    }
+}

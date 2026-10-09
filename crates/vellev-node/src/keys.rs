@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;

@@ -109,7 +109,17 @@ A tenant can be put back as it stood at any moment of its restore window:
 14 days unless `VELLEV_RESTORE_WINDOW_SECS` or the tenant says otherwise.
 Every commit is a restore point, kept in Postgres. A restore is a commit of
 its own, so nothing is lost by it and it can be undone by restoring to just
-before it; requests answered before it stay answered. With an admin key:
+before it; requests answered before it stay answered. A restore named by
+`x-vellev-request`, as the client crate names every one, is made once: asked
+for again within a day it is answered as it was, so a retry never goes back
+past what was written since; asked for again later, it restores again, and
+asking for another state under the same name is refused (422). A restore
+that fails, or is cut short by its node letting the tenant go, once its
+commit was begun is answered as made if it was, and otherwise as of unknown
+outcome: ask for it again by the same name. Another restore of
+the tenant is refused while one runs. A node of an older release
+does not know the name, so upgrade every node before restoring (see
+[docs/compatibility.md](docs/compatibility.md)). With an admin key:
 
 ```sh
 call "http://127.0.0.1:8080/v1/tenants/acme/restore-points"            # the window, earliest and latest
@@ -155,13 +165,152 @@ files and its backups, and every node drops its cached copies. A file a
 stopped writer was still uploading may outlive the purge, but none can
 belong to a tenant made later under the same id, which is refused until the
 purge is done. A backup finishing after the removal discards itself. Removal
-is final: a removed tenant cannot be restored.
+is final: a removed tenant cannot be restored. Its history in Postgres goes
+a batch at a time after the removal, and what is left of it with its purge.
 
 Several nodes may run against the same Postgres and store. Each tenant is
 written by one node at a time; a write that reaches another node is sent
 on to the holder, so set `VELLEV_ADVERTISE_URL` to each node's own address
 (never a load balancer's) wherever the default of this host's name and port
 would not reach it.
+
+A node gives up on whatever stops answering, so that a tenant held up by a
+dead connection passes to another node rather than waiting with it:
+
+- Each request to Postgres, and each wait for a connection to it, is given
+  up after `VELLEV_DATABASE_TIMEOUT_SECS` (10). A request given up leaves its
+  connection to be checked before it is used again, which on a connection
+  that went silent lasts until TCP gives up on it. Bound that on the server
+  and in the kernel too: set `statement_timeout`, `tcp_keepalives_idle`,
+  `tcp_keepalives_interval` and `tcp_keepalives_count` for the role
+  (`ALTER ROLE vellev SET statement_timeout = '10s'`, and so on) or in
+  `postgresql.conf`, and keep the OS's TCP keepalive and retransmission
+  limits short on the nodes. sqlx sets no keepalive of its own.
+- A file larger than `VELLEV_UPLOAD_PART_MIB` (16, from 5 to 5120) goes up
+  in parts of that size, each a request of its own, and comes down a range
+  of that size at a time. So a large segment is never one request and
+  never past S3's 5 GiB limit on one. A file that needs more than 10,000
+  parts (156 GiB at 16 MiB) is refused before any of it goes up.
+- Each try of a request to the store is given up after
+  `VELLEV_STORE_TIMEOUT_SECS` (30) and as long again as a part takes at
+  `VELLEV_STORE_MIN_BYTES_PER_SEC` (a mebibyte a second, about 8 Mbit/s):
+  46 seconds by default. A link that carries a part slower than that is
+  not supported: lower the one or raise the other for it, or its uploads
+  and reads are given up. A request that fails in a way worth trying again
+  is tried up to three times more, under a second apart, and after a
+  timeout only if it is safe to repeat; the request is given up once all
+  four tries and the waits could have run out (three minutes and seven
+  seconds by default). A range of a file coming down that is given up is
+  asked for once more, from the bytes that had come.
+- An upload that fails, or whose caller stops waiting, is aborted. One cut
+  off too abruptly for that, as by a crash, leaves parts in the bucket:
+  give it a lifecycle rule that aborts incomplete multipart uploads after a
+  day (`AbortIncompleteMultipartUpload`).
+- Each step on the cache directory is waited for ten seconds and as long
+  again as its bytes take at 20 MiB/s, after which the node carries on
+  without the copy; the steps run on at most 64 threads of their own. With
+  all of them busy a step waits as long again for one, so a disk that is
+  busy and answering serves everything asked of it; with all of them kept
+  by steps a disk never answered, the cache is passed over at once.
+  Processes and containers on one host may share a cache directory. Files
+  left part written there an hour ago or more are deleted as a node
+  starts.
+- Vectors are the exception to carrying on without the copy, since they
+  may be more than memory holds: a vectors file not yet in the cache is
+  fetched into it a part at a time and read there, never held whole in
+  memory. Reading one through to check it is done `VELLEV_CACHE_LOADS`
+  files at a time on a disk (two), the rest waiting their turn for as long
+  as those that have one get on, however long that is: a tenant of many
+  large files, or many tenants opened at once, all open. A file is given
+  up when the disk has said nothing of it for ten seconds, or is slower
+  all told than its share of 5 MiB a second, which with two read at once
+  is 2.5 MiB a second each, for as long as they are read together and
+  no longer; and those waiting are given up when nothing has moved for
+  longer than one part of a file may take to come from the store and be
+  written, which follows `VELLEV_STORE_TIMEOUT_SECS` and is about ten
+  minutes as a node is set up by default. The tenant then fails to
+  open, as
+  unavailable, and opens when asked again once the disk answers. A file
+  checked once is not checked again by that node while it lies as it did,
+  so opening again goes on from where it failed, and opening a tenant a
+  second time reads nothing through.
+  A node whose cache directory cannot be written does not open tenants
+  that have vectors.
+- A flush's, a merge's and a restore's segments are built and go up before
+  writes wait on them; a failure there commits nothing, leaves the writer
+  as it was and deletes what went up. Writes wait only while a commit is
+  made: its head file goes up, the commit is recorded, each try given up
+  after a quarter of the lease, and it is adopted in memory.
+- Writes that arrive together share a commit: up to 64 requests
+  of them, and no more than 8,192 mutations or 12 MiB, so that the log
+  file a commit writes goes up in one request and is applied in memory in
+  a fraction of a second, which is as long as reads wait on it. A request
+  larger than that on its own is committed alone.
+- Cleaning up deletes at most a thousand files at a time, sixteen at once,
+  and for no longer than a minute, after a minute at most of finding them,
+  between which flushes and merges go on.
+- One request deletes at most 8,192 objects by filter. A delete with no
+  `limit` deletes every object that passes, and is refused as invalid,
+  deleting nothing, if more than 8,192 do. A delete with a `limit` of up
+  to 8,192 deletes that many of them and says how many it did; fewer than
+  the limit means none were left. The deletes by filter of one request
+  count together, one with no limit for 8,192: a request whose deletes may
+  come to more is refused. To delete however many pass, send the delete
+  with a limit until it deletes fewer than the limit.
+  **Each time must be a new request, with a new `x-vellev-request`**: one
+  sent again under the name it had is answered as it was and deletes
+  nothing more. Every one is a commit of its own, so stopping part way
+  loses nothing and going on is only sending it again; what is deleted in
+  the end is whatever passes until none does, objects written meanwhile
+  included, not what passed when the first was sent. A delete counts
+  against the size of the commit it shares with other writes as its limit
+  does, so a small one shares a commit and one of the full 8,192 has a
+  commit to itself; each object deleted counts as a write against the
+  tenant's rate.
+- A node answers `VELLEV_READS_AT_ONCE` reads at once (256), so that
+  reads stuck on a disk cannot take every thread a commit needs. One
+  tenant may have every turn while no other asks. While a read waits
+  whose tenant has less than half of them, no tenant that has half or
+  more is given another, so turns that come free go to tenants with
+  fewer; with every waiting tenant at half or more, a free turn goes to
+  whichever asks first. A read that finds no turn waits
+  `VELLEV_READS_WAIT_MS` for one (500) and is then turned away as
+  unavailable (503) with `Retry-After: 1`, which the Rust client waits
+  out before it asks again. The turn is for the reading alone, and is
+  taken last: a search whose text is being embedded, or whose tenant is
+  being opened, has none yet and keeps none from any other read. The
+  reads that take a turn are the searches (`nearest`, `keyword`,
+  `hybrid`), listing objects and counting them, which are answered off
+  the request's own thread; getting one object, a collection or the
+  collections takes none.
+- Every read counts against its tenant's rate, those that take no turn
+  as well, with one exception: a read turned away for want of a turn is
+  not counted if it had nothing costly done on the way. It stays counted
+  if it had the coordinator asked (a `strong` read, or one after a
+  position the node had not reached), a copy of its tenant opened, or
+  its text sent to a model. What it only waited for another read to have
+  done is that read's: of several that come for a tenant not yet open,
+  or with the same text, the one whose opening or embedding it is is
+  counted, and the rest are not. A text of up to 1,024 bytes embedded
+  lately is not sent again, its vector being kept, and a model with a
+  fault that stands is not asked at all. So a search by a new text that
+  is turned away is counted, since it was embedded; turned away again
+  with the same text, it is not counted again, so long as the text is of
+  no more than 1,024 bytes, was embedded, and its vector is still kept; and answered at last, it
+  is counted for the answer, twice in all. A search waits no longer than
+  two minutes for its text's vector, whatever makes it.
+- A commit does up to three steps on a thread of its own. One that finds
+  no thread free for a step is given a quarter of its lease to get one,
+  each step, before the wait counts against its writer; a writer held for
+  longer than everything it waits on may take counts as stuck, and gives
+  the tenant up.
+- A commit names the position and head it follows, and Postgres records
+  it only on those, so of two writers of one tenant only the one that has
+  seen everything committed can commit, whatever their leases say.
+- A writer whose commit failed, or was given up, stops renewing its lease,
+  as does one that holds writes up for longer than every bound on what it
+  waits for; whatever was working on the tenant is stopped, and a write
+  caught under way is answered as of unknown outcome.
 
 Reads are answered by whichever node they reach, from a copy of the tenant
 it follows. A write answers with `incarnation` and `position`; send them
@@ -177,14 +326,19 @@ collection may only name an embedding endpoint listed in
 
 `GET /v1/limits` tells any key the most a request may ask for: results of a
 search or a page (`VELLEV_MAX_LIMIT`), candidates each side of a hybrid
-search offers, `oversample`, bytes of a body (`VELLEV_MAX_BODY_BYTES`) and
-seconds of a restore window. A node of a release before this answers that
+search offers, `oversample`, bytes of a body (`VELLEV_MAX_BODY_BYTES`),
+seconds of a restore window, objects one request deletes by filter, and
+reads the node answers at once (`VELLEV_READS_AT_ONCE`). A request that
+asks for more of one of them than it may is refused with
+`limit: {name, max}`, the name being the field here; the reads are not
+any one request's to ask too many of, and a node answering as many says
+`unavailable`. A node of a release before this answers that
 it has no such route (404, or 403 to a tenant's key), for which the Rust
 client's `limits()` gives `None`.
 
 ```sh
 call http://127.0.0.1:8080/v1/limits
-# {"results":1000,"candidates":1000,"oversample":1024,"body_bytes":33554432,"restore_window_secs":316224000}
+# {"results":1000,"candidates":1000,"oversample":1024,"body_bytes":33554432,"restore_window_secs":316224000,"deleted":8192,"reads_at_once":256}
 ```
 
 Every failure is `{"error":{"code":…,"message":…}}`, and the code, not the
@@ -344,7 +498,9 @@ A request is sent at most as many times as the client has tries
 (`Options::attempts`) and one less than it has addresses, each for no
 longer than its timeout, with a wait before any address is asked again
 that doubles up to five seconds; a node that turns a request away with
-`Retry-After` is waited on that long, up to a minute.
+`Retry-After` is waited on that long, up to a minute: the same node for a
+tenant asking too much (429), and for a node too busy to answer a read
+(503) after any other address has been asked first.
 
 ## Vector search
 
@@ -360,8 +516,8 @@ are exact with respect to it.
 A segment's vectors live in a column file of their own, read in place
 from the node's local copy of the store (`VELLEV_CACHE_DIR`, set in the
 image) or from a `file://` store's own files, so memory goes on codes and
-properties rather than on the vectors themselves; a node with neither holds
-every vector in memory.
+properties rather than on the vectors themselves; only a node with neither,
+which is no way to run one, holds every vector in memory.
 
 ```sh
 cargo run --release -p vellev-index --example clustered_bench -- 200000 768   # the index alone

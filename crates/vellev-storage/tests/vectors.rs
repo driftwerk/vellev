@@ -131,6 +131,7 @@ async fn a_node_with_a_local_copy_reads_vectors_in_place_and_survives_a_damaged_
 
 #[tokio::test]
 async fn a_store_on_local_disk_has_its_own_files_read_in_place() {
+    let at = |local: Local| local.path;
     let dir = tempfile::tempdir().unwrap();
     let mut cluster = Cluster::new().await;
     let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
@@ -144,11 +145,14 @@ async fn a_store_on_local_disk_has_its_own_files_read_in_place() {
     writer.flush().await.unwrap();
     let vectors = segments_of(&cluster).await.remove(0).vectors.unwrap();
     assert_eq!(
-        cluster.blobs.local(&vectors).await.unwrap(),
+        cluster.blobs.local(&vectors).await.unwrap().map(at),
         Some(dir.path().join(&vectors))
     );
-    assert_eq!(cluster.blobs.local("elsewhere").await.unwrap(), None);
-    assert_eq!(cluster.blobs.local("../etc").await.unwrap(), None);
+    assert_eq!(
+        cluster.blobs.local("elsewhere").await.unwrap().map(at),
+        None
+    );
+    assert_eq!(cluster.blobs.local("../etc").await.unwrap().map(at), None);
     writer
         .partition()
         .read(|state| assert_eq!(vector_of(state, 2), Some(vec![2.0, 0.5])));
@@ -157,4 +161,67 @@ async fn a_store_on_local_disk_has_its_own_files_read_in_place() {
         .await
         .partition()
         .read(|state| assert_eq!(vector_of(state, 9), Some(vec![9.0, 0.5])));
+}
+
+/// Ten notes with vectors flushed into a segment, and the key of its
+/// vectors.
+async fn flushed(cluster: &Cluster) -> String {
+    let writer = cluster.writer().await;
+    let rows = (0..10).map(|n| upsert("notes", n, i64::from(n)));
+    writer
+        .commit([create("notes")].into_iter().chain(rows).collect())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    segments_of(cluster).await.remove(0).vectors.unwrap()
+}
+
+#[tokio::test]
+async fn vectors_a_cache_cannot_keep_fail_the_load_rather_than_be_held_in_memory() {
+    let cluster = Cluster::new().await;
+    let vectors = flushed(&cluster).await;
+
+    // A cache directory that is a file keeps nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = dir.path().join("a-file");
+    std::fs::write(&nowhere, b"in the way").unwrap();
+    let store = cluster.observed();
+    let cached: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(store.clone(), &nowhere));
+    let unkept = cluster.open_on(cached).await.unwrap_err();
+    assert!(
+        matches!(&unkept, StorageError::Blob { key, .. } if *key == vectors),
+        "to be tried again: {unkept}"
+    );
+    let fetched = store.fetched();
+    let times = fetched.iter().filter(|key| **key == vectors).count();
+    assert!(times <= 1, "{fetched:?}");
+}
+
+#[tokio::test]
+async fn vectors_are_fetched_into_the_cache_and_read_there_never_held_in_memory() {
+    let cluster = Cluster::new().await;
+    let vectors = flushed(&cluster).await;
+    let in_memory = cluster.open().await.partition().read(State::resident);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = cluster.observed();
+    let cached: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(store.clone(), dir.path()));
+    let fetched_once = |fetched: Vec<String>| {
+        let times = fetched.iter().filter(|key| **key == vectors).count();
+        assert_eq!(times, 1, "{fetched:?}");
+    };
+    // The first to open finds no copy: the file is fetched into one.
+    let first = cluster.open_on(cached.clone()).await.unwrap();
+    fetched_once(store.fetched());
+    assert!(format::verify(&vectors, &std::fs::read(dir.path().join(&vectors)).unwrap()).is_ok());
+    // The next reads the copy, and asks the store for nothing of it.
+    let second = cluster.open_on(cached).await.unwrap();
+    assert!(!store.fetched().contains(&vectors));
+    for copy in [first, second] {
+        let read = |state: &State| (vector_of(state, 6), state.resident());
+        let (vector, resident) = copy.partition().read(read);
+        assert_eq!(vector, Some(vec![6.0, 0.5]));
+        // Ten vectors of two numbers of four bytes.
+        assert_eq!(resident + 80, in_memory, "none of them in memory");
+    }
 }

@@ -2,17 +2,20 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
-use vellev_core::{NodeId, TenantId};
+use vellev_core::{NodeId, RequestId, TenantId};
 
 use super::{
     checked_hold, checked_ttl, checked_window, window_start, Acquired, Commit, Committed,
-    Coordinator, CoordinatorError, Generation, Incarnation, KeyHash, Lease, LogPosition,
-    ManifestRef, PartitionKey, Point, Purges, RestorePoint, Result, TenantKey, Versions,
+    Coordinator, CoordinatorError, Forgotten, Generation, Incarnation, KeyHash, Lease, LogPosition,
+    ManifestRef, PartitionKey, Point, Purges, RestorePoint, Restored, Result, TenantKey, Versions,
+    RESTORES_KEPT_FOR,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -58,6 +61,8 @@ struct Row {
     manifest: Option<ManifestRef>,
     /// Every commit since the partition was registered, oldest first.
     history: Vec<RestorePoint>,
+    /// The restores recorded lately, with when each was.
+    restores: Vec<(DateTime<Utc>, Restored)>,
     restore_window: Option<Duration>,
     backed_up_at: Option<DateTime<Utc>>,
     /// Who holds the right to back the tenant up, and until when.
@@ -189,6 +194,7 @@ impl Coordinator for MemoryCoordinator {
                 log_position: LogPosition(0),
                 manifest: None,
                 history: Vec::new(),
+                restores: Vec::new(),
                 restore_window: None,
                 backed_up_at: None,
                 backup_claim: None,
@@ -286,7 +292,10 @@ impl Coordinator for MemoryCoordinator {
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
         self.with_current(lease, |row, now| {
-            let advances = commit.log_position > row.log_position;
+            let follows = commit.after.as_ref().is_none_or(|after| {
+                after.position == row.log_position && after.head == row.manifest
+            });
+            let advances = follows && commit.log_position > row.log_position;
             let repeats =
                 commit.log_position == row.log_position && commit.manifest == row.manifest;
             if !(advances || repeats) {
@@ -302,6 +311,14 @@ impl Coordinator for MemoryCoordinator {
                     head: head.clone(),
                     at: now,
                 });
+            }
+            if let (true, Some(restore)) = (advances, commit.restore) {
+                let restored = Restored {
+                    restore,
+                    incarnation: row.incarnation,
+                    position: commit.log_position,
+                };
+                row.restores.push((now, restored));
             }
             row.log_position = commit.log_position;
             row.manifest = commit.manifest;
@@ -468,9 +485,49 @@ impl Coordinator for MemoryCoordinator {
             let start = window_start(now, window)?;
             let forgotten = row.history.len() - row.reachable(start).len();
             row.history.drain(..forgotten);
+            let kept_since = window_start(now, RESTORES_KEPT_FOR)?;
+            row.restores.retain(|(at, _)| *at >= kept_since);
             Ok(forgotten as u64)
         })
         .or_else(|error| unknown_is_none::<()>(error).map(|_| 0))
+    }
+
+    async fn restored(&self, key: &PartitionKey, request: RequestId) -> Result<Option<Restored>> {
+        self.with_row(key, |row, now| {
+            let kept_since = window_start(now, RESTORES_KEPT_FOR)?;
+            Ok(row
+                .restores
+                .iter()
+                .filter(|(at, _)| *at >= kept_since)
+                .map(|(_, restored)| restored)
+                .find(|restored| restored.restore.request == request)
+                .cloned())
+        })
+        .or_else(unknown_is_none)
+    }
+
+    /// Nothing is kept of a partition removed here: its row, history and
+    /// restores and all, go together.
+    async fn forget_removed(
+        &self,
+        _key: &PartitionKey,
+        _after: Option<Forgotten>,
+        _limit: usize,
+    ) -> Result<Option<Forgotten>> {
+        Ok(None)
+    }
+
+    async fn forget_restores(&self) -> Result<u64> {
+        let kept_since = window_start(self.clock.now(), RESTORES_KEPT_FOR)?;
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        Ok(rows
+            .values_mut()
+            .map(|row| {
+                let before = row.restores.len();
+                row.restores.retain(|(at, _)| *at >= kept_since);
+                (before - row.restores.len()) as u64
+            })
+            .sum())
     }
 
     async fn purges(&self, due: Duration, lately: Duration) -> Result<Purges> {

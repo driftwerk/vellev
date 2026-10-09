@@ -6,23 +6,26 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
 
-use crate::blobs::{is_plain, Author, Blobs, Layout, Listed};
+use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Listed, Local, Transfers};
 use crate::catalog::Catalog;
-use crate::column::Column;
+use crate::column::{self, Column};
 use crate::coordinator::{
-    Commit, Committed, Coordinator, Generation, Incarnation, Lease, LogPosition, ManifestRef,
-    PartitionKey,
+    Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation, Lease, LogPosition,
+    ManifestRef, PartitionKey, Prior, Restore,
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
     decode, decode_head, encode, Answer, Answered, Head, Kind, LogSegment, Manifest, Op,
-    SegmentFile, SegmentIndex, SegmentMeta,
+    SegmentFile, SegmentIndex, SegmentMeta, SUMMED_AT_ONCE,
 };
-use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize};
-use crate::state::{self, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored};
+use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
+use crate::state::{
+    self, Discarded, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
+};
 use crate::{Refusal, Result, StorageError};
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
@@ -30,6 +33,13 @@ use crate::{Refusal, Result, StorageError};
 const COMMIT_ATTEMPTS: u32 = 3;
 /// How many rows a flush copies from memory while commits wait.
 const COPIED_AT_ONCE: usize = 4_096;
+/// How many of the files a clean deletes are being deleted at any moment.
+const CLEANING_AT_ONCE: usize = 16;
+/// How long a clean goes on finding what to delete, and how long again
+/// asking for it to be deleted: long enough for all it deletes at once
+/// from a store that answers as stores do, and no longer than anything
+/// that waits for it can well wait.
+const CLEANING_WITHIN: Duration = Duration::from_secs(60);
 
 /// A segment built and ready to write: its file without the rows'
 /// vectors, which the column holds, its indexes, and the frames of the
@@ -186,32 +196,102 @@ impl Partition {
     }
 
     /// The vectors under `key`, read in place from the store's copy on
-    /// local disk when it keeps one; otherwise `held`, the same vectors
-    /// still in memory, or when there is no such thing the file fetched
-    /// and decoded into memory.
+    /// local disk, or `held`, the same vectors still in memory, when that
+    /// copy is not there, is not whole or is not reached in time.
+    ///
+    /// With neither, a store that keeps copies fetches the file into its
+    /// copy, a part at a time, and the copy is read in place. Vectors a
+    /// store keeps copies of are never read whole into memory: they may be
+    /// more than it holds. A copy whose disk does not answer, or does not
+    /// take the file, fails the load, to be tried again, and one that
+    /// answers slowly is waited for as long as it gets on. Only from a
+    /// store that keeps no copies at all, which a node is not run on, are
+    /// they fetched and held in memory; and anywhere but on Unix, where no
+    /// file is read in place.
     async fn column(&self, key: &str, held: Option<Column>) -> Result<Column> {
-        match self.blobs.local(key).await {
-            Ok(Some(path)) => {
-                let name = key.to_string();
-                match blocking(move || Column::map(&name, &path)).await? {
-                    Ok(column) => return Ok(column),
-                    Err(error) => {
-                        tracing::warn!(key, %error, "a vectors file on local disk could not be read in place")
-                    }
-                }
+        self.own(key)?;
+        let in_place = cfg!(unix);
+        let copy = match self.blobs.local(key).await? {
+            Some(local) if in_place => self.mapped(key, local).await,
+            _ => Ok(None),
+        };
+        match (copy, held) {
+            (Ok(Some(column)), _) => return Ok(column),
+            (Ok(None), Some(held)) => return Ok(held),
+            (Err(error), Some(held)) => {
+                tracing::warn!(key, %error, "vectors are held in memory, their copy on local disk not reached");
+                return Ok(held);
             }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(key, %error, "a vectors file could not be copied to local disk")
-            }
+            (Err(unreached), None) => return Err(unreached),
+            (Ok(None), None) => {}
         }
-        match held {
-            Some(column) => Ok(column),
+        let fetched = match in_place {
+            true => self.blobs.fetch_local(key).await?,
+            false => None,
+        };
+        match fetched {
+            Some(local) => self.mapped(key, local).await?.ok_or_else(|| {
+                StorageError::corrupt(key, "as fetched to local disk it is no vectors file")
+            }),
             None => {
-                self.own(key)?;
                 let (name, bytes) = (key.to_string(), self.blobs.get(key).await?);
                 blocking(move || Column::decode(&name, &bytes)).await?
             }
+        }
+    }
+
+    /// The vectors under `key` read in place from the store's copy `local`,
+    /// on the disk the copy lies on, once the whole file is seen to sum to
+    /// what it says: in its turn among the large files read there, for as
+    /// long as that takes while it gets on, unless this process has summed
+    /// the file before as it lies now. None if the copy is not a whole
+    /// vectors file, and a failure if its disk gets nowhere with it.
+    async fn mapped(&self, key: &str, local: Local) -> Result<Option<Column>> {
+        let Local { path, disk } = local;
+        let unreached = |error: std::io::Error| StorageError::Blob {
+            key: key.to_string(),
+            source: error.into(),
+        };
+        // A file this process has summed as it lies now is only laid out
+        // in place again, which reads its ends alone and needs no turn
+        // among the large files being read.
+        let looked_at = disk.run(0, {
+            let path = path.clone();
+            move || column::seen(&path)
+        });
+        let file = match looked_at.await {
+            Ok(file) => file,
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unreached(error)),
+        };
+        let name = key.to_string();
+        let summed = match column::summed_before(&file) {
+            true => {
+                let laid_out = move || Ok(Column::map(&name, &path));
+                let column = disk.run(0, laid_out).await;
+                column.map(|column| column.map(column::Unsummed::trusted_as_summed))
+            }
+            false => {
+                // The turn goes with the step, to be kept until the thread
+                // that reads the file is done with it, whoever stops
+                // waiting first.
+                let loading = disk.loading().await.map_err(unreached)?;
+                let read = disk.run_while_it_gets_on(SUMMED_AT_ONCE, move |progress| {
+                    let _loading = loading;
+                    let column = Column::map(&name, &path);
+                    let told = |bytes| progress.made(bytes);
+                    Ok(column.and_then(|column| column.summed_as(&name, file, told)))
+                });
+                read.await
+            }
+        };
+        match summed {
+            Ok(Ok(column)) => Ok(Some(column)),
+            Ok(Err(error)) => {
+                tracing::warn!(key, %error, "a vectors file on local disk is not read in place");
+                Ok(None)
+            }
+            Err(error) => Err(unreached(error)),
         }
     }
 
@@ -406,9 +486,47 @@ enum Earlier {
     InGroup(usize),
 }
 
+/// How many pieces of work run at once off the async threads, all the
+/// partitions of the process together, apart from what commits do there.
+/// The runtime has so many threads for such work and no more (512 unless
+/// it is built otherwise), and work that finds none free waits for one:
+/// were loading and building segments to take them all, as many tenants
+/// opened at once would, a commit would wait behind them with its writer
+/// held. Kept to this many they leave the rest free for a commit's own
+/// steps (see [`at_once`]).
+///
+/// A pool of threads apart for commits would do as much, but would be a
+/// second thing to size, and time under test would no longer stand still
+/// while a commit works on it, as the runtime's clock does for its own.
+/// What else uses the runtime's threads is not counted here: a read of a
+/// tenant, a request to a store on local disk. Against those nothing is
+/// kept free, so a commit may still wait for a thread, which is then not
+/// held against its writer (see [`Turn::at_once`]).
+const WORKING_AT_ONCE: usize = 128;
+
+fn working() -> Arc<tokio::sync::Semaphore> {
+    static WORKING: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let working = || Arc::new(tokio::sync::Semaphore::new(WORKING_AT_ONCE));
+    WORKING.get_or_init(working).clone()
+}
+
 /// Run `work`, which takes long enough to hold up the async threads, on
-/// one of its own.
+/// one of its own, in its turn among at most [`WORKING_AT_ONCE`]: kept
+/// until the work ends, whoever stops waiting for it.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    let turn = working().acquire_owned().await;
+    let turn = turn.map_err(|error| StorageError::Background(error.to_string()))?;
+    at_once(move || {
+        let _turn = turn;
+        work()
+    })
+    .await
+}
+
+/// Run `work` off the async threads without waiting for a turn: for what
+/// a commit does with its writer held, which must not wait behind
+/// whatever else is being loaded or built.
+async fn at_once<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| StorageError::Background(error.to_string()))
@@ -448,10 +566,16 @@ impl Follower {
 /// until the coordinator has accepted the commit.
 ///
 /// A file is named by its position and its author, and is never rewritten.
-/// The writer therefore never attempts a position twice: from the first
-/// upload of an attempt until it is applied in memory the writer is not
-/// ready, and it becomes ready again only on success. An error, or a caller
-/// that stops waiting, leaves it closed for good.
+/// The writer therefore never attempts a position twice: an attempt runs
+/// from its first upload until it is applied in memory, and only one that
+/// runs to the end and succeeds leaves the writer open. An error, or a
+/// caller that stops waiting, leaves it closed for good.
+///
+/// Every try to commit is given up after a share of the lease, so a writer
+/// needs a Tokio runtime with its time driver enabled. Its requests to the
+/// store are given up as the store says, as
+/// [`ObjectBlobs`](crate::blobs::ObjectBlobs) does by [`Transfers`], and its
+/// steps on local disk as its [`Disk`] says.
 #[derive(Debug)]
 pub struct Writer {
     partition: Arc<Partition>,
@@ -460,15 +584,85 @@ pub struct Writer {
     author: Author,
     vectorize: Option<Arc<dyn Vectorize>>,
     merging: Merging,
-    ready: Mutex<bool>,
-    /// Held while a flush or a merge builds its segment without `ready`,
+    /// How the store gives requests up, by which an attempt that outlives
+    /// every bound on its steps is known to be stuck.
+    transfers: Transfers,
+    /// Held by whatever is deciding or making a commit, one at a time.
+    writing: Mutex<()>,
+    /// Set for good once an attempt fails or is given up part way.
+    closed: AtomicBool,
+    /// Held while a flush or a merge builds its segment without `writing`,
     /// so that one never builds on a state the other is about to replace.
     building: Mutex<()>,
     /// Set while a restore runs, when writes are refused.
     restoring: AtomicBool,
+    /// When the turn now held, if any, was taken, and how long it may be
+    /// held in all.
+    held: Arc<std::sync::Mutex<Option<Holding>>>,
+}
+
+/// A turn being held: since when, how long it may be in all, since when
+/// it has been waiting for a thread to work on, if it is, and how long
+/// such a wait may be before it counts against the turn like any other.
+#[derive(Debug, Clone, Copy)]
+struct Holding {
+    since: Instant,
+    allowed: Duration,
+    queued: Option<Instant>,
+    unheld: Duration,
+}
+
+impl Holding {
+    /// How long the turn may be held by now: what it was allowed, and the
+    /// wait it is in for a thread, as far as that is not held against it.
+    fn allowed_now(&self) -> Duration {
+        let waiting = self
+            .queued
+            .map_or(Duration::ZERO, |queued| queued.elapsed());
+        self.allowed.saturating_add(waiting.min(self.unheld))
+    }
+}
+
+/// How long what a turn does in memory may take whatever the partition
+/// holds, and how many live rows a second it gets through at the least.
+/// The most a turn does in memory is to write a checkpoint's manifest and
+/// adopt it, which walks every live row once. On a tenant of 4.3 million
+/// live rows (`examples/apply_timing.rs`, twice, the slower with its
+/// vectors in memory) the writer was held 0.07s and 0.22s by a flush of
+/// 50,000 rows and 0.21s and 0.79s by a merge: at the slowest over five
+/// million rows a second, of which this allows a twenty-fifth.
+const IN_MEMORY_FLOOR: Duration = Duration::from_secs(5);
+const IN_MEMORY_ROWS_PER_SECOND: u64 = 200_000;
+
+/// How long a turn on a partition of `rows` live rows may spend in memory.
+fn in_memory_within(rows: usize) -> Duration {
+    IN_MEMORY_FLOOR + Duration::from_millis(rows as u64 * 1_000 / IN_MEMORY_ROWS_PER_SECOND)
+}
+
+/// How many mutations a second, and how many of their bytes, a commit gets
+/// through at the least while it resolves them, encodes their log and
+/// applies it. On the tenant above, with rows like its own, a group of
+/// 2,310 mutations and one of 5,310, each of 12 MiB, were committed in
+/// 0.15s and 0.16s, some 0.1s of it applying them, and one of 8,192
+/// deletes in 0.02s: at the slowest fifteen thousand mutations and 76 MiB
+/// a second, of which this allows less than a seventh and a nineteenth,
+/// and both at once.
+const GROUP_ROWS_PER_SECOND: u64 = 2_000;
+const GROUP_BYTES_PER_SECOND: u64 = 4 * 1024 * 1024;
+
+/// How long a commit of `weight` may spend on it in memory, over what any
+/// turn may.
+fn group_within(weight: Weight) -> Duration {
+    let (rows, bytes) = (weight.rows as u64, weight.bytes as u64);
+    Duration::from_millis(rows.saturating_mul(1_000) / GROUP_ROWS_PER_SECOND)
+        + Duration::from_millis(bytes.saturating_mul(1_000) / GROUP_BYTES_PER_SECOND)
 }
 
 impl Writer {
+    /// The most files one call to [`Self::clean`] deletes. A call that
+    /// deleted as many may have left some, which another finds.
+    pub const CLEANED_AT_ONCE: usize = 1_000;
+
     /// Start writing from the state the lease was taken at: `committed` must
     /// be what the coordinator returned together with `lease`.
     pub async fn open(
@@ -489,9 +683,12 @@ impl Writer {
             author,
             vectorize: None,
             merging: Merging::default(),
-            ready: Mutex::new(true),
+            transfers: Transfers::default(),
+            writing: Mutex::new(()),
+            closed: AtomicBool::new(false),
             building: Mutex::new(()),
             restoring: AtomicBool::new(false),
+            held: Arc::default(),
         })
     }
 
@@ -509,6 +706,12 @@ impl Writer {
         Self { merging, ..self }
     }
 
+    /// Take requests to the store to be given up as `transfers` says, the
+    /// store's own, instead of as by default.
+    pub fn transferring(self, transfers: Transfers) -> Self {
+        Self { transfers, ..self }
+    }
+
     pub fn partition(&self) -> &Arc<Partition> {
         &self.partition
     }
@@ -519,6 +722,53 @@ impl Writer {
 
     pub fn author(&self) -> &Author {
         &self.author
+    }
+
+    /// Whether the writer can write no more: an attempt to commit failed,
+    /// or was given up part way, so its outcome is unknown or the lease is
+    /// lost. Anything else that fails leaves the writer as it was.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Wait until nothing else is committing, unless the writer is closed.
+    /// From then until the turn is given back the writer is known to be
+    /// held, and for how long it may be: what is done in memory while it
+    /// is, which takes about as long as the partition has rows, and every
+    /// step the turn then waits on, each of which allows itself its bound
+    /// first (see [`Turn::allow`]).
+    async fn turn(&self) -> Result<Turn<'_>> {
+        let guard = self.writing.lock().await;
+        if self.is_closed() {
+            return Err(StorageError::Closed);
+        }
+        let (taken, in_memory) = (
+            Instant::now(),
+            in_memory_within(self.partition.read(State::rows)),
+        );
+        *self.held.lock().expect("held lock") = Some(Holding {
+            since: taken,
+            allowed: in_memory,
+            queued: None,
+            unheld: self.commit_within(),
+        });
+        Ok(Turn {
+            _guard: guard,
+            taken,
+            held: self.held.clone(),
+        })
+    }
+
+    /// Run one write attempt, closing the writer unless it runs to
+    /// completion and succeeds.
+    async fn attempt<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
+        let mut attempt = Attempt {
+            closed: &self.closed,
+            succeeded: false,
+        };
+        let done = work.await?;
+        attempt.succeeded = true;
+        Ok(done)
     }
 
     /// Commit `mutations` as one atomic step. A rejected mutation fails the
@@ -599,18 +849,35 @@ impl Writer {
     /// which takes the partition over answers it alike. One that fails in
     /// a way that may pass, an embedding that could not be made, is not
     /// answered and may be tried again.
+    ///
+    /// Whatever fails a batch without the writer trying to commit, a
+    /// refusal, a vector not made or a restore under way, is that batch's
+    /// own result. An error for the whole group means the writer is closed:
+    /// it was already, or the commit failed or was given up part way; or,
+    /// with nothing tried, that the runtime is shutting down.
+    ///
+    /// The batches are resolved, their log encoded and the commit applied
+    /// in memory with the writer held, each on a thread for work that takes
+    /// a while, never one of the async ones, and the writer is allowed as
+    /// long for it as so many mutations and bytes take. How many share one
+    /// commit is for the caller to bound, as [`GroupCommitter`] does.
+    ///
+    /// [`GroupCommitter`]: crate::GroupCommitter
     pub async fn commit_batches(
         &self,
         batches: Vec<Batch>,
         made: Embedded,
     ) -> Result<Vec<Result<Receipt>>> {
-        let mut ready = self.ready.lock().await;
-        if !*ready {
-            return Err(StorageError::Closed);
-        }
+        let turn = self.turn().await?;
         if self.restoring.load(Ordering::SeqCst) {
-            return Err(StorageError::Restoring);
+            return Ok(batches
+                .iter()
+                .map(|_| Err(StorageError::Restoring))
+                .collect());
         }
+        let weight: Weight = batches.iter().map(Batch::weight).sum();
+        turn.allow(group_within(weight));
+        let batches = Arc::new(batches);
         let receipt = |position, outcomes| Receipt {
             incarnation: self.partition.incarnation,
             position,
@@ -652,22 +919,30 @@ impl Writer {
             .collect();
         let mut failed: HashMap<Embedding, Unembedded> = HashMap::new();
         let ((position, prev), outcomes, ops) = loop {
-            let (at, outcomes, (mut ops, wanted)) = self.partition.read(|state| {
-                let mut draft = Draft::new(state);
-                let outcomes: Vec<_> = batches
-                    .iter()
-                    .zip(&unembedded)
-                    .zip(&earlier)
-                    .map(
-                        |((batch, unembedded), earlier)| match (unembedded, earlier) {
-                            (None, Earlier::None) => draft.batch(batch.mutations.clone()),
-                            _ => draft.batch(Vec::new()),
-                        },
-                    )
-                    .collect();
-                (state.at(), outcomes, draft.finish())
+            let decided: Vec<bool> = unembedded
+                .iter()
+                .zip(&earlier)
+                .map(|(unembedded, earlier)| {
+                    unembedded.is_some() || !matches!(earlier, Earlier::None)
+                })
+                .collect();
+            let (partition, batches) = (self.partition.clone(), batches.clone());
+            let resolved = turn.at_once(move || {
+                partition.read(|state| {
+                    let mut draft = Draft::new(state);
+                    let outcomes: Vec<_> = batches
+                        .iter()
+                        .zip(decided)
+                        .map(|(batch, decided)| match decided {
+                            false => draft.batch(batch.mutations.clone()),
+                            true => draft.batch(Vec::new()),
+                        })
+                        .collect();
+                    (state.at(), outcomes, draft.finish())
+                })
             });
-            self.make(&wanted, &mut made, &mut failed).await;
+            let (at, outcomes, (mut ops, wanted)) = resolved.await?;
+            self.make(&turn, &wanted, &mut made, &mut failed).await;
             let unmade = |wanted: &&Wanted| failed.contains_key(&wanted.embedding);
             if !wanted.iter().any(|wanted| unmade(&wanted)) {
                 for Wanted {
@@ -689,13 +964,24 @@ impl Writer {
                 let why = failed[&wanted.embedding].clone();
                 unembedded[wanted.batch] = Some((wanted.embedding.model.clone(), why));
             }
+            // A vector that cannot be made for no batch of its own is the
+            // failure of every batch still undecided, and the next round
+            // commits what the rest decided.
             if rejected(&unembedded) == before {
-                let (model, why) = failed
-                    .into_iter()
+                let (model, reason) = failed
+                    .iter()
                     .next()
-                    .map(|(embedding, why)| (embedding.model, why))
+                    .map(|(embedding, reason)| (embedding.model.clone(), reason.clone()))
                     .unwrap_or_default();
-                return Err(StorageError::unembedded(model, why));
+                unembedded
+                    .iter_mut()
+                    .zip(&earlier)
+                    .filter(|(unembedded, earlier)| {
+                        unembedded.is_none() && matches!(earlier, Earlier::None)
+                    })
+                    .for_each(|(unembedded, _)| {
+                        *unembedded = Some((model.clone(), reason.clone()));
+                    });
             }
         };
         let now = std::time::SystemTime::now()
@@ -724,58 +1010,60 @@ impl Writer {
         let position = if ops.is_empty() && answered.is_empty() {
             position
         } else {
-            let log = LogSegment {
-                position: following(position)?,
-                prev,
-                ops,
-                answered,
-            };
-            let key = Layout(&self.lease.key).log(log.position, &self.author);
-            let frame = encode(Kind::Log, &log)?;
-            attempt(&mut ready, async {
-                self.publish(&key, frame, log.position).await?;
-                self.partition
-                    .state
-                    .write()
-                    .expect("partition lock")
-                    .apply(&key, &log)
+            self.attempt(async {
+                let position = following(position)?;
+                let key = Layout(&self.lease.key).log(position, &self.author);
+                let resolved = turn.taken.elapsed();
+                let (log, frame) = turn
+                    .at_once(move || {
+                        let log = LogSegment {
+                            position,
+                            prev,
+                            ops,
+                            answered,
+                        };
+                        encode(Kind::Log, &log).map(|frame| (log, frame))
+                    })
+                    .await??;
+                let (encoded, bytes) = (turn.taken.elapsed(), frame.len());
+                self.publish(&turn, &key, frame, position, None).await?;
+                let published = turn.taken.elapsed();
+                // Applied to its end even if whoever waits here stops
+                // waiting, which closes the writer: the commit is made.
+                let (partition, applied) = (self.partition.clone(), key.clone());
+                turn.at_once(move || {
+                    let mut state = partition.state.write().expect("partition lock");
+                    state.apply(&applied, &log)
+                })
+                .await??;
+                tracing::debug!(
+                    partition = %self.lease.key,
+                    ?position,
+                    mutations = weight.rows,
+                    bytes,
+                    ?resolved,
+                    encoding = ?encoded.saturating_sub(resolved),
+                    publishing = ?published.saturating_sub(encoded),
+                    applying = ?turn.taken.elapsed().saturating_sub(published),
+                    "committed a group"
+                );
+                Ok(position)
             })
-            .await?;
-            log.position
+            .await?
         };
-        // A batch whose request comes again later in the group shares its
-        // failure with that later one.
-        let repeated: HashSet<usize> = earlier
-            .iter()
-            .filter_map(|earlier| match earlier {
-                Earlier::InGroup(first) => Some(*first),
-                _ => None,
-            })
-            .collect();
         let mut results: Vec<Result<Receipt>> = outcomes
             .into_iter()
             .zip(unembedded)
-            .enumerate()
-            .map(|(at, (outcomes, unembedded))| {
-                let result = match unembedded {
-                    Some((model, why)) => Err(StorageError::unembedded(model, why)),
-                    None => outcomes.map(|outcomes| receipt(position, outcomes)),
-                };
-                result.map_err(|error| match repeated.contains(&at) {
-                    true => StorageError::Shared(Arc::new(error)),
-                    false => error,
-                })
+            .map(|(outcomes, unembedded)| match unembedded {
+                Some((model, reason)) => Err(StorageError::unembedded(model, reason)),
+                None => outcomes.map(|outcomes| receipt(position, outcomes)),
             })
             .collect();
         for (at, earlier) in earlier.into_iter().enumerate() {
             results[at] = match earlier {
                 Earlier::None => continue,
                 Earlier::Answered(answer) => answer.map_err(StorageError::Refused),
-                Earlier::InGroup(first) => match &results[first] {
-                    Ok(receipt) => Ok(receipt.clone()),
-                    Err(StorageError::Shared(shared)) => Err(StorageError::Shared(shared.clone())),
-                    Err(_) => unreachable!("a repeated request's failure is shared"),
-                },
+                Earlier::InGroup(first) => told_again(&mut results[first]),
             };
         }
         Ok(results)
@@ -790,6 +1078,7 @@ impl Writer {
     /// text a vector is being made for.
     async fn make(
         &self,
+        turn: &Turn<'_>,
         wanted: &[Wanted],
         made: &mut Embedded,
         failed: &mut HashMap<Embedding, Unembedded>,
@@ -805,6 +1094,9 @@ impl Writer {
             if !known && !texts.contains(&text) {
                 texts.push(text);
             }
+        }
+        if missing.values().any(|texts| !texts.is_empty()) {
+            turn.allow(EMBEDDING_TIMEOUT);
         }
         let asked = missing
             .into_iter()
@@ -875,9 +1167,69 @@ impl Writer {
     /// flushing or a checkpoint made meanwhile left nothing to do.
     pub async fn flush(&self) -> Result<LogPosition> {
         let _building = self.building.lock().await;
-        let Some(mut snapshot) = self.partition.read(State::snapshot) else {
+        let Some(snapshot) = self.partition.read(State::snapshot) else {
             return Ok(self.partition.read(State::position));
         };
+        let mut staged = self.staging();
+        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let turn = self.turn().await?;
+        let position = following(self.partition.read(State::position))?;
+        let key = Layout(&self.lease.key).manifest(position, &self.author);
+        let manifest = self
+            .partition
+            .read(|state| state.flushed_manifest(position, &snapshot, segment.as_ref()))?;
+        let frame = encode(Kind::Manifest, &manifest)?;
+        staged.keep();
+        self.checkpoint(turn, &key, frame, position, |state| {
+            state.flushed(&key, position, snapshot, segment)
+        })
+        .await?;
+        Ok(position)
+    }
+
+    /// Commit the checkpoint `frame` under `key` at `position` and adopt it
+    /// in memory as `adopt` does, which is all a checkpoint does while the
+    /// writer is held; then give the turn back and free what the checkpoint
+    /// took out of memory. Once the commit is made nothing is left to fail:
+    /// what `adopt` adopts was seen to be fit before the writer was held.
+    async fn checkpoint(
+        &self,
+        turn: Turn<'_>,
+        key: &str,
+        frame: Bytes,
+        position: LogPosition,
+        adopt: impl FnOnce(&mut State) -> Discarded,
+    ) -> Result<()> {
+        let discarded = self
+            .attempt(async {
+                self.publish(&turn, key, frame, position, None).await?;
+                let adopting = Instant::now();
+                let adopted = adopt(&mut self.partition.state.write().expect("partition lock"));
+                tracing::debug!(
+                    partition = %self.lease.key,
+                    ?position,
+                    rows = self.partition.read(State::rows),
+                    adopting = ?adopting.elapsed(),
+                    held = ?turn.taken.elapsed(),
+                    "adopted a checkpoint"
+                );
+                Ok(adopted)
+            })
+            .await?;
+        drop(turn);
+        blocking(move || drop(discarded)).await
+    }
+
+    /// What a checkpoint does before the writer is held: copy the rows of
+    /// `snapshot` out of memory, a part at a time so that commits are not
+    /// held up while all of them are, and build, upload and load back the
+    /// segment of them, if there are any, which is then seen to be fit to
+    /// adopt.
+    async fn flushing(
+        &self,
+        mut snapshot: Snapshot,
+        staged: &mut Staged,
+    ) -> Result<(Snapshot, Option<Fit>)> {
         while self
             .partition
             .read(|state| state.copy_rows(&mut snapshot, COPIED_AT_ONCE))
@@ -885,30 +1237,11 @@ impl Writer {
             tokio::task::yield_now().await;
         }
         let named_at = snapshot.position;
-        let segment = match self.uploaded(&mut snapshot, named_at).await? {
-            Some(prepared) => Some(self.loaded(prepared).await?),
+        let segment = match self.uploaded(&mut snapshot, named_at, staged).await? {
+            Some(prepared) => Some(self.fit(prepared, &snapshot.catalog).await?),
             None => None,
         };
-        let mut ready = self.ready.lock().await;
-        if !*ready {
-            return Err(StorageError::Closed);
-        }
-        let position = following(self.partition.read(State::position))?;
-        let key = Layout(&self.lease.key).manifest(position, &self.author);
-        let flushed = segment.as_ref().map(|(meta, _)| meta.clone());
-        let manifest = self
-            .partition
-            .read(|state| state.flushed_manifest(position, &snapshot, flushed));
-        let frame = encode(Kind::Manifest, &manifest)?;
-        let discarded = attempt(&mut ready, async {
-            self.publish(&key, frame, position).await?;
-            let mut state = self.partition.state.write().expect("partition lock");
-            state.flushed(&key, position, snapshot, segment)
-        })
-        .await?;
-        drop(ready);
-        blocking(move || drop(discarded)).await?;
-        Ok(position)
+        Ok((snapshot, segment))
     }
 
     /// Put the partition back as it stood when `head`, committed at
@@ -929,8 +1262,29 @@ impl Writer {
         head: Option<&ManifestRef>,
         position: LogPosition,
     ) -> Result<LogPosition> {
+        self.put_back(head, position, None).await
+    }
+
+    /// As [`Self::restore`] to `head` at `restore.from`, recording `restore`
+    /// with the commit that makes it, so that the coordinator answers its
+    /// request as it was from then on.
+    pub async fn restore_recorded(
+        &self,
+        head: Option<&ManifestRef>,
+        restore: Restore,
+    ) -> Result<LogPosition> {
+        self.put_back(head, restore.from, Some(restore)).await
+    }
+
+    async fn put_back(
+        &self,
+        head: Option<&ManifestRef>,
+        position: LogPosition,
+        restore: Option<Restore>,
+    ) -> Result<LogPosition> {
         let _building = self.building.lock().await;
         let _refusing = Refusing::writes(self).await;
+        self.abreast().await?;
         let at = Committed {
             generation: self.lease.generation,
             incarnation: self.partition.incarnation,
@@ -945,11 +1299,16 @@ impl Writer {
         )
         .await?;
         let mut held = target.held();
+        let mut staged = self.staging();
+        // With writes refused and the building lock held nothing commits,
+        // so the position the partition is at is the one it will be
+        // restored from, and all but the commit is done before the writer
+        // is held.
+        let current = self.partition.read(State::position);
         let segment = match target.read(State::snapshot) {
             Some(mut snapshot) => {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
-                let named_at = self.partition.read(State::position);
-                match self.uploaded(&mut snapshot, named_at).await? {
+                match self.uploaded(&mut snapshot, current, &mut staged).await? {
                     Some(prepared) => {
                         let (meta, loaded) = self.loaded(prepared).await?;
                         held.insert(meta.key.clone(), loaded);
@@ -960,28 +1319,71 @@ impl Writer {
             }
             None => None,
         };
-        let mut ready = self.ready.lock().await;
-        if !*ready {
-            return Err(StorageError::Closed);
-        }
-        let restored = following(self.partition.read(State::position).max(position))?;
+        let restored = following(current.max(position))?;
         let key = Layout(&self.lease.key).manifest(restored, &self.author);
         let manifest = self.partition.read(|current| {
             target.read(|target| current.restored_manifest(restored, target, segment))
         });
         let frame = encode(Kind::Manifest, &manifest)?;
         let state = target.restore(&key, manifest, held).await?;
-        let replaced = attempt(&mut ready, async {
-            self.publish(&key, frame, restored).await?;
-            Ok(std::mem::replace(
-                &mut *self.partition.state.write().expect("partition lock"),
-                state,
-            ))
-        })
-        .await?;
-        drop(ready);
+        let turn = self.turn().await?;
+        // Were the partition anywhere else, what was made above would put
+        // back over commits it never saw; nothing is committed, and the
+        // segment uploaded for it is deleted.
+        if self.partition.read(State::position) != current {
+            return Err(StorageError::Diverged {
+                head: self.partition.read(State::at).1,
+            });
+        }
+        staged.keep();
+        let replaced = self
+            .attempt(async {
+                self.publish(&turn, &key, frame, restored, restore).await?;
+                Ok(std::mem::replace(
+                    &mut *self.partition.state.write().expect("partition lock"),
+                    state,
+                ))
+            })
+            .await?;
+        drop(turn);
         blocking(move || drop((replaced, target))).await?;
         Ok(restored)
+    }
+
+    /// See that the partition is committed just where this writer has it,
+    /// and under its lease, as it is for the one writer of a lease still
+    /// current.
+    ///
+    /// A writer is left behind in two ways. Its lease is taken by another
+    /// node, which the coordinator fences: every commit of the old
+    /// generation is refused. Or a second writer is opened on the very
+    /// lease it holds, which no generation tells apart; a node opens one
+    /// writer for each lease it takes, so only something that opens two on
+    /// one lease, as a test or a tool might, makes that happen, and then
+    /// each commit is refused unless it follows what is committed (see
+    /// [`Commit`]). Either way the coordinator refuses the commit, and
+    /// this is not what keeps a writer left behind from committing. It
+    /// tells one so before it has built and uploaded a restore's segment
+    /// for nothing, with its writer left open; and it is what cleaning up,
+    /// which commits nothing, goes by (see [`Self::current`]).
+    async fn abreast(&self) -> Result<()> {
+        let (position, head) = self.partition.read(State::at);
+        let within = self.commit_within();
+        let asked = self.coordinator.committed(&self.lease.key);
+        let committed = tokio::time::timeout(within, asked).await.map_err(|_| {
+            let reason = format!("the coordinator did not say what is committed within {within:?}");
+            CoordinatorError::backend(std::io::Error::new(std::io::ErrorKind::TimedOut, reason))
+        })??;
+        let here = committed.is_some_and(|committed| {
+            let at = committed.manifest.as_ref().map(|head| head.0.as_str());
+            committed.generation == self.lease.generation
+                && committed.log_position == position
+                && at == head.as_deref()
+        });
+        match here {
+            true => Ok(()),
+            false => Err(StorageError::Diverged { head }),
+        }
     }
 
     /// Build and upload a segment of the rows taken out of `snapshot` and
@@ -991,11 +1393,12 @@ impl Writer {
         &self,
         snapshot: &mut Snapshot,
         named_at: LogPosition,
+        staged: &mut Staged,
     ) -> Result<Option<Prepared>> {
         if snapshot.rows.is_empty() && snapshot.tombstones.is_empty() {
             return Ok(None);
         }
-        let names = self.staged(named_at);
+        let names = self.named(named_at, "");
         let rows = std::mem::take(&mut snapshot.rows);
         let above = self.merging.clustered_above;
         let shape = Shape::of(&snapshot.catalog, &rows, snapshot.tombstones.len(), above);
@@ -1006,22 +1409,27 @@ impl Writer {
         };
         let built = self.built(file, snapshot.catalog.clone()).await?;
         let prepared = Self::prepared(names.meta(shape), built)?;
-        self.upload(&prepared).await?;
+        self.upload(&prepared, staged).await?;
         Ok(Some(prepared))
     }
 
-    /// Names for the files of a segment built from the partition as it was
-    /// at `position`, apart from those of any other build from there.
-    fn staged(&self, position: LogPosition) -> Names {
-        let nonce = uuid::Uuid::new_v4().as_u64_pair().0;
-        self.names(position, &format!("-{nonce:016x}"))
+    /// The files this writer uploads for a commit it has yet to attempt,
+    /// none so far.
+    fn staging(&self) -> Staged {
+        Staged {
+            blobs: self.partition.blobs.clone(),
+            keys: Vec::new(),
+        }
     }
 
-    /// Names for a segment's files written at `position`, told apart from
-    /// others written there by `suffix`.
-    fn names(&self, position: LogPosition, suffix: &str) -> Names {
+    /// Names for the files of a segment built from the partition as it was
+    /// at `position`, apart from those of any other build from there, each
+    /// ending in `marker`.
+    fn named(&self, position: LogPosition, marker: &str) -> Names {
+        let nonce = uuid::Uuid::new_v4().as_u64_pair().0;
+        let suffix = format!("-{nonce:016x}{marker}");
         let layout = Layout(&self.lease.key);
-        let named = |kind| layout.named(kind, position, &self.author, suffix);
+        let named = |kind| layout.named(kind, position, &self.author, &suffix);
         Names {
             segment: named("segment"),
             index: named("index"),
@@ -1071,19 +1479,20 @@ impl Writer {
     }
 
     /// Upload a segment's files, the segment's own last so that it never
-    /// sits in the store without its companions.
-    async fn upload(&self, prepared: &Prepared) -> Result<()> {
+    /// sits in the store without its companions, noting each in `staged`
+    /// before it goes up.
+    async fn upload(&self, prepared: &Prepared, staged: &mut Staged) -> Result<()> {
         let Prepared { meta, built, index } = prepared;
-        if let Some(key) = &meta.vectors {
-            self.partition.blobs.put(key, built.column.clone()).await?;
+        let files = [
+            meta.vectors.as_deref().map(|key| (key, &built.column)),
+            meta.index.as_deref().zip(index.as_ref()),
+            Some((meta.key.as_str(), &built.segment)),
+        ];
+        for (key, bytes) in files.into_iter().flatten() {
+            staged.keys.push(key.to_string());
+            self.partition.blobs.put(key, bytes.clone()).await?;
         }
-        if let Some((key, frame)) = meta.index.as_deref().zip(index.clone()) {
-            self.partition.blobs.put(key, frame).await?;
-        }
-        self.partition
-            .blobs
-            .put(&meta.key, built.segment.clone())
-            .await
+        Ok(())
     }
 
     /// An uploaded segment as the state holds it, with its vectors read
@@ -1103,69 +1512,65 @@ impl Writer {
         Ok((meta, loaded))
     }
 
+    /// As [`Self::loaded`], and seen to be fit to adopt under the
+    /// collections of `catalog`: here, before the writer is held, so that
+    /// a segment that is not fails with nothing committed or changed.
+    async fn fit(&self, prepared: Prepared, catalog: &Catalog) -> Result<Fit> {
+        let (meta, loaded) = self.loaded(prepared).await?;
+        loaded.fit(meta, catalog)
+    }
+
     /// Carry out the merge the partition most needs, if any: replace a run
     /// of segments with one holding their live rows, in a checkpoint that
-    /// also flushes whatever is unflushed. The merged file is built from a
-    /// snapshot, without holding the writer; a row that dies meanwhile is
-    /// dead in the new segment too. Returns the checkpoint's position, or
-    /// `None` when there was nothing to merge or the segments changed under
-    /// the snapshot, in which case asking again is fine.
+    /// also flushes what is unflushed, as [`Self::flush`] does. Both
+    /// segments are built from the partition as it is now and written while
+    /// commits go on; a row that dies meanwhile is dead in the new segment
+    /// too. Returns the checkpoint's position, or `None` when there was
+    /// nothing to merge.
     pub async fn merge(&self) -> Result<Option<LogPosition>> {
         let _building = self.building.lock().await;
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
         let above = self.merging.clustered_above;
-        let Some((file, shape)) = self.partition.read(|state| {
-            let file = state.merged(&merge, state.position())?;
+        let Some((file, shape, named_at)) = self.partition.read(|state| {
+            let named_at = state.position();
+            let file = state.merged(&merge, named_at)?;
             let shape = Shape::of(state.catalog(), &file.rows, file.tombstones.len(), above);
-            Some((file, shape))
+            Some((file, shape, named_at))
         }) else {
             return Ok(None);
         };
         let catalog = self.partition.read(|state| state.catalog().clone());
-        let built = self.built(file, catalog).await?;
-        let layout = Layout(&self.lease.key);
-        let mut ready = self.ready.lock().await;
-        if !*ready {
-            return Err(StorageError::Closed);
-        }
+        let built = self.built(file, catalog.clone()).await?;
+        // Both segments, however large, are uploaded without the writer,
+        // under names of their own at the position each was built from;
+        // see `clean` for why nothing deletes them first.
+        let mut staged = self.staging();
+        let merged = Self::prepared(self.named(named_at, "-merged").meta(shape), built)?;
+        self.upload(&merged, &mut staged).await?;
+        let merged = self.fit(merged, &catalog).await?;
+        let snapshot = self.partition.read(State::taken);
+        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
-        let key = layout.manifest(position, &self.author);
-        let meta = self.names(position, "-merged").meta(shape);
-        let flushed_names = self.names(position, "");
-        let Some((flushed, manifest)) = self.partition.read(|state| {
-            state
-                .unchanged(&merge)
-                .then(|| state.compaction(position, &flushed_names, above, &merge, meta.clone()))
-        }) else {
+        let key = Layout(&self.lease.key).manifest(position, &self.author);
+        // Only what holds the building lock replaces segments, so the run
+        // is as it was planned over. Were it not, the merged segment would
+        // describe nothing there is: nothing is committed, and what was
+        // uploaded is deleted.
+        let Some(manifest) = self.partition.read(|state| {
+            let flushed = segment.as_ref();
+            state.merged_manifest(position, &snapshot, flushed, &merge, merged.meta.clone())
+        })?
+        else {
             return Ok(None);
         };
-        let merged = Self::prepared(meta, built)?;
-        let flushed = match flushed {
-            Some((meta, file)) => {
-                let catalog = self.partition.read(|state| state.catalog().clone());
-                Some(Self::prepared(meta, self.built(file, catalog).await?)?)
-            }
-            None => None,
-        };
-        if !self.partition.read(|state| state.unchanged(&merge)) {
-            return Ok(None);
-        }
         let frame = encode(Kind::Manifest, &manifest)?;
-        attempt(&mut ready, async {
-            self.upload(&merged).await?;
-            if let Some(flushed) = &flushed {
-                self.upload(flushed).await?;
-            }
-            self.publish(&key, frame, position).await?;
-            let merged = self.loaded(merged).await?;
-            let flushed = match flushed {
-                Some(flushed) => Some(self.loaded(flushed).await?),
-                None => None,
-            };
-            let mut state = self.partition.state.write().expect("partition lock");
-            state.compacted(&key, position, flushed, &merge, merged)
+        staged.keep();
+        self.checkpoint(turn, &key, frame, position, |state| {
+            state.compacted(&merge, merged);
+            state.flushed(&key, position, snapshot, segment)
         })
         .await?;
         Ok(Some(position))
@@ -1187,29 +1592,97 @@ impl Writer {
     /// everything before that checkpoint which no checkpoint on the way
     /// lists goes. A restore's checkpoint lists segments far older than
     /// itself, which stay for as long as it is on the way.
-    /// The files are listed before the head is read, with the writer held
-    /// so that no commit is in flight: a file this writer uploaded and had
-    /// not yet published when the listing was taken is reached by then or
-    /// belongs to a commit that failed. A flush uploads its segment's files
-    /// without the writer, under the position of the partition it was built
-    /// from, which is past the latest checkpoint and so past anything this
-    /// deletes until a checkpoint after it has been committed.
+    /// The files are listed first, and the head read after, with the
+    /// writer held for just that reading so that no commit is in flight: a
+    /// file this writer uploaded and had not yet published when the
+    /// listing was taken is reached by then or belongs to a commit that
+    /// failed.
+    ///
+    /// A flush, a merge and a restore upload their segments' files without
+    /// the writer, under the position of the partition they were built from
+    /// and a name of their own, and all of them, like this, hold the
+    /// building lock from before they read the partition until they commit
+    /// or fail. Only they commit checkpoints, so none is committed past that
+    /// position while such files wait to be published, and log commits do
+    /// not move the checkpoint this deletes below. Those files therefore sit
+    /// at or past the latest checkpoint, never below it, and are not deleted
+    /// until a checkpoint after them has been committed and, if they were
+    /// never published, until they are older than `grace`.
+    ///
+    /// The building lock is held until the last file is deleted, not only
+    /// while what to delete is worked out. Let go before, a restore could
+    /// commit meanwhile a checkpoint that lists segments older than the
+    /// one this deletes below, which nothing on the way listed when the
+    /// chain was walked, and they would be deleted from under it. So that
+    /// a flush, a merge or a restore never waits long for it, one call
+    /// deletes at most [`Self::CLEANED_AT_ONCE`] files, several at a time,
+    /// and stops asking for more after a minute; what is left goes with
+    /// the next call, which finds it again. Finding what to delete is
+    /// given a minute too, and a call that takes longer fails.
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
         let _building = self.building.lock().await;
+        let unneeded = tokio::time::timeout(CLEANING_WITHIN, self.unneeded(grace));
+        let orphans = unneeded.await.map_err(|_| StorageError::Blob {
+            key: Layout(&self.lease.key).prefix(),
+            source: format!("what to clean up was not found within {CLEANING_WITHIN:?}").into(),
+        })??;
+        // A few at a time, each lot only once the coordinator has said
+        // again that the partition is this writer's still and where it has
+        // it: see `current`.
+        let blobs = &self.partition.blobs;
+        let given_up = tokio::time::sleep(CLEANING_WITHIN);
+        tokio::pin!(given_up);
+        let mut deleted = 0;
+        for lot in orphans.chunks(CLEANING_AT_ONCE) {
+            self.current().await?;
+            let deleting = try_join_all(lot.iter().map(|key| blobs.delete(key)));
+            tokio::select! {
+                biased;
+                () = &mut given_up => break,
+                done = deleting => done.map(|_| deleted += lot.len())?,
+            }
+        }
+        tracing::debug!(partition = %self.lease.key, deleted, "cleaned");
+        Ok(deleted)
+    }
+
+    /// Where the partition is, once the coordinator has said that it is
+    /// this writer's still and committed just there: asked with the writer
+    /// held, so that no commit of its own is under way.
+    ///
+    /// Cleaning up commits nothing, so no coordinator refuses it, and what
+    /// it deletes is decided by the chain as its writer has it. A writer
+    /// whose lease another has taken has not seen what that one committed:
+    /// a restore since may have put back into use segments this one takes
+    /// for litter. So it asks before it works out what to delete, and
+    /// again before each lot it deletes. What is left is a lot already
+    /// asked for when the lease is lost, and only if, before those
+    /// requests are answered, another writer has taken the lease, opened
+    /// the partition and committed a restore to a state that lists one of
+    /// those very files: a lease is taken from a node only once it has run
+    /// out, by when the node has long stopped whatever was working on the
+    /// tenant, this included.
+    async fn current(&self) -> Result<(LogPosition, Option<String>)> {
+        let turn = self.turn().await?;
+        turn.allow(self.commit_within());
+        self.abreast().await?;
+        Ok(self.partition.read(State::at))
+    }
+
+    /// The files [`Self::clean`] with `grace` deletes, as many as it does
+    /// at once: every file listed, set against the committed chain. Each
+    /// request it makes is given up by the store, but a partition of a
+    /// great many files, or of a long chain, takes many, so whoever asks
+    /// gives the whole of it up after a while.
+    async fn unneeded(&self, grace: Duration) -> Result<Vec<String>> {
         let layout = Layout(&self.lease.key);
         let listed = self.partition.blobs.list(&layout.prefix()).await?;
-        let (position, head) = {
-            let ready = self.ready.lock().await;
-            if !*ready {
-                return Err(StorageError::Closed);
-            }
-            self.partition.read(State::at)
-        };
+        let (position, head) = self.current().await?;
         let cutoff = chrono::Duration::from_std(grace)
             .ok()
             .and_then(|grace| chrono::Utc::now().checked_sub_signed(grace));
         let Some(cutoff) = cutoff else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let files: Vec<(&Listed, LogPosition)> = listed
             .iter()
@@ -1237,34 +1710,93 @@ impl Writer {
             };
         };
         let Some(base) = base else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let kept: HashSet<&str> = checkpoints
             .iter()
             .chain([&base])
             .flat_map(listed_by)
             .collect();
-        let orphans = files
+        Ok(files
             .iter()
-            .filter(|(file, at)| *at < base.position && !kept.contains(file.key.as_str()));
-        let mut deleted = 0;
-        for (file, _) in orphans {
-            self.partition.blobs.delete(&file.key).await?;
-            deleted += 1;
-        }
-        tracing::debug!(partition = %self.lease.key, ?position, deleted, "cleaned");
-        Ok(deleted)
+            .filter(|(file, at)| *at < base.position && !kept.contains(file.key.as_str()))
+            .map(|(file, _)| file.key.clone())
+            .take(Self::CLEANED_AT_ONCE)
+            .collect())
     }
 
-    async fn publish(&self, key: &str, frame: Bytes, position: LogPosition) -> Result<()> {
+    /// Whether something holds the writer now, as whatever commits does
+    /// while it does. For tests that watch what is done meanwhile.
+    #[doc(hidden)]
+    pub fn is_held(&self) -> bool {
+        self.held.lock().expect("held lock").is_some()
+    }
+
+    /// Whether the writer has been held for longer than everything done
+    /// while it was may take, which only something that ignores its bound,
+    /// such as a store that never gives a request up, could make it be.
+    /// A commit waiting a while for a thread to work on is not that: see
+    /// [`Turn::at_once`].
+    pub fn stalled(&self) -> bool {
+        let held = *self.held.lock().expect("held lock");
+        held.is_some_and(|held| held.since.elapsed() > held.allowed_now())
+    }
+
+    /// How long one try to commit may take: a share of the lease, so that
+    /// the tries and the waits between them end within it.
+    fn commit_within(&self) -> Duration {
+        self.lease.ttl / (COMMIT_ATTEMPTS + 1)
+    }
+
+    /// The most a publish of a head file of `bytes` takes: its upload and
+    /// its copy to local disk, then every try to commit and the waits
+    /// between them.
+    fn publish_within(&self, bytes: usize) -> Duration {
+        let waits = (1..COMMIT_ATTEMPTS)
+            .map(|tries| COMMIT_RETRY_DELAY * tries)
+            .sum();
+        let head = self.transfers.upload_within(bytes) + Disk::shared().answers_within(bytes);
+        head + self.commit_within() * COMMIT_ATTEMPTS + waits
+    }
+
+    /// Upload the head file under `key` and commit it at `position`, with
+    /// the restore it makes if it makes one. The upload is given up as the
+    /// store says, and each try to commit after [`Self::commit_within`];
+    /// one given up is as unknown as one whose answer was lost.
+    async fn publish(
+        &self,
+        turn: &Turn<'_>,
+        key: &str,
+        frame: Bytes,
+        position: LogPosition,
+        restore: Option<Restore>,
+    ) -> Result<()> {
+        turn.allow(self.publish_within(frame.len()));
         self.partition.blobs.put(key, frame).await?;
+        // The state this was built on, which nothing has changed since: the
+        // writer is held from before it was read until this is applied.
+        let (was_at, head) = self.partition.read(State::at);
         let commit = Commit {
+            after: Some(Prior {
+                position: was_at,
+                head: head.map(ManifestRef),
+            }),
             log_position: position,
             manifest: Some(ManifestRef(key.to_string())),
+            restore,
+        };
+        let within = self.commit_within();
+        let unanswered = || {
+            let reason = format!("the coordinator did not answer a commit within {within:?}");
+            CoordinatorError::backend(std::io::Error::new(std::io::ErrorKind::TimedOut, reason))
         };
         let mut tries = 1;
         loop {
-            match self.coordinator.commit(&self.lease, commit.clone()).await {
+            let tried =
+                tokio::time::timeout(within, self.coordinator.commit(&self.lease, commit.clone()))
+                    .await
+                    .unwrap_or_else(|_| Err(unanswered()));
+            match tried {
                 Err(error) if error.is_retryable() && tries < COMMIT_ATTEMPTS => {
                     tokio::time::sleep(COMMIT_RETRY_DELAY * tries).await;
                     tries += 1;
@@ -1297,13 +1829,141 @@ fn following(position: LogPosition) -> Result<LogPosition> {
         .ok_or(StorageError::Exhausted("log positions"))
 }
 
-/// Run one write attempt with the writer not ready, making it ready again
-/// only if the attempt ran to completion and succeeded.
-async fn attempt<T>(ready: &mut bool, work: impl Future<Output = Result<T>>) -> Result<T> {
-    *ready = false;
-    let done = work.await?;
-    *ready = true;
-    Ok(done)
+/// A write attempt under way, which closes the writer as it ends unless it
+/// succeeded: a failure and a future dropped part way alike.
+struct Attempt<'a> {
+    closed: &'a AtomicBool,
+    succeeded: bool,
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The writer held, from when it was taken until this is dropped.
+struct Turn<'a> {
+    _guard: MutexGuard<'a, ()>,
+    taken: Instant,
+    held: Arc<std::sync::Mutex<Option<Holding>>>,
+}
+
+impl Turn<'_> {
+    /// Allow the turn `more` for a step it is about to wait on.
+    fn allow(&self, more: Duration) {
+        if let Some(held) = self.held.lock().expect("held lock").as_mut() {
+            held.allowed = held.allowed.saturating_add(more);
+        }
+    }
+
+    /// Run `work`, a step of the commit this turn is for, off the async
+    /// threads and ahead of whatever waits its turn there (see
+    /// [`at_once`]). Those threads are the runtime's, which reads and a
+    /// store on local disk use too, so there may be none free all the
+    /// same. The wait for one is not counted against the turn, for up to
+    /// as long as one try to commit may take: nothing of the writer's is
+    /// stuck meanwhile, and giving its lease up for it would only add an
+    /// opening of the tenant to a node already busy. A wait longer than
+    /// that is no longer a busy node's: whatever keeps every thread, as
+    /// reads stuck on a disk that stopped answering would, keeps this
+    /// writer from writing, and the rest of the wait is held against it
+    /// like anything else it waits on, so that the lease is given up and
+    /// another node takes the tenant.
+    async fn at_once<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T> {
+        let (held, taken) = (self.held.clone(), self.taken);
+        if let Some(held) = self.held.lock().expect("held lock").as_mut() {
+            held.queued = Some(Instant::now());
+        }
+        at_once(move || {
+            let mut holding = held.lock().expect("held lock");
+            if let Some(held) = holding.as_mut().filter(|held| held.since == taken) {
+                held.allowed = held.allowed_now();
+                held.queued = None;
+            }
+            drop(holding);
+            work()
+        })
+        .await
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self.held.lock().expect("held lock") = None;
+    }
+}
+
+/// Files uploaded for a commit not yet attempted. Dropped before it is, by
+/// a failure or by a caller that stops waiting, they are deleted on a task
+/// of its own, which holds up nothing: nothing names them or ever will.
+/// Once the commit is attempted they are kept whatever comes of it, for it
+/// may have been made.
+struct Staged {
+    blobs: Arc<dyn Blobs>,
+    keys: Vec<String>,
+}
+
+impl Staged {
+    /// Keep the files: the commit that names them is about to be tried.
+    fn keep(&mut self) {
+        self.keys.clear();
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let (false, Ok(runtime)) = (self.keys.is_empty(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let (blobs, keys) = (self.blobs.clone(), std::mem::take(&mut self.keys));
+        runtime.spawn(async move {
+            for key in keys {
+                if let Err(error) = blobs.delete(&key).await {
+                    tracing::warn!(key, %error, "a file never published could not be deleted");
+                }
+            }
+        });
+    }
+}
+
+/// A batch's result, as a later batch of the same request in its group
+/// is answered: alike. A refusal or a vector not made is told again as it
+/// is, as neither is a failure of the commit; any other failure, which the
+/// batch's own result then shares, is told as shared.
+fn told_again(first: &mut Result<Receipt>) -> Result<Receipt> {
+    let failure = match first {
+        Ok(receipt) => return Ok(receipt.clone()),
+        Err(failure) => failure,
+    };
+    let refusal = failure.refusal();
+    Err(match (failure, refusal) {
+        (
+            StorageError::Embedding {
+                model,
+                reason,
+                lasting,
+            },
+            _,
+        ) => StorageError::Embedding {
+            model: model.clone(),
+            reason: reason.clone(),
+            lasting: *lasting,
+        },
+        (StorageError::Shared(shared), _) => StorageError::Shared(shared.clone()),
+        (_, Some(refusal)) => StorageError::Refused(refusal),
+        (other, None) => {
+            let shared = Arc::new(std::mem::replace(other, StorageError::Closed));
+            *other = StorageError::Shared(shared.clone());
+            StorageError::Shared(shared)
+        }
+    })
 }
 
 /// Writes refused for as long as this lives.
@@ -1311,16 +1971,433 @@ struct Refusing<'a>(&'a AtomicBool);
 
 impl<'a> Refusing<'a> {
     /// Refuse `writer`'s writes from now on, once any commit under way has
-    /// been made.
+    /// been made. A caller that stops waiting for that commit refuses them
+    /// no longer.
     async fn writes(writer: &'a Writer) -> Refusing<'a> {
         writer.restoring.store(true, Ordering::SeqCst);
-        drop(writer.ready.lock().await);
-        Refusing(&writer.restoring)
+        let refusing = Refusing(&writer.restoring);
+        drop(writer.writing.lock().await);
+        refusing
     }
 }
 
 impl Drop for Refusing<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blobs::ObjectBlobs;
+    use crate::coordinator::{Acquired, MemoryCoordinator};
+    use object_store::memory::InMemory;
+    use vellev_core::{
+        Bm25, Collection, CollectionName, DataType, Distance, EmbeddingProvider, NodeId, ObjectId,
+        Property, TenantId,
+    };
+
+    fn notes() -> CollectionName {
+        CollectionName::new("notes").unwrap()
+    }
+
+    fn create() -> Mutation {
+        Mutation::CreateCollection(Box::new(Collection {
+            name: notes(),
+            properties: vec![Property::new("n", DataType::Int)],
+            embedding: Embedding {
+                provider: EmbeddingProvider::None,
+                model: "test".into(),
+                dimensions: 2,
+                query_prefix: None,
+                document_prefix: None,
+                properties: vec![],
+            },
+            distance: Distance::Cosine,
+            bm25: Bm25::default(),
+            access_rule: None,
+        }))
+    }
+
+    fn upsert(n: u8) -> Mutation {
+        Mutation::Upsert {
+            collection: notes(),
+            id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+            properties: serde_json::Map::from_iter([("n".to_string(), n.into())]),
+            vector: Some(vec![f32::from(n), 0.5]),
+        }
+    }
+
+    const MERGING: Merging = Merging {
+        stale: 0.5,
+        fanout: 2,
+        rows: 1_000_000,
+        clustered_above: state::CLUSTERED_ABOVE,
+    };
+
+    /// Blobs that tell of each segment they are given and keep it waiting
+    /// until let go.
+    #[derive(Debug)]
+    struct Gated {
+        inner: ObjectBlobs,
+        kind: &'static str,
+        waiting: tokio::sync::Notify,
+        go_on: tokio::sync::Notify,
+    }
+
+    impl Gated {
+        /// Over a store in memory, keeping files whose keys hold `kind`.
+        fn keeping(kind: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                inner: ObjectBlobs::new(Arc::new(InMemory::new())),
+                kind,
+                waiting: tokio::sync::Notify::new(),
+                go_on: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Blobs for Gated {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
+            if key.contains(self.kind) {
+                self.waiting.notify_one();
+                self.go_on.notified().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restore_made_ready_for_a_partition_that_then_moved_commits_nothing() {
+        let gated = Gated::keeping("/segment/");
+        let (writer, coordinator) = writer_on(gated.clone()).await;
+        let writer = Arc::new(writer);
+        writer.commit(vec![create(), upsert(1)]).await.unwrap();
+        let committed = coordinator.committed(&writer.lease.key).await;
+        let committed = committed.unwrap().unwrap();
+
+        // While the restore's segment goes up the partition moves, which
+        // nothing but a fault in the writer could make it do.
+        let restoring = tokio::spawn({
+            let (writer, head) = (writer.clone(), committed.manifest.clone());
+            async move { writer.restore(head.as_ref(), committed.log_position).await }
+        });
+        gated.waiting.notified().await;
+        let moved = following(committed.log_position).unwrap();
+        let state = &writer.partition.state;
+        state.write().unwrap().moved_to(moved);
+        gated.go_on.notify_one();
+
+        let refused = restoring.await.unwrap().unwrap_err();
+        assert!(
+            matches!(refused, StorageError::Diverged { .. }),
+            "{refused}"
+        );
+        assert!(!writer.is_closed(), "nothing was tried");
+        let after = coordinator.committed(&writer.lease.key).await;
+        assert_eq!(after.unwrap().unwrap(), committed);
+    }
+
+    /// A writer of a partition of its own, in memory, which merges two
+    /// segments as soon as there are two.
+    async fn writer() -> Writer {
+        let blobs = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        writer_on(blobs).await.0
+    }
+
+    /// As [`writer`], over `blobs`, with its coordinator.
+    async fn writer_on(blobs: Arc<dyn Blobs>) -> (Writer, Arc<MemoryCoordinator>) {
+        let key = PartitionKey {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            partition: vellev_core::Partition::DEFAULT,
+        };
+        let coordinator = Arc::new(MemoryCoordinator::default());
+        coordinator.register(&key).await.unwrap();
+        let (holder, ttl) = (NodeId::generate("node"), Duration::from_secs(30));
+        let Acquired::Lease { lease, committed } =
+            coordinator.acquire(&key, &holder, ttl).await.unwrap()
+        else {
+            panic!("a fresh partition is free to take");
+        };
+        let writer = Writer::open(blobs, coordinator.clone(), lease, &committed).await;
+        (writer.unwrap().merging_with(MERGING), coordinator)
+    }
+
+    #[test]
+    fn a_commit_waiting_for_a_thread_to_work_on_is_not_taken_for_stuck() {
+        // One thread for work off the async ones, and a clock that moves
+        // only when told.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let writer = Arc::new(writer().await);
+            writer.commit(vec![create()]).await.unwrap();
+
+            // The thread is taken by something else, and an hour passes.
+            let (let_go, kept) = std::sync::mpsc::channel::<()>();
+            let kept = tokio::task::spawn_blocking(move || {
+                let _ = kept.recv();
+            });
+            let committing = tokio::spawn({
+                let writer = writer.clone();
+                async move { writer.commit(vec![upsert(1)]).await }
+            });
+            while !writer.is_held() {
+                tokio::task::yield_now().await;
+            }
+            // Past the five seconds a turn has in memory, and within the
+            // quarter of its lease of thirty that a wait for a thread is
+            // not held against it.
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(writer.is_held() && !committing.is_finished());
+            assert!(!writer.stalled(), "it waits for a thread, and is not stuck");
+            // Past that too: whatever keeps the thread keeps the writer
+            // from writing, and it is stuck like any other.
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(writer.stalled(), "no thread in all that time");
+
+            let_go.send(()).unwrap();
+            kept.await.unwrap();
+            committing.await.unwrap().unwrap();
+            assert!(!writer.is_closed() && !writer.stalled());
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_at_a_large_file_is_kept_until_its_thread_is_done_whoever_stops_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Disk::new(Duration::from_secs(60), 20 * 1024 * 1024, 4)
+            .loading_at_once(1)
+            .unwrap();
+        let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let cached = crate::blobs::CachedBlobs::new(store, dir.path()).on(disk.clone());
+        let blobs: Arc<dyn Blobs> = Arc::new(cached);
+        let (writer, coordinator) = writer_on(blobs.clone()).await;
+        writer.commit(vec![create(), upsert(1)]).await.unwrap();
+        writer.flush().await.unwrap();
+        let key = writer.lease.key.clone();
+        let committed = coordinator.committed(&key).await.unwrap().unwrap();
+        let vectors = writer
+            .partition
+            .read(|state| state.segments().next().cloned());
+        let copy = dir.path().join(vectors.unwrap().vectors.unwrap());
+
+        // The copy is a pipe nobody writes to: whoever opens it waits.
+        std::fs::remove_file(&copy).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&copy).status();
+        assert!(made.unwrap().success());
+        let opening = tokio::spawn(async move { Partition::load(key, blobs, &committed).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        opening.abort();
+        assert!(opening.await.unwrap_err().is_cancelled());
+
+        // Nobody waits for it any more, and its thread reads on: the one
+        // turn on the disk is its own still.
+        let another = tokio::time::timeout(Duration::from_millis(300), disk.loading());
+        assert!(another.await.is_err(), "the turn is kept");
+        // Until the thread is done.
+        drop(std::fs::File::options().read(true).write(true).open(&copy));
+        let freed = tokio::time::timeout(Duration::from_secs(30), disk.loading());
+        drop(freed.await.expect("the turn is let go").unwrap());
+    }
+
+    #[tokio::test]
+    async fn vectors_are_read_in_their_turn_among_the_large_files_of_their_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 4)
+            .loading_at_once(1)
+            .unwrap();
+        let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let cached = crate::blobs::CachedBlobs::new(store, dir.path()).on(disk.clone());
+        let blobs: Arc<dyn Blobs> = Arc::new(cached);
+        let (writer, coordinator) = writer_on(blobs.clone()).await;
+        writer.commit(vec![create(), upsert(1)]).await.unwrap();
+        writer.flush().await.unwrap();
+        let key = writer.lease.key.clone();
+        let committed = coordinator.committed(&key).await.unwrap().unwrap();
+
+        // The one turn there is on the disk is taken: the vectors of a
+        // partition opened meanwhile wait for it, their file being one
+        // nobody has summed as it lies now.
+        let vectors = writer
+            .partition
+            .read(|state| state.segments().next().cloned());
+        let copy = dir.path().join(vectors.unwrap().vectors.unwrap());
+        let touched = std::fs::File::options().write(true).open(&copy).unwrap();
+        let earlier = std::time::SystemTime::now() - Duration::from_secs(60);
+        touched.set_modified(earlier).unwrap();
+        let turn = disk.loading().await.unwrap();
+        let (again, committed_again) = ((key.clone(), blobs.clone()), committed.clone());
+        let opening = tokio::spawn(async move { Partition::load(key, blobs, &committed).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!opening.is_finished(), "it waits its turn");
+        drop(turn);
+        opening.await.unwrap().unwrap();
+
+        // Summed once, it is not summed again while it lies as it did:
+        // opened again, it waits for no turn, though none is to be had.
+        let _taken = disk.loading().await.unwrap();
+        let (key, blobs) = again;
+        let opening = Partition::load(key, blobs, &committed_again);
+        let opened = tokio::time::timeout(Duration::from_secs(30), opening).await;
+        opened.expect("it needs no turn").unwrap();
+    }
+
+    #[test]
+    fn a_wait_for_a_thread_to_work_on_is_allowed_for_once_the_thread_is_had() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let gated = Gated::keeping("/log/");
+            let (writer, _) = writer_on(gated.clone()).await;
+            let writer = Arc::new(writer);
+            let allowed = |writer: &Writer| {
+                let held = writer.held.lock().unwrap();
+                held.map(|held| (held.allowed, held.queued.is_some()))
+            };
+
+            // Five seconds with the one thread taken by something else,
+            // within what a wait for one may be.
+            let (let_go, kept) = std::sync::mpsc::channel::<()>();
+            let kept = tokio::task::spawn_blocking(move || {
+                let _ = kept.recv();
+            });
+            let committing = tokio::spawn({
+                let writer = writer.clone();
+                async move { writer.commit(vec![create()]).await }
+            });
+            while !writer.is_held() {
+                tokio::task::yield_now().await;
+            }
+            let (before, waiting) = allowed(&writer).unwrap();
+            assert!(waiting);
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let_go.send(()).unwrap();
+            kept.await.unwrap();
+
+            // The thread is had, and the commit has got as far as storing
+            // its log: the five seconds it waited are no longer a wait it
+            // is in, but time it was allowed, over what the steps since
+            // allowed themselves.
+            gated.waiting.notified().await;
+            let (after, waiting) = allowed(&writer).unwrap();
+            assert!(!waiting);
+            let since = writer.publish_within(0);
+            assert!(
+                after >= before + Duration::from_secs(5) + since,
+                "{after:?}"
+            );
+            assert!(!writer.stalled());
+            gated.go_on.notify_one();
+            committing.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_commit_never_waits_behind_work_that_waits_its_turn() {
+        // Two threads more than what loads and builds may take between
+        // them, and far more of that asked for than may run.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(WORKING_AT_ONCE + 2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let writer = writer().await;
+            let (let_go, kept) = std::sync::mpsc::channel::<()>();
+            let kept = Arc::new(std::sync::Mutex::new(kept));
+            let waiting: Vec<_> = (0..WORKING_AT_ONCE * 2)
+                .map(|_| {
+                    let kept = kept.clone();
+                    tokio::spawn(blocking(move || {
+                        let _ = kept.lock().unwrap().recv();
+                    }))
+                })
+                .collect();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let committing = writer.commit(vec![create(), upsert(1)]);
+            let committed = tokio::time::timeout(Duration::from_secs(30), committing).await;
+            committed.expect("a thread was free for it").unwrap();
+            drop(let_go);
+            for waited in waiting {
+                waited.await.unwrap().unwrap();
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_merge_planned_over_segments_since_replaced_makes_no_manifest() {
+        let (writer, merging) = (writer().await, MERGING);
+        writer.commit(vec![create()]).await.unwrap();
+        for n in 0..2 {
+            writer.commit(vec![upsert(n)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+
+        let planned = writer.partition.read(|state| state.merge_plan(&merging));
+        let planned = planned.expect("two segments to merge");
+        // The manifest a merge over that run would commit, of whatever
+        // segment stands in for the merged one.
+        let manifest = |state: &State| {
+            let merged = state.segments().next().unwrap().clone();
+            let position = following(state.position()).unwrap();
+            let merged = state.merged_manifest(position, &state.taken(), None, &planned, merged);
+            merged.unwrap()
+        };
+        assert!(writer.partition.read(manifest).is_some());
+        writer.merge().await.unwrap().expect("a merge");
+        assert!(
+            writer.partition.read(manifest).is_none(),
+            "the run is no longer the segments it was planned over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flush_the_state_could_not_adopt_makes_no_manifest() {
+        let writer = writer().await;
+        writer.commit(vec![create(), upsert(1)]).await.unwrap();
+        let position = following(writer.partition.read(State::position)).unwrap();
+        let taken = writer.partition.read(State::taken);
+        let refused = |snapshot: &Snapshot| {
+            let made = |state: &State| state.flushed_manifest(position, snapshot, None);
+            writer.partition.read(made).unwrap_err().to_string()
+        };
+        // A snapshot that took a row, and no segment of it.
+        assert!(refused(&taken).contains("does not hold the rows"));
+
+        // The row dies; one written since is not the flush's to drop.
+        writer.commit(vec![upsert(1), upsert(2)]).await.unwrap();
+        let none_taken = writer.partition.read(State::taken).taking_none();
+        assert!(refused(&none_taken).contains("still live"));
+        let of_more = none_taken.of(usize::MAX);
+        assert!(refused(&of_more).contains("more than there is"));
+
+        // A flush is committed while another was building.
+        writer.flush().await.unwrap();
+        assert!(refused(&taken).contains("a checkpoint was committed"));
+        let now = writer.partition.read(State::taken);
+        let manifest = |state: &State| state.flushed_manifest(position, &now, None);
+        assert!(writer.partition.read(manifest).is_ok());
     }
 }

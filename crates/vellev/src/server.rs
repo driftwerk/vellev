@@ -24,11 +24,12 @@ use vellev_api::{Bounded, Code, Missing};
 use vellev_core::{Collection, EmbeddingProvider, TenantId};
 use vellev_node::{Node, NodeError};
 use vellev_storage::coordinator::MAX_RESTORE_WINDOW;
-use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE};
+use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE, DELETED_AT_MOST};
 
 use crate::api;
 use crate::identity::{Caller, IdentityKeys};
 use crate::problem::ApiError;
+use crate::turns::{Turn, Turns};
 
 /// The most candidates per result a search may ask to have scored exactly.
 const MAX_OVERSAMPLE: u32 = 1_024;
@@ -42,6 +43,41 @@ pub struct Limits {
     pub body: usize,
     /// The embedding endpoints a collection may name.
     pub embedding_urls: Arc<[String]>,
+    /// The most reads answered at once, half of them at most for any one
+    /// tenant while another's waits.
+    pub reads: usize,
+    /// How long a read waits for its turn before it is turned away.
+    pub reads_wait: Duration,
+}
+
+/// How long a read turned away is told to wait before it asks again.
+const READ_AGAIN_AFTER: Duration = Duration::from_secs(1);
+
+/// A read's turn, one of the node's. See [`App::reading`].
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Reading {
+    _turn: Turn,
+}
+
+impl Reading {
+    /// Run `work`, the read itself, off the async threads. The turn goes
+    /// with it, to be kept until its thread is done with the read,
+    /// whoever stops waiting for the answer first.
+    #[doc(hidden)]
+    pub async fn run<T: Send + 'static>(
+        self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let read = tokio::task::spawn_blocking(move || {
+            let _turn = self;
+            work()
+        });
+        read.await.map_err(|error| {
+            tracing::error!(%error, "a read did not finish");
+            ApiError::new(Code::Internal, "the node failed to serve the request")
+        })
+    }
 }
 
 /// What every request is served with. The node may not be there yet: a
@@ -59,6 +95,8 @@ pub struct App {
     /// The keys whose identity tokens are trusted.
     pub(crate) identity_keys: Arc<IdentityKeys>,
     limits: Limits,
+    /// A turn for each read being answered: see [`Self::reading`].
+    reading: Arc<Turns>,
     /// For sending a request on to the node that holds its tenant.
     http: reqwest::Client,
 }
@@ -76,12 +114,43 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl App {
+    /// A turn to answer a read of `tenant`, kept until the read is done.
+    ///
+    /// A read runs on one of the runtime's threads for work off the async
+    /// ones, where commits do part of theirs: were reads to take every
+    /// one of them, as they would with each stuck on a disk that stopped
+    /// answering, no commit could be made. So a node answers so many reads
+    /// at once. A tenant may have them all while no other asks; while
+    /// another tenant's read waits for a turn, none is given more than
+    /// half (see [`crate::turns`] for the rule exactly). A
+    /// read that finds no turn waits a moment for one, and is then turned
+    /// away to be asked again shortly.
+    ///
+    /// The turn is for the thread and nothing else. It is taken last,
+    /// when the read has all it needs and only the reading is left: what
+    /// a read waits for before that, a text to be embedded, its tenant to
+    /// be opened, the coordinator to say what is committed, uses no
+    /// thread, has its own bound, and would otherwise keep turns from
+    /// reads that need nothing of the kind.
+    #[doc(hidden)]
+    pub async fn reading(&self, tenant: &TenantId) -> Result<Reading, ApiError> {
+        let turn = self.reading.take(tenant);
+        match tokio::time::timeout(self.limits.reads_wait, turn).await {
+            Ok(turn) => Ok(Reading { _turn: turn }),
+            Err(_) => {
+                let busy = "the node is answering as many reads as it does at once; ask again";
+                Err(ApiError::unavailable(busy).after(READ_AGAIN_AFTER))
+            }
+        }
+    }
+
     pub fn new(keys: Arc<[String]>, limits: Limits) -> Self {
         Self {
             node: Arc::default(),
             stopping: Arc::default(),
             keys,
             identity_keys: Arc::default(),
+            reading: Turns::new(limits.reads),
             limits,
             http: reqwest::Client::builder()
                 .connect_timeout(FORWARD_CONNECT_TIMEOUT)
@@ -133,6 +202,8 @@ impl App {
         allowed.oversample = MAX_OVERSAMPLE.into();
         allowed.body_bytes = self.limits.body as u64;
         allowed.restore_window_secs = MAX_RESTORE_WINDOW.as_secs();
+        allowed.deleted = DELETED_AT_MOST as u64;
+        allowed.reads_at_once = self.reading.most() as u64;
         allowed
     }
 

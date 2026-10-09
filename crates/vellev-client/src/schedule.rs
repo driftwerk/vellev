@@ -20,7 +20,11 @@
 //!    comes before an address not asked since the last. An address that
 //!    turned the request away for asking too much is asked again itself,
 //!    after the wait it gave if that is longer, up to
-//!    [`LONGEST_TURNED_AWAY`].
+//!    [`LONGEST_TURNED_AWAY`]. An address that could not answer just now
+//!    and said when to ask again is not asked again sooner either, up to
+//!    the same longest wait: the other addresses are asked meanwhile, and
+//!    the wait that comes before any is asked a second time is no shorter
+//!    than the one it gave.
 //! 5. The request is given up when its tries are spent.
 //! 6. An answer that is less than another address might give ends all of
 //!    the above. Each address not yet asked for this request is asked
@@ -45,6 +49,9 @@ pub(crate) const LONGEST_TURNED_AWAY: Duration = Duration::from_secs(60);
 pub(crate) enum Tried {
     /// It failed in a way that may pass, here or at another address.
     MayPass,
+    /// It failed in a way that may pass, and the address said to ask it
+    /// again no sooner than after this long.
+    Busy(Duration),
     /// The address turned it away for asking too much, to be asked again
     /// after this long.
     TurnedAway(Duration),
@@ -82,6 +89,9 @@ pub(crate) struct Schedule {
     asked: Vec<bool>,
     /// The addresses asked at all.
     sent: Vec<bool>,
+    /// The longest any address asked since the last wait said to leave
+    /// it before it is asked again.
+    told_to_wait: Duration,
     /// Whether an answer is in hand that another address might better.
     bettering: bool,
 }
@@ -99,6 +109,7 @@ impl Schedule {
             unable: vec![false; addresses],
             sent: asked.clone(),
             asked,
+            told_to_wait: Duration::ZERO,
             bettering: false,
         }
     }
@@ -121,7 +132,7 @@ impl Schedule {
                 self.unable[self.address] = true;
                 self.unable.contains(&false)
             }
-            Tried::MayPass | Tried::TurnedAway(_) | Tried::Less => false,
+            Tried::MayPass | Tried::Busy(_) | Tried::TurnedAway(_) | Tried::Less => false,
         };
         if !free {
             self.tries_left = self.tries_left.saturating_sub(1);
@@ -131,13 +142,18 @@ impl Schedule {
         }
         let (address, least) = match tried {
             Tried::TurnedAway(wait) => (self.address, wait.min(LONGEST_TURNED_AWAY)),
+            Tried::Busy(wait) => {
+                self.told_to_wait = self.told_to_wait.max(wait.min(LONGEST_TURNED_AWAY));
+                (self.following(), Duration::ZERO)
+            }
             Tried::MayPass | Tried::NotByThisAddress | Tried::Less => {
                 (self.following(), Duration::ZERO)
             }
         };
         let after = match self.asked[address] {
             true => {
-                let wait = self.backoff.max(least);
+                let wait = self.backoff.max(least).max(self.told_to_wait);
+                self.told_to_wait = Duration::ZERO;
                 self.backoff = self.backoff.saturating_mul(2).min(LONGEST_BACKOFF);
                 self.asked.fill(false);
                 wait
@@ -296,6 +312,43 @@ mod tests {
         // However long an address says to wait, it is not waited on past
         // the longest.
         let for_an_hour: &[Option<Tried>] = &[Some(Tried::TurnedAway(MS(3_600_000))), None];
+        assert_eq!(
+            asked(&[for_an_hour], 0, 2),
+            (vec![(0, NONE), (0, LONGEST_TURNED_AWAY)], true)
+        );
+    }
+
+    #[test]
+    fn an_address_that_says_when_to_ask_again_is_left_that_long_while_the_others_are_asked() {
+        let busy = |wait| Some(Tried::Busy(MS(wait)));
+        // Alone, it is asked again after the wait it gave, the longer of
+        // that and the backoff.
+        let answers: &[Option<Tried>] = &[busy(1_000), busy(50), None];
+        assert_eq!(
+            asked(&[answers], 0, 4),
+            (vec![(0, NONE), (0, MS(1_000)), (0, MS(200))], true)
+        );
+        // Beside another, the other is asked at once, and the wait before
+        // either is asked a second time is the one it gave.
+        assert_eq!(
+            asked(&[answers, AWAY], 0, 4),
+            (vec![(0, NONE), (1, NONE), (0, MS(1_000)), (1, NONE)], false)
+        );
+        assert_eq!(
+            asked(&[AWAY, answers], 0, 4),
+            (vec![(0, NONE), (1, NONE), (0, MS(1_000)), (1, NONE)], false)
+        );
+        // Once waited, it is not waited again.
+        assert_eq!(
+            asked(&[&[busy(1_000), Some(Tried::MayPass)]], 0, 4),
+            (
+                vec![(0, NONE), (0, MS(1_000)), (0, MS(200)), (0, MS(400))],
+                false
+            )
+        );
+        // However long an address says to wait, it is not waited on past
+        // the longest.
+        let for_an_hour: &[Option<Tried>] = &[busy(3_600_000), None];
         assert_eq!(
             asked(&[for_an_hour], 0, 2),
             (vec![(0, NONE), (0, LONGEST_TURNED_AWAY)], true)

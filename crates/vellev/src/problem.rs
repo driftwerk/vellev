@@ -9,7 +9,7 @@ use vellev_api::{Bounded, Code, Failure, Limit, Missing, Problem};
 use vellev_core::ModelFault;
 use vellev_node::NodeError;
 use vellev_storage::coordinator::CoordinatorError;
-use vellev_storage::{Lacking, Refused, StorageError};
+use vellev_storage::{Capped, Lacking, Over, Refused, StorageError};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -68,6 +68,14 @@ impl ApiError {
 
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(Code::Unavailable, message)
+    }
+
+    /// This failure, with word of how long to wait before asking again.
+    pub fn after(self, wait: std::time::Duration) -> Self {
+        Self {
+            retry_after: Some(wait),
+            ..self
+        }
     }
 
     /// A request that is invalid in a way HTTP has its own status for.
@@ -138,9 +146,12 @@ fn code(error: &StorageError) -> Code {
         E::CollectionExists(_) | E::ObjectExists { .. } | E::ConditionFailed { .. } => {
             Code::Conflict
         }
-        E::InvalidMutation(_) | E::InvalidQuery(_) | E::Schema(_) | E::Filter(_) | E::Object(_) => {
-            Code::Invalid
-        }
+        E::InvalidMutation(_)
+        | E::TooMany { .. }
+        | E::InvalidQuery(_)
+        | E::Schema(_)
+        | E::Filter(_)
+        | E::Object(_) => Code::Invalid,
         E::Coordinator(CoordinatorError::InvalidArgument(_)) => Code::Internal,
         E::Coordinator(CoordinatorError::Purging(_)) => Code::Conflict,
         E::Coordinator(_)
@@ -149,8 +160,11 @@ fn code(error: &StorageError) -> Code {
         | E::Closed
         | E::Restoring
         | E::Diverged { .. } => Code::Unavailable,
-        E::Shared(shared) if matches!(**shared, E::Restoring) => Code::Unavailable,
-        E::Shared(_) => Code::Uncertain,
+        E::Shared(shared) => match shared.root() {
+            root if root.refusal().is_some() => code(root),
+            E::Restoring | E::Embedding { .. } => Code::Unavailable,
+            _ => Code::Uncertain,
+        },
         E::Refused(refusal) => match refusal.kind {
             Refused::NotFound => Code::NotFound,
             Refused::Conflict => Code::Conflict,
@@ -181,6 +195,20 @@ fn missing(error: &StorageError) -> Option<Missing> {
     })
 }
 
+/// What a storage error says was asked too much of, and the most there
+/// may be of it. A refusal answered again as it was says what it kept.
+fn limit(error: &StorageError) -> Option<Limit> {
+    let Over { capped, most } = match error {
+        StorageError::TooMany { over, .. } => *over,
+        StorageError::Refused(refusal) => refusal.over?,
+        _ => return None,
+    };
+    let name = match capped {
+        Capped::Deleted => Bounded::Deleted,
+    };
+    Some(Limit::new(name, most))
+}
+
 impl From<StorageError> for ApiError {
     fn from(error: StorageError) -> Self {
         match (code(&error), error.root()) {
@@ -194,7 +222,11 @@ impl From<StorageError> for ApiError {
                 told.problem.missing = missing(root);
                 told
             }
-            (code, root) => Self::new(code, root.to_string()),
+            (code, root) => {
+                let mut told = Self::new(code, root.to_string());
+                told.problem.limit = limit(root);
+                told
+            }
         }
     }
 }
@@ -210,7 +242,12 @@ impl From<NodeError> for ApiError {
             NodeError::Ahead(_) | NodeError::NoBackups | NodeError::NoSuchModel(_) => {
                 Self::invalid(error.to_string())
             }
-            NodeError::BackingUp(_) => Self::new(Code::Conflict, error.to_string()),
+            NodeError::BackingUp(_) | NodeError::Restoring(_) => {
+                Self::new(Code::Conflict, error.to_string())
+            }
+            NodeError::Reused { .. } => {
+                Self::refused(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+            }
             NodeError::Elsewhere { .. }
             | NodeError::Outdated { .. }
             | NodeError::Stopped
@@ -285,6 +322,99 @@ mod tests {
             told(StorageError::Shared(Arc::new(unembedded()))),
             unavailable
         );
+        assert_eq!(
+            told(StorageError::Shared(Arc::new(StorageError::Restoring))),
+            unavailable
+        );
+    }
+
+    #[test]
+    fn a_request_reused_for_another_restore_is_unprocessable_and_final() {
+        let reused = NodeError::Reused {
+            tenant: vellev_core::TenantId::new("acme").unwrap(),
+            request: vellev_core::RequestId::generate(),
+        };
+        let ApiError {
+            status, problem, ..
+        } = reused.into();
+        assert_eq!(
+            (status, problem.code),
+            (StatusCode::UNPROCESSABLE_ENTITY, Code::Invalid)
+        );
+    }
+
+    #[test]
+    fn a_tenant_being_restored_or_backed_up_is_a_conflict_and_not_a_node_to_ask_again() {
+        let acme = || vellev_core::TenantId::new("acme").unwrap();
+        for busy in [NodeError::Restoring(acme()), NodeError::BackingUp(acme())] {
+            let said = busy.to_string();
+            let ApiError {
+                status,
+                problem,
+                retry_after,
+            } = busy.into();
+            assert_eq!(
+                (status, problem.code, retry_after),
+                (StatusCode::CONFLICT, Code::Conflict, None),
+                "{said}"
+            );
+            assert_eq!(problem.message, said);
+        }
+    }
+
+    #[test]
+    fn a_request_to_delete_too_many_says_the_most_it_may_however_it_is_told() {
+        let most = Over {
+            capped: Capped::Deleted,
+            most: 8_192,
+        };
+        let said = |error: StorageError| {
+            let told = ApiError::from(error);
+            (told.status, told.problem.code, told.problem.limit)
+        };
+        let too_many = || StorageError::TooMany {
+            over: most,
+            message: "a delete takes a limit of 1 to 8192".into(),
+        };
+        let refused = (
+            StatusCode::BAD_REQUEST,
+            Code::Invalid,
+            Some(Limit::new(Bounded::Deleted, 8_192)),
+        );
+        assert_eq!(said(too_many()), refused);
+        // To every caller of the commit it was refused in, and to one
+        // asking again by the same name, who is answered from what was
+        // kept of it.
+        assert_eq!(said(StorageError::Shared(Arc::new(too_many()))), refused);
+        let kept = too_many().refusal().expect("the request's own doing");
+        assert_eq!(kept.over, Some(most));
+        assert_eq!(said(StorageError::Refused(kept.clone())), refused);
+        let from_before = vellev_storage::Refusal { over: None, ..kept };
+        assert_eq!(
+            said(StorageError::Refused(from_before)),
+            (StatusCode::BAD_REQUEST, Code::Invalid, None),
+            "kept by a release from before the most was"
+        );
+        let other = StorageError::InvalidMutation("a delete needs a condition".into());
+        assert_eq!(said(other).2, None);
+    }
+
+    #[test]
+    fn a_shared_failure_that_is_a_refusal_is_told_as_that_refusal() {
+        let told = |error: StorageError| ApiError::from(error).problem.code;
+        let exists =
+            StorageError::CollectionExists(vellev_core::CollectionName::new("notes").unwrap());
+        assert_eq!(told(StorageError::Shared(Arc::new(exists))), Code::Conflict);
+        let refused = StorageError::Refused(vellev_storage::Refusal {
+            kind: Refused::NotFound,
+            message: "object 7 does not exist in notes".into(),
+            lacking: None,
+            over: None,
+        });
+        let nested = StorageError::Shared(Arc::new(StorageError::Shared(Arc::new(refused))));
+        assert_eq!(told(nested), Code::NotFound);
+        let invalid = StorageError::InvalidMutation("no such property".into());
+        assert_eq!(told(StorageError::Shared(Arc::new(invalid))), Code::Invalid);
     }
 
     #[test]
@@ -363,8 +493,16 @@ mod tests {
             missing(unknown().into()),
             (not_found, Some(Missing::Collection))
         );
+        // A refusal shared with whoever sent the same request again is the
+        // request's own doing, and the same however often it is told: it
+        // says what is missing to each of them.
         assert_eq!(
             missing(StorageError::Shared(Arc::new(unknown())).into()),
+            (not_found, Some(Missing::Collection))
+        );
+        let lost = CoordinatorError::backend(std::io::Error::other("connection reset"));
+        assert_eq!(
+            missing(StorageError::Shared(Arc::new(lost.into())).into()),
             (StatusCode::SERVICE_UNAVAILABLE, None),
             "a commit failed as a whole is uncertain, and says nothing missing"
         );
@@ -378,6 +516,7 @@ mod tests {
                 kind: Refused::NotFound,
                 message: format!("collection {collection} does not exist"),
                 lacking,
+                over: None,
             })
         };
         assert_eq!(

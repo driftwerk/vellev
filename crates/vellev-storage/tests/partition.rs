@@ -1,7 +1,6 @@
 mod common;
 
 use common::*;
-use vellev_storage::coordinator::{KeyHash, Point, RestorePoint, TenantKey};
 
 #[tokio::test]
 async fn data_survives_a_restart_with_nothing_held_locally() {
@@ -313,207 +312,11 @@ async fn a_fenced_writer_changes_nothing_and_its_file_is_never_read() {
     });
 }
 
-/// A coordinator whose commit responses can be lost after the commit landed,
-/// or which can stop accepting commits altogether.
-#[derive(Debug)]
-struct Unreliable {
-    inner: Arc<MemoryCoordinator>,
-    lose_responses: AtomicUsize,
-    refuse_commits: AtomicUsize,
-    hang_after_commit: AtomicBool,
-}
-
-fn lost() -> CoordinatorError {
-    CoordinatorError::backend(std::io::Error::other("connection reset"))
-}
-
-#[async_trait]
-impl Coordinator for Unreliable {
-    async fn register(&self, key: &PartitionKey) -> Result<(), CoordinatorError> {
-        self.inner.register(key).await
-    }
-    async fn remove(&self, key: &PartitionKey) -> Result<bool, CoordinatorError> {
-        self.inner.remove(key).await
-    }
-    async fn acquire(
-        &self,
-        key: &PartitionKey,
-        holder: &NodeId,
-        ttl: Duration,
-    ) -> Result<Acquired, CoordinatorError> {
-        self.inner.acquire(key, holder, ttl).await
-    }
-    async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease, CoordinatorError> {
-        self.inner.renew(lease, ttl).await
-    }
-    async fn release(&self, lease: &Lease) -> Result<(), CoordinatorError> {
-        self.inner.release(lease).await
-    }
-    async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed, CoordinatorError> {
-        let take = |counter: &AtomicUsize| {
-            counter
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-        };
-        if take(&self.refuse_commits) {
-            return Err(lost());
-        }
-        let committed = self.inner.commit(lease, commit).await?;
-        if self.hang_after_commit.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
-        }
-        if take(&self.lose_responses) {
-            return Err(lost());
-        }
-        Ok(committed)
-    }
-    async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
-        self.inner.committed(key).await
-    }
-    async fn partitions(
-        &self,
-        after: Option<&PartitionKey>,
-        limit: usize,
-    ) -> Result<Vec<PartitionKey>, CoordinatorError> {
-        self.inner.partitions(after, limit).await
-    }
-    async fn ping(&self) -> Result<(), CoordinatorError> {
-        self.inner.ping().await
-    }
-    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<(), CoordinatorError> {
-        self.inner.announce(node, versions).await
-    }
-    async fn depart(&self, node: &NodeId) -> Result<(), CoordinatorError> {
-        self.inner.depart(node).await
-    }
-    async fn oldest(&self) -> Result<Option<Versions>, CoordinatorError> {
-        self.inner.oldest().await
-    }
-    async fn format(&self) -> Result<u16, CoordinatorError> {
-        self.inner.format().await
-    }
-    async fn raise_format(&self, format: u16) -> Result<u16, CoordinatorError> {
-        self.inner.raise_format(format).await
-    }
-
-    async fn issue_key(
-        &self,
-        tenant: &TenantId,
-        id: uuid::Uuid,
-        hash: &KeyHash,
-    ) -> Result<Option<TenantKey>, CoordinatorError> {
-        self.inner.issue_key(tenant, id, hash).await
-    }
-
-    async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>, CoordinatorError> {
-        self.inner.keys(tenant).await
-    }
-
-    async fn revoke_key(
-        &self,
-        tenant: &TenantId,
-        id: uuid::Uuid,
-    ) -> Result<bool, CoordinatorError> {
-        self.inner.revoke_key(tenant, id).await
-    }
-
-    async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>, CoordinatorError> {
-        self.inner.key_tenant(hash).await
-    }
-
-    async fn restore_point(
-        &self,
-        key: &PartitionKey,
-        point: Point,
-        window: Duration,
-    ) -> Result<Option<RestorePoint>, CoordinatorError> {
-        self.inner.restore_point(key, point, window).await
-    }
-
-    async fn restore_points(
-        &self,
-        key: &PartitionKey,
-        window: Duration,
-    ) -> Result<Option<(RestorePoint, RestorePoint)>, CoordinatorError> {
-        self.inner.restore_points(key, window).await
-    }
-
-    async fn forget_history(
-        &self,
-        key: &PartitionKey,
-        window: Duration,
-    ) -> Result<u64, CoordinatorError> {
-        self.inner.forget_history(key, window).await
-    }
-
-    async fn restore_window(
-        &self,
-        tenant: &TenantId,
-    ) -> Result<Option<Duration>, CoordinatorError> {
-        self.inner.restore_window(tenant).await
-    }
-
-    async fn purges(
-        &self,
-        due: Duration,
-        lately: Duration,
-    ) -> Result<vellev_storage::coordinator::Purges, CoordinatorError> {
-        self.inner.purges(due, lately).await
-    }
-
-    async fn claim_purge(
-        &self,
-        tenant: &TenantId,
-        hold: Duration,
-    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
-        self.inner.claim_purge(tenant, hold).await
-    }
-
-    async fn purged(
-        &self,
-        tenant: &TenantId,
-        claim: uuid::Uuid,
-        forget_after: Duration,
-    ) -> Result<(), CoordinatorError> {
-        self.inner.purged(tenant, claim, forget_after).await
-    }
-
-    async fn claim_backup(
-        &self,
-        tenant: &TenantId,
-        due: Option<Duration>,
-        hold: Duration,
-    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
-        self.inner.claim_backup(tenant, due, hold).await
-    }
-
-    async fn release_backup(
-        &self,
-        tenant: &TenantId,
-        claim: uuid::Uuid,
-        made: bool,
-    ) -> Result<(), CoordinatorError> {
-        self.inner.release_backup(tenant, claim, made).await
-    }
-
-    async fn set_restore_window(
-        &self,
-        tenant: &TenantId,
-        window: Option<Duration>,
-    ) -> Result<bool, CoordinatorError> {
-        self.inner.set_restore_window(tenant, window).await
-    }
-}
-
 #[tokio::test]
 async fn a_lost_commit_response_is_retried_and_an_unknown_outcome_closes_the_writer() {
     let cluster = Cluster::new().await;
-    let unreliable = Arc::new(Unreliable {
-        inner: cluster.coordinator.clone(),
-        lose_responses: AtomicUsize::new(2),
-        refuse_commits: AtomicUsize::new(0),
-        hang_after_commit: AtomicBool::new(false),
-    });
+    let unreliable = Arc::new(Unreliable::over(cluster.coordinator.clone()));
+    unreliable.lose_responses.store(2, Ordering::SeqCst);
     let writer = cluster.writer_on(unreliable.clone()).await;
 
     let position = writer
@@ -556,12 +359,7 @@ async fn a_lost_commit_response_is_retried_and_an_unknown_outcome_closes_the_wri
 #[tokio::test]
 async fn a_write_the_caller_stopped_waiting_for_closes_the_writer() {
     let cluster = Cluster::new().await;
-    let unreliable = Arc::new(Unreliable {
-        inner: cluster.coordinator.clone(),
-        lose_responses: AtomicUsize::new(0),
-        refuse_commits: AtomicUsize::new(0),
-        hang_after_commit: AtomicBool::new(false),
-    });
+    let unreliable = Arc::new(Unreliable::over(cluster.coordinator.clone()));
     let writer = cluster.writer_on(unreliable.clone()).await;
     writer.commit(vec![create("notes")]).await.unwrap();
 
@@ -871,12 +669,7 @@ async fn the_cache_never_reads_or_writes_outside_its_directory() {
 #[tokio::test]
 async fn a_writer_reopened_on_a_live_lease_cannot_replace_a_commit_that_landed_late() {
     let cluster = Cluster::new().await;
-    let unreliable = Arc::new(Unreliable {
-        inner: cluster.coordinator.clone(),
-        lose_responses: AtomicUsize::new(0),
-        refuse_commits: AtomicUsize::new(0),
-        hang_after_commit: AtomicBool::new(false),
-    });
+    let unreliable = Arc::new(Unreliable::over(cluster.coordinator.clone()));
     let (lease, committed) = cluster.lease().await;
     let first = Writer::open(
         cluster.blobs.clone(),
@@ -911,8 +704,10 @@ async fn a_writer_reopened_on_a_live_lease_cannot_replace_a_commit_that_landed_l
     assert_ne!(Layout(&cluster.key).log(position, second.author()), late);
 
     let landed = Commit {
+        after: None,
         log_position: position,
         manifest: Some(ManifestRef(late.clone())),
+        restore: None,
     };
     cluster.coordinator.commit(&lease, landed).await.unwrap();
     let follower = cluster.open().await;
@@ -1311,7 +1106,10 @@ impl Change {
                 by: by as f64,
             },
             Change::Delete(c, object) => delete(COLLECTIONS[c], object),
+            // With a limit far above what the few rows there are come to,
+            // so that a batch may hold several.
             Change::DeleteFrom(c, least) => Mutation::DeleteWhere {
+                limit: Some(256),
                 collection: name(COLLECTIONS[c]),
                 filter: Filter::Gte {
                     property: "n".into(),

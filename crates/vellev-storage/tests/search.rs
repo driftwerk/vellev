@@ -672,8 +672,10 @@ async fn rows_too_long_to_measure_are_scored_exactly_beside_the_shortlist() {
             .commit(
                 writer.lease(),
                 Commit {
+                    after: None,
                     log_position: position,
                     manifest: Some(ManifestRef(key)),
+                    restore: None,
                 },
             )
             .await

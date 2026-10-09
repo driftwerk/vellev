@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,13 @@ pub(crate) fn standing(asked: Duration) -> Duration {
 const QUERY_CACHE: usize = 1_024;
 /// Queries longer than this, in bytes, are not kept.
 const LONGEST_KEPT: usize = 1_024;
+
+/// How long a search waits for its text's vector, whatever makes it: as
+/// long as a model asked over a network is given for one call. A model
+/// run by the node itself answers when its turn on its thread comes, and
+/// has no bound of its own; a search is not kept waiting on it for
+/// longer than this either.
+pub const QUERY_WITHIN: Duration = Duration::from_secs(120);
 
 type Kept = Arc<OnceCell<Option<Vec<f32>>>>;
 
@@ -120,16 +128,40 @@ impl Embedder {
     /// A vector for each text to be stored, in order.
     pub async fn documents(&self, texts: &[String]) -> Result<Vec<Option<Vec<f32>>>> {
         let prefix = self.embedding.document_prefix.as_deref();
-        self.embed(texts, prefix, Purpose::Document).await
+        let sent = AtomicBool::new(false);
+        self.embed(texts, prefix, Purpose::Document, &sent).await
     }
 
     /// The vector to search with for `text`. Asked for again, or by several
-    /// at once, it is worked out once.
+    /// at once, it is worked out once. It is waited for no longer than
+    /// [`QUERY_WITHIN`], by whoever asks first and whoever waits on them
+    /// alike: a search told so may be made again, and the model is still
+    /// asked by whoever waits on.
     pub async fn query(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        self.query_noting(text, &AtomicBool::new(false)).await
+    }
+
+    /// As [`Self::query`], setting `sent` if this call itself sends the
+    /// text to the model, at the moment it does: whatever then comes of
+    /// it, and whether or not the caller waits for it. It is left unset
+    /// by a call answered with a vector kept, by one that waits for a
+    /// vector another call is having made, by one for a blank text, and
+    /// by one refused for a fault that stands, none of which asks the
+    /// model anything.
+    pub async fn query_noting(&self, text: &str, sent: &AtomicBool) -> Result<Option<Vec<f32>>> {
+        tokio::time::timeout(QUERY_WITHIN, self.query_however_long(text, sent))
+            .await
+            .unwrap_or_else(|_| {
+                let unanswered = format!("no vector for the search within {QUERY_WITHIN:?}");
+                Err(EmbedError::failed(&self.embedding.model, unanswered))
+            })
+    }
+
+    async fn query_however_long(&self, text: &str, sent: &AtomicBool) -> Result<Option<Vec<f32>>> {
         let embed = || async {
             let prefix = self.embedding.query_prefix.as_deref();
             let texts = [text.to_string()];
-            let vectors = self.embed(&texts, prefix, Purpose::Query).await?;
+            let vectors = self.embed(&texts, prefix, Purpose::Query, sent).await?;
             Ok(vectors.into_iter().next().flatten())
         };
         if text.len() > LONGEST_KEPT {
@@ -144,6 +176,7 @@ impl Embedder {
         texts: &[String],
         prefix: Option<&str>,
         purpose: Purpose,
+        sent: &AtomicBool,
     ) -> Result<Vec<Option<Vec<f32>>>> {
         let wanted: Vec<String> = texts
             .iter()
@@ -154,6 +187,7 @@ impl Embedder {
             return Ok(vec![None; texts.len()]);
         }
         let before = self.standing()?;
+        sent.store(true, Ordering::Relaxed);
         let made = self.made(texts, wanted, purpose).await;
         if let Some((fault, lies_in)) = self.heard(before, &made) {
             // Said here, with nothing held, and no more often than once

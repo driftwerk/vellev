@@ -324,7 +324,15 @@ fn mutation(change: Change) -> Mutation {
             unique,
         },
         Change::Delete { collection, id } => Mutation::Delete { collection, id },
-        Change::DeleteWhere { collection, filter } => Mutation::DeleteWhere { collection, filter },
+        Change::DeleteWhere {
+            collection,
+            filter,
+            limit,
+        } => Mutation::DeleteWhere {
+            collection,
+            filter,
+            limit: limit.map(|limit| limit as usize),
+        },
     }
 }
 
@@ -343,21 +351,30 @@ async fn write(
     Ok(Json(written(tenant.write(batch).await?)))
 }
 
-/// Read the tenant off the async runtime's threads: a search can take
-/// long enough to hold up other requests.
+/// Read `tenant` through `reader` in a turn of the node's, off the async
+/// runtime's threads: a search can take long enough to hold up other
+/// requests.
+///
+/// The turn is taken here, with nothing left to wait for but a thread,
+/// so that it is kept for the reading alone. A read turned away for want
+/// of one was let through by its tenant's rate before, and the node is
+/// told, which gives that back unless something costly was done for the
+/// read on the way here. A read that had its turn is a query, however it
+/// then ends.
 async fn read<T: Send + 'static>(
+    app: &App,
+    tenant: &TenantId,
     reader: Reader,
     f: impl FnOnce(&State) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(move || reader.read(f))
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "a read did not finish");
-            ApiError::new(
-                vellev_api::Code::Internal,
-                "the node failed to serve the request",
-            )
-        })?
+    let turn = match app.reading(tenant).await {
+        Ok(turn) => turn,
+        Err(turned_away) => {
+            app.node()?.unread(tenant, &reader);
+            return Err(turned_away);
+        }
+    };
+    turn.run(move || reader.read(f)).await?
 }
 
 fn weights(properties: &[Weighted]) -> Vec<(&str, f32)> {
@@ -442,11 +459,17 @@ pub async fn restore_points(
 /// found. Nothing is lost: the restore is a commit of its own, and the
 /// states before it can be gone back to as before. Writes are refused as
 /// unavailable while it runs, and requests answered before it stay
-/// answered. A restore runs to its end even if the caller stops waiting.
+/// answered. A restore goes on even if the caller stops waiting, until it
+/// ends or the node lets the tenant go. One that fails or is stopped once
+/// its commit was begun is looked for: it is answered as made if it was,
+/// and otherwise as of unknown outcome, to be asked for again by its name.
+/// One named by `x-vellev-request` is made once: asked for again, it is
+/// answered as it was, waiting for it if it still runs. Another restore of
+/// the tenant is refused as a conflict while one runs.
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant}/restore",
-    params(("tenant" = TenantId, Path,)),
+    params(WriteHeaders, ("tenant" = TenantId, Path,)),
     request_body = RestoreTo,
     responses((status = OK, body = Restored), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
@@ -455,20 +478,26 @@ pub async fn restore_points(
 pub async fn restore(
     Shared(app): Shared<App>,
     Named(tenant): Named<TenantId>,
+    Requested(request): Requested,
     Body(to): Body<RestoreTo>,
 ) -> Answer<Restored> {
     let node = app.node()?;
-    let point = match to {
-        RestoreTo::At(at) => Point::At(at),
-        RestoreTo::Position(position) => Point::Position(LogPosition(position)),
-        RestoreTo::Backup(id) => {
-            let (backup, position) = node.restore_backup(&tenant, id).await?;
-            let from = RestorePoint::new(backup.position().0, backup.taken_at);
-            return Ok(Json(Restored::new(from, position.0)));
+    let request = request.unwrap_or_else(RequestId::generate);
+    let restored = match to {
+        RestoreTo::At(at) => node.restore(&tenant, Point::At(at), request).await?,
+        RestoreTo::Position(position) => {
+            let point = Point::Position(LogPosition(position));
+            node.restore(&tenant, point, request).await?
         }
+        RestoreTo::Backup(id) => node.restore_backup(&tenant, id, request).await?,
     };
-    let (from, position) = node.restore(&tenant, point).await?;
-    Ok(Json(Restored::new(described(from), position.0)))
+    let vellev_storage::coordinator::Restored {
+        restore,
+        incarnation,
+        position,
+    } = restored;
+    let from = RestorePoint::new(restore.from.0, restore.from_at);
+    Ok(Json(Restored::new(from, incarnation.0, position.0)))
 }
 
 /// Back the tenant up now, whenever it was last backed up.
@@ -945,10 +974,10 @@ pub async fn nearest(
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
     let oversample = app.oversample(asked.oversample)?;
-    let tenant = app.node()?.reader(&tenant, fresh).await?;
+    let reader = app.node()?.reader(&tenant, fresh).await?;
     let vector = match (asked.vector, &asked.text) {
         (Some(vector), None) => vector,
-        (None, Some(text)) => tenant
+        (None, Some(text)) => reader
             .query_vector(&collection, text)
             .await?
             .ok_or_else(|| {
@@ -958,7 +987,7 @@ pub async fn nearest(
             })?,
         _ => return Err(ApiError::invalid("send either a vector or a text")),
     };
-    let results = read(tenant, move |state| {
+    let results = read(&app, &tenant, reader, move |state| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = VectorQuery {
             vector: &vector,
@@ -994,8 +1023,8 @@ pub async fn keyword(
     Body(asked): Body<Keyword>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
-    let tenant = app.node()?.reader(&tenant, fresh).await?;
-    let results = read(tenant, move |state| {
+    let reader = app.node()?.reader(&tenant, fresh).await?;
+    let results = read(&app, &tenant, reader, move |state| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = Keywords {
             text: &asked.text,
@@ -1036,14 +1065,14 @@ pub async fn hybrid(
     let candidates = app.candidates(asked.candidates)?;
     let oversample = app.oversample(asked.oversample)?;
     let alpha = asked.alpha.unwrap_or(DEFAULT_ALPHA);
-    let tenant = app.node()?.reader(&tenant, fresh).await?;
+    let reader = app.node()?.reader(&tenant, fresh).await?;
     let weighs_meaning = alpha > 0.0 && alpha <= 1.0;
     // Why the words alone decide, if the text could not be embedded: as
     // the search would have been refused had it not fallen back.
     let (vector, degraded_by) = match asked.vector {
         Some(vector) => (Some(vector), None),
         None if !weighs_meaning => (None, None),
-        None => match tenant.query_vector(&collection, &asked.text).await {
+        None => match reader.query_vector(&collection, &asked.text).await {
             Ok(vector) => (vector, None),
             Err(vellev_node::NodeError::Embed(error)) => {
                 // A fault that stands was said where it was met, once for
@@ -1063,7 +1092,7 @@ pub async fn hybrid(
             Err(error) => return Err(error.into()),
         },
     };
-    let results = read(tenant, move |state| {
+    let results = read(&app, &tenant, reader, move |state| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = HybridQuery {
             text: &asked.text,
@@ -1107,8 +1136,8 @@ pub async fn list(
     Body(page): Body<Page>,
 ) -> Answer<Objects> {
     let limit = app.limit(page.limit)?;
-    let tenant = app.node()?.reader(&tenant, fresh).await?;
-    read(tenant, move |state| {
+    let reader = app.node()?.reader(&tenant, fresh).await?;
+    read(&app, &tenant, reader, move |state| {
         let filter = viewer.narrowed(&schema(state, &collection)?, page.filter);
         let found = state.list(&collection, filter.as_ref(), page.after, limit + 1)?;
         let next = (found.len() > limit).then(|| found[limit - 1].id());
@@ -1139,8 +1168,8 @@ pub async fn count(
     viewer: Viewer,
     Body(counting): Body<Counting>,
 ) -> Answer<Counted> {
-    let tenant = app.node()?.reader(&tenant, fresh).await?;
-    read(tenant, move |state| {
+    let reader = app.node()?.reader(&tenant, fresh).await?;
+    read(&app, &tenant, reader, move |state| {
         let filter = viewer.narrowed(&schema(state, &collection)?, counting.filter);
         let count = match &filter {
             Some(filter) => state.select(&collection, filter)?.len(),

@@ -1,6 +1,7 @@
 //! Building a node from what its operator configures.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,9 +15,12 @@ use vellev_embed::Embedders;
 use vellev_node::{Node, Settings};
 
 use crate::server::Limits;
+use object_store::aws::AmazonS3ConfigKey;
+use object_store::{BackoffConfig, ClientConfigKey, RetryConfig};
 use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
-use vellev_storage::coordinator::PostgresCoordinator;
+use vellev_storage::coordinator::{Bounded, PostgresCoordinator};
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
+use vellev_storage::{Disk, Transfers};
 
 #[derive(Clone, clap::Args)]
 pub struct Config {
@@ -25,6 +29,12 @@ pub struct Config {
     pub database_url: String,
     #[arg(long, env = "VELLEV_DATABASE_CONNECTIONS", default_value_t = 8)]
     pub database_connections: u32,
+    /// How long any one request to Postgres may go unanswered, in seconds,
+    /// before it is given up as failed. A commit gets the lesser of this and
+    /// a quarter of the lease. To bound statements on the server too, set
+    /// `statement_timeout` for the role, or with `options` in the URL.
+    #[arg(long, env = "VELLEV_DATABASE_TIMEOUT_SECS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub database_timeout_secs: u64,
     /// Where data is kept: `s3://bucket`, with the usual AWS variables for
     /// region, endpoint and credentials; `file:///path`; or `memory://`.
     #[arg(long, env = "VELLEV_STORE")]
@@ -55,6 +65,20 @@ pub struct Config {
     /// The most bytes a request's body may have.
     #[arg(long, env = "VELLEV_MAX_BODY_BYTES", default_value_t = 32 * 1024 * 1024)]
     pub max_body_bytes: usize,
+    /// The most reads answered at once; more are turned away, to be asked
+    /// again. Each takes one of the runtime's 512 threads for work off the
+    /// async ones, of which loading and building take up to 128 and
+    /// commits need the rest.
+    #[arg(long, env = "VELLEV_READS_AT_ONCE", default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=320))]
+    pub reads_at_once: u32,
+    /// How many milliseconds a read waits for its turn, when as many are
+    /// being answered as are at once, before it is turned away.
+    #[arg(long, env = "VELLEV_READS_WAIT_MS", default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    pub reads_wait_ms: u64,
+    /// How many whole vectors files are read or fetched into the cache
+    /// directory at once, the rest waiting their turn.
+    #[arg(long, env = "VELLEV_CACHE_LOADS", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub cache_loads: u32,
     /// Where local embedding models are kept once fetched, unless
     /// `HF_HOME` is set, which what fetches them uses instead.
     #[arg(
@@ -108,6 +132,26 @@ pub struct Config {
     /// copies are deleted, in seconds; it cannot be made again until then.
     #[arg(long, env = "VELLEV_PURGE_AFTER_SECS", default_value_t = 10 * 60)]
     pub purge_after_secs: u64,
+    /// How long one try of a request to object storage may go unanswered, in
+    /// seconds, before the time a part takes at
+    /// `VELLEV_STORE_MIN_BYTES_PER_SEC` is added. A request that fails in a
+    /// way worth trying again is tried up to three times more, a second at
+    /// most between tries, and after a timeout only if it is safe to
+    /// repeat; it is given up once all that could have run out.
+    #[arg(long, env = "VELLEV_STORE_TIMEOUT_SECS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub store_timeout_secs: u64,
+    /// The slowest the link to object storage is expected to carry a part,
+    /// in bytes a second: a try that moves a part slower than this, past
+    /// `VELLEV_STORE_TIMEOUT_SECS`, is given up. By default a mebibyte a
+    /// second, about 8 Mbit/s, below which a node is not supported.
+    #[arg(long, env = "VELLEV_STORE_MIN_BYTES_PER_SEC", default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..))]
+    pub store_min_bytes_per_sec: u64,
+    /// The size of the parts a file larger than it goes up to object storage
+    /// in, and comes down in, in MiB: from 5 to 5120, as S3 takes for every
+    /// part but the last. A file may have at most 10,000 parts, so 16 MiB
+    /// parts carry files up to 156 GiB.
+    #[arg(long, env = "VELLEV_UPLOAD_PART_MIB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(5..=5120))]
+    pub upload_part_mib: u64,
     /// How much longer than a tenant's restore window its files that
     /// nothing reaches any more, such as segments a merge replaced, are
     /// kept before they are deleted, in seconds.
@@ -157,12 +201,119 @@ pub struct Config {
     pub drain_secs: u64,
 }
 
+/// How a node talks to object storage: how large the parts are that a large
+/// file goes up and comes down in, and how long one try of a request may
+/// take, which is `floor` and as long again as a part takes at
+/// `bytes_per_second`, the slowest the link is expected to be.
+#[derive(Debug, Clone, Copy)]
+struct StoreClient {
+    floor: Duration,
+    bytes_per_second: u64,
+    part_bytes: usize,
+}
+
+/// How many times the store client tries a request again after the first
+/// try fails in a way worth trying again. It tries again after a timeout
+/// only a request that is safe to repeat.
+const STORE_RETRIES: u32 = 3;
+/// The longest wait between two tries.
+const STORE_BACKOFF: Duration = Duration::from_secs(1);
+
+impl StoreClient {
+    /// How long one try of a request may take: a part moved at the slowest
+    /// the link is expected to be, past the floor. Every request gets as
+    /// long, the client having one timeout for all.
+    fn try_within(&self) -> Duration {
+        let part = self.part_bytes as u64 * 1_000 / self.bytes_per_second.max(1);
+        self.floor + Duration::from_millis(part)
+    }
+
+    /// How the client tries a request again: [`STORE_RETRIES`] times, never
+    /// starting a try once every try could have run out.
+    fn retry(&self) -> RetryConfig {
+        RetryConfig {
+            backoff: BackoffConfig {
+                init_backoff: Duration::from_millis(100),
+                max_backoff: STORE_BACKOFF,
+                base: 2.0,
+            },
+            max_retries: STORE_RETRIES as usize,
+            retry_timeout: self.transfers().request_within,
+        }
+    }
+
+    /// `builder` set up to give each try up after [`Self::try_within`], to
+    /// connect within five seconds, and to try again as [`Self::retry`]
+    /// says. Every other setting it was given, from the environment or
+    /// otherwise, stays as it was.
+    fn configured(&self, builder: AmazonS3Builder) -> AmazonS3Builder {
+        let millis = |duration: Duration| format!("{}ms", duration.as_millis());
+        let client = |key| AmazonS3ConfigKey::Client(key);
+        builder
+            .with_config(client(ClientConfigKey::Timeout), millis(self.try_within()))
+            .with_config(
+                client(ClientConfigKey::ConnectTimeout),
+                millis(Duration::from_secs(5)),
+            )
+            .with_retry(self.retry())
+    }
+
+    /// Transfers in parts of `part_bytes`, each request given up once every
+    /// try the client may make of it, and every wait between, could have run
+    /// out: it is reached when each try of a request safe to repeat times
+    /// out.
+    fn transfers(&self) -> Transfers {
+        Transfers {
+            part_bytes: self.part_bytes,
+            request_within: self.try_within() * (STORE_RETRIES + 1) + STORE_BACKOFF * STORE_RETRIES,
+        }
+    }
+}
+
+impl Default for StoreClient {
+    fn default() -> Self {
+        Self {
+            floor: Duration::from_secs(30),
+            bytes_per_second: 1024 * 1024,
+            part_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// The variables of `env` that are text, as the process's own are given:
+/// one that is not is nothing a store is set up by, and is passed over.
+fn text(
+    env: impl IntoIterator<Item = (OsString, OsString)>,
+) -> impl Iterator<Item = (String, String)> {
+    env.into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+}
+
+/// An S3 store's builder for `url`, set up from the `AWS_` variables of
+/// `env`, as `AmazonS3Builder::from_env` sets one up from the process's, and
+/// then as `client` says.
+fn s3(
+    url: &str,
+    client: StoreClient,
+    env: impl IntoIterator<Item = (String, String)>,
+) -> AmazonS3Builder {
+    let from_env = env
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("AWS_"))
+        .filter_map(|(key, value)| Some((key.to_ascii_lowercase().parse().ok()?, value)))
+        .fold(AmazonS3Builder::new(), |builder, (key, value)| {
+            builder.with_config(key, value)
+        });
+    client.configured(from_env).with_url(url)
+}
+
 /// The store a URL names. A bucket is used whole: a path within one would
 /// be ignored, and two nodes given different paths would write the same
 /// files.
-fn store(url: &str) -> Result<ObjectBlobs> {
+fn store(url: &str, client: StoreClient) -> Result<ObjectBlobs> {
+    let transfers = client.transfers();
     if url == "memory://" {
-        return Ok(ObjectBlobs::new(Arc::new(InMemory::new())));
+        return Ok(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(transfers));
     }
     if let Some(path) = url.strip_prefix("file://") {
         if !path.starts_with('/') {
@@ -170,14 +321,14 @@ fn store(url: &str) -> Result<ObjectBlobs> {
         }
         std::fs::create_dir_all(path).wrap_err_with(|| format!("creating {path}"))?;
         let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
-        return Ok(ObjectBlobs::on_disk(store, path));
+        return Ok(ObjectBlobs::on_disk(store, path).transferring(transfers));
     }
     if let Some(bucket) = url.strip_prefix("s3://") {
         if bucket.is_empty() || bucket.trim_end_matches('/').contains('/') {
             bail!("{url} must name a bucket and nothing within it");
         }
-        let store = AmazonS3Builder::from_env().with_url(url).build()?;
-        return Ok(ObjectBlobs::new(Arc::new(store)));
+        let store = s3(url, client, text(std::env::vars_os())).build()?;
+        return Ok(ObjectBlobs::new(Arc::new(store)).transferring(transfers));
     }
     bail!("{url} is not an s3://, file:// or memory:// store")
 }
@@ -187,6 +338,15 @@ fn endpoint(url: &str) -> String {
 }
 
 impl Config {
+    fn store_client(&self) -> StoreClient {
+        StoreClient {
+            floor: Duration::from_secs(self.store_timeout_secs),
+            bytes_per_second: self.store_min_bytes_per_sec,
+            part_bytes: usize::try_from(self.upload_part_mib.saturating_mul(1024 * 1024))
+                .unwrap_or(usize::MAX),
+        }
+    }
+
     /// The keys callers may present. A node that nobody could call is a
     /// mistake, so none is refused.
     pub fn keys(&self) -> Result<Arc<[String]>> {
@@ -253,20 +413,33 @@ impl Config {
             results: self.max_limit as usize,
             body: self.max_body_bytes,
             embedding_urls,
+            reads: self.reads_at_once as usize,
+            reads_wait: Duration::from_millis(self.reads_wait_ms),
         };
-        Ok((limits, store(&self.store)?))
+        Ok((limits, store(&self.store, self.store_client())?))
+    }
+
+    /// The disk the cache directory is on: the one every store shares,
+    /// reading and writing as many whole large files at once as is set.
+    fn cache_disk(&self) -> Result<Disk> {
+        let disk = Disk::shared().clone();
+        let disk = disk
+            .loading_at_once(self.cache_loads as usize)
+            .wrap_err("VELLEV_CACHE_LOADS")?;
+        Ok(disk.fetching(&self.store_client().transfers()))
     }
 
     /// A node over `store`, once Postgres can be reached, reachable by
     /// other nodes at `advertise_url` or else at this host on `port`.
     pub async fn node(&self, store: ObjectBlobs, port: u16) -> Result<Node> {
+        let within = Duration::from_secs(self.database_timeout_secs);
         let coordinator =
-            PostgresCoordinator::connect(&self.database_url, self.database_connections)
+            PostgresCoordinator::connect(&self.database_url, self.database_connections, within)
                 .await
                 .wrap_err("connecting to Postgres")?;
         let blobs: Arc<dyn Blobs> = Arc::new(store);
         let blobs = match &self.cache_dir {
-            Some(dir) => Arc::new(CachedBlobs::new(blobs, dir)),
+            Some(dir) => Arc::new(CachedBlobs::open(blobs, dir).await.on(self.cache_disk()?)),
             None => blobs,
         };
         let embedders = Embedders::new(vellev_embed::Settings {
@@ -286,13 +459,14 @@ impl Config {
             backups: self
                 .backup_store
                 .as_deref()
-                .map(self::store)
+                .map(|url| self::store(url, self.store_client()))
                 .transpose()
                 .wrap_err("opening the backup store")?
                 .map(|store| Arc::new(store) as Arc<dyn Blobs>),
             backup_every: Duration::from_secs(self.backup_every_secs),
             backups_kept: Duration::from_secs(self.backups_kept_secs),
             purge_after: Duration::from_secs(self.purge_after_secs),
+            transfers: self.store_client().transfers(),
             grace: Duration::from_secs(self.grace_secs),
             max_format: self.max_format,
             tenant_idle: Duration::from_secs(self.tenant_idle_secs),
@@ -304,7 +478,7 @@ impl Config {
             ..Settings::new(NodeId::reachable_at(address.trim_end_matches('/'), &host))
         };
         Ok(Node::new(
-            Arc::new(coordinator),
+            Arc::new(Bounded::new(Arc::new(coordinator), within)),
             blobs,
             Arc::new(embedders),
             settings,
@@ -322,6 +496,41 @@ mod tests {
     struct Parsed {
         #[command(flatten)]
         config: Config,
+    }
+
+    #[test]
+    fn the_cache_reads_as_many_large_files_at_once_as_it_is_told_to() {
+        assert_eq!(config(&[]).cache_disk().unwrap().loads_at_once(), 2);
+        let five = config(&["--cache-loads", "5"]);
+        assert_eq!(five.cache_disk().unwrap().loads_at_once(), 5);
+    }
+
+    #[test]
+    fn a_turn_at_the_cache_is_waited_for_longer_than_a_part_takes_as_the_store_is_set_up() {
+        // The longer the store is given to answer in, the longer one
+        // fetching a file may go without getting on, and the longer
+        // those behind it must wait before they give it up.
+        let mut last = Duration::ZERO;
+        for secs in ["30", "120", "900"] {
+            let config = config(&["--store-timeout-secs", secs]);
+            let part = config.store_client().transfers().part_within();
+            let still = config.cache_disk().unwrap().loading_still_for();
+            assert!(still > part, "{secs}: {still:?} for a part of {part:?}");
+            assert!(still > last, "{secs}: {still:?}");
+            last = still;
+        }
+        assert!(last > Duration::from_secs(2 * 4 * 900));
+    }
+
+    #[test]
+    fn reads_are_answered_as_many_at_once_and_wait_as_long_as_the_node_is_told() {
+        let (limits, _) = config(&[]).checked().unwrap();
+        assert_eq!(limits.reads, 256);
+        assert_eq!(limits.reads_wait, Duration::from_millis(500));
+        let set = config(&["--reads-at-once", "7", "--reads-wait-ms", "20"]);
+        let (limits, _) = set.checked().unwrap();
+        assert_eq!(limits.reads, 7);
+        assert_eq!(limits.reads_wait, Duration::from_millis(20));
     }
 
     fn config(extra: &[&str]) -> Config {
@@ -371,10 +580,130 @@ mod tests {
     }
 
     #[test]
+    fn an_s3_store_keeps_every_client_setting_its_environment_gives() {
+        let env = [
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_ENDPOINT", "http://127.0.0.1:59090"),
+            ("AWS_PROXY_URL", "http://proxy.internal:3128"),
+            ("AWS_ALLOW_INVALID_CERTIFICATES", "true"),
+            ("AWS_ACCESS_KEY_ID", "key"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_REGION", "eu-west-1"),
+            ("HOME", "/ignored"),
+        ]
+        .map(|(key, value)| (key.to_string(), value.to_string()));
+        let client = StoreClient::default();
+        let builder = s3("s3://bucket", client, env);
+        let setting = |key| builder.get_config_value(&AmazonS3ConfigKey::Client(key));
+        assert_eq!(setting(ClientConfigKey::AllowHttp).as_deref(), Some("true"));
+        assert_eq!(
+            setting(ClientConfigKey::ProxyUrl).as_deref(),
+            Some("http://proxy.internal:3128")
+        );
+        assert_eq!(
+            setting(ClientConfigKey::AllowInvalidCertificates).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            setting(ClientConfigKey::Timeout).as_deref(),
+            Some("46000ms")
+        );
+        assert_eq!(
+            setting(ClientConfigKey::ConnectTimeout).as_deref(),
+            Some("5000ms")
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&AmazonS3ConfigKey::Endpoint)
+                .as_deref(),
+            Some("http://127.0.0.1:59090")
+        );
+        assert!(builder.build().is_ok(), "a plain http endpoint is allowed");
+    }
+
+    #[test]
+    fn a_try_is_given_long_enough_for_a_part_at_the_slowest_link_and_a_request_for_every_try() {
+        let client = StoreClient {
+            floor: Duration::from_secs(30),
+            bytes_per_second: 2 * 1024 * 1024,
+            part_bytes: 64 * 1024 * 1024,
+        };
+        assert_eq!(client.try_within(), Duration::from_secs(30 + 32));
+        assert_eq!(
+            client.transfers().request_within,
+            Duration::from_secs(4 * 62 + 3)
+        );
+        assert_eq!(
+            StoreClient::default().transfers(),
+            Transfers::default(),
+            "a store made without settings bounds its requests as a node's does"
+        );
+        let retry = client.retry();
+        assert_eq!(retry.max_retries, 3);
+        assert_eq!(retry.retry_timeout, client.transfers().request_within);
+        assert_eq!(retry.backoff.max_backoff, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_variable_of_the_environment_that_is_not_text_is_passed_over() {
+        #[cfg(unix)]
+        let odd = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff, 0xfe])
+        };
+        #[cfg(not(unix))]
+        let odd = OsString::from("plain");
+        let env = [
+            (OsString::from("AWS_REGION"), OsString::from("eu-west-1")),
+            (OsString::from("AWS_SESSION_TOKEN"), odd.clone()),
+            (odd, OsString::from("value")),
+        ];
+        let kept: Vec<(String, String)> = text(env).collect();
+        assert!(kept.contains(&("AWS_REGION".into(), "eu-west-1".into())));
+        assert!(kept.len() <= 2);
+    }
+
+    /// A stand-in for S3 that fails every request, counting them.
+    async fn failing_store() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = asked.clone();
+        let router = axum::Router::new().fallback(move || {
+            counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (url, asked)
+    }
+
+    #[tokio::test]
+    async fn an_s3_store_tries_a_failing_request_as_often_as_it_is_set_up_to() {
+        let (endpoint, asked) = failing_store().await;
+        let env = [
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_ENDPOINT", endpoint.as_str()),
+            ("AWS_ACCESS_KEY_ID", "key"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_REGION", "eu-west-1"),
+        ]
+        .map(|(key, value)| (key.to_string(), value.to_string()));
+        let store = s3("s3://bucket", StoreClient::default(), env)
+            .build()
+            .unwrap();
+        let blobs = ObjectBlobs::new(Arc::new(store));
+        assert!(blobs.delete("key").await.is_err());
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1 + STORE_RETRIES as usize
+        );
+    }
+
+    #[test]
     fn a_store_is_named_by_its_url() {
-        assert!(store("memory://").is_ok());
+        assert!(store("memory://", StoreClient::default()).is_ok());
         let dir = std::env::temp_dir().join(format!("vellev-store-{}", std::process::id()));
-        assert!(store(&format!("file://{}", dir.display())).is_ok());
+        assert!(store(&format!("file://{}", dir.display()), StoreClient::default()).is_ok());
         assert!(dir.is_dir());
         std::fs::remove_dir_all(dir).unwrap();
         for unknown in [
@@ -385,9 +714,10 @@ mod tests {
             "s3://",
             "s3://bucket/prefix",
         ] {
-            assert!(store(unknown).is_err(), "{unknown}");
+            assert!(store(unknown, StoreClient::default()).is_err(), "{unknown}");
         }
-        assert!(store("s3://bucket").is_ok() && store("s3://bucket/").is_ok());
+        assert!(store("s3://bucket", StoreClient::default()).is_ok());
+        assert!(store("s3://bucket/", StoreClient::default()).is_ok());
         assert_eq!(config(&[]).max_limit, 1_000);
         let zero = [
             "vellev",

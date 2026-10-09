@@ -4,11 +4,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use futures::future::join_all;
-use vellev_core::{NodeId, Partition, TenantId};
+use vellev_core::{NodeId, Partition, RequestId, TenantId};
 use vellev_storage::coordinator::{
-    Acquired, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease, LogPosition,
-    ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, Point, PostgresCoordinator, Purges,
-    RestorePoint, Versions, MAX_RESTORE_WINDOW, MAX_TTL,
+    Acquired, Bounded, Commit, Committed, Coordinator, CoordinatorError, Generation, Lease,
+    LogPosition, ManifestRef, ManualClock, MemoryCoordinator, PartitionKey, Point,
+    PostgresCoordinator, Prior, Purges, Restore, RestorePoint, Restored, Versions,
+    MAX_RESTORE_WINDOW, MAX_TTL, RESTORES_KEPT_FOR,
 };
 
 const TTL: Duration = Duration::from_secs(30);
@@ -104,6 +105,17 @@ impl Harness for Pg {
         .await
         .expect("rewind history");
         sqlx::query(
+            "UPDATE vellev.restores
+             SET made_at = made_at - make_interval(secs => $3)
+             WHERE tenant = $1 AND partition = $2",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(duration.as_secs_f64())
+        .execute(&self.pool)
+        .await
+        .expect("rewind restores");
+        sqlx::query(
             "UPDATE vellev.purges
              SET requested_at = requested_at - make_interval(secs => $2),
                  purged_at = purged_at - make_interval(secs => $2),
@@ -160,8 +172,10 @@ async fn generation(h: &dyn Harness, key: &PartitionKey) -> Generation {
 
 fn commit(position: u64, manifest: &str) -> Commit {
     Commit {
+        after: None,
         log_position: LogPosition(position),
         manifest: Some(ManifestRef(manifest.into())),
+        restore: None,
     }
 }
 
@@ -343,8 +357,10 @@ async fn commits_advance_the_position_and_followers_see_them(h: &dyn Harness) {
     c.commit(
         &lease,
         Commit {
+            after: None,
             log_position: LogPosition(11),
             manifest: None,
+            restore: None,
         },
     )
     .await
@@ -378,6 +394,57 @@ async fn repeating_a_commit_that_landed_succeeds(h: &dyn Harness) {
         c.committed(&key).await.unwrap().unwrap().manifest,
         Some(ManifestRef("m4".into()))
     );
+}
+
+async fn a_commit_is_made_only_on_what_it_says_it_follows(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let (lease, leased) = lease(h, &key, &node("a")).await;
+    let after = |position: u64, head: Option<&str>, commit: Commit| Commit {
+        after: Some(Prior {
+            position: LogPosition(position),
+            head: head.map(|head| ManifestRef(head.into())),
+        }),
+        ..commit
+    };
+    let start = leased.log_position.0;
+    let first = after(start, None, commit(4, "m4"));
+    let made = c.commit(&lease, first.clone()).await.unwrap();
+
+    // Past what is committed and under the lease, but built on a position
+    // or on a head that is not what is committed: refused, whichever.
+    for stale in [
+        after(start, None, commit(9, "m9")),
+        after(4, Some("other"), commit(9, "m9")),
+        after(4, None, commit(9, "m9")),
+        after(3, Some("m4"), commit(9, "m9")),
+    ] {
+        let refused = c.commit(&lease, stale.clone()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(CoordinatorError::Regressed {
+                    committed: LogPosition(4),
+                    attempted: LogPosition(9),
+                    ..
+                })
+            ),
+            "{stale:?}: {refused:?}"
+        );
+    }
+    assert_eq!(c.committed(&key).await.unwrap(), Some(made.clone()));
+
+    // The very commit made, asked again: made already, whatever it says it
+    // followed, as its writer said before the answer was lost.
+    assert_eq!(c.commit(&lease, first).await.unwrap(), made);
+    // And one that follows it.
+    let next = after(4, Some("m4"), commit(9, "m9"));
+    let made = c.commit(&lease, next.clone()).await.unwrap();
+    assert_eq!(made.log_position, LogPosition(9));
+    assert_eq!(c.commit(&lease, next).await.unwrap(), made);
+    // One that says nothing of what it follows is made on whatever is
+    // committed, as releases before this one commit.
+    c.commit(&lease, commit(12, "m12")).await.unwrap();
 }
 
 async fn a_stalled_writer_is_fenced_and_changes_nothing(h: &dyn Harness) {
@@ -774,6 +841,7 @@ async fn removing_a_partition_forgets_its_history(h: &dyn Harness) {
         .unwrap();
     h.coordinator().remove(&key).await.unwrap();
     assert_eq!(reach(h, &key, HOUR).await, None);
+    forget_removed(h.coordinator(), &key, 1).await;
     purge(h.coordinator(), &key.tenant).await;
     h.coordinator().register(&key).await.unwrap();
     assert_eq!(
@@ -782,6 +850,89 @@ async fn removing_a_partition_forgets_its_history(h: &dyn Harness) {
         "nothing of before reaches the tenant made again"
     );
     assert_eq!(h.coordinator().forget_history(&key, HOUR).await.unwrap(), 0);
+}
+
+async fn a_restore_is_recorded_with_its_commit_for_a_day_and_for_its_incarnation(h: &dyn Harness) {
+    let key = registered(h).await;
+    let (lease, committed) = lease(h, &key, &node("a")).await;
+    let coordinator = h.coordinator();
+    coordinator
+        .commit(&lease, commit(1, "head-1"))
+        .await
+        .unwrap();
+    let restore = Restore {
+        request: RequestId::generate(),
+        asked: [1; 32],
+        from: LogPosition(1),
+        from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap(),
+    };
+    let restoring = Commit {
+        after: None,
+        restore: Some(restore.clone()),
+        ..commit(2, "head-2")
+    };
+    coordinator.commit(&lease, restoring.clone()).await.unwrap();
+    coordinator.commit(&lease, restoring).await.unwrap();
+    let restored = Restored {
+        restore: restore.clone(),
+        incarnation: committed.incarnation,
+        position: LogPosition(2),
+    };
+    let asked = || coordinator.restored(&key, restore.request);
+    assert_eq!(asked().await.unwrap(), Some(restored.clone()));
+    assert_eq!(
+        coordinator
+            .restored(&key, RequestId::generate())
+            .await
+            .unwrap(),
+        None
+    );
+
+    h.pass(&key, RESTORES_KEPT_FOR - Duration::from_secs(60))
+        .await;
+    coordinator.forget_history(&key, HOUR).await.unwrap();
+    assert_eq!(asked().await.unwrap(), Some(restored));
+    h.pass(&key, Duration::from_secs(120)).await;
+    assert_eq!(asked().await.unwrap(), None, "a day old, it counts no more");
+    coordinator.forget_history(&key, HOUR).await.unwrap();
+    assert_eq!(asked().await.unwrap(), None, "and is forgotten");
+
+    let again = Commit {
+        after: None,
+        restore: Some(restore.clone()),
+        ..commit(3, "head-3")
+    };
+    coordinator.commit(&lease, again).await.unwrap();
+    assert!(asked().await.unwrap().is_some());
+    coordinator.remove(&key).await.unwrap();
+    assert_eq!(asked().await.unwrap(), None, "the record goes with it");
+    purge(coordinator, &key.tenant).await;
+    coordinator.register(&key).await.unwrap();
+    assert_eq!(asked().await.unwrap(), None);
+}
+
+async fn restores_a_day_old_are_forgotten_whether_or_not_their_partition_is_kept_up(
+    h: &dyn Harness,
+) {
+    let key = registered(h).await;
+    let (lease, _) = lease(h, &key, &node("a")).await;
+    let coordinator = h.coordinator();
+    let request = RequestId::generate();
+    let restoring = Commit {
+        after: None,
+        restore: Some(Restore {
+            request,
+            asked: [1; 32],
+            from: LogPosition(0),
+            from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap(),
+        }),
+        ..commit(1, "head-1")
+    };
+    coordinator.commit(&lease, restoring).await.unwrap();
+    h.pass(&key, RESTORES_KEPT_FOR + Duration::from_secs(60))
+        .await;
+    assert!(coordinator.forget_restores().await.unwrap() >= 1);
+    assert_eq!(coordinator.restored(&key, request).await.unwrap(), None);
 }
 
 async fn a_tenant_keeps_its_own_restore_window_until_told_otherwise(h: &dyn Harness) {
@@ -997,8 +1148,13 @@ conformance! {
     partitions_are_listed_in_key_order_a_page_at_a_time,
     a_key_reaches_its_tenant_until_revoked_or_the_tenant_goes,
     every_commit_is_a_restore_point_once,
+    a_commit_is_made_only_on_what_it_says_it_follows,
     a_restore_reaches_back_through_its_window_and_to_how_it_then_stood,
     removing_a_partition_forgets_its_history,
+    a_partition_made_again_keeps_its_history_while_the_old_is_forgotten,
+    a_restore_asked_for_again_after_its_record_lapsed_is_recorded_again,
+    a_restore_is_recorded_with_its_commit_for_a_day_and_for_its_incarnation,
+    restores_a_day_old_are_forgotten_whether_or_not_their_partition_is_kept_up,
     a_tenant_keeps_its_own_restore_window_until_told_otherwise,
     one_node_at_a_time_backs_a_tenant_up_and_only_when_due,
     a_removed_tenant_is_purged_before_it_is_made_again,
@@ -1012,7 +1168,9 @@ async fn postgres_migrations_are_idempotent_under_concurrent_starts() {
     let starts: Vec<_> = (0..6)
         .map(|_| {
             let url = url.clone();
-            tokio::spawn(async move { PostgresCoordinator::connect(&url, 2).await })
+            tokio::spawn(async move {
+                PostgresCoordinator::connect(&url, 2, Duration::from_secs(30)).await
+            })
         })
         .collect();
     for started in starts {
@@ -1031,7 +1189,8 @@ async fn a_node_starts_on_a_database_a_newer_release_has_migrated() {
         .execute(&pg.pool)
         .await
         .unwrap();
-    let started = PostgresCoordinator::connect(&database_url().unwrap(), 2).await;
+    let started =
+        PostgresCoordinator::connect(&database_url().unwrap(), 2, Duration::from_secs(30)).await;
     sqlx::query("DELETE FROM vellev.schema_version WHERE version = $1")
         .bind(ahead)
         .execute(&pg.pool)
@@ -1064,6 +1223,259 @@ async fn a_row_inserted_as_before_incarnations_gets_its_generation_as_one() {
     .unwrap();
     let committed = pg.coordinator.committed(&key).await.unwrap().unwrap();
     assert_eq!(committed.incarnation.0, committed.generation.0);
+}
+
+#[tokio::test]
+async fn a_restore_left_behind_by_a_release_that_does_not_know_them_is_not_the_tenants_now() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let (lease, _) = lease(&pg, &key, &node("a")).await;
+    let request = RequestId::generate();
+    let restoring = Commit {
+        after: None,
+        restore: Some(Restore {
+            request,
+            asked: [1; 32],
+            from: LogPosition(0),
+            from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap(),
+        }),
+        ..commit(1, "head-1")
+    };
+    pg.coordinator.commit(&lease, restoring).await.unwrap();
+    assert!(pg
+        .coordinator
+        .restored(&key, request)
+        .await
+        .unwrap()
+        .is_some());
+
+    // Removed and made again by a release that does not know restores.
+    sqlx::query(
+        "UPDATE vellev.partitions SET incarnation = nextval('vellev.generations')
+         WHERE tenant = $1 AND partition = $2",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(pg.coordinator.restored(&key, request).await.unwrap(), None);
+}
+
+/// Forget what is kept of the removed partition, `limit` commits a call,
+/// as a node does. Returns how many calls forgot something.
+async fn forget_removed(coordinator: &dyn Coordinator, key: &PartitionKey, limit: usize) -> usize {
+    let (mut after, mut calls) = (None, 0);
+    while let Some(got_to) = coordinator.forget_removed(key, after, limit).await.unwrap() {
+        after = Some(got_to);
+        calls += 1;
+    }
+    calls
+}
+
+/// How many rows of a removed partition's history are left.
+async fn kept_of(pg: &Pg, key: &PartitionKey) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM vellev.commits WHERE tenant = $1 AND partition = $2),
+                (SELECT count(*) FROM vellev.restores WHERE tenant = $1 AND partition = $2)",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .fetch_one(&pg.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_busy_partition_is_removed_and_its_history_forgotten_within_the_bound_on_a_call() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let (lease, _) = lease(&pg, &key, &node("a")).await;
+    let restoring = Commit {
+        after: None,
+        restore: Some(Restore {
+            request: RequestId::generate(),
+            asked: [1; 32],
+            from: LogPosition(0),
+            from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap(),
+        }),
+        ..commit(1, "head-1")
+    };
+    pg.coordinator.commit(&lease, restoring).await.unwrap();
+    // A million commits, as a busy tenant with a long window keeps.
+    sqlx::query(
+        "INSERT INTO vellev.commits (tenant, partition, incarnation, position, head)
+         SELECT $1, $2, p.incarnation, n, 'head-' || n
+         FROM vellev.partitions p, generate_series(2, 1000001) n
+         WHERE p.tenant = $1 AND p.partition = $2",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+    // As autovacuum would have by the time a tenant grew so.
+    sqlx::query("ANALYZE vellev.commits")
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+
+    // Under a node's default bound on one call, removing touches none of
+    // the history, which goes ten thousand rows a call after.
+    let bounded = Bounded::new(Arc::new(pg.coordinator.clone()), Duration::from_secs(10));
+    assert!(bounded.remove(&key).await.unwrap());
+    assert_eq!(kept_of(&pg, &key).await, (1_000_001, 1));
+    let batches = forget_removed(&bounded, &key, 10_000).await;
+    assert_eq!(batches, 101);
+    assert_eq!(kept_of(&pg, &key).await, (0, 0));
+}
+
+async fn a_partition_made_again_keeps_its_history_while_the_old_is_forgotten(h: &dyn Harness) {
+    let key = registered(h).await;
+    let (first, _) = lease(h, &key, &node("a")).await;
+    let coordinator = h.coordinator();
+    coordinator
+        .commit(&first, commit(1, "head-1"))
+        .await
+        .unwrap();
+    coordinator.remove(&key).await.unwrap();
+    purge(coordinator, &key.tenant).await;
+    coordinator.register(&key).await.unwrap();
+    let (again, _) = lease(h, &key, &node("b")).await;
+    let request = RequestId::generate();
+    let restoring = Commit {
+        after: None,
+        restore: Some(Restore {
+            request,
+            asked: [1; 32],
+            from: LogPosition(1),
+            from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap(),
+        }),
+        ..commit(1, "head-again")
+    };
+    coordinator.commit(&again, restoring).await.unwrap();
+
+    forget_removed(coordinator, &key, 1).await;
+    assert_eq!(
+        reach(h, &key, HOUR).await,
+        Some((1, 1)),
+        "the new history stays"
+    );
+    assert!(coordinator.restored(&key, request).await.unwrap().is_some());
+}
+
+async fn a_restore_asked_for_again_after_its_record_lapsed_is_recorded_again(h: &dyn Harness) {
+    let key = registered(h).await;
+    let (lease, _) = lease(h, &key, &node("a")).await;
+    let coordinator = h.coordinator();
+    let request = RequestId::generate();
+    let restore = |from: u64| Restore {
+        request,
+        asked: [1; 32],
+        from: LogPosition(from),
+        from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap(),
+    };
+    let first = Commit {
+        after: None,
+        restore: Some(restore(0)),
+        ..commit(1, "head-1")
+    };
+    coordinator.commit(&lease, first).await.unwrap();
+    h.pass(&key, RESTORES_KEPT_FOR + Duration::from_secs(60))
+        .await;
+    assert_eq!(coordinator.restored(&key, request).await.unwrap(), None);
+
+    let again = Commit {
+        after: None,
+        restore: Some(restore(1)),
+        ..commit(2, "head-2")
+    };
+    coordinator.commit(&lease, again).await.unwrap();
+    let found = coordinator.restored(&key, request).await.unwrap();
+    assert_eq!(found.map(|done| done.position), Some(LogPosition(2)));
+}
+
+#[tokio::test]
+async fn a_call_waiting_for_a_connection_gives_up_within_its_bound() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let within = Duration::from_millis(500);
+    let url = database_url().unwrap();
+    let named = format!("vellev-test-{}", uuid::Uuid::new_v4().simple());
+    let joined = if url.contains('?') { '&' } else { '?' };
+    let one =
+        PostgresCoordinator::connect(&format!("{url}{joined}application_name={named}"), 1, within)
+            .await
+            .unwrap();
+
+    // Another session holds the partition's row, so removing it through
+    // `one` waits, on the only connection `one` has.
+    let mut holding = pg.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM vellev.partitions WHERE tenant = $1 AND partition = $2 FOR UPDATE")
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&mut *holding)
+        .await
+        .unwrap();
+    let removing = tokio::spawn({
+        let (one, key) = (one.clone(), key.clone());
+        async move { one.remove(&key).await }
+    });
+    // Once the removal waits on the row, ask for something else: it fails
+    // well before the half minute sqlx otherwise waits for a connection.
+    let waiting = async {
+        while sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE application_name = $1 AND wait_event_type = 'Lock'",
+        )
+        .bind(&named)
+        .fetch_one(&pg.pool)
+        .await
+        .unwrap()
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), waiting)
+        .await
+        .expect("the removal waits on the row");
+    let pinged = tokio::time::timeout(Duration::from_secs(15), one.ping()).await;
+    assert!(matches!(pinged, Ok(Err(_))), "{pinged:?}");
+    holding.rollback().await.unwrap();
+    assert!(removing.await.unwrap().unwrap());
+}
+
+#[tokio::test]
+async fn a_restore_of_a_tenant_never_seen_again_is_forgotten_after_a_day() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let (lease, _) = lease(&pg, &key, &node("a")).await;
+    let restoring = Commit {
+        after: None,
+        restore: Some(Restore {
+            request: RequestId::generate(),
+            asked: [1; 32],
+            from: LogPosition(0),
+            from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap(),
+        }),
+        ..commit(1, "head-1")
+    };
+    pg.coordinator.commit(&lease, restoring).await.unwrap();
+    // Removed by a node that never forgot its history.
+    pg.coordinator.remove(&key).await.unwrap();
+    pg.pass(&key, RESTORES_KEPT_FOR + Duration::from_secs(60))
+        .await;
+    assert!(pg.coordinator.forget_restores().await.unwrap() >= 1);
+    assert_eq!(kept_of(&pg, &key).await.1, 0);
 }
 
 #[tokio::test]

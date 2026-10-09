@@ -485,10 +485,12 @@ async fn a_commit_in_flight_while_cleaning_is_not_mistaken_for_an_orphan() {
         .read(|state| assert_eq!(n_of(state, "notes", 1), Some(1)));
 }
 
-#[tokio::test]
-async fn a_row_deleted_while_its_merge_is_built_stays_dead() {
+/// Two segments of ten notes each to merge, with the uploads of logs and
+/// of merged segments each held when armed.
+async fn two_to_merge() -> (Cluster, Arc<Writer>, [Held; 2]) {
     let mut cluster = Cluster::new().await;
-    let (paused, mut seen) = Paused::new(&mut cluster, "/log/");
+    let logs = Paused::new(&mut cluster, "/log/");
+    let merged = Paused::new(&mut cluster, "-merged.segment");
     let merging = Merging {
         fanout: 2,
         ..Merging::default()
@@ -500,26 +502,31 @@ async fn a_row_deleted_while_its_merge_is_built_stays_dead() {
         writer.commit(writes.collect()).await.unwrap();
         writer.flush().await.unwrap();
     }
-    paused.armed.store(true, Ordering::SeqCst);
+    (cluster, writer, [logs, merged])
+}
 
-    let deleting = tokio::spawn({
-        let writer = writer.clone();
-        async move { writer.commit(vec![delete("notes", 3)]).await }
-    });
-    assert_eq!(seen.recv().await, Some("stored"));
-    let merging = tokio::spawn({
-        let writer = writer.clone();
-        async move { writer.merge().await }
-    });
-    tokio::task::yield_now().await;
-    paused.release.notify_one();
-    deleting.await.unwrap().unwrap();
-    merging
-        .await
-        .unwrap()
-        .unwrap()
-        .expect("the two segments merge");
+/// Uploads of one kind that can be held, and word of each that is.
+type Held = (
+    Arc<Paused>,
+    tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+);
 
+/// Wait for an upload to be held, skipping the listings reported.
+async fn held(seen: &mut tokio::sync::mpsc::UnboundedReceiver<&'static str>) {
+    let stored =
+        async { while seen.recv().await.expect("the store is still there") != "stored" {} };
+    soon(stored).await;
+}
+
+/// How many rows and tombstones each segment committed has.
+async fn shape(cluster: &Cluster) -> Vec<(u64, u64)> {
+    let segments = segments_of(cluster).await;
+    let shape = |segment: &SegmentMeta| (segment.rows, segment.tombstones);
+    segments.iter().map(shape).collect()
+}
+
+/// Note 3 is dead to the writer and to a copy opened afresh.
+async fn third_is_dead(cluster: &Cluster, writer: &Writer) {
     let check = |state: &State| {
         assert_eq!(n_of(state, "notes", 3), None);
         assert_eq!(state.count(&name("notes")), 19);
@@ -527,24 +534,93 @@ async fn a_row_deleted_while_its_merge_is_built_stays_dead() {
     };
     writer.partition().read(check);
     cluster.open().await.partition().read(check);
+}
 
-    writer
-        .merge()
-        .await
-        .unwrap()
-        .expect("the merged segment and the flush merge again");
-    let shape: Vec<(u64, u64)> = segments_of(&cluster)
-        .await
-        .iter()
-        .map(|segment| (segment.rows, segment.tombstones))
-        .collect();
+#[tokio::test]
+async fn a_row_deleted_once_its_merged_segment_is_built_is_dead_in_it_and_flushed_with_it() {
+    let (cluster, writer, [_logs, (merged, mut seen)]) = two_to_merge().await;
+    // The merged segment, with the row in it, is built and stored, and
+    // what is unflushed not yet looked at, when the row is deleted.
+    merged.armed.store(true, Ordering::SeqCst);
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    held(&mut seen).await;
+    writer.commit(vec![delete("notes", 3)]).await.unwrap();
+    merged.armed.store(false, Ordering::SeqCst);
+    merged.release.notify_one();
+    let merged = soon(merging).await.unwrap().unwrap();
+    merged.expect("the two segments merge");
+
+    // The delete is flushed with the merge: a segment of its tombstone.
+    assert_eq!(shape(&cluster).await, [(20, 0), (0, 1)]);
+    third_is_dead(&cluster, &writer).await;
+    let again = writer.merge().await.unwrap();
+    again.expect("the merged segment and the flush merge again");
     assert_eq!(
-        shape,
+        shape(&cluster).await,
         [(19, 0)],
-        "the row is left out rather than brought back"
+        "left out, not brought back"
     );
-    writer.partition().read(check);
-    cluster.open().await.partition().read(check);
+    third_is_dead(&cluster, &writer).await;
+}
+
+#[tokio::test]
+async fn a_row_deleted_once_its_merge_has_looked_at_what_is_unflushed_is_dead_by_replay() {
+    let (cluster, writer, [(logs, mut logged), (merged, mut seen)]) = two_to_merge().await;
+    // The delete holds the writer, its log stored and not yet committed.
+    logs.armed.store(true, Ordering::SeqCst);
+    let deleting = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.commit(vec![delete("notes", 3)]).await }
+    });
+    held(&mut logged).await;
+    logs.armed.store(false, Ordering::SeqCst);
+    // The merge builds its segment and looks at what is unflushed, which
+    // is nothing yet, and waits for the writer: nothing it waits on from
+    // here to there is anything but ready.
+    merged.armed.store(true, Ordering::SeqCst);
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    held(&mut seen).await;
+    merged.armed.store(false, Ordering::SeqCst);
+    merged.release.notify_one();
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!merging.is_finished(), "it waits for the writer");
+    logs.release.notify_one();
+    soon(deleting).await.unwrap().unwrap();
+    let merged = soon(merging).await.unwrap().unwrap();
+    merged.expect("the two segments merge");
+
+    // The delete was committed while the merge was built: the merge's
+    // manifest replays it, and the row is dead with nothing flushed.
+    assert_eq!(shape(&cluster).await, [(20, 0)]);
+    third_is_dead(&cluster, &writer).await;
+    let nothing = writer.merge().await.unwrap();
+    assert_eq!(nothing, None, "one segment, a twentieth of it dead");
+    writer.flush().await.unwrap();
+    assert_eq!(shape(&cluster).await, [(20, 0), (0, 1)]);
+    let again = writer.merge().await.unwrap();
+    again.expect("the merged segment and the flush merge");
+    assert_eq!(
+        shape(&cluster).await,
+        [(19, 0)],
+        "left out, not brought back"
+    );
+    third_is_dead(&cluster, &writer).await;
+}
+
+/// What `work` came to, failing the test rather than letting it hang if
+/// that took a minute.
+async fn soon<T>(work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(60), work)
+        .await
+        .expect("done within a minute")
 }
 
 #[tokio::test]
@@ -568,19 +644,19 @@ async fn a_merge_planned_over_segments_another_replaced_meanwhile_does_nothing()
         let writer = writer.clone();
         async move { writer.merge().await }
     });
-    assert_eq!(seen.recv().await, Some("stored"));
+    assert_eq!(soon(seen.recv()).await, Some("stored"));
     let second = tokio::spawn({
         let writer = writer.clone();
         async move { writer.merge().await }
     });
     tokio::task::yield_now().await;
     paused.release.notify_one();
-    first
+    soon(first)
         .await
         .unwrap()
         .unwrap()
         .expect("the first merge goes ahead");
-    assert_eq!(second.await.unwrap().unwrap(), None);
+    assert_eq!(soon(second).await.unwrap().unwrap(), None);
 
     let shape: Vec<u64> = segments_of(&cluster)
         .await
@@ -696,4 +772,158 @@ async fn a_writer_opened_from_a_checkpoint_carries_the_chain_on() {
     assert_eq!(writer.clean(Duration::ZERO).await.unwrap(), 4 + 2);
     let (logs, segments, manifests) = files(&cluster).await;
     assert_eq!((logs.len(), segments.len(), manifests.len()), (0, 3, 1));
+}
+
+/// Blobs over a cache that say the copy on local disk of each vectors file
+/// that `picks` picks is where that of `instead` is, once there is one.
+#[derive(Debug)]
+struct Miscopied {
+    inner: CachedBlobs,
+    picks: fn(&str) -> bool,
+    instead: Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl Blobs for Miscopied {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
+        let instead = self.instead.lock().unwrap().clone();
+        match instead.filter(|_| key.ends_with(".vectors") && (self.picks)(key)) {
+            Some(other) => self.inner.local(&other).await,
+            None => self.inner.local(key).await,
+        }
+    }
+}
+
+/// A writer over such blobs, with three notes flushed into a segment, the
+/// key of whose vectors is returned, and two more written since.
+async fn miscopying(
+    dir: &std::path::Path,
+    picks: fn(&str) -> bool,
+) -> (Cluster, Arc<Miscopied>, Writer, String) {
+    let mut cluster = Cluster::new().await;
+    let miscopied = Arc::new(Miscopied {
+        inner: CachedBlobs::new(cluster.blobs.clone(), dir),
+        picks,
+        instead: Mutex::default(),
+    });
+    cluster.blobs = miscopied.clone();
+    let writer = cluster.writer().await.merging_with(Merging {
+        fanout: 2,
+        ..Merging::default()
+    });
+    let rows = (1..=3).map(|n| upsert("notes", n, i64::from(n)));
+    writer
+        .commit([create("notes")].into_iter().chain(rows).collect())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let first = segments_of(&cluster).await.remove(0).vectors.unwrap();
+    writer
+        .commit(vec![upsert("notes", 4, 4), upsert("notes", 5, 5)])
+        .await
+        .unwrap();
+    (cluster, miscopied, writer, first)
+}
+
+fn notes(state: &State) -> Vec<Option<i64>> {
+    (1..=6).map(|n| n_of(state, "notes", n)).collect()
+}
+
+#[tokio::test]
+async fn a_flush_whose_segment_is_not_fit_fails_before_it_commits_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cluster, miscopied, writer, first) = miscopying(dir.path(), |_| true).await;
+    let before = cluster.committed().await;
+
+    // The two rows' vectors are read back as the first segment's three.
+    *miscopied.instead.lock().unwrap() = Some(first);
+    let unfit = writer.flush().await.unwrap_err();
+    assert!(matches!(unfit, StorageError::Corrupt { .. }), "{unfit}");
+    assert_eq!(cluster.committed().await, before, "nothing was committed");
+    assert!(!writer.is_closed());
+
+    *miscopied.instead.lock().unwrap() = None;
+    writer.commit(vec![upsert("notes", 6, 6)]).await.unwrap();
+    writer.flush().await.unwrap();
+    let all = [1, 2, 3, 4, 5, 6].map(Some);
+    assert_eq!(writer.partition().read(notes), all);
+    assert_eq!(cluster.open().await.partition().read(notes), all);
+}
+
+#[tokio::test]
+async fn a_merge_one_of_whose_segments_is_not_fit_changes_nothing_in_memory_or_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let flushed: fn(&str) -> bool = |key| !key.contains("-merged");
+    let (cluster, miscopied, writer, first) = miscopying(dir.path(), flushed).await;
+    writer.flush().await.unwrap();
+    writer.commit(vec![upsert("notes", 6, 6)]).await.unwrap();
+    let before = cluster.committed().await;
+
+    // The merged segment is fit; the one of the row flushed with it has
+    // its vectors read back as the first segment's three.
+    *miscopied.instead.lock().unwrap() = Some(first);
+    let unfit = writer.merge().await.unwrap_err();
+    assert!(matches!(unfit, StorageError::Corrupt { .. }), "{unfit}");
+    assert_eq!(cluster.committed().await, before, "nothing was committed");
+    assert!(!writer.is_closed());
+    let all = [1, 2, 3, 4, 5, 6].map(Some);
+    assert_eq!(writer.partition().read(notes), all);
+    assert_eq!(writer.partition().read(|state| state.segments().count()), 2);
+
+    *miscopied.instead.lock().unwrap() = None;
+    writer
+        .merge()
+        .await
+        .unwrap()
+        .expect("two segments to merge");
+    writer.commit(vec![upsert("notes", 1, 10)]).await.unwrap();
+    let all = [10, 2, 3, 4, 5, 6].map(Some);
+    assert_eq!(writer.partition().read(notes), all);
+    assert_eq!(cluster.open().await.partition().read(notes), all);
+}
+
+#[tokio::test]
+async fn a_writer_whose_lease_was_taken_since_cleans_nothing_up() {
+    let cluster = Cluster::new().await;
+    let behind = cluster.writer().await.merging_with(Merging {
+        fanout: 2,
+        ..Merging::default()
+    });
+    behind.commit(vec![create("notes")]).await.unwrap();
+    for round in 0..2u8 {
+        behind
+            .commit(vec![upsert("notes", round, 1)])
+            .await
+            .unwrap();
+        behind.flush().await.unwrap();
+    }
+    behind
+        .merge()
+        .await
+        .unwrap()
+        .expect("two segments to merge");
+    behind.flush().await.unwrap();
+    let before = files(&cluster).await;
+
+    // Another has the partition now, and may have put back into use what
+    // this one would take for litter: it is not this one's to clean.
+    let _current = cluster.writer().await;
+    let refused = behind.clean(Duration::ZERO).await.unwrap_err();
+    assert!(
+        matches!(refused, StorageError::Diverged { .. }),
+        "{refused}"
+    );
+    assert_eq!(files(&cluster).await, before);
 }

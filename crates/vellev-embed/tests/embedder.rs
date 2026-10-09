@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -42,6 +43,220 @@ impl Provider for Fake {
         self.asked.lock().unwrap().push(texts);
         Ok(self.answer.clone().unwrap_or(vectors))
     }
+}
+
+/// A model that never answers.
+#[derive(Debug)]
+struct Silent;
+
+#[async_trait]
+impl Provider for Silent {
+    async fn embed(&self, _texts: Vec<String>, _purpose: Purpose) -> Result<Vec<Vec<f32>>> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_search_waits_only_so_long_for_its_vector_whoever_asked_for_it_first() {
+    let silent = Embedder::new(Arc::new(Silent), embedding(EmbeddingProvider::Local));
+    let started = tokio::time::Instant::now();
+    // Two ask for the same text, the second a minute after the first and
+    // waiting on it; and one for a text too long to be kept.
+    let long = "x".repeat(2_000);
+    let later = async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let asked = tokio::time::Instant::now();
+        (silent.query("fox").await, asked.elapsed())
+    };
+    let (first, (second, waited), unkept) =
+        tokio::join!(silent.query("fox"), later, silent.query(&long));
+    for unanswered in [first, second, unkept] {
+        assert!(
+            matches!(&unanswered, Err(EmbedError::Failed { reason, .. }) if reason.contains("within")),
+            "{unanswered:?}"
+        );
+    }
+    assert_eq!(waited, vellev_embed::QUERY_WITHIN, "each its own while");
+    assert_eq!(
+        started.elapsed(),
+        std::time::Duration::from_secs(60) + vellev_embed::QUERY_WITHIN
+    );
+}
+
+/// Whether a query for `text` sent it to the model itself, and how the
+/// query ended.
+async fn sent(embedder: &Embedder, text: &str) -> (bool, Result<Option<Vec<f32>>>) {
+    let sent = AtomicBool::new(false);
+    let answer = embedder.query_noting(text, &sent).await;
+    (sent.load(Ordering::SeqCst), answer)
+}
+
+#[tokio::test]
+async fn a_query_says_whether_it_sent_its_text_to_the_model_itself() {
+    let (fake, lengths) = embedder(Fake::default());
+    let asked = || fake.asked.lock().unwrap().len();
+    assert!(sent(&lengths, "fox").await.0, "never asked before");
+    assert!(!sent(&lengths, "fox").await.0, "its vector is kept");
+    assert!(sent(&lengths, "hen").await.0, "another text");
+    assert_eq!(asked(), 2);
+    // A blank text is sent to no model, and one too long to keep to the
+    // model every time.
+    let (blank, none) = sent(&lengths, "  ").await;
+    assert!(!blank && none.unwrap().is_none());
+    let long = "x".repeat(2_000);
+    assert!(sent(&lengths, &long).await.0 && sent(&lengths, &long).await.0);
+    assert_eq!(asked(), 4);
+
+    // A model that refuses for good is asked once, and not again while
+    // the fault stands: the query refused for the fault sent nothing.
+    let refusing = Fake {
+        refusing: Mutex::new(Some(EmbedError::Unusable {
+            model: "fake".into(),
+            reason: "no such key".into(),
+            fault: vellev_core::ModelFault::Setup,
+        })),
+        ..Fake::default()
+    };
+    let (fake, unusable) = embedder(refusing);
+    let (first, refused) = sent(&unusable, "fox").await;
+    assert!(first && refused.is_err());
+    let (again, refused) = sent(&unusable, "fox").await;
+    assert!(!again && refused.is_err(), "the fault stands");
+    assert_eq!(fake.purposes.lock().unwrap().len(), 1, "asked once");
+}
+
+/// A model that answers each call only when told to, and counts them.
+#[derive(Debug)]
+struct Held {
+    calls: AtomicUsize,
+    answer: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl Provider for Held {
+    async fn embed(&self, texts: Vec<String>, _purpose: Purpose) -> Result<Vec<Vec<f32>>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.answer.acquire().await.unwrap().forget();
+        Ok(texts
+            .iter()
+            .map(|text| vec![text.len() as f32, 0.0])
+            .collect())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_query_that_waits_for_a_vector_another_is_having_made_sent_nothing_itself() {
+    let held = Arc::new(Held {
+        calls: AtomicUsize::new(0),
+        answer: tokio::sync::Semaphore::new(0),
+    });
+    let embedder = Arc::new(Embedder::new(
+        held.clone(),
+        embedding(EmbeddingProvider::Local),
+    ));
+    let asking = |embedder: &Arc<Embedder>| {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { sent(&embedder, "fox").await })
+    };
+    // The first is with the model when the second and third ask.
+    let first = asking(&embedder);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let (second, third) = (asking(&embedder), asking(&embedder));
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+    held.answer.add_permits(1);
+    for (asked, itself) in [(first, true), (second, false), (third, false)] {
+        let (sent, vector) = asked.await.unwrap();
+        assert_eq!((sent, vector.unwrap()), (itself, Some(vec![9.0, 0.0])));
+    }
+    assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+
+    // One that stops waiting for the model sent the text all the same;
+    // whoever waited on it asks the model in its place, and says so.
+    let (gone, waiting) = (
+        tokio::spawn({
+            let embedder = embedder.clone();
+            async move {
+                let sent = Arc::new(AtomicBool::new(false));
+                let asked = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    embedder.query_noting("owl", &sent),
+                );
+                (asked.await.is_err(), sent.load(Ordering::SeqCst))
+            }
+        }),
+        tokio::spawn({
+            let embedder = embedder.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                sent(&embedder, "owl").await
+            }
+        }),
+    );
+    assert_eq!(gone.await.unwrap(), (true, true), "given up, and sent");
+    held.answer.add_permits(8);
+    let (sent, vector) = waiting.await.unwrap();
+    assert_eq!((sent, vector.unwrap()), (true, Some(vec![9.0, 0.0])));
+    assert_eq!(held.calls.load(Ordering::SeqCst), 3);
+}
+
+/// Counts the calls made for texts that hold `TARGET`.
+#[derive(Debug, Default)]
+struct Tally(AtomicUsize);
+
+#[async_trait]
+impl Provider for Tally {
+    async fn embed(&self, texts: Vec<String>, _purpose: Purpose) -> Result<Vec<Vec<f32>>> {
+        if texts.iter().any(|text| text.contains("TARGET")) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(texts
+            .iter()
+            .map(|text| vec![text.len() as f32, 0.0])
+            .collect())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_model_is_never_asked_by_a_query_that_does_not_say_so() {
+    let tally = Arc::new(Tally::default());
+    let embedder = Arc::new(Embedder::new(
+        tally.clone(),
+        embedding(EmbeddingProvider::Local),
+    ));
+    let mut put_out = 0;
+    for round in 0..200 {
+        // The target is asked, then as many others as leave it the
+        // oldest kept: the next text asked puts it out.
+        let target = format!("TARGET {round}");
+        assert!(sent(&embedder, &target).await.0);
+        for filler in 0..1_023 {
+            let filler = format!("filler {round} {filler}");
+            embedder.query(&filler).await.unwrap();
+        }
+        // Another text is asked while the target is asked over and over:
+        // somewhere among the askings it is put out, and asked of the
+        // model again. Each asking says so exactly when the model was
+        // asked for it.
+        let putting_out = tokio::spawn({
+            let embedder = embedder.clone();
+            async move {
+                for _ in 0..(round % 7) * 50 {
+                    std::hint::spin_loop();
+                }
+                embedder.query(&format!("puts out {round}")).await.unwrap();
+            }
+        });
+        for _ in 0..64 {
+            let before = tally.0.load(Ordering::SeqCst);
+            let (said, _) = sent(&embedder, &target).await;
+            let asked = tally.0.load(Ordering::SeqCst) != before;
+            assert_eq!(said, asked, "round {round}");
+            put_out += usize::from(asked);
+        }
+        putting_out.await.unwrap();
+    }
+    assert!(put_out > 0, "the target was never put out while asked");
 }
 
 fn embedding(provider: EmbeddingProvider) -> Embedding {

@@ -19,11 +19,14 @@ mod search;
 mod state;
 
 pub use answers::KEPT_FOR as ANSWERS_KEPT_FOR;
-pub use error::{Lacking, Refusal, Refused, Result, StorageError};
-pub use group::GroupCommitter;
+pub use blobs::{Disk, Local, Transfers};
+pub use error::{Capped, Lacking, Over, Refusal, Refused, Result, StorageError};
+pub use group::{GroupCommitter, GROUP_MOST};
 pub use hybrid::{Fused, Hybrid, DEFAULT_ALPHA, DEFAULT_CANDIDATES};
 pub use keyword::{Keywords, Scored, MAX_WEIGHT};
-pub use mutation::{Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize};
+pub use mutation::{
+    Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
+};
 pub use partition::{Embedded, Follower, Partition, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::{Live, Merging, State};

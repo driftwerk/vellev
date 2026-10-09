@@ -54,6 +54,10 @@ pub enum Error {
         missing: Option<Missing>,
         /// Where the fault lies, for a model a node cannot use.
         reason: Option<Reason>,
+        /// How long the node said to leave it before asking again, if it
+        /// said: as one does that is answering as many reads as it does
+        /// at once.
+        wait: Option<Duration>,
     },
     /// The tenant asked more of the node than it may; the request had no
     /// effect, and may be sent again after `wait`.
@@ -250,7 +254,8 @@ pub struct Options {
     pub attempts: u32,
     /// How long to wait before an address is asked again; each wait after
     /// is twice the one before, up to five seconds. An address that turns
-    /// a request away for asking too much says how long itself.
+    /// a request away for asking too much says how long itself, and so
+    /// may one that cannot answer just now.
     pub backoff: Duration,
     /// The most objects [`Records::store_all`] sends in one request.
     pub batch_objects: usize,
@@ -359,8 +364,8 @@ enum Kind {
     /// A change to the tenants whose effect is the same however many times
     /// it is made.
     Repeatable,
-    /// A change to a tenant's data, named so that a node answers a try of
-    /// it again as it answered the first.
+    /// A change to a tenant, to its data or its state, named so that a node
+    /// answers a try of it again as it answered the first.
     Write(RequestId),
 }
 
@@ -552,6 +557,13 @@ impl Client {
                         (_, Fate::Final, _) | (_, Fate::NotByThisNode, Kind::Write(_)) => None,
                         (Error::Limited { wait, .. }, ..) => Some(Tried::TurnedAway(*wait)),
                         (_, Fate::NotByThisNode, _) => Some(Tried::NotByThisAddress),
+                        (
+                            Error::Api {
+                                wait: Some(wait), ..
+                            },
+                            Fate::NoEffect | Fate::Unknown,
+                            _,
+                        ) => Some(Tried::Busy(*wait)),
                         (_, Fate::NoEffect | Fate::Unknown, _) => Some(Tried::MayPass),
                     };
                     kept = Err(failure);
@@ -632,6 +644,7 @@ impl Client {
                 limit: error.limit,
                 missing: error.missing,
                 reason: error.reason,
+                wait: retry_after,
             },
             Err(_) => Error::Status {
                 status,
@@ -679,24 +692,35 @@ impl Tenant {
         rest: &str,
         body: Option<&(impl Serialize + ?Sized)>,
     ) -> Result<Written> {
+        let written: Written = self.named(method, rest, body).await?;
+        self.reached(written.after());
+        Ok(written)
+    }
+
+    /// Send a change named afresh, the same name on every try, so that a
+    /// node answers a try of it again as it answered the first.
+    async fn named<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        rest: &str,
+        body: Option<&(impl Serialize + ?Sized)>,
+    ) -> Result<T> {
         let path = self.path(rest);
-        let written: Written = self
-            .client
-            .ask(
-                Kind::Write(RequestId::generate()),
-                method,
-                &path,
-                body,
-                Some(&self.id),
-            )
-            .await?;
+        let kind = Kind::Write(RequestId::generate());
+        self.client
+            .ask(kind, method, &path, body, Some(&self.id))
+            .await
+    }
+
+    /// Remember that this client's change left the tenant at `after`, so
+    /// that its reads are answered at or past it.
+    fn reached(&self, after: After) {
         let mut learnt = self.client.learnt();
         let known = learnt.entry(Some(self.id.clone())).or_default();
         known.after = Some(match known.after {
-            Some(known) => known.later(written.after()),
-            None => written.after(),
+            Some(known) => known.later(after),
+            None => after,
         });
-        Ok(written)
     }
 
     /// Send a request that may be sent again whatever came of it.
@@ -762,11 +786,15 @@ impl Tenant {
 
     /// Put this tenant back as it was; needs an admin key. Restoring a
     /// large tenant takes a while: give the client time with
-    /// [`Client::within`]. A restore sent again goes back to the same
-    /// place, as a commit of its own; one from a backup is refused as a
-    /// conflict while the first runs.
+    /// [`Client::within`]. The restore is named, the same on every try, so
+    /// a try sent again after an answer was lost is answered as the first
+    /// was, rather than going back again past what was written since.
+    /// Another restore of the tenant is refused as a conflict while one
+    /// runs. This client's reads are answered at or past the restore.
     pub async fn restore(&self, to: RestoreTo) -> Result<Restored> {
-        self.repeated(Method::POST, "/restore", Some(&to)).await
+        let restored: Restored = self.named(Method::POST, "/restore", Some(&to)).await?;
+        self.reached(restored.after());
+        Ok(restored)
     }
 
     /// Set how far back this tenant may be restored, in seconds, or with

@@ -19,7 +19,7 @@ The formats so far:
 
 | Format | Release | What it added |
 | --- | --- | --- |
-| 1 | first | logs (with the requests each answered), manifests (naming the checkpoint before, the logs committed while a flush built to replay over its segments from the position those segments hold, and the requests answered in the last fifteen minutes), segments, vectors files, clustered index files |
+| 1 | first | logs (with the requests each answered), manifests (naming the checkpoint before, the logs committed while a flush or a merge built to replay over its segments from the position those segments hold, and the requests answered in the last fifteen minutes), segments, vectors files, clustered index files |
 
 A release may, without a new format:
 
@@ -124,7 +124,7 @@ Clients and nodes of different releases talk to each other.
   name a client may not know, read as `unknown`.
 - The limits a node tells (`GET /v1/limits`) may gain fields. One added
   later is optional in the client's types, so that a node from before it
-  still reads; the first five are always told.
+  still reads; the first seven are always told.
 - A request may gain optional fields. A node refuses a field it does not
   understand, at any depth, so a client using a new field against an older
   node is told so rather than ignored.
@@ -139,6 +139,32 @@ registers the protocol it speaks.
 A release whose requests may hold something the previous one does not
 understand raises the protocol and sends such a request on only once
 every node registered speaks it.
+
+A restore is made once only by a node that records it under the request
+that named it (`x-vellev-request`). A node of a release before that ignores
+the header, so while such a node holds a tenant, a restore tried again
+after its answer was lost, sent to it or on to it, is made again, going
+back past whatever was written in between. Upgrade every node before
+asking for a restore, and ask for none while a deploy that adds this runs.
+
+A commit names the position and the head it was built on, and is recorded
+only if those are what is committed still, in the statement that checks
+its lease: two writers under one lease cannot both commit, nor one that
+has not seen what the other did. That is all in the statement a node
+sends, so it needs no migration, and a node of a release before, which
+names nothing, has its commits recorded as they always were: on whatever
+is committed, if they advance the position. While both releases run, only
+this release's writers are held to what they follow. A node opens one
+writer for each lease it takes, so two under one lease is not something a
+node does; the check is what makes that not matter.
+
+A delete by filter may carry a `limit`. A node of a release before refuses
+the field, as it does any it does not know, so page deletes only once
+every node is upgraded; without the field a delete of more than 8,192
+objects is refused by this release and made by the one before. So is a
+request with two deletes by filter and no limits, or with limits that come
+to more than 8,192 between them: the release before made it, and this one
+refuses it as invalid.
 
 ## What rollback covers
 
