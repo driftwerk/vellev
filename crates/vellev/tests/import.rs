@@ -3415,7 +3415,7 @@ async fn a_collection_emptied_by_another_writer_does_not_have_its_native_objects
 
 #[tokio::test]
 async fn notes_weaviate_writes_again_while_a_collection_is_taken_up_do_not_come_back() {
-    let Some(importing) = Importing::new("VellevImportRewritten", 150).await else {
+    let Some(importing) = Importing::new("VellevImportRewrittenBatch", 150).await else {
         return;
     };
     let class = importing.class;
