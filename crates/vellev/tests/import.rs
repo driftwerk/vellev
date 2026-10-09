@@ -4,7 +4,9 @@
 //! Where a test needs Weaviate or another writer to do something at a
 //! given moment of an import, or either side to fail, the import reaches
 //! Weaviate and the node each through a [`Proxy`] that does so around a
-//! chosen request.
+//! chosen request. One test restarts Weaviate itself, under a catch-up,
+//! and runs only when `VELLEV_WEAVIATE_CONTAINER` names the Docker
+//! container it runs in.
 
 mod common;
 
