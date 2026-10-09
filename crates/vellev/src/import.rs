@@ -1780,7 +1780,8 @@ impl<'a> Copying<'a> {
         while let Some(unlisted) = entries.next().await? {
             gone.push(Candidate::Entry(unlisted));
         }
-        // A class made again while it was walked is not gone on from.
+        // A class made again while it was walked is not gone on from, and
+        // one that is not ready is not asked what it does not hold.
         self.weaviate.steady(class, &self.plan.binding).await?;
         if self.options.sole_writer {
             self.orphans(&mut gone).await?;
@@ -1869,9 +1870,10 @@ impl<'a> Copying<'a> {
     /// now that the walk is over. More than the run may delete, none is:
     /// the answer is then false, and they are reported as pending.
     /// Otherwise each is asked for twice, a pause apart, with Weaviate
-    /// ready and the class as it was imported, and only one Weaviate
-    /// twice says it does not hold is deleted, if it is the import's.
-    /// One it does hold after all is settled as any other.
+    /// ready and the class as it was imported, as whoever calls this has
+    /// just seen it to be, and only one Weaviate twice says it does not
+    /// hold is deleted, if it is the import's. One it does hold after
+    /// all is settled as any other.
     async fn remove(&self, gone: Gone, copied: &mut Copied) -> Result<bool> {
         if gone.count == 0 {
             return Ok(true);
@@ -1887,7 +1889,6 @@ impl<'a> Copying<'a> {
         let class = &self.plan.class;
         let mut absent = Vec::new();
         let mut present = Vec::new();
-        self.weaviate.steady(class, &self.plan.binding).await?;
         for candidate in gone.candidates {
             match self.weaviate.held_by_all(class, candidate.id()).await? {
                 true => present.push(candidate),
