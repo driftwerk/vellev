@@ -3659,11 +3659,7 @@ async fn a_comparison_of_some_pages_does_not_always_look_at_the_first() {
         assert_eq!(verified.looked, 10);
         spoiled.push(verified.different);
     }
-    assert!(spoiled.contains(&10) || spoiled.contains(&0), "{spoiled:?}");
-    assert!(
-        spoiled.iter().any(|different| *different == 0),
-        "{spoiled:?}"
-    );
+    assert!(spoiled.contains(&0), "{spoiled:?}");
 }
 
 /// The note of where the class came from, as the tenant keeps it.
