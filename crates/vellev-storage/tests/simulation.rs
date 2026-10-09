@@ -569,6 +569,12 @@ fn walked(state: &State, page: usize, filter: Option<&Filter>, step: usize) -> V
         check(found.len() <= page, || {
             format!("a page of {page} held {} rows", found.len())
         })?;
+        let ids: Vec<ObjectId> = found.iter().map(Live::id).collect();
+        let ascending = ids.windows(2).all(|pair| pair[0] < pair[1]);
+        let onward = after.is_none_or(|after| ids.first().is_none_or(|id| *id > after));
+        check(ascending && onward, || {
+            format!("a page after {after:?} held {ids:?}")
+        })?;
         listed.extend(found.iter().map(|found| (found.id(), n_of(found))));
         if found.len() < page {
             break;

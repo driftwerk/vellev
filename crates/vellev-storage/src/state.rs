@@ -1684,6 +1684,11 @@ mod tests {
                 let found = self.state.list(&name, filter, after, page).unwrap();
                 let ids: Vec<ObjectId> = found.iter().map(Live::id).collect();
                 assert!(ids.len() <= page, "a page of {page} held {}", ids.len());
+                let ascending = ids.windows(2).all(|pair| pair[0] < pair[1]);
+                assert!(
+                    ascending && after.is_none_or(|after| ids.first().is_none_or(|id| *id > after)),
+                    "a page after {after:?} held {ids:?}"
+                );
                 walked.extend(ids);
                 if found.len() < page {
                     return walked;
