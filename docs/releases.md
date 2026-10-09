@@ -111,6 +111,43 @@ before runs on the migrated database.
 - **Vectors are never held in memory by a node with a cache directory.**
   A tenant whose vectors the cache cannot take, or whose disk does not
   answer, does not open, and is `unavailable` until it does.
+- **Every object read carries `version`**: 32 hexadecimal characters, a
+  hash of its properties and vector (docs/compatibility.md says exactly
+  how), from `GET …/objects/{id}`, `/list`, `/nearest`, `/keyword` and
+  `/hybrid`, whether or not the vector is sent along. Opaque: compare
+  for equality only. The same content has the same version under any
+  id, on any node, after any restore; a vector-only change gives a new
+  one; an object changed and changed back has its old one.
+- **A write can be made only if an object is still at a version**:
+  `only_if_version` in the body of `PUT` and `PATCH …/objects/{id}`, as
+  `?only_if_version=` on `DELETE …/objects/{id}`, and on `upsert`,
+  `patch` and `delete` in `POST …/changes`. At any other version the
+  write is refused as `conflict` (409) and `version` in the failure says
+  the one the object is at; a `patch` with `only_if` too must pass both,
+  and a `patch` refused by `only_if` now says `version` as well. On an
+  object that is not stored, a conditional write is `not_found` (404,
+  `missing: object`), as a `patch` is; a plain `delete` of one still
+  changes nothing. A change that leaves the content as it is is still
+  `unchanged`, and the version stays. In a batch, one change at a stale
+  version refuses the whole batch, as `only_if` does; a request named
+  again (`x-vellev-request`) is answered as it was, version and all. A
+  node of 0.1 refuses the field as one it does not know, so a conditional
+  write is never made unconditionally by mistake.
+- **A page of a collection costs its own size.** `/list` used to find
+  and sort every row of the collection for each page, so walking a
+  collection of N rows cost about N²/page. Measured in process, release
+  build, random ids, several segments and a memtable, before → after: a
+  page of 50 from the start of 4M rows 460 ms → 0.8 µs, of 1,000 483 ms
+  → 9 µs, of 50 from the middle 282 ms → 0.6 µs; a page of 50 under a
+  filter half the rows pass 209 ms → 216 µs; a whole walk of 300k rows
+  at page 50 77.9 s → 15 ms, of 4M rows at page 100 (about 3.7 hours
+  before, by its per-page cost) 0.48 s, and under that filter 4.7 s. A
+  filter few rows pass was and stays microseconds a page. The live rows
+  are now kept in key order for this, which costs a lookup a little
+  more: in the same run `get` 125 ns → 208 ns, writing 4M rows in
+  commits of 8,192 22.9 s → 33.0 s (2.5 µs a row more, in the writer's
+  memory work), opening 4M rows from their segments 3.35 s → 4.80 s.
+  Searches are unchanged.
 
 ### vellev-client
 
@@ -153,6 +190,9 @@ New:
 - `Error::Api` has `wait`: how long the node said to leave it before
   asking again, if it said.
 - `Options::better_within`.
+- `Records::delete_if_version(id, version)`, and `Error::version()`: the
+  version an object is at, when a write conditional on it was refused.
+  `Stored::version` on everything read.
 
 ### vellev-api
 
@@ -196,8 +236,18 @@ Breaking:
 - `Change::DeleteWhere` gains `limit: Option<u32>`, so writing the variant
   out needs the field. `Change::delete_where(collection, filter)` and
   `Change::delete_up_to(collection, filter, limit)` build it.
+- `Change::Upsert`, `Change::Patch` and `Change::Delete` gain
+  `only_if_version: Option<Version>`, so writing them out needs the
+  field. `Change::upsert(collection, id, content)`,
+  `Change::patch(collection, id, changes)`, `Change::delete(collection,
+  id)` and `Change::delete_if_version(collection, id, version)` build
+  them.
+- `Stored::new` takes the object's `version` as a fourth argument, and
+  `Stored` gains `version: Option<Version>`: `None` from a node of 0.1.
+- `Problem` gains `version`.
 
-New: `Bounded`, `Limit`, `Limits`, `Missing`, `Reason`, `Code::status()`.
+New: `Bounded`, `Limit`, `Limits`, `Missing`, `Reason`, `Code::status()`,
+`Content::only_if_version`, `Changes::only_if_version`.
 
 Not changed, and why: `Change`, `RestoreTo` and `Consistency` stay
 exhaustive, and `OnlyIf` and `Weighted` stay plain structs. A caller only
@@ -213,7 +263,9 @@ Breaking:
 
 - `ObjectError` is `#[non_exhaustive]`.
 
-New: `ModelFault`, itself `#[non_exhaustive]`.
+New: `ModelFault`, itself `#[non_exhaustive]`; `Version` and
+`VersionError`, with `Version::of(properties, vector)` and
+`Object::version()`.
 
 Not changed, and why: `EmbeddingProvider`, `HttpApi`, `DataType` and
 `Distance` stay exhaustive. They are stored, so a new variant of any is a

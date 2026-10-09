@@ -130,6 +130,64 @@ Clients and nodes of different releases talk to each other.
   node is told so rather than ignored.
 - A route is never removed or changed in meaning; a new one may be added.
 
+## Object versions
+
+Every object a node answers with carries a `version`, 32 hexadecimal
+characters, and a write may ask to be made only if the object is still at
+one (`only_if_version`). The version is a hash of the object's content,
+computed afresh wherever it is read or checked and stored nowhere, so a
+reader on one node and a writer on another must compute it alike, or a
+client that read from the one and writes through the other is refused for
+nothing. How it is computed is therefore a contract between releases, like
+a file format: changing any of it is a breaking change, made only in a
+release that says so, after which every version a client holds is stale
+and its conditional writes are refused until it reads again.
+
+The version is the first 16 bytes of SHA-256 over, in this order:
+
+1. the bytes `vellev object version 1` and a newline;
+2. the number of properties the object has, as a little-endian u64. Only
+   properties with a value count: a property never sent and one sent as
+   JSON `null` are alike absent, and the object has no entry for either;
+3. each property in the order of its name's bytes (the order the stored
+   map keeps): the name's length in bytes as a little-endian u64, the
+   name's UTF-8 bytes, one tag byte for the stored type, then the value:
+   - text (tag 1): the length as a u64, then the UTF-8 bytes, byte for
+     byte, with no normalisation of any kind;
+   - text array (tag 2): the count as a u64, then each text as above;
+   - int (tag 3): the i64, little-endian;
+   - number (tag 4): the f64's bits, little-endian, with `-0.0` taken as
+     `0.0`. What is hashed is the stored value, not the JSON it came as:
+     `1` and `1.0` sent for a number property parse to one f64 and are
+     one version, and a decimal that does not round-trip is hashed as the
+     f64 it parsed to;
+   - bool (tag 5): one byte, 0 or 1;
+   - date (tag 6): the instant as seconds since the Unix epoch, an i64
+     little-endian, then its nanoseconds within the second, a u32
+     little-endian; the zone it was sent in does not count;
+4. the vector: one byte 0 if the object has none, else one byte 1, the
+   number of dimensions as a u64, then each f32's bits, little-endian, in
+   order, with `-0.0` taken as `0.0`.
+
+The one normalisation, of negative zero, is what the writer already does
+when it asks whether a write changes anything: a number or a vector
+element compared equal is the same content, and so the same version.
+
+Not covered: the object's id, which is the key the version belongs to;
+the collection and its schema; the position the object was written at;
+who wrote it, or when. Two objects of the same content have the same
+version, under any id, in any collection, on any node, after any restore.
+
+`vellev-core` pins the contract with golden versions of fixed objects
+(`version::tests::a_version_is_what_the_contract_says_it_is`), computed
+again outside the crate from this description; a change that gives those
+objects other versions fails the test, which is the point.
+
+A node of a release before versions refuses `only_if_version`, as it does
+any field it does not know, so a conditional write sent to one is refused
+rather than made unconditionally; it answers objects without `version`,
+which the client crate reads as `None`.
+
 ## Between nodes
 
 A node sends writes for a tenant on to the node that holds it, marked
