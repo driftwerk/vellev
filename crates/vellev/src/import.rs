@@ -205,6 +205,8 @@ impl Options {
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Report {
     pub classes: BTreeMap<String, Copied>,
+    /// Classes passed over because their import was ended.
+    pub ended: Vec<String>,
 }
 
 /// How a run ended.
@@ -248,6 +250,12 @@ pub struct Copied {
     /// Objects gone from Weaviate that this run left in the collection
     /// because they were not as the import had stored them.
     pub left: u64,
+    /// Objects of Weaviate's that were not copied, by the ledger's mark:
+    /// those a collection lacked, or held otherwise, when it was taken up
+    /// without a ledger, there being no telling whether another writer
+    /// had deleted or changed them. They are copied by a run told that
+    /// nothing else wrote to the collection.
+    pub withheld: u64,
     /// Objects gone from Weaviate that this run did not delete, though
     /// they may be the import's: it was told to delete none, or they are
     /// more than `budget`, what it may delete.
@@ -259,7 +267,8 @@ pub struct Copied {
     /// that replaces one safely says twice over what it holds.
     pub too_large: Vec<String>,
     /// How many objects Weaviate held at the end, how many of Weaviate's
-    /// the ledger had accounted for, and how many the collection held.
+    /// the ledger had accounted for, those withheld aside, and how many
+    /// the collection held.
     pub weaviate: u64,
     pub imported: u64,
     pub vellev: u64,
@@ -272,7 +281,8 @@ pub struct Copied {
 /// What comparing a collection with Weaviate object by object found.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Verified {
-    /// Objects of Weaviate's looked at.
+    /// Objects looked at: of Weaviate's, or, where only some are looked
+    /// at, of those the ledger has.
     pub looked: u64,
     /// Those the collection holds exactly as Weaviate does.
     pub same: u64,
@@ -280,10 +290,13 @@ pub struct Verified {
     /// them for the import's.
     pub different: u64,
     pub missing: u64,
-    /// Those the ledger marks as another writer's, and those it has no
-    /// entry for.
+    /// Those the ledger marks as another writer's or as withheld, those
+    /// it has no entry for, and those it has that Weaviate no longer
+    /// holds.
     pub kept: u64,
+    pub withheld: u64,
     pub unaccounted: u64,
+    pub gone: u64,
     /// Some of the ids that differ or are missing.
     pub examples: Vec<String>,
 }
@@ -294,18 +307,22 @@ impl Copied {
     /// not if Weaviate was written to behind the catch-up; another run
     /// catches up.
     pub fn caught_up(&self) -> bool {
-        self.weaviate + self.pending == self.imported + self.refused.len() as u64
+        let accounted = self.imported + self.withheld + self.refused.len() as u64;
+        self.weaviate + self.pending == accounted
     }
 
     /// Whether something is left that running again does not put right:
-    /// more gone than a run may delete, objects vellev cannot hold, or
-    /// objects found different by a comparison.
+    /// objects not copied or not deleted, objects vellev cannot hold, or
+    /// a comparison that found differences or nothing to compare.
     pub fn unsettled(&self) -> bool {
-        let verified = self.verified.as_ref();
-        self.budget.is_some()
+        let wrong = |verified: &Verified| {
+            verified.different + verified.missing > 0 || (verified.looked == 0 && self.weaviate > 0)
+        };
+        self.withheld > 0
+            || self.pending > 0
             || !self.refused.is_empty()
             || !self.too_large.is_empty()
-            || verified.is_some_and(|verified| verified.different + verified.missing > 0)
+            || self.verified.as_ref().is_some_and(wrong)
     }
 
     /// Whether the collection holds as many objects as the import has
@@ -324,7 +341,7 @@ impl Copied {
             Settled::Refused(why) => {
                 self.refused.insert(id.to_string(), why);
             }
-            Settled::Foreign | Settled::Same => {}
+            Settled::Foreign | Settled::Withheld | Settled::Same => {}
         }
     }
 }
@@ -337,6 +354,9 @@ enum Settled {
     Deleted,
     /// It is another writer's, or was deleted by one: the ledger says so.
     Foreign,
+    /// It was not copied into a collection taken up without a ledger:
+    /// the ledger says so.
+    Withheld,
     /// Gone from Weaviate and another writer's: left, and forgotten.
     Left,
     /// The collection already held what Weaviate does, or neither held it.
@@ -408,10 +428,24 @@ enum Copy {
 #[derive(Debug, Clone)]
 struct Item {
     id: ObjectId,
-    /// When Weaviate says it last changed.
+    /// When Weaviate says it was made, and last changed.
+    created: Option<i64>,
     updated: Option<i64>,
     content: Content,
     hash: String,
+}
+
+/// What the ledger says the collection holds under an id.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mark {
+    /// What the hash says, as far as the import has seen.
+    Stored,
+    /// Something else, or nothing: another writer's doing.
+    Foreign,
+    /// Something else, or nothing, found so when the collection was taken
+    /// up without a ledger: the object was not copied, there being no
+    /// telling whose doing it was.
+    Withheld,
 }
 
 /// What the ledger says of one id.
@@ -420,17 +454,16 @@ struct Entry {
     id: ObjectId,
     updated: Option<i64>,
     hash: String,
-    /// That the collection did not hold the object as the import would
-    /// have it when the import last looked.
-    foreign: bool,
+    mark: Mark,
 }
 
 impl Entry {
-    const PROPERTIES: [(&'static str, DataType); 4] = [
+    const PROPERTIES: [(&'static str, DataType); 5] = [
         ("updated", DataType::Int),
         ("hash", DataType::Text),
         ("foreign", DataType::Bool),
         ("version", DataType::Int),
+        ("withheld", DataType::Bool),
     ];
 
     fn read(stored: Stored) -> Result<Self> {
@@ -443,17 +476,25 @@ impl Entry {
             hash: hash
                 .ok_or_else(|| eyre!("the ledger's entry for {} has no hash", stored.id))?
                 .to_string(),
-            foreign: property("foreign") == Some(&json!(true)),
+            mark: match ["withheld", "foreign"].map(|mark| property(mark) == Some(&json!(true))) {
+                [true, _] => Mark::Withheld,
+                [_, true] => Mark::Foreign,
+                _ => Mark::Stored,
+            },
         })
     }
 
     /// As the ledger holds it. What is as usual is left out, and costs
     /// nothing: the first version, and an object that is the import's.
-    fn properties(item: &Item, foreign: bool) -> Map<String, Value> {
+    fn properties(item: &Item, mark: Mark) -> Map<String, Value> {
         let updated = item.updated.map(|updated| ("updated", json!(updated)));
-        let foreign = foreign.then_some(("foreign", json!(true)));
+        let mark = match mark {
+            Mark::Stored => None,
+            Mark::Foreign => Some(("foreign", json!(true))),
+            Mark::Withheld => Some(("withheld", json!(true))),
+        };
         let version = (VERSION > 1).then(|| ("version", json!(VERSION)));
-        [updated, Some(("hash", json!(item.hash))), foreign, version]
+        [updated, Some(("hash", json!(item.hash))), mark, version]
             .into_iter()
             .flatten()
             .map(|(name, value)| (name.to_string(), value))
@@ -503,7 +544,12 @@ pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Re
     let mut report = Report::default();
     if let Mode::Verify { pages } = options.mode {
         for class in classes {
-            let (plan, _, _) = prepare(&weaviate, class, tenant, source, options).await?;
+            let name = class.class.clone();
+            let prepared = prepare(&weaviate, class, tenant, source, options).await?;
+            let Some((plan, _, _)) = prepared else {
+                report.ended.push(name);
+                continue;
+            };
             let copying = Copying::new(&weaviate, tenant, &plan, options);
             let copied = Copied {
                 verified: Some(copying.verify(pages).await?),
@@ -512,7 +558,7 @@ pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Re
                 vellev: plan.records.count(None).await?,
                 ..Copied::default()
             };
-            report.classes.insert(plan.class.class.clone(), copied);
+            report.classes.insert(name, copied);
         }
         return Ok(report);
     }
@@ -522,7 +568,12 @@ pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Re
     tenant.create().await?;
     let mut plans = Vec::new();
     for class in classes {
-        let (plan, warnings, begins) = prepare(&weaviate, class, tenant, source, options).await?;
+        let name = class.class.clone();
+        let prepared = prepare(&weaviate, class, tenant, source, options).await?;
+        let Some((plan, warnings, begins)) = prepared else {
+            report.ended.push(name);
+            continue;
+        };
         if begins {
             // Whatever the state file says of the class was said of a
             // collection that is no longer there, or of an import that
@@ -546,6 +597,7 @@ pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Re
             // Every id Weaviate held has its entry: one without from now
             // on is new to Weaviate.
             plan.binding.adopting = false;
+            plan.binding.adopting_since = None;
             tenant
                 .apply(vec![plan.binding.change(&plan.schema.name)])
                 .await?;
@@ -564,7 +616,7 @@ pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Re
             state.save(&options.state)?;
         }
         copied.weaviate = weaviate.count(&plan.class).await?;
-        copied.imported = plan.ledger.count(None).await?;
+        copied.imported = plan.ledger.count(None).await? - copied.withheld;
         copied.vellev = plan.records.count(None).await?;
     }
     Ok(report)
@@ -633,14 +685,26 @@ fn object_id(id: &str) -> Result<ObjectId> {
 /// and whether its copying begins from the start. Unless the run only
 /// verifies, the collection is made if there is none, or else given the
 /// properties the class has gained, and its ledger and the note of where
-/// it came from are made beside it.
+/// it came from are made beside it. Nothing, for a class whose import was
+/// ended, in a run of every class: it is passed over.
 async fn prepare(
     weaviate: &Weaviate,
     class: Class,
     tenant: &Tenant,
     source: &Source,
     options: &Options,
-) -> Result<(Plan, Vec<String>, bool)> {
+) -> Result<Option<(Plan, Vec<String>, bool)>> {
+    let name = CollectionName::new(&class.class)
+        .map_err(|error| eyre!("class {}: {error}", class.class))?;
+    let bound = tenant
+        .collection(&imports())
+        .get(Binding::id(&name))
+        .await?;
+    let bound = bound.as_ref().map(Binding::read).transpose()?;
+    let ended = bound.as_ref().is_some_and(|bound| bound.finalised);
+    if ended && options.classes.is_empty() {
+        return Ok(None);
+    }
     if class.multi_tenant() && weaviate.tenant.is_none() {
         bail!(
             "class {} has multi-tenancy on; say which Weaviate tenant to copy",
@@ -663,8 +727,6 @@ async fn prepare(
             ),
         },
     };
-    let name = CollectionName::new(&class.class)
-        .map_err(|error| eyre!("class {}: {error}", class.class))?;
     let ledger = ledger_of(&name)?;
     let records = tenant.collection(&name);
     let stored = records.schema().await?;
@@ -689,11 +751,6 @@ async fn prepare(
     };
     let (wanted, mut warnings) = collection(&class, &vector, embedding, options)?;
     warnings.extend(vectorless);
-    let bound = tenant
-        .collection(&imports())
-        .get(Binding::id(&name))
-        .await?;
-    let bound = bound.as_ref().map(Binding::read).transpose()?;
     let ledgered = tenant.collection(&ledger).schema().await?;
     let identity = weaviate.identity(&class).await?;
     let mut binding = Binding {
@@ -703,8 +760,10 @@ async fn prepare(
         updated_as: options.updated_as.clone(),
         shards: identity.clone(),
         adopting: false,
+        adopting_since: None,
         finalised: false,
     };
+    let now = Utc::now().timestamp_millis();
     let mut changes = Vec::new();
     let mut begins = stored.is_none();
     let schema = match stored {
@@ -733,9 +792,12 @@ async fn prepare(
                     // is gone is taken up from the start.
                     binding.adopting = bound.adopting || ledgered.is_none();
                     begins = ledgered.is_none();
+                    let since = bound.adopting_since.filter(|_| !begins).unwrap_or(now);
+                    binding.adopting_since = binding.adopting.then_some(since);
                 }
                 None => {
                     binding.adopting = true;
+                    binding.adopting_since = Some(now);
                     begins = true;
                 }
             }
@@ -779,7 +841,7 @@ async fn prepare(
         vector,
         binding,
     };
-    Ok((plan, warnings, begins))
+    Ok(Some((plan, warnings, begins)))
 }
 
 /// A collection of the import's own notes: nothing in it is searched,
@@ -845,14 +907,16 @@ struct Binding {
     /// shards are named after them.
     shards: Option<String>,
     /// That the collection was there before its ledger, and not every id
-    /// of Weaviate's has its entry yet.
+    /// of Weaviate's has its entry yet; and when, by this machine's
+    /// clock, its taking up began.
     adopting: bool,
+    adopting_since: Option<i64>,
     /// That the import of the collection has ended.
     finalised: bool,
 }
 
 impl Binding {
-    const PROPERTIES: [(&'static str, DataType); 8] = [
+    const PROPERTIES: [(&'static str, DataType); 9] = [
         ("class", DataType::Text),
         ("source", DataType::Text),
         ("createdAs", DataType::Text),
@@ -861,6 +925,7 @@ impl Binding {
         ("adopting", DataType::Bool),
         ("finalised", DataType::Bool),
         ("version", DataType::Int),
+        ("adoptingSince", DataType::Int),
     ];
 
     /// Where a collection's binding is kept: under an id made of its name,
@@ -883,6 +948,7 @@ impl Binding {
             flag(self.adopting),
             flag(self.finalised),
             Some(json!(VERSION)),
+            self.adopting_since.map(|since| json!(since)),
         ];
         let properties = Self::PROPERTIES.iter().zip(values);
         Change::Upsert {
@@ -910,6 +976,7 @@ impl Binding {
             updated_as: text("updatedAs"),
             shards: text("shards"),
             adopting: flag("adopting"),
+            adopting_since: property("adoptingSince").and_then(Value::as_i64),
             finalised: flag("finalised"),
         })
     }
@@ -1068,25 +1135,60 @@ fn batches(steps: Vec<Step>, most: usize, bytes: usize) -> Vec<Vec<Step>> {
     batches
 }
 
-/// What the ledger has that a walk of Weaviate did not list: gone from
-/// it, unless Weaviate says otherwise when asked for each. No more are
-/// kept than a run may delete, and one over, to tell.
+/// An object the collection may hold that Weaviate does not.
+#[derive(Debug, Clone, PartialEq)]
+enum Candidate {
+    /// What the ledger has that a walk of Weaviate did not list.
+    Entry(Entry),
+    /// What the collection holds that neither Weaviate listed nor the
+    /// ledger has: looked for only where nothing but an import is said
+    /// to have written to the collection.
+    Orphan(ObjectId),
+}
+
+impl Candidate {
+    fn id(&self) -> ObjectId {
+        match self {
+            Candidate::Entry(entry) => entry.id,
+            Candidate::Orphan(id) => *id,
+        }
+    }
+}
+
+/// What may be gone from Weaviate, unless it says otherwise when asked
+/// for each. No more are kept than a run may delete, and one over, to
+/// tell.
 struct Gone {
-    entries: Vec<Entry>,
+    candidates: Vec<Candidate>,
     count: u64,
-    /// How many of them the ledger marks as another writer's.
+    /// How many of them the ledger marks as another writer's, and as
+    /// withheld.
     foreign: u64,
+    withheld: u64,
     budget: u64,
 }
 
 impl Gone {
-    fn push(&mut self, entry: Entry) {
+    fn push(&mut self, candidate: Candidate) {
         self.count += 1;
-        self.foreign += u64::from(entry.foreign);
+        if let Candidate::Entry(entry) = &candidate {
+            self.foreign += u64::from(entry.mark == Mark::Foreign);
+            self.withheld += u64::from(entry.mark == Mark::Withheld);
+        }
         if self.count <= self.budget {
-            self.entries.push(entry);
+            self.candidates.push(candidate);
         }
     }
+}
+
+/// What Weaviate says of an id being settled.
+#[derive(Clone, Copy)]
+enum Now<'a> {
+    Holds(&'a Item),
+    /// It holds no such object, and the ledger has the id.
+    Gone,
+    /// It holds no such object, and the ledger has no such id.
+    Orphan,
 }
 
 /// One class being copied.
@@ -1158,6 +1260,7 @@ impl<'a> Copying<'a> {
             };
             let last = last.id.clone();
             let items = self.items(&page, copied)?;
+            self.weaviate.steady(&plan.class, &plan.binding).await?;
             if plan.binding.adopting {
                 let from = after.as_deref().map(object_id).transpose()?;
                 let entries =
@@ -1175,12 +1278,12 @@ impl<'a> Copying<'a> {
     }
 
     /// Note in the ledger what Weaviate holds under the item's id, and
-    /// whether the collection holds it otherwise: in place of the entry
-    /// `known` to be there, or else only if there is still none, the
-    /// step failing otherwise.
-    fn note(&self, item: &Item, known: bool, foreign: bool) -> Change {
+    /// what the collection holds by `mark`: in place of the entry `known`
+    /// to be there, or else only if there is still none, the step failing
+    /// otherwise.
+    fn note(&self, item: &Item, known: bool, mark: Mark) -> Change {
         let collection = self.plan.ledger_name.clone();
-        let properties = Entry::properties(item, foreign);
+        let properties = Entry::properties(item, mark);
         let (id, vector) = (item.id, None);
         match known {
             true => Change::Upsert {
@@ -1199,26 +1302,27 @@ impl<'a> Copying<'a> {
     }
 
     /// The note, unless the entry already says as much.
-    fn noting(&self, item: &Item, entry: Option<&Entry>, foreign: bool) -> Vec<Change> {
+    fn noting(&self, item: &Item, entry: Option<&Entry>, mark: Mark) -> Vec<Change> {
         let said = entry.is_some_and(|entry| {
-            (&entry.hash, entry.updated, entry.foreign) == (&item.hash, item.updated, foreign)
+            (&entry.hash, entry.updated, entry.mark) == (&item.hash, item.updated, mark)
         });
         match said {
             true => Vec::new(),
-            false => vec![self.note(item, entry.is_some(), foreign)],
+            false => vec![self.note(item, entry.is_some(), mark)],
         }
     }
 
     /// Store the object and its entry, if the collection holds nothing
-    /// under its id and the ledger no entry; otherwise the step fails.
-    fn fresh(&self, item: &Item) -> Vec<Change> {
+    /// under its id, and the ledger no entry or the one read; otherwise
+    /// the step fails.
+    fn fresh(&self, item: &Item, entry: Option<&Entry>) -> Vec<Change> {
         let object = Change::Insert {
             collection: self.data(),
             id: item.id,
             properties: item.content.properties.clone(),
             vector: item.content.vector.clone(),
         };
-        vec![object, self.note(item, false, false)]
+        vec![object, self.note(item, entry.is_some(), Mark::Stored)]
     }
 
     /// Store the item in place of `stored`, if that is still as it was
@@ -1231,7 +1335,7 @@ impl<'a> Copying<'a> {
             properties: item.content.properties.clone(),
             vector: item.content.vector.clone(),
         });
-        changes.push(self.note(item, known, false));
+        changes.push(self.note(item, known, Mark::Stored));
         changes
     }
 
@@ -1272,14 +1376,30 @@ impl<'a> Copying<'a> {
     /// under its id: not while the ledger says the import stored exactly
     /// this, and it is nobody else's.
     fn reads(item: &Item, entry: Option<&Entry>) -> bool {
-        !entry.is_some_and(|entry| entry.hash == item.hash && !entry.foreign)
+        !entry.is_some_and(|entry| entry.hash == item.hash && entry.mark == Mark::Stored)
+    }
+
+    /// Whether Weaviate made the item after the collection began to be
+    /// taken up, by more than the two clocks may disagree: it is then new
+    /// to Weaviate, as one the walk had already passed would be taken to
+    /// be, and not something the collection once held.
+    fn made_since(&self, item: &Item) -> bool {
+        let skew = self.options.skew.as_millis() as i64;
+        let since = self.plan.binding.adopting_since;
+        since.is_some_and(|since| item.created.is_some_and(|created| created > since + skew))
     }
 
     /// What brings the collection to hold what Weaviate does under the
     /// item's id, if what it holds, `stored`, is the import's to change,
-    /// and the ledger to say what Weaviate holds. While a collection that
-    /// had no ledger is `adopted`, what it lacks is not stored and what
-    /// differs is not replaced, unless nothing else has written to it.
+    /// and the ledger to say what Weaviate holds.
+    ///
+    /// While a collection that had no ledger is `adopted`, an id without
+    /// an entry is not vouched for: what the collection lacks under it is
+    /// not stored and what differs is not replaced, but marked as
+    /// withheld, unless Weaviate made the object since. What is so marked
+    /// is stored or replaced, then or by any later run, once nothing but
+    /// an import is said to have written to the collection. What is
+    /// marked as another writer's never is.
     fn settling(
         &self,
         item: &Item,
@@ -1288,49 +1408,69 @@ impl<'a> Copying<'a> {
         adopted: bool,
     ) -> (Vec<Change>, Settled) {
         if !Self::reads(item, entry) {
-            return (self.noting(item, entry, false), Settled::Same);
+            return (self.noting(item, entry, Mark::Stored), Settled::Same);
         }
         let held = stored.and_then(|stored| self.plan.hash(stored));
         let ours = entry.is_some_and(|entry| held.as_deref() == Some(entry.hash.as_str()));
-        let sole = adopted && self.options.sole_writer;
+        let withheld = entry.is_some_and(|entry| entry.mark == Mark::Withheld);
+        let unvouched = withheld || (adopted && entry.is_none());
+        let sole = unvouched && self.options.sole_writer;
         match (entry, stored) {
-            (None, None) if adopted && !sole => {
-                (vec![self.note(item, false, true)], Settled::Foreign)
-            }
-            (None, None) => (self.fresh(item), Settled::Stored),
             (_, Some(_)) if held.as_deref() == Some(item.hash.as_str()) => {
-                (self.noting(item, entry, false), Settled::Same)
+                (self.noting(item, entry, Mark::Stored), Settled::Same)
             }
             (Some(_), Some(stored)) if ours => {
                 (self.replace(stored, item, true), Settled::Replaced)
             }
-            (None, Some(stored)) if sole => (self.replace(stored, item, false), Settled::Replaced),
-            _ => (self.noting(item, entry, true), Settled::Foreign),
+            (None, None) if !adopted || self.made_since(item) => {
+                (self.fresh(item, None), Settled::Stored)
+            }
+            (_, None) if sole => (self.fresh(item, entry), Settled::Stored),
+            (_, Some(stored)) if sole => (
+                self.replace(stored, item, entry.is_some()),
+                Settled::Replaced,
+            ),
+            _ if unvouched => (self.noting(item, entry, Mark::Withheld), Settled::Withheld),
+            _ => (self.noting(item, entry, Mark::Foreign), Settled::Foreign),
         }
     }
 
-    /// Delete what the import stored under an id Weaviate no longer has,
-    /// if the collection still holds it so, and forget the id. The one
-    /// place a delete of an object is made.
-    fn removing(&self, entry: &Entry, stored: Option<&Stored>) -> (Vec<Change>, Settled) {
+    /// Delete what the collection holds under `id`, which Weaviate no
+    /// longer has, if it is the import's to delete, and forget the id.
+    /// It is the import's if it is as the ledger's entry says the import
+    /// stored it; or, where nothing but an import is said to have written
+    /// to the collection, if it was withheld or the ledger has no entry
+    /// for it. The one place a delete of an object is made.
+    fn removing(
+        &self,
+        id: ObjectId,
+        entry: Option<&Entry>,
+        stored: Option<&Stored>,
+    ) -> (Vec<Change>, Settled) {
         let held = stored.and_then(|stored| self.plan.hash(stored));
+        let mine = match entry {
+            Some(entry) if held.as_deref() == Some(entry.hash.as_str()) => true,
+            Some(entry) => entry.mark == Mark::Withheld && self.options.sole_writer,
+            None => self.options.sole_writer,
+        };
+        let forget = entry.map(|_| self.forget(id));
         match stored {
-            Some(stored) if held.as_deref() == Some(entry.hash.as_str()) => {
+            Some(stored) if mine => {
                 let mut changes = self.unless_changed(stored);
                 changes.push(Change::Delete {
                     collection: self.data(),
-                    id: entry.id,
+                    id,
                 });
-                changes.push(self.forget(entry.id));
+                changes.extend(forget);
                 (changes, Settled::Deleted)
             }
-            Some(_) => (vec![self.forget(entry.id)], Settled::Left),
-            None => (vec![self.forget(entry.id)], Settled::Same),
+            Some(_) => (forget.into_iter().collect(), Settled::Left),
+            None => (forget.into_iter().collect(), Settled::Same),
         }
     }
 
-    /// Settle one object: the item Weaviate holds now, or, with none, an
-    /// id Weaviate has been found not to hold. A step refused because
+    /// Settle one object: the item Weaviate holds now, or an id Weaviate
+    /// has been found not to hold. A step refused because
     /// the object or its entry is not as it was read is made again from
     /// a new reading, and after enough of that the object is left to
     /// whoever keeps writing it. Refused though both read as before, the
@@ -1338,7 +1478,7 @@ impl<'a> Copying<'a> {
     async fn settle(
         &self,
         id: ObjectId,
-        now: Option<&Item>,
+        now: Now<'_>,
         mut entry: Option<Entry>,
         adopted: bool,
     ) -> Result<Settled> {
@@ -1347,17 +1487,22 @@ impl<'a> Copying<'a> {
             if attempt > 0 {
                 entry = self.entry(id).await?;
             }
-            let reads = now.is_none_or(|item| Self::reads(item, entry.as_ref()));
+            let reads = match now {
+                Now::Holds(item) => Self::reads(item, entry.as_ref()),
+                Now::Gone | Now::Orphan => true,
+            };
             let stored = match reads {
                 true => self.plan.records.get(id).await?,
                 false => None,
             };
             let (changes, settled) = match (now, &entry) {
-                (Some(item), entry) => {
+                (Now::Holds(item), entry) => {
                     self.settling(item, entry.as_ref(), stored.as_ref(), adopted)
                 }
-                (None, Some(entry)) => self.removing(entry, stored.as_ref()),
-                (None, None) => return Ok(Settled::Same),
+                (Now::Gone, None) => return Ok(Settled::Same),
+                (Now::Gone | Now::Orphan, entry) => {
+                    self.removing(id, entry.as_ref(), stored.as_ref())
+                }
             };
             if changes.is_empty() {
                 return Ok(settled);
@@ -1380,7 +1525,7 @@ impl<'a> Copying<'a> {
                     return Ok(Settled::TooLarge)
                 }
                 (Some(Refusal::TooLarge), error) | (Some(Refusal::Unfit(_)), error)
-                    if self.options.skip_refused && now.is_some() =>
+                    if self.options.skip_refused && matches!(now, Now::Holds(_)) =>
                 {
                     return Ok(Settled::Refused(error.to_string()))
                 }
@@ -1415,7 +1560,7 @@ impl<'a> Copying<'a> {
                     for step in batch {
                         let id = step.item.id;
                         let entry = self.entry(id).await?;
-                        let settled = self.settle(id, Some(&step.item), entry, adopted);
+                        let settled = self.settle(id, Now::Holds(&step.item), entry, adopted);
                         made.push((id, settled.await?));
                     }
                 }
@@ -1434,7 +1579,7 @@ impl<'a> Copying<'a> {
     /// at a time.
     async fn store(&self, items: Vec<Item>, copied: &mut Copied) -> Result<()> {
         let step = |item: Item| Step {
-            changes: self.fresh(&item),
+            changes: self.fresh(&item, None),
             settled: Settled::Stored,
             item,
         };
@@ -1554,29 +1699,34 @@ impl<'a> Copying<'a> {
     }
 
     /// How many objects of a class whose ledger holds `ledgered` a run
-    /// may delete.
+    /// may delete: the fewer of a count and a part of the ledger, and,
+    /// unless that part is all of it, never the last of them.
     fn budget(&self, ledgered: u64) -> u64 {
         match self.options.deletes {
             Deletes::None => 0,
             Deletes::UpTo { count, fraction } => {
-                count.min((ledgered as f64 * fraction).ceil() as u64)
+                let part = (ledgered as f64 * fraction).ceil() as u64;
+                let all = if fraction < 1.0 { 1 } else { 0 };
+                count.min(part).min(ledgered.saturating_sub(all))
             }
         }
     }
 
     /// Walk Weaviate's ids beside the ledger's, both in id order, and
-    /// settle each object the ledger does not have as Weaviate lists it
-    /// and each changed since `since`; then see to what the ledger has
-    /// that Weaviate did not list. Whether every one of those was seen
-    /// to: if not, the catch-up is to be made again from where the last
-    /// one began.
+    /// settle each object the ledger does not have as Weaviate lists it,
+    /// each changed since `since`, and each that was withheld if the
+    /// collection is now said to have had no other writer; then see to
+    /// what the collection may hold that Weaviate did not list. Whether
+    /// every one of those was seen to: if not, the catch-up is to be made
+    /// again from where the last one began.
     async fn catch_up(&self, since: i64, copied: &mut Copied) -> Result<bool> {
         let class = &self.plan.class;
         let ledgered = self.plan.ledger.count(None).await?;
         let mut gone = Gone {
-            entries: Vec::new(),
+            candidates: Vec::new(),
             count: 0,
             foreign: 0,
+            withheld: 0,
             budget: self.budget(ledgered),
         };
         let mut entries = Entries::new(&self.plan.ledger, self.options.page, None);
@@ -1604,16 +1754,19 @@ impl<'a> Copying<'a> {
                 }
                 cursor = Some((seen.id.clone(), id));
                 while let Some(unlisted) = entries.before(id).await? {
-                    gone.push(unlisted);
+                    gone.push(Candidate::Entry(unlisted));
                 }
                 let entry = entries.at(id).await?;
+                let mark = entry.as_ref().map(|entry| entry.mark);
                 let noted = entry
                     .as_ref()
                     .is_some_and(|entry| entry.updated == seen.updated);
-                if !noted || seen.updated.unwrap_or(i64::MAX) >= since {
+                let owed = mark == Some(Mark::Withheld) && self.options.sole_writer;
+                if !noted || owed || seen.updated.unwrap_or(i64::MAX) >= since {
                     wanted.push((id, entry));
                 } else {
-                    copied.kept += u64::from(entry.is_some_and(|entry| entry.foreign));
+                    copied.kept += u64::from(mark == Some(Mark::Foreign));
+                    copied.withheld += u64::from(mark == Some(Mark::Withheld));
                 }
             }
             let Some((_, through)) = cursor.clone() else {
@@ -1625,7 +1778,12 @@ impl<'a> Copying<'a> {
             self.revisit(listing, wanted, &mut gone, copied).await?;
         }
         while let Some(unlisted) = entries.next().await? {
-            gone.push(unlisted);
+            gone.push(Candidate::Entry(unlisted));
+        }
+        // A class made again while it was walked is not gone on from.
+        self.weaviate.steady(class, &self.plan.binding).await?;
+        if self.options.sole_writer {
+            self.orphans(&mut gone).await?;
         }
         self.remove(gone, copied).await
     }
@@ -1645,12 +1803,18 @@ impl<'a> Copying<'a> {
         }
         let ids: Vec<ObjectId> = wanted.iter().map(|(id, _)| *id).collect();
         let mut fetched = self.fetch(cursor, &ids, span, copied).await?;
+        // What was fetched is stored only if it came of the class that
+        // was imported: one made again meanwhile holds other objects
+        // under the same ids.
+        self.weaviate
+            .steady(&self.plan.class, &self.plan.binding)
+            .await?;
         let mut settling = Vec::new();
         for (id, entry) in wanted {
             match (fetched.remove(&id), entry) {
                 (Some(Some(item)), entry) => settling.push((item, entry)),
                 (Some(None), _) | (None, None) => {}
-                (None, Some(entry)) => gone.push(entry),
+                (None, Some(entry)) => gone.push(Candidate::Entry(entry)),
             }
         }
         let reads = |(item, entry): &(Item, Option<Entry>)| Self::reads(item, entry.as_ref());
@@ -1671,18 +1835,43 @@ impl<'a> Copying<'a> {
         };
         let steps = settling.into_iter().map(step).collect();
         let made = self.make(steps, false, copied).await?;
-        let foreign = |(_, settled): &&(ObjectId, Settled)| *settled == Settled::Foreign;
-        copied.kept += made.iter().filter(foreign).count() as u64;
+        let marked = |mark: Settled| made.iter().filter(|(_, settled)| *settled == mark).count();
+        copied.kept += marked(Settled::Foreign) as u64;
+        copied.withheld += marked(Settled::Withheld) as u64;
         Ok(())
     }
 
-    /// See to what the ledger has that Weaviate did not list, now that
-    /// the walk is over. More than the run may delete, none is: the
-    /// answer is then false, and they are reported as pending. Otherwise
-    /// each is asked for twice, a pause apart, with Weaviate ready and
-    /// the class as it was imported, and only one Weaviate twice says it
-    /// does not hold is deleted, if it is the import's. One it does hold
-    /// after all is settled as any other.
+    /// What the collection holds that the ledger has no entry for, now
+    /// that every object Weaviate listed has one: left by an import that
+    /// kept no ledger, of objects Weaviate has deleted since, if nothing
+    /// but an import wrote to the collection. Looked for only when that
+    /// is said.
+    async fn orphans(&self, gone: &mut Gone) -> Result<()> {
+        let limit = u32::try_from(self.options.page).unwrap_or(u32::MAX);
+        let mut entries = Entries::new(&self.plan.ledger, self.options.page, None);
+        let mut page = Page::new(limit);
+        loop {
+            let listed = self.plan.records.list(&page).await?;
+            for stored in &listed.objects {
+                while entries.before(stored.id).await?.is_some() {}
+                if entries.at(stored.id).await?.is_none() {
+                    gone.push(Candidate::Orphan(stored.id));
+                }
+            }
+            match listed.next {
+                Some(next) => page.after = Some(next),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// See to what the collection may hold that Weaviate did not list,
+    /// now that the walk is over. More than the run may delete, none is:
+    /// the answer is then false, and they are reported as pending.
+    /// Otherwise each is asked for twice, a pause apart, with Weaviate
+    /// ready and the class as it was imported, and only one Weaviate
+    /// twice says it does not hold is deleted, if it is the import's.
+    /// One it does hold after all is settled as any other.
     async fn remove(&self, gone: Gone, copied: &mut Copied) -> Result<bool> {
         if gone.count == 0 {
             return Ok(true);
@@ -1690,6 +1879,7 @@ impl<'a> Copying<'a> {
         if gone.count > gone.budget {
             copied.pending = gone.count;
             copied.kept += gone.foreign;
+            copied.withheld += gone.withheld;
             let chosen = self.options.deletes == Deletes::None;
             copied.budget = (!chosen).then_some(gone.budget);
             return Ok(chosen);
@@ -1698,14 +1888,10 @@ impl<'a> Copying<'a> {
         let mut absent = Vec::new();
         let mut present = Vec::new();
         self.weaviate.steady(class, &self.plan.binding).await?;
-        for entry in gone.entries {
-            match self
-                .weaviate
-                .object(class, entry.id, false, Asked::All)
-                .await?
-            {
-                Some(_) => present.push(entry),
-                None => absent.push(entry),
+        for candidate in gone.candidates {
+            match self.weaviate.held_by_all(class, candidate.id()).await? {
+                true => present.push(candidate),
+                false => absent.push(candidate),
             }
         }
         if !absent.is_empty() {
@@ -1717,23 +1903,28 @@ impl<'a> Copying<'a> {
             // object and deleting it.
             self.weaviate.steady(class, &self.plan.binding).await?;
             let mut confirmed = Vec::new();
-            for entry in group {
-                match self
-                    .weaviate
-                    .object(class, entry.id, false, Asked::All)
-                    .await?
-                {
-                    Some(_) => present.push(entry.clone()),
-                    None => confirmed.push(entry.clone()),
+            for candidate in group {
+                match self.weaviate.held_by_all(class, candidate.id()).await? {
+                    true => present.push(candidate.clone()),
+                    false => confirmed.push(candidate.clone()),
                 }
             }
             self.weaviate.steady(class, &self.plan.binding).await?;
-            for entry in confirmed {
-                let id = entry.id;
-                copied.count(id, self.settle(id, None, Some(entry), false).await?);
+            for candidate in confirmed {
+                let id = candidate.id();
+                let settled = match candidate {
+                    Candidate::Entry(entry) => self.settle(id, Now::Gone, Some(entry), false),
+                    Candidate::Orphan(_) => self.settle(id, Now::Orphan, None, false),
+                };
+                copied.count(id, settled.await?);
             }
         }
-        for entry in present {
+        for candidate in present {
+            // What the ledger has no entry for and Weaviate holds after
+            // all is new to it: the next walk lists it.
+            let Candidate::Entry(entry) = candidate else {
+                continue;
+            };
             let id = entry.id;
             let object = self
                 .weaviate
@@ -1742,82 +1933,145 @@ impl<'a> Copying<'a> {
             let Some(item) = self.items(object.as_slice(), copied)?.pop() else {
                 continue;
             };
-            let settled = self.settle(id, Some(&item), Some(entry), false).await?;
+            let settled = self
+                .settle(id, Now::Holds(&item), Some(entry), false)
+                .await?;
             copied.kept += u64::from(settled == Settled::Foreign);
+            copied.withheld += u64::from(settled == Settled::Withheld);
             copied.count(id, settled);
         }
         Ok(true)
     }
 
     /// Compare what the collection holds with what Weaviate does, object
-    /// by object, changing nothing: over `pages` pages of Weaviate's,
-    /// each begun after an id picked at random, or over all of them.
+    /// by object, changing nothing: over everything Weaviate holds, or
+    /// over `pages` pages of the ledger picked at random, and what
+    /// Weaviate and the collection hold of the ids on them. A ledger's
+    /// pages are picked, not places among all ids there could be, so
+    /// that ids that lie close together are looked at as any others.
     async fn verify(&self, pages: Option<usize>) -> Result<Verified> {
-        const EXAMPLES: usize = 20;
-        let class = &self.plan.class;
         let mut verified = Verified::default();
-        let mut unreadable = Copied::default();
-        let mut cursor: Option<String> = None;
-        let mut looked = 0;
-        loop {
-            if pages.is_some() {
-                cursor = Some(ObjectId::generate().to_string());
+        let Some(pages) = pages else {
+            self.compare(None, None, &mut verified).await?;
+            return Ok(verified);
+        };
+        let ledgered = self.plan.ledger.count(None).await? as usize;
+        let all = ledgered.div_ceil(self.options.page);
+        let mut picked: Vec<usize> = (0..all).collect();
+        for kept in 0..pages.min(all) {
+            let random = u128::from_le_bytes(*ObjectId::generate().0.as_bytes()) as usize;
+            picked.swap(kept, kept + random % (all - kept));
+        }
+        picked.truncate(pages);
+        picked.sort_unstable();
+        let mut page = Page::new(u32::try_from(self.options.page).unwrap_or(u32::MAX));
+        let mut picked = picked.into_iter().peekable();
+        for nth in 0.. {
+            if picked.peek().is_none() {
+                break;
             }
+            let listed = self.plan.ledger.list(&page).await?;
+            let from = page.after;
+            if picked.next_if_eq(&nth).is_some() {
+                if let Some(last) = listed.objects.last() {
+                    self.compare(from, Some(last.id), &mut verified).await?;
+                }
+            }
+            match listed.next {
+                Some(next) => page.after = Some(next),
+                None => break,
+            }
+        }
+        Ok(verified)
+    }
+
+    /// Compare the objects Weaviate holds after `from` and no later than
+    /// `through`, or to the end, with what the collection holds, and
+    /// with what the ledger says of them.
+    async fn compare(
+        &self,
+        from: Option<ObjectId>,
+        through: Option<ObjectId>,
+        verified: &mut Verified,
+    ) -> Result<()> {
+        const EXAMPLES: usize = 20;
+        let options = Options {
+            skip_refused: true,
+            ..self.options.clone()
+        };
+        let reading = Copying::new(self.weaviate, self.tenant, self.plan, &options);
+        let mut unreadable = Copied::default();
+        let mut entries = Entries::new(&self.plan.ledger, self.options.page, from);
+        let mut cursor = from;
+        let within = |id: ObjectId| through.is_none_or(|through| id <= through);
+        loop {
+            let after = cursor.map(|id| id.to_string());
             let page = self
                 .weaviate
                 .page(
-                    class,
-                    cursor.as_deref(),
+                    &self.plan.class,
+                    after.as_deref(),
                     self.options.page,
                     self.plan.vectors(),
                 )
                 .await?;
-            let from = cursor.as_deref().map(object_id).transpose()?;
-            if let Some(last) = page.last() {
-                let through = object_id(&last.id)?;
-                let mut entries = Entries::new(&self.plan.ledger, self.options.page, from);
-                let mut known = HashMap::new();
-                while let Some(entry) = entries.through(through).await? {
-                    known.insert(entry.id, entry);
-                }
-                let options = Options {
-                    skip_refused: true,
-                    ..self.options.clone()
-                };
-                let reading = Copying::new(self.weaviate, self.tenant, self.plan, &options);
-                let items = reading.items(&page, &mut unreadable)?;
-                let ids: Vec<ObjectId> = items.iter().map(|item| item.id).collect();
-                let held = self.held(from, through, &ids, ids.len()).await?;
-                for item in items {
+            let mut items = reading.items(&page, &mut unreadable)?;
+            let listed = page.len();
+            items.retain(|item| within(item.id));
+            let Some(last) = items.last().map(|item| item.id) else {
+                break;
+            };
+            let ids: Vec<ObjectId> = items.iter().map(|item| item.id).collect();
+            let held = self.held(cursor, last, &ids, ids.len()).await?;
+            for item in items {
+                while entries.before(item.id).await?.is_some() {
+                    verified.gone += 1;
                     verified.looked += 1;
-                    let stored = held.get(&item.id);
-                    let hash = stored.and_then(|stored| self.plan.hash(stored));
-                    let wrong = match (known.get(&item.id), stored) {
-                        _ if hash.as_ref() == Some(&item.hash) => &mut verified.same,
-                        (None, _) => &mut verified.unaccounted,
-                        (Some(entry), _) if entry.foreign => &mut verified.kept,
-                        (Some(_), None) => &mut verified.missing,
-                        (Some(_), Some(_)) => &mut verified.different,
-                    };
-                    *wrong += 1;
-                    let wrong = verified.missing + verified.different;
-                    let listed = verified.examples.len();
-                    if listed < EXAMPLES && wrong as usize > listed {
-                        verified.examples.push(item.id.to_string());
-                    }
                 }
-                cursor = Some(last.id.clone());
+                let entry = entries.at(item.id).await?;
+                let stored = held.get(&item.id);
+                let hash = stored.and_then(|stored| self.plan.hash(stored));
+                let found = match (entry.map(|entry| entry.mark), stored) {
+                    _ if hash.as_ref() == Some(&item.hash) => &mut verified.same,
+                    (None, _) => &mut verified.unaccounted,
+                    (Some(Mark::Foreign), _) => &mut verified.kept,
+                    (Some(Mark::Withheld), _) => &mut verified.withheld,
+                    (Some(Mark::Stored), None) => &mut verified.missing,
+                    (Some(Mark::Stored), Some(_)) => &mut verified.different,
+                };
+                *found += 1;
+                verified.looked += 1;
+                let wrong = (verified.missing + verified.different) as usize;
+                let shown = verified.examples.len();
+                if shown < EXAMPLES && wrong > shown {
+                    verified.examples.push(item.id.to_string());
+                }
             }
-            looked += 1;
-            match pages {
-                Some(pages) if looked >= pages => break,
-                None if page.is_empty() => break,
-                _ => {}
+            cursor = Some(last);
+            if listed < self.options.page || through.is_some_and(|through| last >= through) {
+                break;
             }
         }
-        verified.unaccounted += unreadable.refused.len() as u64;
-        verified.looked += unreadable.refused.len() as u64;
-        Ok(verified)
+        // What the ledger has of the range that Weaviate did not list.
+        loop {
+            let entry = match through {
+                Some(through) => entries.through(through).await?,
+                None => entries.next().await?,
+            };
+            if entry.is_none() {
+                break;
+            }
+            verified.gone += 1;
+            verified.looked += 1;
+        }
+        let unreadable = unreadable
+            .refused
+            .keys()
+            .filter_map(|id| object_id(id).ok());
+        let unreadable = unreadable.filter(|id| within(*id)).count() as u64;
+        verified.unaccounted += unreadable;
+        verified.looked += unreadable;
+        Ok(())
     }
 }
 
@@ -2329,6 +2583,7 @@ impl Object {
         Ok(held
             .map(|(content, hash)| Item {
                 id,
+                created: self.creation_time_unix,
                 updated: self.updated,
                 content,
                 hash,
@@ -2385,8 +2640,20 @@ impl Weaviate {
         what: &str,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<(reqwest::StatusCode, String)> {
+        let (status, text, _) = self.answered(what, build).await?;
+        Ok((status, text))
+    }
+
+    /// As [`Self::answer`], and whether the answer came at the first
+    /// asking.
+    async fn answered(
+        &self,
+        what: &str,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<(reqwest::StatusCode, String, bool)> {
         let began = Instant::now();
         let mut wait = Duration::from_millis(500);
+        let mut at_once = true;
         loop {
             let failed = match build(&self.http).send().await {
                 Ok(answer) => {
@@ -2399,7 +2666,7 @@ impl Weaviate {
                         // of all.
                         Err(error) => error.to_string(),
                         Ok(text) if passing => format!("{status}: {text}"),
-                        Ok(text) => return Ok((status, text)),
+                        Ok(text) => return Ok((status, text, at_once)),
                     }
                 }
                 Err(error) => error.to_string(),
@@ -2412,7 +2679,21 @@ impl Weaviate {
             }
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(Duration::from_secs(30));
+            at_once = false;
         }
+    }
+
+    /// Wait until Weaviate answers that it is ready, and say whether it
+    /// did at the first asking. Until it is, it answers that it holds no
+    /// such class or object for those it holds.
+    async fn ready(&self) -> Result<bool> {
+        let url = format!("{}/v1/.well-known/ready", self.url);
+        let asking = self.answered("whether it is ready", |http| http.get(&url));
+        let (status, _, at_once) = asking.await?;
+        if !status.is_success() {
+            bail!("Weaviate answered whether it is ready with {status}");
+        }
+        Ok(at_once)
     }
 
     /// What Weaviate answers; `None` if it holds nothing there.
@@ -2481,12 +2762,38 @@ impl Weaviate {
         query.extend(after.map(|after| ("after", after.to_string())));
         query.extend(vectors.then(|| ("include", "vector".to_string())));
         query.extend(self.tenant_of(class));
-        let page = self
-            .get("/v1/objects", &query)
-            .await?
-            .ok_or_else(|| eyre!("Weaviate has no class {}", class.class))?;
-        serde_json::from_value(page["objects"].clone())
-            .wrap_err_with(|| format!("reading a page of {}", class.class))
+        let began = Instant::now();
+        loop {
+            if let Some(page) = self.get("/v1/objects", &query).await? {
+                return serde_json::from_value(page["objects"].clone())
+                    .wrap_err_with(|| format!("reading a page of {}", class.class));
+            }
+            // It has no such class, unless it was not ready to say.
+            if self.ready().await? || began.elapsed() > self.patience {
+                bail!("Weaviate has no class {}", class.class);
+            }
+        }
+    }
+
+    /// Whether every copy of `class` holds an object under `id`. That
+    /// none does is believed only of a Weaviate that says it is ready
+    /// straight after: one that was not is asked again.
+    async fn held_by_all(&self, class: &Class, id: ObjectId) -> Result<bool> {
+        let began = Instant::now();
+        loop {
+            if self.object(class, id, false, Asked::All).await?.is_some() {
+                return Ok(true);
+            }
+            if self.ready().await? {
+                return Ok(false);
+            }
+            if began.elapsed() > self.patience {
+                bail!(
+                    "Weaviate was not ready to say whether it holds {id} of {}; nothing was deleted",
+                    class.class
+                );
+            }
+        }
     }
 
     /// One object of `class` as it is now; none if Weaviate holds no such
@@ -2551,25 +2858,22 @@ impl Weaviate {
     /// Wait until what Weaviate says of an object of `class` can be
     /// believed: it answers that it is ready, and every shard of the
     /// class is loaded. Refuse if the class is gone, or is not the one
-    /// `binding` says was imported. A Weaviate that is starting answers
+    /// `binding` says was imported, so that nothing of another class is
+    /// stored and nothing deleted for it. A Weaviate that is starting answers
     /// that it holds no such object for objects it holds.
     async fn steady(&self, class: &Class, binding: &Binding) -> Result<()> {
         let began = Instant::now();
-        let url = format!("{}/v1/.well-known/ready", self.url);
         loop {
-            let (status, _) = self
-                .answer("whether it is ready", |http| http.get(&url))
-                .await?;
-            if !status.is_success() {
-                bail!("Weaviate answered whether it is ready with {status}; nothing was deleted");
-            }
+            self.ready().await?;
             let Some(shards) = self.shards(class).await? else {
                 bail!(
                     "Weaviate no longer has class {}; its objects stay in the collection",
                     class.class
                 );
             };
-            if shards.iter().all(|(_, serving)| *serving) {
+            // A class with no shard listed is not one whose shards are
+            // all loaded.
+            if !shards.is_empty() && shards.iter().all(|(_, serving)| *serving) {
                 let mut names: Vec<&str> = shards.iter().map(|(name, _)| name.as_str()).collect();
                 names.sort();
                 let is = names.join(",");
@@ -2865,6 +3169,7 @@ mod tests {
                 updated_as: None,
                 shards: Some("a".into()),
                 adopting: false,
+                adopting_since: None,
                 finalised: false,
             },
         }
@@ -3003,6 +3308,7 @@ mod tests {
             let (content, hash) = held.unwrap();
             Item {
                 id,
+                created: Some(1_000),
                 updated: Some(updated),
                 content,
                 hash,
@@ -3019,22 +3325,36 @@ mod tests {
             .unwrap()
         }
 
-        fn entry(&self, title: &str, updated: i64, foreign: bool) -> Entry {
+        fn entry(&self, title: &str, updated: i64, mark: Mark) -> Entry {
             let item = self.item(title, updated);
             Entry {
                 id: item.id,
                 updated: item.updated,
                 hash: item.hash,
-                foreign,
+                mark,
             }
         }
     }
 
-    /// What kind each change is, and of which collection.
+    /// What kind each change is, and of which collection; for one to the
+    /// ledger, with the mark it gives the entry.
     fn kinds(changes: &[Change]) -> Vec<String> {
+        let marked = |properties: &Map<String, Value>| {
+            let marks = ["foreign", "withheld"];
+            let mark = marks.iter().find(|mark| properties.contains_key(**mark));
+            mark.map_or(String::new(), |mark| format!(" {mark}"))
+        };
         let kind = |change: &Change| match change {
-            Change::Insert { collection, .. } => format!("insert {collection}"),
-            Change::Upsert { collection, .. } => format!("upsert {collection}"),
+            Change::Insert {
+                collection,
+                properties,
+                ..
+            } => format!("insert {collection}{}", marked(properties)),
+            Change::Upsert {
+                collection,
+                properties,
+                ..
+            } => format!("upsert {collection}{}", marked(properties)),
             Change::Delete { collection, .. } => format!("delete {collection}"),
             Change::Patch {
                 only_if: Some(only_if),
@@ -3054,59 +3374,85 @@ mod tests {
         "unless mood is not null",
         "unless score is not 0.30000000000000004",
     ];
+    const ENTRY: &str = "vellev_imported_Memory";
+
+    /// The guards on an object read as "fox", and then these changes.
+    fn guarded(then: &[&str]) -> Vec<String> {
+        let changes = GUARDS.iter().chain(then);
+        changes
+            .map(|change| change.replace("ENTRY", ENTRY))
+            .collect()
+    }
+
+    fn only(changes: &[&str]) -> Vec<String> {
+        let changes = changes.iter();
+        changes
+            .map(|change| change.replace("ENTRY", ENTRY))
+            .collect()
+    }
 
     #[test]
     fn an_object_is_stored_replaced_or_left_by_what_the_ledger_and_the_collection_hold() {
-        let fixture = Fixture::new(options());
-        let copying = fixture.copying();
-        let hen = fixture.item("hen", 2);
-        let ours = fixture.entry("fox", 1, false);
-        let settling = |entry: Option<&Entry>, stored: Option<&Stored>| {
-            let (changes, settled) = copying.settling(&hen, entry, stored, false);
-            (kinds(&changes), settled)
-        };
-        let entry = "vellev_imported_Memory";
+        // Nothing else having written to the collection changes none of
+        // this: that is said of what was withheld, and of nothing else.
+        for sole_writer in [false, true] {
+            let fixture = Fixture::new(Options {
+                sole_writer,
+                ..options()
+            });
+            let copying = fixture.copying();
+            let hen = fixture.item("hen", 2);
+            let ours = fixture.entry("fox", 1, Mark::Stored);
+            let settling = |entry: Option<&Entry>, stored: Option<&Stored>| {
+                let (changes, settled) = copying.settling(&hen, entry, stored, false);
+                (kinds(&changes), settled)
+            };
 
-        // New to Weaviate: stored, if neither is there to be written over.
-        assert_eq!(
-            settling(None, None),
-            (
-                vec!["insert Memory".into(), format!("insert {entry}")],
-                Settled::Stored
-            )
-        );
-        // The import's, changed in Weaviate: replaced, unless a property
-        // of it changes first, one without a value among them.
-        let replaced = settling(Some(&ours), Some(&fixture.stored("fox")));
-        let mut expected: Vec<String> = GUARDS.iter().map(|guard| guard.to_string()).collect();
-        expected.extend(["upsert Memory".to_string(), format!("upsert {entry}")]);
-        assert_eq!(replaced, (expected, Settled::Replaced));
-        // Another writer's, deleted by one, or never the import's: left,
-        // and the ledger says so.
-        let foreign = (vec![format!("upsert {entry}")], Settled::Foreign);
-        assert_eq!(settling(Some(&ours), Some(&fixture.stored("owl"))), foreign);
-        assert_eq!(settling(Some(&ours), None), foreign);
-        assert_eq!(
-            settling(None, Some(&fixture.stored("owl"))),
-            (vec![format!("insert {entry}")], Settled::Foreign)
-        );
-        // As Weaviate has it already, whoever stored it: the import's.
-        assert_eq!(
-            settling(None, Some(&fixture.stored("hen"))),
-            (vec![format!("insert {entry}")], Settled::Same)
-        );
-        let marked = fixture.entry("fox", 1, true);
-        assert_eq!(
-            settling(Some(&marked), Some(&fixture.stored("hen"))),
-            (vec![format!("upsert {entry}")], Settled::Same)
-        );
-        // Once the ledger says an object is another writer's, it is not
-        // said again.
-        let said = fixture.entry("hen", 2, true);
-        assert_eq!(
-            settling(Some(&said), Some(&fixture.stored("owl"))),
-            (vec![], Settled::Foreign)
-        );
+            // New to Weaviate: stored, if neither is there to be written
+            // over.
+            assert_eq!(
+                settling(None, None),
+                (only(&["insert Memory", "insert ENTRY"]), Settled::Stored)
+            );
+            // The import's, changed in Weaviate: replaced, unless a
+            // property of it changes first, one without a value among
+            // them.
+            assert_eq!(
+                settling(Some(&ours), Some(&fixture.stored("fox"))),
+                (
+                    guarded(&["upsert Memory", "upsert ENTRY"]),
+                    Settled::Replaced
+                )
+            );
+            // Another writer's, deleted by one, or never the import's:
+            // left, and the ledger says so.
+            let foreign = (only(&["upsert ENTRY foreign"]), Settled::Foreign);
+            assert_eq!(settling(Some(&ours), Some(&fixture.stored("owl"))), foreign);
+            assert_eq!(settling(Some(&ours), None), foreign);
+            assert_eq!(
+                settling(None, Some(&fixture.stored("owl"))),
+                (only(&["insert ENTRY foreign"]), Settled::Foreign)
+            );
+            // As Weaviate has it already, whoever stored it: the
+            // import's.
+            assert_eq!(
+                settling(None, Some(&fixture.stored("hen"))),
+                (only(&["insert ENTRY"]), Settled::Same)
+            );
+            let marked = fixture.entry("fox", 1, Mark::Foreign);
+            assert_eq!(
+                settling(Some(&marked), Some(&fixture.stored("hen"))),
+                (only(&["upsert ENTRY"]), Settled::Same)
+            );
+            // Once the ledger says an object is another writer's, it is
+            // not said again, and the object is never written over.
+            let said = fixture.entry("hen", 2, Mark::Foreign);
+            assert_eq!(
+                settling(Some(&said), Some(&fixture.stored("owl"))),
+                (vec![], Settled::Foreign)
+            );
+            assert_eq!(settling(Some(&said), None), (vec![], Settled::Foreign));
+        }
     }
 
     #[test]
@@ -3114,16 +3460,19 @@ mod tests {
         let fixture = Fixture::new(options());
         let copying = fixture.copying();
         let hen = fixture.item("hen", 2);
-        let noted = fixture.entry("hen", 2, false);
-        let earlier = fixture.entry("hen", 1, false);
+        let noted = fixture.entry("hen", 2, Mark::Stored);
+        let earlier = fixture.entry("hen", 1, Mark::Stored);
         assert!(!Copying::reads(&hen, Some(&noted)));
         assert!(Copying::reads(&hen, None));
-        assert!(Copying::reads(&hen, Some(&fixture.entry("fox", 2, false))));
-        assert!(Copying::reads(&hen, Some(&fixture.entry("hen", 2, true))));
+        let changed = fixture.entry("fox", 2, Mark::Stored);
+        assert!(Copying::reads(&hen, Some(&changed)));
+        for mark in [Mark::Foreign, Mark::Withheld] {
+            assert!(Copying::reads(&hen, Some(&fixture.entry("hen", 2, mark))));
+        }
         let (changes, settled) = copying.settling(&hen, Some(&noted), None, false);
         assert_eq!((kinds(&changes), settled), (vec![], Settled::Same));
         let (changes, settled) = copying.settling(&hen, Some(&earlier), None, false);
-        assert_eq!(kinds(&changes), ["upsert vellev_imported_Memory"]);
+        assert_eq!(kinds(&changes), only(&["upsert ENTRY"]));
         assert_eq!(settled, Settled::Same);
         let Change::Upsert { properties, .. } = &changes[0] else {
             unreachable!()
@@ -3135,48 +3484,108 @@ mod tests {
     }
 
     #[test]
-    fn a_collection_taken_up_is_given_nothing_it_lacks_unless_nothing_else_wrote_to_it() {
-        let hen = |fixture: &Fixture| fixture.item("hen", 2);
-        let entry = "vellev_imported_Memory";
-        let taken = |fixture: &Fixture, stored: Option<&Stored>| {
-            let (changes, settled) = fixture
-                .copying()
-                .settling(&hen(fixture), None, stored, true);
+    fn a_collection_taken_up_has_what_it_lacks_or_holds_otherwise_withheld() {
+        let fixture = Fixture::new(options());
+        let hen = fixture.item("hen", 2);
+        let taken = |stored: Option<&Stored>| {
+            let (changes, settled) = fixture.copying().settling(&hen, None, stored, true);
             (kinds(&changes), settled)
         };
         // Without a ledger nothing tells an object new to Weaviate from
         // one deleted in vellev, nor one changed in Weaviate from one
         // changed in vellev.
-        let fixture = Fixture::new(options());
-        let withheld = (vec![format!("insert {entry}")], Settled::Foreign);
-        assert_eq!(taken(&fixture, None), withheld);
-        assert_eq!(taken(&fixture, Some(&fixture.stored("fox"))), withheld);
-        let (changes, _) = fixture.copying().settling(&hen(&fixture), None, None, true);
-        let Change::Insert { properties, .. } = &changes[0] else {
-            unreachable!()
-        };
-        assert_eq!(properties["foreign"], json!(true));
+        let withheld = (only(&["insert ENTRY withheld"]), Settled::Withheld);
+        assert_eq!(taken(None), withheld);
+        assert_eq!(taken(Some(&fixture.stored("fox"))), withheld);
         assert_eq!(
-            taken(&fixture, Some(&fixture.stored("hen"))),
-            (vec![format!("insert {entry}")], Settled::Same)
+            taken(Some(&fixture.stored("hen"))),
+            (only(&["insert ENTRY"]), Settled::Same)
         );
 
+        // What was withheld stays so, whatever Weaviate does to it, and
+        // is not said twice.
+        let settling = |entry: &Entry, stored: Option<&Stored>| {
+            let (changes, settled) = fixture.copying().settling(&hen, Some(entry), stored, false);
+            (kinds(&changes), settled)
+        };
+        let said = fixture.entry("hen", 2, Mark::Withheld);
+        assert_eq!(settling(&said, None), (vec![], Settled::Withheld));
+        let earlier = fixture.entry("owl", 1, Mark::Withheld);
+        let again = (only(&["upsert ENTRY withheld"]), Settled::Withheld);
+        assert_eq!(settling(&earlier, None), again);
+        assert_eq!(settling(&earlier, Some(&fixture.stored("fox"))), again);
+    }
+
+    #[test]
+    fn what_weaviate_made_since_a_taking_up_began_is_new_to_it_and_stored() {
+        let mut fixture = Fixture::new(Options {
+            skew: Duration::from_millis(100),
+            ..options()
+        });
+        fixture.plan.binding.adopting_since = Some(1_000);
+        let taken = |created: Option<i64>| {
+            let hen = Item {
+                created,
+                ..fixture.item("hen", 2)
+            };
+            let (changes, settled) = fixture.copying().settling(&hen, None, None, true);
+            (kinds(&changes), settled)
+        };
+        let stored = (only(&["insert Memory", "insert ENTRY"]), Settled::Stored);
+        let withheld = (only(&["insert ENTRY withheld"]), Settled::Withheld);
+        assert_eq!(taken(Some(1_101)), stored);
+        // Not what it made before, by as much as the clocks may differ,
+        // nor what it does not say the making of.
+        assert_eq!(taken(Some(1_100)), withheld);
+        assert_eq!(taken(Some(900)), withheld);
+        assert_eq!(taken(None), withheld);
+        // And what the collection holds under such an id is not written
+        // over for it.
+        let hen = Item {
+            created: Some(5_000),
+            ..fixture.item("hen", 2)
+        };
+        let fox = fixture.stored("fox");
+        let (changes, settled) = fixture.copying().settling(&hen, None, Some(&fox), true);
+        assert_eq!((kinds(&changes), settled), withheld);
+    }
+
+    #[test]
+    fn what_was_withheld_is_stored_or_replaced_once_nothing_else_is_said_to_have_written() {
         let sole = Fixture::new(Options {
             sole_writer: true,
             ..options()
         });
+        let hen = sole.item("hen", 2);
+        let settling = |entry: Option<&Entry>, stored: Option<&Stored>, adopted: bool| {
+            let (changes, settled) = sole.copying().settling(&hen, entry, stored, adopted);
+            (kinds(&changes), settled)
+        };
+        let fox = sole.stored("fox");
+        // While the collection is taken up.
         assert_eq!(
-            taken(&sole, None),
+            settling(None, None, true),
+            (only(&["insert Memory", "insert ENTRY"]), Settled::Stored)
+        );
+        assert_eq!(
+            settling(None, Some(&fox), true),
             (
-                vec!["insert Memory".into(), format!("insert {entry}")],
-                Settled::Stored
+                guarded(&["upsert Memory", "insert ENTRY"]),
+                Settled::Replaced
             )
         );
-        let mut expected: Vec<String> = GUARDS.iter().map(|guard| guard.to_string()).collect();
-        expected.extend(["upsert Memory".to_string(), format!("insert {entry}")]);
+        // And by any run after one that withheld it.
+        let withheld = sole.entry("owl", 1, Mark::Withheld);
         assert_eq!(
-            taken(&sole, Some(&sole.stored("fox"))),
-            (expected, Settled::Replaced)
+            settling(Some(&withheld), None, false),
+            (only(&["insert Memory", "upsert ENTRY"]), Settled::Stored)
+        );
+        assert_eq!(
+            settling(Some(&withheld), Some(&fox), false),
+            (
+                guarded(&["upsert Memory", "upsert ENTRY"]),
+                Settled::Replaced
+            )
         );
     }
 
@@ -3184,25 +3593,53 @@ mod tests {
     fn only_what_the_import_stored_and_nobody_changed_is_deleted() {
         let fixture = Fixture::new(options());
         let copying = fixture.copying();
-        let ours = fixture.entry("fox", 1, false);
-        let removing = |stored: Option<&Stored>| {
-            let (changes, settled) = copying.removing(&ours, stored);
+        let removing = |entry: Option<&Entry>, stored: Option<&Stored>| {
+            let id = serde_json::from_value(json!(id(1))).unwrap();
+            let (changes, settled) = copying.removing(id, entry, stored);
             (kinds(&changes), settled)
         };
-        let entry = "vellev_imported_Memory";
-        let mut expected: Vec<String> = GUARDS.iter().map(|guard| guard.to_string()).collect();
-        expected.extend(["delete Memory".to_string(), format!("delete {entry}")]);
-        assert_eq!(
-            removing(Some(&fixture.stored("fox"))),
-            (expected, Settled::Deleted)
+        let ours = fixture.entry("fox", 1, Mark::Stored);
+        let (fox, owl) = (fixture.stored("fox"), fixture.stored("owl"));
+        let deleted = (
+            guarded(&["delete Memory", "delete ENTRY"]),
+            Settled::Deleted,
         );
+        let forgotten = |settled: Settled| (only(&["delete ENTRY"]), settled);
+        assert_eq!(removing(Some(&ours), Some(&fox)), deleted);
+        assert_eq!(removing(Some(&ours), Some(&owl)), forgotten(Settled::Left));
+        assert_eq!(removing(Some(&ours), None), forgotten(Settled::Same));
+        // Neither what was withheld, nor what the ledger has no entry
+        // for, is the import's to delete by itself.
+        let withheld = fixture.entry("hen", 1, Mark::Withheld);
         assert_eq!(
-            removing(Some(&fixture.stored("owl"))),
-            (vec![format!("delete {entry}")], Settled::Left)
+            removing(Some(&withheld), Some(&fox)),
+            forgotten(Settled::Left)
         );
+        assert_eq!(removing(None, Some(&fox)), (vec![], Settled::Left));
+
+        // They are once nothing but an import is said to have written to
+        // the collection; what another writer is known to have written
+        // still is not.
+        let sole = Fixture::new(Options {
+            sole_writer: true,
+            ..options()
+        });
+        let copying = sole.copying();
+        let removing = |entry: Option<&Entry>, stored: Option<&Stored>| {
+            let id = serde_json::from_value(json!(id(1))).unwrap();
+            let (changes, settled) = copying.removing(id, entry, stored);
+            (kinds(&changes), settled)
+        };
+        assert_eq!(removing(Some(&withheld), Some(&fox)), deleted);
         assert_eq!(
-            removing(None),
-            (vec![format!("delete {entry}")], Settled::Same)
+            removing(None, Some(&fox)),
+            (guarded(&["delete Memory"]), Settled::Deleted)
+        );
+        assert_eq!(removing(None, None), (vec![], Settled::Same));
+        let foreign = sole.entry("hen", 1, Mark::Foreign);
+        assert_eq!(
+            removing(Some(&foreign), Some(&fox)),
+            forgotten(Settled::Left)
         );
     }
 
@@ -3224,24 +3661,42 @@ mod tests {
             }
         );
         assert_eq!(budget(usual, 20), 1);
+        assert_eq!(budget(usual, 21), 2);
         assert_eq!(budget(usual, 1_000), 50);
         assert_eq!(budget(usual, 4_200_000), 1_000);
-        assert_eq!(budget(usual, 0), 0);
         assert_eq!(budget(Deletes::None, 4_200_000), 0);
+        // Never the last object of a class, unless a run may delete all
+        // of one.
+        assert_eq!(budget(usual, 2), 1);
+        assert_eq!(budget(usual, 1), 0);
+        assert_eq!(budget(usual, 0), 0);
+        let half = Deletes::UpTo {
+            count: 1_000,
+            fraction: 0.5,
+        };
+        assert_eq!(budget(half, 2), 1);
+        let all = Deletes::UpTo {
+            count: 1_000,
+            fraction: 1.0,
+        };
+        assert_eq!((budget(all, 1), budget(all, 20)), (1, 20));
 
         // What is gone is counted whole, and kept only as far as it may
         // be deleted.
         let mut gone = Gone {
-            entries: Vec::new(),
+            candidates: Vec::new(),
             count: 0,
             foreign: 0,
-            budget: 2,
+            withheld: 0,
+            budget: 3,
         };
         let fixture = Fixture::new(options());
-        for foreign in [false, true, true] {
-            gone.push(fixture.entry("fox", 1, foreign));
+        for mark in [Mark::Stored, Mark::Foreign, Mark::Foreign, Mark::Withheld] {
+            gone.push(Candidate::Entry(fixture.entry("fox", 1, mark)));
         }
-        assert_eq!((gone.count, gone.foreign, gone.entries.len()), (3, 2, 2));
+        gone.push(Candidate::Orphan(fixture.item("fox", 1).id));
+        let counted = (gone.count, gone.foreign, gone.withheld);
+        assert_eq!((counted, gone.candidates.len()), ((5, 2, 1), 3));
     }
 
     #[test]
@@ -3288,12 +3743,10 @@ mod tests {
             Entry::read(serde_json::from_value(stored).unwrap())
         };
         let read = entry(json!({ "hash": "h", "updated": 3 })).unwrap();
-        assert_eq!((read.updated, read.foreign), (Some(3), false));
-        assert!(
-            entry(json!({ "hash": "h", "foreign": true }))
-                .unwrap()
-                .foreign
-        );
+        assert_eq!((read.updated, read.mark), (Some(3), Mark::Stored));
+        let marked = |mark: &str| entry(json!({ "hash": "h", mark: true })).unwrap().mark;
+        assert_eq!(marked("foreign"), Mark::Foreign);
+        assert_eq!(marked("withheld"), Mark::Withheld);
         assert!(entry(json!({ "hash": "h", "version": 1 })).is_ok());
         let later = entry(json!({ "hash": "h", "version": 2 })).unwrap_err();
         assert!(
@@ -3326,7 +3779,14 @@ mod tests {
             .collect();
         assert_eq!(
             added,
-            ["updatedAs", "shards", "adopting", "finalised", "version"]
+            [
+                "updatedAs",
+                "shards",
+                "adopting",
+                "finalised",
+                "version",
+                "adoptingSince"
+            ]
         );
     }
 
@@ -3334,6 +3794,7 @@ mod tests {
     fn a_run_is_settled_behind_or_unsettled_by_what_it_left() {
         let report = |copied: Copied| Report {
             classes: [("Memory".to_string(), copied)].into(),
+            ended: Vec::new(),
         };
         let level = Copied {
             weaviate: 10,
@@ -3357,19 +3818,30 @@ mod tests {
             ..level.clone()
         };
         assert_eq!(outcome(behind.clone()), Outcome::Behind);
-        // What it was told not to delete is still to be deleted, and
-        // nothing is behind for it.
+        // What is gone from Weaviate and was not deleted, whether the
+        // run was told to delete nothing or might not delete so much, is
+        // the import's and not as Weaviate has it.
         let pending = Copied {
             weaviate: 8,
             pending: 2,
             ..level.clone()
         };
-        assert_eq!(outcome(pending.clone()), Outcome::Settled);
+        assert!(pending.caught_up());
+        assert_eq!(outcome(pending.clone()), Outcome::Unsettled);
         let over = Copied {
             budget: Some(1),
             ..pending
         };
         assert_eq!(outcome(over), Outcome::Unsettled);
+        // Nor has a run settled that did not copy what Weaviate holds.
+        let withheld = Copied {
+            imported: 7,
+            withheld: 3,
+            vellev: 7,
+            ..level.clone()
+        };
+        assert!(withheld.caught_up());
+        assert_eq!(outcome(withheld), Outcome::Unsettled);
         let refused = Copied {
             weaviate: 11,
             refused: [(id(1), "why".to_string())].into(),
@@ -3389,6 +3861,18 @@ mod tests {
             ..behind
         };
         assert_eq!(outcome(wrong), Outcome::Unsettled);
+        // A comparison that looked at nothing, of a class that holds
+        // something, compared nothing.
+        let unseen = Copied {
+            verified: Some(Verified::default()),
+            ..level.clone()
+        };
+        assert_eq!(outcome(unseen), Outcome::Unsettled);
+        let empty = Copied {
+            verified: Some(Verified::default()),
+            ..Copied::default()
+        };
+        assert_eq!(outcome(empty), Outcome::Settled);
     }
 
     #[test]
@@ -3397,7 +3881,7 @@ mod tests {
         let step = |bytes: usize| {
             let item = fixture.item(&"x".repeat(bytes), 0);
             Step {
-                changes: fixture.copying().fresh(&item),
+                changes: fixture.copying().fresh(&item, None),
                 settled: Settled::Stored,
                 item,
             }

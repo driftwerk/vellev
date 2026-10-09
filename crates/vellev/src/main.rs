@@ -452,8 +452,18 @@ async fn main() -> Result<ExitCode> {
                 let named: Vec<&str> = named.map(|(class, _)| class.as_str()).collect();
                 (!named.is_empty()).then(|| named.join(", "))
             };
+            for class in &report.ended {
+                eprintln!("{class}: its import was ended; nothing was done");
+            }
+            if let Some(withheld) = classes(&|copied| copied.withheld > 0) {
+                eprintln!("{withheld}: some of Weaviate's objects were NOT copied: see `withheld`. The collection was there before the import kept a ledger of it, as one an earlier release imported is, and held nothing, or something else, under their ids; nothing tells an object Weaviate gained or changed since from one another writer deleted or changed in vellev. If nothing but an import has written to the collection, run again with --sole-writer, which stores and replaces them, and deletes what Weaviate no longer holds; otherwise they stay as they are");
+            }
             if let Some(over) = classes(&|copied| copied.budget.is_some()) {
                 eprintln!("{over}: more objects are gone from Weaviate than a run may delete, so none was deleted: see `pending` and `budget`. A Weaviate that was emptied, restored or is not the one imported looks like this. If they are truly gone, raise --max-deletes and --max-delete-fraction for one run");
+            }
+            if let Some(pending) = classes(&|copied| copied.pending > 0 && copied.budget.is_none())
+            {
+                eprintln!("{pending}: objects gone from Weaviate were not deleted, as asked: see `pending`");
             }
             if let Some(refused) = classes(&|copied| !copied.refused.is_empty()) {
                 eprintln!(
@@ -468,6 +478,12 @@ async fn main() -> Result<ExitCode> {
                 verified.is_some_and(|verified| verified.different + verified.missing > 0)
             }) {
                 eprintln!("{wrong}: the collection does not hold some of the import's objects as Weaviate does: see `verified`");
+            }
+            if let Some(unseen) = classes(&|copied| {
+                let verified = copied.verified.as_ref();
+                verified.is_some_and(|verified| verified.looked == 0) && copied.weaviate > 0
+            }) {
+                eprintln!("{unseen}: nothing was compared, though Weaviate holds objects: the ledger has none of them");
             }
             if let Some(behind) = classes(&|copied| !copied.caught_up()) {
                 eprintln!("{behind}: Weaviate holds a different number of objects than the import has accounted for; it was written to during the run; run again to catch up");
