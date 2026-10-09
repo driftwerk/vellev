@@ -194,8 +194,9 @@ struct ImportWeaviate {
     /// The most objects to ask of Weaviate a second.
     #[arg(long)]
     per_second: Option<f64>,
-    /// How far Weaviate's clock may be behind this machine's, in seconds:
-    /// a catch-up looks back this much further for changes.
+    /// How far Weaviate's clock and this machine's may differ, in
+    /// seconds, either being ahead: a catch-up looks back this much
+    /// further for changes, and fetches again what changed within it.
     #[arg(long, default_value_t = 300)]
     skew_secs: u64,
     /// Where progress is kept; vellev-import-TENANT.json by default.
@@ -223,12 +224,31 @@ struct ImportWeaviate {
     /// again before the run stops: as long as a restart of it may take.
     #[arg(long, default_value_t = 600)]
     patience_secs: u64,
-    /// Say that nothing but an import has written to the collections
-    /// found without a ledger, such as those an earlier release imported:
-    /// what they lack is stored and what differs from Weaviate's is
-    /// replaced, where otherwise both are left alone.
-    #[arg(long)]
+    /// Say that nothing but an import has written, at any time since
+    /// before this release first ran against them, to the collections it
+    /// found without a ledger, such as those an earlier release imported.
+    /// What they lack is then STORED and what differs from Weaviate's is
+    /// REPLACED, where otherwise both are withheld. It deletes nothing by
+    /// itself. If anything else has written to them, its objects are
+    /// written over: say --other-writers instead.
+    #[arg(long, conflicts_with = "other_writers")]
     sole_writer: bool,
+    /// With --sole-writer: DELETE from vellev the objects such a
+    /// collection held, when this release first took it up, that Weaviate
+    /// did not hold, if each is still exactly as it was then. They are
+    /// taken for objects Weaviate deleted before there was a ledger. If
+    /// anything else wrote to the collection before or while it was taken
+    /// up, its objects are among them and are deleted. Within what a run
+    /// may delete, and only once Weaviate has twice said it does not hold
+    /// each. Nothing stored since the taking up is ever deleted by this.
+    #[arg(long, requires = "sole_writer")]
+    delete_unknown: bool,
+    /// Say that something else has written to the collections found
+    /// without a ledger: what was withheld from them, and what they held
+    /// that Weaviate did not, is another writer's, and is left alone for
+    /// good. A later --sole-writer does nothing to it.
+    #[arg(long)]
+    other_writers: bool,
     /// Say that a class Weaviate has made again since it was imported is
     /// the one to go on from.
     #[arg(long)]
@@ -383,6 +403,8 @@ async fn main() -> Result<ExitCode> {
                 confirm_secs,
                 patience_secs,
                 sole_writer,
+                delete_unknown,
+                other_writers,
                 accept_remade,
                 skip_refused,
                 strict,
@@ -434,6 +456,8 @@ async fn main() -> Result<ExitCode> {
                 confirm: Duration::from_secs(confirm_secs),
                 patience: Duration::from_secs(patience_secs),
                 sole_writer,
+                delete_unknown,
+                other_writers,
                 accept_remade,
                 skip_refused,
                 mode,
@@ -456,7 +480,10 @@ async fn main() -> Result<ExitCode> {
                 eprintln!("{class}: its import was ended; nothing was done");
             }
             if let Some(withheld) = classes(&|copied| copied.withheld > 0) {
-                eprintln!("{withheld}: some of Weaviate's objects were NOT copied: see `withheld`. The collection was there before the import kept a ledger of it, as one an earlier release imported is, and held nothing, or something else, under their ids; nothing tells an object Weaviate gained or changed since from one another writer deleted or changed in vellev. If nothing but an import has written to the collection, run again with --sole-writer, which stores and replaces them, and deletes what Weaviate no longer holds; otherwise they stay as they are");
+                eprintln!("{withheld}: some of Weaviate's objects were NOT copied: see `withheld`. The collection was there before the import kept a ledger of it, as one an earlier release imported is, and held nothing, or something else, under their ids; nothing tells an object Weaviate gained or changed since from one another writer deleted or changed in vellev. If nothing but an import has ever written to the collection, run again with --sole-writer, which stores and replaces them. If something else has, run again with --other-writers, which leaves them for good");
+            }
+            if let Some(unknown) = classes(&|copied| copied.unknown > 0) {
+                eprintln!("{unknown}: the collection held objects, when it was taken up without a ledger, that Weaviate does not hold: see `unknown`. They are objects Weaviate deleted before there was a ledger, or another writer's; nothing tells which, and they were left. If nothing but an import has ever written to the collection, --sole-writer --delete-unknown deletes those that are still as they were. If something else has, --other-writers leaves them for good");
             }
             if let Some(over) = classes(&|copied| copied.budget.is_some()) {
                 eprintln!("{over}: more objects are gone from Weaviate than a run may delete, so none was deleted: see `pending` and `budget`. A Weaviate that was emptied, restored or is not the one imported looks like this. If they are truly gone, raise --max-deletes and --max-delete-fraction for one run");

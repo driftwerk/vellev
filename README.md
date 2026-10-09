@@ -63,12 +63,19 @@ rule is:
   not brought back.
 - Everything else is left as it is, and the ledger marks it: an object
   changed or replaced in vellev since the import stored it, one deleted
-  there, one written under Weaviate's id by something else. An object
-  under an id Weaviate never had is never looked at. So a writer that
-  has moved to vellev, or one that mirrors Weaviate into vellev under
+  there, one written under Weaviate's id by something else. The ledger
+  keeps the entry of an object it leaves for as long as the collection
+  holds it, so the same is said of it on every run. An object under an
+  id Weaviate never had is never looked at, with one exception, below,
+  for a collection taken up without a ledger. So a writer that has
+  moved to vellev, or one that mirrors Weaviate into vellev under
   Weaviate's ids, is not undone by a later run. An object a mirror
   stores exactly as the import would is the import's too: it goes when
   Weaviate's does.
+
+In short: the import deletes or writes over nothing in vellev it cannot
+show it put there, but for one narrow act an operator asks for in so
+many words, once, of a collection that was there before its ledger.
 
 The object and its ledger entry are written in one atomic step. The step
 that replaces or deletes an object fails if any of the object's
@@ -87,10 +94,10 @@ Nothing is deleted while Weaviate is walked. What the ledger has and the
 walk did not list is first only counted.
 
 - **A run deletes at most `--max-deletes` objects of a class (1000) and
-  at most `--max-delete-fraction` of what was imported of it (0.05),
-  whichever is fewer, and never the last object of a class.** A class of
-  up to twenty objects may so lose one in a run, and one of a single
-  object none. A run that finds more gone deletes none of them, reports
+  at most `--max-delete-fraction` (0.05) of what was imported of it or
+  of what the collection holds, whichever is fewer, and never the last
+  object the collection holds.** A collection of up to twenty objects
+  may so lose one in a run, and one of a single object none. A run that finds more gone deletes none of them, reports
   them as `pending` beside the `budget`, and fails: a Weaviate that was
   emptied, restored from a backup, or is not the one imported looks
   exactly like one that deleted a great deal. If they are truly gone,
@@ -133,35 +140,54 @@ release imported**, and any that something else made.
 
 Without a ledger nothing tells an object Weaviate gained since from one
 somebody deleted in vellev, nor one Weaviate changed from one somebody
-changed in vellev. So, by default:
+changed in vellev, nor one Weaviate deleted from one somebody wrote to
+vellev. Weaviate's times do not tell either: a batch that writes an
+object again gives it a new time of creation. So, by default:
 
 - What the collection holds exactly as Weaviate does becomes the
   import's.
 - **What it lacks, or holds otherwise, is not copied.** It is marked in
-  the ledger as `withheld`, counted under that name on every run, and
-  the run fails, saying so: a run never settles over objects it did not
-  copy. For a collection an earlier release imported, that is every
-  object Weaviate gained or changed since that import last caught up,
-  and every object holding a number the earlier release read a digit
-  off (see the release notes).
-- An object Weaviate made after the taking up began, by more than
-  `--skew-secs`, is new to it and is stored: it cannot have been deleted
-  from a collection that never held it.
-- Nothing is deleted. An object Weaviate deleted before there was a
-  ledger stays.
+  the ledger as `withheld`, with what the collection held, counted under
+  that name on every run, and the run fails, saying so: a run never
+  settles over objects it did not copy. For a collection an earlier
+  release imported, that is every object Weaviate gained or changed
+  since that import last caught up, and every object holding a number
+  the earlier release read a digit off (see the release notes).
+- **What it holds that Weaviate does not is not deleted.** On the first
+  taking up of a collection nothing has ever kept a ledger of, each such
+  object is noted in the ledger as `unknown`, with a hash of it as it
+  was then, and counted under that name on every run; the run fails
+  until somebody says whose they are. This noting is the one time the
+  import looks at an object under an id Weaviate never had. No later
+  run notes any, not even a taking up begun again because the ledger
+  was lost: what the collection holds by then may have been written
+  since.
 
-**The remedy is `--sole-writer`**, on that run or any later one: it says
-nothing but an import has written to the collection. Then what was
-withheld is stored or replaced, and what the collection holds that
-neither Weaviate nor the ledger has is deleted, as anything is: within
-the bound, after Weaviate has twice said it does not hold it. What the
-ledger marks as another writer's is still left alone. If something else
-has written to the collection, do not say so: what is withheld then
-stays as it is, the run goes on failing, and the collection is brought
-level only by whoever knows which side is right.
+The taking up over, an object Weaviate lists without an entry is new to
+Weaviate, and is stored. Two things settle what was withheld or is
+unknown, and the run fails until one of them is said:
 
-Once the taking up is over, an object without an entry is new to
-Weaviate, and is stored.
+- **`--sole-writer`** says nothing but an import has written to the
+  collection, at any time since before it was taken up. Then what was
+  withheld is stored or replaced, on that run or any later one. It
+  deletes nothing by itself. Say it only if it is true: anything else
+  written there is written over.
+- **`--sole-writer --delete-unknown`** says that too, and asks for the
+  unknown objects to be deleted: each is taken for one Weaviate deleted
+  before there was a ledger, and is deleted as anything is, within the
+  bound, after Weaviate has twice said it does not hold it, and only if
+  it is still exactly as it was noted; one changed since is left,
+  counted as `left`, and stays unknown until it is said to be another
+  writer's. Objects stored in the collection after the taking up are
+  never among them, whatever a run is told. An object another writer
+  stored during the taking up is among them, which is why the flag is
+  honest only if `--sole-writer` is. Once the last of them is deleted
+  or settled, nothing is owed, and the two flags do nothing more.
+- **`--other-writers`** says something else has written to the
+  collection: what was withheld, and what is unknown, is marked as
+  another writer's and left alone for good. A later run with the other
+  flags copies nothing over it and deletes none of it. The two cannot
+  both be said.
 
 ### Ending an import
 
@@ -185,9 +211,14 @@ Per class:
   writer's. The same on every run while they stay so.
 - `withheld`: the objects of Weaviate's that were not copied into a
   collection taken up without a ledger. The same on every run until one
-  with `--sole-writer`.
-- `left`: objects gone from Weaviate that this run left in the
-  collection because they were not as the import had stored them.
+  with `--sole-writer` or `--other-writers`.
+- `unknown`: the objects such a collection held, when it was taken up,
+  that Weaviate did not. The same on every run until one with
+  `--sole-writer --delete-unknown` or `--other-writers`.
+- `left`: objects gone from Weaviate that stay in the collection because
+  they were not as the import had stored them: another writer's, and no
+  fault of the import's. Their entries are kept, so the same on every
+  run, and Weaviate is not asked about them again.
 - `pending` and `budget`: see above.
 - `refused`: objects vellev cannot hold, by id, with why. One stops the
   run unless `--skip-refused` is given.
@@ -208,9 +239,9 @@ The command exits with
   Objects of another writer's do not count against it.
 - **3** when Weaviate was written to behind the catch-up: run again.
 - **1** when something is left that another run will not put right by
-  itself: objects withheld, objects gone and not deleted, objects
-  refused or too large, a comparison that found differences or looked at
-  nothing, or any failure.
+  itself: objects withheld or unknown, objects gone and not deleted,
+  objects refused or too large, a comparison that found differences or
+  looked at nothing, or any failure.
 
 `--strict` makes it 1 as well whenever a collection holds anything that
 is not as the import left it.
@@ -226,8 +257,14 @@ listing the ledger once. It reports, under `verified`, how many it
 `looked` at, how many are the `same`, how many of the import's are
 `different` or `missing`, with some of their ids, and how many are
 `kept` by another writer, `withheld`, `unaccounted` for, or `gone` from
-Weaviate. One that looked at nothing, of a class that holds objects,
-fails.
+Weaviate while the collection still holds them. It counts `withheld`,
+`unknown` and `left` over the whole ledger as a run that imports does,
+and fails on the same terms: on anything withheld, unknown, different,
+missing or gone, and on looking at nothing of a class that holds
+objects. `--verify-all` also counts, as `extra`, the objects the
+collection holds that the ledger has no entry for: another writer's,
+under ids Weaviate never had, and no fault of the import's unless it is
+told to be `--strict`. `--verify` of some pages cannot see them.
 
 ### What it costs
 

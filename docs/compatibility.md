@@ -410,8 +410,9 @@ release before stopped.
   numbers the node did not store.
 - A collection imported before there was a ledger is taken up, not
   caught up as it was: what it lacks or holds otherwise is withheld, not
-  copied, and the run fails until one is told that nothing else wrote
-  to it. See the README.
+  copied, what it holds that Weaviate does not is noted and not
+  deleted, and the run fails until one is told whose they are. See the
+  README.
 - The report may gain fields. Its exit status is 0 when everything that
   is the import's is settled, 3 when another run is all it takes, and 1
   otherwise; before, it was 1 whenever the counts differed.

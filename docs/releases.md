@@ -320,11 +320,15 @@ and say what the caller then answers for.
   everything else of Weaviate's, which is whatever Weaviate gained or
   changed since that import last caught up and whatever holds a number
   read the old way, is **not copied**. It is counted as `withheld` and
-  the run fails, every time, saying so. The remedy is one run with
-  `--sole-writer`, if nothing but an import has written to the
-  collection: it stores and replaces what was withheld, and deletes,
-  within the usual bound, what Weaviate deleted meanwhile. Otherwise
-  import into a collection made anew.
+  the run fails, every time, saying so. What the collection held that
+  Weaviate did not is noted, once, as `unknown`, and not deleted. The
+  remedy, if nothing but an import has ever written to the collection,
+  is one run with `--sole-writer`, which stores and replaces what was
+  withheld, and `--delete-unknown` beside it, which deletes what was
+  noted, within the usual bound, if it is still as it was noted. If
+  something else has written to the collection, `--other-writers`
+  leaves all of it alone for good. Otherwise import into a collection
+  made anew.
 - **`vellev import finalise`** ends an import: it drops the ledgers and
   notes that the collections are no longer imported.
 - **The exit status says what is left**: 0 when everything that is the
@@ -335,11 +339,15 @@ and say what the caller then answers for.
 - **The report is exact, and the same every run.** An object deleted
   from Weaviate between being listed and being fetched is deleted in the
   same run. `changed` no longer counts objects stored again unchanged.
-  New fields: `kept`, `withheld`, `left`, `pending`, `budget`,
-  `refused`, `too_large`, `imported`, `verified`, and `ended` beside
-  the classes.
+  New fields: `kept`, `withheld`, `unknown`, `left`, `pending`,
+  `budget`, `refused`, `too_large`, `imported`, `verified`, and `ended`
+  beside the classes. An object gone from Weaviate that stays in the
+  collection as another writer's keeps its ledger entry, and is counted
+  as `left` on every run.
 - **`--verify` and `--verify-all`** compare what a collection holds with
-  what Weaviate does, object by object, and change nothing.
+  what Weaviate does, object by object, and change nothing. They fail
+  on what a run that imports fails on, and `--verify-all` counts what
+  the collection holds that the ledger has no entry for.
 - A class whose import was ended is passed over by a run of every
   class, and refused only when named.
 - **A collection is caught up only from the Weaviate it was imported
