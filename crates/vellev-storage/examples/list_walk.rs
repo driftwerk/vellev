@@ -200,6 +200,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
     println!("page 1000 from the start, with versions: {versions:?}");
+    // What answering such a page costs besides, roughly: each object's
+    // properties and vector written as JSON, as the API writes them.
+    let written = best_of_three(|| {
+        partition.read(|state| {
+            state
+                .list(&name, None, None, 1_000)
+                .expect("a known collection")
+                .iter()
+                .map(|found| {
+                    let object = (found.object.properties_json(), found.vector);
+                    serde_json::to_vec(&object).expect("JSON").len()
+                })
+                .sum::<usize>()
+        });
+    });
+    println!("page 1000 from the start, written as JSON with vectors: {written:?}");
     let near = vec![0.5; dimensions as usize];
     let searched = best_of_three(|| {
         let query = Query::nearest(&near, 100);

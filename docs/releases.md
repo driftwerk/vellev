@@ -117,7 +117,16 @@ before runs on the migrated database.
   `/hybrid`, whether or not the vector is sent along. Opaque: compare
   for equality only. The same content has the same version under any
   id, on any node, after any restore; a vector-only change gives a new
-  one; an object changed and changed back has its old one.
+  one; an object changed and changed back has its old one. It is
+  computed as an object is answered, never stored: in the same runs as
+  below, about 1.6 µs an object with a 768-dimension vector (`get` 0.4
+  µs → 1.6 µs; a page of 1,000 with versions 1.7 ms, where writing that
+  page as JSON with its vectors takes 15 ms and without them about 0.3
+  ms; a top-100 search gains 0.2 ms on 38 ms), and under 0.2 µs with a
+  2-dimension one. On aarch64 that takes `sha2`'s assembly backend,
+  which `vellev-core` now builds with there; without it a version costs
+  about 9 µs at 768 dimensions. x86-64 uses the processor's SHA
+  extensions as before.
 - **A write can be made only if an object is still at a version**:
   `only_if_version` in the body of `PUT` and `PATCH …/objects/{id}`, as
   `?only_if_version=` on `DELETE …/objects/{id}`, and on `upsert`,
