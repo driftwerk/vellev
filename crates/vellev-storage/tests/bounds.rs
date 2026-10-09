@@ -1452,6 +1452,7 @@ fn a_commit_resolves_encodes_and_applies_its_group_off_the_async_threads() {
             id: id(1),
             properties: json!({ "title": "a note" }).as_object().unwrap().clone(),
             vector: None,
+            only_if_version: None,
         };
         let committing = tokio::spawn({
             let writer = writer.clone();
@@ -1614,6 +1615,7 @@ async fn a_group_as_large_as_any_is_committed_long_before_its_writer_is_taken_fo
             .unwrap()
             .clone(),
         vector: Some(vec![n as f32, 0.5]),
+        only_if_version: None,
     };
     let mut weight = Weight::default();
     let group: Vec<Batch> = (0..GROUP_MOST.rows)

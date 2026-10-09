@@ -3,7 +3,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
-use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value};
+use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value, Version};
 use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
@@ -234,6 +234,12 @@ impl Live<'_> {
             vector: self.vector.map(<[f32]>::to_vec),
             ..self.object.clone()
         }
+    }
+
+    /// The object's version: of its properties and vector, as they are
+    /// stored.
+    pub fn version(&self) -> Version {
+        Version::of(&self.object.properties, self.vector)
     }
 
     /// Whether this is `object`, vector and all.
@@ -1811,7 +1817,8 @@ mod tests {
         assert!(live > 1_000, "{live}");
 
         let half = n / 2;
-        let cases: [(Option<Filter>, Box<dyn Fn(i64) -> bool>); 3] = [
+        type Passes = Box<dyn Fn(i64) -> bool>;
+        let cases: [(Option<Filter>, Passes); 3] = [
             (None, Box::new(|_| true)),
             (Some(dense(half)), Box::new(move |n| n >= half)),
             (Some(sparse()), Box::new(|n| k(n) == "x")),

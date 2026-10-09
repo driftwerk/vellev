@@ -110,6 +110,7 @@ async fn main() {
                 .unwrap()
                 .clone(),
             vector: None,
+            only_if_version: None,
         });
         writer.commit(puts.collect()).await.unwrap();
     }

@@ -55,7 +55,7 @@ fn collection() -> Collection {
 const SPARSE: u64 = 10_000;
 
 fn row(collection: &CollectionName, n: u64) -> Mutation {
-    let k = if n % SPARSE == 0 { "x" } else { "y" };
+    let k = if n.is_multiple_of(SPARSE) { "x" } else { "y" };
     Mutation::Upsert {
         collection: collection.clone(),
         id: ObjectId::generate(),
@@ -64,6 +64,7 @@ fn row(collection: &CollectionName, n: u64) -> Mutation {
             .expect("an object")
             .clone(),
         vector: Some(vec![n as f32, 1.0]),
+        only_if_version: None,
     }
 }
 
@@ -178,6 +179,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         partition.read(|state| state.get(&name, middle).map(|found| found.to_object()));
     });
     println!("get: {got:?}");
+    let versioned = best_of_three(|| {
+        partition.read(|state| state.get(&name, middle).map(|found| found.version()));
+    });
+    println!("get, and its version: {versioned:?}");
+    let versions = best_of_three(|| {
+        partition.read(|state| {
+            state
+                .list(&name, None, None, 1_000)
+                .expect("a known collection")
+                .iter()
+                .map(Live::version)
+                .count()
+        });
+    });
+    println!("page 1000 from the start, with versions: {versions:?}");
     let searched = best_of_three(|| {
         let query = Query::nearest(&[0.5, 1.0], 100);
         partition.read(|state| {

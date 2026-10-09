@@ -2,7 +2,8 @@ mod common;
 
 use common::*;
 use serde_json::Value as Json;
-use vellev_storage::{Condition, GroupCommitter, Outcome, Receipt};
+use vellev_core::Version;
+use vellev_storage::{Batch, Condition, GroupCommitter, Outcome, Receipt};
 
 fn object(properties: Json) -> serde_json::Map<String, Json> {
     properties.as_object().unwrap().clone()
@@ -27,6 +28,7 @@ fn patch(object_id: u8, properties: Json, only_if: Option<(&str, Json)>) -> Muta
             property: property.into(),
             equals,
         }),
+        only_if_version: None,
     }
 }
 
@@ -151,6 +153,7 @@ async fn patch_merges_removes_and_keeps_the_rest() {
         properties: Default::default(),
         vector: Some(vec![1.0, 2.0]),
         only_if: None,
+        only_if_version: None,
     };
     writer.commit(vec![revector]).await.unwrap();
     writer.partition().read(|state| {
@@ -189,6 +192,7 @@ async fn a_mutation_that_changes_nothing_is_not_logged() {
         id: id(1),
         properties: stored.properties_json(),
         vector: stored.vector.clone(),
+        only_if_version: None,
     };
     let unchanged = vec![
         identical,
@@ -718,6 +722,7 @@ async fn a_group_takes_no_more_than_its_bound_in_mutations_and_in_bytes() {
             id: id(201),
             properties: object(json!({ "title": title, "n": batch })),
             vector: None,
+            only_if_version: None,
         }]
     };
     let rounds: [(Vec<Vec<Mutation>>, u64); 2] = [
@@ -767,6 +772,7 @@ async fn a_delete_by_filter_takes_so_many_objects_and_is_refused_more() {
         id: ObjectId(uuid::Uuid::from_u128(n as u128)),
         properties: object(json!({ "n": 7 })),
         vector: None,
+        only_if_version: None,
     };
     let rows = (0..DELETED_AT_MOST).map(row);
     let first = [create("notes")].into_iter().chain(rows).collect();
@@ -804,12 +810,14 @@ async fn a_delete_by_filter_takes_so_many_objects_and_is_refused_more() {
     let one = Mutation::Delete {
         collection: name("notes"),
         id: ObjectId(uuid::Uuid::from_u128(0)),
+        only_if_version: None,
     };
     writer.commit(vec![one, row(0)]).await.unwrap();
     writer
         .commit(vec![Mutation::Delete {
             collection: name("notes"),
             id: ObjectId(uuid::Uuid::from_u128(DELETED_AT_MOST as u128)),
+            only_if_version: None,
         }])
         .await
         .unwrap();
@@ -830,6 +838,7 @@ async fn a_delete_by_filter_with_a_limit_deletes_that_many_at_a_time_until_none_
         id: ObjectId(uuid::Uuid::from_u128(n as u128)),
         properties: object(json!({ "n": 7 })),
         vector: None,
+        only_if_version: None,
     };
     // More than a delete with no limit takes.
     let rows = (0..DELETED_AT_MOST + 1_000).map(row);
@@ -943,4 +952,284 @@ fn most_deleted() -> vellev_storage::Over {
         capped: vellev_storage::Capped::Deleted,
         most: vellev_storage::DELETED_AT_MOST as u64,
     }
+}
+
+fn version_of(state: &State, object_id: u8) -> Option<Version> {
+    state
+        .get(&name("notes"), id(object_id))
+        .map(|found| found.version())
+}
+
+/// `mutation` made only if its object is at `version`.
+fn at(mutation: Mutation, version: Version) -> Mutation {
+    match mutation {
+        Mutation::Upsert {
+            collection,
+            id,
+            properties,
+            vector,
+            ..
+        } => Mutation::Upsert {
+            collection,
+            id,
+            properties,
+            vector,
+            only_if_version: Some(version),
+        },
+        Mutation::Patch {
+            collection,
+            id,
+            properties,
+            vector,
+            only_if,
+            ..
+        } => Mutation::Patch {
+            collection,
+            id,
+            properties,
+            vector,
+            only_if,
+            only_if_version: Some(version),
+        },
+        Mutation::Delete { collection, id, .. } => Mutation::Delete {
+            collection,
+            id,
+            only_if_version: Some(version),
+        },
+        other => panic!("{other:?} takes no version"),
+    }
+}
+
+/// A version no object is at: of content never written.
+fn stale() -> Version {
+    "00000000000000000000000000000000".parse().unwrap()
+}
+
+fn stale_version(error: &StorageError) -> bool {
+    matches!(error, StorageError::StaleVersion { .. })
+}
+
+#[tokio::test]
+async fn a_write_conditional_on_a_version_is_made_only_at_that_version() {
+    let (cluster, writer) = notes().await;
+    let version = |writer: &Writer| {
+        writer
+            .partition()
+            .read(|state| version_of(state, 1).unwrap())
+    };
+    let v10 = version(&writer);
+
+    let receipt = writer
+        .commit(vec![at(patch(1, json!({ "n": 11 }), None), v10)])
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcomes, vec![Outcome::Applied]);
+    let v11 = version(&writer);
+    assert_ne!(v11, v10);
+
+    // At any other version, refused and told the one it is at, whatever
+    // the write; the object stays as it was.
+    for change in [
+        at(patch(1, json!({ "n": 12 }), None), v10),
+        at(upsert("notes", 1, 12), stale()),
+        at(delete("notes", 1), v10),
+    ] {
+        let before = cluster.committed().await;
+        let error = writer.commit(vec![change]).await.unwrap_err();
+        assert!(
+            matches!(&error, StorageError::StaleVersion { stored, .. } if *stored == v11),
+            "{error:?}"
+        );
+        assert_eq!(error.stored_version(), Some(v11));
+        assert_eq!(cluster.committed().await, before);
+    }
+    writer
+        .partition()
+        .read(|state| assert_eq!(n_of(state, "notes", 1), Some(11)));
+
+    // A write that leaves the content as it is changes no version and
+    // logs nothing; one that changes the vector alone changes it.
+    let before = cluster.committed().await;
+    let same = at(patch(1, json!({ "n": 11 }), None), v11);
+    let receipt = writer.commit(vec![same]).await.unwrap();
+    assert_eq!(receipt.outcomes, vec![Outcome::Unchanged]);
+    assert_eq!(cluster.committed().await, before);
+    assert_eq!(version(&writer), v11);
+    let revectored = Mutation::Patch {
+        collection: name("notes"),
+        id: id(1),
+        properties: object(json!({})),
+        vector: Some(vec![0.25, 0.75]),
+        only_if: None,
+        only_if_version: Some(v11),
+    };
+    let receipt = writer.commit(vec![revectored]).await.unwrap();
+    assert_eq!(receipt.outcomes, vec![Outcome::Applied]);
+    let revectored = version(&writer);
+    assert_ne!(revectored, v11);
+    assert_eq!(
+        revectored,
+        Version::of(
+            &BTreeMap::from([
+                ("title".to_string(), Value::Text("row 1".into())),
+                ("n".to_string(), Value::Int(11)),
+            ]),
+            Some(&[0.25, 0.75]),
+        ),
+        "the version is of the content, vector and all"
+    );
+
+    // A condition sees what the batch did before it.
+    let next = Version::of(
+        &BTreeMap::from([
+            ("title".to_string(), Value::Text("row 1".into())),
+            ("n".to_string(), Value::Int(12)),
+        ]),
+        Some(&[0.25, 0.75]),
+    );
+    let receipt = writer
+        .commit(vec![
+            at(patch(1, json!({ "n": 12 }), None), revectored),
+            at(patch(1, json!({ "n": 13 }), None), next),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcomes, vec![Outcome::Applied, Outcome::Applied]);
+    let v13 = version(&writer);
+
+    // A reader elsewhere sees the version the writer checks against,
+    // through a checkpoint too.
+    writer.flush().await.unwrap();
+    let follower = cluster.open().await;
+    assert_eq!(
+        follower.partition().read(|state| version_of(state, 1)),
+        Some(v13)
+    );
+    assert_eq!(version(&writer), v13);
+
+    // Deleted at its version; then a conditional write finds nothing,
+    // while a plain delete still changes nothing.
+    let receipt = writer
+        .commit(vec![at(delete("notes", 1), v13)])
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcomes, vec![Outcome::Applied]);
+    for change in [
+        at(upsert("notes", 1, 1), v13),
+        at(patch(1, json!({ "n": 1 }), None), v13),
+        at(delete("notes", 1), v13),
+    ] {
+        refused(&cluster, &writer, vec![change], |e| {
+            matches!(e, StorageError::UnknownObject { .. })
+        })
+        .await;
+    }
+    let receipt = writer.commit(vec![delete("notes", 1)]).await.unwrap();
+    assert_eq!(receipt.outcomes, vec![Outcome::Unchanged]);
+}
+
+#[tokio::test]
+async fn both_conditions_of_a_patch_must_hold_and_a_refusal_keeps_the_version() {
+    let (cluster, writer) = notes().await;
+    let v10 = writer
+        .partition()
+        .read(|state| version_of(state, 1).unwrap());
+    refused(
+        &cluster,
+        &writer,
+        vec![at(
+            patch(1, json!({ "n": 11 }), Some(("n", json!(10)))),
+            stale(),
+        )],
+        stale_version,
+    )
+    .await;
+    let before = cluster.committed().await;
+    let error = writer
+        .commit(vec![at(
+            patch(1, json!({ "n": 11 }), Some(("n", json!(99)))),
+            v10,
+        )])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, StorageError::ConditionFailed { stored, .. } if *stored == v10),
+        "{error:?}"
+    );
+    assert_eq!(cluster.committed().await, before);
+    let receipt = writer
+        .commit(vec![at(
+            patch(1, json!({ "n": 11 }), Some(("n", json!(10)))),
+            v10,
+        )])
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcomes, vec![Outcome::Applied]);
+
+    // Refused under a name, the refusal keeps the version the object was
+    // at, and a try of it again is told it: by this writer, and by one
+    // opened afresh after a checkpoint, from what the log kept.
+    let v11 = writer
+        .partition()
+        .read(|state| version_of(state, 1).unwrap());
+    let request = RequestId::generate();
+    let named = || Batch {
+        request: Some(request),
+        mutations: vec![at(patch(1, json!({ "n": 12 }), None), v10)],
+    };
+    let answered = |answers: Vec<vellev_storage::Result<Receipt>>| {
+        let error = answers.into_iter().next().unwrap().unwrap_err();
+        assert!(error.refusal().is_some(), "{error:?}");
+        error.stored_version()
+    };
+    let first = writer
+        .commit_batches(vec![named()], Default::default())
+        .await
+        .unwrap();
+    assert_eq!(answered(first), Some(v11));
+    writer
+        .commit(vec![patch(1, json!({ "n": 12 }), None)])
+        .await
+        .unwrap();
+    let again = writer
+        .commit_batches(vec![named()], Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        answered(again),
+        Some(v11),
+        "as it was refused, not as it is"
+    );
+    writer.flush().await.unwrap();
+    let reopened = cluster.writer().await;
+    let later = reopened
+        .commit_batches(vec![named()], Default::default())
+        .await
+        .unwrap();
+    assert_eq!(answered(later), Some(v11));
+}
+
+#[tokio::test]
+async fn a_group_with_a_stale_version_in_one_batch_commits_the_rest() {
+    let (cluster, writer) = notes().await;
+    let results = writer
+        .commit_group(vec![
+            vec![
+                insert(2, json!({ "n": 2 })),
+                at(delete("notes", 1), stale()),
+            ],
+            vec![insert(3, json!({ "n": 3 }))],
+        ])
+        .await
+        .unwrap();
+    assert!(stale_version(results[0].as_ref().unwrap_err()));
+    assert_eq!(
+        results[1].as_ref().unwrap().outcomes,
+        vec![Outcome::Applied]
+    );
+    cluster.open().await.partition().read(|state| {
+        assert_eq!(n_of(state, "notes", 1), Some(10));
+        assert_eq!(n_of(state, "notes", 2), None);
+        assert_eq!(n_of(state, "notes", 3), Some(3));
+    });
 }

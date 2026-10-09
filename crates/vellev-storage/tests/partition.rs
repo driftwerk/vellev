@@ -52,12 +52,14 @@ async fn a_rejected_mutation_fails_the_whole_batch_and_changes_nothing() {
         id: id(2),
         properties: json!({ "n": "two" }).as_object().unwrap().clone(),
         vector: None,
+        only_if_version: None,
     };
     let wrong_vector = Mutation::Upsert {
         collection: name("notes"),
         id: id(2),
         properties: Default::default(),
         vector: Some(vec![1.0; 3]),
+        only_if_version: None,
     };
     let mut resized = schema("notes");
     resized.embedding.dimensions = 3;
@@ -139,6 +141,7 @@ async fn schema_changes_are_durable() {
         id: id(1),
         properties: json!({ "reviewed": true }).as_object().unwrap().clone(),
         vector: None,
+        only_if_version: None,
     };
     writer.commit(vec![reviewed]).await.unwrap();
     for flush in [false, true] {
@@ -1091,6 +1094,7 @@ impl Change {
                     id,
                     properties,
                     vector,
+                    only_if_version: None,
                 } => Mutation::Insert {
                     collection,
                     id,

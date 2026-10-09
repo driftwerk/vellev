@@ -1,6 +1,7 @@
 use serde_json::{Map, Value as Json};
 use vellev_core::{
     Collection, CollectionName, Embedding, ModelFault, ObjectId, Property, RequestId, Value,
+    Version,
 };
 
 use vellev_index::filter::Filter;
@@ -20,12 +21,14 @@ pub enum Mutation {
         property: Property,
     },
     DropCollection(CollectionName),
-    /// Write the whole object, replacing any stored one.
+    /// Write the whole object, replacing any stored one. With
+    /// `only_if_version`, only if one is stored and is at that version.
     Upsert {
         collection: CollectionName,
         id: ObjectId,
         properties: Map<String, Json>,
         vector: Option<Vec<f32>>,
+        only_if_version: Option<Version>,
     },
     /// Write the object only if none is stored under its id.
     Insert {
@@ -35,13 +38,16 @@ pub enum Mutation {
         vector: Option<Vec<f32>>,
     },
     /// Merge into a stored object: a property sent as JSON null is removed,
-    /// and the vector is replaced when one is given.
+    /// and the vector is replaced when one is given. Only if the stored
+    /// object passes `only_if` and is at `only_if_version`, where given;
+    /// both must hold.
     Patch {
         collection: CollectionName,
         id: ObjectId,
         properties: Map<String, Json>,
         vector: Option<Vec<f32>>,
         only_if: Option<Condition>,
+        only_if_version: Option<Version>,
     },
     /// Add `by` to a numeric property, counting an absent value as zero. An
     /// int moves only by whole numbers, which `by` holds exactly up to 2^53.
@@ -60,9 +66,12 @@ pub enum Mutation {
         values: Vec<String>,
         unique: bool,
     },
+    /// Delete the object, if there is one: deleting none changes nothing.
+    /// With `only_if_version`, there must be one, at that version.
     Delete {
         collection: CollectionName,
         id: ObjectId,
+        only_if_version: Option<Version>,
     },
     /// Delete every object that passes `filter`, as the batch sees them:
     /// including rows it wrote earlier, excluding rows it already deleted.

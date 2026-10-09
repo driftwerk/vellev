@@ -48,6 +48,7 @@ fn row(n: u32) -> Mutation {
         id: object(n),
         properties: properties.as_object().unwrap().clone(),
         vector: Some(vector(n)),
+        only_if_version: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn gone(n: u32) -> Mutation {
     Mutation::Delete {
         collection: name("notes"),
         id: object(n),
+        only_if_version: None,
     }
 }
 
@@ -161,6 +163,7 @@ async fn write_fixtures() {
         properties: json!({ "n": 1_011 }).as_object().unwrap().clone(),
         vector: None,
         only_if: None,
+        only_if_version: None,
     };
     let made = writer
         .commit_batches(vec![named(2, vec![patch])], Embedded::new())

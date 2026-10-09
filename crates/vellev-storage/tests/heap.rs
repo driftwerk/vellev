@@ -45,6 +45,7 @@ fn wide(n: u16) -> Mutation {
         id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
         properties: json!({ "n": n }).as_object().unwrap().clone(),
         vector: Some(vec![f32::from(n) + 1.0; DIMENSIONS]),
+        only_if_version: None,
     }
 }
 

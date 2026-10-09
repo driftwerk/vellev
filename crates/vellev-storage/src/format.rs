@@ -388,6 +388,7 @@ mod tests {
                         message: "object 7 already exists in notes".into(),
                         lacking: None,
                         over: None,
+                        version: None,
                     }),
                 },
             ],
@@ -537,6 +538,7 @@ mod tests {
                     message: message.into(),
                     lacking,
                     over: None,
+                    version: None,
                 }),
             }],
             ..log()
@@ -657,6 +659,7 @@ mod tests {
             message: "a delete takes a limit of 1 to 8192".into(),
             lacking: None,
             over,
+            version: None,
         };
         let older = || OlderRefusal {
             kind: Refused::Invalid,
@@ -708,6 +711,69 @@ mod tests {
                 capped: LaterCapped::Written,
                 most: 5,
             }),
+        };
+        assert_eq!(
+            rmp_serde::from_slice::<Refusal>(&pack(&later)).unwrap(),
+            refused(None)
+        );
+    }
+
+    #[test]
+    fn the_version_a_refusal_was_at_is_kept_and_other_releases_read_past_it() {
+        use crate::Refused;
+        use vellev_core::Version;
+        /// A refusal as the release before `version` was kept reads and
+        /// writes it.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct OlderRefusal {
+            kind: Refused,
+            message: String,
+        }
+        let at: Version = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let refused = |version| Refusal {
+            kind: Refused::Conflict,
+            message: "object 7 in notes is not at the version given".into(),
+            lacking: None,
+            over: None,
+            version,
+        };
+        let older = || OlderRefusal {
+            kind: Refused::Conflict,
+            message: "object 7 in notes is not at the version given".into(),
+        };
+        fn pack<T: Serialize>(kept: &T) -> Vec<u8> {
+            rmp_serde::to_vec_named(kept).unwrap()
+        }
+        let kept = pack(&refused(Some(at)));
+        assert_eq!(
+            rmp_serde::from_slice::<Refusal>(&kept).unwrap(),
+            refused(Some(at))
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<OlderRefusal>(&kept).unwrap(),
+            older(),
+            "the release before reads past what it does not know"
+        );
+        let before = pack(&older());
+        assert_eq!(
+            rmp_serde::from_slice::<Refusal>(&before).unwrap(),
+            refused(None),
+            "and what it wrote reads as a refusal that kept no version"
+        );
+        assert_eq!(pack(&refused(None)), before, "written as it always was");
+
+        // A release after this one may keep a version written otherwise:
+        // read here, after a rollback, it is a refusal that kept none.
+        #[derive(Debug, Serialize)]
+        struct LaterRefusal {
+            kind: Refused,
+            message: String,
+            version: Vec<u8>,
+        }
+        let later = LaterRefusal {
+            kind: Refused::Conflict,
+            message: "object 7 in notes is not at the version given".into(),
+            version: vec![1, 2, 3],
         };
         assert_eq!(
             rmp_serde::from_slice::<Refusal>(&pack(&later)).unwrap(),

@@ -24,6 +24,7 @@ fn note(object: u8, properties: serde_json::Value) -> Mutation {
         id: id(object),
         properties: properties.as_object().unwrap().clone(),
         vector: None,
+        only_if_version: None,
     }
 }
 
@@ -325,6 +326,7 @@ async fn the_best_few_are_the_head_of_the_whole_ranking_over_many_blocks() {
                 .unwrap()
                 .clone(),
                 vector: None,
+                only_if_version: None,
             })
             .collect::<Vec<_>>();
         for batch in mutations.chunks(500) {
@@ -337,6 +339,7 @@ async fn the_best_few_are_the_head_of_the_whole_ranking_over_many_blocks() {
     let deleted = (0..3_000u32).step_by(7).map(|n| Mutation::Delete {
         collection: name(NOTES),
         id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+        only_if_version: None,
     });
     writer.commit(deleted.collect()).await.unwrap();
 
@@ -389,6 +392,7 @@ async fn ties_many_clauses_weights_and_filters_keep_the_best_few_exact() {
                 .unwrap()
                 .clone(),
                 vector: None,
+                only_if_version: None,
             }
         })
         .collect();
