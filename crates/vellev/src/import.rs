@@ -33,8 +33,8 @@
 //! candidates are counted against what a run may delete, and if they are
 //! within it each is asked for twice, a pause apart, with Weaviate ready
 //! and the class the one that was imported and its shards loaded, before
-//! the import deletes what it stored under that id: [`Copying::remove`]
-//! is the one place that does.
+//! the import deletes what it stored under that id. [`Copying::removing`]
+//! is the one place a delete of an object is made.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
