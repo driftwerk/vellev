@@ -84,9 +84,9 @@ included, so a write that lands meanwhile is kept, and nothing is asked
 of Weaviate between that read and the step. Two things go unseen in the
 instant between them: a change to the object's vector alone, and a value
 for a property the collection gained since the run began. Either is then
-deleted or written over with the object. vellev has no condition on an
-object's version yet, and a condition can name a property but not the
-vector; with one on the version, neither would go unseen.
+deleted or written over with the object, until vellev has a condition
+on an object's version (DW-677): a condition can name a property but not
+the vector, and with one on the version neither would go unseen.
 
 ### Deleting
 
