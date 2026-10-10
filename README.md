@@ -231,7 +231,8 @@ copies. With a backup store the purge waits at least
 tenant still holds its claim. The purge is done, and a tenant may be made
 again under the same id, only once a pass over its files and backups finds
 nothing left; until then making one is refused with the code `purging` and
-a `Retry-After` of how long that may be. One node at a time purges a
+a `Retry-After` of the least that may be, a lower bound and not when the
+purge will be done. One node at a time purges a
 tenant, by a claim it renews before every listing and every batch of
 deletes, and which is renewed only while the purge is still that node's to
 do and no tenant of the id has been made: a node that stalls in the middle

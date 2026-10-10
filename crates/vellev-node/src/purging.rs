@@ -84,9 +84,11 @@
 //!   it listed before it stalled.
 //! - A pause that stops every clock the machine has, as a hypervisor
 //!   freezing a guest does: no clock it can ask counts it, and the node
-//!   goes on as if no time had passed. The same bound holds for what one
-//!   batch sends, but not for the batches after it until the claim's next
-//!   renewal is refused, which is before each.
+//!   goes on as if no time had passed. It sends the batch it was
+//!   sending, at most [`DELETED_AT_ONCE`] deletes, and no other: the
+//!   claim is renewed with the coordinator before each batch, and is not
+//!   once another node holds it, the purge is done or the tenant is there
+//!   again.
 //!
 //! A file in the backups deleted so is put back as any deleted late from
 //! under a backup is, by the backup looking again once it is written and

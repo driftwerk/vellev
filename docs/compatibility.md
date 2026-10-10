@@ -54,8 +54,9 @@ stay where they are, unseen, and are seen again once this release runs.
   before reads either as `unknown`, and this release's Rust client reads
   both as final, as it does any code it is not told to retry: the request
   as sent will not pass by being sent again at once, and `purging` says
-  in `Retry-After` how long that is, minutes rather than seconds, for
-  whoever makes the tenant again to wait out.
+  in `Retry-After` the least that is, minutes rather than seconds, for
+  whoever makes the tenant again to wait out before asking again: a
+  lower bound, not when the purge will be done.
 - Migration `0010_lineage.sql` follows `0009_restores.sql`. A database
   migrated to `0009` by the release before takes `0010` as a node of this
   release starts.
