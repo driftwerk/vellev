@@ -1032,7 +1032,7 @@ async fn an_object_another_writer_stores_while_the_import_stores_its_page_is_kep
 }
 
 #[tokio::test]
-async fn an_entry_written_while_an_object_is_settled_is_read_before_it_is_settled_again() {
+async fn an_entry_written_by_another_run_while_an_object_is_settled_stops_the_run() {
     let Some(mut importing) = Importing::new("VellevImportRacedEntry", 10).await else {
         return;
     };
@@ -1057,9 +1057,16 @@ async fn an_entry_written_while_an_object_is_settled_is_read_before_it_is_settle
             let entry = Content::new(map(json!({ "hash": "another import's" })));
             ledger.put(oid(30), &entry).await.unwrap();
         });
-    assert_eq!(importing.counts().await, ([0; 5], [11; 3]));
+    // Only an import writes a ledger: this one does not go on beside
+    // another.
+    let stopped = importing.run().await.unwrap_err();
     assert!(importing.front.spent());
-    importing.assert_same().await;
+    assert!(
+        format!("{stopped:#}").contains("is another import of the tenant running?"),
+        "{stopped:#}"
+    );
+    let entry = importing.entry(30).await.unwrap();
+    assert_eq!(entry["hash"], json!("another import's"));
 }
 
 #[tokio::test]
@@ -3133,8 +3140,8 @@ async fn a_weaviate_that_is_not_ready_is_not_believed_about_a_listing_or_an_obje
 }
 
 #[tokio::test]
-async fn a_page_taken_up_one_object_at_a_time_is_still_given_nothing_it_lacks() {
-    let Some(importing) = Importing::new("VellevImportAdoptSingly", 60).await else {
+async fn an_entry_written_by_another_run_under_a_page_taken_up_stops_the_run() {
+    let Some(importing) = Importing::new("VellevImportAdoptRaced", 60).await else {
         return;
     };
     let class = importing.class;
@@ -3142,8 +3149,8 @@ async fn a_page_taken_up_one_object_at_a_time_is_still_given_nothing_it_lacks() 
     importing.ledger().drop().await.unwrap();
     importing.records.delete(oid(4)).await.unwrap();
     // An entry appears for note 8 once the collection has been read: the
-    // request that takes up the page is refused, and its objects are
-    // settled one at a time.
+    // request that takes up the page is refused, and the entry found
+    // not to be what was read.
     let ledger = importing.ledger();
     let read = format!("/collections/{class}/list");
     importing
@@ -3152,8 +3159,15 @@ async fn a_page_taken_up_one_object_at_a_time_is_still_given_nothing_it_lacks() 
             let entry = Content::new(map(json!({ "hash": "another import's" })));
             ledger.put(oid(8), &entry).await.unwrap();
         });
-    let report = importing.run().await.unwrap();
+    let stopped = importing.run().await.unwrap_err();
     assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("is another import of the tenant running?"),
+        "{stopped:#}"
+    );
+    assert!(importing.get(4).await.is_none(), "note 4 came back");
+    // Alone again, the run takes the collection up.
+    let report = importing.run().await.unwrap();
     assert_eq!(withheld(&report, class), 1);
     assert!(importing.get(4).await.is_none(), "note 4 came back");
 }
@@ -4215,4 +4229,244 @@ async fn an_object_another_writer_deletes_while_the_import_replaces_it_is_not_br
     );
     // And stays so.
     assert_eq!(importing.counts().await, ([0, 0, 0, 3, 0], [10, 10, 7]));
+}
+
+// What a fifth review asked of the import.
+
+#[tokio::test]
+async fn a_first_run_told_of_other_writers_still_takes_what_both_hold_alike_for_the_imports() {
+    let Some(importing) = ledgerless("VellevImportOthersFirst").await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    let plain = importing.options.clone();
+    let report = importing.run_as(&others(&plain)).await.unwrap();
+    // The ninety-nine notes the collection holds as Weaviate does are
+    // the import's; the one changed and the twenty it lacks, the other
+    // writer's.
+    let copied = &report.classes[class];
+    assert_eq!((copied.kept, copied.withheld, copied.unknown), (21, 0, 0));
+    assert_eq!(report.outcome(false), Outcome::Settled);
+    let theirs = |entry: Option<Value>| entry.unwrap().get("theirs") == Some(&json!(true));
+    assert!(!theirs(importing.entry(5).await));
+    assert!(!theirs(importing.entry(7).await));
+    assert!(theirs(importing.entry(2).await));
+    assert!(theirs(importing.entry(300).await));
+    // So what Weaviate changes of them is copied, and what it deletes
+    // deleted, by any later run.
+    weaviate.put(class, 5, changed(5)).await;
+    weaviate.delete(class, 7).await;
+    let report = importing.run_as(&plain).await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!((copied.changed, copied.deleted, copied.kept), (1, 1, 21));
+    assert_eq!(report.outcome(false), Outcome::Settled);
+    assert_eq!(
+        importing.get(5).await.unwrap().properties["n"],
+        json!(1_000_005)
+    );
+    assert!(importing.get(7).await.is_none());
+    // And what is the other writer's stays as it was.
+    assert_eq!(importing.get(2).await.unwrap().properties["n"], json!(2));
+    assert!(importing.get(300).await.is_none());
+}
+
+#[tokio::test]
+async fn a_taking_up_gone_on_with_by_a_run_told_of_other_writers_marks_nothing_both_hold_alike() {
+    let Some(importing) = Importing::new("VellevImportOthersResumed", 120).await else {
+        return;
+    };
+    let class = importing.class;
+    half_taken_up(&importing).await;
+    let told = others(&importing.options);
+    let report = importing.run_as(&told).await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!((copied.kept, copied.withheld, copied.unknown), (0, 0, 0));
+    assert_eq!(report.outcome(true), Outcome::Settled);
+    for n in 0..120 {
+        let entry = importing.entry(n).await.unwrap();
+        assert_eq!(entry.get("theirs"), None, "note {n}");
+    }
+}
+
+#[tokio::test]
+async fn a_ledger_found_emptied_is_taken_up_and_brings_back_nothing() {
+    let Some(importing) = Importing::new("VellevImportLedgerEmptied", 30).await else {
+        return;
+    };
+    let class = importing.class;
+    importing.run().await.unwrap();
+    // Writers moved over: one object more, one deleted, one changed.
+    importing
+        .records
+        .put(oid(1_000), &foreign(1_000))
+        .await
+        .unwrap();
+    importing.records.delete(oid(3)).await.unwrap();
+    importing.records.put(oid(4), &foreign(4)).await.unwrap();
+    // The ledger loses every entry, and the note of the collection is
+    // still there, saying it was imported.
+    let ledger = importing.ledger();
+    for n in 0..30 {
+        ledger.delete(oid(n)).await.unwrap();
+    }
+    let report = importing.run().await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!(
+        (copied.stored, copied.changed, copied.deleted),
+        (0, 0, 0),
+        "{copied:?}"
+    );
+    // What the collection lacks and what it holds otherwise are
+    // withheld, and what it holds that Weaviate does not is not noted:
+    // it may have been written since the import.
+    assert_eq!((copied.withheld, copied.unknown), (2, 0));
+    assert!(importing.get(3).await.is_none(), "note 3 came back");
+    assert_eq!(
+        importing.get(4).await.unwrap().properties,
+        foreign(4).properties
+    );
+    assert_eq!(importing.entry(1_000).await, None);
+    assert_eq!(report.outcome(false), Outcome::Unsettled);
+    let bound = binding(&importing).await;
+    assert_eq!((bound.get("adopting"), bound.get("census")), (None, None));
+    // Nor does a run told to delete what was unknown find anything to.
+    let report = importing.run_as(&sweeping(&importing.options)).await;
+    assert_eq!(report.unwrap().classes[class].deleted, 0);
+    assert!(importing.get(1_000).await.is_some());
+}
+
+#[tokio::test]
+async fn an_entry_written_by_another_run_while_an_object_is_replaced_stops_the_run() {
+    let Some(importing) = Importing::new("VellevImportRacedLedger", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    weaviate.put(class, 4, changed(4)).await;
+    // Another import of the tenant, from another state file, writes the
+    // entry of note 4 between this one's reading and its writing.
+    let ledger = importing.ledger();
+    let read = importing.read(4);
+    importing
+        .front
+        .after(0, &["GET", &read], move || async move {
+            let entry = map(json!({ "hash": "another import's", "withheld": true }));
+            ledger.put(oid(4), &Content::new(entry)).await.unwrap();
+        });
+    let stopped = importing.run().await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("is another import of the tenant running?"),
+        "{stopped:#}"
+    );
+    // Nothing of the step was made: neither the object nor the entry.
+    assert_eq!(importing.get(4).await.unwrap().properties["n"], json!(4));
+    let entry = importing.entry(4).await.unwrap();
+    assert_eq!(entry["hash"], json!("another import's"));
+}
+
+#[tokio::test]
+async fn a_node_too_old_to_hold_a_write_to_a_version_stops_the_run_whatever_is_skipped() {
+    let Some(importing) = Importing::new("VellevImportOldNode", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    weaviate.put(class, 4, changed(4)).await;
+    // As a node of 0.1 refuses a change with a field it does not know.
+    // The first request to change the tenant, which sees to its
+    // collections, is let through.
+    let message = "unknown field `only_if_version`, expected one of `collection`, `id`";
+    let unknown = json!({ "error": { "code": "invalid", "message": message } });
+    importing
+        .front
+        .answer(1, &["POST", "/changes"], StatusCode::BAD_REQUEST, unknown);
+    let skipping = Options {
+        skip_refused: true,
+        ..importing.options.clone()
+    };
+    let stopped = importing.run_as(&skipping).await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("one of an earlier release is among those asked"),
+        "{stopped:#}"
+    );
+    assert_eq!(importing.get(4).await.unwrap().properties["n"], json!(4));
+    // With every node knowing it, the note is replaced.
+    assert_eq!(importing.counts().await, ([0, 1, 0, 0, 0], [10; 3]));
+}
+
+#[tokio::test]
+async fn a_comparison_settles_once_what_was_left_or_unknown_is_gone_from_the_collection_too() {
+    let Some(importing) = Importing::new("VellevImportVerifyGone", 20).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    importing.unledgered().await;
+    importing
+        .records
+        .put(oid(1_000), &foreign(1_000))
+        .await
+        .unwrap();
+    let report = importing.run().await.unwrap();
+    assert_eq!(unknown(&report, class), 1);
+    // Another writer's object under an id Weaviate then deletes: left.
+    importing.records.put(oid(3), &foreign(3)).await.unwrap();
+    weaviate.delete(class, 3).await;
+    let report = importing.run().await.unwrap();
+    assert_eq!(
+        (report.classes[class].left, unknown(&report, class)),
+        (1, 1)
+    );
+    // The other writer removes both. A comparison says what a run that
+    // copies would: nothing is left, nothing unknown, and Weaviate was
+    // not written to meanwhile.
+    importing.records.delete(oid(3)).await.unwrap();
+    importing.records.delete(oid(1_000)).await.unwrap();
+    for pages in [None, Some(100)] {
+        let comparing = Options {
+            mode: Mode::Verify { pages },
+            ..importing.options.clone()
+        };
+        let report = importing.run_as(&comparing).await.unwrap();
+        let copied = &report.classes[class];
+        assert_eq!((copied.left, copied.unknown), (0, 0), "{pages:?}");
+        assert!(copied.caught_up(), "{pages:?}: {copied:?}");
+        assert_eq!(report.outcome(true), Outcome::Settled, "{pages:?}");
+    }
+    let report = importing.run().await.unwrap();
+    assert_eq!(counts(&report, class), ([0; 5], [19; 3]));
+    assert_eq!(report.outcome(true), Outcome::Settled);
+    assert_eq!(importing.ledger().count(None).await.unwrap(), 19);
+}
+
+#[tokio::test]
+async fn a_page_taken_up_one_object_at_a_time_is_settled_as_one_being_taken_up() {
+    let Some(importing) = ledgerless("VellevImportAdoptSingly").await else {
+        return;
+    };
+    let class = importing.class;
+    // A run told nothing else wrote replaces note 2, which Weaviate
+    // changed. Something changes it between the run's reading and its
+    // writing all the same: the request that takes up the page is
+    // refused, each of its objects is settled by itself, still as of a
+    // collection being taken up, and note 2 is replaced as it was to be.
+    let records = importing.records.clone();
+    let read = format!("/collections/{class}/list");
+    importing
+        .front
+        .after(0, &["POST", &read], move || async move {
+            let patch = Changes::new(map(json!({ "n": 99 })));
+            records.patch(oid(2), &patch).await.unwrap();
+        });
+    let report = importing.run_as(&sole(&importing.options)).await.unwrap();
+    assert!(importing.front.spent());
+    let copied = &report.classes[class];
+    assert_eq!((copied.stored, copied.changed, copied.withheld), (20, 1, 0));
+    assert_eq!(
+        importing.get(2).await.unwrap().properties["n"],
+        json!(1_000_002)
+    );
+    assert_eq!(report.outcome(true), Outcome::Settled);
 }
