@@ -300,7 +300,10 @@ and say what the caller then answers for.
   wrote it. The import now keeps a ledger in the tenant,
   `vellev_imported_CLASS`, and replaces or deletes an object only while
   it is exactly as the import left it; anything else is left, and marked
-  in the ledger. The README states the rule.
+  in the ledger. The README states the rule. Each replacing and each
+  deleting is conditional on the version the object was read at, so that
+  nothing another writer does to its properties or its vector between
+  the import's read and its write is lost.
 - **Nothing is deleted until Weaviate has been walked, and then only
   within a bound**: `--max-deletes` (1000) and `--max-delete-fraction`
   (0.05) of a class, the fewer. A run that finds more gone deletes none
@@ -341,7 +344,7 @@ and say what the caller then answers for.
   from Weaviate between being listed and being fetched is deleted in the
   same run. `changed` no longer counts objects stored again unchanged.
   New fields: `kept`, `withheld`, `unknown`, `barred`, `left`,
-  `pending`, `budget`, `refused`, `too_large`, `imported`, `verified`,
+  `pending`, `budget`, `refused`, `imported`, `verified`,
   and `ended` beside the classes. An object gone from Weaviate that
   stays in the collection as another writer's keeps its ledger entry,
   and is counted as `left` on every run, until the collection no longer

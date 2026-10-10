@@ -1989,25 +1989,23 @@ async fn an_object_vellev_cannot_hold_stops_the_run_or_is_passed_over_and_report
 }
 
 #[tokio::test]
-async fn an_object_too_large_to_replace_safely_is_left_and_reported() {
+async fn an_object_as_large_as_a_request_takes_is_replaced_like_any_other() {
     let Some(importing) = Importing::new("VellevImportLarge", 10).await else {
         return;
     };
     let (class, weaviate) = (importing.class, &importing.weaviate);
-    // It fits a request once, and not twice: once to say what must not
-    // have changed and once more to replace it.
+    // It fits a request once, and not twice: replacing it says what it
+    // is to be, and of what it was only the version.
     let large = |mark: &str| json!({ "title": format!("{mark} {}", "x".repeat(MAX_BODY * 2 / 3)) });
     weaviate.post(class, 20, large("first"), vector(20)).await;
     assert_eq!(importing.counts().await, ([11, 0, 0, 0, 0], [11; 3]));
     weaviate.put(class, 20, large("second")).await;
     weaviate.put(class, 4, changed(4)).await;
     let report = importing.run().await.unwrap();
-    let copied = &report.classes[class];
-    assert_eq!(counts(&report, class), ([0, 1, 0, 0, 0], [11; 3]));
-    assert_eq!(copied.too_large, [uuid(20)]);
-    assert_eq!(report.outcome(false), Outcome::Unsettled);
+    assert_eq!(counts(&report, class), ([0, 2, 0, 0, 0], [11; 3]));
+    assert_eq!(report.outcome(false), Outcome::Settled);
     let title = importing.get(20).await.unwrap().properties["title"].clone();
-    assert!(title.as_str().unwrap().starts_with("first"));
+    assert!(title.as_str().unwrap().starts_with("second"));
 }
 
 #[tokio::test]
@@ -2406,7 +2404,6 @@ async fn a_class_made_again_under_a_catch_up_with_the_same_ids_is_not_stored_ove
 }
 
 #[tokio::test]
-#[ignore = "takes a condition on an object's version, which vellev does not have yet: DW-677"]
 async fn an_object_whose_vector_alone_another_writer_changes_while_the_import_deletes_it_is_kept() {
     let Some(importing) = Importing::new("VellevImportVectorDelete", 10).await else {
         return;
@@ -2429,7 +2426,50 @@ async fn an_object_whose_vector_alone_another_writer_changes_while_the_import_de
 }
 
 #[tokio::test]
-#[ignore = "takes a condition on an object's version, which vellev does not have yet: DW-677"]
+async fn objects_whose_vectors_alone_another_writer_changes_while_the_import_replaces_their_page_are_kept(
+) {
+    let Some(importing) = Importing::new("VellevImportVectorPage", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    for n in [4, 6, 7] {
+        weaviate.put(class, n, changed(n)).await;
+    }
+    // The three are read as one range and replaced by one request. The
+    // other writer gives notes 4 and 7 other vectors in between, and
+    // touches nothing else of them: the request is refused whole, and
+    // each of its objects settled again from a new reading.
+    let theirs = vec![0.0, 0.0, 0.0, 1.0];
+    let (records, vector) = (importing.records.clone(), theirs.clone());
+    let read = format!("/collections/{class}/list");
+    importing
+        .front
+        .after(0, &["POST", &read], move || async move {
+            for n in [4, 7] {
+                let mut patch = Changes::new(Map::new());
+                patch.vector = Some(vector.clone());
+                records.patch(oid(n), &patch).await.unwrap();
+            }
+        });
+    importing.front.listen();
+    assert_eq!(importing.counts().await, ([0, 1, 0, 2, 0], [10; 3]));
+    assert!(importing.front.spent());
+    for n in [4, 7] {
+        let kept = importing.get(n).await.unwrap();
+        assert_eq!(kept.vector, Some(theirs.clone()), "note {n}");
+        assert_eq!(kept.properties["n"], json!(n), "note {n}");
+    }
+    assert_eq!(
+        importing.get(6).await.unwrap().properties["n"],
+        json!(1_000_006)
+    );
+    // The note of the collection, the page refused, and then each of its
+    // three by itself.
+    assert_eq!(importing.front.asked("/changes").len(), 5);
+}
+
+#[tokio::test]
 async fn an_object_whose_vector_alone_another_writer_changes_while_the_import_replaces_it_is_kept()
 {
     let Some(importing) = Importing::new("VellevImportVectorReplace", 10).await else {
@@ -4027,12 +4067,12 @@ async fn a_request_carries_no_more_changes_than_it_is_told_to() {
     importing.front.listen();
     assert_eq!(importing.counts().await, ([40, 0, 0, 0, 0], [40; 3]));
     assert_eq!(importing.front.asked("/changes").len(), 1 + 4);
-    // Replaced, each takes a change for every property it must still
-    // have, one to store it and one to note it: nine, two to a request.
+    // Replaced, each takes as many: one to store it, if it is still at
+    // the version it was read at, and one to note it.
     for n in 0..40 {
         importing.weaviate.put(class, n, changed(n)).await;
     }
     importing.front.listen();
     assert_eq!(importing.counts().await, ([0, 40, 0, 0, 0], [40; 3]));
-    assert_eq!(importing.front.asked("/changes").len(), 1 + 20);
+    assert_eq!(importing.front.asked("/changes").len(), 1 + 4);
 }

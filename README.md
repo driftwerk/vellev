@@ -81,15 +81,22 @@ show it put there, but for one narrow act an operator asks for in so
 many words, once, of a collection that was there before its ledger.
 
 The object and its ledger entry are written in one atomic step. The step
-that replaces or deletes an object fails if any of the object's
-properties changed since the import read it, those without a value
-included, so a write that lands meanwhile is kept, and nothing is asked
-of Weaviate between that read and the step. Two things go unseen in the
-instant between them: a change to the object's vector alone, and a value
-for a property the collection gained since the run began. Either is then
-deleted or written over with the object, until vellev has a condition
-on an object's version (DW-677): a condition can name a property but not
-the vector, and with one on the version neither would go unseen.
+that replaces or deletes an object is conditional on the version the
+object was at when the import read it, and a version is of everything an
+object holds: every property, those the collection gained since the run
+began included, and its vector. So the step fails if anything at all of
+the object changed, or the object went, between that read and the step,
+and nothing is asked of Weaviate in between. A step that fails so is
+made again from a new reading, which finds the object another writer's
+and leaves it; where several objects went in one request, the whole
+request fails, nothing of it is made, and each of its objects is settled
+again by itself from a new reading. No write that lands between the
+import's read and its write is lost: not one to a property, not one to
+the vector alone.
+
+This takes nodes that give objects versions, which those of 0.2 do. Read
+from a node that gives none, the run stops before it replaces or deletes
+anything.
 
 ### Deleting
 
@@ -250,10 +257,6 @@ Per class:
 - `pending` and `budget`: see above.
 - `refused`: objects vellev cannot hold, by id, with why. One stops the
   run unless `--skip-refused` is given.
-- `too_large`: objects changed in Weaviate that could not be replaced,
-  because the step that replaces one safely says twice over what it
-  holds, once to say what must not have changed, and the two did not fit
-  the node's limit on a request. They are left as they are.
 - `weaviate`, `imported`, `vellev`: how many objects Weaviate holds, the
   ledger has accounted for, those withheld aside, and the collection
   holds.
@@ -268,7 +271,7 @@ The command exits with
 - **3** when Weaviate was written to behind the catch-up: run again.
 - **1** when something is left that another run will not put right by
   itself: objects withheld or unknown, objects gone and not deleted,
-  objects refused or too large, a comparison that found differences or
+  objects refused, a comparison that found differences or
   looked at nothing, or any failure.
 
 `--strict` makes it 1 as well whenever a collection holds anything that

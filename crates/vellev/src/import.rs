@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
-use vellev_api::{Bounded, Change, Code, Content, Missing, OnlyIf, Page, Stored};
+use vellev_api::{Bounded, Change, Code, Content, Missing, Page, Stored};
 use vellev_client::{Records, Tenant};
 use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider,
@@ -292,9 +292,6 @@ pub struct Copied {
     pub budget: Option<u64>,
     /// Objects vellev cannot hold, passed over: why, by id.
     pub refused: BTreeMap<String, String>,
-    /// Objects changed in Weaviate and too large to replace: the step
-    /// that replaces one safely says twice over what it holds.
-    pub too_large: Vec<String>,
     /// How many objects Weaviate held at the end, how many of Weaviate's
     /// the ledger had accounted for, those withheld aside, and how many
     /// the collection held. An entry of an id Weaviate does not hold,
@@ -357,7 +354,6 @@ impl Copied {
             || self.unknown > 0
             || self.pending > 0
             || !self.refused.is_empty()
-            || !self.too_large.is_empty()
             || self.verified.as_ref().is_some_and(wrong)
     }
 
@@ -379,7 +375,6 @@ impl Copied {
             Settled::Replaced => self.changed += 1,
             Settled::Deleted => self.deleted += 1,
             Settled::Left => self.left += 1,
-            Settled::TooLarge => self.too_large.push(id.to_string()),
             Settled::Refused(why) => {
                 self.refused.insert(id.to_string(), why);
             }
@@ -404,7 +399,6 @@ enum Settled {
     Left,
     /// The collection already held what Weaviate does, or neither held it.
     Same,
-    TooLarge,
     Refused(String),
 }
 
@@ -1078,6 +1072,7 @@ impl Binding {
                 .filter_map(|((name, _), value)| Some((name.to_string(), value?)))
                 .collect(),
             vector: None,
+            only_if_version: None,
         }
     }
 
@@ -1406,6 +1401,7 @@ impl<'a> Copying<'a> {
                 id,
                 properties,
                 vector,
+                only_if_version: None,
             },
             false => Change::Insert {
                 collection,
@@ -1446,46 +1442,48 @@ impl<'a> Copying<'a> {
         vec![object, self.note(&stored, entry.is_some())]
     }
 
-    /// Store the item in place of `stored`, if that is still as it was
-    /// read, and note it.
+    /// Store the item in place of `stored`, and note it. The step fails
+    /// unless the object is still at the version it was read at: with
+    /// every property and its vector as they were then, and there at
+    /// all.
     fn replace(&self, stored: &Stored, item: &Item, known: bool) -> Vec<Change> {
-        let mut changes = self.unless_changed(stored);
-        changes.push(Change::Upsert {
+        let object = Change::Upsert {
             collection: self.data(),
             id: item.id,
             properties: item.content.properties.clone(),
             vector: item.content.vector.clone(),
-        });
-        changes.push(self.note(&Entry::of(item, Mark::Stored), known));
-        changes
+            only_if_version: stored.version,
+        };
+        vec![object, self.note(&Entry::of(item, Mark::Stored), known)]
+    }
+
+    /// Delete `stored` and forget its id. The step fails unless the
+    /// object is still at the version it was read at.
+    fn delete(&self, stored: &Stored) -> Vec<Change> {
+        let object = Change::Delete {
+            collection: self.data(),
+            id: stored.id,
+            only_if_version: stored.version,
+        };
+        vec![object, self.forget(stored.id)]
     }
 
     fn forget(&self, id: ObjectId) -> Change {
-        Change::Delete {
-            collection: self.plan.ledger_name.clone(),
-            id,
-        }
+        Change::delete(self.plan.ledger_name.clone(), id)
     }
 
-    /// Changes that alter nothing and fail, and with them the step they
-    /// are part of, unless every property of the object is still as
-    /// `stored` has it, those without a value included.
-    fn unless_changed(&self, stored: &Stored) -> Vec<Change> {
-        let guard = |property: &Property| Change::Patch {
-            collection: self.data(),
-            id: stored.id,
-            properties: Map::new(),
-            vector: None,
-            only_if: Some(OnlyIf {
-                property: property.name.clone(),
-                equals: stored
-                    .properties
-                    .get(&property.name)
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            }),
-        };
-        self.plan.schema.properties.iter().map(guard).collect()
+    /// Whether the node said what version each object read is at, which
+    /// is what replacing or deleting it is conditional on. A node of a
+    /// release before versions says none, and a write conditional on
+    /// none is not conditional: the run stops rather than make one.
+    fn versioned<'s>(read: impl IntoIterator<Item = &'s Stored>) -> Result<()> {
+        match read.into_iter().find(|stored| stored.version.is_none()) {
+            Some(stored) => bail!(
+                "the node gave no version for object {}: it is of a release before 0.2, and the import replaces and deletes only what it can hold to the version it read",
+                stored.id
+            ),
+            None => Ok(()),
+        }
     }
 
     async fn entry(&self, id: ObjectId) -> Result<Option<Entry>> {
@@ -1615,15 +1613,7 @@ impl<'a> Copying<'a> {
             Mark::Foreign | Mark::Theirs => false,
         };
         match stored {
-            Some(stored) if mine => {
-                let mut changes = self.unless_changed(stored);
-                changes.push(Change::Delete {
-                    collection: self.data(),
-                    id: entry.id,
-                });
-                changes.push(self.forget(entry.id));
-                (changes, Settled::Deleted)
-            }
+            Some(stored) if mine => (self.delete(stored), Settled::Deleted),
             Some(_) => (self.renoting(self.left(entry), Some(entry)), Settled::Left),
             None => (self.dropping(entry, self.left(entry)), Settled::Same),
         }
@@ -1803,6 +1793,7 @@ impl<'a> Copying<'a> {
                 true => self.plan.records.get(id).await?,
                 false => None,
             };
+            Self::versioned(&stored)?;
             let (changes, settled) = match (now, &entry) {
                 (Now::Holds(item), entry) => {
                     self.settling(item, entry.as_ref(), stored.as_ref(), adopted)
@@ -1824,11 +1815,6 @@ impl<'a> Copying<'a> {
                         return Err(error).wrap_err_with(|| format!("settling object {id}"));
                     }
                     before = Some(read);
-                }
-                (Some(Refusal::TooLarge), _)
-                    if matches!(settled, Settled::Replaced | Settled::Deleted) =>
-                {
-                    return Ok(Settled::TooLarge)
                 }
                 (Some(Refusal::TooLarge), error) | (Some(Refusal::Unfit(_)), error)
                     if self.options.skip_refused && matches!(now, Now::Holds(_)) =>
@@ -1955,6 +1941,7 @@ impl<'a> Copying<'a> {
         if !unknown.is_empty() {
             self.note_unknown(unknown).await?;
         }
+        Self::versioned(held.values())?;
         let step = |item: Item| {
             let entry = known.remove(&item.id);
             let stored = held.remove(&item.id);
@@ -2231,6 +2218,7 @@ impl<'a> Copying<'a> {
             .map(|(item, _)| item.id)
             .collect();
         let mut held = self.held(from, through, &read, span).await?;
+        Self::versioned(held.values())?;
         let step = |(item, entry): (Item, Option<Entry>)| {
             let stored = held.remove(&item.id);
             let (changes, settled) = self.settling(&item, entry.as_ref(), stored.as_ref(), false);
@@ -3760,10 +3748,15 @@ mod tests {
 
         fn stored(&self, title: &str) -> Stored {
             let item = self.item(title, 0);
+            // A version of its own for each: no node made these.
+            let version = title
+                .bytes()
+                .fold(1_u128, |all, byte| all * 257 + byte as u128);
             serde_json::from_value(json!({
                 "id": item.id,
                 "properties": item.content.properties,
                 "vector": item.content.vector,
+                "version": format!("{version:032x}"),
             }))
             .unwrap()
         }
@@ -3793,35 +3786,14 @@ mod tests {
                 ..
             } => format!("upsert {collection}{}", marked(properties)),
             Change::Delete { collection, .. } => format!("delete {collection}"),
-            Change::Patch {
-                only_if: Some(only_if),
-                properties,
-                vector: None,
-                ..
-            } if properties.is_empty() => {
-                format!("unless {} is not {}", only_if.property, only_if.equals)
-            }
             other => format!("{other:?}"),
         };
         changes.iter().map(kind).collect()
     }
 
-    const GUARDS: [&str; 3] = [
-        "unless title is not \"fox\"",
-        "unless mood is not null",
-        "unless score is not 0.30000000000000004",
-    ];
     const ENTRY: &str = "vellev_imported_Memory";
     /// How many cells the table of everything a run can meet has.
     const CELLS: usize = 4_580;
-
-    /// The guards on an object read as "fox", and then these changes.
-    fn guarded(then: &[&str]) -> Vec<String> {
-        let changes = GUARDS.iter().chain(then);
-        changes
-            .map(|change| change.replace("ENTRY", ENTRY))
-            .collect()
-    }
 
     fn only(changes: &[&str]) -> Vec<String> {
         let changes = changes.iter();
@@ -3858,10 +3830,7 @@ mod tests {
             // them.
             assert_eq!(
                 settling(Some(&ours), Some(&fixture.stored("fox"))),
-                (
-                    guarded(&["upsert Memory", "upsert ENTRY"]),
-                    Settled::Replaced
-                )
+                (only(&["upsert Memory", "upsert ENTRY"]), Settled::Replaced)
             );
             // Another writer's, deleted by one, or never the import's:
             // left, and the ledger says so.
@@ -4006,10 +3975,7 @@ mod tests {
         );
         assert_eq!(
             settling(None, Some(&fox), true),
-            (
-                guarded(&["upsert Memory", "insert ENTRY"]),
-                Settled::Replaced
-            )
+            (only(&["upsert Memory", "insert ENTRY"]), Settled::Replaced)
         );
         // And by any run after one that withheld it, or found it there
         // unknown to Weaviate.
@@ -4021,10 +3987,7 @@ mod tests {
             );
             assert_eq!(
                 settling(Some(&entry), Some(&fox), false),
-                (
-                    guarded(&["upsert Memory", "upsert ENTRY"]),
-                    Settled::Replaced
-                )
+                (only(&["upsert Memory", "upsert ENTRY"]), Settled::Replaced)
             );
         }
     }
@@ -4071,10 +4034,7 @@ mod tests {
         let fixture = Fixture::new(options());
         let ours = fixture.entry("fox", 1, Mark::Stored);
         let (fox, owl) = (fixture.stored("fox"), fixture.stored("owl"));
-        let deleted = (
-            guarded(&["delete Memory", "delete ENTRY"]),
-            Settled::Deleted,
-        );
+        let deleted = (only(&["delete Memory", "delete ENTRY"]), Settled::Deleted);
         assert_eq!(removing(&fixture, &ours, Some(&fox)), deleted);
         // What is left is never forgotten: its entry says Weaviate no
         // longer holds it, once.
@@ -4159,6 +4119,39 @@ mod tests {
             removing(&sweeping, &foreign, Some(&owl)),
             left("upsert ENTRY foreign gone")
         );
+    }
+
+    #[test]
+    fn an_object_is_replaced_or_deleted_only_at_the_version_it_was_read_at() {
+        let fixture = Fixture::new(options());
+        let copying = fixture.copying();
+        let (fox, owl) = (fixture.stored("fox"), fixture.stored("owl"));
+        assert!(fox.version.is_some() && fox.version != owl.version);
+        let ours = fixture.entry("fox", 1, Mark::Stored);
+        let hen = fixture.item("hen", 2);
+        let (replacing, _) = copying.settling(&hen, Some(&ours), Some(&fox), false);
+        let [Change::Upsert {
+            only_if_version, ..
+        }, _] = &replacing[..]
+        else {
+            panic!("{replacing:?}");
+        };
+        assert_eq!(*only_if_version, fox.version);
+        let (deleting, _) = copying.removing(&ours, Some(&fox));
+        let [Change::Delete {
+            only_if_version, ..
+        }, _] = &deleting[..]
+        else {
+            panic!("{deleting:?}");
+        };
+        assert_eq!(*only_if_version, fox.version);
+        // Read from a node that gives no version, nothing can be held to
+        // one, and the run stops.
+        let unversioned: Stored =
+            serde_json::from_value(json!({ "id": fox.id, "properties": fox.properties })).unwrap();
+        assert!(Copying::versioned([&fox, &owl]).is_ok());
+        let stopped = Copying::versioned([&fox, &unversioned]).unwrap_err();
+        assert!(stopped.to_string().contains("gave no version"), "{stopped}");
     }
 
     #[test]
@@ -4472,6 +4465,26 @@ mod tests {
                                 assert!(weaviate && stored.is_none(), "{cell}");
                                 let new = entry.is_none() && !adopted;
                                 assert!(new || (sole && (unvouched || taken_up)), "{cell}");
+                            }
+                            // And then only if it is still at the
+                            // version it was read at.
+                            for change in &changes {
+                                if let Change::Upsert {
+                                    collection,
+                                    only_if_version,
+                                    ..
+                                }
+                                | Change::Delete {
+                                    collection,
+                                    only_if_version,
+                                    ..
+                                } = change
+                                {
+                                    let read = stored.and_then(|stored| stored.version);
+                                    let data = collection.as_str() == "Memory";
+                                    assert!(!data || read.is_some(), "{cell}");
+                                    assert!(!data || *only_if_version == read, "{cell}");
+                                }
                             }
                             // (d) Without an entry, and outside a taking
                             // up, nothing is deleted or written over.
@@ -4790,11 +4803,6 @@ mod tests {
             ..level.clone()
         };
         assert_eq!(outcome(refused), Outcome::Unsettled);
-        let large = Copied {
-            too_large: vec![id(1)],
-            ..level.clone()
-        };
-        assert_eq!(outcome(large), Outcome::Unsettled);
         let wrong = Copied {
             verified: Some(Verified {
                 different: 1,

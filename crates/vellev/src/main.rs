@@ -509,9 +509,6 @@ async fn main() -> Result<ExitCode> {
                     "{refused}: some objects vellev cannot hold were passed over: see `refused`"
                 );
             }
-            if let Some(large) = classes(&|copied| !copied.too_large.is_empty()) {
-                eprintln!("{large}: some objects changed in Weaviate are too large to replace safely in one request, and were left as they are: see `too_large`");
-            }
             if let Some(wrong) = classes(&|copied| {
                 let verified = copied.verified.as_ref();
                 verified.is_some_and(|verified| verified.different + verified.missing > 0)
