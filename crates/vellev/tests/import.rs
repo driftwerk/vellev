@@ -4762,7 +4762,7 @@ async fn no_more_entries_than_a_page_are_held_to_be_forgotten() {
     importing.front.listen();
     assert_eq!(importing.counts().await, ([0; 5], [18; 3]));
     let changes = importing.front.asked("/changes").len();
-    assert!(changes >= 1 + 2, "{changes} requests changed the tenant");
+    assert!(changes > 2, "{changes} requests changed the tenant");
     assert_eq!(importing.ledger().count(None).await.unwrap(), 18);
 }
 
@@ -4842,4 +4842,30 @@ async fn a_write_to_a_version_that_a_node_calls_invalid_is_not_skipped() {
     );
     assert_eq!(importing.get(4).await.unwrap().properties["n"], json!(4));
     assert_eq!(importing.counts().await, ([0, 1, 0, 0, 0], [11; 3]));
+}
+
+#[tokio::test]
+async fn a_tenant_the_node_is_busy_with_is_not_taken_for_another_import() {
+    let Some(importing) = Importing::new("VellevImportRestoring", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    // The node refuses the first write of a run as it does one to a
+    // tenant being restored from a backup: with the code it gives a
+    // note that is no longer the one read, and the note is as it was.
+    let message = "tenant is being restored already, as another request asked";
+    let busy = json!({ "error": { "code": "conflict", "message": message } });
+    importing
+        .front
+        .answer(0, &["POST", "/changes"], StatusCode::CONFLICT, busy);
+    let refused = importing.run().await.unwrap_err();
+    assert!(importing.front.spent());
+    let refused = format!("{refused:#}");
+    assert!(
+        refused.contains("which is as the import read it"),
+        "{refused}"
+    );
+    assert!(refused.contains("being restored"), "{refused}");
+    assert!(!refused.contains("another import"), "{refused}");
+    assert_eq!(importing.counts().await, ([0; 5], [10; 3]));
 }
