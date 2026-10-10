@@ -2487,6 +2487,76 @@ async fn a_request_to_delete_more_than_one_may_says_the_most_one_may() {
 }
 
 /// What a node that cannot use a collection's model answers.
+/// A collection made while the node that holds its tenant was set up for
+/// its model stays when that node is started again without the model
+/// allowed, or without the region it calls: a search of it is then
+/// refused as the node's setup, and so is a write, by the node that
+/// holds the tenant. Operators who narrow what a node runs or calls are
+/// told so by every request, not by data lost.
+#[tokio::test]
+async fn a_collection_on_a_model_or_region_the_holding_node_is_no_longer_set_up_for_is_refused_as_its_setup(
+) {
+    let cluster = Cluster::new();
+    let set_up = |allowed: &[&str], regions: &[&str]| vellev_embed::Settings {
+        local_models_allowed: allowed.iter().map(ToString::to_string).collect(),
+        bedrock_regions: regions.iter().map(ToString::to_string).collect(),
+        ..Default::default()
+    };
+    let unused = "http://unused.test";
+    async fn refused(served: &Served, path: &str) {
+        let nearest = json!({ "text": "a red fox", "limit": 1 });
+        let searched = served.post(&format!("{path}/nearest"), nearest).await;
+        assert_eq!(searched, model_unavailable("setup"), "{path}");
+        let object = format!("{path}/objects/{}", id(1));
+        let fox = json!({ "properties": { "title": "a red fox" } });
+        let written = served.put(&object, fox).await;
+        assert_eq!(written, model_unavailable("setup"), "{path}");
+        assert_eq!(served.get(&object).await.0, StatusCode::NOT_FOUND);
+    }
+
+    // A collection on a local model the node allowed: the node started
+    // again allows only the default.
+    let allowing = cluster
+        .serve_embedding_with(unused, set_up(&["BAAI/bge-small-en-v1.5"], &[]))
+        .await;
+    allowing
+        .with_notes(json!({
+            "provider": "local",
+            "model": "BAAI/bge-small-en-v1.5",
+            "dimensions": 384,
+            "properties": ["title"],
+        }))
+        .await;
+    allowing.node.shutdown().await;
+    allowing.stop().await;
+    let narrowed = cluster
+        .serve_embedding_with(unused, set_up(&["BAAI/bge-base-en-v1.5"], &[]))
+        .await;
+    refused(&narrowed, NOTES).await;
+    narrowed.node.shutdown().await;
+    narrowed.stop().await;
+
+    // A collection on Bedrock in a region the node called: the node
+    // started again calls none.
+    let calling = cluster
+        .serve_embedding_with(unused, set_up(&[], &["eu-west-2"]))
+        .await;
+    calling.ok(Method::PUT, "/v1/tenants/beta", None).await;
+    let titan = notes(json!({
+        "provider": "bedrock",
+        "region": "eu-west-2",
+        "model": "amazon.titan-embed-text-v2:0",
+        "dimensions": 256,
+        "properties": ["title"],
+    }));
+    let beta = "/v1/tenants/beta/collections/notes";
+    calling.ok(Method::PUT, beta, Some(titan)).await;
+    calling.node.shutdown().await;
+    calling.stop().await;
+    let elsewhere = cluster.serve_embedding_with(unused, set_up(&[], &[])).await;
+    refused(&elsewhere, beta).await;
+}
+
 fn model_unavailable(reason: &str) -> (StatusCode, Value) {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -2511,8 +2581,24 @@ async fn a_collection_with_a_model_no_build_runs_is_refused_as_the_requests_faul
         )
     };
     let titan = json!({ "provider": "bedrock", "region": "eu-west-2", "model": "amazon.titan-embed-text-v2:0", "dimensions": 2 });
+    let bedrock = |region: &str, model: &str| json!({ "provider": "bedrock", "region": region, "model": model, "dimensions": 256 });
     for (embedding, message) in [
         (unheard_of.clone(), "acme/unheard-of cannot be run locally"),
+        // A model the release runs and this node is not set up to.
+        (
+            local("BAAI/bge-small-en-v1.5", 384),
+            "this node is set up to run only Xenova/bge-base-en-v1.5 locally, not BAAI/bge-small-en-v1.5",
+        ),
+        // A region the node is not set up to call, and a model of the
+        // collection's own making.
+        (
+            bedrock("tenant-17-made-this-up-1", "amazon.titan-embed-text-v2:0"),
+            "this node is set up to embed through Bedrock in no region, not in tenant-17-made-this-up-1",
+        ),
+        (
+            bedrock("eu-west-2", "amazon.titan-embed-text-v2:0-mine"),
+            "amazon.titan-embed-text-v2:0-mine is not amazon.titan-embed-text-v2, the one Bedrock model that can be embedded with",
+        ),
         (
             local("BAAI/bge-base-en-v1.5", 1024),
             "BAAI/bge-base-en-v1.5 has 768 dimensions, not 1024",

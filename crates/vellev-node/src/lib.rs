@@ -226,9 +226,14 @@ async fn restore_window(
         .min(MAX_RESTORE_WINDOW))
 }
 
-/// The node's embedders, as a writer asks for vectors.
+/// The node's embedders, as a tenant's writer asks for vectors: in the
+/// tenant's name, by which a model shared among tenants gives each its
+/// turn.
 #[derive(Debug)]
-struct Documents(Arc<Embedders>);
+struct Documents {
+    embedders: Arc<Embedders>,
+    tenant: TenantId,
+}
 
 #[async_trait]
 impl Vectorize for Documents {
@@ -238,7 +243,7 @@ impl Vectorize for Documents {
         texts: Vec<String>,
     ) -> std::result::Result<Vec<Vec<f32>>, Unembedded> {
         let embedder = self
-            .0
+            .embedders
             .embedder(embedding)
             .map_err(unembedded)?
             .ok_or_else(|| {
@@ -247,7 +252,10 @@ impl Vectorize for Documents {
                     "its collection's clients supply the vectors",
                 )
             })?;
-        let vectors = embedder.documents(&texts).await.map_err(unembedded)?;
+        let vectors = embedder
+            .documents_for(self.tenant.as_str(), &texts)
+            .await
+            .map_err(unembedded)?;
         vectors
             .into_iter()
             .collect::<Option<_>>()
@@ -473,7 +481,10 @@ impl Tenant {
         }
         let made = alike.into_iter().map(|(embedding, texts)| async move {
             let embedder = self.embedders.embedder(&embedding).ok()??;
-            let vectors = embedder.documents(&texts).await.ok()?;
+            let vectors = embedder
+                .documents_for(self.id.as_str(), &texts)
+                .await
+                .ok()?;
             Some((embedding, texts, vectors))
         });
         join_all(made)
@@ -1351,7 +1362,10 @@ impl Inner {
             !hold.is_lost() && Instant::now() < *deadline.lock().expect("deadline lock");
         let writer = match opened {
             Ok(writer) if !self.opened().stopped && still_held => {
-                let documents = Arc::new(Documents(self.embedders.clone()));
+                let documents = Arc::new(Documents {
+                    embedders: self.embedders.clone(),
+                    tenant: tenant.clone(),
+                });
                 Arc::new(
                     writer
                         .embedding_with(documents)
@@ -1548,7 +1562,10 @@ mod tests {
             document_prefix: None,
             properties: vec!["title".into()],
         };
-        let documents = Documents(Arc::new(Embedders::new(Default::default())));
+        let documents = Documents {
+            embedders: Arc::new(Embedders::new(Default::default())),
+            tenant: TenantId::new("acme").unwrap(),
+        };
         assert_eq!(
             documents.vectors(&supplied, vec!["fox".into()]).await,
             Err(Unembedded::for_good(

@@ -2,17 +2,24 @@
 
 mod bedrock;
 mod embedder;
+#[cfg(all(test, feature = "local"))]
+mod harness;
 mod http;
+#[cfg(feature = "local")]
+mod line;
 #[cfg(feature = "local")]
 mod local;
 mod registry;
 
-pub use bedrock::Bedrock;
-pub use embedder::{Embedder, FAULT_STANDS, QUERY_WITHIN};
+pub use bedrock::{Bedrock, UNREACHED_FOR};
+pub use embedder::{
+    Embedder, DOCUMENTS_HELD_AT_MOST, DOCUMENTS_WITHIN, EACH_DOCUMENT_WITHIN, FAULT_STANDS,
+    QUERY_WITHIN,
+};
 pub use http::Http;
 #[cfg(feature = "local")]
 pub use local::Local;
-pub use registry::{Embedders, Settings};
+pub use registry::{Embedders, Settings, DEFAULT_LOCAL_MODEL, LOCAL_MODELS, LOCAL_MODEL_IDLE};
 
 use std::sync::LazyLock;
 
@@ -317,6 +324,18 @@ fn without(said: &str, shape: &Shape) -> String {
     without
 }
 
+/// Whether `c` is a character a key can be made of, whichever of the
+/// [`KEYS`] it is shaped as, the value in a query string apart: a letter
+/// or a digit, one of `_-.~+/=`, or what masks one, `*` and `…`.
+///
+/// So where what is said is cut short for looking through, whatever of a
+/// key was left at the cut, too short to be told for one, lies wholly in
+/// the run of these that ends there. The value in a query string is
+/// taken out whole however little of it there is, cut short or not.
+pub(crate) fn of_a_key(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_-.~+/=*\u{2026}".contains(c)
+}
+
 /// What texts are embedded for. Someone is waiting on a query, so where a
 /// model has a queue, queries go ahead of documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,11 +344,85 @@ pub enum Purpose {
     Query,
 }
 
+/// How a model says how it is getting on with a call's texts: each time
+/// it gets somewhere with them, and, if it keeps its callers in a line,
+/// how long it reckons it will be before it comes to these. A model
+/// whose callers wait on one another says so, so that a caller is given
+/// up on when the model has stopped or will not come to it, and not for
+/// how much the others ask of it.
+#[derive(Debug, Clone)]
+pub struct Progress(std::sync::Arc<tokio::sync::watch::Sender<Said>>);
+
+/// What a model last said of how it is getting on with a call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Said {
+    /// How long it last said it will be before it comes to the call, if
+    /// it said: over and above what it may go without getting anywhere.
+    pub(crate) allowed: Option<std::time::Duration>,
+    /// How many times it has said anything.
+    times: u64,
+}
+
+impl Progress {
+    /// Something to say it with, and what hears it said.
+    pub(crate) fn heard() -> (Self, tokio::sync::watch::Receiver<Said>) {
+        let (says, hears) = tokio::sync::watch::channel(Said::default());
+        (Self(std::sync::Arc::new(says)), hears)
+    }
+
+    /// The model has got somewhere with the call: it has made some of
+    /// its texts, or what serves the model has answered. It is given as
+    /// long again as a model may go without getting anywhere.
+    pub fn made(&self) {
+        self.0.send_modify(|said| {
+            said.allowed = None;
+            said.times += 1;
+        });
+    }
+
+    /// The model reckons it will be `within` from now before it comes
+    /// to the call: for what stands ahead of it, or for its own loading.
+    /// The call is given that, and as long again as a model may go
+    /// without getting anywhere, before it is given up on. A model that
+    /// keeps a line says this of each call that waits, each time the
+    /// line moves.
+    pub fn allowed(&self, within: std::time::Duration) {
+        self.0.send_modify(|said| {
+            said.allowed = Some(within);
+            said.times += 1;
+        });
+    }
+}
+
 /// A model that turns texts into vectors.
 #[async_trait]
 pub trait Provider: std::fmt::Debug + Send + Sync {
     /// One vector for each text, in order. No text is blank.
     async fn embed(&self, texts: Vec<String>, purpose: Purpose) -> Result<Vec<Vec<f32>>>;
+
+    /// Whether the model says how it is getting on with a call, through
+    /// [`Self::embed_saying`]. One that does not is given a time for the
+    /// whole of a call, counted from when it is asked.
+    fn says_how_it_gets_on(&self) -> bool {
+        false
+    }
+
+    /// As [`Self::embed`], for `tenant`, saying through `progress` each
+    /// time the model gets somewhere with these texts. A model that
+    /// keeps callers waiting on one another, in a line or for a share of
+    /// the calls it may make, shares itself among the tenants and not
+    /// among their calls, and is given up on only when it has got
+    /// nowhere with a call for too long.
+    async fn embed_saying(
+        &self,
+        texts: Vec<String>,
+        purpose: Purpose,
+        tenant: &str,
+        progress: Progress,
+    ) -> Result<Vec<Vec<f32>>> {
+        let _ = (tenant, progress);
+        self.embed(texts, purpose).await
+    }
 }
 
 #[cfg(test)]
@@ -653,6 +746,39 @@ mod tests {
         ];
         for said in said.into_iter().chain(glued.iter().map(String::as_str)) {
             assert_eq!(without_keys(said), said);
+        }
+    }
+
+    /// What is dropped where looking for keys ends is the run of these
+    /// characters that ends there: a shape whose keys had some other
+    /// character in them would leave the start of one behind.
+    #[test]
+    fn a_key_of_any_shape_is_made_only_of_the_characters_a_key_is_made_of() {
+        let keys = [
+            "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz_-",
+            "sk-ab\u{2026}wxyz",
+            "sk-ab...wxyz",
+            "sk-****abcd",
+            "hf_AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh",
+            "hf_abcd\u{2026}",
+            "hf_ab***wxyz",
+            "AKIAIOSFODNN7EXAMPLE",
+            "AIzaSyA-0123456789abcdefghijklmnopqrstu",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl",
+            // Every character a credential after `Bearer` or `Basic` has.
+            "dXNlcjpwYXNzd29yZA==",
+            "ABCdef012._~+/=-ABCdef012",
+        ];
+        for key in keys {
+            // Each is a key, all of it, said after `Bearer` as the last
+            // two are only then.
+            let said = format!("Bearer {key}");
+            assert_eq!(without_keys(&said), format!("Bearer {REDACTED}"), "{key}");
+            assert!(key.chars().all(of_a_key), "{key}");
+        }
+        for not in [' ', '\n', '"', '\'', '&', '?', '<', ':', ',', '\\', '密'] {
+            assert!(!of_a_key(not), "{not:?}");
         }
     }
 
