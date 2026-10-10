@@ -4977,6 +4977,12 @@ mod tests {
                             // version it was read at.
                             assert!(versioned(&changes, stored), "{cell}");
                             assert!(alone(&changes, entry), "{cell}");
+                            // That a collection is being taken up bears
+                            // only on an id the ledger has no entry for.
+                            if adopted && entry.is_some() {
+                                let caught_up = done(fixture(said), entry, weaviate, stored, false);
+                                assert_eq!(kinds(&changes), kinds(&caught_up), "{cell}");
+                            }
                             // (d) Without an entry, and outside a taking
                             // up, nothing is deleted or written over.
                             if entry.is_none() && !adopted {

@@ -4396,6 +4396,20 @@ async fn a_node_too_old_to_hold_a_write_to_a_version_stops_the_run_whatever_is_s
     assert_eq!(importing.get(4).await.unwrap().properties["n"], json!(4));
     // With every node knowing it, the note is replaced.
     assert_eq!(importing.counts().await, ([0, 1, 0, 0, 0], [10; 3]));
+    // So with a delete, which is made of one object by itself.
+    weaviate.delete(class, 3).await;
+    let unknown = json!({ "error": { "code": "invalid", "message": message } });
+    importing
+        .front
+        .answer(1, &["POST", "/changes"], StatusCode::BAD_REQUEST, unknown);
+    let stopped = importing.run_as(&skipping).await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("one of an earlier release is among those asked"),
+        "{stopped:#}"
+    );
+    assert!(importing.get(3).await.is_some());
+    assert_eq!(importing.counts().await, ([0, 0, 1, 0, 0], [9; 3]));
 }
 
 #[tokio::test]
