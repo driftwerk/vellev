@@ -657,9 +657,12 @@ pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Re
             };
             let copying = Copying::new(&weaviate, tenant, &plan, options);
             let mut copied = Copied::default();
-            copied.verified = Some(copying.verify(pages, &mut copied).await?);
+            let (verified, stale) = copying.verify(pages, &mut copied).await?;
+            copied.verified = Some(verified);
             copied.weaviate = weaviate.count(&plan.class).await?;
-            copied.imported = plan.ledger.count(None).await? - copied.unvouched();
+            // An entry the next run that copies forgets accounts for
+            // nothing of Weaviate's.
+            copied.imported = plan.ledger.count(None).await? - copied.unvouched() - stale;
             copied.vellev = plan.records.count(None).await?;
             report.classes.insert(name, copied);
         }
@@ -2318,9 +2321,10 @@ impl<'a> Copying<'a> {
     /// pages are picked, not places among all ids there could be, so
     /// that ids that lie close together are looked at as any others.
     /// What the ledger says was withheld, left or unknown is counted in
-    /// `copied`, of the whole ledger either way; what it says was left,
-    /// by whether the collection holds it still.
-    async fn verify(&self, pages: Option<usize>, copied: &mut Copied) -> Result<Verified> {
+    /// `copied`, of the whole ledger either way, as a run that copies
+    /// counts it: by whether the collection holds it still. Answers too
+    /// with how many entries such a run would forget.
+    async fn verify(&self, pages: Option<usize>, copied: &mut Copied) -> Result<(Verified, u64)> {
         let mut verified = Verified::default();
         let ledgered = self.plan.ledger.count(None).await? as usize;
         let all = ledgered.div_ceil(self.options.page);
@@ -2331,25 +2335,24 @@ impl<'a> Copying<'a> {
         };
         let mut entries = Entries::new(&self.plan.ledger, self.options.page, None);
         let (mut from, mut nth, mut on_page) = (None, 0, 0);
-        let mut left = Vec::new();
+        let (mut left, mut stale) = (Vec::new(), 0);
         while let Some(entry) = entries.next().await? {
-            let pre = entry.mark == Mark::Unknown || (entry.mark == Mark::Withheld && entry.gone);
-            copied.unknown += u64::from(pre);
-            if entry.gone && !pre {
-                left.push((entry.id, entry.mark));
+            let (id, mark, gone) = (entry.id, entry.mark, entry.gone);
+            copied.kept += u64::from(mark == Mark::Theirs && !gone);
+            copied.withheld += u64::from(mark == Mark::Withheld && !gone);
+            if gone || mark == Mark::Unknown {
+                left.push(entry);
             }
-            copied.kept += u64::from(entry.mark == Mark::Theirs && !entry.gone);
-            copied.withheld += u64::from(entry.mark == Mark::Withheld && !entry.gone);
             on_page += 1;
             if on_page == self.options.page {
-                self.leaving(from, &mut left, copied).await?;
+                stale += self.leaving(from, &mut left, copied).await?;
                 if picked.next_if_eq(&nth).is_some() {
-                    self.compare(from, Some(entry.id), &mut verified).await?;
+                    self.compare(from, Some(id), &mut verified).await?;
                 }
-                (from, nth, on_page) = (Some(entry.id), nth + 1, 0);
+                (from, nth, on_page) = (Some(id), nth + 1, 0);
             }
         }
-        self.leaving(from, &mut left, copied).await?;
+        stale += self.leaving(from, &mut left, copied).await?;
         if picked.next_if_eq(&nth).is_some() {
             self.compare(from, None, &mut verified).await?;
         }
@@ -2357,33 +2360,35 @@ impl<'a> Copying<'a> {
             self.compare(None, None, &mut verified).await?;
             verified.extra = Some(self.extra().await?);
         }
-        Ok(verified)
+        Ok((verified, stale))
     }
 
-    /// Count the entries `left`, all of ids after `from`, that say
-    /// Weaviate no longer holds an object: as left, where the collection
-    /// holds it still, and as barred, where it does not and the entry
-    /// stays for being another writer's. One of neither is forgotten by
-    /// the next run that copies.
+    /// Count the entries `left`, all of ids after `from`, that are of
+    /// nothing Weaviate holds: each as a run that copies counts it, by
+    /// whether the collection holds its object still. Answers with how
+    /// many of them such a run forgets.
     async fn leaving(
         &self,
         from: Option<ObjectId>,
-        left: &mut Vec<(ObjectId, Mark)>,
+        left: &mut Vec<Entry>,
         copied: &mut Copied,
-    ) -> Result<()> {
-        let Some(&(through, _)) = left.last() else {
-            return Ok(());
+    ) -> Result<u64> {
+        let Some(through) = left.last().map(|entry| entry.id) else {
+            return Ok(0);
         };
-        let ids: Vec<ObjectId> = left.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<ObjectId> = left.iter().map(|entry| entry.id).collect();
         let held = self.present(from, through, &ids).await?;
-        for (id, mark) in left.drain(..) {
-            match (held.contains(&id), mark) {
-                (true, _) => copied.left += 1,
-                (false, Mark::Theirs) => copied.barred += 1,
-                (false, _) => {}
-            }
-        }
-        Ok(())
+        let stale = |entry: Entry| self.stale(&entry, held.contains(&entry.id), copied);
+        Ok(left.drain(..).map(stale).map(u64::from).sum())
+    }
+
+    /// Count an entry kept though Weaviate does not hold its id as a run
+    /// that copies does, and say whether that run forgets it: it then
+    /// accounts for nothing, and is not counted at all.
+    fn stale(&self, entry: &Entry, holds: bool, copied: &mut Copied) -> bool {
+        let kept = self.keeping(entry, None, holds, copied);
+        kept.iter()
+            .any(|change| matches!(change, Change::Delete { .. }))
     }
 
     /// How many objects the collection holds that the ledger has no
@@ -4156,6 +4161,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_comparison_counts_what_weaviate_does_not_hold_as_a_run_that_copies_would() {
+        let fixture = Fixture::new(options());
+        let counted = |entry: &Entry, holds: bool| {
+            let mut copied = Copied::default();
+            let stale = fixture.copying().stale(entry, holds, &mut copied);
+            (stale, copied.left, copied.unknown, copied.barred)
+        };
+        let left = |mark: Mark| Entry {
+            gone: true,
+            ..fixture.entry("fox", 1, mark)
+        };
+        // Left in the collection, it is counted so; gone from there too,
+        // its entry is one the next run forgets, and counts for nothing.
+        for mark in [Mark::Stored, Mark::Foreign] {
+            assert_eq!(counted(&left(mark), true), (false, 1, 0, 0));
+            assert_eq!(counted(&left(mark), false), (true, 0, 0, 0));
+        }
+        // So with what was there when the collection was taken up.
+        for entry in [fixture.entry("fox", 1, Mark::Unknown), left(Mark::Withheld)] {
+            assert_eq!(counted(&entry, true), (false, 0, 1, 0));
+            assert_eq!(counted(&entry, false), (true, 0, 0, 0));
+        }
+        // What was said to be another writer's keeps its entry, which
+        // bars the id.
+        let theirs = left(Mark::Stored).theirs(Some(1), true);
+        assert_eq!(counted(&theirs, true), (false, 1, 0, 0));
+        assert_eq!(counted(&theirs, false), (false, 0, 0, 1));
     }
 
     #[test]
