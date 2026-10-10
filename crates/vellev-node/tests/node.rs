@@ -1250,8 +1250,8 @@ struct Unrenewing {
     /// Whether every claim on a backup is taken and the answer saying so
     /// lost, however often it is asked for.
     claims_unheard: AtomicBool,
-    /// Whether letting a claim on a backup go waits, once it is asked for,
-    /// which is signalled, until it is let through.
+    /// Whether letting a claim go, on a backup or to purge, waits, once it
+    /// is asked for, which is signalled, until it is let through.
     releases_wait: AtomicBool,
     release_asked: tokio::sync::Notify,
     release_let_through: tokio::sync::Notify,
@@ -1631,6 +1631,10 @@ impl Coordinator for Unrenewing {
         tenant: &TenantId,
         claim: uuid::Uuid,
     ) -> Result<(), CoordinatorError> {
+        if self.releases_wait.load(Ordering::SeqCst) {
+            self.release_asked.notify_one();
+            self.release_let_through.notified().await;
+        }
         self.purge_releases.fetch_add(1, Ordering::SeqCst);
         self.inner.release_purge(tenant, claim).await
     }
@@ -6937,25 +6941,38 @@ async fn a_claim_none_of_whose_answers_was_heard_is_let_go() {
 async fn a_claim_whose_holder_stops_waiting_as_it_is_let_go_is_let_go_all_the_same() {
     let cluster = Cluster::new();
     let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
-    let node = backing_up_through(&cluster, coordinator.clone(), backup_store()).await;
-
-    // The backup is made, and whoever asked for it stops waiting just as
-    // its claim is being let go, the coordinator slow to answer.
-    coordinator.releases_wait.store(true, Ordering::SeqCst);
+    let blobs = Troubled::over(cluster.store.clone());
+    let node = node_over(&cluster, coordinator.clone(), blobs.clone(), backup_store());
     let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    noted(&node, 1, "fox").await;
+    node.drop_tenant(&acme).await.unwrap();
+    cluster.clock.advance(hold());
+
+    // A purge gives up on a tenant still written to and lets its claim go,
+    // the coordinator slow to answer; whoever ran the purge is stopped
+    // just then, as a node shutting down stops its tasks.
+    blobs.refilling.store(true, Ordering::SeqCst);
+    coordinator.releases_wait.store(true, Ordering::SeqCst);
     tokio::select! {
         biased;
         () = coordinator.release_asked.notified() => {}
-        backed_up = node.back_up(&acme) => panic!("{backed_up:?}"),
+        purged = node.purge_due() => panic!("{purged:?}"),
     }
-    assert!(!unclaimed(&cluster.coordinator, &tenant("acme")).await);
+    let claimed = || async {
+        let claimed = cluster
+            .coordinator
+            .claim_purge(&acme, Duration::ZERO, hold());
+        claimed.await.unwrap()
+    };
+    assert!(claimed().await.is_none(), "held until it is let go");
     coordinator.releases_wait.store(false, Ordering::SeqCst);
     coordinator.release_let_through.notify_one();
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
     assert!(
-        unclaimed(&cluster.coordinator, &tenant("acme")).await,
+        claimed().await.is_some(),
         "let go on a task of its own, which ran to its end"
     );
 }
