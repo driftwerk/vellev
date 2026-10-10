@@ -2605,7 +2605,10 @@ impl<'a> Copying<'a> {
             let (id, mark, gone) = (entry.id, entry.mark, entry.gone);
             copied.kept += u64::from(mark == Mark::Theirs && !gone);
             copied.withheld += u64::from(mark == Mark::Withheld && !gone);
-            if gone || mark == Mark::Unknown {
+            let pre = mark == Mark::Unknown || (mark == Mark::Withheld && gone);
+            if pre && self.relisted(&entry, copied).await? {
+                // Counted as a run that copies would settle it.
+            } else if gone || mark == Mark::Unknown {
                 left.push(entry);
             }
             on_page += 1;
@@ -2645,6 +2648,33 @@ impl<'a> Copying<'a> {
         let held = self.present(from, through, &ids).await?;
         let stale = |entry: Entry| self.stale(&entry, held.contains(&entry.id), copied);
         Ok(left.drain(..).map(stale).map(u64::from).sum())
+    }
+
+    /// Whether Weaviate holds after all the id of an entry that says it
+    /// did not when the collection was taken up, or since. A run that
+    /// copies settles such an entry by what Weaviate holds, and it is
+    /// counted here as that run would leave it.
+    async fn relisted(&self, entry: &Entry, copied: &mut Copied) -> Result<bool> {
+        let (class, vectors) = (&self.plan.class, self.plan.vectors());
+        let object = self
+            .weaviate
+            .object(class, entry.id, vectors, Asked::Any)
+            .await?;
+        let listed = object.is_some();
+        if let Some(item) = self.items(object.as_slice(), copied)?.pop() {
+            let stored = self.plan.records.get(entry.id).await?;
+            self.relisting(&item, stored.as_ref(), copied);
+        }
+        Ok(listed)
+    }
+
+    /// Count what was unknown, or withheld and gone, and is listed by
+    /// Weaviate after all, as a run that copies and is told nothing
+    /// leaves it: the import's, if the collection holds exactly what
+    /// Weaviate does, and withheld otherwise.
+    fn relisting(&self, item: &Item, stored: Option<&Stored>, copied: &mut Copied) {
+        let held = stored.and_then(|stored| self.plan.hash(stored));
+        copied.withheld += u64::from(held.as_deref() != Some(item.hash.as_str()));
     }
 
     /// Count an entry kept though Weaviate does not hold its id as a run
@@ -4034,6 +4064,14 @@ mod tests {
             .unwrap()
         }
 
+        /// An object the collection holds that it could not have been
+        /// sent as the schema is: its title is no text.
+        fn unhashable(&self) -> Stored {
+            let mut stored = self.stored("yak");
+            stored.properties.insert("title".into(), json!(5));
+            stored
+        }
+
         /// An entry as it is read from the ledger, at a version.
         fn entry(&self, title: &str, updated: i64, mark: Mark) -> Entry {
             Entry {
@@ -4074,10 +4112,10 @@ mod tests {
     /// may do to what was said to be another writer's is; those among
     /// the first where a run must do something; and those where the last
     /// guard on deleting is asked by itself.
-    const SAFETY: usize = 1_380;
-    const LATER: usize = 6_400;
-    const LIVENESS: usize = 404;
-    const DIRECT: usize = 440;
+    const SAFETY: usize = 1_656;
+    const LATER: usize = 9_456;
+    const LIVENESS: usize = 454;
+    const DIRECT: usize = 528;
 
     fn only(changes: &[&str]) -> Vec<String> {
         let changes = changes.iter();
@@ -4637,6 +4675,23 @@ mod tests {
     }
 
     #[test]
+    fn a_comparison_counts_what_weaviate_lists_after_all_as_a_run_that_copies_would_leave_it() {
+        let fixture = Fixture::new(options());
+        let hen = fixture.item("hen", 2);
+        let counted = |stored: Option<&Stored>| {
+            let mut copied = Copied::default();
+            fixture.copying().relisting(&hen, stored, &mut copied);
+            copied.withheld
+        };
+        // Lacking, held otherwise, or held as nothing the collection
+        // could have been sent: withheld. Held exactly so: the import's.
+        assert_eq!(counted(None), 1);
+        assert_eq!(counted(Some(&fixture.stored("fox"))), 1);
+        assert_eq!(counted(Some(&fixture.unhashable())), 1);
+        assert_eq!(counted(Some(&fixture.stored("hen"))), 0);
+    }
+
+    #[test]
     fn a_ledger_entry_that_is_not_the_one_read_stops_the_run() {
         let fixture = Fixture::new(options());
         let read = fixture.entry("fox", 1, Mark::Stored);
@@ -5004,10 +5059,15 @@ mod tests {
         }
         // Everything the collection can hold under the id: nothing; what
         // an entry hashes as; what it was found to hold; what Weaviate
-        // holds now; something else.
-        let held: Vec<Option<Stored>> = [None, Some("fox"), Some("owl"), Some("hen"), Some("emu")]
-            .map(|title| title.map(|title| plain.stored(title)))
-            .into();
+        // holds now; something else; and something the collection as this
+        // run knows it could not have been sent, which hashes as nothing
+        // does.
+        let mut held: Vec<Option<Stored>> =
+            [None, Some("fox"), Some("owl"), Some("hen"), Some("emu")]
+                .map(|title| title.map(|title| plain.stored(title)))
+                .into();
+        held.push(Some(plain.unhashable()));
+        assert_eq!(plain.plan.hash(&plain.unhashable()), None);
         let is = |stored: Option<&Stored>, hash: &str| {
             stored.and_then(|stored| plain.plan.hash(stored)).as_deref() == Some(hash)
         };
@@ -5134,6 +5194,17 @@ mod tests {
                             // version it was read at.
                             assert!(versioned(&changes, stored), "{cell}");
                             assert!(alone(&changes, entry), "{cell}");
+                            // An entry written to say the import stored
+                            // what Weaviate lists says so truly: the
+                            // collection holds that, or the step stores
+                            // it.
+                            if let Some(now) = after.as_ref().filter(|now| Some(*now) != entry) {
+                                if now.mark == Mark::Stored && !now.gone {
+                                    let stores = ["upsert Memory", "insert Memory"];
+                                    let stores = stores.iter().any(|kind| has(&changes, kind));
+                                    assert!(is(stored, &now.hash) || stores, "{cell}");
+                                }
+                            }
                             // That a collection is being taken up bears
                             // only on an id the ledger has no entry for.
                             if adopted && entry.is_some() {

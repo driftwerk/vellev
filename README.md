@@ -57,7 +57,11 @@ rule is:
 
 - An object is the import's while the collection holds, under an id the
   ledger has, exactly what the ledger's hash says. The import replaces
-  and deletes only its own objects.
+  and deletes only its own objects. One exception errs on the side of
+  leaving: an object Weaviate deleted while the collection held
+  something else under its id was left, and is not asked about again,
+  so it stays left even if a writer then puts back exactly what the
+  import had stored, for as long as Weaviate lacks the id.
 - It stores a new object only where the collection holds nothing under
   the id and the ledger has no entry. What somebody deleted in vellev is
   not brought back.
@@ -293,7 +297,12 @@ Per class:
   are kept so that nothing is stored under them again.
 - `pending` and `budget`: see above.
 - `refused`: objects vellev cannot hold, by id, with why. One stops the
-  run unless `--skip-refused` is given.
+  run unless `--skip-refused` is given. That passes over what the
+  import finds unfit before sending it, and a new object a node
+  refuses; it does not pass over a replacing or a deleting a node
+  refuses as invalid, since those are conditional on a version and a
+  node does not say whether the object or the condition is at fault:
+  the run stops.
 - `weaviate`, `imported`, `vellev`: how many objects Weaviate holds, the
   ledger has accounted for, those withheld aside, and the collection
   holds.
@@ -328,7 +337,7 @@ listing the ledger once. It reports, under `verified`, how many it
 Weaviate while the collection still holds them. It counts `withheld`,
 `unknown`, `left` and `barred` over the whole ledger as a run that
 imports does, asking the collection which of those objects it still
-holds,
+holds, and Weaviate whether it has come to hold what was unknown,
 and fails on the same terms: on anything withheld, unknown, different,
 missing or gone, and on looking at nothing of a class that holds
 objects. `--verify-all` also counts, as `extra`, the objects the

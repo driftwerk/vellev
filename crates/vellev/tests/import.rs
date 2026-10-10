@@ -4647,3 +4647,199 @@ async fn a_class_with_nothing_imported_is_compared_like_any_other() {
         assert_eq!((verified.looked, verified.same), (3, 3), "{class}");
     }
 }
+
+#[tokio::test]
+async fn a_comparison_counts_what_a_run_that_copies_then_counts() {
+    let Some(importing) = Importing::new("VellevImportVerifyAgrees", 20).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    importing.unledgered().await;
+    // Four objects the collection holds that Weaviate does not, two
+    // notes Weaviate gained and one it changed: a collection taken up.
+    for n in 1_000..1_004 {
+        importing.records.put(oid(n), &foreign(n)).await.unwrap();
+    }
+    weaviate.add(class, 300..302).await;
+    weaviate.put(class, 2, changed(2)).await;
+    let report = importing.run().await.unwrap();
+    assert_eq!((unknown(&report, class), withheld(&report, class)), (4, 3));
+    let comparing = Options {
+        mode: Mode::Verify { pages: None },
+        ..importing.options.clone()
+    };
+    // What a comparison says of a class, and then a run that copies,
+    // nothing having been written in between.
+    let said = |report: &Report| {
+        let copied = &report.classes[class];
+        let outcome = report.outcome(false);
+        let unsettled = [copied.withheld, copied.unknown, copied.left, copied.kept];
+        let held = [copied.weaviate, copied.imported, copied.vellev];
+        (unsettled, copied.barred, held, copied.caught_up(), outcome)
+    };
+    // Of what was unknown, one is removed from the collection; Weaviate
+    // comes to list another, which is removed from the collection too;
+    // and a third, which stays.
+    importing.records.delete(oid(1_001)).await.unwrap();
+    weaviate.add(class, 1_002..1_004).await;
+    importing.records.delete(oid(1_002)).await.unwrap();
+    let compared = importing.run_as(&comparing).await.unwrap();
+    let copied = importing.run().await.unwrap();
+    assert_eq!(said(&compared), said(&copied));
+    assert_eq!(
+        said(&copied).0,
+        [5, 1, 0, 0],
+        "the two Weaviate now lists are withheld like the three before, and one is unknown still"
+    );
+    assert!(said(&copied).3);
+    assert_eq!(importing.entry(1_001).await, None);
+    // Weaviate deletes the note it had changed, which was withheld: it
+    // is left, and from the next run on unknown, as what the collection
+    // held when it was taken up that Weaviate does not.
+    weaviate.delete(class, 2).await;
+    importing.run().await.unwrap();
+    let compared = importing.run_as(&comparing).await.unwrap();
+    let copied = importing.run().await.unwrap();
+    assert_eq!(said(&compared), said(&copied));
+    assert_eq!(said(&copied).0, [4, 2, 0, 0]);
+    let sampling = Options {
+        mode: Mode::Verify { pages: Some(100) },
+        ..importing.options.clone()
+    };
+    let sampled = importing.run_as(&sampling).await.unwrap();
+    assert_eq!(said(&sampled), said(&copied));
+}
+
+#[tokio::test]
+async fn a_collection_whose_note_is_lost_is_not_compared_and_nothing_is_written_of_it() {
+    let Some(importing) = Importing::new("VellevImportVerifyNoteLost", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    let imports = CollectionName::new("vellev_imports").unwrap();
+    importing.tenant.collection(&imports).drop().await.unwrap();
+    let comparing = Options {
+        mode: Mode::Verify { pages: None },
+        ..importing.options.clone()
+    };
+    importing.front.listen();
+    let refused = importing.run_as(&comparing).await.unwrap_err();
+    let refused = format!("{refused:#}");
+    assert!(
+        refused.contains("the note of where its collection was imported from is lost"),
+        "{refused}"
+    );
+    assert!(refused.contains("there is nothing to compare"), "{refused}");
+    // A comparison changes nothing: not even to note the collection.
+    assert_eq!(importing.front.asked("/changes").len(), 0);
+    let noted = importing.tenant.collection(&imports).schema().await;
+    assert!(noted.unwrap().is_none());
+    assert_eq!(importing.ledger().count(None).await.unwrap(), 10);
+}
+
+#[tokio::test]
+async fn no_more_entries_than_a_page_are_held_to_be_forgotten() {
+    let Some(mut importing) = Importing::new("VellevImportForgetPaged", 30).await else {
+        return;
+    };
+    importing.options.page = 5;
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // Twelve of another writer's objects, left when Weaviate deleted
+    // their ids, and then removed from the collection by that writer.
+    for n in 0..12 {
+        importing.records.put(oid(n), &foreign(n)).await.unwrap();
+        weaviate.delete(class, n).await;
+    }
+    assert_eq!(importing.counts().await, ([0, 0, 0, 0, 12], [18, 18, 30]));
+    for n in 0..12 {
+        importing.records.delete(oid(n)).await.unwrap();
+    }
+    // Their entries are forgotten as they come to a page of them, and
+    // not all at the end: in more requests than the one that would
+    // carry them all, beside the one that notes the collection.
+    importing.front.listen();
+    assert_eq!(importing.counts().await, ([0; 5], [18; 3]));
+    let changes = importing.front.asked("/changes").len();
+    assert!(changes >= 1 + 2, "{changes} requests changed the tenant");
+    assert_eq!(importing.ledger().count(None).await.unwrap(), 18);
+}
+
+#[tokio::test]
+async fn a_node_too_old_for_a_condition_on_a_ledger_entry_stops_the_run() {
+    let Some(importing) = Importing::new("VellevImportOldNodeLedger", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // An entry to forget: of another writer's object, left when Weaviate
+    // deleted the id, and since removed from the collection.
+    importing.records.put(oid(3), &foreign(3)).await.unwrap();
+    weaviate.delete(class, 3).await;
+    assert_eq!(importing.counts().await, ([0, 0, 0, 0, 1], [9, 9, 10]));
+    importing.records.delete(oid(3)).await.unwrap();
+    // The request that forgets it is refused as a node of 0.1 refuses a
+    // delete with a field it does not know.
+    let message = "unknown field `only_if_version`, expected `collection` or `id`";
+    let unknown = json!({ "error": { "code": "invalid", "message": message } });
+    importing
+        .front
+        .answer(1, &["POST", "/changes"], StatusCode::BAD_REQUEST, unknown);
+    let stopped = importing.run().await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("one of an earlier release is among those asked"),
+        "{stopped:#}"
+    );
+    assert!(importing.entry(3).await.is_some());
+    assert_eq!(importing.counts().await, ([0; 5], [9; 3]));
+}
+
+#[tokio::test]
+async fn a_write_to_a_version_that_a_node_calls_invalid_is_not_skipped() {
+    let Some(importing) = Importing::new("VellevImportInvalidVersioned", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    let skipping = Options {
+        skip_refused: true,
+        ..importing.options.clone()
+    };
+    // The node says no more of a refusal than that the request is
+    // invalid: of the request for the page, and then of each object's
+    // by itself. The first request to change the tenant, which sees to
+    // its collections, is let through.
+    let invalid = || {
+        let said = json!({ "error": { "code": "invalid", "message": "it cannot be" } });
+        for skip in [1, 0] {
+            let changes = ["POST", "/changes"];
+            importing
+                .front
+                .answer(skip, &changes, StatusCode::BAD_REQUEST, said.clone());
+        }
+    };
+    // Of a new object, that is of the object: it is passed over, as the
+    // run is told to.
+    weaviate.add(class, 30..31).await;
+    invalid();
+    let report = importing.run_as(&skipping).await.unwrap();
+    assert!(importing.front.spent());
+    let refused: Vec<&String> = report.classes[class].refused.keys().collect();
+    assert_eq!(refused, [&uuid(30)]);
+    assert_eq!(importing.counts().await, ([1, 0, 0, 0, 0], [11; 3]));
+    // Of a replacing, which is conditional on a version, it may be of
+    // the condition: nothing tells, and the run stops.
+    weaviate.put(class, 4, changed(4)).await;
+    invalid();
+    let stopped = importing.run_as(&skipping).await.unwrap_err();
+    assert!(importing.front.spent());
+    let stopped = format!("{stopped:#}");
+    assert!(
+        stopped.contains("does not say whether the object or the condition is at fault"),
+        "{stopped}"
+    );
+    assert_eq!(importing.get(4).await.unwrap().properties["n"], json!(4));
+    assert_eq!(importing.counts().await, ([0, 1, 0, 0, 0], [11; 3]));
+}
