@@ -328,6 +328,56 @@ async fn files_nothing_reaches_are_deleted_but_never_those_ahead_of_the_writer()
     assert_eq!(writer.clean(Duration::ZERO).await.unwrap(), 0);
 }
 
+#[tokio::test]
+async fn how_old_a_file_is_is_told_by_the_clock_the_writer_is_given() {
+    let cluster = Cluster::new().await;
+    // Two hours behind the machine's clock, by which the store says when
+    // each file was written.
+    let hour = Duration::from_secs(3_600);
+    let clock = Arc::new(ManualClock::starting_at(Utc::now() - 2 * hour));
+    let writer = cluster.writer().await.timed_by(clock.clone());
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for round in 0..4u8 {
+        writer
+            .commit(vec![upsert("notes", round, 1)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    writer.merge().await.unwrap().unwrap();
+    let (_, segments, manifests) = files(&cluster).await;
+    assert_eq!((segments.len(), manifests.len()), (5, 5));
+
+    assert_eq!(
+        writer.clean(Duration::ZERO).await.unwrap(),
+        0,
+        "by the writer's clock no file is written yet, though by the machine's each is old"
+    );
+    // Three hours ahead of the machine's.
+    clock.advance(5 * hour);
+    assert_eq!(
+        writer.clean(4 * hour).await.unwrap(),
+        0,
+        "three hours old by the writer's clock, and kept four"
+    );
+    let deleted = writer.clean(2 * hour).await.unwrap();
+    let (logs, segments, manifests) = files(&cluster).await;
+    assert_eq!(
+        (logs.len(), segments.len(), manifests.len()),
+        (0, 1, 1),
+        "kept two hours they are old, though by the machine's clock each was written just now"
+    );
+    assert_eq!(
+        deleted,
+        5 + 4 + 4 + 4,
+        "five logs, four segments and their vectors, four checkpoints"
+    );
+    let follower = cluster.open().await;
+    follower
+        .partition()
+        .read(|state| assert_eq!(state.count(&name("notes")), 4));
+}
+
 /// Blobs that list the files named in `old` as written long ago.
 #[derive(Debug)]
 struct Aged {

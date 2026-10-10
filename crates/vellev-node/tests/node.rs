@@ -2442,6 +2442,38 @@ async fn a_copy_left_unread_catches_up_through_merges_and_cleanup() {
 }
 
 #[tokio::test]
+async fn how_old_a_tenants_files_are_is_told_by_the_clock_the_node_is_given() {
+    let cluster = Cluster::new();
+    // Not the coordinator's clock, by which the tenant's lease runs out.
+    let hour = Duration::from_secs(60 * 60);
+    let clock = Arc::new(ManualClock::starting_at(Utc::now()));
+    let node = cluster.node_from(Settings {
+        clock: clock.clone(),
+        ..cluster.settings()
+    });
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(0, "ant", None)])
+        .await
+        .unwrap();
+    acme.flush().await.unwrap();
+    acme.write(vec![note(1, "fox", None)]).await.unwrap();
+    acme.flush().await.unwrap();
+
+    assert_eq!(
+        acme.compact(hour).await.unwrap(),
+        0,
+        "every file was written within the hour"
+    );
+    clock.advance(2 * hour);
+    assert_eq!(
+        acme.compact(hour).await.unwrap(),
+        3,
+        "both logs and the first checkpoint are two hours old by the node's clock"
+    );
+}
+
+#[tokio::test]
 async fn a_point_past_anything_committed_is_refused_rather_than_waited_for() {
     let cluster = Cluster::new();
     let (writing, reading) = (cluster.node(), cluster.reading_node());

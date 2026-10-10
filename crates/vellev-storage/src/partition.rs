@@ -14,8 +14,8 @@ use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Listed, Local, Transfe
 use crate::catalog::Catalog;
 use crate::column::{self, Column};
 use crate::coordinator::{
-    Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation, Lease, Lineage,
-    LogPosition, ManifestRef, PartitionKey, Prior, Restore,
+    Clock, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation, Lease,
+    Lineage, LogPosition, ManifestRef, PartitionKey, Prior, Restore, SystemClock,
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
@@ -587,6 +587,9 @@ pub struct Writer {
     /// How the store gives requests up, by which an attempt that outlives
     /// every bound on its steps is known to be stuck.
     transfers: Transfers,
+    /// What tells the time of day when [`Self::clean`] asks how old a file
+    /// is, which the store says the other half of: when it was written.
+    clock: Arc<dyn Clock>,
     /// Held by whatever is deciding or making a commit, one at a time.
     writing: Mutex<()>,
     /// Set for good once an attempt fails or is given up part way.
@@ -684,6 +687,7 @@ impl Writer {
             vectorize: None,
             merging: Merging::default(),
             transfers: Transfers::default(),
+            clock: Arc::new(SystemClock),
             writing: Mutex::new(()),
             closed: AtomicBool::new(false),
             building: Mutex::new(()),
@@ -710,6 +714,12 @@ impl Writer {
     /// store's own, instead of as by default.
     pub fn transferring(self, transfers: Transfers) -> Self {
         Self { transfers, ..self }
+    }
+
+    /// Tell how old a file is by `clock` when cleaning up
+    /// ([`Self::clean`]), instead of by the machine's.
+    pub fn timed_by(self, clock: Arc<dyn Clock>) -> Self {
+        Self { clock, ..self }
     }
 
     pub fn partition(&self) -> &Arc<Partition> {
@@ -1688,7 +1698,7 @@ impl Writer {
         let (position, head) = self.current().await?;
         let cutoff = chrono::Duration::from_std(grace)
             .ok()
-            .and_then(|grace| chrono::Utc::now().checked_sub_signed(grace));
+            .and_then(|grace| self.clock.now().checked_sub_signed(grace));
         let Some(cutoff) = cutoff else {
             return Ok(Vec::new());
         };
