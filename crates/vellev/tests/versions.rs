@@ -365,7 +365,8 @@ async fn a_version_is_the_same_once_the_object_is_flushed_to_a_segment() {
             .ok(
                 Method::POST,
                 &format!("{NOTES}/list"),
-                Some(json!({ "limit": 10 })),
+                // The first two in id order: the fox and the hen.
+                Some(json!({ "limit": 2 })),
             )
             .await;
         found.extend(listed["objects"].as_array().unwrap().iter().map(version));
@@ -377,24 +378,56 @@ async fn a_version_is_the_same_once_the_object_is_flushed_to_a_segment() {
             )
             .await;
         found.push(version(&near["results"][0]));
+        // By the words alone, which find the object without its vector
+        // being looked at: the fox, which has one, and the hen, which
+        // has none.
+        for (search, text) in [
+            ("keyword", "fox"),
+            ("keyword", "hen"),
+            ("hybrid", "fox"),
+            ("hybrid", "hen"),
+        ] {
+            let asked = json!({ "text": text, "limit": 1, "vectors": true });
+            let answered = served
+                .ok(Method::POST, &format!("{NOTES}/{search}"), Some(asked))
+                .await;
+            let result = &answered["results"][0];
+            let expected = if text == "fox" { 1 } else { 2 };
+            assert_eq!(result["id"], json!(id(expected)), "{search} {text}");
+            assert_eq!(
+                result.get("vector").cloned(),
+                (text == "fox").then(|| json!([1.0, 0.0])),
+                "{search} {text}: the stored vector is answered"
+            );
+            assert_eq!(answered["degraded"], Value::Null, "{search} {text}");
+            found.push(version(result));
+        }
         found
     }
     let before = read(&served).await;
     assert_eq!(before[0], before[2]);
     assert_eq!(before[0], before[4]);
     assert_eq!(before[1], before[3]);
+    let (fox, hen) = (before[0].clone(), before[1].clone());
+    assert_eq!(before[5..], [fox.clone(), hen.clone(), fox, hen]);
     let acme = vellev_core::TenantId::new("acme").unwrap();
-    served
-        .node
-        .tenant(&acme)
-        .await
-        .unwrap()
-        .flush()
-        .await
-        .unwrap();
+    let tenant = served.node.tenant(&acme).await.unwrap();
+    tenant.flush().await.unwrap();
     // A row in a segment keeps its vector apart from the object: its
     // version is of both still, for the one with a vector and the one
-    // without, and a write at it is made.
+    // without, however the object is found, and a write at it is made.
+    assert_eq!(read(&served).await, before);
+    // And in one segment merged from several, which a node makes once
+    // there are four small ones side by side.
+    for n in 3..=5 {
+        let owl = json!({ "properties": { "title": "an owl", "n": n }, "vector": [0.0, 1.0] });
+        served.ok(Method::PUT, &object(n), Some(owl)).await;
+        tenant.flush().await.unwrap();
+    }
+    let segments = || tenant.read(|state| state.segments().count());
+    assert_eq!(segments(), 4);
+    tenant.compact(std::time::Duration::ZERO).await.unwrap();
+    assert_eq!(segments(), 1, "merged");
     assert_eq!(read(&served).await, before);
     let moved = served
         .ok(

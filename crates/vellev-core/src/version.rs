@@ -235,10 +235,79 @@ mod tests {
                 ),
                 "9c9ebb0010a3b02ae9aa939cbd1c1761",
             ),
+            // A leap second, 23:59:60.25, which chrono keeps as the 59th
+            // second with nanoseconds from a thousand million up.
+            (
+                object(
+                    &[(
+                        "at",
+                        Value::Date(
+                            chrono::NaiveDate::from_ymd_opt(2026, 12, 31)
+                                .unwrap()
+                                .and_hms_nano_opt(23, 59, 59, 1_250_000_000)
+                                .unwrap()
+                                .and_utc(),
+                        ),
+                    )],
+                    None,
+                ),
+                "d5a20a29d62d2781b3fa75a174068df4",
+            ),
+            // A quarter of a second before the epoch: second -1,
+            // nanoseconds 750,000,000.
+            (
+                object(
+                    &[(
+                        "at",
+                        Value::Date(
+                            chrono::DateTime::<Utc>::from_timestamp(-1, 750_000_000).unwrap(),
+                        ),
+                    )],
+                    None,
+                ),
+                "0597cfe538ab35fd7973401ff66ab311",
+            ),
         ];
         for (object, version) in golden {
             assert_eq!(object.version().to_string(), version, "{object:?}");
         }
+    }
+
+    /// What docs/compatibility.md says of a leap second holds of one as
+    /// it is sent: read from JSON it is the 59th second with nanoseconds
+    /// past a thousand million, it is answered as it was sent, and it is
+    /// not the second after, which has another version.
+    #[test]
+    fn a_leap_second_is_kept_as_sent_and_is_not_the_second_after() {
+        use crate::schema::tests::workforce_memory;
+        let read = |sent: &str| {
+            let json = serde_json::json!(sent);
+            Value::typed(&workforce_memory(), "createdAt", &json)
+                .unwrap()
+                .unwrap()
+        };
+        let leap = read("2026-12-31T23:59:60.25Z");
+        let Value::Date(at) = &leap else {
+            panic!("{leap:?}")
+        };
+        assert_eq!(at.timestamp_subsec_nanos(), 1_250_000_000);
+        assert_eq!(
+            leap.to_json(),
+            serde_json::json!("2026-12-31T23:59:60.250Z")
+        );
+        assert_eq!(
+            read("2026-12-31T23:59:60.250Z"),
+            leap,
+            "read back as answered"
+        );
+        let version = |value: &Value| object(&[("at", value.clone())], None).version();
+        assert_eq!(
+            version(&leap).to_string(),
+            "d5a20a29d62d2781b3fa75a174068df4",
+            "the golden above, reached from what a client sends"
+        );
+        assert_ne!(version(&leap), version(&read("2027-01-01T00:00:00.25Z")));
+        assert_ne!(version(&leap), version(&read("2026-12-31T23:59:59.25Z")));
     }
 
     #[test]

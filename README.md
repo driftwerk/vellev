@@ -320,12 +320,13 @@ catches up that far before it answers (the Rust client does this for you).
 `eventual` answers with whatever the node has, at most about a second old.
 
 Every object read carries a `version`, and a `PUT`, `PATCH` or `DELETE` of
-an object can be made `only_if_version` it is still at (in the body, or
-`?only_if_version=` on a `DELETE`, which a node of 0.1 ignores, so send a
-conditional delete in a batch until every node is 0.2; in a batch, on
-`upsert`, `patch` and `delete`): two writers that read the same object cannot each overwrite the
-other's change unknowing, as the one that comes second is refused with
-`conflict` and the version the object has now, and reads again. The
+an object can be made `only_if_version` it is still at: in the body of a
+`PUT` or `PATCH`, on an `upsert`, `patch` or `delete` in a batch, and as
+`?only_if_version=` on a `DELETE`. A node of 0.1 ignores that query and
+deletes, so send a conditional delete in a batch until every node is 0.2.
+Two writers that read the same object cannot each overwrite the other's
+change unknowing, as the one that comes second is refused with `conflict`
+and the version the object has now, and reads again. The
 version is of the object's content, properties and vector, so an object
 changed and changed back is at its old version again, and a write
 conditional on it then finds exactly the content it read. It is opaque:

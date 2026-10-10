@@ -133,8 +133,9 @@ Clients and nodes of different releases talk to each other.
 ## Object versions
 
 Every object a node answers with carries a `version`, 32 hexadecimal
-characters, and a write may ask to be made only if the object is still at
-one (`only_if_version`). The version is a hash of the object's content,
+characters, written in lower case and read in either, and a write may ask
+to be made only if the object is still at one (`only_if_version`). The
+version is a hash of the object's content,
 computed afresh wherever it is read or checked and stored nowhere, so a
 reader on one node and a writer on another must compute it alike, or a
 client that read from the one and writes through the other is refused for
@@ -166,7 +167,10 @@ The version is the first 16 bytes of SHA-256 over, in this order:
      little-endian, then its nanoseconds within the second, a u32
      little-endian, so that an instant before the epoch has the second
      floored and nanoseconds from 0 upward (`-0.25 s` is `-1` and
-     `750000000`); the zone it was sent in does not count;
+     `750000000`), and a leap second (`23:59:60`, which the node keeps
+     as the 59th second with nanoseconds from 1,000,000,000 upward) is
+     that second and those nanoseconds; the zone it was sent in does not
+     count;
 4. the vector: one byte 0 if the object has none, else one byte 1, the
    number of dimensions as a u64, then each f32's bits, little-endian, in
    order, with `-0.0` taken as `0.0`.

@@ -1558,27 +1558,82 @@ async fn a_search_a_node_cannot_embed_for_is_answered_by_one_that_can() {
 
 /// A node of 0.1 ignores a query it does not know on a `DELETE`, and
 /// would delete whatever the condition; it refuses a change it does not
-/// know. So the client sends a conditional delete as a batch.
+/// know, 400 `invalid`, its `Change` being `deny_unknown_fields` and its
+/// delete having `collection` and `id` alone. So the client sends a
+/// conditional delete as a batch, and against such a node is refused
+/// rather than obeyed: here against a stand-in that answers as 0.1 does.
 #[tokio::test]
 async fn a_conditional_delete_goes_as_a_change_a_node_of_0_1_refuses_rather_than_ignores() {
-    let stub = Stub::answering(|_, _| {
-        (
-            200,
-            json!({ "incarnation": 1, "position": 2, "outcomes": [{ "outcome": "applied" }] }),
-        )
-    })
-    .await;
-    let client = Client::connect(&[&stub.url], KEY, tries(1)).unwrap();
+    use axum::body::to_bytes;
+    use axum::extract::Request;
+    let deletes = Arc::new(Mutex::new(0usize));
+    let posts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (deleted, posted) = (deletes.clone(), posts.clone());
+    let applied =
+        || json!({ "incarnation": 1, "position": 2, "outcomes": [{ "outcome": "applied" }] });
+    let router = axum::Router::new().fallback(move |request: Request| {
+        let (deleted, posted) = (deleted.clone(), posted.clone());
+        async move {
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+            if method == Asked::DELETE {
+                *deleted.lock().unwrap() += 1;
+                return (Answered::OK, axum::Json(applied())).into_response();
+            }
+            if method == Asked::POST && path.ends_with("/changes") {
+                posted
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                #[derive(serde::Deserialize)]
+                #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+                #[allow(dead_code)]
+                enum OldChange {
+                    Delete { collection: String, id: uuid::Uuid },
+                }
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                #[allow(dead_code)]
+                struct OldBatch {
+                    changes: Vec<OldChange>,
+                }
+                return match serde_json::from_slice::<OldBatch>(&body) {
+                    Ok(_) => (Answered::OK, axum::Json(applied())).into_response(),
+                    Err(error) => {
+                        let message = format!("Failed to deserialize the JSON body: {error}");
+                        let refused = json!({ "error": { "code": "invalid", "message": message } });
+                        (Answered::BAD_REQUEST, axum::Json(refused)).into_response()
+                    }
+                };
+            }
+            (Answered::NOT_FOUND, axum::Json(failure("not_found"))).into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = Client::connect(&[&url], KEY, quick(3)).unwrap();
     let notes = client.tenant(&tenant("acme")).collection(&notes_named());
     let at = "0123456789abcdef0123456789abcdef".parse().unwrap();
-    notes.delete_if_version(oid(1), at).await.unwrap();
-    assert_eq!(stub.asked("POST /v1/tenants/acme/changes"), 1);
-    assert_eq!(stub.asked("DELETE"), 0);
-    notes.delete(oid(1)).await.unwrap();
-    assert_eq!(
-        stub.asked("DELETE /v1/tenants/acme/collections/notes/objects/"),
-        1,
-        "a plain delete is a DELETE still"
+    let refused = notes.delete_if_version(oid(1), at).await.unwrap_err();
+    assert!(
+        matches!(&refused, Error::Api { status, code: Code::Invalid, .. } if status.as_u16() == 400),
+        "{refused:?}"
     );
-    assert_eq!(stub.asked("POST"), 1);
+    assert_eq!(refused.code(), Some(Code::Invalid));
+    assert!(!refused.is_unknown_outcome(), "final, not uncertain");
+    assert_eq!(*deletes.lock().unwrap(), 0, "nothing deleted");
+    let sent = posts.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "one try: a 400 is final");
+    assert!(
+        sent[0].contains("\"only_if_version\":\"0123456789abcdef0123456789abcdef\""),
+        "{sent:?}"
+    );
+    assert!(sent[0].contains("\"op\":\"delete\""), "{sent:?}");
+    // A plain delete still goes as a DELETE and is made.
+    let made = notes.delete(oid(1)).await.unwrap();
+    assert_eq!(made.outcomes, vec![Outcome::Applied]);
+    assert_eq!(*deletes.lock().unwrap(), 1);
+    assert_eq!(posts.lock().unwrap().len(), 1);
 }
