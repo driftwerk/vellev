@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use vellev_core::{Collection, Object, ObjectId, Property, RequestId};
 use vellev_index::clustered::ClusteredIndex;
 
+use crate::blobs::is_plain;
 use crate::coordinator::LogPosition;
 use crate::mutation::Outcome;
 use crate::{Refusal, Result, StorageError};
@@ -188,11 +189,24 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// This checkpoint, read from under `key` in another store, naming
-    /// every file by the key `fresh` gives for the one it had there: each
-    /// segment, its index and its vectors, the logs to replay and the
-    /// checkpoint before. Nothing else of it changes. A file `fresh` gives
-    /// no key for fails it, so that none is ever named by the key it had.
+    /// This checkpoint, read from under `key`, naming every file by the
+    /// key `fresh` gives for the one it names it by now: each segment, its
+    /// index and its vectors, the logs to replay and the checkpoint before.
+    /// Nothing else of it changes.
+    ///
+    /// No file passes by accident. One `fresh` gives no key for fails it,
+    /// and so does a key `fresh` gives that would make two files one or
+    /// name nothing: one given for two files, one another file of the
+    /// checkpoint is named by now, an empty one, or one that is not a
+    /// plain path. A file given the key it has keeps it, which is the
+    /// caller's to want or not: the remap does not know which keys are
+    /// new.
+    ///
+    /// A restore from a backup makes with it the checkpoint it loads what
+    /// it copied through, kept in memory and never committed, having first
+    /// cleared `prev` and taken `replay` out, to put it back after: the
+    /// logs are read under the keys they had, and no key is given for
+    /// them, so that either left in fails here.
     pub fn remapped(self, key: &str, fresh: &HashMap<String, String>) -> Result<Self> {
         // Taken apart in full, so that a field added to either does not
         // compile here until it is said whether it names a file.
@@ -206,12 +220,31 @@ impl Manifest {
             replay_after,
             answered,
         } = self;
-        let renamed = |old: String| {
-            fresh.get(&old).cloned().ok_or_else(|| {
-                StorageError::corrupt(key, format!("it names {old}, which was given no new key"))
-            })
+        let refused = |reason: String| StorageError::corrupt(key, reason);
+        // The key each file had, by the one it was given.
+        let mut given: HashMap<String, String> = HashMap::new();
+        let mut renamed = |old: String| {
+            let new = fresh
+                .get(&old)
+                .ok_or_else(|| refused(format!("it names {old}, which was given no new key")))?;
+            // An empty key is no plain one either.
+            if !is_plain(new) {
+                let reason = format!("it names {old}, which was given {new:?}, no plain key");
+                return Err(refused(reason));
+            }
+            match given.get(new) {
+                Some(other) if *other != old => Err(refused(format!(
+                    "it names {other} and {old}, which were both given {new}"
+                ))),
+                Some(_) => Ok(new.clone()),
+                None => {
+                    given.insert(new.clone(), old);
+                    Ok(new.clone())
+                }
+            }
         };
-        let segments = segments.into_iter().map(|segment| {
+        let mut renamed_segments = Vec::with_capacity(segments.len());
+        for segment in segments {
             let SegmentMeta {
                 key,
                 rows,
@@ -219,24 +252,40 @@ impl Manifest {
                 index,
                 vectors,
             } = segment;
-            Ok(SegmentMeta {
+            renamed_segments.push(SegmentMeta {
                 key: renamed(key)?,
                 rows,
                 tombstones,
-                index: index.map(&renamed).transpose()?,
-                vectors: vectors.map(&renamed).transpose()?,
-            })
-        });
-        Ok(Self {
+                index: index.map(&mut renamed).transpose()?,
+                vectors: vectors.map(&mut renamed).transpose()?,
+            });
+        }
+        let remapped = Self {
             position,
-            prev: prev.map(&renamed).transpose()?,
+            prev: prev.map(&mut renamed).transpose()?,
             next_collection_id,
             collections,
-            segments: segments.collect::<Result<_>>()?,
-            replay: replay.into_iter().map(&renamed).collect::<Result<_>>()?,
+            segments: renamed_segments,
+            replay: replay
+                .into_iter()
+                .map(&mut renamed)
+                .collect::<Result<_>>()?,
             replay_after,
             answered,
-        })
+        };
+        // Every key it named went through `renamed`, so `given` holds each
+        // of them: a new key that is another file's old one would leave
+        // that file's name meaning two files, before and after.
+        let had: std::collections::HashSet<&String> = given.values().collect();
+        match given
+            .iter()
+            .find(|(new, old)| new != old && had.contains(new))
+        {
+            Some((new, old)) => Err(refused(format!(
+                "it names {old}, which was given {new}, the key of another file it names"
+            ))),
+            None => Ok(remapped),
+        }
     }
 }
 
@@ -1015,6 +1064,104 @@ mod tests {
         }
     }
 
+    /// `mapping`, with the keys `to` gives for some of them instead.
+    fn mapping_but(keys: &[String], to: &[(&String, &str)]) -> HashMap<String, String> {
+        let mut fresh = mapping(keys);
+        for (old, new) in to {
+            assert!(fresh.insert((*old).clone(), new.to_string()).is_some());
+        }
+        fresh
+    }
+
+    /// That `outcome` is a refusal of the checkpoint under "k" that says
+    /// each of `saying`.
+    fn refused(case: &str, outcome: Result<Manifest>, saying: &[&str]) {
+        match outcome {
+            Err(StorageError::Corrupt { key, reason }) => {
+                assert_eq!(key, "k");
+                for said in saying {
+                    assert!(reason.contains(said), "{case}: {reason}");
+                }
+            }
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_remap_that_gives_two_files_one_key_is_refused_whichever_fields_name_them() {
+        for (case, manifest, names) in checkpoints() {
+            // Every pair of files it names, in both orders: two segments,
+            // a segment and its own index or vectors, a log and the
+            // checkpoint before, and the rest.
+            for (one, other) in names
+                .iter()
+                .flat_map(|one| names.iter().map(move |o| (one, o)))
+            {
+                if one == other {
+                    continue;
+                }
+                let both = new(one);
+                let fresh = mapping_but(&names, &[(other, &both)]);
+                let outcome = manifest.clone().remapped("k", &fresh);
+                refused(case, outcome, &[one.as_str(), other.as_str(), &both]);
+            }
+        }
+        // A segment, its index and its vectors all given the one key.
+        let (_, manifest, names) = checkpoints().remove(2);
+        let fresh = mapping_but(
+            &names,
+            &[(&names[2], &new(&names[1])), (&names[3], &new(&names[1]))],
+        );
+        refused(
+            "a merge",
+            manifest.remapped("k", &fresh),
+            &[&new(&names[1])],
+        );
+    }
+
+    #[test]
+    fn a_remap_that_gives_a_file_the_key_another_had_is_refused() {
+        for (case, manifest, names) in checkpoints() {
+            for (one, other) in names
+                .iter()
+                .flat_map(|one| names.iter().map(move |o| (one, o)))
+            {
+                if one == other {
+                    continue;
+                }
+                // One file moved onto the key another had, which moved on.
+                let chained = mapping_but(&names, &[(one, other.as_str())]);
+                let outcome = manifest.clone().remapped("k", &chained);
+                refused(case, outcome, &[one.as_str(), other.as_str()]);
+                // And two files that change keys with each other.
+                let swapped = mapping_but(&names, &[(one, other.as_str()), (other, one.as_str())]);
+                let outcome = manifest.clone().remapped("k", &swapped);
+                refused(case, outcome, &[one.as_str(), other.as_str()]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_remap_to_a_key_that_is_empty_or_not_a_plain_path_is_refused() {
+        for (case, manifest, names) in checkpoints() {
+            for old in &names {
+                for unfit in [
+                    "",
+                    "tenant-b//x",
+                    "tenant-b/./x",
+                    "tenant-b/../x",
+                    "tenant-b\\x",
+                    "/x",
+                    "x/",
+                ] {
+                    let fresh = mapping_but(&names, &[(old, unfit)]);
+                    let outcome = manifest.clone().remapped("k", &fresh);
+                    refused(case, outcome, &[old.as_str(), "no plain key"]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_checkpoint_remapped_to_the_keys_it_had_is_written_as_it_was() {
         for (case, manifest, names) in checkpoints() {
@@ -1048,12 +1195,15 @@ mod tests {
     #[test]
     fn an_index_of_another_segment_is_not_rekeyed() {
         let (from, to) = (old("segment", "11-w-1f"), new(&old("segment", "11-w-1f")));
-        let anothers = index_of(&old("segment", "13-w-2e"));
-        assert!(matches!(
-            rekeyed_index("k", &anothers, &from, &to),
-            Err(StorageError::Corrupt { key, reason })
-                if key == "k" && reason == "it indexes another segment"
-        ));
+        // Another segment's, and one that says the new key already: it
+        // is not the index of the segment that was under `from`.
+        for anothers in [index_of(&old("segment", "13-w-2e")), index_of(&to)] {
+            assert!(matches!(
+                rekeyed_index("k", &anothers, &from, &to),
+                Err(StorageError::Corrupt { key, reason })
+                    if key == "k" && reason == "it indexes another segment"
+            ));
+        }
     }
 
     #[test]
