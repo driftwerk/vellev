@@ -52,7 +52,7 @@ use vellev_api::{Bounded, Change, Code, Content, Missing, Page, Stored};
 use vellev_client::{Records, Tenant};
 use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider,
-    ObjectError, ObjectId, Property,
+    ObjectError, ObjectId, Property, Version,
 };
 
 /// How many times an object is settled again because another writer
@@ -494,9 +494,13 @@ enum Mark {
 }
 
 /// What the ledger says of one id.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 struct Entry {
     id: ObjectId,
+    /// The version the node gave the entry when it was read, which
+    /// writing it anew or forgetting it is conditional on; none for one
+    /// yet to be written.
+    at: Option<Version>,
     updated: Option<i64>,
     /// Of the object as Weaviate held it when the import last looked.
     hash: String,
@@ -508,6 +512,25 @@ struct Entry {
     /// object was left in the collection, being nothing the import may
     /// delete.
     gone: bool,
+}
+
+/// Two entries are equal that say the same: where each was read does not
+/// count, so that one is not written again for saying what it said.
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        let says = |entry: &Self| {
+            let found = entry.found.clone();
+            (
+                entry.id,
+                entry.updated,
+                entry.hash.clone(),
+                entry.mark,
+                found,
+                entry.gone,
+            )
+        };
+        says(self) == says(other)
+    }
 }
 
 impl Entry {
@@ -530,6 +553,7 @@ impl Entry {
     fn theirs(&self, updated: Option<i64>, gone: bool) -> Self {
         Self {
             id: self.id,
+            at: self.at,
             updated,
             hash: String::new(),
             mark: Mark::Theirs,
@@ -542,6 +566,7 @@ impl Entry {
     fn of(item: &Item, mark: Mark) -> Self {
         Self {
             id: item.id,
+            at: None,
             updated: item.updated,
             hash: item.hash.clone(),
             mark,
@@ -550,13 +575,23 @@ impl Entry {
         }
     }
 
+    /// The entry as the ledger holds it. One the node gives no version
+    /// for is not read: nothing could then tell that it had been written
+    /// by another run since.
     fn read(stored: Stored) -> Result<Self> {
         let property = |name: &str| stored.properties.get(name);
         later(property("version"), "the ledger")?;
         let hash = property("hash").and_then(Value::as_str);
         let said = |name: &str| property(name) == Some(&json!(true));
+        let Some(at) = stored.version else {
+            bail!(
+                "the node gave no version for the ledger's entry for {}: it is of a release before 0.2, and the import keeps no ledger on one",
+                stored.id
+            );
+        };
         Ok(Self {
             id: stored.id,
+            at: Some(at),
             updated: property("updated").and_then(Value::as_i64),
             hash: hash
                 .ok_or_else(|| eyre!("the ledger's entry for {} has no hash", stored.id))?
@@ -1220,9 +1255,15 @@ fn refusal(error: &vellev_client::Error) -> Option<Refusal> {
 /// One object's part of a request: what settles it.
 struct Step {
     item: Item,
+    /// What the ledger said of the id when the step was made, if it was
+    /// asked.
+    noted: Option<Option<Entry>>,
     changes: Vec<Change>,
     settled: Settled,
 }
+
+/// What a ledger written by something else means.
+const OTHER_IMPORT: &str = "is another import of the tenant running? Two must not run at once";
 
 impl Step {
     /// How many bytes a request grows by to carry it, near enough.
@@ -1279,6 +1320,12 @@ struct Gone {
     foreign: u64,
     withheld: u64,
     budget: u64,
+    /// Entries to forget, of objects neither Weaviate, by its listing,
+    /// nor the collection holds: forgotten only once the walk is over
+    /// and Weaviate has said it was ready and the class the one
+    /// imported, since a listing that left an id out for any other
+    /// reason would have its object stored again as new.
+    forgotten: Vec<Change>,
 }
 
 impl Gone {
@@ -1392,21 +1439,22 @@ impl<'a> Copying<'a> {
         state.save(&options.state)
     }
 
-    /// Write the entry to the ledger: in place of the one `known` to be
-    /// there, or else only if there is still none, the step failing
-    /// otherwise.
-    fn note(&self, entry: &Entry, known: bool) -> Change {
+    /// Write the entry to the ledger: in place of the one that `was`
+    /// there, if that is still at the version it was read at, or else
+    /// only if there is still none, the step failing otherwise. Only an
+    /// import writes a ledger, so a step that fails so met another's.
+    fn note(&self, entry: &Entry, was: Option<&Entry>) -> Change {
         let collection = self.plan.ledger_name.clone();
         let (id, properties, vector) = (entry.id, entry.properties(), None);
-        match known {
-            true => Change::Upsert {
+        match was {
+            Some(was) => Change::Upsert {
                 collection,
                 id,
                 properties,
                 vector,
-                only_if_version: None,
+                only_if_version: was.at,
             },
-            false => Change::Insert {
+            None => Change::Insert {
                 collection,
                 id,
                 properties,
@@ -1427,7 +1475,7 @@ impl<'a> Copying<'a> {
     fn renoting(&self, now: Entry, entry: Option<&Entry>) -> Vec<Change> {
         match entry == Some(&now) {
             true => Vec::new(),
-            false => vec![self.note(&now, entry.is_some())],
+            false => vec![self.note(&now, entry)],
         }
     }
 
@@ -1442,14 +1490,14 @@ impl<'a> Copying<'a> {
             vector: item.content.vector.clone(),
         };
         let stored = Entry::of(item, Mark::Stored);
-        vec![object, self.note(&stored, entry.is_some())]
+        vec![object, self.note(&stored, entry)]
     }
 
     /// Store the item in place of `stored`, and note it. The step fails
     /// unless the object is still at the version it was read at: with
     /// every property and its vector as they were then, and there at
     /// all.
-    fn replace(&self, stored: &Stored, item: &Item, known: bool) -> Vec<Change> {
+    fn replace(&self, stored: &Stored, item: &Item, was: Option<&Entry>) -> Vec<Change> {
         let object = Change::Upsert {
             collection: self.data(),
             id: item.id,
@@ -1457,22 +1505,38 @@ impl<'a> Copying<'a> {
             vector: item.content.vector.clone(),
             only_if_version: stored.version,
         };
-        vec![object, self.note(&Entry::of(item, Mark::Stored), known)]
+        vec![object, self.note(&Entry::of(item, Mark::Stored), was)]
     }
 
-    /// Delete `stored` and forget its id. The step fails unless the
+    /// Delete `stored` and forget its entry. The step fails unless the
     /// object is still at the version it was read at.
-    fn delete(&self, stored: &Stored) -> Vec<Change> {
+    fn delete(&self, stored: &Stored, entry: &Entry) -> Vec<Change> {
         let object = Change::Delete {
             collection: self.data(),
             id: stored.id,
             only_if_version: stored.version,
         };
-        vec![object, self.forget(stored.id)]
+        vec![object, self.forget(entry)]
     }
 
-    fn forget(&self, id: ObjectId) -> Change {
-        Change::delete(self.plan.ledger_name.clone(), id)
+    /// Forget the entry, if it is still at the version it was read at.
+    fn forget(&self, entry: &Entry) -> Change {
+        Change::Delete {
+            collection: self.plan.ledger_name.clone(),
+            id: entry.id,
+            only_if_version: entry.at,
+        }
+    }
+
+    /// Stop the run if the ledger's entry for `id` is not the one a
+    /// step was made on: only an import writes a ledger, and nothing of
+    /// this one's was made between the two readings.
+    fn alone(id: ObjectId, read: Option<&Entry>, again: Option<&Entry>) -> Result<()> {
+        let at = |entry: Option<&Entry>| entry.map(|entry| entry.at);
+        if read != again || at(read) != at(again) {
+            bail!("the ledger's entry for {id} changed under the import: {OTHER_IMPORT}");
+        }
+        Ok(())
     }
 
     /// Whether the node said what version each object read is at, which
@@ -1560,14 +1624,11 @@ impl<'a> Copying<'a> {
                 (self.renoting(theirs, entry), Settled::Foreign)
             }
             (Some(_), Some(stored)) if ours => {
-                (self.replace(stored, item, true), Settled::Replaced)
+                (self.replace(stored, item, entry), Settled::Replaced)
             }
             (None, None) if !adopted => (self.fresh(item, None), Settled::Stored),
             (_, None) if sole => (self.fresh(item, entry), Settled::Stored),
-            (_, Some(stored)) if sole => (
-                self.replace(stored, item, entry.is_some()),
-                Settled::Replaced,
-            ),
+            (_, Some(stored)) if sole => (self.replace(stored, item, entry), Settled::Replaced),
             _ if unvouched => {
                 // What the collection held when it was taken up: noted
                 // then, and kept through whatever Weaviate does since.
@@ -1619,7 +1680,7 @@ impl<'a> Copying<'a> {
             Mark::Foreign | Mark::Theirs => false,
         };
         match stored {
-            Some(stored) if mine => (self.delete(stored), Settled::Deleted),
+            Some(stored) if mine => (self.delete(stored, entry), Settled::Deleted),
             Some(_) => (self.renoting(self.left(entry), Some(entry)), Settled::Left),
             None => (self.dropping(entry, self.left(entry)), Settled::Same),
         }
@@ -1646,7 +1707,7 @@ impl<'a> Copying<'a> {
     fn dropping(&self, entry: &Entry, kept: Entry) -> Vec<Change> {
         match kept.mark {
             Mark::Theirs => self.renoting(kept, Some(entry)),
-            _ => vec![self.forget(entry.id)],
+            _ => vec![self.forget(entry)],
         }
     }
 
@@ -1731,14 +1792,30 @@ impl<'a> Copying<'a> {
             let holds = held.contains(&entry.id);
             changes.extend(self.keeping(entry, now.as_ref(), holds, copied));
         }
-        Ok(self.noted(changes).await?)
+        let (forgotten, noted) = changes
+            .into_iter()
+            .partition(|change| matches!(change, Change::Delete { .. }));
+        gone.forgotten.extend::<Vec<Change>>(forgotten);
+        self.noted(noted).await
     }
 
     /// Write ledger entries that do not hang on one another, no more of
-    /// them to a request than one may carry.
-    async fn noted(&self, notes: Vec<Change>) -> Result<(), vellev_client::Error> {
+    /// them to a request than one may carry. Each is written only if the
+    /// ledger still has what was read, or still nothing: refused, it
+    /// was written by something else meanwhile, and the run stops rather
+    /// than go on beside it.
+    async fn noted(&self, notes: Vec<Change>) -> Result<()> {
+        let name = &self.plan.ledger_name;
         for notes in notes.chunks(self.options.batch_changes.max(1)) {
-            self.tenant.apply(notes.to_vec()).await?;
+            match self.tenant.apply(notes.to_vec()).await {
+                Ok(_) => {}
+                Err(error) if matches!(refusal(&error), Some(Refusal::Overtaken)) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("{name} changed under the import: {OTHER_IMPORT}")
+                    });
+                }
+                Err(error) => return Err(error).wrap_err_with(|| format!("writing {name}")),
+            }
         }
         Ok(())
     }
@@ -1789,7 +1866,9 @@ impl<'a> Copying<'a> {
         let mut before = None;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
-                entry = self.entry(id).await?;
+                let again = self.entry(id).await?;
+                Self::alone(id, entry.as_ref(), again.as_ref())?;
+                entry = again;
             }
             let reads = match now {
                 Now::Holds(item) => Self::reads(item, entry.as_ref()),
@@ -1865,6 +1944,9 @@ impl<'a> Copying<'a> {
                     for step in batch {
                         let id = step.item.id;
                         let entry = self.entry(id).await?;
+                        if let Some(noted) = &step.noted {
+                            Self::alone(id, noted.as_ref(), entry.as_ref())?;
+                        }
                         let settled = self.settle(id, Now::Holds(&step.item), entry, adopted);
                         made.push((id, settled.await?));
                     }
@@ -1883,9 +1965,12 @@ impl<'a> Copying<'a> {
     /// them the request is refused whole, and its objects are settled one
     /// at a time.
     async fn store(&self, items: Vec<Item>, copied: &mut Copied) -> Result<()> {
+        // The ledger was not asked: a page stored before a run was
+        // stopped has its entries, and is settled an object at a time.
         let step = |item: Item| Step {
             changes: self.fresh(&item, None),
             settled: Settled::Stored,
+            noted: None,
             item,
         };
         let steps = items.into_iter().map(step).collect();
@@ -1933,7 +2018,7 @@ impl<'a> Copying<'a> {
                     && !past(stored.id)
                     && !known.contains_key(&stored.id)
                 {
-                    unknown.push(self.note(&self.unknown(&stored), false));
+                    unknown.push(self.note(&self.unknown(&stored), None));
                 }
             }
             if unknown.len() >= self.options.page {
@@ -1954,6 +2039,7 @@ impl<'a> Copying<'a> {
             let (changes, settled) = self.settling(&item, entry.as_ref(), stored.as_ref(), true);
             Step {
                 item,
+                noted: Some(entry),
                 changes,
                 settled,
             }
@@ -1968,18 +2054,9 @@ impl<'a> Copying<'a> {
     /// taken up, and the run stops rather than go on beside it.
     async fn note_unknown(&self, notes: Vec<Change>) -> Result<()> {
         let name = &self.plan.schema.name;
-        match self.noted(notes).await {
-            Ok(()) => Ok(()),
-            Err(error) if matches!(refusal(&error), Some(Refusal::Overtaken)) => {
-                Err(error).wrap_err_with(|| {
-                    format!(
-                        "noting what collection {name} holds that Weaviate does not: the ledger changed under the import; is another import of the tenant running?"
-                    )
-                })
-            }
-            Err(error) => Err(error)
-                .wrap_err_with(|| format!("noting what collection {name} holds that Weaviate does not")),
-        }
+        self.noted(notes)
+            .await
+            .wrap_err_with(|| format!("noting what collection {name} holds that Weaviate does not"))
     }
 
     /// The entry of an object the collection holds that Weaviate does
@@ -1989,6 +2066,7 @@ impl<'a> Copying<'a> {
     fn unknown(&self, stored: &Stored) -> Entry {
         Entry {
             id: stored.id,
+            at: None,
             updated: None,
             hash: self.plan.hash(stored).unwrap_or_default(),
             mark: Mark::Unknown,
@@ -2109,6 +2187,7 @@ impl<'a> Copying<'a> {
             foreign: 0,
             withheld: 0,
             budget: self.budget(ledgered, held),
+            forgotten: Vec::new(),
         };
         let mut entries = Entries::new(&self.plan.ledger, self.options.page, None);
         let mut pacer = Pacer::new(self.options.per_second);
@@ -2183,6 +2262,7 @@ impl<'a> Copying<'a> {
         // A class made again while it was walked is not gone on from, and
         // one that is not ready is not asked what it does not hold.
         self.weaviate.steady(class, &self.plan.binding).await?;
+        self.noted(std::mem::take(&mut gone.forgotten)).await?;
         self.remove(gone, copied).await
     }
 
@@ -2230,6 +2310,7 @@ impl<'a> Copying<'a> {
             let (changes, settled) = self.settling(&item, entry.as_ref(), stored.as_ref(), false);
             Step {
                 item,
+                noted: Some(entry),
                 changes,
                 settled,
             }
@@ -3769,8 +3850,12 @@ mod tests {
             .unwrap()
         }
 
+        /// An entry as it is read from the ledger, at a version.
         fn entry(&self, title: &str, updated: i64, mark: Mark) -> Entry {
-            Entry::of(&self.item(title, updated), mark)
+            Entry {
+                at: self.stored(title).version,
+                ..Entry::of(&self.item(title, updated), mark)
+            }
         }
     }
 
@@ -4164,6 +4249,66 @@ mod tests {
     }
 
     #[test]
+    fn a_ledger_entry_that_is_not_the_one_read_stops_the_run() {
+        let fixture = Fixture::new(options());
+        let read = fixture.entry("fox", 1, Mark::Stored);
+        let alone = |read: Option<&Entry>, again: Option<&Entry>| {
+            Copying::alone(read.map_or(id_of(&fixture), |entry| entry.id), read, again)
+        };
+        assert!(alone(None, None).is_ok());
+        assert!(alone(Some(&read), Some(&read)).is_ok());
+        // Written anew, though it says the same; saying something else;
+        // there where there was none; gone.
+        let rewritten = Entry {
+            at: fixture.stored("owl").version,
+            ..read.clone()
+        };
+        let other = fixture.entry("fox", 1, Mark::Withheld);
+        let changed = [
+            (Some(&read), Some(&rewritten)),
+            (Some(&read), Some(&other)),
+            (None, Some(&read)),
+            (Some(&read), None),
+        ];
+        for (read, again) in changed {
+            let stopped = alone(read, again).unwrap_err().to_string();
+            assert!(
+                stopped.contains("is another import of the tenant running?"),
+                "{stopped}"
+            );
+        }
+        // Every write of an entry there was says which it was, and one of
+        // an entry there was not is made only where there is still none.
+        let copying = fixture.copying();
+        let gone = Entry {
+            gone: true,
+            ..read.clone()
+        };
+        match copying.note(&gone, Some(&read)) {
+            Change::Upsert {
+                only_if_version, ..
+            } => assert_eq!(only_if_version, read.at),
+            other => panic!("{other:?}"),
+        }
+        match copying.forget(&read) {
+            Change::Delete {
+                only_if_version, ..
+            } => assert_eq!(only_if_version, read.at),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(copying.note(&gone, None), Change::Insert { .. }));
+        assert!(read.at.is_some());
+        // One the node gives no version for is not read at all.
+        let unversioned = json!({ "id": read.id, "properties": { "hash": "h" } });
+        let stopped = Entry::read(serde_json::from_value(unversioned).unwrap()).unwrap_err();
+        assert!(stopped.to_string().contains("gave no version"), "{stopped}");
+    }
+
+    fn id_of(fixture: &Fixture) -> ObjectId {
+        fixture.item("fox", 0).id
+    }
+
+    #[test]
     fn a_comparison_counts_what_weaviate_does_not_hold_as_a_run_that_copies_would() {
         let fixture = Fixture::new(options());
         let counted = |entry: &Entry, holds: bool| {
@@ -4375,7 +4520,8 @@ mod tests {
                     properties,
                     ..
                 } if *collection == ledger => {
-                    let stored = json!({ "id": id, "properties": properties });
+                    let version = format!("{:032x}", properties.len() + 1);
+                    let stored = json!({ "id": id, "properties": properties, "version": version });
                     entry = Some(Entry::read(serde_json::from_value(stored).unwrap()).unwrap());
                 }
                 Change::Delete { collection, .. } if *collection == ledger => entry = None,
@@ -4496,6 +4642,28 @@ mod tests {
                 _ => true,
             })
         };
+        // Whether each change to the ledger is made only if it still
+        // has the entry that was read, at the version it was read at, or
+        // still has none.
+        let alone = |changes: &[Change], entry: Option<&Entry>| {
+            let read = entry.and_then(|entry| entry.at);
+            changes.iter().all(|change| match change {
+                Change::Upsert {
+                    collection,
+                    only_if_version,
+                    ..
+                }
+                | Change::Delete {
+                    collection,
+                    only_if_version,
+                    ..
+                } if collection.as_str() == ENTRY => read.is_some() && *only_if_version == read,
+                Change::Insert { collection, .. } if collection.as_str() == ENTRY => {
+                    entry.is_none()
+                }
+                _ => true,
+            })
+        };
         // What makes an object the import's to delete, by the entry and
         // what the collection holds: that the import stored it and it is
         // still so; or that it was there at the taking up and is still
@@ -4577,6 +4745,7 @@ mod tests {
                             // And then only if it is still at the
                             // version it was read at.
                             assert!(versioned(&changes, stored), "{cell}");
+                            assert!(alone(&changes, entry), "{cell}");
                             // (d) Without an entry, and outside a taking
                             // up, nothing is deleted or written over.
                             if entry.is_none() && !adopted {
@@ -4707,6 +4876,7 @@ mod tests {
                                         {
                                             assert!(!has(&changes, kind), "{cell}");
                                         }
+                                        assert!(alone(&changes, Some(&theirs)), "{cell}");
                                         let still = noted(Some(&theirs), &changes).expect(&cell);
                                         assert_eq!(
                                             (still.mark, still.hash.as_str()),
@@ -4745,6 +4915,7 @@ mod tests {
                     assert_eq!(has(&changes, "delete Memory"), mine, "{cell}");
                     assert_eq!(settled == Settled::Deleted, mine, "{cell}");
                     assert!(versioned(&changes, stored), "{cell}");
+                    assert!(alone(&changes, Some(entry)), "{cell}");
                     for kind in ["upsert Memory", "insert Memory"] {
                         assert!(!has(&changes, kind), "{cell}");
                     }
@@ -4823,6 +4994,7 @@ mod tests {
             foreign: 0,
             withheld: 0,
             budget: 3,
+            forgotten: Vec::new(),
         };
         let fixture = Fixture::new(options());
         for mark in [Mark::Stored, Mark::Foreign, Mark::Foreign, Mark::Withheld] {
@@ -4900,7 +5072,8 @@ mod tests {
     #[test]
     fn a_ledger_or_a_note_of_a_later_version_is_not_read() {
         let entry = |properties: Value| {
-            let stored = json!({ "id": id(1), "properties": properties });
+            let version = "000102030405060708090a0b0c0d0e0f";
+            let stored = json!({ "id": id(1), "properties": properties, "version": version });
             Entry::read(serde_json::from_value(stored).unwrap())
         };
         let read = entry(json!({ "hash": "h", "updated": 3 })).unwrap();
@@ -5046,6 +5219,7 @@ mod tests {
             Step {
                 changes: fixture.copying().fresh(&item, None),
                 settled: Settled::Stored,
+                noted: None,
                 item,
             }
         };
