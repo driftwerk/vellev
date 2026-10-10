@@ -342,3 +342,107 @@ fn every_fixture_file_decodes_as_what_it_is() {
         assert_eq!(log.answered[0].request, request(2));
     }
 }
+
+/// The newest checkpoint of `format`'s fixtures and its key, with the
+/// frame it is kept as.
+fn newest_checkpoint(format: u16) -> (String, Bytes, Manifest) {
+    let directory = fixtures(format).join("tenant-a/0/manifest");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    files.sort();
+    let path = files.last().unwrap();
+    let name = path.file_name().unwrap().to_string_lossy();
+    let key = format!("tenant-a/0/manifest/{name}");
+    let frame = Bytes::from(std::fs::read(path).unwrap());
+    let manifest = format::decode(&key, Kind::Manifest, &frame).unwrap();
+    (key, frame, manifest)
+}
+
+fn holds(frame: &[u8], key: &str) -> bool {
+    frame
+        .windows(key.len())
+        .any(|window| window == key.as_bytes())
+}
+
+/// A checkpoint a release wrote, with segments, an index, vectors, logs
+/// to replay and a checkpoint before it: remapped, nothing in it is the
+/// key of a file as that release wrote it; remapped to the same keys, it
+/// is written byte for byte as it was.
+#[test]
+fn a_released_checkpoint_is_remapped_whole_and_written_as_it_was_under_the_same_keys() {
+    let (key, frame, manifest) = newest_checkpoint(FORMAT_VERSION);
+    assert!(manifest.prev.is_some() && !manifest.replay.is_empty());
+    assert!(manifest
+        .segments
+        .iter()
+        .any(|segment| segment.index.is_some() && segment.vectors.is_some()));
+    // Every file there is but the checkpoint itself, which nothing in it
+    // names, and so every one it could name.
+    let partition = fixtures(FORMAT_VERSION);
+    let mut names = Vec::new();
+    for kind in ["log", "manifest", "segment", "vectors", "index"] {
+        for entry in std::fs::read_dir(partition.join("tenant-a/0").join(kind)).unwrap() {
+            let name = entry.unwrap().file_name();
+            names.push(format!("tenant-a/0/{kind}/{}", name.to_string_lossy()));
+        }
+    }
+    names.retain(|name| *name != key);
+    let named: Vec<&String> = names.iter().filter(|name| holds(&frame, name)).collect();
+    assert_eq!(named.len(), 1 + 2 + 2 + 1 + 2, "{named:?}");
+
+    let same = names.iter().map(|name| (name.clone(), name.clone()));
+    let unchanged = manifest.clone().remapped(&key, &same.collect()).unwrap();
+    assert_eq!(format::encode(Kind::Manifest, &unchanged).unwrap(), frame);
+
+    let fresh = names
+        .iter()
+        .map(|name| (name.clone(), name.replace("tenant-a/0/", "tenant-b/3/")));
+    let remapped = manifest.remapped(&key, &fresh.collect()).unwrap();
+    let written = format::encode(Kind::Manifest, &remapped).unwrap();
+    assert!(!holds(&written, "tenant-a/0/"));
+    let read: Manifest = format::decode(&key, Kind::Manifest, &written).unwrap();
+    assert_eq!(read, remapped);
+}
+
+/// An index file a release wrote says its segment's key. Re-keyed, it
+/// says the new one, and holds the indexes it held.
+#[test]
+fn a_released_index_file_is_rekeyed_whole() {
+    let (_, _, manifest) = newest_checkpoint(FORMAT_VERSION);
+    let segment = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.index.is_some())
+        .unwrap();
+    let key = segment.index.clone().unwrap();
+    let frame = std::fs::read(fixtures(FORMAT_VERSION).join(&key)).unwrap();
+    let was: SegmentIndex = format::decode(&key, Kind::Index, &frame).unwrap();
+    assert_eq!(was.segment, segment.key);
+
+    let to = segment.key.replace("tenant-a/0/", "tenant-b/3/");
+    let rekeyed = format::rekeyed_index(&key, &frame, &segment.key, &to).unwrap();
+    assert!(!holds(&rekeyed, &segment.key));
+    let now: SegmentIndex = format::decode(&key, Kind::Index, &rekeyed).unwrap();
+    assert_eq!(now.segment, to);
+    assert_eq!(now.vectors.len(), was.vectors.len());
+    let of = |index: &SegmentIndex| -> Vec<_> { index.vectors.iter().map(|(of, _)| *of).collect() };
+    assert!(!was.vectors.is_empty());
+    assert_eq!(of(&now), of(&was));
+    // Given its key back it is the file it was, to the byte: nothing of
+    // the indexes was touched.
+    assert_eq!(
+        format::rekeyed_index(&key, &rekeyed, &to, &segment.key).unwrap(),
+        frame
+    );
+    // One of the other segment of the checkpoint is left alone.
+    let other = &manifest
+        .segments
+        .iter()
+        .find(|other| other.key != segment.key);
+    assert!(matches!(
+        format::rekeyed_index(&key, &frame, &other.unwrap().key, &to),
+        Err(StorageError::Corrupt { .. })
+    ));
+}
