@@ -245,9 +245,14 @@ struct ImportWeaviate {
     #[arg(long, requires = "sole_writer", conflicts_with = "other_writers")]
     delete_unknown: bool,
     /// Say that something else has written to the collections found
-    /// without a ledger: what was withheld from them, and what they held
-    /// that Weaviate did not, is another writer's, and is left alone for
-    /// good. A later --sole-writer does nothing to it.
+    /// without a ledger, of every class of this run. What such a
+    /// collection lacks of Weaviate's, or holds otherwise than Weaviate
+    /// does, and what it held that Weaviate did not, is then another
+    /// writer's and is left alone FOR GOOD: never copied over, deleted
+    /// or stored again, whatever a later run is told. What it holds
+    /// exactly as Weaviate does stays the import's, and is kept up with
+    /// Weaviate as ever. There is no taking it back but to end the
+    /// import and import into a collection made anew.
     #[arg(long)]
     other_writers: bool,
     /// Say that a class Weaviate has made again since it was imported is

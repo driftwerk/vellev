@@ -331,7 +331,10 @@ and say what the caller then answers for.
   noted, within the usual bound, if it is still as it was noted. If
   something else has written to the collection, `--other-writers`
   leaves all of it alone for good, in one run, and no later run copies
-  over it, deletes it or stores it again, whatever that run is told.
+  over it, deletes it or stores it again, whatever that run is told. It
+  marks so only what the collection lacks or holds otherwise than
+  Weaviate does, on the first run as on a later one; what both hold
+  alike stays the import's. It is said of every class of the run.
   Otherwise import into a collection made anew.
 - **`vellev import finalise`** ends an import: it drops the ledgers and
   notes that the collections are no longer imported.
@@ -372,7 +375,13 @@ and say what the caller then answers for.
   100. `--batch-bytes` is the most bytes sent to the node in one
   request, 8 MiB unless given; a request carries at most 8,192 changes
   besides, what a node commits together with other writers' requests.
-- Two runs with the same state file: the second is refused.
+- Two runs with the same state file: the second is refused. Two with
+  different ones are not kept apart, but the ledger is written only over
+  what was read, at the version it was read at: a run that finds it
+  written under it stops.
+- A node of 0.1 among those asked refuses a write conditional on a
+  version; the run stops at it, saying so, with or without
+  `--skip-refused`.
 
 ### vellev-client
 

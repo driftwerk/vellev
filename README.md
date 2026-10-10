@@ -94,6 +94,12 @@ again by itself from a new reading. No write that lands between the
 import's read and its write is lost: not one to a property, not one to
 the vector alone.
 
+A writer that changes an object and changes it back around the import's
+write is met as one that changed it: the step is refused, the object
+reads as it did before, nothing explains the refusal, and the run stops
+with the node's 409 rather than guess. Nothing was written; the next
+run, with the writer quiet, settles the object.
+
 This takes nodes that give objects versions, which those of 0.2 do. Read
 from a node that gives none, the run stops before it replaces or deletes
 anything.
@@ -173,9 +179,15 @@ object again gives it a new time of creation. So, by default:
   and begun again, so the answer `--sole-writer --delete-unknown` asks
   for covers all that time. No later run notes any, not even a taking
   up begun again because the ledger was lost: what the collection holds
-  by then may have been written since. Two imports of a tenant must not
-  run at once; one that finds an object already noted by another while
-  it notes them stops, saying so, and deletes nothing.
+  by then may have been written since.
+
+Two imports of a tenant must not run at once, from one machine or two.
+A state file keeps out a second run that shares it, and nothing keeps
+out one with another. So every write over a ledger entry, and every
+forgetting of one, is made only if the entry is still at the version it
+was read at, and every first note of one only if there is still none: a
+run that finds the ledger written under it stops, saying so, having
+made nothing of the step that found it.
 
 The import keeps one more collection in the tenant, `vellev_imports`,
 which says of each class where it was imported from and how. If that
@@ -184,7 +196,15 @@ collection up again beside the ledger: every entry stands as it is,
 nothing is noted as unknown, and an object of Weaviate's without an
 entry is withheld as above. The run records the Weaviate it is given as
 the one imported, having nothing to hold it against, so give it the
-right one.
+right one. A ledger found with no entry in it, beside a collection that
+holds objects and a note that says it was imported, was emptied: the
+collection is taken up likewise, with nothing noted and nothing stored
+for having no entry. With the ledger and the note both lost, nothing
+tells the collection from one never imported with a ledger: it is taken
+up as one, what it holds that Weaviate does not is noted as unknown
+again, objects written since the import among them, and none of that is
+deleted unless a run is told both `--sole-writer` and
+`--delete-unknown`.
 
 The taking up over, an object Weaviate lists without an entry is new to
 Weaviate, and is stored. Two things settle what was withheld or is
@@ -207,9 +227,18 @@ unknown, and the run fails until one of them is said:
   honest only if `--sole-writer` is. Once the last of them is deleted
   or settled, nothing is owed, and the two flags do nothing more.
 - **`--other-writers`** says something else has written to the
-  collection: what was withheld, and what is unknown, is marked as
-  another writer's and left alone for good, all of it in that one run,
-  whatever Weaviate has deleted of it since and however much. The
+  collection. It marks as another writer's exactly this: every object
+  of Weaviate's the collection lacks or holds otherwise than Weaviate
+  does, and every object it held at the taking up that Weaviate did
+  not; whether a run found them before and withheld or noted them, or
+  finds them now, as when the flag is given on the first run over the
+  collection or to go on with a taking up that was stopped. What the
+  collection holds exactly as Weaviate does is not marked, whatever is
+  said: it is the import's, and goes on being replaced and deleted as
+  Weaviate changes and deletes it. Like the other two it is said of
+  every class of the run; name the classes it is true of with
+  `--class`. What it marks is left alone for good, all of it in that
+  one run, whatever Weaviate has deleted of it since and however much. The
   ledger then keeps no hash of any of it, so nothing a later run reads
   can make it the import's again: no run, whatever it is told, copies
   over it, deletes it, or stores it again if the other writer deletes
