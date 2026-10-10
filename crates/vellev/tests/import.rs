@@ -3793,6 +3793,7 @@ async fn what_is_said_to_be_another_writers_is_not_written_over_when_weaviate_ga
     // was left for good: no run copies anything over it, even one whose
     // Weaviate object the other writer's happens to be the same as.
     importing.weaviate.add(class, 1_000..1_001).await;
+    importing.front.listen();
     for options in [plain.clone(), sole(plain), sweeping(plain)] {
         let report = importing.run_as(&options).await.unwrap();
         let copied = &report.classes[class];
@@ -3805,6 +3806,9 @@ async fn what_is_said_to_be_another_writers_is_not_written_over_when_weaviate_ga
         );
     }
     assert_eq!(importing.entry(1_000).await.unwrap()["theirs"], json!(true));
+    // Nor did any of them so much as read it: it was read here, once
+    // after each.
+    assert_eq!(importing.front.asked(&importing.read(1_000)).len(), 3);
     // Weaviate deletes it again: theirs stays.
     importing.weaviate.delete(class, 1_000).await;
     let report = importing.run_as(&sweeping(plain)).await.unwrap();
@@ -4039,9 +4043,15 @@ async fn an_entry_kept_for_an_object_left_is_forgotten_once_the_collection_no_lo
         weaviate.delete(class, n).await;
     }
     assert_eq!(importing.counts().await, ([0, 0, 0, 0, 12], [88, 88, 100]));
+    importing.front.listen();
     let report = importing.run().await.unwrap();
     assert_eq!(counts(&report, class), ([0, 0, 0, 0, 12], [88, 88, 100]));
     assert_eq!(report.outcome(true), Outcome::Unsettled);
+    // Where many lie on a page of Weaviate's ids they are asked after as
+    // the range they lie in, not one by one: nine of these do, and the
+    // three whose ids lie apart from them are asked after singly.
+    let singly = |n: u64| importing.front.asked(&importing.read(n)).len();
+    assert_eq!((0..12).map(singly).sum::<usize>(), 3);
     // The other writer removes them from vellev: one, and then the rest.
     importing.records.delete(oid(3)).await.unwrap();
     assert_eq!(importing.counts().await, ([0, 0, 0, 0, 11], [88, 88, 99]));
@@ -4132,4 +4142,31 @@ async fn nothing_is_replaced_or_deleted_on_the_word_of_a_node_that_gives_no_vers
     stops(importing.run_as(&sole(&importing.options)).await);
     assert!(importing.front.spent());
     assert_eq!(importing.get(6).await.unwrap().properties["n"], json!(6));
+}
+
+#[tokio::test]
+async fn what_was_withheld_and_is_found_held_when_weaviate_is_asked_is_still_counted_withheld() {
+    let Some(importing) = ledgerless("VellevImportWithheldAsked").await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    let report = importing.run().await.unwrap();
+    assert_eq!(withheld(&report, class), 21);
+    // Weaviate does not list one of the notes withheld, and holds it
+    // again by the time it is asked whether it does.
+    weaviate.delete(class, 300).await;
+    let again = weaviate.clone();
+    importing
+        .proxy
+        .before(0, &["consistency_level=ALL"], move |_| async move {
+            again.add(class, 300..301).await;
+        });
+    let report = importing.run().await.unwrap();
+    assert!(importing.proxy.spent());
+    assert_eq!(
+        (counts(&report, class), withheld(&report, class)),
+        (([0; 5], [120, 99, 100]), 21)
+    );
+    assert_eq!(report.outcome(false), Outcome::Unsettled);
+    assert!(report.classes[class].caught_up());
 }

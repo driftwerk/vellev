@@ -191,12 +191,6 @@ struct ImportWeaviate {
     /// enough; under its limit on a request's body.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     batch_bytes: usize,
-    /// The most changes to send the node in one request; no more than it
-    /// commits together with other writers' requests, which it is unless
-    /// given. An object and its ledger entry always go in one request,
-    /// however few this is.
-    #[arg(long)]
-    batch_changes: Option<std::num::NonZeroUsize>,
     /// The most objects to ask of Weaviate a second.
     #[arg(long)]
     per_second: Option<f64>,
@@ -401,7 +395,6 @@ async fn main() -> Result<ExitCode> {
                 updated_as,
                 page,
                 batch_bytes,
-                batch_changes,
                 per_second,
                 skew_secs,
                 state,
@@ -470,10 +463,6 @@ async fn main() -> Result<ExitCode> {
                 skip_refused,
                 mode,
                 ..vellev::import::Options::new(state)
-            };
-            let options = vellev::import::Options {
-                batch_changes: batch_changes.map_or(options.batch_changes, usize::from),
-                ..options
             };
             let report =
                 vellev::import::weaviate(&source, &client.tenant(&tenant), &options).await?;
@@ -619,11 +608,5 @@ mod tests {
         }
         let all = ["--sole-writer", "--delete-unknown", "--other-writers"];
         assert!(import(&all).is_err());
-    }
-
-    #[test]
-    fn a_request_must_be_let_carry_some_change() {
-        assert!(import(&["--batch-changes", "1"]).is_ok());
-        assert!(import(&["--batch-changes", "0"]).is_err());
     }
 }

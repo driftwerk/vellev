@@ -370,9 +370,8 @@ and say what the caller then answers for.
   time. A rate that is not a number is refused.
 - `--page` is the node's limit on results unless given, where it was
   100. `--batch-bytes` is the most bytes sent to the node in one
-  request, 8 MiB unless given, and `--batch-changes` the most changes,
-  8,192 unless given: what a node commits together with other writers'
-  requests.
+  request, 8 MiB unless given; a request carries at most 8,192 changes
+  besides, what a node commits together with other writers' requests.
 - Two runs with the same state file: the second is refused.
 
 ### vellev-client

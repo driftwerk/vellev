@@ -327,9 +327,8 @@ told to be `--strict`. `--verify` of some pages cannot see them.
   many. A collection with a great many of another writer's objects that
   Weaviate deleted pays for that on every run.
 - A request to the node carries at most `--batch-bytes` (8 MiB) and at
-  most `--batch-changes` changes (8,192, what a node commits together
-  with other writers' requests), an object and its entry always in the
-  same one.
+  most 8,192 changes, what a node commits together with other writers'
+  requests, an object and its entry always in the same one.
 - A request Weaviate fails or turns away is asked again for
   `--patience-secs` (600) before the run stops.
 

@@ -4119,6 +4119,20 @@ mod tests {
             removing(&sweeping, &foreign, Some(&owl)),
             left("upsert ENTRY foreign gone")
         );
+        // Told that something else wrote, what was there at the taking
+        // up is left as another writer's, whatever it is now.
+        let others = Fixture::new(Options {
+            other_writers: true,
+            ..options()
+        });
+        for entry in [&unknown, &withheld, &lacked] {
+            for stored in [&fox, &owl] {
+                assert_eq!(
+                    removing(&others, entry, Some(stored)),
+                    left("upsert ENTRY theirs gone")
+                );
+            }
+        }
     }
 
     #[test]
