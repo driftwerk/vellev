@@ -8,8 +8,36 @@ cannot see.
 
 ## 0.2.0
 
-Bring clients up to this release before the nodes: see
-`model_unavailable` below.
+### Before you upgrade
+
+- **Bring clients up to this release before the nodes**: see
+  `model_unavailable` below.
+- **Name the local models your collections embed with.** A node used to
+  run any model fastembed lists. It now runs its own,
+  `VELLEV_LOCAL_MODEL`, which is `BAAI/bge-base-en-v1.5` unless set, and
+  the others named in `VELLEV_LOCAL_MODELS_ALLOWED`, and no other. A
+  collection that embeds with a model not named is answered
+  `model_unavailable` (501, `setup`) from the upgrade on. A node does not
+  start if a name is not a model the release runs, or if it is told to
+  run more models than `VELLEV_LOCAL_MODELS` could ever have loaded.
+- **Name the regions your collections embed through Bedrock in**, in
+  `VELLEV_BEDROCK_REGIONS`, five at the most, unless the only one is the
+  node's own: `AWS_REGION`, or `AWS_DEFAULT_REGION` if that is unset or
+  blank, which is the default, read from those two variables only and
+  not from a profile or the machine. A collection in any other region is
+  answered `model_unavailable` (501, `setup`) from the upgrade on. So is one whose Bedrock model is not
+  `amazon.titan-embed-text-v2:0` or the same without its version, with
+  `build`: any name that began as Titan's used to be taken.
+- **Give a node memory for the local models it may have loaded**, about
+  a gigabyte each, `VELLEV_LOCAL_MODELS` of them: two unless set.
+- **Texts longer than 51,200 characters are cut** before a local model
+  reads them. A model reads 512 tokens and no more, so a vector changes
+  only for a text whose first 512 tokens lay beyond that, which takes
+  runs of white space longer than a hundred characters: such a text's
+  vector may differ from the one the same text gave before.
+- **Pass a tenant key when embedding through `vellev-embed` directly**:
+  `Embedder::documents_for` and `query_for`. A local model shares itself
+  among tenants, and callers that give none share one line.
 
 The workspace's version is 0.2.0 from the change that added what follows
 on restores, deletes and reads. Upgrade every node before asking for a
@@ -45,19 +73,82 @@ before runs on the migrated database.
   refused. Making again a collection that is there exactly so still
   changes nothing.
 - **A lasting embedding fault is logged at most once in 20 seconds** for
-  each way of embedding and each `reason`, whatever the model does
+  each model and each `reason`, however many collections embed with the
+  model and however each words its texts, and whatever the model does
   meanwhile. A model that
   refuses every request is not asked again within 20 seconds of the first
   refusal, though requests on their way to it when the fault first shows
   each still reach it once. A model that answers some requests and
   refuses others goes on being asked.
 - What a model's server says is logged and passed on without what is
-  shaped like a key in it: see the README for the shapes.
+  shaped like a key in it: see the README for the shapes. Nor is the
+  start of a key that lies cut short four kilobytes into what an endpoint
+  says, and no more than 64 kilobytes of a refusal are read.
 - An OpenAI endpoint's `model_not_found` and `invalid_api_key`, Bedrock's
   resource not found, a model directory the node may not write, and
   vectors of another size than the collection's are `model_unavailable`.
   Everything else that stops a text being embedded is `unavailable`, as
   before.
+- **A write is given up on when the model has stopped, not for others'
+  load.** A search whose text is not embedded within 10 seconds
+  (`VELLEV_EMBED_QUERY_SECS`) is `unavailable` (503): send it again. A
+  write is `unavailable` when the model has got nowhere with it for a
+  minute (`VELLEV_EMBED_DOCUMENTS_SECS`) beyond the wait it was told to
+  expect: nothing of its own made, and nothing ahead of it in its own
+  tenant's line done with. What other tenants do is not its progress and
+  not its stalling. A write a local model is reckoned not to come to
+  within two minutes (`VELLEV_EMBED_DOCUMENTS_HELD_SECS`) is `unavailable`
+  at once rather than held, the tenants with most queued first. A local
+  model had no limit, and Titan none for a write of many texts. A commit
+  still waits five minutes at most for its vectors. A local model still
+  being fetched when a request is given up on goes on being fetched.
+  `VELLEV_EMBED_EACH_DOCUMENT_SECS` is a second at the least.
+- **A node runs its own local model alone unless told otherwise**: see
+  above. A collection made with a model it does not run is `invalid`
+  (400).
+- **A node holds each local model once, and two loaded at most**
+  (`VELLEV_LOCAL_MODELS`). A model named by another organisation's copy,
+  or in another case, was loaded again for each name, about a gigabyte a
+  time while it runs, with no limit. A place is kept for the node's own
+  model, which stays loaded. Any other not used for 15 minutes
+  (`VELLEV_LOCAL_MODEL_IDLE_SECS`) is let go, and loaded again when asked
+  for. A collection whose model there is no room for just now is
+  `unavailable` (503). A model let go may not give its memory back to the
+  operating system.
+- **A local model is shared among tenants, not among requests.** Each
+  tenant has a line of its own, and each run owes each waiting tenant an
+  equal share of its weight, which the tenant spends a text at a time in
+  turn, and a share not used passes to the next in turn: so tenants have
+  the same of the model's time whatever their texts weigh, and a run is
+  no longer for it; within a tenant, writes are made in
+  the order they came, with writes of four texts or fewer first. Searches
+  likewise, and runs of searches and of writes take turns. One tenant's
+  bulk import no longer puts another tenant's one-text write at the back
+  of a queue, and forty searchers no longer starve every write. A run is
+  as much as takes about a second, by the length of the texts, not 32
+  whatever they are. A run the model fails is put off and each tenant in
+  it run by itself in its turn, so a text the model fails on fails the
+  write it is in and no other; a tenant whose texts keep failing is run
+  apart from the others, less and less often, and logged each time. The
+  README states what is promised as bounds.
+- **A search no longer waits behind a write's texts on Bedrock.** Two of
+  the ten calls a node has to Titan at once are kept for searches, and
+  writes' texts have the other eight, shared out among the tenants that
+  write in turn, so a large write takes about three tenths longer to
+  embed than before, and tenants' writes take turns. The ten are the
+  node's, whatever sizes its collections name, and are shared equally
+  among the regions it embeds through, so one region that stops answering
+  does not stop the others. A region a caller gives up on after thirty
+  seconds unanswered is not tried again for five. A search beside a
+  write of two thousand texts waited for them all.
+- **A collection can only be made to embed through Bedrock in a region
+  the node calls, with Titan by name**: any other is `invalid` (400).
+- **Those who search with the same text at once are all told how it went
+  together.** When the embedding failed, each used to ask again in its
+  turn, the last of ten waiting ten times as long as the first.
+- **A node keeps what it knows of 64 models served elsewhere**, and
+  forgets the least lately asked for, never one in use. With all 64 in
+  use, a request for another is `unavailable` (503).
 
 - **A restore is made once.** `POST /v1/tenants/{tenant}/restore` takes
   `x-vellev-request`, as writes do: asked for again under the same name
@@ -100,10 +191,10 @@ before runs on the migrated database.
   free, while its vector is kept (a text of up to 1,024 bytes whose
   embedding succeeded, among the 1,024 asked last); and the search answered at last is counted like any other. Ask
   again after the wait.
-- **A search waits at most two minutes for its text to be embedded**,
-  by a model the node runs itself as by one it calls. `nearest` is then
-  refused as `unavailable` (503); `hybrid` answers by the words alone,
-  with `degraded_by: "unavailable"`.
+- **A search waits at most ten seconds for its text to be embedded**
+  (`VELLEV_EMBED_QUERY_SECS`), by a model the node runs itself as by one
+  it calls. `nearest` is then refused as `unavailable` (503); `hybrid`
+  answers by the words alone, with `degraded_by: "unavailable"`.
 - **New settings**: `VELLEV_READS_AT_ONCE` (256), `VELLEV_READS_WAIT_MS`
   (500), `VELLEV_CACHE_LOADS` (2), `VELLEV_STORE_TIMEOUT_SECS`,
   `VELLEV_STORE_MIN_BYTES_PER_SEC`, `VELLEV_UPLOAD_PART_MIB` and

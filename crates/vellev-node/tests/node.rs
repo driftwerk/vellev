@@ -221,6 +221,103 @@ fn schema(provider: EmbeddingProvider) -> Mutation {
     }))
 }
 
+/// A collection embedded by the model the node runs itself.
+fn own_model() -> Mutation {
+    Mutation::CreateCollection(Box::new(Collection {
+        name: notes(),
+        properties: vec![
+            Property::new("title", DataType::Text).searchable(),
+            Property::new("n", DataType::Int),
+        ],
+        embedding: Embedding {
+            provider: EmbeddingProvider::Local,
+            model: "BAAI/bge-base-en-v1.5".into(),
+            dimensions: 768,
+            query_prefix: Some("Represent this sentence for searching relevant passages: ".into()),
+            document_prefix: None,
+            properties: vec!["title".into()],
+        },
+        distance: Distance::Cosine,
+        bm25: Bm25::default(),
+        access_rule: None,
+    }))
+}
+
+/// Two tenants' writes on the model the node runs itself take turns at
+/// it: a tenant's one object is embedded beside another tenant's bulk
+/// write, not after it, and a search of the one is answered meanwhile.
+/// The model is fetched and run, so this is run by hand:
+///
+///   VELLEV_MODEL_CACHE=... cargo test --release -p vellev-node --test node take_turns -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "fetches and runs the model"]
+async fn two_tenants_writes_take_turns_on_the_model_the_node_runs_itself() {
+    let cache = std::env::var("VELLEV_MODEL_CACHE")
+        .map(Into::into)
+        .unwrap_or_else(|_| std::env::temp_dir().join("vellev-models"));
+    let cluster = Cluster::new();
+    let node = Node::new(
+        cluster.coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings {
+            cache,
+            ..EmbedSettings::default()
+        })),
+        cluster.settings(),
+    );
+    let passage = "The quarterly review covered hiring, the migration off the old cluster, \
+        an incident in the billing service, and plans for the next release.";
+    for id in ["bulk", "small"] {
+        node.create_tenant(&tenant(id)).await.unwrap();
+        let opened = node.tenant(&tenant(id)).await.unwrap();
+        opened
+            .write(vec![own_model(), note(1, passage, None)])
+            .await
+            .unwrap();
+    }
+    // The bulk tenant writes sixty-four objects at once; half a second
+    // in, the small tenant writes one and searches.
+    let bulk = tokio::spawn({
+        let bulk = node.tenant(&tenant("bulk")).await.unwrap();
+        async move {
+            let began = std::time::Instant::now();
+            let notes: Vec<Mutation> = (2..66)
+                .map(|n| note(n, &format!("{n}. {passage}"), None))
+                .collect();
+            (bulk.write(notes).await, began.elapsed())
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let small = node.tenant(&tenant("small")).await.unwrap();
+    let began = std::time::Instant::now();
+    let written = small
+        .write(vec![note(2, "a small write meanwhile", None)])
+        .await;
+    let wrote_in = began.elapsed();
+    let began = std::time::Instant::now();
+    let reader = node
+        .reader(&tenant("small"), Freshness::Eventual)
+        .await
+        .unwrap();
+    let searched = reader
+        .query_vector(&notes(), "what did the review cover?")
+        .await;
+    let searched_in = began.elapsed();
+    let (bulk, bulk_took) = bulk.await.unwrap();
+    println!(
+        "beside a bulk write of 64 that took {bulk_took:.2?}: a 1-object write in {wrote_in:.2?}, a search in {searched_in:.2?}"
+    );
+    written.unwrap();
+    assert!(searched.unwrap().is_some());
+    bulk.unwrap();
+    assert!(wrote_in < Duration::from_secs(5), "{wrote_in:?}");
+    assert!(searched_in < Duration::from_secs(5), "{searched_in:?}");
+    assert!(
+        wrote_in + searched_in < bulk_took,
+        "beside it, not after it"
+    );
+}
+
 fn id(n: u64) -> ObjectId {
     ObjectId(uuid::Uuid::from_u128(u128::from(n)))
 }

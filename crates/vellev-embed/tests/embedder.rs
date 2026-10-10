@@ -226,18 +226,19 @@ async fn the_model_is_never_asked_by_a_query_that_does_not_say_so() {
     ));
     let mut put_out = 0;
     for round in 0..200 {
-        // The target is asked, then as many others as leave it the
-        // oldest kept: the next text asked puts it out.
+        // The target is asked, then as many others as leave it the one
+        // asked for longest ago: the next text asked puts it out, unless
+        // the target is asked again first, which keeps it.
         let target = format!("TARGET {round}");
         assert!(sent(&embedder, &target).await.0);
         for filler in 0..1_023 {
             let filler = format!("filler {round} {filler}");
             embedder.query(&filler).await.unwrap();
         }
-        // Another text is asked while the target is asked over and over:
-        // somewhere among the askings it is put out, and asked of the
-        // model again. Each asking says so exactly when the model was
-        // asked for it.
+        // Another text is asked while the target is asked over and over,
+        // and every other round before it is: somewhere among the
+        // askings it is put out, and asked of the model again. Each
+        // asking says so exactly when the model was asked for it.
         let putting_out = tokio::spawn({
             let embedder = embedder.clone();
             async move {
@@ -247,6 +248,10 @@ async fn the_model_is_never_asked_by_a_query_that_does_not_say_so() {
                 embedder.query(&format!("puts out {round}")).await.unwrap();
             }
         });
+        let mut putting_out = Some(putting_out);
+        if round % 2 == 0 {
+            putting_out.take().unwrap().await.unwrap();
+        }
         for _ in 0..64 {
             let before = tally.0.load(Ordering::SeqCst);
             let (said, _) = sent(&embedder, &target).await;
@@ -254,9 +259,11 @@ async fn the_model_is_never_asked_by_a_query_that_does_not_say_so() {
             assert_eq!(said, asked, "round {round}");
             put_out += usize::from(asked);
         }
-        putting_out.await.unwrap();
+        if let Some(putting_out) = putting_out {
+            putting_out.await.unwrap();
+        }
     }
-    assert!(put_out > 0, "the target was never put out while asked");
+    assert!(put_out >= 100, "the target was put out {put_out} times");
 }
 
 fn embedding(provider: EmbeddingProvider) -> Embedding {
@@ -472,12 +479,13 @@ async fn a_model_that_cannot_be_used_is_not_asked_again_while_the_fault_stands()
 }
 
 #[tokio::test]
-async fn collections_that_embed_alike_share_an_embedder() {
+async fn collections_that_embed_with_one_model_share_what_is_held_for_it() {
     let embedders = Embedders::new(Settings::default());
     assert!(embedders
         .embedder(&embedding(EmbeddingProvider::None))
         .unwrap()
         .is_none());
+    assert_eq!(embedders.held(), 0);
 
     let http = |url: &str| {
         embedding(EmbeddingProvider::Http {
@@ -489,29 +497,34 @@ async fn collections_that_embed_alike_share_an_embedder() {
         .embedder(&http("http://one.test"))
         .unwrap()
         .unwrap();
-    let again = embedders
-        .embedder(&http("http://one.test"))
-        .unwrap()
-        .unwrap();
-    let elsewhere = embedders
+    // One model, however the collections that embed with it word their
+    // texts and whichever properties they embed: and each embedder is
+    // still its collection's own way of embedding.
+    let reworded = Embedding {
+        query_prefix: None,
+        document_prefix: Some("store: ".into()),
+        properties: vec!["title".into()],
+        ..http("http://one.test")
+    };
+    let other = embedders.embedder(&reworded).unwrap().unwrap();
+    assert_eq!(embedders.held(), 1);
+    assert_eq!(first.embedding(), &http("http://one.test"));
+    assert_eq!(other.embedding(), &reworded);
+    // Another endpoint is another model.
+    embedders
         .embedder(&http("http://two.test"))
         .unwrap()
         .unwrap();
-    let reworded = Embedding {
-        query_prefix: None,
-        ..http("http://one.test")
-    };
-    let reworded = embedders.embedder(&reworded).unwrap().unwrap();
-    assert!(Arc::ptr_eq(&first, &again));
-    assert!(!Arc::ptr_eq(&first, &elsewhere));
-    assert!(!Arc::ptr_eq(&first, &reworded));
-    assert_eq!(first.embedding(), &http("http://one.test"));
+    assert_eq!(embedders.held(), 2);
 }
 
 #[cfg(feature = "local")]
 #[test]
 fn a_model_no_build_runs_is_refused_when_asked_for_and_asking_builds_nothing() {
-    let embedders = Embedders::new(Settings::default());
+    let embedders = Embedders::new(Settings {
+        bedrock_regions: vec!["eu-west-2".into()],
+        ..Settings::default()
+    });
     let with = |provider: EmbeddingProvider, model: &str, dimensions| Embedding {
         model: model.into(),
         dimensions,
@@ -608,6 +621,42 @@ async fn a_query_asked_by_many_at_once_is_embedded_once_and_a_failure_is_not_kep
     embedder.query(&long).await.unwrap();
     embedder.query(&long).await.unwrap();
     assert_eq!(fake.purposes.lock().unwrap().len(), 4);
+}
+
+/// A collection names the model it embeds through Bedrock with, and
+/// may name any. Only Titan is one, by either of its names: a name of
+/// the collection's own making is refused when the collection is made,
+/// and nothing is held for it.
+#[test]
+fn a_bedrock_model_that_is_not_titan_is_refused_when_asked_for() {
+    let embedders = Embedders::new(Settings {
+        bedrock_regions: vec!["eu-west-2".into()],
+        ..Settings::default()
+    });
+    let named = |model: &str| Embedding {
+        model: model.into(),
+        dimensions: 256,
+        ..embedding(EmbeddingProvider::Bedrock {
+            region: "eu-west-2".into(),
+        })
+    };
+    for titan in ["amazon.titan-embed-text-v2:0", "amazon.titan-embed-text-v2"] {
+        assert_eq!(embedders.admits(&named(titan)), Ok(()), "{titan}");
+    }
+    for model in [
+        "amazon.titan-embed-text-v2:0-made-up-17",
+        "amazon.titan-embed-text-v2:1",
+        "amazon.titan-embed-text-v20",
+        "Amazon.Titan-Embed-Text-v2:0",
+    ] {
+        let refused = embedders.admits(&named(model));
+        assert!(
+            matches!(refused, Err(EmbedError::NoSuchModel(_))),
+            "{model}"
+        );
+        assert!(embedders.embedder(&named(model)).is_err());
+    }
+    assert_eq!(embedders.held(), 0);
 }
 
 #[test]
@@ -829,4 +878,324 @@ async fn a_fault_that_stands_is_lifted_by_the_model_answering_well_however_late(
         assert_eq!(model.calls(), 4);
     })
     .await;
+}
+
+fn seconds(seconds: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(seconds)
+}
+
+/// What a model that did not answer `within` such a time fails with.
+fn late(within: &str) -> EmbedError {
+    EmbedError::Failed {
+        model: "fake".into(),
+        reason: format!("no answer within {within}"),
+    }
+}
+
+/// The same query asked by `askers` at once, each a second after the one
+/// before: what each was told, and how long after the first asked.
+async fn one_after_another(
+    embedder: &Arc<Embedder>,
+    text: &str,
+    askers: u64,
+) -> Vec<(Result<Option<Vec<f32>>>, std::time::Duration)> {
+    let started = tokio::time::Instant::now();
+    let asking = (0..askers).map(|nth| async move {
+        tokio::time::sleep(seconds(nth)).await;
+        (embedder.query(text).await, started.elapsed())
+    });
+    futures::future::join_all(asking).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_query_asked_by_many_at_once_fails_for_them_all_at_once_and_is_asked_again_after() {
+    // A model that fails, in a way that may pass, half a minute after it
+    // is asked: and is given two minutes to answer.
+    let model = Arc::new(Told {
+        slow: seconds(30),
+        ..Told::default()
+    });
+    let embedder = Embedder::new(model.clone(), embedding(EmbeddingProvider::Local))
+        .answering_within(seconds(120), seconds(120), seconds(1));
+    let embedder = Arc::new(embedder);
+    let failed = EmbedError::Failed {
+        model: "fake".into(),
+        reason: "503 Service Unavailable".into(),
+    };
+
+    // Ten ask the same, over ten seconds. The model is asked once, and
+    // all are told how it failed when it does: none asks in turn after,
+    // to be told half a minute later each.
+    let told = one_after_another(&embedder, "failing fox", 10).await;
+    for (answer, after) in told {
+        assert_eq!((answer, after), (Err(failed.clone()), seconds(30)));
+    }
+    assert_eq!(model.calls(), 1);
+
+    // The failure is not kept: whoever asks next asks the model.
+    let started = tokio::time::Instant::now();
+    assert_eq!(embedder.query("failing fox").await, Err(failed.clone()));
+    assert_eq!((model.calls(), started.elapsed()), (2, seconds(30)));
+
+    // Those who ask for different texts each ask for themselves, all at
+    // once: none waits on another.
+    let started = tokio::time::Instant::now();
+    let answers = at_once(&embedder, &numbered("failing", 10)).await;
+    assert!(answers.iter().all(|answer| answer == &Err(failed.clone())));
+    assert_eq!((model.calls(), started.elapsed()), (12, seconds(30)));
+    let most = model
+        .most_in_flight
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(most, 10);
+
+    // A vector is told to all who wait likewise, and kept.
+    let told = one_after_another(&embedder, "fox", 10).await;
+    for (answer, after) in told {
+        assert_eq!((answer, after), (Ok(Some(vec![1.0, 2.0])), seconds(30)));
+    }
+    let started = tokio::time::Instant::now();
+    assert_eq!(embedder.query("fox").await, Ok(Some(vec![1.0, 2.0])));
+    assert_eq!((model.calls(), started.elapsed()), (13, seconds(0)));
+}
+
+#[tokio::test]
+async fn a_query_whose_first_asker_goes_away_is_worked_out_for_the_next() {
+    soon(async {
+        let (model, embedder) = told(Told::default());
+        let ask = || {
+            let embedder = embedder.clone();
+            tokio::spawn(async move { embedder.query("held").await })
+        };
+        let first = ask();
+        called(&model, 1).await;
+        let second = ask();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(model.calls(), 1, "the second waits on the first");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        // No one is left asking the model: the second does.
+        called(&model, 2).await;
+        model.let_go.notify_one();
+        assert_eq!(second.await.unwrap(), Ok(Some(vec![1.0, 2.0])));
+        assert_eq!(embedder.query("held").await, Ok(Some(vec![1.0, 2.0])));
+        assert_eq!(model.calls(), 2, "and it is kept");
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_model_that_does_not_answer_in_time_is_given_up_on_and_asked_again_by_the_next_call() {
+    // Should the model be waited on for ever, this fails rather than
+    // hangs.
+    tokio::time::timeout(seconds(7 * 24 * 60 * 60), given_up_on())
+        .await
+        .expect("no model is waited on for ever");
+}
+
+async fn given_up_on() {
+    let (model, embedder) = told(Told::default());
+    assert_eq!(
+        (vellev_embed::QUERY_WITHIN, vellev_embed::DOCUMENTS_WITHIN),
+        (seconds(10), seconds(60))
+    );
+    assert_eq!(vellev_embed::EACH_DOCUMENT_WITHIN, seconds(1));
+
+    // A query is given ten seconds. Giving up may pass: it is not kept,
+    // and it is not a fault that stands, so the next call asks again.
+    let started = tokio::time::Instant::now();
+    assert_eq!(embedder.query("never").await, Err(late("10s")));
+    assert_eq!(started.elapsed(), seconds(10));
+    assert_eq!(late("10s").lasting(), None);
+    assert_eq!(embedder.query("never").await, Err(late("10s")));
+    assert_eq!(model.calls(), 2);
+    assert_eq!(embedder.query("fox").await, Ok(Some(vec![1.0, 2.0])));
+    assert_eq!(model.calls(), 3);
+
+    // Those who wait on another's asking are told when that one's time
+    // is up: none waits out a time of its own after it.
+    let told = one_after_another(&embedder, "never again", 5).await;
+    for (answer, after) in told {
+        assert_eq!((answer, after), (Err(late("10s")), seconds(10)));
+    }
+    assert_eq!(model.calls(), 4);
+
+    // A call for documents is given a minute, and a second for each of
+    // its texts.
+    let started = tokio::time::Instant::now();
+    let documents = texts(&["never", "fox", "hen"]);
+    assert_eq!(embedder.documents(&documents).await, Err(late("63s")));
+    assert_eq!(started.elapsed(), seconds(63));
+    assert_eq!(embedder.documents(&documents[1..]).await.unwrap().len(), 2);
+
+    // Or as long as the embedder is told, which is never so long that
+    // it cannot be counted from now.
+    let told_how_long = |query, documents, each| {
+        Embedder::new(model.clone(), embedding(EmbeddingProvider::Local))
+            .answering_within(query, documents, each)
+    };
+    let ms = std::time::Duration::from_millis;
+    let embedder = told_how_long(seconds(2), seconds(5), ms(500));
+    let started = tokio::time::Instant::now();
+    assert_eq!(embedder.query("never").await, Err(late("2s")));
+    assert_eq!(started.elapsed(), seconds(2));
+    let documents = texts(&["never", "", "fox", "hen"]);
+    assert_eq!(embedder.documents(&documents).await, Err(late("7s")));
+    assert_eq!(started.elapsed(), seconds(2 + 7));
+    let for_ever = std::time::Duration::MAX;
+    let embedder = told_how_long(for_ever, for_ever, for_ever);
+    assert_eq!(embedder.query("never").await, Err(late("86400s")));
+    assert_eq!(embedder.documents(&documents).await, Err(late("86400s")));
+}
+
+/// A model that keeps its callers in a line, and says how it gets on. A
+/// call's texts wait `waits` seconds for the model to turn to them, and
+/// it takes `works` over them. All the while it says it has got
+/// somewhere every `says` seconds: or nothing, if that is none.
+#[derive(Debug, Default)]
+struct Lined {
+    waits: u64,
+    works: u64,
+    says_waiting: u64,
+    says_working: u64,
+    /// Whether it lets go, when asked, of what it would say it with.
+    lets_go: bool,
+}
+
+impl Lined {
+    /// Pass `all` seconds, saying it has got somewhere every `says`.
+    async fn pass(all: u64, says: u64, progress: Option<&vellev_embed::Progress>) {
+        let mut left = all;
+        while left > 0 {
+            let step = if says == 0 { left } else { says.min(left) };
+            tokio::time::sleep(seconds(step)).await;
+            left -= step;
+            if let (Some(progress), true) = (progress, says > 0) {
+                progress.made();
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for Lined {
+    async fn embed(&self, texts: Vec<String>, _: Purpose) -> Result<Vec<Vec<f32>>> {
+        tokio::time::sleep(seconds(self.waits + self.works)).await;
+        Ok(vec![vec![1.0, 2.0]; texts.len()])
+    }
+
+    fn says_how_it_gets_on(&self) -> bool {
+        true
+    }
+
+    async fn embed_saying(
+        &self,
+        texts: Vec<String>,
+        _: Purpose,
+        _: &str,
+        progress: vellev_embed::Progress,
+    ) -> Result<Vec<Vec<f32>>> {
+        let progress = (!self.lets_go).then_some(progress);
+        Self::pass(self.waits, self.says_waiting, progress.as_ref()).await;
+        if let Some(progress) = &progress {
+            progress.made();
+        }
+        Self::pass(self.works, self.says_working, progress.as_ref()).await;
+        Ok(vec![vec![1.0, 2.0]; texts.len()])
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_is_given_up_on_when_the_model_gets_nowhere_and_not_for_how_long_it_takes() {
+    // Should anything here wait for ever, it fails rather than hangs.
+    tokio::time::timeout(seconds(7 * 24 * 60 * 60), getting_on())
+        .await
+        .expect("no model is waited on for ever");
+}
+
+async fn getting_on() {
+    let failed = |reason: &str| EmbedError::Failed {
+        model: "fake".into(),
+        reason: reason.into(),
+    };
+    let stalled = || failed("nothing from the model in 60s");
+    // What a write of three texts to `model` comes to, and how long
+    // after it was asked. It is given up on when the model has got
+    // nowhere for a minute; and, however it gets on, when it has had
+    // eight times the 63 seconds a write of three texts is given alone.
+    let written = |model: Lined| async move {
+        let embedder = Embedder::new(Arc::new(model), embedding(EmbeddingProvider::Local));
+        let started = tokio::time::Instant::now();
+        let made = embedder.documents(&texts(&["fox", "hen", "owl"])).await;
+        (made.map(|vectors| vectors.len()), started.elapsed())
+    };
+    let every_half_minute = |waits, works| Lined {
+        waits,
+        works,
+        says_waiting: 30,
+        says_working: 30,
+        ..Lined::default()
+    };
+
+    // Kept waiting five minutes behind others, in a line that moves,
+    // and then made over four minutes with the model shared among many:
+    // it is made. Nothing was given up on for others' load.
+    assert_eq!(
+        written(every_half_minute(300, 240)).await,
+        (Ok(3), seconds(540))
+    );
+    // A model that stops is given up on a minute after it last got
+    // anywhere: before it has turned to the write, or after.
+    let stops_waiting = Lined {
+        says_waiting: 0,
+        ..every_half_minute(900, 10)
+    };
+    assert_eq!(written(stops_waiting).await, (Err(stalled()), seconds(60)));
+    let stops_working = Lined {
+        says_working: 0,
+        ..every_half_minute(90, 61)
+    };
+    assert_eq!(written(stops_working).await, (Err(stalled()), seconds(150)));
+    let too_seldom = Lined {
+        says_working: 61,
+        ..every_half_minute(0, 200)
+    };
+    assert_eq!(written(too_seldom).await, (Err(stalled()), seconds(60)));
+    // One that goes on saying it gets somewhere, and never finishes, is
+    // given up on too: eight times the 63 seconds a write of three texts
+    // is given alone, and the two minutes a write may wait for its turn,
+    // from when the write was made, however the time was spent.
+    let never_done = failed("no answer within 624s");
+    assert_eq!(
+        written(every_half_minute(0, 100_000)).await,
+        (Err(never_done.clone()), seconds(624))
+    );
+    assert_eq!(
+        written(every_half_minute(600, 100_000)).await,
+        (Err(never_done.clone()), seconds(624))
+    );
+    assert_eq!(
+        written(every_half_minute(500, 100)).await,
+        (Ok(3), seconds(600))
+    );
+    assert_eq!((stalled().lasting(), never_done.lasting()), (None, None));
+    // One that lets go of what it would say it with has no more to say:
+    // it is given a minute from then.
+    let lets_go = |works| Lined {
+        lets_go: true,
+        ..every_half_minute(0, works)
+    };
+    assert_eq!(written(lets_go(59)).await, (Ok(3), seconds(59)));
+    assert_eq!(written(lets_go(61)).await, (Err(stalled()), seconds(60)));
+
+    // A query's time is counted from when it is asked, wherever it
+    // waits: someone is waiting on it.
+    let query = |model: Lined| async move {
+        let embedder = Embedder::new(Arc::new(model), embedding(EmbeddingProvider::Local));
+        let started = tokio::time::Instant::now();
+        (embedder.query("fox").await.is_ok(), started.elapsed())
+    };
+    assert_eq!(query(every_half_minute(9, 2)).await, (false, seconds(10)));
+    assert_eq!(query(every_half_minute(5, 4)).await, (true, seconds(9)));
 }

@@ -101,6 +101,51 @@ pub struct Config {
         value_delimiter = ','
     )]
     pub embedding_keys: Vec<String>,
+    /// The node's own local embedding model, which collections embed
+    /// with unless they say otherwise. A place is kept for it among those
+    /// loaded, and it stays loaded. Empty, the node has none.
+    #[arg(
+        long,
+        env = "VELLEV_LOCAL_MODEL",
+        default_value = vellev_embed::DEFAULT_LOCAL_MODEL
+    )]
+    pub local_model: String,
+    /// The other local embedding models collections may be made with,
+    /// by name and separated by commas.
+    #[arg(long, env = "VELLEV_LOCAL_MODELS_ALLOWED", value_delimiter = ',')]
+    pub local_models_allowed: Vec<String>,
+    /// The regions collections may embed through Bedrock in, separated
+    /// by commas: by default the node's own, `AWS_REGION` or
+    /// `AWS_DEFAULT_REGION`, if it has one. The node's calls to Bedrock
+    /// are shared equally among them.
+    #[arg(long, env = "VELLEV_BEDROCK_REGIONS", value_delimiter = ',')]
+    pub bedrock_regions: Option<Vec<String>>,
+    /// The most local embedding models loaded at once, the node's own
+    /// among them. Each takes about a gigabyte while it runs.
+    #[arg(long, env = "VELLEV_LOCAL_MODELS", default_value_t = vellev_embed::LOCAL_MODELS as u64, value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub local_models: u64,
+    /// How long a local embedding model other than the node's own may go
+    /// unused before it is let go, in seconds.
+    #[arg(long, env = "VELLEV_LOCAL_MODEL_IDLE_SECS", default_value_t = vellev_embed::LOCAL_MODEL_IDLE.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+    pub local_model_idle_secs: u64,
+    /// How long an embedding model is given to answer a search, in
+    /// seconds; a search it has not answered by then is `unavailable`.
+    #[arg(long, env = "VELLEV_EMBED_QUERY_SECS", default_value_t = vellev_embed::QUERY_WITHIN.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+    pub embed_query_secs: u64,
+    /// How long an embedding model may go without getting anywhere with
+    /// a write's texts before the write is `unavailable`, in seconds:
+    /// not how long the write may take.
+    #[arg(long, env = "VELLEV_EMBED_DOCUMENTS_SECS", default_value_t = vellev_embed::DOCUMENTS_WITHIN.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+    pub embed_documents_secs: u64,
+    /// How many seconds more for each text of a write a model is given
+    /// that does not say how it is getting on.
+    #[arg(long, env = "VELLEV_EMBED_EACH_DOCUMENT_SECS", default_value_t = vellev_embed::EACH_DOCUMENT_WITHIN.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+    pub embed_each_document_secs: u64,
+    /// The longest a write waits for its turn at a local model, in
+    /// seconds: one the model will not come to within this is
+    /// `unavailable` at once, to be sent again when there is less to do.
+    #[arg(long, env = "VELLEV_EMBED_DOCUMENTS_HELD_SECS", default_value_t = vellev_embed::DOCUMENTS_HELD_AT_MOST.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+    pub embed_documents_held_secs: u64,
     /// Where other nodes can reach this one, so that a request for a tenant
     /// this node holds can be sent on to it: this node's own address, never
     /// a load balancer's. By default this host's name and the port
@@ -337,6 +382,17 @@ fn endpoint(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
+/// The node's own region of Amazon's, as the AWS tools read it: from
+/// `AWS_REGION`, or `AWS_DEFAULT_REGION` if that is unset or blank. Not
+/// from a profile, nor from the machine the node runs on.
+fn own_region(aws_region: Option<String>, aws_default_region: Option<String>) -> Option<String> {
+    [aws_region, aws_default_region]
+        .into_iter()
+        .flatten()
+        .map(|region| region.trim().to_string())
+        .find(|region| !region.is_empty())
+}
+
 impl Config {
     fn store_client(&self) -> StoreClient {
         StoreClient {
@@ -375,11 +431,48 @@ impl Config {
             .collect()
     }
 
+    /// How the node embeds, which is refused if it could not embed so.
+    fn embedding(&self) -> Result<vellev_embed::Settings> {
+        let var = |name| std::env::var(name).ok();
+        self.embedding_in(own_region(var("AWS_REGION"), var("AWS_DEFAULT_REGION")))
+    }
+
+    /// How a node whose own region of Amazon's is `own` embeds.
+    fn embedding_in(&self, own: Option<String>) -> Result<vellev_embed::Settings> {
+        let named = |names: &[String]| -> Vec<String> {
+            let names = names.iter().map(|name| name.trim());
+            names
+                .filter(|name| !name.is_empty())
+                .map(String::from)
+                .collect()
+        };
+        let settings = vellev_embed::Settings {
+            cache: self.model_dir.clone(),
+            keys: self.embedding_keys()?,
+            local_model: named(std::slice::from_ref(&self.local_model)).pop(),
+            local_models_allowed: named(&self.local_models_allowed),
+            bedrock_regions: match &self.bedrock_regions {
+                Some(regions) => named(regions),
+                None => named(&own.into_iter().collect::<Vec<_>>()),
+            },
+            local_models: usize::try_from(self.local_models).unwrap_or(usize::MAX),
+            local_model_idle: Duration::from_secs(self.local_model_idle_secs),
+            query_within: Duration::from_secs(self.embed_query_secs),
+            documents_within: Duration::from_secs(self.embed_documents_secs),
+            each_document_within: Duration::from_secs(self.embed_each_document_secs),
+            documents_held_at_most: Duration::from_secs(self.embed_documents_held_secs),
+            ..Default::default()
+        };
+        settings.checked().map_err(|wrong| eyre!(wrong))?;
+        Ok(settings)
+    }
+
     /// What callers may ask of the node, and the store it keeps data in.
     /// Everything that can be wrong without reaching another machine is
     /// found wrong here.
     pub fn checked(&self) -> Result<(Limits, ObjectBlobs)> {
         let keyed = self.embedding_keys()?;
+        self.embedding()?;
         let embedding_urls = self
             .embedding_urls
             .iter()
@@ -442,11 +535,7 @@ impl Config {
             Some(dir) => Arc::new(CachedBlobs::open(blobs, dir).await.on(self.cache_disk()?)),
             None => blobs,
         };
-        let embedders = Embedders::new(vellev_embed::Settings {
-            cache: self.model_dir.clone(),
-            keys: self.embedding_keys()?,
-            ..Default::default()
-        });
+        let embedders = Embedders::new(self.embedding()?);
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "vellev".into());
         let address = self
             .advertise_url
@@ -550,6 +639,154 @@ mod tests {
         assert!(config(&["--api-keys", " , "]).keys().is_err());
         let keys = config(&["--api-keys", "one, two,,"]).keys().unwrap();
         assert_eq!(*keys, ["one".to_string(), "two".to_string()]);
+    }
+
+    #[test]
+    fn a_node_embeds_as_it_is_told_and_runs_its_own_local_model_alone_unless_told() {
+        let seconds = Duration::from_secs;
+        let untold = config(&[]).embedding_in(None).unwrap();
+        assert_eq!(untold.cache, PathBuf::from("/var/lib/vellev/models"));
+        assert!(untold.keys.is_empty());
+        assert_eq!(untold.local_model.as_deref(), Some("BAAI/bge-base-en-v1.5"));
+        assert!(untold.local_models_allowed.is_empty());
+        assert!(untold.bedrock_regions.is_empty());
+        assert_eq!(
+            (untold.local_models, untold.local_model_idle),
+            (2, seconds(900))
+        );
+        assert_eq!(untold.query_within, seconds(10));
+        assert_eq!(
+            (untold.documents_within, untold.each_document_within),
+            (seconds(60), seconds(1))
+        );
+        assert_eq!(untold.documents_held_at_most, seconds(120));
+        assert_eq!(untold.fault_stands, vellev_embed::FAULT_STANDS);
+
+        let told = config(&[
+            "--model-dir",
+            "/models",
+            "--embedding-keys",
+            "http://tei:80=t",
+            "--local-model",
+            "bge-small-en-v1.5",
+            "--local-models-allowed",
+            "BAAI/bge-large-en-v1.5, bge-base-en-v1.5,,",
+            "--bedrock-regions",
+            "eu-west-2, us-east-1,",
+            "--local-models",
+            "3",
+            "--local-model-idle-secs",
+            "60",
+            "--embed-query-secs",
+            "4",
+            "--embed-documents-secs",
+            "120",
+            "--embed-each-document-secs",
+            "2",
+            "--embed-documents-held-secs",
+            "45",
+        ])
+        .embedding_in(Some("ap-south-1".into()))
+        .unwrap();
+        assert_eq!(told.cache, PathBuf::from("/models"));
+        assert_eq!(told.keys["http://tei:80"], "t");
+        assert_eq!(told.local_model.as_deref(), Some("bge-small-en-v1.5"));
+        assert_eq!(
+            told.local_models_allowed,
+            ["BAAI/bge-large-en-v1.5", "bge-base-en-v1.5"]
+        );
+        assert_eq!(told.bedrock_regions, ["eu-west-2", "us-east-1"]);
+        assert_eq!((told.local_models, told.local_model_idle), (3, seconds(60)));
+        assert_eq!(told.query_within, seconds(4));
+        assert_eq!(
+            (told.documents_within, told.each_document_within),
+            (seconds(120), seconds(2))
+        );
+        assert_eq!(told.documents_held_at_most, seconds(45));
+        assert!(config(&["--embedding-keys", "no-token"])
+            .embedding_in(None)
+            .is_err());
+
+        // The node's own region is read as the AWS tools read it: a blank
+        // `AWS_REGION` falls through to `AWS_DEFAULT_REGION`.
+        let some = |region: &str| Some(region.to_string());
+        assert_eq!(
+            own_region(some("eu-west-2"), some("us-east-1")),
+            some("eu-west-2")
+        );
+        assert_eq!(own_region(some(" "), some("us-east-1")), some("us-east-1"));
+        assert_eq!(own_region(None, some(" us-east-1 ")), some("us-east-1"));
+        assert_eq!(own_region(some(""), some("")), None);
+        assert_eq!(own_region(None, None), None);
+        // Told of no regions, a node embeds through Bedrock in its own,
+        // if it has one; and told of none in so many words, in none.
+        let own = config(&[]).embedding_in(Some("eu-west-2".into())).unwrap();
+        assert_eq!(own.bedrock_regions, ["eu-west-2"]);
+        let none = config(&["--bedrock-regions", ""]).embedding_in(Some("eu-west-2".into()));
+        assert!(none.unwrap().bedrock_regions.is_empty());
+        // Told to have no model of its own, a node has none.
+        let none = config(&["--local-model", ""]).embedding_in(None).unwrap();
+        assert_eq!(none.local_model, None);
+
+        // A node cannot be told to hold no model, or to give no time.
+        for nothing in [
+            "--local-models",
+            "--local-model-idle-secs",
+            "--embed-query-secs",
+            "--embed-documents-secs",
+            "--embed-each-document-secs",
+            "--embed-documents-held-secs",
+        ] {
+            let required = ["vellev", "--database-url", "x", "--store", "memory://"];
+            let asked = required.into_iter().chain([nothing, "0"]);
+            assert!(Parsed::try_parse_from(asked).is_err(), "{nothing}");
+        }
+    }
+
+    /// What a node could not do as it is told is refused when it starts,
+    /// and not found out by the collections made on it.
+    #[test]
+    fn a_node_told_to_run_local_models_it_cannot_does_not_start() {
+        let wrong = |told: &[&str]| {
+            let refused = config(told).embedding_in(None).unwrap_err();
+            refused.to_string()
+        };
+        // It is found with whatever else is wrong with how a node is
+        // told to run, before anything is reached.
+        assert!(config(&["--local-model", "BAAI/bge-base-en-v15"])
+            .checked()
+            .is_err());
+        assert!(config(&[]).checked().is_ok());
+        // A slip in a name: its own model's, or another's.
+        assert_eq!(
+            wrong(&["--local-model", "BAAI/bge-base-en-v15"]),
+            "BAAI/bge-base-en-v15 is not a local model this release runs"
+        );
+        assert_eq!(
+            wrong(&[
+                "--local-models-allowed",
+                "bge-small-en-v1.5,acme/unheard-of"
+            ]),
+            "acme/unheard-of is not a local model this release runs"
+        );
+        // More models than could ever be loaded.
+        assert_eq!(
+            wrong(&[
+                "--local-models",
+                "1",
+                "--local-models-allowed",
+                "bge-small-en-v1.5"
+            ]),
+            "a node with room for one local model has room for its own alone, \
+             Xenova/bge-base-en-v1.5: it cannot also run Xenova/bge-small-en-v1.5"
+        );
+        let two = [
+            "--local-models",
+            "2",
+            "--local-models-allowed",
+            "bge-small-en-v1.5",
+        ];
+        assert!(config(&two).embedding_in(None).is_ok());
     }
 
     #[test]

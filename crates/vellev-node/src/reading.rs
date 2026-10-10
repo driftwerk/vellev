@@ -95,16 +95,20 @@ impl Reader {
                 .map(|schema| schema.embedding.clone())
                 .ok_or_else(|| StorageError::UnknownCollection(collection.clone()))
         })?;
-        let embedders = match &self.from {
-            From::Writer(tenant) => &tenant.embedders,
-            From::Follower(followed) => &followed.embedders,
+        let (embedders, tenant) = match &self.from {
+            From::Writer(tenant) => (&tenant.embedders, tenant.id()),
+            From::Follower(followed) => (&followed.embedders, &followed.tenant),
         };
         let Some(embedder) = embedders.embedder(&embedding)? else {
             return Ok(None);
         };
-        // Told by the embedder at the moment it sends the text, so that
-        // it is known however the asking ends, and whoever stops waiting.
-        Ok(embedder.query_noting(text, &self.worked).await?)
+        // In the tenant's name, by which a model shared among tenants
+        // gives each its turn. Told by the embedder at the moment it
+        // sends the text, so that it is known however the asking ends,
+        // and whoever stops waiting.
+        Ok(embedder
+            .query_noting_for(tenant.as_str(), text, &self.worked)
+            .await?)
     }
 }
 
@@ -112,6 +116,7 @@ impl Reader {
 /// it is used.
 #[derive(Debug)]
 pub struct Followed {
+    tenant: TenantId,
     follower: Follower,
     embedders: Arc<Embedders>,
     used: Mutex<Instant>,
@@ -322,6 +327,7 @@ impl Inner {
             .ok_or_else(|| NodeError::UnknownTenant(tenant.clone()))?;
         let follower = Follower::open(key(tenant), self.blobs.clone(), &committed).await?;
         let followed = Arc::new(Followed {
+            tenant: tenant.clone(),
             follower,
             embedders: self.embedders.clone(),
             used: Mutex::new(Instant::now()),
