@@ -266,7 +266,8 @@ pub struct Copied {
     pub kept: u64,
     /// Objects gone from Weaviate that stay in the collection because
     /// they were not as the import had stored them: another writer's.
-    /// The ledger keeps their entries, so the same on every run.
+    /// The ledger keeps their entries while the collection holds them,
+    /// so the same on every run until it no longer does.
     pub left: u64,
     /// Objects the collection held when it was taken up without a ledger
     /// that Weaviate does not hold: deleted there before there was a
@@ -296,7 +297,8 @@ pub struct Copied {
     pub too_large: Vec<String>,
     /// How many objects Weaviate held at the end, how many of Weaviate's
     /// the ledger had accounted for, those withheld aside, and how many
-    /// the collection held.
+    /// the collection held. An entry of an id Weaviate does not hold,
+    /// as those unknown, left and barred are, is not among the second.
     pub weaviate: u64,
     pub imported: u64,
     pub vellev: u64,
@@ -1659,8 +1661,10 @@ impl<'a> Copying<'a> {
     /// up is now to be deleted. Told that something else wrote to the
     /// collection, whatever was withheld or unknown is kept as another
     /// writer's, at once and however much of it there is: nothing of it
-    /// is ever deleted, so there is nothing to ask Weaviate. Any other
-    /// may be gone, and Weaviate is asked.
+    /// is ever deleted, so there is nothing to ask Weaviate. What was
+    /// said to be another writer's on an earlier run is kept likewise,
+    /// its entry saying from now on that Weaviate does not hold it. Any
+    /// other may be gone, and Weaviate is asked.
     fn unlisted(&self, entry: Entry) -> Unlisted {
         let pre = entry.mark == Mark::Unknown || (entry.mark == Mark::Withheld && entry.gone);
         let theirs = Self::unsettled(&entry) && self.options.other_writers;
@@ -1731,8 +1735,14 @@ impl<'a> Copying<'a> {
             let holds = held.contains(&entry.id);
             changes.extend(self.keeping(entry, now.as_ref(), holds, copied));
         }
-        if !changes.is_empty() {
-            self.tenant.apply(changes).await?;
+        Ok(self.noted(changes).await?)
+    }
+
+    /// Write ledger entries that do not hang on one another, no more of
+    /// them to a request than one may carry.
+    async fn noted(&self, notes: Vec<Change>) -> Result<(), vellev_client::Error> {
+        for notes in notes.chunks(self.options.batch_changes.max(1)) {
+            self.tenant.apply(notes.to_vec()).await?;
         }
         Ok(())
     }
@@ -1964,13 +1974,19 @@ impl<'a> Copying<'a> {
     /// something else is writing the ledger while the collection is
     /// taken up, and the run stops rather than go on beside it.
     async fn note_unknown(&self, notes: Vec<Change>) -> Result<()> {
-        let noted = self.tenant.apply(notes).await;
-        noted.map(drop).wrap_err_with(|| {
-            format!(
-                "noting what collection {} holds that Weaviate does not: the ledger changed under the import; is another import of the tenant running?",
-                self.plan.schema.name
-            )
-        })
+        let name = &self.plan.schema.name;
+        match self.noted(notes).await {
+            Ok(()) => Ok(()),
+            Err(error) if matches!(refusal(&error), Some(Refusal::Overtaken)) => {
+                Err(error).wrap_err_with(|| {
+                    format!(
+                        "noting what collection {name} holds that Weaviate does not: the ledger changed under the import; is another import of the tenant running?"
+                    )
+                })
+            }
+            Err(error) => Err(error)
+                .wrap_err_with(|| format!("noting what collection {name} holds that Weaviate does not")),
+        }
     }
 
     /// The entry of an object the collection holds that Weaviate does
@@ -4078,6 +4094,13 @@ mod tests {
         let foreign = fixture.entry("hen", 1, Mark::Foreign);
         assert_eq!(
             removing(&fixture, &foreign, Some(&owl)),
+            left("upsert ENTRY foreign gone")
+        );
+        // Not even one that is exactly what its entry hashed: the mark
+        // says another writer put it there.
+        let matching = fixture.entry("fox", 1, Mark::Foreign);
+        assert_eq!(
+            removing(&fixture, &matching, Some(&fox)),
             left("upsert ENTRY foreign gone")
         );
         assert_eq!(

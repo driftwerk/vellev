@@ -3830,6 +3830,11 @@ async fn one_run_told_of_other_writers_settles_all_that_was_withheld_however_muc
             foreign(2).properties
         );
     }
+    // Settled so, a run writes the note of the collection, as every run
+    // does, and nothing else: no entry is written again for being kept.
+    importing.front.listen();
+    importing.run_as(plain).await.unwrap();
+    assert_eq!(importing.front.asked("/changes").len(), 1);
     // Weaviate makes one of the ten again: what the other writer left
     // out of the collection is not brought back.
     weaviate.add(class, 300..301).await;
