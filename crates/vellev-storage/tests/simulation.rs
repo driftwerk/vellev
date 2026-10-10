@@ -12,7 +12,8 @@
 //! the coordinator really recorded, whatever the writers were told.
 //!
 //! A step takes an hour, and a wait as many more as it says. The store says
-//! each file was written as many hours ago as have passed since, so that
+//! each file was written as many hours ago as have passed since, and half
+//! an hour more, so that
 //! cleaning up with a grace of some hours deletes what is older and keeps
 //! what is not, as it does where files age by the clock; and the
 //! coordinator's clock moves with it, so that commits pass out of the
@@ -274,8 +275,12 @@ impl Blobs for SimBlobs {
         let (now, step) = (Utc::now(), self.step.load(Ordering::SeqCst));
         let landed = self.landed.lock().unwrap();
         for file in &mut listed {
+            // Half an hour more than the hours passed, so that a file as
+            // many hours old as a clean's grace is older than it whenever
+            // the cleaner reads the time, and not younger when it reads
+            // it within the moment this was read.
             let steps = step - landed.get(&file.key).copied().unwrap_or(step);
-            file.modified = now - STEP * steps as u32;
+            file.modified = now - STEP * steps as u32 - STEP / 2;
         }
         Ok(listed)
     }
