@@ -19,8 +19,9 @@ use vellev_core::{Embedding, ModelFault, NodeId, Partition, RequestId, TenantId}
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
-    Acquired, Coordinator, CoordinatorError, Generation, Lease, Lineage, LogPosition, ManifestRef,
-    PartitionKey, Point, Restore, RestorePoint, Restored, TenantKey, Versions, MAX_RESTORE_WINDOW,
+    Acquired, Clock, Coordinator, CoordinatorError, Generation, Lease, Lineage, LogPosition,
+    ManifestRef, PartitionKey, Point, Restore, RestorePoint, Restored, SystemClock, TenantKey,
+    Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
@@ -29,6 +30,7 @@ use vellev_storage::{
 };
 
 mod backing;
+pub use backing::LANDED_AFTER;
 mod claim_clock;
 mod keys;
 mod limits;
@@ -131,6 +133,9 @@ pub struct Settings {
     /// The clock backup claims are measured on, which counts the time the
     /// machine was suspended, as the coordinator's does.
     pub claim_clock: Arc<dyn ClaimClock>,
+    /// What tells the time of day: when a backup is taken, and how old one
+    /// is when backups are pruned. The machine's, unless told otherwise.
+    pub clock: Arc<dyn Clock>,
     /// How often the node looks for tenants due a backup, the first time
     /// at a moment of its own within as long, so that nodes started
     /// together look at different times.
@@ -175,6 +180,7 @@ impl Settings {
             backup_claim: Duration::from_secs(15 * 60),
             request_bounds: RequestBounds::default(),
             claim_clock: Arc::new(BootClock),
+            clock: Arc::new(SystemClock),
             backups_looked_for_every: Duration::from_secs(10 * 60),
             purges_looked_for_every: PURGES_LOOKED_FOR_EVERY,
             purge_after: Duration::from_secs(10 * 60),

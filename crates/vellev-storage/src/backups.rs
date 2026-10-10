@@ -37,6 +37,14 @@
 //! a pending one young enough to be of a backup under way, no file kept
 //! beside it is deleted, as it may list any of them; an older pending one
 //! is forgotten as any other is.
+//!
+//! Nothing looks whether a complete backup's files are still there until
+//! it is restored from. One that lost a file from the store stays listed,
+//! and fails only when its files are fetched back by someone who lacks
+//! that one, saying which backup lacks which file. A backup taken later by
+//! the same cluster that lists the file copies it back; a backup whose
+//! lost file no later backup lists is never mended, and fails at restore
+//! for as long as it is kept.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -618,7 +626,19 @@ impl Backups {
         let copied = wanted.len();
         let copies = wanted.into_iter().map(|(kept, key)| async move {
             still(held, &backup.tenant)?;
-            let bytes = self.store.get(&kept).await?;
+            let bytes = match self.store.get(&kept).await {
+                // Said of the backup: it cannot be restored from, by
+                // anyone who lacks the file, until a backup that lists the
+                // file is taken by the cluster that took this one.
+                Err(StorageError::Missing { .. }) => {
+                    let reason = format!(
+                        "backup {} of tenant {} lists {key}, and it is not in the backup store",
+                        backup.id, backup.tenant
+                    );
+                    return Err(StorageError::corrupt(&kept, reason));
+                }
+                bytes => bytes?,
+            };
             // Asked again once the file is read, just before it is written.
             still(held, &backup.tenant)?;
             primary.put(&key, bytes).await

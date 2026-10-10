@@ -65,8 +65,11 @@
 //! as it was. A backup whose complete record was
 //! written is the run's outcome whatever the claim does after. Each piece
 //! of work runs to its end, or to where it stops, whoever stops waiting for
-//! it, and its claim is let go when it does; only a panic, or the runtime
-//! stopping, leaves a claim to run out within its hold. The daily backups
+//! it, and its claim is let go when it does. A claim is left to run out
+//! within its hold by a panic, by the runtime stopping, by a coordinator
+//! that does not answer the letting go, and, on purpose, where it is a
+//! claim to purge under which a delete was sent and the purge did not end
+//! well ([`Claim::left_to_run_out`]). The daily backups
 //! need no node to hold the tenant, so tenants nobody has used for a while
 //! are backed up too; a tenant that never committed is not, holding
 //! nothing. A backup of a tenant removed meanwhile forgets itself, and what
@@ -104,9 +107,15 @@ use crate::{
 const CLAIM_ATTEMPTS: u32 = 3;
 /// How long to wait before asking again, times the attempts so far.
 const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(200);
-/// The least margin a claim may have between when the node takes it for
-/// lost and when another may take it.
-const MIN_MARGIN: Duration = Duration::from_secs(1);
+/// How long after the node gave a request to object storage up the store
+/// is taken to have applied it or let it drop. This is an assumption about
+/// the store, and the one thing here the node cannot see to itself: giving
+/// a request up stops the node waiting for it, not the store working on it.
+/// A store answers a delete in milliseconds and gives up a request it
+/// holds within seconds, so half a minute is several times what any does;
+/// a store that applied one later still would be beyond any margin, and
+/// what it could then undo is what `purging` says it could.
+pub const LANDED_AFTER: Duration = Duration::from_secs(30);
 /// How many tenants are looked through at a time.
 const PAGE: usize = 256;
 /// How many times a restore starts again when cleaning up deletes a file
@@ -116,9 +125,9 @@ const ATTEMPTS: usize = 3;
 impl RequestBounds {
     /// Why a backup claim of `hold` cannot be held with requests that take
     /// as long as these bounds say, if it cannot: its margin, a third of
-    /// it, must outlast a request to object storage already sent, and be
-    /// whole seconds; and the rest must leave time for every attempt to
-    /// take or renew it.
+    /// it, must outlast a request to object storage already sent and the
+    /// [`LANDED_AFTER`] the store is given to apply it once given up; and
+    /// the rest must leave time for every attempt to take or renew it.
     pub fn claim_problem(&self, hold: Duration) -> Option<String> {
         claim_problem(hold, *self)
     }
@@ -134,11 +143,11 @@ fn claim_problem(hold: Duration, bounds: RequestBounds) -> Option<String> {
         Some(format!(
             "a backup claim of {hold:?} is longer than the {MAX_BACKUP_HOLD:?} one may last"
         ))
-    } else if margin < MIN_MARGIN.max(bounds.store) {
+    } else if margin < bounds.store + LANDED_AFTER {
         Some(format!(
             "a backup claim of {hold:?} is taken for lost a third of it before it runs out, \
-             which must be at least {MIN_MARGIN:?} and outlast a request to object storage, \
-             {:?}",
+             which must outlast a request to object storage, {:?}, and the {LANDED_AFTER:?} \
+             the store is given to apply one given up",
             bounds.store
         ))
     } else if hold - margin < asking {
@@ -366,6 +375,16 @@ impl Node {
                     tracing::info!(%tenant, key, "a file went before it was restored; again");
                     attempt += 1;
                 }
+                // Gone again each time it was fetched back: said of the
+                // backup, with the file, rather than as a file missing
+                // from somewhere.
+                Err(NodeError::Storage(StorageError::Missing { key })) => {
+                    let reason = format!(
+                        "backup {id} of tenant {tenant} lists it, and it went from the \
+                         tenant's store each of the {ATTEMPTS} times it was fetched back"
+                    );
+                    return Err(StorageError::Corrupt { key, reason }.into());
+                }
                 restored => {
                     let restored = restored?;
                     tracing::info!(%tenant, backup = %id, copied, ?restored, "restored from a backup");
@@ -426,7 +445,8 @@ impl Inner {
     ) -> Result<Backups> {
         let within = self.settings.request_bounds.store;
         let inner = self.settings.backups.clone().ok_or(NodeError::NoBackups)?;
-        Ok(Backups::new(through(Arc::new(Within { inner, within }))))
+        let store = through(Arc::new(Within { inner, within }));
+        Ok(Backups::new(store).timed_by(self.settings.clock.clone()))
     }
 
     /// Which tenant `tenant` is now, and as the backups this cluster takes
@@ -940,14 +960,28 @@ impl Claim {
         }
     }
 
-    /// `work`, stopped where it is once the claim is lost; one lost just
-    /// as the work is done counts as lost.
+    /// `work`, stopped where it is once the claim is lost, and not taken
+    /// up again, at any point it waited, once the claim's clock says so;
+    /// one lost just as the work is done counts as lost.
     pub(crate) async fn during<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
         self.still()?;
+        // The claim's clock is asked each time the work is taken up again,
+        // whatever woke it: `lost` below looks at the clock only when its
+        // own timer fires or the deadline moves, and work woken by a timer
+        // of its own, as a request waiting out the store client's backoff
+        // between two tries is on a machine just woken from sleep, would
+        // go on and send with no clock asked.
+        let mut work = std::pin::pin!(work);
+        let asked = std::future::poll_fn(|context| {
+            if self.still().is_err() {
+                return std::task::Poll::Ready(Err(NodeError::ClaimLost(self.of.tenant.clone())));
+            }
+            work.as_mut().poll(context)
+        });
         tokio::select! {
             biased;
             () = self.lost() => Err(NodeError::ClaimLost(self.of.tenant.clone())),
-            done = work => done,
+            done = asked => done,
         }
     }
 

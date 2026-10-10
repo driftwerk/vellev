@@ -108,11 +108,15 @@ window ends, and nothing either release keeps is pruned by the other: see
   another while it adopted answers `unavailable` (503), to be tried again.
 - **Two new codes, both 409**: `empty`, for backing up a tenant that has
   committed nothing, which answered 201 with a backup of nothing; and
-  `purging`, with a `Retry-After` of how long the purge may still take,
-  for making a tenant whose id is still being purged, which was
-  `conflict`. A client of the release before reads either as `unknown`.
-  Neither is one to send again at once: the Rust client takes both as
-  final, and whoever makes a tenant again waits the `Retry-After` out.
+  `purging`, with a `Retry-After`, for making a tenant whose id is still
+  being purged, which was `conflict`. The `Retry-After` is the least the
+  purge may still take, not when it will be done: until the purge is due
+  and a node next looks, and no account of a purge that failed and whose
+  claim is running out, which may add up to `VELLEV_BACKUP_CLAIM_SECS`.
+  Asked again after it, the node says `purging` again, with another. A
+  client of the release before reads either code as `unknown`. Neither is
+  one to send again at once: the Rust client takes both as final, and
+  whoever makes a tenant again waits at least the `Retry-After` out.
 - **A removed tenant is purged under a renewed claim**, by one node, which
   deletes nothing of a tenant made again under the id meanwhile; a purge
   that fails once it has sent a delete is taken up again when that claim
@@ -121,7 +125,8 @@ window ends, and nothing either release keeps is pruned by the other: see
   tenant is looked over again for a day after, for files that landed
   late. A backup claim is held for `VELLEV_BACKUP_CLAIM_SECS` (15 minutes;
   at least three times what one request to the store may take with its
-  tries, 9 minutes 21 seconds as a node is set up by default) and renewed,
+  tries and half a minute more, 10 minutes 51 seconds as a node is set up
+  by default) and renewed,
   where it was held for six hours.
 - **`Backup` says its `lineage` and its `cluster`.**
 - **New settings**: `VELLEV_BACKUP_CLAIM_SECS` and

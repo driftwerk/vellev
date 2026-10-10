@@ -137,8 +137,9 @@ removed tenants), and backups
 are kept 35 days (`VELLEV_BACKUPS_KEPT_SECS`), the newest always. One node
 at a time backs a tenant up or restores it, by a claim it renews while it
 works; `VELLEV_BACKUP_CLAIM_SECS` (fifteen minutes, at least three times
-what one request to the store may take with its tries: 9 minutes 21
-seconds as a node is set up by default) is how long a node that died
+what one request to the store may take with its tries and half a minute
+more for the store to apply one given up: 10 minutes 51 seconds as a node
+is set up by default) is how long a node that died
 holding one keeps others from the tenant's backups. A backup
 copies only the files no earlier one has, so keeping many costs little more
 than keeping one. Everything of a tenant lies under its own prefix of the
@@ -183,6 +184,16 @@ issued to an empty tenant was issued for whatever was to be put in it,
 which may not be this, and is to be revoked first. Both are refused as a
 conflict. Once it has adopted a backup the tenant is restored from its own
 backups as any other.
+
+A backup is listed for as long as its record is there, and nothing looks
+whether its files still are until it is restored from. A backup that has
+lost a file from the backup store stays listed as one to restore from, and
+fails only then, saying which backup lacks which file; a cluster that
+still has the file in the tenant's own store restores from it all the
+same. The next backup the same cluster takes copies back any file it
+lists that went, so a backup that lists the lost file is mended by it. An
+older backup whose lost file the tenant no longer lists is not mended by
+anything: it fails at restore for as long as it is kept.
 
 The same from the command line, with an admin key in `VELLEV_API_KEY`:
 

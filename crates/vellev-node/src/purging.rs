@@ -41,13 +41,17 @@
 //! - A purge that fails, or is cut short, or is dropped, once any delete
 //!   was sent under its claim, leaves the claim to run out rather than let
 //!   it go. A delete is sent only while the claim is taken for held, a
-//!   third of its hold before it could run out; it lands, if it does,
-//!   within what a request to the store may take; and a node is not run
-//!   with a claim a third of which is less than that. So by when another
-//!   node may claim the purge, and so before the purge can be done and
-//!   the tenant made again, every delete sent under the claim has landed
-//!   or never will. A purge that failed before any delete was sent lets
-//!   its claim go at once.
+//!   third of its hold before it could run out; the node gives it up
+//!   within what a request to the store may take; and the store is taken
+//!   to apply it or let it drop within [`LANDED_AFTER`] of that. A node is
+//!   not run with a claim a third of which is less than the two together.
+//!   So by when another node may claim the purge, and so before the purge
+//!   can be done and the tenant made again, every delete sent under the
+//!   claim has landed or never will. The last step is an assumption about
+//!   the store and not something the node enforces: giving a request up
+//!   stops the node waiting, not the store working, and the margin given
+//!   it is what [`LANDED_AFTER`] says and why. A purge that failed before
+//!   any delete was sent lets its claim go at once.
 //! - A node that stalls past its claim, unseen by its own timers, is held
 //!   to the same: it asks its claim's clock, which counts time the machine
 //!   was suspended, before every delete, and sends none once the claim is
@@ -64,21 +68,38 @@
 //!   once it is written that every file it lists is there, and copies
 //!   back any that went, as does the next that lists the file.
 //!
-//! One thing this does not cover, and nothing short of the store refusing
-//! a stale delete would: a machine suspended in the middle of a request,
-//! after its clock was asked and before the bytes left, or between one try
-//! and the next inside the store's client, which tries again by timers
-//! that stop with the machine and asks no clock. Woken after its claim ran
-//! out, it sends that one request, at most [`DELETED_AT_ONCE`] of them, for
-//! files it listed before it stalled. The files in the backups it may so
-//! delete are put back as any deleted late from under a backup are, by the
-//! backup looking again once it is written and by the next that lists the
-//! file. The files in the store are not: a restore from a backup looks
-//! that every file the backup lists is there just before it commits, and
-//! fetches again any that went, but a delete that lands after the commit
-//! is not seen until the file is read.
+//! A machine suspended while a delete waits, as between one try and the
+//! next inside the store's client, which tries again by timers that stop
+//! with the machine, sends nothing once woken: the work under a claim asks
+//! the claim's clock every time it is taken up again, whatever woke it,
+//! and is dropped where it stands once the claim is no longer taken for
+//! held.
+//!
+//! What stays open, and nothing short of the store refusing a stale delete
+//! would close:
+//!
+//! - A machine suspended inside one step of the work, after the clock was
+//!   asked and before the bytes left. Woken past its claim, it sends what
+//!   that step was sending: at most [`DELETED_AT_ONCE`] deletes, of files
+//!   it listed before it stalled.
+//! - A pause that stops every clock the machine has, as a hypervisor
+//!   freezing a guest does: no clock it can ask counts it, and the node
+//!   goes on as if no time had passed. The same bound holds for what one
+//!   batch sends, but not for the batches after it until the claim's next
+//!   renewal is refused, which is before each.
+//!
+//! A file in the backups deleted so is put back as any deleted late from
+//! under a backup is, by the backup looking again once it is written and
+//! by the next that lists the file. A file in the tenants' store is not
+//! put back: the tenant fails loudly when it is next opened, naming the
+//! file, and the file is still in the backup the lineage was taken up
+//! from. A restore from a backup looks, just before it commits, that every
+//! file the backup lists is there, by name alone, not by size or sum, and
+//! fetches again any that went; a delete that lands after the commit is
+//! not seen until the file is read.
 //!
 //! [`DELETED_AT_ONCE`]: vellev_storage::backups::DELETED_AT_ONCE
+//! [`LANDED_AFTER`]: crate::LANDED_AFTER
 //!
 //! Removing a tenant removes everything kept of it, which a node still
 //! writing for it when it is removed could undo: a writer uploading a file,

@@ -1256,6 +1256,120 @@ async fn a_lease_moved_on_is_told_so_whatever_its_commit_adopts_and_whatever_is_
     assert_eq!(taken_up(h, &key.tenant).await.0, to_be.lineage);
 }
 
+/// Every answer to a commit, by what is committed, whose lease commits,
+/// what adoption is noted and for whom, how the commit stands to what is
+/// committed, and what it says of adopting: asked in one order whatever
+/// the coordinator. The lease first: one moved on is told so. Then the
+/// commit: one that neither follows what is committed, by what it says
+/// it follows too, nor repeats it, is told that. Only then the adoption.
+async fn a_commit_is_answered_by_its_lease_then_what_it_follows_then_the_adoption(h: &dyn Harness) {
+    let c = h.coordinator();
+    let named = |head: &str| Some(ManifestRef(head.into()));
+    for committed in [false, true] {
+        for stale in [false, true] {
+            for noted in ["none", "for the stale lease", "for the current lease"] {
+                for relation in [
+                    "advances",
+                    "repeats",
+                    "neither",
+                    "after another head",
+                    "after another position",
+                ] {
+                    for says in ["nothing", "the lineage noted", "another lineage"] {
+                        let cell = format!(
+                            "committed {committed}, stale {stale}, noted {noted}, {relation}, says {says}"
+                        );
+                        let key = registered(h).await;
+                        let (first, _) = lease(h, &key, &node("a")).await;
+                        if committed {
+                            c.commit(&first, commit(1, "base")).await.unwrap();
+                        }
+                        let own = identity(h, &key.tenant).await.unwrap().lineage;
+                        let to_be = adoption(2);
+                        if noted == "for the stale lease" {
+                            let noted = c.adopt_on_commit(&key, first.generation, &to_be);
+                            assert_eq!(noted.await.unwrap(), !committed, "{cell}");
+                        }
+                        h.pass(&key, TTL + Duration::from_secs(1)).await;
+                        let (current, _) = lease(h, &key, &node("b")).await;
+                        if noted == "for the current lease" {
+                            let noted = c.adopt_on_commit(&key, current.generation, &to_be);
+                            assert_eq!(noted.await.unwrap(), !committed, "{cell}");
+                        }
+                        let at = u64::from(committed);
+                        let head = committed.then_some("base");
+                        let (position, manifest) = match relation {
+                            "repeats" => (at, head.and_then(named)),
+                            "neither" => (at, named("another")),
+                            _ => (2, named("m")),
+                        };
+                        let after = match relation {
+                            "after another head" => Some(Prior {
+                                position: LogPosition(at),
+                                head: named("nope"),
+                            }),
+                            "after another position" => Some(Prior {
+                                position: LogPosition(at + 1),
+                                head: head.and_then(named),
+                            }),
+                            _ => None,
+                        };
+                        let asked = Commit {
+                            after,
+                            log_position: LogPosition(position),
+                            manifest,
+                            restore: None,
+                            adopting: match says {
+                                "nothing" => None,
+                                "the lineage noted" => Some(to_be.lineage),
+                                _ => Some(Lineage(uuid::Uuid::new_v4())),
+                            },
+                        };
+                        let by = if stale { &first } else { &current };
+                        let answered = c.commit(by, asked).await;
+
+                        let adopting = !committed && noted == "for the current lease";
+                        let follows = matches!(relation, "advances" | "repeats");
+                        let adopts = relation == "advances" && says == "the lineage noted";
+                        let expected = match () {
+                            () if stale => "fenced",
+                            () if !follows => "does not follow",
+                            () if adopting && adopts => "adopted",
+                            () if adopting => "adopting",
+                            () if says != "nothing" => "unadopted",
+                            () => "made",
+                        };
+                        let got = match &answered {
+                            Ok(_) if adopting && adopts => "adopted",
+                            Ok(_) => "made",
+                            Err(CoordinatorError::Fenced { .. }) => "fenced",
+                            Err(CoordinatorError::Regressed { .. }) => "does not follow",
+                            Err(CoordinatorError::Adopting(_)) => "adopting",
+                            Err(CoordinatorError::Unadopted(_)) => "unadopted",
+                            Err(_) => "something else",
+                        };
+                        assert_eq!(got, expected, "{cell}: {answered:?}");
+
+                        // And nothing is left changed by a commit refused.
+                        let now = c.committed(&key).await.unwrap().unwrap();
+                        let lineage = identity(h, &key.tenant).await.unwrap().lineage;
+                        match expected {
+                            "adopted" => assert_eq!(lineage, to_be.lineage, "{cell}"),
+                            _ => assert_eq!(lineage, own, "{cell}"),
+                        }
+                        match expected {
+                            "adopted" | "made" => {
+                                assert_eq!(now.log_position, LogPosition(position), "{cell}")
+                            }
+                            _ => assert_eq!(now.log_position, LogPosition(at), "{cell}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn a_commit_repeated_does_not_record_its_restore_again(h: &dyn Harness) {
     let key = registered(h).await;
     let (lease, _) = lease(h, &key, &node("a")).await;
@@ -2043,6 +2157,7 @@ conformance! {
     a_commit_that_says_it_adopts_is_refused_unless_that_adoption_is_noted_for_its_lease,
     a_lease_moved_on_is_told_so_whatever_its_commit_adopts_and_whatever_is_noted,
     a_commit_repeated_does_not_record_its_restore_again,
+    a_commit_is_answered_by_its_lease_then_what_it_follows_then_the_adoption,
     a_tenant_given_a_key_or_written_to_elsewhere_meanwhile_takes_nothing_up,
     a_purge_claim_let_go_is_taken_again_at_once_and_any_other_is_left_be,
     a_tenant_removed_before_it_took_a_backup_up_is_purged_as_the_tenant_it_was,
