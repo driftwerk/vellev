@@ -51,7 +51,8 @@ use vellev_core::{Partition as PartitionNumber, TenantId};
 
 use crate::blobs::{is_plain, Blobs, Layout};
 use crate::coordinator::{
-    ClusterId, Coordinator, Identity, Incarnation, Lineage, LogPosition, PartitionKey, TenantKey,
+    Clock, ClusterId, Coordinator, Identity, Incarnation, Lineage, LogPosition, PartitionKey,
+    SystemClock, TenantKey,
 };
 use crate::partition::Partition;
 use crate::{Result, StorageError};
@@ -264,11 +265,22 @@ impl Home {
 #[derive(Debug, Clone)]
 pub struct Backups {
     store: Arc<dyn Blobs>,
+    /// What tells when a backup is taken, and how old one is.
+    clock: Arc<dyn Clock>,
 }
 
 impl Backups {
+    /// The backups kept in `store`, timed by the machine's clock.
     pub fn new(store: Arc<dyn Blobs>) -> Self {
-        Self { store }
+        Self {
+            store,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// These, timed by `clock` instead.
+    pub fn timed_by(self, clock: Arc<dyn Clock>) -> Self {
+        Self { clock, ..self }
     }
 
     /// Copy `partitions` of `owner`, as committed now, out of `primary`:
@@ -312,7 +324,8 @@ impl Backups {
         partitions: &[PartitionKey],
         held: &dyn Held,
     ) -> Result<Option<Copied>> {
-        let Some(backup) = taken(primary, coordinator, owner, partitions).await? else {
+        let now = self.clock.now();
+        let Some(backup) = taken(primary, coordinator, owner, partitions, now).await? else {
             return Ok(None);
         };
         let pending = record(&backup, PENDING);
@@ -530,7 +543,7 @@ impl Backups {
     /// so just before anything is deleted, and nothing more is if it is
     /// not.
     pub async fn prune(&self, owner: &Owner, keep: Duration, held: &dyn Held) -> Result<usize> {
-        let (home, now) = (owner.home(), Utc::now());
+        let (home, now) = (owner.home(), self.clock.now());
         let Records { usable, unusable } = self
             .records(&home, ".json")
             .await?
@@ -596,6 +609,31 @@ impl Backups {
         held: &dyn Held,
     ) -> Result<usize> {
         let prefix = &backup.home().files();
+        let wanted: Vec<(String, String)> = self
+            .lacking(primary, backup)
+            .await?
+            .into_iter()
+            .map(|key| (format!("{prefix}{key}"), key))
+            .collect();
+        let copied = wanted.len();
+        let copies = wanted.into_iter().map(|(kept, key)| async move {
+            still(held, &backup.tenant)?;
+            let bytes = self.store.get(&kept).await?;
+            // Asked again once the file is read, just before it is written.
+            still(held, &backup.tenant)?;
+            primary.put(&key, bytes).await
+        });
+        stream::iter(copies)
+            .buffer_unordered(AT_ONCE)
+            .try_collect::<()>()
+            .await?;
+        Ok(copied)
+    }
+
+    /// The files `backup` lists that `primary` lacks, by the keys they had
+    /// in it: what is still to be fetched back before `backup` can be
+    /// restored, or went since it was.
+    pub async fn lacking(&self, primary: &Arc<dyn Blobs>, backup: &Backup) -> Result<Vec<String>> {
         let mut present = HashSet::new();
         for taken in &backup.partitions {
             let layout = Layout(&taken.key(&backup.tenant)).prefix();
@@ -617,24 +655,11 @@ impl Backups {
                     .map(|listed| listed.key),
             );
         }
-        let wanted: Vec<(String, String)> = backup
+        Ok(backup
             .files()
             .filter(|key| !present.contains(*key))
-            .map(|key| (format!("{prefix}{key}"), key.to_string()))
-            .collect();
-        let copied = wanted.len();
-        let copies = wanted.into_iter().map(|(kept, key)| async move {
-            still(held, &backup.tenant)?;
-            let bytes = self.store.get(&kept).await?;
-            // Asked again once the file is read, just before it is written.
-            still(held, &backup.tenant)?;
-            primary.put(&key, bytes).await
-        });
-        stream::iter(copies)
-            .buffer_unordered(AT_ONCE)
-            .try_collect::<()>()
-            .await?;
-        Ok(copied)
+            .cloned()
+            .collect())
     }
 
     /// Forget `backup`, complete or pending, and leave its files, for
@@ -734,13 +759,14 @@ impl Aged {
     }
 }
 
-/// What a backup of `partitions` as committed now is to hold, or nothing if
-/// none of them has committed.
+/// What a backup of `partitions` as committed now, at `now`, is to hold, or
+/// nothing if none of them has committed.
 async fn taken(
     primary: &Arc<dyn Blobs>,
     coordinator: &dyn Coordinator,
     owner: &Owner,
     partitions: &[PartitionKey],
+    now: DateTime<Utc>,
 ) -> Result<Option<Backup>> {
     let mut taken = Vec::with_capacity(partitions.len());
     for key in partitions {
@@ -765,7 +791,7 @@ async fn taken(
         tenant: owner.tenant.clone(),
         lineage: owner.lineage,
         cluster: owner.cluster,
-        taken_at: taken_at(Utc::now()),
+        taken_at: taken_at(now),
         partitions: taken,
         keys: coordinator.keys(&owner.tenant).await?,
         restore_window: coordinator.restore_window(&owner.tenant).await?,

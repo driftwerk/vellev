@@ -1545,3 +1545,20 @@ async fn the_files_of_a_batch_are_deleted_together() {
         "as long as one delete for each batch"
     );
 }
+
+#[tokio::test]
+async fn a_backup_says_when_it_was_taken_by_its_clock_to_the_microsecond() {
+    let cluster = Cluster::new().await;
+    written(&cluster).await;
+    // A clock to the nanosecond, as a Linux machine's is: a coordinator
+    // keeps the time a restore went back to to the microsecond, and a
+    // backup that said a finer one would be another time read back.
+    let fine = chrono::DateTime::<Utc>::from_timestamp(1_760_000_000, 123_456_789).unwrap();
+    let clock = Arc::new(ManualClock::starting_at(fine));
+    let backups = Backups::new(memory()).timed_by(clock);
+    let backup = take(&backups, &cluster).await;
+    assert_eq!(backup.taken_at.timestamp(), 1_760_000_000);
+    assert_eq!(backup.taken_at.timestamp_subsec_nanos(), 123_456_000);
+    let own = owner(&cluster).await;
+    assert_eq!(backups.list(&own).await.unwrap(), [backup]);
+}

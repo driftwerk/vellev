@@ -316,6 +316,35 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_refused_for_an_adoption_is_a_conflict_and_one_by_a_lease_moved_on_is_not() {
+        let tenant = || TenantId::new("acme").unwrap();
+        let conflict = (StatusCode::CONFLICT, Code::Conflict);
+        let coordinator = StorageError::Coordinator;
+        assert_eq!(
+            told(coordinator(CoordinatorError::Adopting(tenant()))),
+            conflict
+        );
+        assert_eq!(
+            told(coordinator(CoordinatorError::Unadopted(tenant()))),
+            conflict
+        );
+        let key = vellev_storage::coordinator::PartitionKey {
+            tenant: tenant(),
+            partition: vellev_core::Partition::DEFAULT,
+        };
+        let generation = vellev_storage::coordinator::Generation;
+        let fenced = CoordinatorError::Fenced {
+            key,
+            held: generation(1),
+            current: generation(2),
+        };
+        assert_eq!(
+            told(coordinator(fenced)),
+            (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable)
+        );
+    }
+
+    #[test]
     fn a_commit_that_failed_as_a_whole_is_uncertain_and_one_callers_refusal_is_not() {
         let blob = || StorageError::Blob {
             key: "k".into(),

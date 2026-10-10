@@ -101,6 +101,11 @@ window ends, and nothing either release keeps is pruned by the other: see
   tenant is given the backup's keys only with `with_keys`, which brings
   back a key revoked after the backup was taken. Only a tenant never
   written to and without keys adopts; any other is a `conflict` (409).
+  So is a commit refused while a tenant is taking a backup up, and the
+  restore of an adoption that finds it no longer noted for the lease that
+  commits it, as when it was given up meanwhile: nothing was restored, and
+  the adoption may be asked for again. A node that lost the tenant to
+  another while it adopted answers `unavailable` (503), to be tried again.
 - **Two new codes, both 409**: `empty`, for backing up a tenant that has
   committed nothing, which answered 201 with a backup of nothing; and
   `purging`, with a `Retry-After` of how long the purge may still take,
@@ -109,7 +114,10 @@ window ends, and nothing either release keeps is pruned by the other: see
   Neither is one to send again at once: the Rust client takes both as
   final, and whoever makes a tenant again waits the `Retry-After` out.
 - **A removed tenant is purged under a renewed claim**, by one node, which
-  deletes nothing of a tenant made again under the id meanwhile; and the
+  deletes nothing of a tenant made again under the id meanwhile; a purge
+  that fails once it has sent a delete is taken up again when that claim
+  has run out, not before, so that no delete of unknown fate is on its
+  way when the id is taken again; and the
   tenant is looked over again for a day after, for files that landed
   late. A backup claim is held for `VELLEV_BACKUP_CLAIM_SECS` (15 minutes;
   at least three times what one request to the store may take with its

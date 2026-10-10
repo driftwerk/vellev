@@ -224,7 +224,11 @@ a `Retry-After` of how long that may be. One node at a time purges a
 tenant, by a claim it renews before every listing and every batch of
 deletes, and which is renewed only while the purge is still that node's to
 do and no tenant of the id has been made: a node that stalls in the middle
-of a purge deletes nothing of a tenant made since.
+of a purge deletes nothing of a tenant made since. A purge that fails once
+it has sent a delete is taken up again only when its claim has run out,
+`VELLEV_BACKUP_CLAIM_SECS` later at most, and not at once: a delete it gave
+up on may yet land, and must not on a tenant made since, least of all one
+taken up again from a backup, whose files have the names they had.
 
 A node that stalled may still land a file after that: a writer's upload,
 or a backup's copy. So for a day after a purge the tenant is looked over

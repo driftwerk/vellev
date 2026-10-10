@@ -141,6 +141,28 @@ impl PostgresCoordinator {
         else {
             return Ok(None);
         };
+        // A lease moved on is told so, whatever its commit says of
+        // adopting and whatever is noted: the answer is the lease's, to be
+        // tried again by whoever holds the partition now.
+        if generation != bigint(lease.generation.0)? {
+            return Ok(None);
+        }
+        // Nor is a commit that neither follows what is committed nor
+        // repeats it told anything of adoptions: it does not follow, as
+        // the statement itself would find.
+        let head = commit.manifest.as_ref().map(|head| head.0.as_str());
+        let at = bigint(commit.log_position.0)?;
+        let follows = match &commit.after {
+            None => true,
+            Some(after) => {
+                bigint(after.position.0)? == position
+                    && after.head.as_ref().map(|head| head.0.as_str()) == manifest.as_deref()
+            }
+        };
+        let repeats = at == position && head == manifest.as_deref();
+        if !(repeats || (follows && at > position)) {
+            return Ok(None);
+        }
         // What is noted for this lease, on a partition that has yet to
         // commit: anything else noted is of a lease moved on, and no more.
         let committed = position != 0 || manifest.is_some();
@@ -170,10 +192,7 @@ impl PostgresCoordinator {
             }
             (None, Some(says)) => {
                 // Only the very commit that made the adoption, asked again.
-                let made = says.0 == lineage
-                    && bigint(commit.log_position.0)? == position
-                    && commit.manifest.as_ref().map(|head| head.0.as_str()) == manifest.as_deref();
-                if !made {
+                if !(repeats && says.0 == lineage) {
                     return Err(CoordinatorError::Unadopted(tenant.clone()));
                 }
             }
@@ -452,10 +471,18 @@ struct Adopting {
 /// A commit, as one statement: fenced by the lease's generation, and
 /// advancing the partition or repeating what is committed. `$guard` is
 /// what more the row must satisfy.
+///
+/// The restore a commit makes is recorded with the commit that advances
+/// the partition, and not again by that commit repeated, which makes
+/// nothing: `was` is the position before the statement, every part of
+/// which sees the partition as it was when the statement began.
 macro_rules! commit {
     ($guard:literal) => {
         concat!(
-            "WITH done AS (
+            "WITH was AS (
+                 SELECT log_position AS position FROM vellev.partitions
+                 WHERE tenant = $1 AND partition = $2
+             ), done AS (
                  UPDATE vellev.partitions
                  SET log_position = $4, manifest = $5
                  WHERE tenant = $1 AND partition = $2 AND generation = $3
@@ -474,7 +501,7 @@ macro_rules! commit {
                  INSERT INTO vellev.restores
                      (tenant, partition, request, asked, incarnation, position, from_position, from_at)
                  SELECT $1, $2, $6, $9, incarnation, log_position, $7, $8 FROM done
-                 WHERE $6::uuid IS NOT NULL
+                 WHERE $6::uuid IS NOT NULL AND log_position > (SELECT position FROM was)
                  ON CONFLICT (tenant, partition, incarnation, request) DO UPDATE
                  SET asked = EXCLUDED.asked, position = EXCLUDED.position,
                      from_position = EXCLUDED.from_position, from_at = EXCLUDED.from_at,

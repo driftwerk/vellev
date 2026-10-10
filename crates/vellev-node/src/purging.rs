@@ -12,16 +12,63 @@
 //! be done, the claim is still this node's, and the tenant has not been
 //! made again: a node that stalled past its claim, while another finished
 //! the purge and the tenant was made again, deletes nothing of the new
-//! tenant. What it may still delete is what it was told it might before it
-//! stalled: the files of the batch it had listed then. In the store those
-//! are the old tenant's, whose names no later tenant's files take. In the
-//! backups they are of the old tenant's lineage and this cluster's taking,
-//! which is only ever some other tenant's again if that very lineage is
-//! taken up again here, from a backup another cluster took or one put
-//! back, and backed up, all before the stalled node goes on: a file its new
-//! backup reuses may then be among them, and is put back as any file
-//! deleted late from under a backup is, by the backup looking again once it
-//! is written and by the next that lists the file.
+//! tenant.
+//!
+//! # A delete whose fate is not known
+//!
+//! A delete sent to a store and not answered may yet land: given up after
+//! as long as a request may take, cut short with the work it was part of,
+//! or dropped with the rest of its batch when one of them failed. Where it
+//! lands matters, because a file's name is not the old tenant's alone. A
+//! tenant made afresh under the name writes files under other names, by
+//! its own incarnation and author; but one that takes the old tenant's
+//! lineage up again from a backup has the backup's files written back
+//! under the very keys they had, in the store, and backs them up again
+//! under the very keys in the backups. A delete of the old tenant's that
+//! lands after that takes a file from under the new one, which has
+//! committed to it. So no tenant may be made under the name while such a
+//! delete may still land, and the rule is kept by the claim:
+//!
+//! - A purge that is done has had every delete it sent answered. A pass
+//!   counts as having deleted only if every delete of every batch was
+//!   answered as made: one that fails, or is given up, fails its batch,
+//!   which drops the others of it, and the pass, and the purge with it; no
+//!   error from a delete is taken for anything else on the way. And the
+//!   purge is noted done only by a later pass that found nothing and sent
+//!   nothing. The same holds of a purge that gives up while the tenant is
+//!   still being written to: every delete was answered, and its claim is
+//!   let go at once.
+//! - A purge that fails, or is cut short, or is dropped, once any delete
+//!   was sent under its claim, leaves the claim to run out rather than let
+//!   it go. A delete is sent only while the claim is taken for held, a
+//!   third of its hold before it could run out; it lands, if it does,
+//!   within what a request to the store may take; and a node is not run
+//!   with a claim a third of which is less than that. So by when another
+//!   node may claim the purge, and so before the purge can be done and
+//!   the tenant made again, every delete sent under the claim has landed
+//!   or never will. A purge that failed before any delete was sent lets
+//!   its claim go at once.
+//! - A node that stalls past its claim, unseen by its own timers, is held
+//!   to the same: it asks its claim's clock, which counts time the machine
+//!   was suspended, before every delete, and sends none once the claim is
+//!   no longer taken for held; and whoever purges next does so only once
+//!   the claim has run out.
+//!
+//! One thing this does not cover, and nothing short of the store refusing
+//! a stale delete would: a machine suspended in the middle of a request,
+//! after its clock was asked and before the bytes left, or between one try
+//! and the next inside the store's client, which tries again by timers
+//! that stop with the machine and asks no clock. Woken after its claim ran
+//! out, it sends that one request, at most [`DELETED_AT_ONCE`] of them, for
+//! files it listed before it stalled. The files in the backups it may so
+//! delete are put back as any deleted late from under a backup are, by the
+//! backup looking again once it is written and by the next that lists the
+//! file. The files in the store are not: a restore from a backup looks
+//! that every file the backup lists is there just before it commits, and
+//! fetches again any that went, but a delete that lands after the commit
+//! is not seen until the file is read.
+//!
+//! [`DELETED_AT_ONCE`]: vellev_storage::backups::DELETED_AT_ONCE
 //!
 //! Removing a tenant removes everything kept of it, which a node still
 //! writing for it when it is removed could undo: a writer uploading a file,
@@ -303,18 +350,27 @@ impl Inner {
         let Some(purge) = claimed else {
             return Ok(None);
         };
-        // The claim is let go whichever way this ends, and left to run out
-        // only if the coordinator does not answer: a purge not done is
-        // taken up again by the next pass, not a claim later.
+        // What becomes of the claim is what keeps a delete of unknown fate
+        // from landing on a tenant made since: see the module's account.
         let claim = self.purge_claim(tenant, purge.id, hold).renewed(asked);
         match self.purged_under(&purge, &claim).await {
+            // Done: the coordinator has ended the claim.
             Ok(Some(deleted)) => {
                 claim.ended();
                 Ok(Some(deleted))
             }
-            not_done => {
+            // Still written to: every delete sent was answered, and the
+            // next pass may go on at once.
+            Ok(None) => {
                 claim.let_go(false).await;
-                not_done
+                Ok(None)
+            }
+            // Failed or cut short: dropped, the claim is let go if no
+            // delete was sent under it, and otherwise left to run out, as
+            // it is if this future is dropped before it gets here.
+            Err(error) => {
+                drop(claim);
+                Err(error)
             }
         }
     }
@@ -373,6 +429,7 @@ impl Inner {
             id,
             hold,
             within: self.settings.request_bounds.coordinator,
+            deleted: Arc::default(),
         }
     }
 
@@ -384,14 +441,16 @@ impl Inner {
         let tenant = &removed.tenant;
         held(claim, tenant).await?;
         let files = self.files(tenant).await?;
-        backups::delete(&self.store(), tenant, &files, claim)
+        let store = claim.deleting_through(Arc::new(self.store()));
+        backups::delete(store.as_ref(), tenant, &files, claim)
             .await
             .map_err(claimed)?;
         let backed_up = match self.settings.backups {
             Some(_) => {
                 held(claim, tenant).await?;
                 let kept = self.kept(removed).await?;
-                let purged = self.backups()?.purge(&kept, claim).await;
+                let backups = self.backups_through(|store| claim.deleting_through(store))?;
+                let purged = backups.purge(&kept, claim).await;
                 purged.map_err(claimed)?
             }
             None => 0,

@@ -78,6 +78,7 @@
 //! [`DELETED_AT_ONCE`]: vellev_storage::backups::DELETED_AT_ONCE
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -341,11 +342,26 @@ impl Node {
                     .adopting(backup, taken.position, with_keys, generation);
                 claim.during(noting).await?;
             }
+            // Looked for again just before the commit, under the claim:
+            // loading the state to restore reads the files it does not
+            // hold already, and no others, so one that went since it was
+            // fetched, as by a delete sent long before and landing late,
+            // could be committed to unseen. Any that went is fetched again
+            // with the next try, and the restore refused if it keeps on.
+            let looking = backups.lacking(&primary, backup);
+            let lacking = claim
+                .during(async { looking.await.map_err(claimed) })
+                .await?;
             claim.still()?;
-            match opened
-                .restored(head.clone(), restore.clone(), adopting)
-                .await
-            {
+            let restored = match lacking.into_iter().next() {
+                Some(key) => Err(NodeError::Storage(StorageError::Missing { key })),
+                None => {
+                    opened
+                        .restored(head.clone(), restore.clone(), adopting)
+                        .await
+                }
+            };
+            match restored {
                 Err(NodeError::Storage(StorageError::Missing { key })) if attempt < ATTEMPTS => {
                     tracing::info!(%tenant, key, "a file went before it was restored; again");
                     attempt += 1;
@@ -399,12 +415,18 @@ impl Inner {
     /// request to object storage may take: the bound a claim's margin is
     /// checked against is the one the node keeps to.
     pub(crate) fn backups(&self) -> Result<Backups> {
+        self.backups_through(|store| store)
+    }
+
+    /// [`Self::backups`], asked through whatever `through` makes of the
+    /// store so bounded.
+    pub(crate) fn backups_through(
+        &self,
+        through: impl FnOnce(Arc<dyn Blobs>) -> Arc<dyn Blobs>,
+    ) -> Result<Backups> {
         let within = self.settings.request_bounds.store;
-        self.settings
-            .backups
-            .clone()
-            .map(|inner| Backups::new(Arc::new(Within { inner, within })))
-            .ok_or(NodeError::NoBackups)
+        let inner = self.settings.backups.clone().ok_or(NodeError::NoBackups)?;
+        Ok(Backups::new(through(Arc::new(Within { inner, within }))))
     }
 
     /// Which tenant `tenant` is now, and as the backups this cluster takes
@@ -554,6 +576,7 @@ impl Inner {
             id: Uuid::new_v4(),
             hold: self.settings.backup_claim,
             within: self.settings.request_bounds.coordinator,
+            deleted: Arc::default(),
         };
         let asked = self.settings.claim_clock.now();
         let (id, hold, within) = (claimed.id, claimed.hold, claimed.within);
@@ -733,6 +756,39 @@ impl Blobs for Within {
     }
 }
 
+/// A store that notes, before it is asked for each, that a delete was sent
+/// through it under a claim: sent, whatever becomes of it, answered or
+/// given up or its future dropped, for the store may have it.
+#[derive(Debug)]
+struct Deleting {
+    inner: Arc<dyn Blobs>,
+    sent: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Blobs for Deleting {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn list_within(
+        &self,
+        prefix: &str,
+        each: Duration,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list_within(prefix, each).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.sent.store(true, Ordering::SeqCst);
+        self.inner.delete(key).await
+    }
+}
+
 /// What a claim is the right to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Right {
@@ -754,6 +810,9 @@ pub(crate) struct Claimed {
     pub(crate) id: Uuid,
     pub(crate) hold: Duration,
     pub(crate) within: Duration,
+    /// Whether a delete was sent under the claim, through a store that
+    /// says so ([`Claim::deleting_through`]).
+    pub(crate) deleted: Arc<AtomicBool>,
 }
 
 impl Claimed {
@@ -913,17 +972,46 @@ impl Claim {
         self.renewing.abort();
         self.let_go = true;
     }
+
+    /// `store`, noting on the claim each delete sent through it: so that
+    /// the claim, dropped, knows whether one may still be on its way.
+    pub(crate) fn deleting_through(&self, store: Arc<dyn Blobs>) -> Arc<dyn Blobs> {
+        Arc::new(Deleting {
+            inner: store,
+            sent: self.of.deleted.clone(),
+        })
+    }
+
+    /// Whether the claim, dropped now, is to be left to run out rather
+    /// than let go: a claim to purge under which a delete was sent. The
+    /// purge it was dropped from did not end well, or it would have been
+    /// let go or ended, so the fate of its last deletes is not known: one
+    /// given up unanswered, or cut short with the work, may yet land. It
+    /// lands within what a request to the store may take, and was sent
+    /// while the claim was taken for held, a third of a hold before it
+    /// could run out; a third of a hold is at least what a request may
+    /// take ([`RequestBounds::claim_problem`]). So by when the claim has
+    /// run out, and no sooner, nobody purges the tenant or makes it again
+    /// under a delete still to land. Let go at once, the next pass would
+    /// purge it, the name be taken, and the delete land on the new tenant:
+    /// on the very keys, if it took the old one's lineage up from a
+    /// backup.
+    fn left_to_run_out(&self) -> bool {
+        self.of.right == Right::Purge && self.of.deleted.load(Ordering::SeqCst)
+    }
 }
 
 /// A claim dropped without being let go, as one is when the task holding
-/// it is stopped, is let go on a task of its own, which runs to its end
-/// whatever becomes of the one that held the claim: so a claim is never
-/// left to run out because the work under it was cut short. One that
-/// cannot be let go, the coordinator not answering, runs out by itself.
+/// it is stopped or the work under it fails, is let go on a task of its
+/// own, which runs to its end whatever becomes of the one that held the
+/// claim: so a claim is not left to run out because the work under it was
+/// cut short. One that cannot be let go, the coordinator not answering,
+/// runs out by itself; and one to purge under which a delete was sent is
+/// left to ([`Claim::left_to_run_out`]).
 impl Drop for Claim {
     fn drop(&mut self) {
         self.renewing.abort();
-        if self.let_go {
+        if self.let_go || self.left_to_run_out() {
             return;
         }
         let of = self.of.clone();
