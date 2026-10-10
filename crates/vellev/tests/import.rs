@@ -4170,3 +4170,49 @@ async fn what_was_withheld_and_is_found_held_when_weaviate_is_asked_is_still_cou
     assert_eq!(report.outcome(false), Outcome::Unsettled);
     assert!(report.classes[class].caught_up());
 }
+
+#[tokio::test]
+async fn an_object_another_writer_deletes_while_the_import_replaces_it_is_not_brought_back() {
+    let Some(importing) = Importing::new("VellevImportDeletedReplace", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // One object, read by itself: deleted between that and its replacing.
+    weaviate.put(class, 4, changed(4)).await;
+    let records = importing.records.clone();
+    let read = importing.read(4);
+    importing
+        .front
+        .after(0, &["GET", &read], move || async move {
+            records.delete(oid(4)).await.unwrap();
+        });
+    assert_eq!(importing.counts().await, ([0, 0, 0, 1, 0], [10, 10, 9]));
+    assert!(importing.front.spent());
+    assert!(importing.get(4).await.is_none());
+    // Three, read as one range and replaced by one request: two of them
+    // deleted in between. The third is replaced all the same.
+    for n in [5, 6, 7] {
+        weaviate.put(class, n, changed(n)).await;
+    }
+    let records = importing.records.clone();
+    let read = format!("/collections/{class}/list");
+    importing
+        .front
+        .after(0, &["POST", &read], move || async move {
+            for n in [5, 7] {
+                records.delete(oid(n)).await.unwrap();
+            }
+        });
+    assert_eq!(importing.counts().await, ([0, 1, 0, 3, 0], [10, 10, 7]));
+    assert!(importing.front.spent());
+    for n in [4, 5, 7] {
+        assert!(importing.get(n).await.is_none(), "note {n} came back");
+    }
+    assert_eq!(
+        importing.get(6).await.unwrap().properties["n"],
+        json!(1_000_006)
+    );
+    // And stays so.
+    assert_eq!(importing.counts().await, ([0, 0, 0, 3, 0], [10, 10, 7]));
+}
