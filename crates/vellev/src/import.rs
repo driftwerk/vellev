@@ -780,10 +780,18 @@ pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Re
         if plan.binding.adopting {
             // Every id Weaviate held has its entry: one without from now
             // on is new to Weaviate.
+            let name = &plan.schema.name;
+            let noted = tenant.collection(&imports()).get(Binding::id(name)).await?;
+            let noted = noted.as_ref().map(Binding::held).transpose()?;
+            let Some((_, at)) = noted.filter(|(noted, _)| *noted == plan.binding) else {
+                bail!(
+                    "the note of where collection {name} was imported from changed under the import: {OTHER_IMPORT}"
+                );
+            };
             plan.binding.adopting = false;
             plan.binding.census = false;
-            tenant
-                .apply(vec![plan.binding.change(&plan.schema.name)])
+            plan.binding
+                .write(tenant, name, Some(at), Vec::new())
                 .await?;
         }
     }
@@ -822,7 +830,7 @@ pub async fn finalise(tenant: &Tenant, classes: &[String]) -> Result<Vec<String>
             Err(error) => return Err(error.into()),
         };
         for stored in &listed.objects {
-            let mut binding = Binding::read(stored)?;
+            let (mut binding, at) = Binding::held(stored)?;
             let Some(class) = binding.class.clone() else {
                 continue;
             };
@@ -834,11 +842,11 @@ pub async fn finalise(tenant: &Tenant, classes: &[String]) -> Result<Vec<String>
             binding.finalised = true;
             binding.adopting = false;
             binding.census = false;
-            let mut changes = vec![binding.change(&name)];
+            let mut changes = Vec::new();
             if tenant.collection(&ledger).schema().await?.is_some() {
                 changes.push(Change::DropCollection { collection: ledger });
             }
-            tenant.apply(changes).await?;
+            binding.write(tenant, &name, Some(at), changes).await?;
             ended.push(class);
         }
         match listed.next {
@@ -885,7 +893,8 @@ async fn prepare(
         .collection(&imports())
         .get(Binding::id(&name))
         .await?;
-    let bound = bound.as_ref().map(Binding::read).transpose()?;
+    let bound = bound.as_ref().map(Binding::held).transpose()?;
+    let (bound, noted_at) = bound.unzip();
     let ended = bound.as_ref().is_some_and(|bound| bound.finalised);
     if ended && options.classes.is_empty() {
         return Ok(None);
@@ -999,12 +1008,8 @@ async fn prepare(
     };
     let noted = tenant.collection(&imports()).schema().await?;
     changes.extend(grown(noted, bookkeeping(imports(), &Binding::PROPERTIES)));
-    changes.push(binding.change(&name));
     if options.mode == Mode::Import {
-        tenant
-            .apply(changes)
-            .await
-            .wrap_err_with(|| format!("preparing collection {name}"))?;
+        binding.write(tenant, &name, noted_at, changes).await?;
     } else if begins {
         bail!(
             "class {} has not been imported: there is nothing to compare",
@@ -1116,8 +1121,10 @@ impl Binding {
         ObjectId(uuid::Uuid::from_slice(&hash[..16]).expect("sixteen bytes"))
     }
 
-    /// The change that notes it for `collection`.
-    fn change(&self, collection: &CollectionName) -> Change {
+    /// The change that notes it for `collection`: over the note that
+    /// `was` there, if it is still at that version, or else only if
+    /// there is still none.
+    fn change(&self, collection: &CollectionName, was: Option<Version>) -> Change {
         let text = |value: &Option<String>| value.as_ref().map(|value| json!(value));
         let flag = |value: bool| value.then_some(json!(true));
         let values = [
@@ -1132,14 +1139,60 @@ impl Binding {
             flag(self.census),
         ];
         let properties = Self::PROPERTIES.iter().zip(values);
-        Change::Upsert {
-            collection: imports(),
-            id: Self::id(collection),
-            properties: properties
-                .filter_map(|((name, _), value)| Some((name.to_string(), value?)))
-                .collect(),
-            vector: None,
-            only_if_version: None,
+        let properties = properties
+            .filter_map(|((name, _), value)| Some((name.to_string(), value?)))
+            .collect();
+        let (collection, id, vector) = (imports(), Self::id(collection), None);
+        match was {
+            Some(was) => Change::Upsert {
+                collection,
+                id,
+                properties,
+                vector,
+                only_if_version: Some(was),
+            },
+            None => Change::Insert {
+                collection,
+                id,
+                properties,
+                vector,
+            },
+        }
+    }
+
+    /// The note as the tenant holds it, and the version it is at, which
+    /// writing it anew is conditional on.
+    fn held(stored: &Stored) -> Result<(Self, Version)> {
+        let Some(at) = stored.version else {
+            bail!(
+                "the node gave no version for the note of where a collection was imported from: it is of a release before 0.2, and the import keeps none on one"
+            );
+        };
+        Ok((Self::read(stored)?, at))
+    }
+
+    /// Write the note of `collection`, which was at `was` when read, or
+    /// was not there. Refused, something else wrote it meanwhile: an
+    /// import that began, or one that was ended.
+    async fn write(
+        &self,
+        tenant: &Tenant,
+        collection: &CollectionName,
+        was: Option<Version>,
+        with: Vec<Change>,
+    ) -> Result<()> {
+        let mut changes = with;
+        changes.push(self.change(collection, was));
+        match tenant.apply(changes).await {
+            Ok(_) => Ok(()),
+            Err(error) if refusal(&error) == Some(Refusal::Overtaken) => {
+                Err(error).wrap_err_with(|| {
+                    format!(
+                        "the note of where collection {collection} was imported from changed under the import: {OTHER_IMPORT}"
+                    )
+                })
+            }
+            Err(error) => Err(error).wrap_err_with(|| format!("preparing collection {collection}")),
         }
     }
 
@@ -1847,7 +1900,23 @@ impl<'a> Copying<'a> {
             .into_iter()
             .partition(|change| matches!(change, Change::Delete { .. }));
         gone.forgotten.extend::<Vec<Change>>(forgotten);
-        self.noted(noted).await
+        self.noted(noted).await?;
+        // No more are held than a page of them: Weaviate is checked, as
+        // at the end of the walk, and they are forgotten.
+        if gone.forgotten.len() >= self.options.page {
+            self.forget_unlisted(gone).await?;
+        }
+        Ok(())
+    }
+
+    /// Forget the entries of objects neither Weaviate, by its listing,
+    /// nor the collection holds, once Weaviate says it is ready and the
+    /// class the one imported.
+    async fn forget_unlisted(&self, gone: &mut Gone) -> Result<()> {
+        self.weaviate
+            .steady(&self.plan.class, &self.plan.binding)
+            .await?;
+        self.noted(std::mem::take(&mut gone.forgotten)).await
     }
 
     /// Write ledger entries that do not hang on one another, no more of
@@ -2327,8 +2396,7 @@ impl<'a> Copying<'a> {
         }
         // A class made again while it was walked is not gone on from, and
         // one that is not ready is not asked what it does not hold.
-        self.weaviate.steady(class, &self.plan.binding).await?;
-        self.noted(std::mem::take(&mut gone.forgotten)).await?;
+        self.forget_unlisted(&mut gone).await?;
         self.remove(gone, copied).await
     }
 
@@ -3952,10 +4020,12 @@ mod tests {
 
     const ENTRY: &str = "vellev_imported_Memory";
     /// How many cells the table of everything a run can meet has: those
-    /// where what a run may do is checked, those among them where it
-    /// must do something, and those where the last guard on deleting is
-    /// asked by itself.
-    const SAFETY: usize = 7_780;
+    /// where what a run may do is checked; those where what a later run
+    /// may do to what was said to be another writer's is; those among
+    /// the first where a run must do something; and those where the last
+    /// guard on deleting is asked by itself.
+    const SAFETY: usize = 1_380;
+    const LATER: usize = 6_400;
     const LIVENESS: usize = 404;
     const DIRECT: usize = 440;
 
@@ -4377,6 +4447,35 @@ mod tests {
         ] {
             assert!(!unversed(Code::Invalid, message), "{message}");
         }
+    }
+
+    #[test]
+    fn the_note_of_a_collection_is_written_only_over_the_one_read_or_where_there_is_none() {
+        let fixture = Fixture::new(options());
+        let (binding, name) = (&fixture.plan.binding, &fixture.plan.schema.name);
+        let at = fixture.stored("fox").version;
+        match binding.change(name, at) {
+            Change::Upsert {
+                collection,
+                only_if_version,
+                ..
+            } => assert_eq!((collection.as_str(), only_if_version), (IMPORTS, at)),
+            other => panic!("{other:?}"),
+        }
+        assert!(at.is_some());
+        assert!(matches!(binding.change(name, None), Change::Insert { .. }));
+        // One the node gives no version for is not read.
+        let noted = |version: Option<&str>| {
+            let Change::Insert { id, properties, .. } = binding.change(name, None) else {
+                unreachable!()
+            };
+            let stored = json!({ "id": id, "properties": properties, "version": version });
+            Binding::held(&serde_json::from_value(stored).unwrap())
+        };
+        let (read, _) = noted(Some("000102030405060708090a0b0c0d0e0f")).unwrap();
+        assert_eq!(&read, binding);
+        let stopped = noted(None).unwrap_err().to_string();
+        assert!(stopped.contains("gave no version"), "{stopped}");
     }
 
     #[test]
@@ -4914,7 +5013,7 @@ mod tests {
         };
         let fixtures = TOLD.map(told);
         let fixture = |said: Told| &fixtures[TOLD.iter().position(|told| *told == said).unwrap()];
-        let (mut safety, mut liveness, mut direct) = (0, 0, 0);
+        let (mut safety, mut relapses, mut liveness, mut direct) = (0, 0, 0, 0);
         for entry in &entries {
             for weaviate in [true, false] {
                 for stored in &held {
@@ -5102,7 +5201,7 @@ mod tests {
                             for later in TOLD {
                                 for weaviate in [true, false] {
                                     for stored in &held {
-                                        safety += 1;
+                                        relapses += 1;
                                         let stored = stored.as_ref();
                                         let later = fixture(later);
                                         let changes =
@@ -5181,7 +5280,10 @@ mod tests {
         }
         // Every cell was looked at: change the tables above, and say so
         // here.
-        assert_eq!((safety, liveness, direct), (SAFETY, LIVENESS, DIRECT));
+        assert_eq!(
+            (safety, relapses, liveness, direct),
+            (SAFETY, LATER, LIVENESS, DIRECT)
+        );
     }
 
     #[test]

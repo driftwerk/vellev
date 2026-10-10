@@ -4521,3 +4521,32 @@ async fn an_entry_is_not_forgotten_on_the_word_of_a_class_that_was_made_again() 
     let entry = importing.entry(3).await.expect("the entry was forgotten");
     assert_eq!(entry["gone"], json!(true));
 }
+
+#[tokio::test]
+async fn an_import_ended_while_a_run_begins_is_not_begun_again_by_it() {
+    let Some(importing) = Importing::new("VellevImportEndedUnder", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    // The import is ended once a run has read the note of the
+    // collection and before it writes it: the run's note, of an import
+    // that goes on, is not written over the one that says it ended.
+    let tenant = importing.tenant.clone();
+    let noted = "/collections/vellev_imports/objects/";
+    importing
+        .front
+        .after(0, &["GET", noted], move || async move {
+            import::finalise(&tenant, &[]).await.unwrap();
+        });
+    let stopped = importing.run().await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("is another import of the tenant running?"),
+        "{stopped:#}"
+    );
+    assert_eq!(binding(&importing).await["finalised"], json!(true));
+    let refused = importing.run().await.unwrap_err();
+    assert!(refused.to_string().contains("was ended"), "{refused}");
+    assert!(importing.ledger().schema().await.unwrap().is_none());
+    assert_eq!(importing.records.count(None).await.unwrap(), 10);
+}
