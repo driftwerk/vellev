@@ -1534,7 +1534,9 @@ async fn a_weaviate_that_lists_its_ids_out_of_order_is_not_caught_up_with() {
 
     // Nor is a ledger the node lists out of order walked.
     let list = format!("/collections/vellev_imported_{}/list", importing.class);
-    let entry = |n: u64| json!({ "id": uuid(n), "properties": { "hash": "h" } });
+    let version = "000102030405060708090a0b0c0d0e0f";
+    let entry =
+        |n: u64| json!({ "id": uuid(n), "properties": { "hash": "h" }, "version": version });
     let unordered = json!({ "objects": [entry(3), entry(2)] });
     importing
         .front
@@ -4469,4 +4471,39 @@ async fn a_page_taken_up_one_object_at_a_time_is_settled_as_one_being_taken_up()
         json!(1_000_002)
     );
     assert_eq!(report.outcome(true), Outcome::Settled);
+}
+
+#[tokio::test]
+async fn an_entry_is_not_forgotten_on_the_word_of_a_class_that_was_made_again() {
+    let Some(importing) = Importing::new("VellevImportForgetRemade", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // Another writer's object, left when Weaviate deleted the id, and
+    // then removed from the collection by that writer: its entry is one
+    // to forget.
+    importing.records.put(oid(3), &foreign(3)).await.unwrap();
+    weaviate.delete(class, 3).await;
+    assert_eq!(importing.counts().await, ([0, 0, 0, 0, 1], [9, 9, 10]));
+    importing.records.delete(oid(3)).await.unwrap();
+    // The class is made again as the walk begins, and lists nothing.
+    // That is not believed, and the entry stays: forgotten, the id would be stored
+    // as new by the next run to see it.
+    let again = weaviate.clone();
+    let page = importing.page(false);
+    importing
+        .proxy
+        .before(0, &strs(&page), move |_| async move {
+            again.drop(class).await;
+            again.make(class).await;
+        });
+    let refused = importing.run().await.unwrap_err();
+    assert!(importing.proxy.spent());
+    assert!(
+        refused.to_string().contains("has been made again"),
+        "{refused}"
+    );
+    let entry = importing.entry(3).await.expect("the entry was forgotten");
+    assert_eq!(entry["gone"], json!(true));
 }
