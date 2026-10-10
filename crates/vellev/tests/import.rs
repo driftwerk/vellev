@@ -4550,3 +4550,40 @@ async fn an_import_ended_while_a_run_begins_is_not_begun_again_by_it() {
     assert!(importing.ledger().schema().await.unwrap().is_none());
     assert_eq!(importing.records.count(None).await.unwrap(), 10);
 }
+
+#[tokio::test]
+async fn a_note_written_by_another_run_while_a_collection_is_taken_up_stops_the_run() {
+    let Some(importing) = ledgerless("VellevImportNoteRaced").await else {
+        return;
+    };
+    let class = importing.class;
+    // Another import of the tenant, from another Weaviate, writes the
+    // note of the collection while this one takes the collection up.
+    let imports = CollectionName::new("vellev_imports").unwrap();
+    let notes = importing.tenant.collection(&imports);
+    let read = format!("/collections/{class}/list");
+    importing
+        .front
+        .after(0, &["POST", &read], move || async move {
+            let listed = notes.list(&Page::new(10)).await.unwrap();
+            let class = json!(class);
+            let mut noted = listed.objects.into_iter();
+            let mut noted = noted
+                .find(|noted| noted.properties.get("class") == Some(&class))
+                .unwrap();
+            let elsewhere = json!("http://another.weaviate");
+            noted.properties.insert("source".into(), elsewhere);
+            let another = Content::new(noted.properties);
+            notes.put(noted.id, &another).await.unwrap();
+        });
+    let stopped = importing.run().await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("is another import of the tenant running?"),
+        "{stopped:#}"
+    );
+    // The other's note stands, still saying the taking up is not over.
+    let bound = binding(&importing).await;
+    assert_eq!(bound["source"], json!("http://another.weaviate"));
+    assert_eq!(bound["adopting"], json!(true));
+}
