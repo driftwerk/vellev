@@ -686,24 +686,22 @@ impl Options {
 }
 
 /// How a run goes about a collection that is already there, by the note
-/// of where it was imported from, if there is one, whether it has a
-/// ledger, and whether that ledger was `emptied`: has no entry, though
-/// the collection holds objects and the note says no taking up is under
-/// way. Answers with whether the collection is being taken up, whether
-/// what it holds that Weaviate does not is noted meanwhile, and whether
-/// its copying begins from the start.
+/// of where it was imported from, if there is one, and whether it has a
+/// ledger. Answers with whether the collection is being taken up,
+/// whether what it holds that Weaviate does not is noted meanwhile, and
+/// whether its copying begins from the start.
 ///
 /// What a collection holds that Weaviate does not is noted only on the
 /// first taking up of one nothing has ever kept a ledger of, and on that
 /// taking up gone on with after a stop. A ledger or a note found without
-/// the other, or a ledger found emptied, says the collection was
-/// imported before: what it holds by now may have been written since,
-/// and nothing of it is noted, nor is anything it lacks stored for
-/// having no entry.
-fn taking_up(bound: Option<&Binding>, ledgered: bool, emptied: bool) -> (bool, bool, bool) {
+/// the other says the collection was imported before: what it holds by
+/// now may have been written since, and nothing of it is noted. A
+/// ledger that is there is believed, whatever it holds: one with no
+/// entry is of a collection nothing was imported into.
+fn taking_up(bound: Option<&Binding>, ledgered: bool) -> (bool, bool, bool) {
     match bound {
         Some(bound) => {
-            let begins = !ledgered || emptied;
+            let begins = !ledgered;
             let census = bound.census && bound.adopting && !begins;
             (bound.adopting || begins, census, begins)
         }
@@ -980,15 +978,8 @@ async fn prepare(
             if let Some(bound) = &bound {
                 bound.agrees(&binding, &name, options.accept_remade)?;
             }
-            // A ledger with no entry beside a collection that holds
-            // objects, no taking up being under way, was emptied.
-            let walked = bound.as_ref().is_some_and(|bound| !bound.adopting);
-            let emptied = ledgered.is_some()
-                && walked
-                && tenant.collection(&ledger).count(None).await? == 0
-                && records.count(None).await? > 0;
             (binding.adopting, binding.census, begins) =
-                taking_up(bound.as_ref(), ledgered.is_some(), emptied);
+                taking_up(bound.as_ref(), ledgered.is_some());
             let (gained, differing) = reconcile(&stored, &wanted)
                 .wrap_err_with(|| format!("class {} no longer fits its collection", class.class))?;
             warnings.extend(differing);
@@ -4394,37 +4385,29 @@ mod tests {
         // (taken up, noting what Weaviate does not hold, from the start)
         // Never imported with a ledger: taken up, and what it holds that
         // Weaviate does not noted.
-        assert_eq!(taking_up(None, false, false), (true, true, true));
+        assert_eq!(taking_up(None, false), (true, true, true));
         // Its note alone lost: taken up again beside its ledger, and
-        // nothing noted, whatever the ledger holds.
-        assert_eq!(taking_up(None, true, false), (true, false, true));
-        assert_eq!(taking_up(None, true, true), (true, false, true));
-        // Imported, and both there: caught up.
-        let imported = bound(false, false);
-        assert_eq!(
-            taking_up(Some(&imported), true, false),
-            (false, false, false)
-        );
-        // Its ledger lost, or emptied: taken up from the start, and
         // nothing noted.
-        assert_eq!(
-            taking_up(Some(&imported), false, false),
-            (true, false, true)
-        );
-        assert_eq!(taking_up(Some(&imported), true, true), (true, false, true));
+        assert_eq!(taking_up(None, true), (true, false, true));
+        // Imported, and both there: caught up, whatever the ledger
+        // holds.
+        let imported = bound(false, false);
+        assert_eq!(taking_up(Some(&imported), true), (false, false, false));
+        // Its ledger lost: taken up from the start, and nothing noted.
+        assert_eq!(taking_up(Some(&imported), false), (true, false, true));
         // A first taking up stopped part way goes on, noting still.
         let taking = bound(true, true);
-        assert_eq!(taking_up(Some(&taking), true, false), (true, true, false));
+        assert_eq!(taking_up(Some(&taking), true), (true, true, false));
         // Its ledger lost meanwhile, it begins again and notes nothing:
         // what the collection holds by then may have been written since.
-        assert_eq!(taking_up(Some(&taking), false, false), (true, false, true));
+        assert_eq!(taking_up(Some(&taking), false), (true, false, true));
         // A later taking up, which noted nothing, goes on so.
         let again = bound(true, false);
-        assert_eq!(taking_up(Some(&again), true, false), (true, false, false));
+        assert_eq!(taking_up(Some(&again), true), (true, false, false));
         // A note that says to note what is found, of no taking up, says
         // nothing.
         let stray = bound(false, true);
-        assert_eq!(taking_up(Some(&stray), true, false), (false, false, false));
+        assert_eq!(taking_up(Some(&stray), true), (false, false, false));
     }
 
     #[test]

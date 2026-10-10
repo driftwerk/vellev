@@ -196,15 +196,23 @@ collection up again beside the ledger: every entry stands as it is,
 nothing is noted as unknown, and an object of Weaviate's without an
 entry is withheld as above. The run records the Weaviate it is given as
 the one imported, having nothing to hold it against, so give it the
-right one. A ledger found with no entry in it, beside a collection that
-holds objects and a note that says it was imported, was emptied: the
-collection is taken up likewise, with nothing noted and nothing stored
-for having no entry. With the ledger and the note both lost, nothing
+right one. With the ledger and the note both lost, nothing
 tells the collection from one never imported with a ledger: it is taken
 up as one, what it holds that Weaviate does not is noted as unknown
 again, objects written since the import among them, and none of that is
 deleted unless a run is told both `--sole-writer` and
 `--delete-unknown`.
+
+**The ledger and the note are the import's memory, and are not to be
+written by hand.** A ledger or a note lost whole is seen for what it
+is, as above. One emptied or edited is not: the import believes what a
+ledger that is there says, and a ledger with no entry for an id says
+the id was never imported. So if entries are deleted from a ledger, an
+object somebody deliberately deleted from vellev is stored again from
+Weaviate by the next run, as one new to Weaviate, and an object another
+writer changed keeps no mark of whose it is beyond what it holds.
+Nothing remembers otherwise. To be rid of a ledger, end the import, or
+drop the ledger whole.
 
 The taking up over, an object Weaviate lists without an entry is new to
 Weaviate, and is stored. Two things settle what was withheld or is

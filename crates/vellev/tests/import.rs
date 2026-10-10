@@ -4291,53 +4291,6 @@ async fn a_taking_up_gone_on_with_by_a_run_told_of_other_writers_marks_nothing_b
 }
 
 #[tokio::test]
-async fn a_ledger_found_emptied_is_taken_up_and_brings_back_nothing() {
-    let Some(importing) = Importing::new("VellevImportLedgerEmptied", 30).await else {
-        return;
-    };
-    let class = importing.class;
-    importing.run().await.unwrap();
-    // Writers moved over: one object more, one deleted, one changed.
-    importing
-        .records
-        .put(oid(1_000), &foreign(1_000))
-        .await
-        .unwrap();
-    importing.records.delete(oid(3)).await.unwrap();
-    importing.records.put(oid(4), &foreign(4)).await.unwrap();
-    // The ledger loses every entry, and the note of the collection is
-    // still there, saying it was imported.
-    let ledger = importing.ledger();
-    for n in 0..30 {
-        ledger.delete(oid(n)).await.unwrap();
-    }
-    let report = importing.run().await.unwrap();
-    let copied = &report.classes[class];
-    assert_eq!(
-        (copied.stored, copied.changed, copied.deleted),
-        (0, 0, 0),
-        "{copied:?}"
-    );
-    // What the collection lacks and what it holds otherwise are
-    // withheld, and what it holds that Weaviate does not is not noted:
-    // it may have been written since the import.
-    assert_eq!((copied.withheld, copied.unknown), (2, 0));
-    assert!(importing.get(3).await.is_none(), "note 3 came back");
-    assert_eq!(
-        importing.get(4).await.unwrap().properties,
-        foreign(4).properties
-    );
-    assert_eq!(importing.entry(1_000).await, None);
-    assert_eq!(report.outcome(false), Outcome::Unsettled);
-    let bound = binding(&importing).await;
-    assert_eq!((bound.get("adopting"), bound.get("census")), (None, None));
-    // Nor does a run told to delete what was unknown find anything to.
-    let report = importing.run_as(&sweeping(&importing.options)).await;
-    assert_eq!(report.unwrap().classes[class].deleted, 0);
-    assert!(importing.get(1_000).await.is_some());
-}
-
-#[tokio::test]
 async fn an_entry_written_by_another_run_while_an_object_is_replaced_stops_the_run() {
     let Some(importing) = Importing::new("VellevImportRacedLedger", 10).await else {
         return;
@@ -4586,4 +4539,111 @@ async fn a_note_written_by_another_run_while_a_collection_is_taken_up_stops_the_
     let bound = binding(&importing).await;
     assert_eq!(bound["source"], json!("http://another.weaviate"));
     assert_eq!(bound["adopting"], json!(true));
+}
+
+// What a sixth review asked of the import.
+
+/// A collection whose ledger has no entry for ordinary reasons, beside
+/// an object a writer that moved to vellev stored under an id of its
+/// own: the class held nothing when it was imported, or everything
+/// imported of it has since been deleted from Weaviate, and so from
+/// the collection.
+async fn with_nothing_imported(class: &'static str, ever: bool) -> Option<Importing> {
+    let mut importing = Importing::new(class, if ever { 3 } else { 0 }).await?;
+    importing.options.created_as = None;
+    importing.options.dimensions.insert(class.into(), 4);
+    importing.run().await.unwrap();
+    importing
+        .records
+        .put(oid(5_000), &foreign(5_000))
+        .await
+        .unwrap();
+    for n in 0..3 {
+        if ever {
+            importing.weaviate.delete(class, n).await;
+        }
+    }
+    let report = importing.run().await.unwrap();
+    assert_eq!(counts(&report, class).1, [0, 0, 1]);
+    assert_eq!(report.outcome(false), Outcome::Settled);
+    assert_eq!(importing.ledger().count(None).await.unwrap(), 0);
+    Some(importing)
+}
+
+/// Weaviate gains three notes, and a run stores them.
+async fn gains_are_stored(importing: &Importing, options: &Options) {
+    let class = importing.class;
+    importing.weaviate.add(class, 10..13).await;
+    let report = importing.run_as(options).await.unwrap();
+    let copied = &report.classes[class];
+    assert_eq!(
+        (copied.stored, copied.withheld, copied.kept),
+        (3, 0, 0),
+        "{copied:?}"
+    );
+    assert_eq!(counts(&report, class).1, [3, 3, 4]);
+    assert_eq!(report.outcome(false), Outcome::Settled);
+    for n in 10..13 {
+        assert!(importing.get(n).await.is_some(), "note {n}");
+        assert_eq!(importing.entry(n).await.unwrap().get("theirs"), None);
+    }
+    assert!(importing.get(5_000).await.is_some());
+}
+
+#[tokio::test]
+async fn a_class_imported_while_it_held_nothing_has_what_weaviate_gains_stored() {
+    let class = "VellevImportEmptyGains";
+    let Some(importing) = with_nothing_imported(class, false).await else {
+        return;
+    };
+    gains_are_stored(&importing, &importing.options).await;
+    assert_eq!(importing.counts().await, ([0; 5], [3, 3, 4]));
+}
+
+#[tokio::test]
+async fn a_class_with_everything_imported_deleted_since_has_what_weaviate_gains_stored() {
+    let class = "VellevImportDeletedGains";
+    let Some(importing) = with_nothing_imported(class, true).await else {
+        return;
+    };
+    gains_are_stored(&importing, &importing.options).await;
+    assert_eq!(importing.counts().await, ([0; 5], [3, 3, 4]));
+}
+
+#[tokio::test]
+async fn a_run_told_of_other_writers_marks_nothing_of_a_class_with_nothing_imported() {
+    for (class, ever) in [
+        ("VellevImportEmptyOthers", false),
+        ("VellevImportDeletedOthers", true),
+    ] {
+        let Some(importing) = with_nothing_imported(class, ever).await else {
+            return;
+        };
+        gains_are_stored(&importing, &others(&importing.options)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_class_with_nothing_imported_is_compared_like_any_other() {
+    for (class, ever) in [
+        ("VellevImportEmptyVerify", false),
+        ("VellevImportDeletedVerify", true),
+    ] {
+        let Some(importing) = with_nothing_imported(class, ever).await else {
+            return;
+        };
+        let comparing = Options {
+            mode: Mode::Verify { pages: None },
+            ..importing.options.clone()
+        };
+        let report = importing.run_as(&comparing).await.unwrap();
+        assert_eq!(report.outcome(false), Outcome::Settled, "{class}");
+        let extra = report.classes[class].verified.as_ref().unwrap().extra;
+        assert_eq!(extra, Some(1), "{class}");
+        gains_are_stored(&importing, &importing.options).await;
+        let report = importing.run_as(&comparing).await.unwrap();
+        assert_eq!(report.outcome(false), Outcome::Settled, "{class}");
+        let verified = report.classes[class].verified.clone().unwrap();
+        assert_eq!((verified.looked, verified.same), (3, 3), "{class}");
+    }
 }
