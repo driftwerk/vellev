@@ -110,7 +110,19 @@ a node is set up by default, so fifteen minutes is the least): the grace is
 all that keeps a file a restore within the window names from being deleted,
 and it must cover a file being written a few minutes before it is
 committed, a restore waiting behind a clean-up, and what the clocks of the
-node, the store and Postgres differ by.
+node, the store and Postgres differ by. That least is a stop-gap for a node
+set up near its defaults, and follows the store's bound only. It does not
+cover a long lease with a long database timeout (a file waits for its
+commit through three tries, each a quarter of `VELLEV_LEASE_SECS` or
+`VELLEV_DATABASE_TIMEOUT_SECS` if that is shorter: an hour's lease and a
+timeout of fifteen minutes make that about forty-eight minutes), one write
+larger than a part (16 MiB by default), a clock wrong by more than the
+grace, or a flush or merge that takes longer than the grace. Until cleaning
+up goes by the commits Postgres still holds instead of by time (DW-681,
+with DW-668), raise the grace with the lease and the database timeout: it
+should exceed what one request to the store may take plus three times the
+lesser of a quarter of the lease and the database timeout, with room to
+spare.
 
 A tenant can be put back as it stood at any moment of its restore window:
 14 days unless `VELLEV_RESTORE_WINDOW_SECS` or the tenant says otherwise.

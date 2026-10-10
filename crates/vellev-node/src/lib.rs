@@ -65,12 +65,15 @@ const FORGOTTEN_AT_ONCE: usize = 10_000;
 ///
 /// The grace is all that stands between cleaning up and a restore to a
 /// point of the window: nothing else keeps a file such a restore names
-/// from being deleted. With every clock right it must cover
+/// from being deleted. This floor is a stop-gap under that margin, not a
+/// proof of it. As a node is set up by default, and with every clock
+/// right, the grace must cover
 ///
-/// - the time a head file is in the store before its commit, up to one
-///   upload and three tries to commit: under four minutes as a node is set
-///   up by default, and longer the longer a request to the store may take,
-///   which is why three of those are the least where they come to more;
+/// - the time a head file is in the store before its commit: its upload,
+///   one request to the store while the file is of one part, and three
+///   tries to commit, each a quarter of [`Settings::lease`] or the
+///   coordinator's bound if that is shorter. Under four minutes by
+///   default;
 /// - the time a restore that has found its target waits behind a clean-up
 ///   under way, up to two minutes;
 /// - what the node's clock, the store's and the database's differ by,
@@ -78,10 +81,26 @@ const FORGOTTEN_AT_ONCE: usize = 10_000;
 /// - a reader that took a committed position and has yet to fetch its
 ///   files.
 ///
-/// That is six to seven minutes, and this about twice it. It does not
-/// cover a clock wrong by more than the grace, nor a flush or a merge that
-/// keeps a restore waiting for longer than the grace: no margin of time
-/// does.
+/// That is six to seven minutes by default, and this about twice it. The
+/// floor follows the store's bound and nothing else, so it does **not**
+/// cover:
+///
+/// - a long lease with a long bound on the coordinator: an hour's lease
+///   and fifteen minutes for the database let a head file wait some
+///   forty-eight minutes for its commit, and a grace of fifteen is still
+///   taken;
+/// - a head file of more than one part (16 MiB by default), whose upload
+///   may take as many requests as it has parts and three more: one write
+///   of that size is past fifteen minutes on its own, by default;
+/// - a clock wrong by more than the grace;
+/// - a flush or a merge that keeps a restore waiting for longer than the
+///   grace.
+///
+/// Until cleaning up is fenced by the coordinator's rows instead of by
+/// time (DW-681, with the clean floor of DW-668), raise the grace with the
+/// lease and the coordinator's bound: it should exceed one request to
+/// object storage and three times the lesser of a quarter of the lease
+/// and the coordinator's bound, with room to spare.
 pub const LEAST_GRACE: Duration = Duration::from_secs(15 * 60);
 
 /// How long object storage having answered counts for readiness, so that
@@ -111,7 +130,9 @@ pub struct Settings {
     /// and a reader that took a committed position still finds its files.
     /// At least [`LEAST_GRACE`] and three requests to object storage, as
     /// [`Settings::check`] makes sure: it is the whole margin between
-    /// cleaning up and a restore to a point of the window.
+    /// cleaning up and a restore to a point of the window. That floor does
+    /// not follow the lease or the coordinator's bound: see
+    /// [`LEAST_GRACE`] for what it leaves to whoever sets this.
     pub grace: Duration,
     /// How often a copy of a tenant kept for reads looks for new commits.
     pub follow_every: Duration,
@@ -218,11 +239,15 @@ impl Settings {
         }
     }
 
-    /// Refuse settings a node cannot run by, saying why.
+    /// Refuse settings a node cannot run by, saying why: the grace first,
+    /// if more than one thing is wrong. [`Node::new`] does not ask this:
+    /// whoever makes a node from settings of their own calls it, or runs
+    /// without the floor under the grace and the check of the backup
+    /// claim.
     pub fn check(&self) -> Result<()> {
         self.request_bounds
-            .claim_problem(self.backup_claim)
-            .or_else(|| self.request_bounds.grace_problem(self.grace))
+            .grace_problem(self.grace)
+            .or_else(|| self.request_bounds.claim_problem(self.backup_claim))
             .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
     }
 }
@@ -730,9 +755,10 @@ impl Tenant {
     /// `grace` is taken as it is given, and nothing here checks it. A node
     /// looking after its tenants gives the tenant's restore window and
     /// [`Settings::grace`] on top, which is at least
-    /// [`RequestBounds::least_grace`]; whoever calls this with less may
-    /// delete files a restore to a point of that window names, and that is
-    /// the caller's breach.
+    /// [`RequestBounds::least_grace`] where [`Settings::check`] was asked;
+    /// whoever calls this with less may delete files a restore to a point
+    /// of that window names, and that is the caller's breach. What that
+    /// floor does not cover is said at [`LEAST_GRACE`].
     pub async fn compact(&self, grace: Duration) -> Result<usize> {
         while self
             .writer
@@ -988,6 +1014,10 @@ struct Inner {
 pub struct Node(Arc<Inner>);
 
 impl Node {
+    /// A node that runs as `settings` say, taken as they are: nothing here
+    /// refuses them. Call [`Settings::check`] first, as the `vellev`
+    /// binary does, or the node runs with whatever grace and backup claim
+    /// it was given.
     pub fn new(
         coordinator: Arc<dyn Coordinator>,
         blobs: Arc<dyn Blobs>,

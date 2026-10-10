@@ -1611,9 +1611,18 @@ impl Writer {
     /// once they are older. Whoever calls this with less than that window
     /// and, on top, the time a file may be in the store before its commit,
     /// a restore may wait behind a call of this, and the clocks may differ
-    /// by (a node allows a quarter of an hour, or three requests to the
-    /// store if those take longer) may delete files such a restore needs,
-    /// and that is the caller's breach.
+    /// by, may delete files such a restore needs, and that is the caller's
+    /// breach. The first of those is as long as a publish may take: the
+    /// head file's upload, one request to the store for a file of one part
+    /// and as many as its parts and three more for a larger one, and three
+    /// tries to commit, each a quarter of the lease or as long as the
+    /// coordinator is given if that is less. A node refuses a margin under
+    /// a quarter of an hour, or under three requests to the store, which
+    /// covers a head file of one part under a lease and a coordinator's
+    /// bound near their defaults and no more; nor does any margin cover a
+    /// clock wrong by more than it, or a flush or a merge that holds the
+    /// building lock for longer. Deciding this by the coordinator's rows
+    /// instead of by time is DW-681, with the clean floor of DW-668.
     ///
     /// What is needed is decided by the committed chain alone: it is walked
     /// back to the latest checkpoint before the oldest recent file, and

@@ -2474,6 +2474,71 @@ async fn how_old_a_tenants_files_are_is_told_by_the_clock_the_node_is_given() {
 }
 
 #[tokio::test]
+async fn a_node_looking_after_a_tenant_keeps_its_files_for_the_grace_it_is_set_to() {
+    let cluster = Cluster::new();
+    let minutes = |n: u64| Duration::from_secs(n * 60);
+    // The tenant is flushed at every write, and looked after once each
+    // flush is made; nothing may be restored, so the grace is all its
+    // files are kept for. Not the coordinator's clock, by which the lease
+    // runs out.
+    let clock = Arc::new(ManualClock::starting_at(Utc::now()));
+    let node = cluster.node_from(Settings {
+        flush_rows: 1,
+        grace: minutes(15),
+        clock: clock.clone(),
+        ..cluster.settings()
+    });
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    // Two writes, each flushed: the node looks the tenant over after each
+    // flush and before the next, so by the second flush it has looked it
+    // over as it stood at the first.
+    let looked_after = |from: u64| {
+        let acme = acme.clone();
+        async move {
+            for n in from..from + 2 {
+                acme.write(vec![note(n, "fox", None)]).await.unwrap();
+                for _ in 0..500 {
+                    if acme.read(State::unflushed) == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(acme.read(State::unflushed), 0, "flushed at every write");
+            }
+        }
+    };
+    let heads = || async {
+        let mut keys = keys_under(cluster.store.as_ref(), "acme/").await;
+        keys.retain(|key| key.ends_with(".log") || key.ends_with(".manifest"));
+        keys
+    };
+    looked_after(0).await;
+    let first = heads().await;
+    assert!(first.len() >= 4, "{first:?}");
+
+    clock.advance(minutes(10));
+    looked_after(2).await;
+    let kept = heads().await;
+    assert!(
+        first.iter().all(|key| kept.contains(key)),
+        "ten minutes old, and kept fifteen: {first:?} of {kept:?}"
+    );
+
+    clock.advance(minutes(10));
+    looked_after(4).await;
+    let kept = heads().await;
+    assert!(
+        !first.iter().any(|key| kept.contains(key)),
+        "twenty minutes old, and nothing reaches them: {first:?} of {kept:?}"
+    );
+    assert_eq!(acme.read(count), 6);
+}
+
+#[tokio::test]
 async fn a_point_past_anything_committed_is_refused_rather_than_waited_for() {
     let cluster = Cluster::new();
     let (writing, reading) = (cluster.node(), cluster.reading_node());
@@ -3915,6 +3980,19 @@ fn a_grace_below_fifteen_minutes_or_three_requests_to_the_store_is_refused() {
         refusal(graced(seconds(60 * 60), seconds(1_201))).contains("at least 3603s"),
         "the grace a node has unless told otherwise is refused too, under a store that slow"
     );
+
+    // With a backup claim that cannot be held either, it is the grace
+    // that is spoken of, as by the binary.
+    let both = Settings {
+        grace: Duration::ZERO,
+        backup_claim: seconds(60),
+        ..Settings::new(NodeId::generate("node"))
+    };
+    let claim = both.request_bounds.claim_problem(both.backup_claim);
+    assert!(claim.unwrap().contains("a backup claim of 60s"));
+    let refused = refusal(both.check());
+    assert!(refused.contains("a grace of 0ns"), "{refused}");
+    assert!(!refused.contains("backup claim"), "{refused}");
 }
 
 #[test]

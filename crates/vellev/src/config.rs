@@ -177,7 +177,13 @@ pub struct Config {
     /// all that keeps a file a restore within the window names from being
     /// deleted, where a file is written a little before it is committed, a
     /// restore waits behind a clean-up, and the clocks of the node, the
-    /// store and Postgres differ.
+    /// store and Postgres differ. The least covers a node set up near its
+    /// defaults and no more: raise this with `VELLEV_LEASE_SECS` and
+    /// `VELLEV_DATABASE_TIMEOUT_SECS`, to more than one request to the
+    /// store and three times the lesser of a quarter of the lease and the
+    /// database timeout, with room to spare. Nor does it cover one write
+    /// larger than a part (`VELLEV_UPLOAD_PART_MIB`), a clock wrong by more
+    /// than it, or a flush or merge that takes longer than it.
     #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 60 * 60, value_parser = clap::value_parser!(u64).range(vellev_node::LEAST_GRACE.as_secs()..))]
     pub grace_secs: u64,
     /// How long a tenant this node writes for may go unused before it is
@@ -845,6 +851,13 @@ mod tests {
         let refused = format!("{:#}", claimed.map(drop).unwrap_err());
         assert!(refused.contains("VELLEV_BACKUP_CLAIM_SECS"), "{refused}");
         assert!(!refused.contains("VELLEV_GRACE_SECS"), "{refused}");
+        // With both wrong it is the grace that is spoken of, as by
+        // `Settings::check`.
+        let slow = ["--store-timeout-secs", "120", "--grace-secs", "900"];
+        let both = config(&slow).settings(NodeId::generate("node"), None);
+        let refused = format!("{:#}", both.map(drop).unwrap_err());
+        assert!(refused.contains("VELLEV_GRACE_SECS"), "{refused}");
+        assert!(!refused.contains("VELLEV_BACKUP_CLAIM_SECS"), "{refused}");
     }
 
     #[test]

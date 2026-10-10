@@ -31,15 +31,33 @@ what one request to the store may take with its tries where that is longer:
 9 minutes 21 seconds as a node is set up by default, so fifteen minutes,
 and more only where a request is given longer than by default
 (`VELLEV_STORE_TIMEOUT_SECS`, `VELLEV_STORE_MIN_BYTES_PER_SEC`,
-`VELLEV_UPLOAD_PART_MIB`). The grace is how much longer than
+`VELLEV_UPLOAD_PART_MIB`) and `VELLEV_BACKUP_CLAIM_SECS` is raised too:
+at its default of fifteen minutes the backup claim already refuses a
+request of more than four and a half. The grace is how much longer than
 a tenant's restore window a file nothing reaches any more is kept, and it
 is all that keeps cleaning up from deleting a file a restore within the
 window names: it has to cover a file being written a few minutes before
 its commit, a restore waiting behind a clean-up, and what the clocks of
 the node, the store and Postgres differ by. A node left at the default, an
-hour, starts as before. Whoever builds on `vellev-node` gets the same
-refusal from `Settings::check`; `Writer::clean` and `Tenant::compact` take
-any grace still, and say what the caller then answers for.
+hour, starts as before.
+
+The least is a stop-gap, and covers a node set up near its defaults and no
+more. It follows the store's bound only, and does not cover a long lease
+with a long database timeout (a file waits for its commit through three
+tries, each a quarter of `VELLEV_LEASE_SECS` or
+`VELLEV_DATABASE_TIMEOUT_SECS` if that is shorter), one write larger than
+a part (16 MiB by default), a clock wrong by more than the grace, or a
+flush or merge that takes longer than the grace. Until cleaning up goes by
+the commits Postgres still holds instead of by time (DW-681, with DW-668),
+a node with a longer lease or database timeout should have a longer grace:
+more than what one request to the store may take plus three times the
+lesser of a quarter of the lease and the database timeout, with room to
+spare.
+
+Whoever builds on `vellev-node` gets the same refusal from
+`Settings::check`, and only by calling it: `Node::new` takes its settings
+as they are. `Writer::clean` and `Tenant::compact` take any grace still,
+and say what the caller then answers for.
 
 ### What a node answers
 
