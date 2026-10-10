@@ -1172,6 +1172,15 @@ async fn a_commit_that_says_it_adopts_is_refused_unless_that_adoption_is_noted_f
     assert!(noted.await.unwrap());
     let restoring = adopting_commit(3, "m3", unasked);
     assert!(adopting(&c.commit(&held, restoring).await));
+    // A commit that neither follows nor repeats what is committed, here
+    // nothing, under a head, is told that and nothing of adoptions.
+    for nowhere in [commit(0, "m"), adopting_commit(0, "m", to_be.lineage)] {
+        let refused = c.commit(&held, nowhere).await;
+        assert!(
+            matches!(refused, Err(CoordinatorError::Regressed { .. })),
+            "{refused:?}"
+        );
+    }
     let restoring = adopting_commit(2, "m2", to_be.lineage);
     assert!(adopting(&c.commit(&held, restoring).await));
     assert_eq!(taken_up(h, tenant).await, own);

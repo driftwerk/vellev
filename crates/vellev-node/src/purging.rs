@@ -54,6 +54,16 @@
 //!   no longer taken for held; and whoever purges next does so only once
 //!   the claim has run out.
 //!
+//! - The looking over of a tenant purged (below) deletes under no claim,
+//!   and only in the backups, never in the tenants' store: what this
+//!   cluster took of a lineage no tenant has. It asks before each batch
+//!   that no tenant of the name is of that lineage, so a batch may be on
+//!   its way as the lineage is taken up again here. What it then deletes
+//!   late is a file of this cluster's backups of that lineage, which a
+//!   backup the tenant takes afterwards may list: that backup looks again
+//!   once it is written that every file it lists is there, and copies
+//!   back any that went, as does the next that lists the file.
+//!
 //! One thing this does not cover, and nothing short of the store refusing
 //! a stale delete would: a machine suspended in the middle of a request,
 //! after its clock was asked and before the bytes left, or between one try
