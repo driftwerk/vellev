@@ -685,6 +685,25 @@ impl Options {
     }
 }
 
+/// Why a collection whose copying would begin from the start cannot be
+/// compared with Weaviate: what of its import was found to be missing.
+fn uncompared(held: bool, noted: bool, ledgered: bool) -> &'static str {
+    match (held, noted, ledgered) {
+        (false, ..) => "it has not been imported",
+        (true, false, true) => {
+            "the note of where its collection was imported from is lost, though its ledger is there; a run that imports takes the collection up again"
+        }
+        (true, true, false) => {
+            "its ledger is lost, though the note of where its collection was imported from is there; a run that imports takes the collection up again"
+        }
+        (true, false, false) => {
+            "its collection has neither a ledger nor a note of where it was imported from: it was imported by a release that kept none, or not at all, and a run that imports takes it up"
+        }
+        // Both there, a collection's copying does not begin again.
+        (true, true, true) => "its import is to begin again",
+    }
+}
+
 /// How a run goes about a collection that is already there, by the note
 /// of where it was imported from, if there is one, and whether it has a
 /// ledger. Answers with whether the collection is being taken up,
@@ -957,6 +976,7 @@ async fn prepare(
     };
     let mut changes = Vec::new();
     let mut begins = stored.is_none();
+    let (schema_held, ledgered_held) = (stored.is_some(), ledgered.is_some());
     let schema = match stored {
         None => {
             // A ledger left by a collection since dropped says nothing of
@@ -1002,8 +1022,9 @@ async fn prepare(
     if options.mode == Mode::Import {
         binding.write(tenant, &name, noted_at, changes).await?;
     } else if begins {
+        let found = uncompared(schema_held, bound.is_some(), ledgered_held);
         bail!(
-            "class {} has not been imported: there is nothing to compare",
+            "class {}: {found}; there is nothing to compare",
             class.class
         );
     }
@@ -1177,11 +1198,26 @@ impl Binding {
         match tenant.apply(changes).await {
             Ok(_) => Ok(()),
             Err(error) if refusal(&error) == Some(Refusal::Overtaken) => {
-                Err(error).wrap_err_with(|| {
-                    format!(
-                        "the note of where collection {collection} was imported from changed under the import: {OTHER_IMPORT}"
-                    )
-                })
+                // The node refuses so both a note that is no longer the
+                // one read and a tenant it is busy with, as one being
+                // restored: reading the note again tells which.
+                let noted = tenant.collection(&imports());
+                let again = noted.get(Self::id(collection)).await;
+                let at = again
+                    .ok()
+                    .map(|again| again.and_then(|again| again.version));
+                match at {
+                    Some(at) if at != was => Err(error).wrap_err_with(|| {
+                        format!(
+                            "the note of where collection {collection} was imported from changed under the import: {OTHER_IMPORT}"
+                        )
+                    }),
+                    _ => Err(error).wrap_err_with(|| {
+                        format!(
+                            "the node refused to write the note of where collection {collection} was imported from, which is as the import read it"
+                        )
+                    }),
+                }
             }
             Err(error) => Err(error).wrap_err_with(|| format!("preparing collection {collection}")),
         }
@@ -1316,10 +1352,16 @@ enum Refusal {
 
 /// Whether a refusal as invalid is of the condition on a version and not
 /// of what was to be written: a node of 0.1 refuses a field it does not
-/// know by naming it, in one of two ways, and as a release already made
-/// it will go on doing so.
+/// know by naming it straight after the words "unknown field", and as a
+/// release already made it will go on doing so. The fields it lists
+/// after that, as those it expected, are not looked at: a node that
+/// knows the condition lists it there when it refuses another field.
 fn unversed(code: Code, message: &str) -> bool {
-    code == Code::Invalid && message.contains("unknown field") && message.contains(CONDITION)
+    let named = message
+        .split_once("unknown field `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(named, _)| named);
+    code == Code::Invalid && named == Some(CONDITION)
 }
 
 /// The field of a change that makes it conditional on a version.
@@ -1922,7 +1964,9 @@ impl<'a> Copying<'a> {
                 Ok(_) => {}
                 Err(error) if matches!(refusal(&error), Some(Refusal::Overtaken)) => {
                     return Err(error).wrap_err_with(|| {
-                        format!("{name} changed under the import: {OTHER_IMPORT}")
+                        format!(
+                            "the node refused a write to {name} conditional on what the import read of it. If the node does not say it is refusing the tenant's writes for a reason of its own, the ledger was written meanwhile: {OTHER_IMPORT}"
+                        )
                     });
                 }
                 Err(error) if refusal(&error) == Some(Refusal::Old) => {
@@ -2018,6 +2062,21 @@ impl<'a> Copying<'a> {
                 // Nothing a run is told lets it go on past a node too
                 // old to hold a write to a version.
                 (Some(Refusal::Old), error) => return Err(error).wrap_err(OLD_NODE),
+                // Nor past a write conditional on a version that a node
+                // calls invalid. What vellev cannot hold of an object is
+                // found before anything is sent, and a node that refuses
+                // one says nothing that tells an object it cannot hold
+                // from a condition it cannot read: the object is not
+                // passed over on a guess.
+                (Some(Refusal::Unfit(_)), error)
+                    if matches!(settled, Settled::Replaced | Settled::Deleted) =>
+                {
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "the node refused as invalid a write to object {id} conditional on its version, and does not say whether the object or the condition is at fault; nothing is skipped on that"
+                        )
+                    })
+                }
                 (Some(Refusal::TooLarge), error) | (Some(Refusal::Unfit(_)), error)
                     if self.options.skip_refused && matches!(now, Now::Holds(_)) =>
                 {
@@ -4414,19 +4473,25 @@ mod tests {
     fn a_node_that_does_not_know_a_condition_on_a_version_is_told_from_an_object_it_cannot_hold() {
         // As a node of 0.1 refuses a change with a field it does not
         // know, by either of the ways it reads a body.
+        // As a node of 0.1.0 was seen to refuse an upsert and a delete
+        // with a field it does not know.
         let old = [
             "unknown field `only_if_version`, expected one of `collection`, `id`, `properties`, `vector`",
-            "unknown field `changes[3].only_if_version`",
+            "unknown field `only_if_version`, expected `collection` or `id`",
         ];
         for message in old {
             assert!(unversed(Code::Invalid, message), "{message}");
             assert!(!unversed(Code::Conflict, message), "{message}");
         }
-        // What a node says of an object it cannot hold is not that.
+        // What a node says of an object it cannot hold is not that, nor
+        // what one that knows the condition says of another field.
         for message in [
             "property title: too long",
             "unknown field `colour`",
+            "unknown field `colour`, expected one of `collection`, `id`, `properties`, `vector`, `only_if_version`",
             "the object is not at the version given as only_if_version",
+            "unknown field",
+            "unknown field `only_if_version",
         ] {
             assert!(!unversed(Code::Invalid, message), "{message}");
         }
@@ -4459,6 +4524,16 @@ mod tests {
         assert_eq!(&read, binding);
         let stopped = noted(None).unwrap_err().to_string();
         assert!(stopped.contains("gave no version"), "{stopped}");
+    }
+
+    #[test]
+    fn a_comparison_that_cannot_be_made_says_what_of_the_import_is_missing() {
+        assert!(uncompared(false, false, false).contains("has not been imported"));
+        assert!(uncompared(false, true, true).contains("has not been imported"));
+        let note = uncompared(true, false, true);
+        assert!(note.starts_with("the note of where its collection was imported from is lost"));
+        assert!(uncompared(true, true, false).starts_with("its ledger is lost"));
+        assert!(uncompared(true, false, false).contains("neither a ledger nor a note"));
     }
 
     #[test]
