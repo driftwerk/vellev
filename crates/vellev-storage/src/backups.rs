@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -765,7 +765,7 @@ async fn taken(
         tenant: owner.tenant.clone(),
         lineage: owner.lineage,
         cluster: owner.cluster,
-        taken_at: Utc::now(),
+        taken_at: taken_at(Utc::now()),
         partitions: taken,
         keys: coordinator.keys(&owner.tenant).await?,
         restore_window: coordinator.restore_window(&owner.tenant).await?,
@@ -893,6 +893,13 @@ fn usable(record: &[u8]) -> std::result::Result<Backup, Unusable> {
     serde_json::from_slice(record).map_err(Unusable::Unreadable)
 }
 
+/// When a backup taken at `now` says it was taken: to the microsecond, as
+/// a coordinator records the time a restore from it went back to, so that
+/// a restore says the same time when it is made as when it is asked after.
+fn taken_at(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.trunc_subsecs(6)
+}
+
 /// Where everything kept under the name `tenant` lies, of whichever tenant
 /// of that name.
 fn named(tenant: &TenantId) -> String {
@@ -918,4 +925,16 @@ fn encoded(backup: &Backup) -> Result<Bytes> {
     serde_json::to_vec_pretty(backup)
         .map(Bytes::from)
         .map_err(|error| StorageError::Encode(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_backup_says_when_it_was_taken_to_the_microsecond() {
+        let fine = DateTime::<Utc>::from_timestamp(1_760_000_000, 123_456_789).unwrap();
+        assert_eq!(taken_at(fine).timestamp_subsec_nanos(), 123_456_000);
+        assert_eq!(taken_at(fine).timestamp(), 1_760_000_000);
+    }
 }

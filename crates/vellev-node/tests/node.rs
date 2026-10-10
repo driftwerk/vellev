@@ -6495,3 +6495,37 @@ impl Blobs for Fetching {
         self.inner.delete(key).await
     }
 }
+
+#[tokio::test]
+async fn a_restore_says_when_what_it_went_back_to_was_as_its_source_says_on_a_clock_however_fine() {
+    let cluster = Cluster::new();
+    // A clock to the nanosecond, as a Linux machine's is.
+    cluster.clock.advance(Duration::from_nanos(123_456_789));
+    let node = backing_up_to(&cluster, backup_store());
+    let acme = tenant("acme");
+    restorable(&node, &acme).await;
+    let (_, points) = node.restore_points(&acme).await.unwrap().unwrap();
+    let (_, latest) = points.unwrap();
+    let request = RequestId::generate();
+    let restored = node
+        .restore(&acme, Point::Position(latest.position), request)
+        .await
+        .unwrap();
+    assert_eq!(
+        (restored.restore.from, restored.restore.from_at),
+        (latest.position, latest.at),
+        "the time the restore point says"
+    );
+    let again = node
+        .restore(&acme, Point::Position(latest.position), request)
+        .await
+        .unwrap();
+    assert_eq!(again, restored, "and the same asked again, from the record");
+
+    let backup = node.back_up(&acme).await.unwrap();
+    let from_backup = node
+        .restore_backup(&acme, backup.id, RequestId::generate())
+        .await
+        .unwrap();
+    assert_eq!(from_backup.restore.from_at, backup.taken_at);
+}

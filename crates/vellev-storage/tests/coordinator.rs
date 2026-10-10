@@ -1540,11 +1540,14 @@ async fn a_restore_is_recorded_with_its_commit_for_a_day_and_for_its_incarnation
         .commit(&lease, commit(1, "head-1"))
         .await
         .unwrap();
+    // A time to the microsecond, as fine as any a node asks with, is read
+    // back as it was given.
     let restore = Restore {
         request: RequestId::generate(),
         asked: [1; 32],
         from: LogPosition(1),
-        from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap(),
+        from_at: Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 0).unwrap()
+            + chrono::Duration::microseconds(123_456),
     };
     let restoring = Commit {
         after: None,

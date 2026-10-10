@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use uuid::Uuid;
 use vellev_core::{NodeId, RequestId, TenantId};
 
@@ -127,6 +127,13 @@ impl Default for MemoryCoordinator {
 }
 
 impl MemoryCoordinator {
+    /// The time by the coordinator's clock, to the microsecond: as Postgres
+    /// keeps every time it is given, so that a time this coordinator hands
+    /// out is the same read back from a record of it as when it was given.
+    fn now(&self) -> DateTime<Utc> {
+        self.clock.now().trunc_subsecs(6)
+    }
+
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             cluster: ClusterId(Uuid::new_v4()),
@@ -155,7 +162,7 @@ impl MemoryCoordinator {
         key: &PartitionKey,
         f: impl FnOnce(&mut Row, DateTime<Utc>) -> Result<T>,
     ) -> Result<T> {
-        let now = self.clock.now();
+        let now = self.now();
         let mut rows = self.rows.lock().expect("coordinator lock");
         let row = rows
             .get_mut(key)
@@ -207,7 +214,7 @@ impl Coordinator for MemoryCoordinator {
             .get(&key.tenant)
             .filter(|purge| purge.purged.is_none());
         if let Some(purge) = undone {
-            let asked = self.clock.now() - purge.requested;
+            let asked = self.now() - purge.requested;
             return Err(CoordinatorError::Purging {
                 tenant: key.tenant.clone(),
                 asked: asked.to_std().unwrap_or_default(),
@@ -298,7 +305,7 @@ impl Coordinator for MemoryCoordinator {
                         tenant: key.tenant.clone(),
                         lineage: row.lineage,
                     },
-                    requested: self.clock.now(),
+                    requested: self.now(),
                     purged: None,
                     claim: None,
                     looked: None,
@@ -376,7 +383,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
-        let now = self.clock.now();
+        let now = self.now();
         let tenant = &lease.key.tenant;
         let mut rows = self.rows.lock().expect("coordinator lock");
         let mut others = rows.iter().filter(|(key, _)| key != &&lease.key);
@@ -528,7 +535,7 @@ impl Coordinator for MemoryCoordinator {
         }
         let issued = TenantKey {
             id,
-            created: self.clock.now(),
+            created: self.now(),
             hash: *hash,
         };
         let mut keys = self.keys.lock().expect("coordinator lock");
@@ -643,7 +650,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn forget_restores(&self) -> Result<u64> {
-        let kept_since = window_start(self.clock.now(), RESTORES_KEPT_FOR)?;
+        let kept_since = window_start(self.now(), RESTORES_KEPT_FOR)?;
         let mut rows = self.rows.lock().expect("coordinator lock");
         Ok(rows
             .values_mut()
@@ -656,7 +663,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn purges(&self, due: Duration, lately: Duration) -> Result<Purges> {
-        let now = self.clock.now();
+        let now = self.now();
         let (due, lately) = (window_start(now, due)?, window_start(now, lately)?);
         let purges = self.purges.lock().expect("coordinator lock");
         let mut found = Purges::default();
@@ -678,7 +685,7 @@ impl Coordinator for MemoryCoordinator {
         due: Duration,
         hold: Duration,
     ) -> Result<Option<PurgeClaim>> {
-        let now = self.clock.now();
+        let now = self.now();
         let until = expiry(now, checked_hold(hold)?)?;
         let due = window_start(now, due)?;
         let mut purges = self.purges.lock().expect("coordinator lock");
@@ -709,7 +716,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
-        let until = expiry(self.clock.now(), checked_hold(hold)?)?;
+        let until = expiry(self.now(), checked_hold(hold)?)?;
         let rows = self.rows.lock().expect("coordinator lock");
         let mut purges = self.purges.lock().expect("coordinator lock");
         let held = purges
@@ -726,7 +733,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()> {
-        let now = self.clock.now();
+        let now = self.now();
         let forgotten = window_start(now, forget_after)?;
         let mut purges = self.purges.lock().expect("coordinator lock");
         let held = purges.get_mut(tenant).filter(|purge| {
@@ -762,7 +769,7 @@ impl Coordinator for MemoryCoordinator {
         every: Duration,
         limit: usize,
     ) -> Result<Vec<Removed>> {
-        let now = self.clock.now();
+        let now = self.now();
         let (lately, since) = (window_start(now, lately)?, window_start(now, every)?);
         let mut purges = self.purges.lock().expect("coordinator lock");
         let mut due: Vec<&mut Purge> = purges
@@ -788,7 +795,7 @@ impl Coordinator for MemoryCoordinator {
         due: Option<Duration>,
         hold: Duration,
     ) -> Result<bool> {
-        let now = self.clock.now();
+        let now = self.now();
         let until = expiry(now, checked_hold(hold)?)?;
         let since = due.map(|due| window_start(now, due)).transpose()?;
         let mut rows = self.rows.lock().expect("coordinator lock");
@@ -814,7 +821,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn renew_backup(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
-        let until = expiry(self.clock.now(), checked_hold(hold)?)?;
+        let until = expiry(self.now(), checked_hold(hold)?)?;
         let mut rows = self.rows.lock().expect("coordinator lock");
         let held = rows.iter_mut().filter(|(key, row)| {
             &key.tenant == tenant && row.backup_claim.is_some_and(|(held, _)| held == claim)
@@ -828,7 +835,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn release_backup(&self, tenant: &TenantId, claim: Uuid, made: bool) -> Result<()> {
-        let now = self.clock.now();
+        let now = self.now();
         let mut rows = self.rows.lock().expect("coordinator lock");
         let held = rows.iter_mut().filter(|(key, row)| {
             &key.tenant == tenant && row.backup_claim.is_some_and(|(held, _)| held == claim)
@@ -871,6 +878,39 @@ impl Coordinator for MemoryCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whatever its clock says, to the nanosecond on some machines, the
+    /// times it hands out are to the microsecond, as those Postgres hands
+    /// out are: a restore point's time is the one a restore to it records.
+    #[tokio::test]
+    async fn the_times_it_hands_out_are_to_the_microsecond() {
+        let fine = DateTime::<Utc>::from_timestamp(1_760_000_000, 123_456_789).unwrap();
+        let c = MemoryCoordinator::new(Arc::new(ManualClock::starting_at(fine)));
+        let key = PartitionKey {
+            tenant: TenantId::new("acme").unwrap(),
+            partition: vellev_core::Partition::DEFAULT,
+        };
+        c.register(&key).await.unwrap();
+        let holder = NodeId::generate("a");
+        let Acquired::Lease { lease, .. } = c
+            .acquire(&key, &holder, Duration::from_secs(30))
+            .await
+            .unwrap()
+        else {
+            panic!("not leased");
+        };
+        let first = Commit {
+            after: None,
+            log_position: LogPosition(1),
+            manifest: Some(ManifestRef("m1".into())),
+            restore: None,
+            adopting: None,
+        };
+        c.commit(&lease, first).await.unwrap();
+        let hour = Duration::from_secs(60 * 60);
+        let (_, latest) = c.restore_points(&key, hour).await.unwrap().unwrap();
+        assert_eq!(latest.at.timestamp_subsec_nanos(), 123_456_000);
+    }
 
     /// An adoption is noted only on a tenant that has not committed, and
     /// the commit that makes it is the first: should one be found noted on
