@@ -101,7 +101,9 @@ window ends, and nothing either release keeps is pruned by the other: see
   tenant is given the backup's keys only with `with_keys`, which brings
   back a key revoked after the backup was taken. Only a tenant never
   written to and without keys adopts; any other is a `conflict` (409).
-  So is a commit refused while a tenant is taking a backup up, and the
+  So is a restore from a backup that lists a file no longer in the backup
+  store, which says which backup and which file, and was a 500 that said
+  neither. So is a commit refused while a tenant is taking a backup up, and the
   restore of an adoption that finds it no longer noted for the lease that
   commits it, as when it was given up meanwhile: nothing was restored, and
   the adoption may be asked for again. A node that lost the tenant to

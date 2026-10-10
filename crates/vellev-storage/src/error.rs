@@ -21,6 +21,18 @@ pub enum StorageError {
     },
     #[error("{key} is corrupt: {reason}")]
     Corrupt { key: String, reason: String },
+    /// A fact about the backup, for whoever asked to restore from it: it
+    /// lists a file that is no longer in the backup store, and cannot be
+    /// restored from by a cluster that does not have the file itself.
+    #[error(
+        "backup {backup} of tenant {tenant} cannot be restored from: it lists {file}, \
+         which is not in the backup store"
+    )]
+    BackupLacks {
+        tenant: vellev_core::TenantId,
+        backup: uuid::Uuid,
+        file: String,
+    },
     #[error("{key} has format version {found}, newer than the supported {supported}")]
     UnsupportedVersion {
         key: String,

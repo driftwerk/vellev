@@ -3974,7 +3974,7 @@ async fn a_backup_outlives_a_restore_that_failed_and_the_days_after_it() {
     assert!(
         matches!(
             failed,
-            Err(NodeError::Storage(StorageError::Corrupt { .. }))
+            Err(NodeError::Storage(StorageError::BackupLacks { .. }))
         ),
         "{failed:?}"
     );
@@ -5045,7 +5045,7 @@ async fn a_tenant_that_takes_up_another_backup_after_one_failed_has_nothing_of_t
     assert!(
         matches!(
             failed,
-            Err(NodeError::Storage(StorageError::Corrupt { .. }))
+            Err(NodeError::Storage(StorageError::BackupLacks { .. }))
         ),
         "{failed:?}"
     );
@@ -7038,13 +7038,41 @@ async fn a_purge_that_failed_with_only_a_backups_delete_sent_leaves_its_claim_to
     node.create_tenant(&acme).await.unwrap();
 }
 
-/// A backup store each delete of which waits out a backoff on the
-/// runtime's timers before the request goes, as the store's client does
-/// between two tries; the first runs a hook before it waits.
+/// A store each delete of which, of a key holding `only` if that is given,
+/// waits out a backoff on the runtime's timers before the request goes, as
+/// the store's client does between two tries. The first such runs a hook
+/// before it waits, and every delete sent once that hook has run is
+/// counted.
 #[derive(Debug)]
 struct Backoff {
-    inner: ObjectBlobs,
+    inner: Arc<dyn Blobs>,
+    only: Option<&'static str>,
     before_backoff: Hook,
+    hooked: AtomicBool,
+    sent_since: AtomicUsize,
+}
+
+impl Backoff {
+    fn over(inner: Arc<dyn Blobs>, only: Option<&'static str>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            only,
+            before_backoff: Hook::default(),
+            hooked: AtomicBool::new(false),
+            sent_since: AtomicUsize::new(0),
+        })
+    }
+
+    /// Have the machine be suspended for a claim's hold, as `claims` counts
+    /// it, while the next delete is parked on its backoff: by another task,
+    /// which on the one thread these tests run on has its turn only once
+    /// the delete has parked. So the clock moves between two polls of the
+    /// delete, as it does over a suspend, and not within one.
+    fn suspended_while_parked(&self, claims: Arc<RuntimeClock>) {
+        self.before_backoff.set(async move {
+            tokio::spawn(async move { claims.sleep_through(hold()) });
+        });
+    }
 }
 
 #[async_trait]
@@ -7059,9 +7087,17 @@ impl Blobs for Backoff {
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        self.before_backoff.run().await;
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        if self.only.is_none_or(|only| key.contains(only)) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if self.before_backoff.is_set() {
+                self.before_backoff.run().await;
+                self.hooked.store(true, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if self.hooked.load(Ordering::SeqCst) {
+            self.sent_since.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.delete(key).await
     }
 }
@@ -7069,10 +7105,8 @@ impl Blobs for Backoff {
 #[tokio::test]
 async fn a_machine_suspended_between_two_tries_of_a_delete_sends_nothing_once_woken() {
     let cluster = Cluster::new();
-    let store = Arc::new(Backoff {
-        inner: ObjectBlobs::new(Arc::new(InMemory::new())),
-        before_backoff: Hook::default(),
-    });
+    let inner = backup_store();
+    let store = Backoff::over(inner.clone(), None);
     let claims = Arc::new(RuntimeClock::new());
     let node = cluster.node_from(Settings {
         backups: Some(store.clone()),
@@ -7080,26 +7114,107 @@ async fn a_machine_suspended_between_two_tries_of_a_delete_sends_nothing_once_wo
         ..cluster.settings()
     });
     written_and_backed_up(&node).await;
-    let kept = keys_under(&store.inner, "_backups/acme/").await.len();
+    let kept = keys_under(inner.as_ref(), "_backups/acme/").await.len();
     assert!(kept > 2);
     node.drop_tenant(&tenant("acme")).await.unwrap();
     cluster.clock.advance(hold());
 
-    // The machine is suspended past the claim while a delete waits out a
-    // backoff inside the store's client. Woken, the client's own timer
-    // fires and takes the delete up again: the claim's clock is asked
-    // then, as whenever the work is taken up, and nothing is sent.
-    store
-        .before_backoff
-        .set(async move { claims.sleep_through(hold()) });
+    // The machine is suspended past the claim while a purge's delete in
+    // the backups waits out a backoff inside the store's client. Woken,
+    // the client's own timer fires and takes the delete up again: the
+    // claim's clock is asked before it is, and nothing is sent.
+    store.suspended_while_parked(claims);
     node.purge_due().await.unwrap();
     assert!(!store.before_backoff.is_set(), "the machine slept");
+    assert_eq!(store.sent_since.load(Ordering::SeqCst), 0);
     assert_eq!(
-        keys_under(&store.inner, "_backups/acme/").await.len(),
+        keys_under(inner.as_ref(), "_backups/acme/").await.len(),
         kept,
         "nothing was deleted once the claim had run out by its own clock"
     );
     assert!(node.create_tenant(&tenant("acme")).await.is_err());
+}
+
+#[tokio::test]
+async fn a_machine_suspended_between_two_tries_of_a_tenants_file_delete_sends_nothing_once_woken() {
+    let cluster = Cluster::new();
+    let blobs = Backoff::over(cluster.store.clone(), None);
+    let claims = Arc::new(RuntimeClock::new());
+    let node = Node::new(
+        cluster.coordinator.clone(),
+        blobs.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            backups: Some(backup_store()),
+            claim_clock: claims.clone(),
+            ..cluster.settings()
+        },
+    );
+    written_and_backed_up(&node).await;
+    let kept = keys_under(cluster.store.as_ref(), "acme/").await.len();
+    assert!(kept > 2);
+    node.drop_tenant(&tenant("acme")).await.unwrap();
+    cluster.clock.advance(hold());
+
+    // The same, in the tenants' store, where a file deleted late is not
+    // put back by anything.
+    blobs.suspended_while_parked(claims);
+    node.purge_due().await.unwrap();
+    assert!(!blobs.before_backoff.is_set(), "the machine slept");
+    assert_eq!(blobs.sent_since.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        keys_under(cluster.store.as_ref(), "acme/").await.len(),
+        kept
+    );
+    assert!(node.create_tenant(&tenant("acme")).await.is_err());
+}
+
+#[tokio::test]
+async fn a_machine_suspended_between_two_tries_of_a_prune_sends_nothing_once_woken() {
+    let cluster = Cluster::new();
+    let inner = backup_store();
+    let day = Duration::from_secs(24 * 60 * 60);
+    let claims = Arc::new(RuntimeClock::new());
+    let plain = cluster.node_from(Settings {
+        backups: Some(inner.clone()),
+        backups_kept: day,
+        clock: cluster.clock.clone(),
+        ..cluster.settings()
+    });
+    let acme = tenant("acme");
+    let first = written_and_backed_up(&plain).await;
+    cluster.clock.advance(Duration::from_secs(60 * 60));
+    noted(&plain, 3, "owl").await;
+    let second = plain.back_up(&acme).await.unwrap();
+    drop(plain);
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+
+    // Under a claim on a tenant's backups, in pruning: the machine is
+    // suspended past the claim while the delete of an old backup's record
+    // waits between two tries. Nothing is pruned once it wakes, and the
+    // backup made is the run's outcome all the same.
+    let store = Backoff::over(inner.clone(), Some(".backup.json"));
+    let node = cluster.node_from(Settings {
+        backups: Some(store.clone()),
+        backups_kept: day,
+        clock: cluster.clock.clone(),
+        claim_clock: claims.clone(),
+        ..cluster.settings()
+    });
+    cluster.clock.advance(2 * day);
+    noted(&node, 4, "elk").await;
+    let before = keys_under(inner.as_ref(), "_backups/acme/").await;
+    store.suspended_while_parked(claims);
+    let third = node.back_up(&acme).await.unwrap();
+    assert!(
+        !store.before_backoff.is_set(),
+        "the machine slept in pruning"
+    );
+    assert_eq!(store.sent_since.load(Ordering::SeqCst), 0);
+    let after = keys_under(inner.as_ref(), "_backups/acme/").await;
+    let gone: Vec<_> = before.iter().filter(|key| !after.contains(key)).collect();
+    assert!(gone.is_empty(), "{gone:?}");
+    assert_eq!(node.backups(&acme).await.unwrap(), [first, second, third]);
 }
 
 #[tokio::test]
@@ -7164,12 +7279,16 @@ async fn a_backup_lacking_a_file_stays_listed_and_says_which_when_it_is_restored
     let refused = node
         .adopt_backup(&acme, backup.id, false, RequestId::generate())
         .await;
-    let Err(NodeError::Storage(StorageError::Corrupt { key, reason })) = refused else {
+    let Err(NodeError::Storage(StorageError::BackupLacks {
+        tenant,
+        backup: lacking,
+        file,
+    })) = refused
+    else {
         panic!("{refused:?}");
     };
-    assert_eq!(key, lost);
-    assert!(reason.contains(&backup.id.to_string()), "{reason}");
-    assert!(reason.contains("not in the backup store"), "{reason}");
+    assert_eq!((tenant, lacking), (acme.clone(), backup.id));
+    assert!(lost.ends_with(&file), "{file} of {lost}");
     let now = cluster.coordinator.identity(&acme).await.unwrap().unwrap();
     assert!(!now.committed && now.lineage != backup.lineage, "{now:?}");
 

@@ -198,8 +198,24 @@ async fn a_lost_tenant_whose_restore_failed_is_restored_when_asked_again() {
 
     let fresh = Cluster::new().serve_backing_up_to(store.clone()).await;
     let adopt = json!({ "adopt": { "backup": backup["id"], "with_keys": true } });
-    let (status, _) = fresh.post(RESTORE, adopt.clone()).await;
-    assert!(status.is_server_error(), "{status}");
+    // Refused as a fact about the backup, for whoever restores in a hurry
+    // to act on: which backup lacks which file, over the API and on the
+    // command line alike.
+    let (status, body) = fresh.post(RESTORE, adopt.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "conflict", "{body}");
+    let id = backup["id"].as_str().unwrap();
+    let file = hidden.key.rsplit_once("/acme/").unwrap().1;
+    for told in [
+        body["error"]["message"].as_str().unwrap().to_string(),
+        command(&fresh, &["restore", "--adopt", id])
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(told.contains(id), "{told}");
+        assert!(told.contains(file), "{told}");
+        assert!(told.contains("not in the backup store"), "{told}");
+    }
     let keys = fresh.ok(Method::GET, "/v1/tenants/acme/keys", None).await;
     assert_eq!(
         keys["keys"],

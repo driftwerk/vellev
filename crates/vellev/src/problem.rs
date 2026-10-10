@@ -175,6 +175,10 @@ fn code(error: &StorageError) -> Code {
             Refused::Conflict => Code::Conflict,
             Refused::Invalid => Code::Invalid,
         },
+        // Not a fault of the node: what the request asks to restore from
+        // cannot be, as it is stored, and whoever asked needs to know
+        // which backup lacks which file. It names no secret.
+        E::BackupLacks { .. } => Code::Conflict,
         E::Missing { .. }
         | E::Corrupt { .. }
         | E::UnusableRecords { .. }
@@ -342,6 +346,41 @@ mod tests {
             told(coordinator(fenced)),
             (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable)
         );
+    }
+
+    #[test]
+    fn a_backup_lacking_a_file_is_a_conflict_that_says_which_and_a_corrupt_file_is_not_told() {
+        let backup = uuid::Uuid::new_v4();
+        let lacks = StorageError::BackupLacks {
+            tenant: TenantId::new("acme").unwrap(),
+            backup,
+            file: "acme/0/segment/1.segment".into(),
+        };
+        let ApiError {
+            status, problem, ..
+        } = lacks.into();
+        assert_eq!(
+            (status, problem.code),
+            (StatusCode::CONFLICT, Code::Conflict)
+        );
+        assert!(problem.message.contains(&backup.to_string()), "{problem:?}");
+        assert!(
+            problem.message.contains("acme/0/segment/1.segment"),
+            "{problem:?}"
+        );
+
+        let corrupt = StorageError::Corrupt {
+            key: "acme/0/segment/1.segment".into(),
+            reason: "its checksum is another".into(),
+        };
+        let ApiError {
+            status, problem, ..
+        } = corrupt.into();
+        assert_eq!(
+            (status, problem.code),
+            (StatusCode::INTERNAL_SERVER_ERROR, Code::Internal)
+        );
+        assert!(!problem.message.contains("segment"), "{problem:?}");
     }
 
     #[test]

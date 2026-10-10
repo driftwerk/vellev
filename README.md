@@ -188,9 +188,10 @@ backups as any other.
 A backup is listed for as long as its record is there, and nothing looks
 whether its files still are until it is restored from. A backup that has
 lost a file from the backup store stays listed as one to restore from, and
-fails only then, saying which backup lacks which file; a cluster that
-still has the file in the tenant's own store restores from it all the
-same. The next backup the same cluster takes copies back any file it
+fails only then: the restore is refused as a `conflict` (409) whose message
+names the backup and the file it lacks, and the command line prints it. A
+cluster that still has the file in the tenant's own store restores from it
+all the same. The next backup the same cluster takes copies back any file it
 lists that went, so a backup that lists the lost file is mended by it. An
 older backup whose lost file the tenant no longer lists is not mended by
 anything: it fails at restore for as long as it is kept.

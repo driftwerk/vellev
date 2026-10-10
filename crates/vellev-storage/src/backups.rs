@@ -631,11 +631,11 @@ impl Backups {
                 // anyone who lacks the file, until a backup that lists the
                 // file is taken by the cluster that took this one.
                 Err(StorageError::Missing { .. }) => {
-                    let reason = format!(
-                        "backup {} of tenant {} lists {key}, and it is not in the backup store",
-                        backup.id, backup.tenant
-                    );
-                    return Err(StorageError::corrupt(&kept, reason));
+                    return Err(StorageError::BackupLacks {
+                        tenant: backup.tenant.clone(),
+                        backup: backup.id,
+                        file: key,
+                    });
                 }
                 bytes => bytes?,
             };
