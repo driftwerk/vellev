@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use futures::future::join_all;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch, OnceCell};
@@ -478,7 +478,9 @@ impl Asking {
             request: self.request,
             asked: self.digest,
             from,
-            from_at,
+            // To the microsecond, as the coordinator records it: the
+            // answer given now is the one given from the record later.
+            from_at: from_at.trunc_subsecs(6),
         }
     }
 
@@ -1650,6 +1652,15 @@ mod tests {
     use vellev_core::EmbeddingProvider;
 
     use super::*;
+
+    #[test]
+    fn a_restore_is_asked_for_to_the_microsecond_as_it_is_recorded() {
+        let taken_at = DateTime::<Utc>::from_timestamp(1_760_000_000, 1_500).unwrap();
+        let asking = Asking::of(RequestId::generate(), Target::Backup(uuid::Uuid::nil()));
+        let restore = asking.to(LogPosition(1), taken_at);
+        assert_eq!(restore.from_at.timestamp_subsec_nanos(), 1_000);
+        assert_eq!(restore.from_at.timestamp(), 1_760_000_000);
+    }
 
     #[tokio::test]
     async fn a_collection_whose_clients_supply_the_vectors_is_never_embedded_for() {

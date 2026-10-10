@@ -1220,7 +1220,11 @@ async fn a_record_that_says_no_lineage_or_cluster_is_nobodys() {
 #[tokio::test]
 async fn nothing_this_release_keeps_lies_where_the_release_before_looks() {
     let cluster = Cluster::new().await;
-    let store = memory();
+    let listings = Arc::new(Listings {
+        inner: memory(),
+        listed: std::sync::Mutex::default(),
+    });
+    let store: Arc<dyn Blobs> = listings.clone();
     let backups = Backups::new(store.clone());
     written(&cluster).await;
     let own = owner(&cluster).await;
@@ -1250,6 +1254,67 @@ async fn nothing_this_release_keeps_lies_where_the_release_before_looks() {
     }
     assert!(keys(&store, &before_records).await.is_empty());
     assert!(keys(&store, &before_files).await.is_empty());
+
+    // Nor does anything of this release look there: finding backups lists
+    // the records' place alone, and pruning and purging list records and
+    // files under the lineage and cluster alone.
+    let (listed_records, listed_files) = (
+        format!("_backups/{tenant}/records/"),
+        format!("_backups/{tenant}/data/"),
+    );
+    listings.listed();
+    backups.of_any(tenant).await.unwrap();
+    assert_eq!(listings.listed(), std::slice::from_ref(&listed_records));
+    backups.list(&own).await.unwrap();
+    assert_eq!(listings.listed(), [format!("{listed_records}{lineage}/")]);
+    backups.find(&own, backup.id).await.unwrap();
+    assert_eq!(listings.listed(), [format!("{listed_records}{lineage}/")]);
+    backups
+        .prune(&own, Duration::ZERO, &Claimed(true))
+        .await
+        .unwrap();
+    backups.any_kept(&own).await.unwrap();
+    backups.purge(&own, &Claimed(true)).await.unwrap();
+    let listed = listings.listed();
+    assert!(!listed.is_empty());
+    for prefix in listed {
+        assert!(
+            prefix.starts_with(&format!("{listed_records}{lineage}/{by}/"))
+                || prefix.starts_with(&format!("{listed_files}{lineage}/{by}/")),
+            "{prefix} was listed"
+        );
+    }
+}
+
+/// Object storage that notes each prefix listed of it.
+#[derive(Debug)]
+struct Listings {
+    inner: Arc<dyn Blobs>,
+    listed: std::sync::Mutex<Vec<String>>,
+}
+
+impl Listings {
+    /// The prefixes listed since last asked.
+    fn listed(&self) -> Vec<String> {
+        std::mem::take(&mut self.listed.lock().unwrap())
+    }
+}
+
+#[async_trait]
+impl Blobs for Listings {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.listed.lock().unwrap().push(prefix.to_string());
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
 }
 
 #[tokio::test]

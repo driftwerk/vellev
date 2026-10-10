@@ -1233,8 +1233,10 @@ struct Unrenewing {
     /// its tenant's backups were taken over, and takes `commits_slowly`.
     disowning_on_commit: AtomicBool,
     commits_slowly: Duration,
-    /// What happens once, just after an adoption is next noted for a
-    /// tenant, as a restore asked to adopt has it be before its commit.
+    /// What happens once, just before an adoption is next asked to be
+    /// noted for a tenant, and once, just after one is, as a restore asked
+    /// to adopt has it be before its commit.
+    adoption_noting: Hook,
     adoption_noted: Hook,
     /// Whether two adoptions of one tenant are raced: then how many were
     /// noted is counted, a signal is given once a second is, and a commit
@@ -1288,6 +1290,7 @@ impl Unrenewing {
             lapsed: AtomicBool::new(false),
             disowning_on_commit: AtomicBool::new(false),
             commits_slowly: Duration::ZERO,
+            adoption_noting: Hook::default(),
             adoption_noted: Hook::default(),
             adoptions_raced: AtomicBool::new(false),
             adoptions_noted: AtomicUsize::new(0),
@@ -1570,6 +1573,7 @@ impl Coordinator for Unrenewing {
         generation: vellev_storage::coordinator::Generation,
         adoption: &vellev_storage::coordinator::Adoption,
     ) -> Result<bool, CoordinatorError> {
+        self.adoption_noting.run().await;
         let noted = self
             .inner
             .adopt_on_commit(key, generation, adoption)
@@ -6414,4 +6418,46 @@ async fn adoption_runs_end_to_end_on_postgres() {
         .await
         .unwrap();
     admin.close().await;
+}
+
+#[tokio::test]
+async fn a_node_whose_lease_went_before_it_noted_its_adoption_notes_nothing_for_the_next() {
+    let (store, backup) = backed_up_elsewhere().await;
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node_through = || {
+        Node::new(
+            coordinator.clone(),
+            cluster.store.clone(),
+            Arc::new(Embedders::new(EmbedSettings::default())),
+            Settings {
+                backups: Some(store.clone()),
+                ..cluster.settings()
+            },
+        )
+    };
+    let (stalled, other) = (node_through(), node_through());
+    let acme = tenant("acme");
+    // The node stalls past its lease with the files fetched and the
+    // adoption about to be noted; another node takes the tenant meanwhile.
+    // The adoption is asked for under the lease the node holds, which is
+    // no more, and so refused: not under the lease current now, which is
+    // the other node's and asked for nothing.
+    let (clock, elsewhere) = (cluster.clock.clone(), other.clone());
+    coordinator.adoption_noting.set(async move {
+        clock.advance(LEASE + Duration::from_secs(1));
+        drop(elsewhere.tenant(&tenant("acme")).await.unwrap());
+    });
+    let lost = stalled
+        .adopt_backup(&acme, backup.id, true, RequestId::generate())
+        .await;
+    assert!(!coordinator.adoption_noting.is_set(), "the machine slept");
+    assert!(matches!(lost, Err(NodeError::Lost(_))), "{lost:?}");
+
+    // The other node writes the tenant as the tenant it is: nothing noted
+    // stands in its way, and nothing of the backup is taken.
+    noted(&other, 1, "its own").await;
+    let now = cluster.coordinator.identity(&acme).await.unwrap().unwrap();
+    assert!(now.committed && now.lineage != backup.lineage, "{now:?}");
+    assert_eq!(cluster.coordinator.keys(&acme).await.unwrap(), []);
 }

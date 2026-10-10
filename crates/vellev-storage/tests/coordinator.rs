@@ -2731,6 +2731,43 @@ async fn postgres_a_first_commit_that_waited_while_an_adoption_was_noted_does_no
     assert_eq!((now.lineage, now.committed), (own, false));
 }
 
+/// Nothing writes an adoption onto a partition that has committed, nor
+/// leaves one there past the commit that makes or outlives it; should one
+/// be found there all the same, it is of a lease that is no more, and no
+/// commit makes it. The memory coordinator's guard has the same test.
+#[tokio::test]
+async fn postgres_an_adoption_noted_on_a_partition_that_has_committed_is_never_made() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let c = &pg.coordinator;
+    let key = registered(&pg).await;
+    let (held, _) = lease(&pg, &key, &node("a")).await;
+    let own = taken_up(&pg, &key.tenant).await;
+    let to_be = adoption(2);
+    assert!(c
+        .adopt_on_commit(&key, held.generation, &to_be)
+        .await
+        .unwrap());
+    sqlx::query(
+        "UPDATE vellev.partitions SET log_position = 1 WHERE tenant = $1 AND partition = $2",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+    let restoring = adopting_commit(2, "restored", to_be.lineage);
+    assert!(unadopted(&c.commit(&held, restoring).await));
+    assert_eq!(taken_up(&pg, &key.tenant).await, own);
+    c.commit(&held, commit(2, "m2")).await.unwrap();
+    assert_eq!(taken_up(&pg, &key.tenant).await, own);
+    assert_eq!(
+        c.committed(&key).await.unwrap().unwrap().log_position,
+        LogPosition(2)
+    );
+}
+
 #[tokio::test]
 async fn postgres_registering_removing_and_adopting_together_leave_a_tenant_one_lineage() {
     const TASKS: u32 = 12;
