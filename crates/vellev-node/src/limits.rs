@@ -155,8 +155,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_batch_larger_than_a_bucket_is_let_through_and_owed() {
+    // On a clock that stands still, as the two after it are: a bucket
+    // refills by its clock between one asking and the next, so on a
+    // running one what is owed is less than was taken by however long the
+    // test took to ask again.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_larger_than_a_bucket_is_let_through_and_owed() {
         let limits = Limits::new(None, Some(100.0));
         let busy = TenantId::new("busy").unwrap();
         limits.admit(&busy, Asked::Write, 500).unwrap();
@@ -164,14 +168,12 @@ mod tests {
             Err(NodeError::Limited { wait, .. }) => wait,
             other => panic!("{other:?}"),
         };
-        assert!(
-            owed >= Duration::from_secs(4),
-            "{owed:?}: the 400 over is owed"
-        );
+        // The 400 over, and the one asked for now, at 100 a second.
+        assert_eq!(owed, Duration::from_secs_f64(401.0 / 100.0));
     }
 
-    #[test]
-    fn what_a_request_turns_out_to_cost_is_owed_too() {
+    #[tokio::test(start_paused = true)]
+    async fn what_a_request_turns_out_to_cost_is_owed_too() {
         let limits = Limits::new(None, Some(100.0));
         let busy = TenantId::new("busy").unwrap();
         limits.admit(&busy, Asked::Write, 1).unwrap();
@@ -182,7 +184,7 @@ mod tests {
             Err(NodeError::Limited { wait, .. }) => wait,
             other => panic!("{other:?}"),
         };
-        assert!(owed >= Duration::from_secs(4), "{owed:?}");
+        assert_eq!(owed, Duration::from_secs_f64(401.0 / 100.0));
         Limits::new(None, None).owe(&busy, Asked::Write, 1_000);
     }
 

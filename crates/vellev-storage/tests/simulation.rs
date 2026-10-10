@@ -260,7 +260,7 @@ impl Coordinator for SimCoordinator {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.clean.ping().await
     }
-    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<(), CoordinatorError> {
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<u16, CoordinatorError> {
         self.clean.announce(node, versions).await
     }
     async fn depart(&self, node: &NodeId) -> Result<(), CoordinatorError> {
@@ -362,12 +362,67 @@ impl Coordinator for SimCoordinator {
         self.clean.purges(due, lately).await
     }
 
+    async fn identity(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<vellev_storage::coordinator::Identity>, CoordinatorError> {
+        self.clean.identity(tenant).await
+    }
+
+    async fn cluster(&self) -> Result<vellev_storage::coordinator::ClusterId, CoordinatorError> {
+        self.clean.cluster().await
+    }
+
+    async fn adopt_on_commit(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+        adoption: &vellev_storage::coordinator::Adoption,
+    ) -> Result<bool, CoordinatorError> {
+        self.clean.adopt_on_commit(key, generation, adoption).await
+    }
+
+    async fn adopt_no_more(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+    ) -> Result<(), CoordinatorError> {
+        self.clean.adopt_no_more(key, generation).await
+    }
+
     async fn claim_purge(
         &self,
         tenant: &TenantId,
+        due: Duration,
         hold: Duration,
-    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
-        self.clean.claim_purge(tenant, hold).await
+    ) -> Result<Option<vellev_storage::coordinator::PurgeClaim>, CoordinatorError> {
+        self.clean.claim_purge(tenant, due, hold).await
+    }
+
+    async fn renew_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        hold: Duration,
+    ) -> Result<bool, CoordinatorError> {
+        self.clean.renew_purge(tenant, claim, hold).await
+    }
+
+    async fn release_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+    ) -> Result<(), CoordinatorError> {
+        self.clean.release_purge(tenant, claim).await
+    }
+
+    async fn look_overs(
+        &self,
+        lately: Duration,
+        every: Duration,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::Removed>, CoordinatorError> {
+        self.clean.look_overs(lately, every, limit).await
     }
 
     async fn purged(
@@ -379,13 +434,27 @@ impl Coordinator for SimCoordinator {
         self.clean.purged(tenant, claim, forget_after).await
     }
 
+    async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool, CoordinatorError> {
+        self.clean.reopen_purge(tenant).await
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,
+        claim: uuid::Uuid,
         due: Option<Duration>,
         hold: Duration,
-    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
-        self.clean.claim_backup(tenant, due, hold).await
+    ) -> Result<bool, CoordinatorError> {
+        self.clean.claim_backup(tenant, claim, due, hold).await
+    }
+
+    async fn renew_backup(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        hold: Duration,
+    ) -> Result<bool, CoordinatorError> {
+        self.clean.renew_backup(tenant, claim, hold).await
     }
 
     async fn release_backup(
@@ -1108,7 +1177,7 @@ impl World {
             from: point.log_position,
             from_at: Utc::now(),
         };
-        let restoring = writer.restore_recorded(point.manifest.as_ref(), restore);
+        let restoring = writer.restore_recorded(point.manifest.as_ref(), restore, None);
         // Only the partition's own writer cleans with no grace.
         let grace = match who {
             Who::Current => Duration::ZERO,

@@ -116,6 +116,14 @@ pub enum Code {
     NotFound = 3,
     /// The request disagrees with what is stored.
     Conflict = 4,
+    /// There is nothing for the request to act on, as a tenant that never
+    /// committed anything has nothing to back up. Asking again changes
+    /// nothing until there is.
+    Empty = 11,
+    /// A tenant of the name was removed, and what was kept of it is still
+    /// being deleted: the tenant can be made again once that is done, and
+    /// the request sent again after the `Retry-After` it gives.
+    Purging = 12,
     /// The tenant is asking more of the node than it may; the request had
     /// no effect and may be sent again after the `Retry-After` it gives.
     Limited = 5,
@@ -149,7 +157,7 @@ impl Code {
             Code::Unauthorized => 401,
             Code::Forbidden => 403,
             Code::NotFound => 404,
-            Code::Conflict => 409,
+            Code::Conflict | Code::Empty | Code::Purging => 409,
             Code::Limited => 429,
             Code::Unavailable | Code::Uncertain => 503,
             // The node's failing, not the caller's, so a server error; and
@@ -442,8 +450,29 @@ pub enum RestoreTo {
     At(chrono::DateTime<chrono::Utc>),
     /// As the commit at this position left it.
     Position(u64),
-    /// As the backup with this id took it.
+    /// As its own backup with this id took it.
     Backup(uuid::Uuid),
+    /// As a backup kept under its name took a tenant this cluster has
+    /// lost.
+    Adopt(Adopt),
+}
+
+/// Which backup a tenant this cluster has lost is to be taken up again
+/// from. The tenant is made, if there is none, and with the restore becomes
+/// the tenant the backup is of, with the restore window it had; nothing of
+/// the backup is the tenant's unless the restore is done. A tenant that has
+/// been written to here, or has keys, is refused as a conflict: it is some
+/// other tenant of the name, or was made for one.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Adopt {
+    /// The id of the backup.
+    pub backup: uuid::Uuid,
+    /// Whether the tenant is given the keys the backup kept: those it had
+    /// when the backup was taken, so that a key revoked since then reaches
+    /// the tenant again. Without it the tenant is given no key.
+    #[serde(default)]
+    pub with_keys: bool,
 }
 
 /// A copy of a tenant kept in the backup store.
@@ -452,6 +481,15 @@ pub enum RestoreTo {
 #[non_exhaustive]
 pub struct Backup {
     pub id: uuid::Uuid,
+    /// Which tenant of its name it is of: a tenant made later under the
+    /// same name has another. None from a node of a release before backups
+    /// said it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<uuid::Uuid>,
+    /// Which cluster took it. None from a node of a release before backups
+    /// said it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<uuid::Uuid>,
     pub taken_at: chrono::DateTime<chrono::Utc>,
     /// The position of the tenant's last commit then.
     pub position: u64,
@@ -1254,6 +1292,8 @@ impl Backup {
     ) -> Self {
         Self {
             id,
+            lineage: None,
+            cluster: None,
             taken_at,
             position,
             files,
@@ -1953,6 +1993,8 @@ mod tests {
             (Code::Forbidden, 403),
             (Code::NotFound, 404),
             (Code::Conflict, 409),
+            (Code::Empty, 409),
+            (Code::Purging, 409),
             (Code::Limited, 429),
             (Code::Unavailable, 503),
             (Code::Uncertain, 503),
@@ -1976,6 +2018,8 @@ mod tests {
             Code::Internal,
             Code::Unknown,
             Code::ModelUnavailable,
+            Code::Empty,
+            Code::Purging,
         ];
         for (number, code) in numbered.into_iter().enumerate() {
             assert_eq!(code as usize, number, "{code:?}");

@@ -28,6 +28,16 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     async fn get(&self, key: &str) -> Result<Bytes>;
     /// Every file whose key starts with `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>>;
+    /// As [`Self::list`], given up as failed once the store has taken
+    /// longer than `each` over any one answer: so that how long a listing
+    /// may take grows with how much there is to list, and a long one is not
+    /// given up for being long. A store that answers a listing all at once
+    /// is given `each` for the whole of it.
+    async fn list_within(&self, prefix: &str, each: Duration) -> Result<Vec<Listed>> {
+        tokio::time::timeout(each, self.list(prefix))
+            .await
+            .map_err(|_| unanswered(prefix, each))?
+    }
     /// Remove a file; one that is not there is no error.
     async fn delete(&self, key: &str) -> Result<()>;
     /// The copy of the file on local disk, if the store has one there now.
@@ -64,6 +74,15 @@ pub trait Blobs: fmt::Debug + Send + Sync {
 pub struct Local {
     pub path: PathBuf,
     pub disk: Disk,
+}
+
+/// The failure of a request to the store about `key` that went unanswered
+/// for `within`.
+pub fn unanswered(key: &str, within: Duration) -> StorageError {
+    StorageError::Blob {
+        key: key.to_string(),
+        source: format!("no answer within {within:?}").into(),
+    }
 }
 
 /// A file as a listing shows it.
@@ -1085,6 +1104,28 @@ impl Blobs for ObjectBlobs {
         Ok(listed)
     }
 
+    async fn list_within(&self, prefix: &str, each: Duration) -> Result<Vec<Listed>> {
+        use futures::TryStreamExt;
+        let under = object_store::path::Path::from(prefix);
+        let mut listing = self.store.list(Some(&under));
+        let mut listed = Vec::new();
+        // The store answers a page at a time, and each file of a page at
+        // once: the wait for the next file is the wait for its page.
+        loop {
+            let next = tokio::time::timeout(each, listing.try_next())
+                .await
+                .map_err(|_| unanswered(prefix, each))?
+                .map_err(|e| blob_error(prefix, e))?;
+            match next {
+                Some(meta) => listed.push(Listed {
+                    key: meta.location.to_string(),
+                    modified: meta.last_modified,
+                }),
+                None => return Ok(listed),
+            }
+        }
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         let within = self.transfers.request_within;
         match bounded(key, within, self.store.delete(&ObjectPath::from(key))).await {
@@ -1323,6 +1364,10 @@ impl Blobs for CachedBlobs {
 
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
         self.inner.list(prefix).await
+    }
+
+    async fn list_within(&self, prefix: &str, each: Duration) -> Result<Vec<Listed>> {
+        self.inner.list_within(prefix, each).await
     }
 
     /// The copy on local disk goes first, and the file only once it has:

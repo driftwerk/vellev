@@ -154,12 +154,16 @@ fn code(error: &StorageError) -> Code {
         | E::Filter(_)
         | E::Object(_) => Code::Invalid,
         E::Coordinator(CoordinatorError::InvalidArgument(_)) => Code::Internal,
-        E::Coordinator(CoordinatorError::Purging(_)) => Code::Conflict,
+        E::Coordinator(CoordinatorError::Purging { .. }) => Code::Purging,
+        E::Coordinator(CoordinatorError::Adopting(_) | CoordinatorError::Unadopted(_)) => {
+            Code::Conflict
+        }
         E::Coordinator(_)
         | E::Blob { .. }
         | E::Embedding { .. }
         | E::Closed
         | E::Restoring
+        | E::Unheld(_)
         | E::Diverged { .. } => Code::Unavailable,
         E::Shared(shared) => match shared.root() {
             root if root.refusal().is_some() => code(root),
@@ -171,8 +175,13 @@ fn code(error: &StorageError) -> Code {
             Refused::Conflict => Code::Conflict,
             Refused::Invalid => Code::Invalid,
         },
+        // Not a fault of the node: what the request asks to restore from
+        // cannot be, as it is stored, and whoever asked needs to know
+        // which backup lacks which file. It names no secret.
+        E::BackupLacks { .. } => Code::Conflict,
         E::Missing { .. }
         | E::Corrupt { .. }
+        | E::UnusableRecords { .. }
         | E::UnsupportedVersion { .. }
         | E::Exhausted(_)
         | E::Encode(_)
@@ -218,6 +227,10 @@ impl From<StorageError> for ApiError {
                 tracing::error!(%error, "request failed");
                 Self::new(Code::Internal, "the node failed to serve the request")
             }
+            // How long the purge has left is not known here: asked again as
+            // often as a node looks for tenants to purge.
+            (Code::Purging, root) => Self::new(Code::Purging, root.to_string())
+                .after(vellev_node::PURGES_LOOKED_FOR_EVERY),
             (Code::NotFound, root) => {
                 let mut told = Self::new(Code::NotFound, root.to_string());
                 told.problem.missing = missing(root);
@@ -244,8 +257,13 @@ impl From<NodeError> for ApiError {
             NodeError::Ahead(_) | NodeError::NoBackups | NodeError::NoSuchModel(_) => {
                 Self::invalid(error.to_string())
             }
-            NodeError::BackingUp(_) | NodeError::Restoring(_) => {
-                Self::new(Code::Conflict, error.to_string())
+            NodeError::Empty(_) => Self::new(Code::Empty, error.to_string()),
+            NodeError::BackingUp(_)
+            | NodeError::Restoring(_)
+            | NodeError::NotLost(_)
+            | NodeError::Keyed(_) => Self::new(Code::Conflict, error.to_string()),
+            NodeError::Purging { wait, .. } => {
+                Self::new(Code::Purging, error.to_string()).after(wait)
             }
             NodeError::Reused { .. } => {
                 Self::refused(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
@@ -255,7 +273,9 @@ impl From<NodeError> for ApiError {
             | NodeError::Stopped
             | NodeError::Busy
             | NodeError::Lost(_)
+            | NodeError::ClaimLost(_)
             | NodeError::Behind(_) => Self::unavailable(error.to_string()),
+            NodeError::Settings(_) => Self::new(Code::Internal, error.to_string()),
             NodeError::Embed(error) => {
                 let lasting = error.lasting();
                 Self::unembedded(error, lasting)
@@ -297,6 +317,70 @@ mod tests {
             status, problem, ..
         } = error.into();
         (status, problem.code)
+    }
+
+    #[test]
+    fn a_commit_refused_for_an_adoption_is_a_conflict_and_one_by_a_lease_moved_on_is_not() {
+        let tenant = || TenantId::new("acme").unwrap();
+        let conflict = (StatusCode::CONFLICT, Code::Conflict);
+        let coordinator = StorageError::Coordinator;
+        assert_eq!(
+            told(coordinator(CoordinatorError::Adopting(tenant()))),
+            conflict
+        );
+        assert_eq!(
+            told(coordinator(CoordinatorError::Unadopted(tenant()))),
+            conflict
+        );
+        let key = vellev_storage::coordinator::PartitionKey {
+            tenant: tenant(),
+            partition: vellev_core::Partition::DEFAULT,
+        };
+        let generation = vellev_storage::coordinator::Generation;
+        let fenced = CoordinatorError::Fenced {
+            key,
+            held: generation(1),
+            current: generation(2),
+        };
+        assert_eq!(
+            told(coordinator(fenced)),
+            (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable)
+        );
+    }
+
+    #[test]
+    fn a_backup_lacking_a_file_is_a_conflict_that_says_which_and_a_corrupt_file_is_not_told() {
+        let backup = uuid::Uuid::new_v4();
+        let lacks = StorageError::BackupLacks {
+            tenant: TenantId::new("acme").unwrap(),
+            backup,
+            file: "acme/0/segment/1.segment".into(),
+        };
+        let ApiError {
+            status, problem, ..
+        } = lacks.into();
+        assert_eq!(
+            (status, problem.code),
+            (StatusCode::CONFLICT, Code::Conflict)
+        );
+        assert!(problem.message.contains(&backup.to_string()), "{problem:?}");
+        assert!(
+            problem.message.contains("acme/0/segment/1.segment"),
+            "{problem:?}"
+        );
+
+        let corrupt = StorageError::Corrupt {
+            key: "acme/0/segment/1.segment".into(),
+            reason: "its checksum is another".into(),
+        };
+        let ApiError {
+            status, problem, ..
+        } = corrupt.into();
+        assert_eq!(
+            (status, problem.code),
+            (StatusCode::INTERNAL_SERVER_ERROR, Code::Internal)
+        );
+        assert!(!problem.message.contains("segment"), "{problem:?}");
     }
 
     #[test]

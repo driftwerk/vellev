@@ -291,12 +291,12 @@ impl Blobs for Paused {
 /// Purge a removed tenant as a node would, so that it may be made again.
 pub async fn purge(coordinator: &dyn Coordinator, tenant: &TenantId) {
     let claim = coordinator
-        .claim_purge(tenant, Duration::from_secs(60))
+        .claim_purge(tenant, Duration::ZERO, Duration::from_secs(60))
         .await
         .unwrap()
         .expect("a purge to claim");
     coordinator
-        .purged(tenant, claim, Duration::from_secs(24 * 60 * 60))
+        .purged(tenant, claim.id, Duration::from_secs(24 * 60 * 60))
         .await
         .unwrap();
 }
@@ -392,7 +392,7 @@ impl Coordinator for Unreliable {
     async fn ping(&self) -> Result<(), CoordinatorError> {
         self.inner.ping().await
     }
-    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<(), CoordinatorError> {
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<u16, CoordinatorError> {
         self.inner.announce(node, versions).await
     }
     async fn depart(&self, node: &NodeId) -> Result<(), CoordinatorError> {
@@ -494,12 +494,71 @@ impl Coordinator for Unreliable {
         self.inner.purges(due, lately).await
     }
 
+    async fn identity(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<vellev_storage::coordinator::Identity>, CoordinatorError> {
+        self.inner.identity(tenant).await
+    }
+
+    async fn cluster(&self) -> Result<vellev_storage::coordinator::ClusterId, CoordinatorError> {
+        self.inner.cluster().await
+    }
+
+    async fn adopt_on_commit(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+        adoption: &vellev_storage::coordinator::Adoption,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.adopt_on_commit(key, generation, adoption).await
+    }
+
+    async fn adopt_no_more(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.adopt_no_more(key, generation).await
+    }
+
     async fn claim_purge(
         &self,
         tenant: &TenantId,
+        due: Duration,
         hold: Duration,
-    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
-        self.inner.claim_purge(tenant, hold).await
+    ) -> Result<Option<vellev_storage::coordinator::PurgeClaim>, CoordinatorError> {
+        self.inner.claim_purge(tenant, due, hold).await
+    }
+
+    async fn renew_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        hold: Duration,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.renew_purge(tenant, claim, hold).await
+    }
+
+    async fn release_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.release_purge(tenant, claim).await
+    }
+
+    async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool, CoordinatorError> {
+        self.inner.reopen_purge(tenant).await
+    }
+
+    async fn look_overs(
+        &self,
+        lately: Duration,
+        every: Duration,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::Removed>, CoordinatorError> {
+        self.inner.look_overs(lately, every, limit).await
     }
 
     async fn purged(
@@ -514,10 +573,20 @@ impl Coordinator for Unreliable {
     async fn claim_backup(
         &self,
         tenant: &TenantId,
+        claim: uuid::Uuid,
         due: Option<Duration>,
         hold: Duration,
-    ) -> Result<Option<uuid::Uuid>, CoordinatorError> {
-        self.inner.claim_backup(tenant, due, hold).await
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.claim_backup(tenant, claim, due, hold).await
+    }
+
+    async fn renew_backup(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        hold: Duration,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.renew_backup(tenant, claim, hold).await
     }
 
     async fn release_backup(

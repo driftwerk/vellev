@@ -7,15 +7,15 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use uuid::Uuid;
 use vellev_core::{NodeId, RequestId, TenantId};
 
 use super::{
-    checked_hold, checked_ttl, checked_window, window_start, Acquired, Commit, Committed,
-    Coordinator, CoordinatorError, Forgotten, Generation, Incarnation, KeyHash, Lease, LogPosition,
-    ManifestRef, PartitionKey, Point, Purges, RestorePoint, Restored, Result, TenantKey, Versions,
-    RESTORES_KEPT_FOR,
+    checked_hold, checked_ttl, checked_window, window_start, Acquired, Adoption, ClusterId, Commit,
+    Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation,
+    KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges,
+    Removed, RestorePoint, Restored, Result, TenantKey, Versions, RESTORES_KEPT_FOR,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -56,6 +56,7 @@ impl Clock for ManualClock {
 struct Row {
     generation: Generation,
     incarnation: Incarnation,
+    lineage: Lineage,
     lease: Option<(NodeId, DateTime<Utc>)>,
     log_position: LogPosition,
     manifest: Option<ManifestRef>,
@@ -67,6 +68,9 @@ struct Row {
     backed_up_at: Option<DateTime<Utc>>,
     /// Who holds the right to back the tenant up, and until when.
     backup_claim: Option<(Uuid, DateTime<Utc>)>,
+    /// What its tenant is to become with a commit, and the generation of
+    /// the lease that is to make it.
+    adopting: Option<(Generation, Adoption)>,
 }
 
 impl Row {
@@ -79,6 +83,11 @@ impl Row {
         }
     }
 
+    /// Whether the partition has ever committed anything.
+    fn has_committed(&self) -> bool {
+        self.manifest.is_some() || self.log_position != LogPosition(0)
+    }
+
     /// The commits a restore reaching back from `start` may go to.
     fn reachable(&self, start: DateTime<Utc>) -> &[RestorePoint] {
         let within = self.history.partition_point(|commit| commit.at < start);
@@ -89,15 +98,19 @@ impl Row {
 /// A removed tenant's purge.
 #[derive(Debug, Clone)]
 struct Purge {
+    removed: Removed,
     requested: DateTime<Utc>,
     purged: Option<DateTime<Utc>>,
     claim: Option<(Uuid, DateTime<Utc>)>,
+    /// When a node last looked for anything written for the tenant since.
+    looked: Option<DateTime<Utc>>,
 }
 
 /// The coordinator's rules without a database: the same fencing, driven by an
 /// injectable clock.
 #[derive(Debug)]
 pub struct MemoryCoordinator {
+    cluster: ClusterId,
     clock: Arc<dyn Clock>,
     generations: AtomicU64,
     rows: Mutex<HashMap<PartitionKey, Row>>,
@@ -114,8 +127,16 @@ impl Default for MemoryCoordinator {
 }
 
 impl MemoryCoordinator {
+    /// The time by the coordinator's clock, to the microsecond: as Postgres
+    /// keeps every time it is given, so that a time this coordinator hands
+    /// out is the same read back from a record of it as when it was given.
+    fn now(&self) -> DateTime<Utc> {
+        self.clock.now().trunc_subsecs(6)
+    }
+
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
+            cluster: ClusterId(Uuid::new_v4()),
             clock,
             generations: AtomicU64::new(0),
             rows: Mutex::new(HashMap::new()),
@@ -124,6 +145,12 @@ impl MemoryCoordinator {
             keys: Mutex::new(Vec::new()),
             purges: Mutex::default(),
         }
+    }
+
+    /// Whether `tenant` has any key.
+    fn keyed(&self, tenant: &TenantId) -> bool {
+        let keys = self.keys.lock().expect("coordinator lock");
+        keys.iter().any(|(of, ..)| of == tenant)
     }
 
     fn next_generation(&self) -> Generation {
@@ -135,7 +162,7 @@ impl MemoryCoordinator {
         key: &PartitionKey,
         f: impl FnOnce(&mut Row, DateTime<Utc>) -> Result<T>,
     ) -> Result<T> {
-        let now = self.clock.now();
+        let now = self.now();
         let mut rows = self.rows.lock().expect("coordinator lock");
         let row = rows
             .get_mut(key)
@@ -176,20 +203,33 @@ fn expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
 
 #[async_trait]
 impl Coordinator for MemoryCoordinator {
+    async fn cluster(&self) -> Result<ClusterId> {
+        Ok(self.cluster)
+    }
+
     async fn register(&self, key: &PartitionKey) -> Result<()> {
         let mut rows = self.rows.lock().expect("coordinator lock");
         let purging = self.purges.lock().expect("coordinator lock");
-        if purging
+        let undone = purging
             .get(&key.tenant)
-            .is_some_and(|purge| purge.purged.is_none())
-        {
-            return Err(CoordinatorError::Purging(key.tenant.clone()));
+            .filter(|purge| purge.purged.is_none());
+        if let Some(purge) = undone {
+            let asked = self.now() - purge.requested;
+            return Err(CoordinatorError::Purging {
+                tenant: key.tenant.clone(),
+                asked: asked.to_std().unwrap_or_default(),
+            });
         }
         if !rows.contains_key(key) {
             let generation = self.next_generation();
+            let lineage = rows
+                .iter()
+                .find(|(other, _)| other.tenant == key.tenant)
+                .map_or_else(|| Lineage(Uuid::new_v4()), |(_, row)| row.lineage);
             let row = Row {
                 generation,
                 incarnation: Incarnation(generation.0),
+                lineage,
                 lease: None,
                 log_position: LogPosition(0),
                 manifest: None,
@@ -198,25 +238,77 @@ impl Coordinator for MemoryCoordinator {
                 restore_window: None,
                 backed_up_at: None,
                 backup_claim: None,
+                adopting: None,
             };
             rows.insert(key.clone(), row);
         }
         Ok(())
     }
 
+    async fn identity(&self, tenant: &TenantId) -> Result<Option<Identity>> {
+        let rows = self.rows.lock().expect("coordinator lock");
+        let mut of: Vec<(&PartitionKey, &Row)> = rows
+            .iter()
+            .filter(|(key, _)| &key.tenant == tenant)
+            .collect();
+        of.sort_by_key(|(key, _)| key.partition.0);
+        Ok(of.first().map(|(_, first)| Identity {
+            lineage: first.lineage,
+            committed: of.iter().any(|(_, row)| row.has_committed()),
+        }))
+    }
+
+    async fn adopt_on_commit(
+        &self,
+        key: &PartitionKey,
+        generation: Generation,
+        adoption: &Adoption,
+    ) -> Result<bool> {
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        let mut tenants = rows.iter().filter(|(other, _)| other.tenant == key.tenant);
+        let committed = tenants.any(|(_, row)| row.has_committed());
+        let keyed = self.keyed(&key.tenant);
+        let row = rows
+            .get_mut(key)
+            .filter(|row| row.generation == generation && !committed && !keyed);
+        let noted = row.is_some();
+        if let Some(row) = row {
+            row.adopting = Some((generation, adoption.clone()));
+        }
+        Ok(noted)
+    }
+
+    async fn adopt_no_more(&self, key: &PartitionKey, generation: Generation) -> Result<()> {
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        let noted = rows.get_mut(key).filter(|row| {
+            row.adopting
+                .as_ref()
+                .is_some_and(|(by, _)| *by == generation)
+        });
+        if let Some(row) = noted {
+            row.adopting = None;
+        }
+        Ok(())
+    }
+
     async fn remove(&self, key: &PartitionKey) -> Result<bool> {
         let mut rows = self.rows.lock().expect("coordinator lock");
-        let existed = rows.remove(key).is_some();
+        let removed = rows.remove(key);
         if !rows.keys().any(|other| other.tenant == key.tenant) {
             self.keys
                 .lock()
                 .expect("coordinator lock")
                 .retain(|(tenant, ..)| tenant != &key.tenant);
-            if existed {
+            if let Some(row) = &removed {
                 let purge = Purge {
-                    requested: self.clock.now(),
+                    removed: Removed {
+                        tenant: key.tenant.clone(),
+                        lineage: row.lineage,
+                    },
+                    requested: self.now(),
                     purged: None,
                     claim: None,
+                    looked: None,
                 };
                 self.purges
                     .lock()
@@ -224,7 +316,7 @@ impl Coordinator for MemoryCoordinator {
                     .insert(key.tenant.clone(), purge);
             }
         }
-        Ok(existed)
+        Ok(removed.is_some())
     }
 
     async fn acquire(
@@ -291,39 +383,81 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed> {
-        self.with_current(lease, |row, now| {
-            let follows = commit.after.as_ref().is_none_or(|after| {
-                after.position == row.log_position && after.head == row.manifest
+        let now = self.now();
+        let tenant = &lease.key.tenant;
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        let mut others = rows.iter().filter(|(key, _)| key != &&lease.key);
+        let elsewhere = others.any(|(key, row)| &key.tenant == tenant && row.has_committed());
+        let row = rows
+            .get_mut(&lease.key)
+            .ok_or_else(|| CoordinatorError::UnknownPartition(lease.key.clone()))?;
+        if row.generation != lease.generation {
+            return Err(lease.fenced_by(row.generation));
+        }
+        let follows = commit
+            .after
+            .as_ref()
+            .is_none_or(|after| after.position == row.log_position && after.head == row.manifest);
+        let advances = follows && commit.log_position > row.log_position;
+        let repeats = commit.log_position == row.log_position && commit.manifest == row.manifest;
+        if !(advances || repeats) {
+            return Err(CoordinatorError::Regressed {
+                key: lease.key.clone(),
+                committed: row.log_position,
+                attempted: commit.log_position,
             });
-            let advances = follows && commit.log_position > row.log_position;
-            let repeats =
-                commit.log_position == row.log_position && commit.manifest == row.manifest;
-            if !(advances || repeats) {
-                return Err(CoordinatorError::Regressed {
-                    key: lease.key.clone(),
-                    committed: row.log_position,
-                    attempted: commit.log_position,
-                });
+        }
+        // An adoption is made by the first commit of the lease it was noted
+        // for, saying so, or not at all; one of a lease since moved on is
+        // no more. A commit that says it adopts and finds none noted is
+        // refused, unless it is the very commit that made it, asked again.
+        let adopting = row
+            .adopting
+            .take()
+            .filter(|(generation, _)| *generation == row.generation && !row.has_committed());
+        match (&adopting, commit.adopting) {
+            (Some((generation, adoption)), says) => {
+                let restores = says == Some(adoption.lineage)
+                    && adoption.at == commit.log_position
+                    && commit.manifest.is_some();
+                if !restores || elsewhere || self.keyed(tenant) {
+                    row.adopting = Some((*generation, adoption.clone()));
+                    return Err(CoordinatorError::Adopting(tenant.clone()));
+                }
             }
-            if let (true, Some(head)) = (advances, &commit.manifest) {
-                row.history.push(RestorePoint {
-                    position: commit.log_position,
-                    head: head.clone(),
-                    at: now,
-                });
+            (None, Some(lineage)) if !(repeats && row.lineage == lineage) => {
+                return Err(CoordinatorError::Unadopted(tenant.clone()));
             }
-            if let (true, Some(restore)) = (advances, commit.restore) {
-                let restored = Restored {
-                    restore,
-                    incarnation: row.incarnation,
-                    position: commit.log_position,
-                };
-                row.restores.push((now, restored));
+            (None, _) => {}
+        }
+        if let (true, Some(head)) = (advances, &commit.manifest) {
+            row.history.push(RestorePoint {
+                position: commit.log_position,
+                head: head.clone(),
+                at: now,
+            });
+        }
+        if let (true, Some(restore)) = (advances, commit.restore) {
+            let restored = Restored {
+                restore,
+                incarnation: row.incarnation,
+                position: commit.log_position,
+            };
+            row.restores.push((now, restored));
+        }
+        row.log_position = commit.log_position;
+        row.manifest = commit.manifest;
+        let committed = row.committed();
+        if let Some((_, adoption)) = adopting {
+            for (_, row) in rows.iter_mut().filter(|(key, _)| &key.tenant == tenant) {
+                row.lineage = adoption.lineage;
+                row.restore_window = adoption.restore_window;
             }
-            row.log_position = commit.log_position;
-            row.manifest = commit.manifest;
-            Ok(row.committed())
-        })
+            let kept = adoption.keys.into_iter();
+            let kept = kept.map(|key| (tenant.clone(), key.hash, key));
+            self.keys.lock().expect("coordinator lock").extend(kept);
+        }
+        Ok(committed)
     }
 
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>> {
@@ -355,12 +489,10 @@ impl Coordinator for MemoryCoordinator {
         Ok(())
     }
 
-    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<()> {
-        self.nodes
-            .lock()
-            .expect("coordinator lock")
-            .insert(node.clone(), versions);
-        Ok(())
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<u16> {
+        let mut nodes = self.nodes.lock().expect("coordinator lock");
+        nodes.insert(node.clone(), versions);
+        Ok(*self.format.lock().expect("coordinator lock"))
     }
 
     async fn depart(&self, node: &NodeId) -> Result<()> {
@@ -403,7 +535,7 @@ impl Coordinator for MemoryCoordinator {
         }
         let issued = TenantKey {
             id,
-            created: self.clock.now(),
+            created: self.now(),
             hash: *hash,
         };
         let mut keys = self.keys.lock().expect("coordinator lock");
@@ -518,7 +650,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn forget_restores(&self) -> Result<u64> {
-        let kept_since = window_start(self.clock.now(), RESTORES_KEPT_FOR)?;
+        let kept_since = window_start(self.now(), RESTORES_KEPT_FOR)?;
         let mut rows = self.rows.lock().expect("coordinator lock");
         Ok(rows
             .values_mut()
@@ -531,7 +663,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn purges(&self, due: Duration, lately: Duration) -> Result<Purges> {
-        let now = self.clock.now();
+        let now = self.now();
         let (due, lately) = (window_start(now, due)?, window_start(now, lately)?);
         let purges = self.purges.lock().expect("coordinator lock");
         let mut found = Purges::default();
@@ -547,22 +679,61 @@ impl Coordinator for MemoryCoordinator {
         Ok(found)
     }
 
-    async fn claim_purge(&self, tenant: &TenantId, hold: Duration) -> Result<Option<Uuid>> {
-        let now = self.clock.now();
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        due: Duration,
+        hold: Duration,
+    ) -> Result<Option<PurgeClaim>> {
+        let now = self.now();
         let until = expiry(now, checked_hold(hold)?)?;
+        let due = window_start(now, due)?;
         let mut purges = self.purges.lock().expect("coordinator lock");
         let Some(purge) = purges.get_mut(tenant).filter(|purge| {
-            purge.purged.is_none() && purge.claim.is_none_or(|(_, until)| until < now)
+            purge.purged.is_none()
+                && purge.requested <= due
+                && purge.claim.is_none_or(|(_, until)| until < now)
         }) else {
             return Ok(None);
         };
-        let claim = Uuid::new_v4();
-        purge.claim = Some((claim, until));
-        Ok(Some(claim))
+        let id = Uuid::new_v4();
+        purge.claim = Some((id, until));
+        Ok(Some(PurgeClaim {
+            id,
+            removed: purge.removed.clone(),
+        }))
+    }
+
+    async fn release_purge(&self, tenant: &TenantId, claim: Uuid) -> Result<()> {
+        let mut purges = self.purges.lock().expect("coordinator lock");
+        let held = purges.get_mut(tenant).filter(|purge| {
+            purge.purged.is_none() && purge.claim.is_some_and(|(held, _)| held == claim)
+        });
+        if let Some(purge) = held {
+            purge.claim = None;
+        }
+        Ok(())
+    }
+
+    async fn renew_purge(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
+        let until = expiry(self.now(), checked_hold(hold)?)?;
+        let rows = self.rows.lock().expect("coordinator lock");
+        let mut purges = self.purges.lock().expect("coordinator lock");
+        let held = purges
+            .get_mut(tenant)
+            .filter(|purge| {
+                purge.purged.is_none() && purge.claim.is_some_and(|(held, _)| held == claim)
+            })
+            .filter(|_| !rows.keys().any(|key| &key.tenant == tenant));
+        let renewed = held.is_some();
+        if let Some(purge) = held {
+            purge.claim = Some((claim, until));
+        }
+        Ok(renewed)
     }
 
     async fn purged(&self, tenant: &TenantId, claim: Uuid, forget_after: Duration) -> Result<()> {
-        let now = self.clock.now();
+        let now = self.now();
         let forgotten = window_start(now, forget_after)?;
         let mut purges = self.purges.lock().expect("coordinator lock");
         let held = purges.get_mut(tenant).filter(|purge| {
@@ -570,19 +741,61 @@ impl Coordinator for MemoryCoordinator {
         });
         if let Some(purge) = held {
             purge.purged = Some(now);
+            purge.looked = Some(now);
             purge.claim = None;
         }
         purges.retain(|_, purge| purge.purged.is_none_or(|purged| purged >= forgotten));
         Ok(())
     }
 
+    async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool> {
+        let rows = self.rows.lock().expect("coordinator lock");
+        let mut purges = self.purges.lock().expect("coordinator lock");
+        let done = purges
+            .get_mut(tenant)
+            .filter(|purge| purge.purged.is_some())
+            .filter(|_| !rows.keys().any(|key| &key.tenant == tenant));
+        let reopened = done.is_some();
+        if let Some(purge) = done {
+            purge.purged = None;
+            purge.claim = None;
+        }
+        Ok(reopened)
+    }
+
+    async fn look_overs(
+        &self,
+        lately: Duration,
+        every: Duration,
+        limit: usize,
+    ) -> Result<Vec<Removed>> {
+        let now = self.now();
+        let (lately, since) = (window_start(now, lately)?, window_start(now, every)?);
+        let mut purges = self.purges.lock().expect("coordinator lock");
+        let mut due: Vec<&mut Purge> = purges
+            .values_mut()
+            .filter(|purge| purge.purged.is_some_and(|purged| purged >= lately))
+            .filter(|purge| purge.looked.is_none_or(|looked| looked <= since))
+            .collect();
+        due.sort_by(|a, b| (a.looked, &a.removed.tenant).cmp(&(b.looked, &b.removed.tenant)));
+        Ok(due
+            .into_iter()
+            .take(limit)
+            .map(|purge| {
+                purge.looked = Some(now);
+                purge.removed.clone()
+            })
+            .collect())
+    }
+
     async fn claim_backup(
         &self,
         tenant: &TenantId,
+        claim: Uuid,
         due: Option<Duration>,
         hold: Duration,
-    ) -> Result<Option<Uuid>> {
-        let now = self.clock.now();
+    ) -> Result<bool> {
+        let now = self.now();
         let until = expiry(now, checked_hold(hold)?)?;
         let since = due.map(|due| window_start(now, due)).transpose()?;
         let mut rows = self.rows.lock().expect("coordinator lock");
@@ -591,22 +804,38 @@ impl Coordinator for MemoryCoordinator {
             .filter(|(key, _)| &key.tenant == tenant)
             .map(|(_, row)| row)
             .collect();
-        let free = |row: &&mut Row| {
-            row.backup_claim.is_none_or(|(_, until)| until < now)
-                && since.is_none_or(|since| row.backed_up_at.is_none_or(|at| at <= since))
+        let takeable = |row: &&mut Row| match row.backup_claim {
+            Some((held, _)) if held == claim => true,
+            held => {
+                held.is_none_or(|(_, until)| until < now)
+                    && since.is_none_or(|since| row.backed_up_at.is_none_or(|at| at <= since))
+            }
         };
-        if rows.is_empty() || !rows.iter().all(free) {
-            return Ok(None);
+        if rows.is_empty() || !rows.iter().all(takeable) {
+            return Ok(false);
         }
-        let claim = Uuid::new_v4();
         for row in &mut rows {
             row.backup_claim = Some((claim, until));
         }
-        Ok(Some(claim))
+        Ok(true)
+    }
+
+    async fn renew_backup(&self, tenant: &TenantId, claim: Uuid, hold: Duration) -> Result<bool> {
+        let until = expiry(self.now(), checked_hold(hold)?)?;
+        let mut rows = self.rows.lock().expect("coordinator lock");
+        let held = rows.iter_mut().filter(|(key, row)| {
+            &key.tenant == tenant && row.backup_claim.is_some_and(|(held, _)| held == claim)
+        });
+        let mut renewed = false;
+        for (_, row) in held {
+            row.backup_claim = Some((claim, until));
+            renewed = true;
+        }
+        Ok(renewed)
     }
 
     async fn release_backup(&self, tenant: &TenantId, claim: Uuid, made: bool) -> Result<()> {
-        let now = self.clock.now();
+        let now = self.now();
         let mut rows = self.rows.lock().expect("coordinator lock");
         let held = rows.iter_mut().filter(|(key, row)| {
             &key.tenant == tenant && row.backup_claim.is_some_and(|(held, _)| held == claim)
@@ -643,5 +872,109 @@ impl Coordinator for MemoryCoordinator {
             found = true;
         }
         Ok(found)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whatever its clock says, to the nanosecond on some machines, the
+    /// times it hands out are to the microsecond, as those Postgres hands
+    /// out are: a restore point's time is the one a restore to it records.
+    #[tokio::test]
+    async fn the_times_it_hands_out_are_to_the_microsecond() {
+        let fine = DateTime::<Utc>::from_timestamp(1_760_000_000, 123_456_789).unwrap();
+        let c = MemoryCoordinator::new(Arc::new(ManualClock::starting_at(fine)));
+        let key = PartitionKey {
+            tenant: TenantId::new("acme").unwrap(),
+            partition: vellev_core::Partition::DEFAULT,
+        };
+        c.register(&key).await.unwrap();
+        let holder = NodeId::generate("a");
+        let Acquired::Lease { lease, .. } = c
+            .acquire(&key, &holder, Duration::from_secs(30))
+            .await
+            .unwrap()
+        else {
+            panic!("not leased");
+        };
+        let first = Commit {
+            after: None,
+            log_position: LogPosition(1),
+            manifest: Some(ManifestRef("m1".into())),
+            restore: None,
+            adopting: None,
+        };
+        c.commit(&lease, first).await.unwrap();
+        let hour = Duration::from_secs(60 * 60);
+        let (_, latest) = c.restore_points(&key, hour).await.unwrap().unwrap();
+        assert_eq!(latest.at.timestamp_subsec_nanos(), 123_456_000);
+    }
+
+    /// An adoption is noted only on a tenant that has not committed, and
+    /// the commit that makes it is the first: should one be found noted on
+    /// a partition that has committed since, as nothing writes it, it is
+    /// a note of a lease that is no more, and no commit makes it.
+    #[tokio::test]
+    async fn an_adoption_noted_on_a_partition_that_has_committed_is_never_made() {
+        let clock = Arc::new(ManualClock::starting_at(Utc::now()));
+        let c = MemoryCoordinator::new(clock);
+        let key = PartitionKey {
+            tenant: TenantId::new("acme").unwrap(),
+            partition: vellev_core::Partition::DEFAULT,
+        };
+        c.register(&key).await.unwrap();
+        let holder = NodeId::generate("a");
+        let Acquired::Lease { lease, .. } = c
+            .acquire(&key, &holder, Duration::from_secs(30))
+            .await
+            .unwrap()
+        else {
+            panic!("not leased");
+        };
+        let own = c.identity(&key.tenant).await.unwrap().unwrap().lineage;
+        let to_be = Adoption {
+            lineage: Lineage(Uuid::new_v4()),
+            at: LogPosition(2),
+            keys: Vec::new(),
+            restore_window: None,
+        };
+        assert!(c
+            .adopt_on_commit(&key, lease.generation, &to_be)
+            .await
+            .unwrap());
+        {
+            let mut rows = c.rows.lock().unwrap();
+            let row = rows.get_mut(&key).unwrap();
+            row.log_position = LogPosition(1);
+            assert!(row.adopting.is_some());
+        }
+        let restoring = Commit {
+            after: None,
+            log_position: LogPosition(2),
+            manifest: Some(ManifestRef("restored".into())),
+            restore: None,
+            adopting: Some(to_be.lineage),
+        };
+        let refused = c.commit(&lease, restoring).await;
+        assert!(
+            matches!(refused, Err(CoordinatorError::Unadopted(_))),
+            "{refused:?}"
+        );
+        assert_eq!(c.identity(&key.tenant).await.unwrap().unwrap().lineage, own);
+        let plain = Commit {
+            after: None,
+            log_position: LogPosition(2),
+            manifest: Some(ManifestRef("m2".into())),
+            restore: None,
+            adopting: None,
+        };
+        c.commit(&lease, plain).await.unwrap();
+        assert_eq!(c.identity(&key.tenant).await.unwrap().unwrap().lineage, own);
+        assert_eq!(
+            c.committed(&key).await.unwrap().map(|at| at.log_position),
+            Some(LogPosition(2))
+        );
     }
 }

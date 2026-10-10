@@ -11,7 +11,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Notify;
 use vellev::config::Config;
 use vellev::server::App;
-use vellev_api::RestoreTo;
+use vellev_api::{Adopt, RestoreTo};
 use vellev_core::{Embedding, TenantId};
 use vellev_storage::blobs::ObjectBlobs;
 
@@ -89,6 +89,15 @@ enum BackupAction {
         /// The id of one of its backups.
         #[arg(long, group = "to")]
         backup: Option<uuid::Uuid>,
+        /// The id of a backup kept under its name, to take up again a
+        /// tenant this cluster has lost: the tenant is made, with the
+        /// restore window it had.
+        #[arg(long, group = "to")]
+        adopt: Option<uuid::Uuid>,
+        /// Give the tenant adopted the keys the backup kept: those it had
+        /// when the backup was taken, one revoked since among them.
+        #[arg(long, requires = "adopt")]
+        with_keys: bool,
     },
     /// Set how far back the tenant may be restored.
     Window {
@@ -246,12 +255,18 @@ async fn main() -> Result<ExitCode> {
                     at,
                     position,
                     backup,
+                    adopt,
+                    with_keys,
                 } => {
+                    let adopt = adopt.map(|backup| Adopt { backup, with_keys });
                     let to = at
                         .map(RestoreTo::At)
                         .or(position.map(RestoreTo::Position))
                         .or(backup.map(RestoreTo::Backup))
-                        .ok_or_else(|| eyre::eyre!("restore to --at, --position or --backup"))?;
+                        .or(adopt.map(RestoreTo::Adopt))
+                        .ok_or_else(|| {
+                            eyre::eyre!("restore to --at, --position, --backup or --adopt")
+                        })?;
                     serde_json::to_value(tenant.restore(to).await?)?
                 }
                 BackupAction::Window { secs } => {

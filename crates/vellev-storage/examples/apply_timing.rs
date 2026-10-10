@@ -129,6 +129,7 @@ async fn main() {
         log_position: LogPosition(position),
         manifest: Some(ManifestRef(head)),
         restore: None,
+        adopting: None,
     };
     let committed = coordinator.commit(&lease, committed).await.unwrap();
 

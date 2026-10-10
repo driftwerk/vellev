@@ -3,14 +3,14 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use futures::future::join_all;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch, OnceCell};
@@ -19,8 +19,9 @@ use vellev_core::{Embedding, ModelFault, NodeId, Partition, RequestId, TenantId}
 use vellev_embed::{EmbedError, Embedders};
 use vellev_storage::blobs::Blobs;
 use vellev_storage::coordinator::{
-    Acquired, Coordinator, CoordinatorError, Lease, LogPosition, ManifestRef, PartitionKey, Point,
-    Restore, RestorePoint, Restored, TenantKey, Versions, MAX_RESTORE_WINDOW,
+    Acquired, Clock, Coordinator, CoordinatorError, Generation, Lease, Lineage, LogPosition,
+    ManifestRef, PartitionKey, Point, Restore, RestorePoint, Restored, SystemClock, TenantKey,
+    Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
@@ -29,6 +30,8 @@ use vellev_storage::{
 };
 
 mod backing;
+pub use backing::LANDED_AFTER;
+mod claim_clock;
 mod keys;
 mod limits;
 mod purging;
@@ -38,7 +41,9 @@ use keys::Keys;
 use limits::Asked;
 use limits::Limits;
 
+pub use claim_clock::{BootClock, ClaimClock};
 pub use keys::{Issued, REMEMBERED_FOR as KEYS_REMEMBERED_FOR};
+pub use purging::{LOOKED_FOR_EVERY as PURGES_LOOKED_FOR_EVERY, LOOKED_OVER_EVERY, REMEMBERED};
 pub use reading::{Freshness, Reader};
 
 /// The node-to-node protocol this release speaks: what a request one node
@@ -115,9 +120,35 @@ pub struct Settings {
     pub backups_scheduled: bool,
     /// How long a backup is kept; the newest of a tenant always is.
     pub backups_kept: Duration,
+    /// How long a claim to back a tenant up or restore it lasts unless it
+    /// is renewed, as it is every third of that while the work runs: a node
+    /// gone, or a claim it never heard it took, blocks the tenant for no
+    /// longer. The node takes it for lost a third of it before it runs out,
+    /// a margin that must cover a request to object storage already sent,
+    /// as [`Settings::check`] makes sure.
+    pub backup_claim: Duration,
+    /// How long one request to object storage, retries and all, and one
+    /// request to the coordinator, may take to land or fail.
+    pub request_bounds: RequestBounds,
+    /// The clock backup claims are measured on, which counts the time the
+    /// machine was suspended, as the coordinator's does.
+    pub claim_clock: Arc<dyn ClaimClock>,
+    /// What tells the time of day: when a backup is taken, and how old one
+    /// is when backups are pruned. The machine's, unless told otherwise.
+    pub clock: Arc<dyn Clock>,
+    /// How often the node looks for tenants due a backup, the first time
+    /// at a moment of its own within as long, so that nodes started
+    /// together look at different times.
+    pub backups_looked_for_every: Duration,
+    /// How often the node looks for removed tenants to purge, and for
+    /// those purged lately to look over again.
+    pub purges_looked_for_every: Duration,
     /// How long after a tenant is removed everything kept of it is
     /// deleted: long enough for any node that held it to notice and stop
-    /// committing. A file a stopped writer uploads later still lingers.
+    /// committing. Where tenants are backed up it is no sooner than
+    /// [`Settings::backup_claim`], so that no backup of the tenant still
+    /// holds its claim. A file written for the tenant later still is
+    /// deleted when a node next looks the tenant over, for a day after.
     pub purge_after: Duration,
     /// How files go to and come from object storage, and when a request is
     /// given up.
@@ -146,14 +177,50 @@ impl Settings {
             backup_every: Duration::from_secs(24 * 60 * 60),
             backups_scheduled: true,
             backups_kept: Duration::from_secs(35 * 24 * 60 * 60),
+            backup_claim: Duration::from_secs(15 * 60),
+            request_bounds: RequestBounds::default(),
+            claim_clock: Arc::new(BootClock),
+            clock: Arc::new(SystemClock),
+            backups_looked_for_every: Duration::from_secs(10 * 60),
+            purges_looked_for_every: PURGES_LOOKED_FOR_EVERY,
             purge_after: Duration::from_secs(10 * 60),
             transfers: Transfers::default(),
+        }
+    }
+
+    /// Refuse settings a node cannot run by, saying why.
+    pub fn check(&self) -> Result<()> {
+        self.request_bounds
+            .claim_problem(self.backup_claim)
+            .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
+    }
+}
+
+/// How long one request may take to land or fail: to object storage,
+/// retries and all, so that a delete already sent lands within it; and to
+/// the coordinator, each attempt of which the node gives up on after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBounds {
+    pub store: Duration,
+    pub coordinator: Duration,
+}
+
+impl Default for RequestBounds {
+    /// What one request to object storage may take as the store client is
+    /// set up unless told otherwise ([`vellev_storage::Transfers`]), and a
+    /// coordinator request of ten seconds.
+    fn default() -> Self {
+        Self {
+            store: vellev_storage::Transfers::default().request_within,
+            coordinator: Duration::from_secs(10),
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
+    #[error("the node's settings cannot be run by: {0}")]
+    Settings(String),
     #[error("tenant {0} does not exist")]
     UnknownTenant(TenantId),
     #[error("tenant {tenant} is written by {holder}")]
@@ -183,6 +250,25 @@ pub enum NodeError {
         tenant: TenantId,
         request: RequestId,
     },
+    #[error("tenant {0} has nothing committed to back up")]
+    Empty(TenantId),
+    #[error(
+        "tenant {tenant} was removed and what was kept of it is being deleted; it can be \
+         made again, empty, once that is done: ask again in {wait:?}"
+    )]
+    Purging { tenant: TenantId, wait: Duration },
+    #[error(
+        "tenant {0} has keys, issued for whatever was to be put in it; revoke them before \
+         it takes up a backup"
+    )]
+    Keyed(TenantId),
+    #[error(
+        "tenant {0} has been written to here, and is not the tenant that backup is of; \
+         only a tenant this cluster has lost is taken up again from a backup"
+    )]
+    NotLost(TenantId),
+    #[error("the claim to back tenant {0} up or restore it was lost before the work was done")]
+    ClaimLost(TenantId),
     #[error("tenant {0} has no backup {1}")]
     UnknownBackup(TenantId, uuid::Uuid),
     #[error("the cluster writes file format {cluster}, and this release reads only up to {reads}")]
@@ -354,6 +440,12 @@ pub(crate) struct Asking {
 pub(crate) enum Target {
     Point(Point),
     Backup(uuid::Uuid),
+    /// A backup kept under the tenant's name, taken up by a tenant this
+    /// cluster had lost, with the keys the backup kept or without.
+    Adopt {
+        backup: uuid::Uuid,
+        with_keys: bool,
+    },
 }
 
 impl Asking {
@@ -373,6 +465,11 @@ impl Asking {
                 digest.update(b"backup");
                 digest.update(id.as_bytes());
             }
+            Target::Adopt { backup, with_keys } => {
+                digest.update(b"adopt");
+                digest.update(backup.as_bytes());
+                digest.update([u8::from(with_keys)]);
+            }
         }
         Self {
             request,
@@ -387,7 +484,9 @@ impl Asking {
             request: self.request,
             asked: self.digest,
             from,
-            from_at,
+            // To the microsecond, as the coordinator records it: the
+            // answer given now is the one given from the record later.
+            from_at: from_at.trunc_subsecs(6),
         }
     }
 
@@ -605,16 +704,27 @@ impl Tenant {
         self.compact(window.saturating_add(grace)).await
     }
 
+    /// The generation of the lease this node writes the tenant under.
+    pub(crate) fn generation(&self) -> Generation {
+        self.writer.lease().generation
+    }
+
     /// Put the tenant back as it stood at `head`, as `restore` asks, and
-    /// as [`Writer::restore_recorded`] does. A failure that closes the
+    /// as [`Writer::restore_recorded`] does, `adopting` the lineage of the
+    /// backup it takes up if it takes one up. A failure that closes the
     /// writer is only told here: the hold is lost by whoever runs this on
     /// a task (see [`Self::restoring`]), once the task has ended, since
     /// losing it stops that task wherever it is, with whatever it had
     /// still to say and to tidy up.
-    async fn restored(&self, head: Option<ManifestRef>, restore: Restore) -> Result<Restored> {
+    async fn restored(
+        &self,
+        head: Option<ManifestRef>,
+        restore: Restore,
+        adopting: Option<Lineage>,
+    ) -> Result<Restored> {
         let position = self
             .writer
-            .restore_recorded(head.as_ref(), restore.clone())
+            .restore_recorded(head.as_ref(), restore.clone(), adopting)
             .await
             .map_err(|error| self.told(error))?;
         Ok(Restored {
@@ -807,6 +917,9 @@ struct Inner {
     limits: Arc<Limits>,
     /// The tenants purged lately whose cached files this node has dropped.
     dropped: Mutex<std::collections::HashSet<TenantId>>,
+    /// The newest file format the cluster was seen to write; it never
+    /// falls.
+    cluster_format: AtomicU16,
 }
 
 #[derive(Debug, Clone)]
@@ -827,6 +940,7 @@ impl Node {
             store_answered: Mutex::default(),
             keys: Keys::default(),
             dropped: Mutex::default(),
+            cluster_format: AtomicU16::new(0),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -838,15 +952,10 @@ impl Node {
     /// Whether the node can reach Postgres and object storage and can read
     /// what the cluster writes.
     pub async fn ready(&self) -> Result<()> {
+        self.0.readable()?;
         self.store_answers().await?;
-        let cluster = self.0.coordinator.format().await?;
-        match cluster <= FORMAT_VERSION {
-            true => Ok(()),
-            false => Err(NodeError::Outdated {
-                cluster,
-                reads: FORMAT_VERSION,
-            }),
-        }
+        self.0.saw_format(self.0.coordinator.format().await?);
+        self.0.readable()
     }
 
     /// Whether object storage answered within [`STORE_ANSWERED`], asking
@@ -876,7 +985,9 @@ impl Node {
     /// Register this node as running and reading what it reads, now and
     /// every third of a lease until it stops, and each time raise the file
     /// format the cluster writes as far as this node may write, which only
-    /// happens once every node registered reads it.
+    /// happens once every node registered reads it. A node that finds the
+    /// cluster writing a format newer than it reads says so, and is no
+    /// longer ready.
     pub fn announcing(&self) {
         let every = (self.0.settings.lease / 3).max(Duration::from_secs(1));
         let (inner, versions) = (Arc::downgrade(&self.0), self.versions());
@@ -889,8 +1000,9 @@ impl Node {
                 }
                 let node = &inner.settings.node;
                 let announced = async {
-                    inner.coordinator.announce(node, versions).await?;
-                    inner.coordinator.raise_format(writes).await
+                    inner.saw_format(inner.coordinator.announce(node, versions).await?);
+                    inner.saw_format(inner.coordinator.raise_format(writes).await?);
+                    Ok::<_, CoordinatorError>(())
                 };
                 if let Err(error) = announced.await {
                     tracing::warn!(%error, "announcing the node failed");
@@ -977,7 +1089,7 @@ impl Node {
 
     /// Creating a tenant that exists changes nothing.
     pub async fn create_tenant(&self, tenant: &TenantId) -> Result<()> {
-        Ok(self.0.coordinator.register(&key(tenant)).await?)
+        self.0.register(tenant).await
     }
 
     /// Forget the tenant, and then its history, a batch at a time. Returns
@@ -993,11 +1105,8 @@ impl Node {
         if let Some(opened) = opening.as_ref().and_then(|opening| opening.get()) {
             opened.hold.lose();
         }
-        // The tenant is gone whatever comes of this: what is left, the
-        // purge forgets.
-        if let Err(error) = self.0.forget_removed(tenant).await {
-            tracing::warn!(%tenant, %error, "a removed tenant's history is left for its purge");
-        }
+        // What is left of its history is forgotten by its purge, under the
+        // claim that purges it, a batch at a time.
         Ok(existed)
     }
 
@@ -1028,7 +1137,7 @@ impl Node {
                     .await?
                     .ok_or_else(|| NodeError::NoRestorePoint(id.clone()))?;
                 let restore = asking.to(target.position, target.at);
-                opened.restored(Some(target.head), restore).await
+                opened.restored(Some(target.head), restore, None).await
             })
             .await?;
         tracing::info!(%tenant, ?restored, "restored");
@@ -1178,6 +1287,33 @@ impl Node {
 impl Inner {
     fn opened(&self) -> std::sync::MutexGuard<'_, Open> {
         self.open.lock().expect("tenants lock")
+    }
+
+    /// Note that the cluster writes `format`, saying so plainly the first
+    /// time it is newer than this release reads.
+    fn saw_format(&self, format: u16) {
+        let before = self.cluster_format.fetch_max(format, Ordering::SeqCst);
+        if format > FORMAT_VERSION && before <= FORMAT_VERSION {
+            tracing::error!(
+                cluster = format,
+                reads = FORMAT_VERSION,
+                "the cluster writes a file format newer than this release reads; \
+                 this node is not ready, and is to be replaced by a newer release"
+            );
+        }
+    }
+
+    /// Whether this release reads the newest format the cluster was seen
+    /// to write.
+    fn readable(&self) -> Result<()> {
+        let cluster = self.cluster_format.load(Ordering::SeqCst);
+        if cluster > FORMAT_VERSION {
+            return Err(NodeError::Outdated {
+                cluster,
+                reads: FORMAT_VERSION,
+            });
+        }
+        Ok(())
     }
 
     /// How often tenants are looked over for letting go.
@@ -1442,21 +1578,6 @@ impl Inner {
         hold.stops(maintaining.abort_handle());
     }
 
-    /// Forget what is kept of the removed `tenant`'s history, a batch at a
-    /// time, each well within any bound on one call to the coordinator.
-    async fn forget_removed(&self, tenant: &TenantId) -> Result<()> {
-        let mut after = None;
-        loop {
-            after = self
-                .coordinator
-                .forget_removed(&key(tenant), after, FORGOTTEN_AT_ONCE)
-                .await?;
-            if after.is_none() {
-                return Ok(());
-            }
-        }
-    }
-
     /// How far back `tenant` may be restored.
     async fn restore_window(&self, tenant: &TenantId) -> Result<Duration> {
         restore_window(
@@ -1537,6 +1658,15 @@ mod tests {
     use vellev_core::EmbeddingProvider;
 
     use super::*;
+
+    #[test]
+    fn a_restore_is_asked_for_to_the_microsecond_as_it_is_recorded() {
+        let taken_at = DateTime::<Utc>::from_timestamp(1_760_000_000, 1_500).unwrap();
+        let asking = Asking::of(RequestId::generate(), Target::Backup(uuid::Uuid::nil()));
+        let restore = asking.to(LogPosition(1), taken_at);
+        assert_eq!(restore.from_at.timestamp_subsec_nanos(), 1_000);
+        assert_eq!(restore.from_at.timestamp(), 1_760_000_000);
+    }
 
     #[tokio::test]
     async fn a_collection_whose_clients_supply_the_vectors_is_never_embedded_for() {

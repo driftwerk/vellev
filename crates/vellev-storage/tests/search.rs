@@ -678,6 +678,7 @@ async fn rows_too_long_to_measure_are_scored_exactly_beside_the_shortlist() {
                     log_position: position,
                     manifest: Some(ManifestRef(key)),
                     restore: None,
+                    adopting: None,
                 },
             )
             .await

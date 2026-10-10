@@ -473,9 +473,13 @@ pub async fn restore_points(
 }
 
 /// Put the tenant back as it stood at a moment or a commit within its
-/// restore window; a point out of reach, or a moment to come, is not
-/// found. Nothing is lost: the restore is a commit of its own, and the
-/// states before it can be gone back to as before. Writes are refused as
+/// restore window, or as one of its own backups took it; a point out of
+/// reach, a moment to come, or a backup that is not its own is not found.
+/// To adopt a backup instead takes up again a tenant this cluster has
+/// lost, from any backup kept under its name, and with the keys the backup
+/// kept only if asked: as any restore, only an admin key may ask for it.
+/// Nothing is lost: the restore is a commit of its own, and the states
+/// before it can be gone back to as before. Writes are refused as
 /// unavailable while it runs, and requests answered before it stay
 /// answered. A restore goes on even if the caller stops waiting, until it
 /// ends or the node lets the tenant go. One that fails or is stopped once
@@ -506,6 +510,11 @@ pub async fn restore(
         RestoreTo::Position(position) => {
             let point = Point::Position(LogPosition(position));
             node.restore(&tenant, point, request).await?
+        }
+        RestoreTo::Adopt(adopt) => {
+            let (backup, with_keys) = (adopt.backup, adopt.with_keys);
+            node.adopt_backup(&tenant, backup, with_keys, request)
+                .await?
         }
         RestoreTo::Backup(id) => node.restore_backup(&tenant, id, request).await?,
     };
@@ -551,12 +560,15 @@ pub async fn backups(Shared(app): Shared<App>, Named(tenant): Named<TenantId>) -
 
 /// A backup as the API describes it.
 fn kept(backup: vellev_storage::backups::Backup) -> Backup {
-    Backup::new(
+    let mut kept = Backup::new(
         backup.id,
         backup.taken_at,
         backup.position().0,
         backup.files().count(),
-    )
+    );
+    kept.lineage = Some(backup.lineage.0);
+    kept.cluster = Some(backup.cluster.0);
+    kept
 }
 
 /// Set how far back the tenant may be restored, or with none go back to

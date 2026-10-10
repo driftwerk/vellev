@@ -38,6 +38,7 @@ eyre = "0.6"
 futures = "0.3"
 http-body-util = "0.1"
 memmap2 = "0.9"
+nix = { version = "0.29", default-features = false, features = ["time"] }
 object_store = { version = "0.12", features = ["aws"] }
 proptest = "1"
 rayon = "1"
