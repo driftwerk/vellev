@@ -10,6 +10,7 @@
 //! may both ignore it and drop it when it rewrites the file; anything else,
 //! and any new enum variant, needs a new `FORMAT_VERSION`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -184,6 +185,77 @@ pub struct Manifest {
     /// it became visible at.
     #[serde(default)]
     pub answered: Vec<(LogPosition, Answered)>,
+}
+
+impl Manifest {
+    /// This checkpoint, read from under `key` in another store, naming
+    /// every file by the key `fresh` gives for the one it had there: each
+    /// segment, its index and its vectors, the logs to replay and the
+    /// checkpoint before. Nothing else of it changes. A file `fresh` gives
+    /// no key for fails it, so that none is ever named by the key it had.
+    pub fn remapped(self, key: &str, fresh: &HashMap<String, String>) -> Result<Self> {
+        // Taken apart in full, so that a field added to either does not
+        // compile here until it is said whether it names a file.
+        let Self {
+            position,
+            prev,
+            next_collection_id,
+            collections,
+            segments,
+            replay,
+            replay_after,
+            answered,
+        } = self;
+        let renamed = |old: String| {
+            fresh.get(&old).cloned().ok_or_else(|| {
+                StorageError::corrupt(key, format!("it names {old}, which was given no new key"))
+            })
+        };
+        let segments = segments.into_iter().map(|segment| {
+            let SegmentMeta {
+                key,
+                rows,
+                tombstones,
+                index,
+                vectors,
+            } = segment;
+            Ok(SegmentMeta {
+                key: renamed(key)?,
+                rows,
+                tombstones,
+                index: index.map(&renamed).transpose()?,
+                vectors: vectors.map(&renamed).transpose()?,
+            })
+        });
+        Ok(Self {
+            position,
+            prev: prev.map(&renamed).transpose()?,
+            next_collection_id,
+            collections,
+            segments: segments.collect::<Result<_>>()?,
+            replay: replay.into_iter().map(&renamed).collect::<Result<_>>()?,
+            replay_after,
+            answered,
+        })
+    }
+}
+
+/// The index file `frame`, read from under `key`, of the segment that was
+/// under `from`, as the index file of that segment under `to`: the same
+/// indexes, saying the key the segment now has. One that says another
+/// segment than `from` is refused. Loaded, it is passed over as another
+/// segment's; given the new key, it would be taken for this segment's and
+/// searched by.
+pub fn rekeyed_index(key: &str, frame: &[u8], from: &str, to: &str) -> Result<Bytes> {
+    let SegmentIndex { segment, vectors } = decode(key, Kind::Index, frame)?;
+    if segment != from {
+        return Err(StorageError::corrupt(key, "it indexes another segment"));
+    }
+    let rekeyed = SegmentIndex {
+        segment: to.to_string(),
+        vectors,
+    };
+    encode(Kind::Index, &rekeyed)
 }
 
 /// A file a head reference can point at.
@@ -779,6 +851,224 @@ mod tests {
             rmp_serde::from_slice::<Refusal>(&pack(&later)).unwrap(),
             refused(None)
         );
+    }
+
+    /// A key as a file had it where a checkpoint was read from.
+    fn old(kind: &str, name: &str) -> String {
+        format!("tenant-a/0/{kind}/{name}.{kind}")
+    }
+
+    /// The key a restore would give the file that was under `old`: one of
+    /// its own, holding nothing of the old one.
+    fn new(old: &str) -> String {
+        let name = old.rsplit('/').next().unwrap();
+        format!("tenant-b/7/restored/{}", name.replace('0', "9"))
+    }
+
+    fn mapping(keys: &[String]) -> HashMap<String, String> {
+        keys.iter().map(|key| (key.clone(), new(key))).collect()
+    }
+
+    fn checkpoint(
+        prev: Option<String>,
+        segments: Vec<SegmentMeta>,
+        replay: Vec<String>,
+    ) -> Manifest {
+        Manifest {
+            position: LogPosition(16),
+            prev,
+            next_collection_id: 3,
+            collections: Vec::new(),
+            replay_after: LogPosition(if replay.is_empty() { 0 } else { 14 }),
+            segments,
+            replay,
+            answered: vec![(LogPosition(15), log().answered[0].clone())],
+        }
+    }
+
+    fn segment(key: String, index: Option<String>, vectors: Option<String>) -> SegmentMeta {
+        SegmentMeta {
+            key,
+            rows: 4,
+            tombstones: 1,
+            index,
+            vectors,
+        }
+    }
+
+    /// Checkpoints of each kind there is, each with every key it names,
+    /// written out here and not gathered from its fields.
+    fn checkpoints() -> Vec<(&'static str, Manifest, Vec<String>)> {
+        let all = |name: &str| {
+            let (key, index, vectors) = (
+                old("segment", name),
+                old("index", name),
+                old("vectors", name),
+            );
+            let names = vec![key.clone(), index.clone(), vectors.clone()];
+            (segment(key, Some(index), Some(vectors)), names)
+        };
+        let before = old("manifest", "00000000000000000012-w");
+        let logs = vec![
+            old("log", "00000000000000000015-w"),
+            old("log", "00000000000000000016-w"),
+        ];
+        let (large, large_names) = all("00000000000000000011-w-1f");
+        let (merged, merged_names) = all("00000000000000000016-w-2e-merged");
+        let (kept, kept_names) = all("00000000000000000009-w-3d");
+        let unindexed = old("segment", "00000000000000000014-w-4c");
+        let unindexed_vectors = old("vectors", "00000000000000000014-w-4c");
+        let bare = old("segment", "00000000000000000016-w-5b");
+        vec![
+            (
+                "the first flush, of rows without vectors",
+                checkpoint(None, vec![segment(bare.clone(), None, None)], Vec::new()),
+                vec![bare.clone()],
+            ),
+            (
+                "a flush that replays the logs committed while it was built",
+                checkpoint(
+                    Some(before.clone()),
+                    vec![
+                        large,
+                        segment(unindexed.clone(), None, Some(unindexed_vectors.clone())),
+                    ],
+                    logs.clone(),
+                ),
+                [
+                    vec![before.clone()],
+                    large_names,
+                    vec![unindexed, unindexed_vectors],
+                    logs,
+                ]
+                .concat(),
+            ),
+            (
+                "a merge",
+                checkpoint(Some(before.clone()), vec![merged], Vec::new()),
+                [vec![before.clone()], merged_names].concat(),
+            ),
+            (
+                "a restore: the segments of the point gone back to, and what it held in memory",
+                checkpoint(
+                    Some(before.clone()),
+                    vec![kept, segment(bare.clone(), None, None)],
+                    Vec::new(),
+                ),
+                [vec![before], kept_names, vec![bare]].concat(),
+            ),
+        ]
+    }
+
+    fn holds(frame: &[u8], key: &str) -> bool {
+        frame
+            .windows(key.len())
+            .any(|window| window == key.as_bytes())
+    }
+
+    #[test]
+    fn a_remapped_checkpoint_names_no_file_by_the_key_it_had() {
+        for (case, manifest, names) in checkpoints() {
+            let fresh = mapping(&names);
+            for (old, new) in &fresh {
+                assert!(names.iter().all(|name| !new.contains(name)), "{old} {new}");
+            }
+            let was = encode(Kind::Manifest, &manifest).unwrap();
+            for name in &names {
+                assert!(holds(&was, name), "{case}: {name} is not one it names");
+            }
+            let remapped = manifest.clone().remapped("k", &fresh).unwrap();
+            let frame = encode(Kind::Manifest, &remapped).unwrap();
+            for name in &names {
+                assert!(!holds(&frame, name), "{case}: {name} is still named");
+                assert!(holds(&frame, &fresh[name]), "{case}: {name} was dropped");
+            }
+            assert_eq!(
+                decode::<Manifest>("k", Kind::Manifest, &frame).unwrap(),
+                remapped,
+                "{case}"
+            );
+            // Mapped back, it is the checkpoint it was: every key went to
+            // the one given for it, and nothing else changed.
+            let back: HashMap<String, String> = fresh
+                .iter()
+                .map(|(old, new)| (new.clone(), old.clone()))
+                .collect();
+            assert_eq!(remapped.remapped("k", &back).unwrap(), manifest, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_file_given_no_new_key_fails_the_remap_whichever_field_names_it() {
+        for (case, manifest, names) in checkpoints() {
+            for lacking in &names {
+                let mut fresh = mapping(&names);
+                fresh.remove(lacking);
+                match manifest.clone().remapped("k", &fresh) {
+                    Err(StorageError::Corrupt { key, reason }) => {
+                        assert_eq!(key, "k");
+                        assert!(reason.contains(lacking.as_str()), "{case}: {reason}");
+                    }
+                    other => panic!("{case}: without {lacking}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_remapped_to_the_keys_it_had_is_written_as_it_was() {
+        for (case, manifest, names) in checkpoints() {
+            let same: HashMap<String, String> =
+                names.iter().map(|key| (key.clone(), key.clone())).collect();
+            let frame = encode(Kind::Manifest, &manifest).unwrap();
+            let read: Manifest = decode("k", Kind::Manifest, &frame).unwrap();
+            let remapped = read.remapped("k", &same).unwrap();
+            assert_eq!(encode(Kind::Manifest, &remapped).unwrap(), frame, "{case}");
+        }
+    }
+
+    fn index_of(segment: &str) -> Bytes {
+        let index = SegmentIndex {
+            segment: segment.to_string(),
+            vectors: Vec::new(),
+        };
+        encode(Kind::Index, &index).unwrap()
+    }
+
+    #[test]
+    fn a_rekeyed_index_says_the_key_its_segment_now_has() {
+        let (from, to) = (old("segment", "11-w-1f"), new(&old("segment", "11-w-1f")));
+        let rekeyed = rekeyed_index("k", &index_of(&from), &from, &to).unwrap();
+        assert!(!holds(&rekeyed, &from), "the key the segment had is kept");
+        let read: SegmentIndex = decode("k", Kind::Index, &rekeyed).unwrap();
+        assert_eq!(read.segment, to);
+        assert_eq!(rekeyed, index_of(&to));
+    }
+
+    #[test]
+    fn an_index_of_another_segment_is_not_rekeyed() {
+        let (from, to) = (old("segment", "11-w-1f"), new(&old("segment", "11-w-1f")));
+        let anothers = index_of(&old("segment", "13-w-2e"));
+        assert!(matches!(
+            rekeyed_index("k", &anothers, &from, &to),
+            Err(StorageError::Corrupt { key, reason })
+                if key == "k" && reason == "it indexes another segment"
+        ));
+    }
+
+    #[test]
+    fn an_index_that_cannot_be_read_is_not_rekeyed() {
+        let (from, to) = (old("segment", "11-w-1f"), new(&old("segment", "11-w-1f")));
+        let whole = index_of(&from);
+        let mut damaged = whole.to_vec();
+        *damaged.last_mut().unwrap() ^= 0x01;
+        let manifest = encode(Kind::Manifest, &checkpoints().remove(0).1).unwrap();
+        for unreadable in [&damaged[..], &whole[..whole.len() - 1], &manifest[..], &[]] {
+            assert!(matches!(
+                rekeyed_index("k", unreadable, &from, &to),
+                Err(StorageError::Corrupt { .. })
+            ));
+        }
     }
 
     #[test]
