@@ -285,6 +285,7 @@ fn entity(collection: &CollectionName, n: u64, dimensions: u32) -> Mutation {
                 .map(|d| ((n + u64::from(d)) % 97) as f32 / 97.0)
                 .collect(),
         ),
+        only_if_version: None,
     }
 }
 

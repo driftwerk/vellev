@@ -77,6 +77,7 @@ async fn a_segment_without_vectors_has_no_column() {
             .unwrap()
             .clone(),
         vector: None,
+        only_if_version: None,
     };
     writer
         .commit(vec![create("notes"), bare(1), bare(2)])

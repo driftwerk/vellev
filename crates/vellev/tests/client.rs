@@ -201,6 +201,68 @@ async fn the_whole_api_is_reached_through_the_client() {
     assert_eq!(clash.code(), Some(Code::Conflict));
     assert!(!clash.is_unknown_outcome());
 
+    // Every object read says its version, a write can be made only at
+    // it, and a refusal says the one the object is at.
+    let at = notes.get(oid(1)).await.unwrap().unwrap().version.unwrap();
+    assert_eq!(clash.version(), Some(at));
+    let listed = notes.list(&Page::new(10)).await.unwrap();
+    assert_eq!(listed.objects[0].version, Some(at));
+    let found = notes
+        .nearest(&Nearest::to_vector(vec![1.0, 0.0], 1))
+        .await
+        .unwrap();
+    assert_eq!(found.results[0].object.version, Some(at));
+    let stale = "00000000000000000000000000000000".parse().unwrap();
+    let refused = notes
+        .put(
+            oid(1),
+            &content("a red fox", 6, Some([1.0, 0.0])).only_if_version(stale),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.version()),
+        (Some(Code::Conflict), Some(at))
+    );
+    let refused = notes.delete_if_version(oid(1), stale).await.unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.version()),
+        (Some(Code::Conflict), Some(at))
+    );
+    let moved = Changes::new(json!({ "n": 6 }).as_object().unwrap().clone()).only_if_version(at);
+    notes.patch(oid(1), &moved).await.unwrap();
+    let now = notes.get(oid(1)).await.unwrap().unwrap().version.unwrap();
+    assert_ne!(now, at);
+    // A store refused part of the way at a stale version says the
+    // version too, through the partial failure.
+    let partial = notes
+        .store_all([
+            (oid(3), content("owl", 3, None)),
+            (oid(1), content("a red fox", 7, None).only_if_version(stale)),
+        ])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(partial, Error::Partial { stored: 0, .. }),
+        "{partial:?}"
+    );
+    assert_eq!(
+        (partial.code(), partial.version()),
+        (Some(Code::Conflict), Some(now))
+    );
+    assert_eq!(notes.get(oid(3)).await.unwrap(), None);
+    let deleted = notes.delete_if_version(oid(1), now).await.unwrap();
+    assert_eq!(deleted.outcomes, vec![Outcome::Applied]);
+    let gone = notes.delete_if_version(oid(1), now).await.unwrap_err();
+    assert_eq!(
+        (gone.code(), gone.missing()),
+        (Some(Code::NotFound), Some(Missing::Object))
+    );
+    notes
+        .put(oid(1), &content("a red fox", 5, Some([1.0, 0.0])))
+        .await
+        .unwrap();
+
     let changed = acme
         .apply(
             [
@@ -208,6 +270,7 @@ async fn the_whole_api_is_reached_through_the_client() {
                 vec![Change::Delete {
                     collection: notes_named(),
                     id: oid(9),
+                    only_if_version: None,
                 }],
             ]
             .concat(),
@@ -1491,4 +1554,86 @@ async fn a_search_a_node_cannot_embed_for_is_answered_by_one_that_can() {
         (true, Some(Code::ModelUnavailable))
     );
     assert!(by_words.results[0].distance.is_none());
+}
+
+/// A node of 0.1 ignores a query it does not know on a `DELETE`, and
+/// would delete whatever the condition; it refuses a change it does not
+/// know, 400 `invalid`, its `Change` being `deny_unknown_fields` and its
+/// delete having `collection` and `id` alone. So the client sends a
+/// conditional delete as a batch, and against such a node is refused
+/// rather than obeyed: here against a stand-in that answers as 0.1 does.
+#[tokio::test]
+async fn a_conditional_delete_goes_as_a_change_a_node_of_0_1_refuses_rather_than_ignores() {
+    use axum::body::to_bytes;
+    use axum::extract::Request;
+    let deletes = Arc::new(Mutex::new(0usize));
+    let posts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (deleted, posted) = (deletes.clone(), posts.clone());
+    let applied =
+        || json!({ "incarnation": 1, "position": 2, "outcomes": [{ "outcome": "applied" }] });
+    let router = axum::Router::new().fallback(move |request: Request| {
+        let (deleted, posted) = (deleted.clone(), posted.clone());
+        async move {
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+            if method == Asked::DELETE {
+                *deleted.lock().unwrap() += 1;
+                return (Answered::OK, axum::Json(applied())).into_response();
+            }
+            if method == Asked::POST && path.ends_with("/changes") {
+                posted
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                #[derive(serde::Deserialize)]
+                #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+                #[allow(dead_code)]
+                enum OldChange {
+                    Delete { collection: String, id: uuid::Uuid },
+                }
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                #[allow(dead_code)]
+                struct OldBatch {
+                    changes: Vec<OldChange>,
+                }
+                return match serde_json::from_slice::<OldBatch>(&body) {
+                    Ok(_) => (Answered::OK, axum::Json(applied())).into_response(),
+                    Err(error) => {
+                        let message = format!("Failed to deserialize the JSON body: {error}");
+                        let refused = json!({ "error": { "code": "invalid", "message": message } });
+                        (Answered::BAD_REQUEST, axum::Json(refused)).into_response()
+                    }
+                };
+            }
+            (Answered::NOT_FOUND, axum::Json(failure("not_found"))).into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = Client::connect(&[&url], KEY, quick(3)).unwrap();
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let at = "0123456789abcdef0123456789abcdef".parse().unwrap();
+    let refused = notes.delete_if_version(oid(1), at).await.unwrap_err();
+    assert!(
+        matches!(&refused, Error::Api { status, code: Code::Invalid, .. } if status.as_u16() == 400),
+        "{refused:?}"
+    );
+    assert_eq!(refused.code(), Some(Code::Invalid));
+    assert!(!refused.is_unknown_outcome(), "final, not uncertain");
+    assert_eq!(*deletes.lock().unwrap(), 0, "nothing deleted");
+    let sent = posts.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "one try: a 400 is final");
+    assert!(
+        sent[0].contains("\"only_if_version\":\"0123456789abcdef0123456789abcdef\""),
+        "{sent:?}"
+    );
+    assert!(sent[0].contains("\"op\":\"delete\""), "{sent:?}");
+    // A plain delete still goes as a DELETE and is made.
+    let made = notes.delete(oid(1)).await.unwrap();
+    assert_eq!(made.outcomes, vec![Outcome::Applied]);
+    assert_eq!(*deletes.lock().unwrap(), 1);
+    assert_eq!(posts.lock().unwrap().len(), 1);
 }

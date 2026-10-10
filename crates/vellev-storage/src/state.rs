@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
-use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value};
+use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value, Version};
 use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
@@ -235,6 +236,12 @@ impl Live<'_> {
         }
     }
 
+    /// The object's version: of its properties and vector, as they are
+    /// stored.
+    pub fn version(&self) -> Version {
+        Version::of(&self.object.properties, self.vector)
+    }
+
     /// Whether this is `object`, vector and all.
     pub fn is(&self, object: &Object) -> bool {
         self.object.id == object.id
@@ -459,7 +466,9 @@ pub struct State {
     catalog: Catalog,
     segments: Vec<Segment>,
     memtable: Memtable,
-    live: HashMap<RowKey, Location>,
+    /// Where the live row of each key lies, in key order: a collection's
+    /// live rows are a range of it, by id, which is how they are paged.
+    live: BTreeMap<RowKey, Location>,
     corpora: HashMap<CollectionId, Corpus>,
     /// The logs applied since the last checkpoint, oldest first: what is
     /// in the memtable and in no segment.
@@ -664,16 +673,36 @@ impl State {
     pub(crate) fn row(&self, collection: CollectionId, id: ObjectId) -> Option<Live<'_>> {
         self.live
             .get(&(collection, id))
-            .map(|location| match *location {
-                Location::Memtable(row) => Live {
-                    object: &self.memtable.rows[row].object,
-                    vector: self.memtable.rows[row].object.vector.as_deref(),
-                },
-                Location::Segment(segment, row) => Live {
-                    object: &self.segments[segment].file.rows[row].object,
-                    vector: self.segments[segment].vectors.get(row),
-                },
-            })
+            .map(|location| self.located(*location))
+    }
+
+    /// The row at `location`, which must be a live one.
+    fn located(&self, location: Location) -> Live<'_> {
+        match location {
+            Location::Memtable(row) => Live {
+                object: &self.memtable.rows[row].object,
+                vector: self.memtable.rows[row].object.vector.as_deref(),
+            },
+            Location::Segment(segment, row) => Live {
+                object: &self.segments[segment].file.rows[row].object,
+                vector: self.segments[segment].vectors.get(row),
+            },
+        }
+    }
+
+    /// The collection's live rows in id order, from just after `after`.
+    fn in_order(
+        &self,
+        collection: CollectionId,
+        after: Option<ObjectId>,
+    ) -> impl Iterator<Item = (&RowKey, &Location)> {
+        let from = match after {
+            Some(after) => Bound::Excluded((collection, after)),
+            None => Bound::Included((collection, ObjectId(uuid::Uuid::nil()))),
+        };
+        self.live
+            .range((from, Bound::Unbounded))
+            .take_while(move |((c, _), _)| *c == collection)
     }
 
     /// Every live object in the collection, in no particular order.
@@ -702,8 +731,16 @@ impl State {
     /// objects after `after` that pass `filter`. Paging by the last id seen
     /// stays correct while rows are written and deleted in between.
     ///
-    /// Each page selects every matching row and sorts them, so walking a
-    /// whole collection costs its size once per page.
+    /// The live rows are kept in key order, so a page with no filter costs
+    /// a seek and its own size, and a walk of the whole collection costs
+    /// its size once. With a filter, the rows that pass are found in each
+    /// layer's index, as a search finds them, and the page is taken from
+    /// them in whichever of two ways is cheaper, both giving the same
+    /// rows: when few pass, the ones after `after` are partly sorted; when
+    /// many do, the live rows are met in order from `after` and kept if
+    /// they pass, which costs about the page's size times the share that
+    /// do not. Either way a walk with a filter costs about the collection's
+    /// size in all, where it used to cost that for every page.
     pub fn list(
         &self,
         collection: &CollectionName,
@@ -711,17 +748,56 @@ impl State {
         after: Option<ObjectId>,
         limit: usize,
     ) -> Result<Vec<Live<'_>>> {
-        let mut page = match filter {
-            Some(filter) => self.select(collection, filter)?,
-            None => {
-                self.catalog.known(collection)?;
-                self.scan(collection).collect()
-            }
+        let (id, schema) = self.catalog.known(collection)?;
+        let Some(filter) = filter else {
+            let page = self.in_order(id, after).take(limit);
+            return Ok(page.map(|(_, location)| self.located(*location)).collect());
         };
-        page.retain(|found| after.is_none_or(|after| found.id() > after));
-        page.sort_unstable_by_key(Live::id);
-        page.truncate(limit);
-        Ok(page)
+        let predicate = filter.compile(schema)?;
+        let passing: Vec<RoaringBitmap> = self
+            .layers()
+            .map(|layer| {
+                layer
+                    .indexes
+                    .get(&id)
+                    .map(|index| predicate.select(&index.rows))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let matches: u64 = passing.iter().map(RoaringBitmap::len).sum();
+        let rows = self.corpora.get(&id).map_or(0, |corpus| corpus.objects);
+        // Sorting the matches costs about as many steps as there are of
+        // them; meeting them in order costs about `limit` times the rows
+        // there are for each that passes.
+        if matches.saturating_mul(matches) <= (limit as u64).saturating_mul(rows) {
+            let mut page: Vec<Live<'_>> = self
+                .layers()
+                .zip(&passing)
+                .flat_map(|(layer, passing)| {
+                    passing
+                        .iter()
+                        .map(|row| row as usize)
+                        .filter(move |row| !layer.dead[*row])
+                        .map(move |row| layer.live(row))
+                })
+                .filter(|found| after.is_none_or(|after| found.id() > after))
+                .collect();
+            if page.len() > limit {
+                page.select_nth_unstable_by_key(limit, Live::id);
+                page.truncate(limit);
+            }
+            page.sort_unstable_by_key(Live::id);
+            return Ok(page);
+        }
+        let memtable = self.segments.len();
+        let page = self
+            .in_order(id, after)
+            .filter(|(_, location)| match **location {
+                Location::Memtable(row) => passing[memtable].contains(row as u32),
+                Location::Segment(segment, row) => passing[segment].contains(row as u32),
+            })
+            .take(limit);
+        Ok(page.map(|(_, location)| self.located(*location)).collect())
     }
 
     /// Every layer, oldest first.
@@ -936,10 +1012,8 @@ impl State {
                 Op::CreateCollection { .. } | Op::AddProperty { .. } => {}
                 Op::DropCollection { collection } => {
                     let dropped: Vec<RowKey> = self
-                        .live
-                        .keys()
-                        .filter(|(c, _)| c == collection)
-                        .copied()
+                        .in_order(*collection, None)
+                        .map(|(key, _)| *key)
                         .collect();
                     dropped.into_iter().for_each(|key| {
                         self.forget(key);
@@ -1452,5 +1526,473 @@ impl State {
             checkpoint: Some(key.to_string()),
             ..state
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use vellev_core::{Bm25, DataType, Distance, Embedding, EmbeddingProvider, Property};
+
+    use super::*;
+    use crate::column::Column;
+
+    fn schema(name: &str) -> Collection {
+        Collection {
+            name: CollectionName::new(name).unwrap(),
+            properties: vec![
+                Property::new("n", DataType::Int),
+                Property::new("k", DataType::Text),
+            ],
+            embedding: Embedding {
+                provider: EmbeddingProvider::None,
+                model: "test".into(),
+                dimensions: 2,
+                query_prefix: None,
+                document_prefix: None,
+                properties: vec![],
+            },
+            distance: Distance::Cosine,
+            bm25: Bm25::default(),
+            access_rule: None,
+        }
+    }
+
+    fn oid(id: u128) -> ObjectId {
+        ObjectId(uuid::Uuid::from_u128(id))
+    }
+
+    /// One row in 199 has `k == "x"`; the rest `"y"`.
+    fn k(n: i64) -> &'static str {
+        if n % 199 == 0 {
+            "x"
+        } else {
+            "y"
+        }
+    }
+
+    fn upsert(collection: u64, id: u128, n: i64) -> Op {
+        Op::Upsert {
+            collection: CollectionId(collection),
+            object: Object {
+                id: oid(id),
+                properties: BTreeMap::from([
+                    ("n".to_string(), Value::Int(n)),
+                    ("k".to_string(), Value::Text(k(n).to_string())),
+                ]),
+                vector: Some(vec![n as f32, 0.5]),
+            },
+        }
+    }
+
+    fn delete(collection: u64, id: u128) -> Op {
+        Op::Delete {
+            collection: CollectionId(collection),
+            id: oid(id),
+        }
+    }
+
+    /// A partition in memory, with the writer's part of flushing and
+    /// merging done here: segments are built from what the state gives
+    /// and adopted as a committed flush or merge would be.
+    struct Built {
+        state: State,
+        files: u64,
+    }
+
+    impl Built {
+        fn new(collections: &[&str]) -> Self {
+            let mut built = Self {
+                state: State::default(),
+                files: 0,
+            };
+            let created = collections
+                .iter()
+                .enumerate()
+                .map(|(id, name)| Op::CreateCollection {
+                    id: CollectionId(id as u64),
+                    schema: Box::new(schema(name)),
+                })
+                .collect();
+            built.commit(created);
+            built
+        }
+
+        fn commit(&mut self, ops: Vec<Op>) {
+            let position = self.state.position().next().unwrap();
+            let log = LogSegment {
+                position,
+                prev: self.state.head().map(str::to_string),
+                ops,
+                answered: Vec::new(),
+            };
+            self.state
+                .apply(&format!("log-{}", position.0), &log)
+                .unwrap();
+        }
+
+        /// A segment of `file`, whose rows have their vectors with them,
+        /// as the writer builds and loads one back.
+        fn fit(&mut self, mut file: SegmentFile, catalog: &Catalog) -> Fit {
+            self.files += 1;
+            let shape = Shape::of(catalog, &file.rows, file.tombstones.len(), CLUSTERED_ABOVE);
+            let column = Column::taken_from(&mut file.rows);
+            let names = Names {
+                segment: format!("segment-{}", self.files),
+                index: format!("index-{}", self.files),
+                vectors: format!("vectors-{}", self.files),
+            };
+            Loaded::fresh(file, column, Stored::default())
+                .fit(names.meta(shape), catalog)
+                .unwrap()
+        }
+
+        fn flush(&mut self) {
+            let Some(mut snapshot) = self.state.snapshot() else {
+                return;
+            };
+            while self.state.copy_rows(&mut snapshot, 7) {}
+            let fit = (!snapshot.rows.is_empty()).then(|| {
+                let file = SegmentFile {
+                    position: snapshot.position,
+                    rows: snapshot.rows.clone(),
+                    tombstones: snapshot.tombstones.clone(),
+                };
+                let catalog = snapshot.catalog.clone();
+                self.fit(file, &catalog)
+            });
+            let position = self.state.position().next().unwrap();
+            self.state
+                .flushed(&format!("manifest-{}", position.0), position, snapshot, fit);
+        }
+
+        /// Merge a run of segments if there is one to merge.
+        fn merge(&mut self) -> bool {
+            let merging = Merging {
+                fanout: 2,
+                ..Merging::default()
+            };
+            let Some(plan) = self.state.merge_plan(&merging) else {
+                return false;
+            };
+            let file = self.state.merged(&plan, self.state.position()).unwrap();
+            let catalog = self.state.catalog().clone();
+            let fit = self.fit(file, &catalog);
+            self.state.compacted(&plan, fit);
+            true
+        }
+
+        fn walk(&self, collection: &str, filter: Option<&Filter>, page: usize) -> Vec<ObjectId> {
+            let name = CollectionName::new(collection).unwrap();
+            let mut walked = Vec::new();
+            let mut after = None;
+            loop {
+                let found = self.state.list(&name, filter, after, page).unwrap();
+                let ids: Vec<ObjectId> = found.iter().map(Live::id).collect();
+                assert!(ids.len() <= page, "a page of {page} held {}", ids.len());
+                let ascending = ids.windows(2).all(|pair| pair[0] < pair[1]);
+                assert!(
+                    ascending && after.is_none_or(|after| ids.first().is_none_or(|id| *id > after)),
+                    "a page after {after:?} held {ids:?}"
+                );
+                walked.extend(ids);
+                if found.len() < page {
+                    return walked;
+                }
+                after = walked.last().copied();
+            }
+        }
+
+        /// The page as the release before listed it: every match, sorted
+        /// and cut.
+        fn as_before(
+            &self,
+            collection: &str,
+            filter: Option<&Filter>,
+            after: Option<ObjectId>,
+            limit: usize,
+        ) -> Vec<ObjectId> {
+            let name = CollectionName::new(collection).unwrap();
+            let mut page: Vec<ObjectId> = match filter {
+                Some(filter) => self.state.select(&name, filter).unwrap(),
+                None => self.state.scan(&name).collect(),
+            }
+            .iter()
+            .map(Live::id)
+            .filter(|id| after.is_none_or(|after| *id > after))
+            .collect();
+            page.sort_unstable();
+            page.truncate(limit);
+            page
+        }
+    }
+
+    /// What is live, as the test knows it: `n` by collection and id.
+    type Oracle = BTreeMap<(u64, u128), i64>;
+
+    fn expected(oracle: &Oracle, collection: u64, passes: impl Fn(i64) -> bool) -> Vec<ObjectId> {
+        oracle
+            .iter()
+            .filter(|((c, _), n)| *c == collection && passes(**n))
+            .map(|((_, id), _)| oid(*id))
+            .collect()
+    }
+
+    fn dense(half: i64) -> Filter {
+        Filter::Gte {
+            property: "n".into(),
+            value: json!(half),
+        }
+    }
+
+    fn sparse() -> Filter {
+        Filter::Eq {
+            property: "k".into(),
+            value: json!("x"),
+        }
+    }
+
+    /// A small deterministic generator.
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    #[test]
+    fn pages_walk_every_live_row_once_in_id_order_however_the_rows_lie() {
+        let mut built = Built::new(&["notes", "other"]);
+        let mut oracle = Oracle::new();
+        let mut random = Random(0x5eed);
+        let (ids, rows) = (3_000u64, 2_000);
+        let mut n = 0i64;
+        for step in 0..200 {
+            let mut ops = Vec::new();
+            for _ in 0..rows / 100 {
+                let id = u128::from(random.below(ids));
+                n += 1;
+                ops.push(upsert(0, id, n));
+                oracle.insert((0, id), n);
+                // The other collection shares ids with this one.
+                if random.below(3) == 0 {
+                    ops.push(upsert(1, id, -n));
+                    oracle.insert((1, id), -n);
+                }
+            }
+            for _ in 0..3 {
+                let id = u128::from(random.below(ids));
+                ops.push(delete(0, id));
+                oracle.remove(&(0, id));
+            }
+            built.commit(ops);
+            if step % 5 == 4 {
+                built.flush();
+            }
+            if step % 11 == 10 {
+                assert!(built.merge(), "two segments lie side by side");
+            }
+        }
+        // And some rows written since the last flush.
+        let since: Vec<Op> = (0..20)
+            .map(|_| {
+                let id = u128::from(random.below(ids));
+                n += 1;
+                oracle.insert((0, id), n);
+                upsert(0, id, n)
+            })
+            .collect();
+        built.commit(since);
+        let segments = built.state.segments().count();
+        assert!(
+            segments >= 2 && built.state.unflushed() > 0,
+            "{segments} segments and {} unflushed rows: rows lie in several places",
+            built.state.unflushed()
+        );
+        let live = expected(&oracle, 0, |_| true).len() as u64;
+        assert!(live > 1_000, "{live}");
+
+        let half = n / 2;
+        type Passes = Box<dyn Fn(i64) -> bool>;
+        let cases: [(Option<Filter>, Passes); 3] = [
+            (None, Box::new(|_| true)),
+            (Some(dense(half)), Box::new(move |n| n >= half)),
+            (Some(sparse()), Box::new(|n| k(n) == "x")),
+        ];
+        for (filter, passes) in &cases {
+            let want = expected(&oracle, 0, passes);
+            for page in [1, 2, 3, 7, 50, 1_000, 10_000] {
+                assert_eq!(
+                    built.walk("notes", filter.as_ref(), page),
+                    want,
+                    "{filter:?} at page {page}"
+                );
+            }
+        }
+        // A dense filter at a small page is met along the live rows, a
+        // sparse one is sorted: both ways of taking a filtered page are
+        // walked above.
+        let matching = |filter: &Filter| {
+            built
+                .state
+                .select(&CollectionName::new("notes").unwrap(), filter)
+                .unwrap()
+                .len() as u64
+        };
+        let (many, few) = (matching(&dense(half)), matching(&sparse()));
+        assert!(
+            many * many > live,
+            "{many} of {live} are met in order at page 1"
+        );
+        assert!(few * few <= live, "{few} of {live} are sorted at page 1");
+
+        // Every boundary: a page after any id, held or not, is the ids
+        // after it, and a page past the end is empty.
+        let all = expected(&oracle, 0, |_| true);
+        let notes = CollectionName::new("notes").unwrap();
+        for (at, id) in all.iter().enumerate() {
+            let page = built.state.list(&notes, None, Some(*id), 3).unwrap();
+            let ids: Vec<ObjectId> = page.iter().map(Live::id).collect();
+            assert_eq!(ids, all[at + 1..(at + 4).min(all.len())]);
+            let gone = oid(id.0.as_u128() + 1);
+            if !oracle.contains_key(&(0, gone.0.as_u128())) {
+                let page = built.state.list(&notes, None, Some(gone), 3).unwrap();
+                let ids: Vec<ObjectId> = page.iter().map(Live::id).collect();
+                assert_eq!(ids, all[at + 1..(at + 4).min(all.len())]);
+            }
+        }
+        assert!(built
+            .state
+            .list(&notes, None, Some(oid(u128::MAX)), 3)
+            .unwrap()
+            .is_empty());
+        assert!(built.state.list(&notes, None, None, 0).unwrap().is_empty());
+
+        // And at random: as the release before listed it, which found
+        // every match and sorted them.
+        for _ in 0..300 {
+            let filter = match random.below(3) {
+                0 => None,
+                1 => Some(dense(random.below(n as u64) as i64)),
+                _ => Some(sparse()),
+            };
+            let after = match random.below(3) {
+                0 => None,
+                1 => Some(oid(u128::from(random.below(ids)))),
+                _ => all.get(random.below(all.len() as u64) as usize).copied(),
+            };
+            let limit = 1 + random.below(60) as usize;
+            let page = built
+                .state
+                .list(&notes, filter.as_ref(), after, limit)
+                .unwrap();
+            let ids: Vec<ObjectId> = page.iter().map(Live::id).collect();
+            let before = built.as_before("notes", filter.as_ref(), after, limit);
+            assert_eq!(ids, before, "{filter:?} after {after:?} limit {limit}");
+            for (found, id) in page.iter().zip(&ids) {
+                assert_eq!(
+                    found.object.properties["n"],
+                    Value::Int(oracle[&(0, id.0.as_u128())]),
+                    "the live row of {id}"
+                );
+            }
+        }
+        assert_eq!(built.walk("other", None, 7), expected(&oracle, 1, |_| true));
+    }
+
+    #[test]
+    fn a_row_written_again_or_deleted_is_listed_once_or_not_at_all_wherever_its_copies_lie() {
+        let mut built = Built::new(&["notes"]);
+        let notes = CollectionName::new("notes").unwrap();
+        let listed = |built: &Built| -> Vec<(ObjectId, i64)> {
+            built
+                .state
+                .list(&notes, None, None, 100)
+                .unwrap()
+                .iter()
+                .map(|found| match found.object.properties["n"] {
+                    Value::Int(n) => (found.id(), n),
+                    ref other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        built.commit((1..=6).map(|id| upsert(0, id, id as i64)).collect());
+        built.flush();
+        // Written again in a second segment, and again in the memtable;
+        // deleted from a segment, and deleted from the memtable.
+        built.commit(vec![upsert(0, 2, 20), upsert(0, 3, 30), delete(0, 4)]);
+        built.flush();
+        built.commit(vec![upsert(0, 3, 300), upsert(0, 7, 7), delete(0, 5)]);
+        built.commit(vec![delete(0, 7), upsert(0, 8, 8)]);
+        let want = vec![
+            (oid(1), 1),
+            (oid(2), 20),
+            (oid(3), 300),
+            (oid(6), 6),
+            (oid(8), 8),
+        ];
+        assert_eq!(listed(&built), want);
+        // The first segment is mostly dead and is rewritten alone.
+        assert!(built.merge());
+        assert_eq!(built.state.segments().count(), 2);
+        assert_eq!(listed(&built), want);
+        built.flush();
+        assert_eq!(listed(&built), want);
+        while built.merge() {
+            assert_eq!(listed(&built), want);
+        }
+        assert_eq!(built.state.segments().count(), 1);
+        assert_eq!(listed(&built), want);
+        let paged = |after| {
+            built
+                .state
+                .list(&notes, None, Some(oid(after)), 2)
+                .unwrap()
+                .iter()
+                .map(Live::id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paged(2), [oid(3), oid(6)]);
+        assert_eq!(paged(4), [oid(6), oid(8)]);
+        assert_eq!(paged(8), []);
+    }
+
+    #[test]
+    fn a_dropped_collection_takes_only_its_own_rows_and_a_page_of_one_never_holds_anothers() {
+        let mut built = Built::new(&["a", "b", "c"]);
+        let ops = (1..=9u128)
+            .flat_map(|id| [upsert(0, id, 1), upsert(1, id, 2), upsert(2, id, 3)])
+            .collect();
+        built.commit(ops);
+        built.flush();
+        built.commit(vec![upsert(1, 10, 2), upsert(0, 10, 1)]);
+        let ids: Vec<ObjectId> = (1..=10).map(oid).collect();
+        for name in ["a", "b", "c"] {
+            let want = if name == "c" { &ids[..9] } else { &ids[..] };
+            assert_eq!(built.walk(name, None, 4), want, "{name}");
+        }
+        built.commit(vec![Op::DropCollection {
+            collection: CollectionId(1),
+        }]);
+        assert_eq!(built.state.rows(), 19);
+        assert_eq!(built.walk("a", None, 4), ids);
+        assert_eq!(built.walk("c", None, 4), &ids[..9]);
+        let b = CollectionName::new("b").unwrap();
+        assert!(matches!(
+            built.state.list(&b, None, None, 4),
+            Err(StorageError::UnknownCollection(_))
+        ));
+        built.commit(vec![Op::CreateCollection {
+            id: CollectionId(3),
+            schema: Box::new(schema("b")),
+        }]);
+        assert!(built.state.list(&b, None, None, 4).unwrap().is_empty());
+        built.commit(vec![upsert(3, 5, 5)]);
+        assert_eq!(built.walk("b", None, 4), [oid(5)]);
+        assert_eq!(built.state.count(&b), 1);
     }
 }

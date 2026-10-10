@@ -16,7 +16,9 @@ use vellev_api::{
     Restored, Results, Stored, TenantKey, TenantKeys, TenantPage, Tenants, Weighted, Written,
     AFTER, CONSISTENCY, REQUEST,
 };
-use vellev_core::{Collection, CollectionName, Object, ObjectId, Property, RequestId, TenantId};
+use vellev_core::{
+    Collection, CollectionName, Object, ObjectId, Property, RequestId, TenantId, Version,
+};
 use vellev_node::{Freshness, Reader};
 use vellev_storage::coordinator::{Incarnation, LogPosition, Point, MAX_RESTORE_WINDOW};
 use vellev_storage::{Batch as Writes, Hybrid as HybridQuery, Keywords};
@@ -224,11 +226,15 @@ impl<S: Send + Sync> FromRequestParts<S> for Fresh {
     }
 }
 
-fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool) -> Stored {
+/// `object` as it is answered, with its vector if `vectors` and its
+/// `version` either way: what found the object says it is, of the vector
+/// stored, which a row in a segment keeps apart from the object.
+fn stored(object: &Object, vector: Option<&[f32]>, vectors: bool, version: Version) -> Stored {
     Stored::new(
         object.id,
         object.properties_json(),
         vector.filter(|_| vectors).map(<[f32]>::to_vec),
+        version,
     )
 }
 
@@ -269,11 +275,13 @@ fn mutation(change: Change) -> Mutation {
             id,
             properties,
             vector,
+            only_if_version,
         } => Mutation::Upsert {
             collection,
             id,
             properties,
             vector,
+            only_if_version,
         },
         Change::Insert {
             collection,
@@ -292,12 +300,14 @@ fn mutation(change: Change) -> Mutation {
             properties,
             vector,
             only_if,
+            only_if_version,
         } => Mutation::Patch {
             collection,
             id,
             properties,
             vector,
             only_if: condition(only_if),
+            only_if_version,
         },
         Change::Increment {
             collection,
@@ -323,7 +333,15 @@ fn mutation(change: Change) -> Mutation {
             values,
             unique,
         },
-        Change::Delete { collection, id } => Mutation::Delete { collection, id },
+        Change::Delete {
+            collection,
+            id,
+            only_if_version,
+        } => Mutation::Delete {
+            collection,
+            id,
+            only_if_version,
+        },
         Change::DeleteWhere {
             collection,
             filter,
@@ -839,7 +857,7 @@ pub async fn object(
             let found = state
                 .get(&collection, id)
                 .filter(|found| viewer.sees(&schema, found.object))
-                .map(|found| stored(found.object, found.vector, true));
+                .map(|found| stored(found.object, found.vector, true, found.version()));
             found.ok_or_else(|| {
                 ApiError::not_found(
                     Missing::Object,
@@ -867,13 +885,17 @@ pub async fn put_object(
     Body(content): Body<Content>,
 ) -> Answer<Written> {
     let Content {
-        properties, vector, ..
+        properties,
+        vector,
+        only_if_version,
+        ..
     } = content;
     let upsert = Mutation::Upsert {
         collection,
         id,
         properties,
         vector,
+        only_if_version,
     };
     write(&app, &tenant, request, vec![upsert]).await
 }
@@ -898,6 +920,7 @@ pub async fn patch_object(
         properties,
         vector,
         only_if,
+        only_if_version,
         ..
     } = changes;
     let patch = Mutation::Patch {
@@ -906,15 +929,29 @@ pub async fn patch_object(
         properties,
         vector,
         only_if: condition(only_if),
+        only_if_version,
     };
     write(&app, &tenant, request, vec![patch]).await
 }
 
-/// Deleting an object that is not stored changes nothing.
+/// What a delete of one object may ask: a delete has no body.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct Deleting {
+    /// Delete the object only if it is stored and at this version:
+    /// `conflict` (409) otherwise, with the version it is at, and
+    /// `not_found` (404) if it is not stored.
+    #[param(value_type = Option<String>)]
+    only_if_version: Option<Version>,
+}
+
+/// Deleting an object that is not stored changes nothing, unless the
+/// delete is conditional on a version.
 #[utoipa::path(
     delete,
     path = "/v1/tenants/{tenant}/collections/{collection}/objects/{id}",
-    params(WriteHeaders, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
+    params(WriteHeaders, Deleting, ("tenant" = TenantId, Path,), ("collection" = CollectionName, Path,), ("id" = ObjectId, Path,)),
     responses((status = OK, body = Written), (status = "4XX", body = Failure),
         (status = "5XX", body = Failure)
     )
@@ -923,31 +960,34 @@ pub async fn delete_object(
     Shared(app): Shared<App>,
     Named((tenant, collection, id)): Named<(TenantId, CollectionName, ObjectId)>,
     Requested(request): Requested,
+    Asked(deleting): Asked<Deleting>,
 ) -> Answer<Written> {
-    write(
-        &app,
-        &tenant,
-        request,
-        vec![Mutation::Delete { collection, id }],
-    )
-    .await
+    let delete = Mutation::Delete {
+        collection,
+        id,
+        only_if_version: deleting.only_if_version,
+    };
+    write(&app, &tenant, request, vec![delete]).await
 }
 
 fn hit(hit: Hit<'_>, vectors: bool) -> Found {
-    let mut found = Found::new(stored(hit.object, Some(hit.vector), vectors));
+    let version = hit.version();
+    let mut found = Found::new(stored(hit.object, Some(hit.vector), vectors, version));
     found.distance = Some(hit.distance);
     found.certainty = hit.certainty;
     found
 }
 
 fn scored(scored: Scored<'_>, vectors: bool) -> Found {
-    let mut found = Found::new(stored(scored.object, scored.vector, vectors));
+    let version = scored.version();
+    let mut found = Found::new(stored(scored.object, scored.vector, vectors, version));
     found.keyword = Some(scored.score);
     found
 }
 
 fn fused(fused: Fused<'_>, vectors: bool) -> Found {
-    let mut found = Found::new(stored(fused.object, fused.vector, vectors));
+    let version = fused.version();
+    let mut found = Found::new(stored(fused.object, fused.vector, vectors, version));
     found.score = Some(fused.score);
     found.distance = fused.distance;
     found.certainty = fused.certainty;
@@ -1144,7 +1184,7 @@ pub async fn list(
         let objects = found
             .into_iter()
             .take(limit)
-            .map(|found| stored(found.object, found.vector, page.vectors))
+            .map(|found| stored(found.object, found.vector, page.vectors, found.version()))
             .collect();
         Ok(Json(Objects::new(objects, next)))
     })

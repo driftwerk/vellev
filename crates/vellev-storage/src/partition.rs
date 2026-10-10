@@ -2026,6 +2026,7 @@ mod tests {
             id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
             properties: serde_json::Map::from_iter([("n".to_string(), n.into())]),
             vector: Some(vec![f32::from(n), 0.5]),
+            only_if_version: None,
         }
     }
 

@@ -2,12 +2,14 @@
 //!
 //! Random histories interleave writes from a current writer and from stalled
 //! ones, each a named request that inserts rows with vectors and may delete
-//! one, the same requests made again, checkpoints, merges, restores alone
-//! and beside a flush, a merge or a clean, cleaning up with and without
-//! grace, takeovers and follower catch-ups, with faults in the store and
-//! the coordinator. After every step the committed state is read through
-//! fault-free handles and checked against what the coordinator really
-//! recorded, whatever the writers were told.
+//! one, or changes or deletes a row only if it is at a version a reader
+//! gave or at one nothing is at, the same requests made again,
+//! checkpoints, merges, restores alone and beside a flush, a merge or a
+//! clean, cleaning up with and without grace, takeovers and follower
+//! catch-ups, with faults in the store and the coordinator. After every
+//! step the committed state is read through fault-free handles, as rows
+//! with their versions and as a walk of pages, and checked against what
+//! the coordinator really recorded, whatever the writers were told.
 //!
 //! A step stands for an hour in the age of a file: the store says each was
 //! written as many hours ago as there have been steps since, so that
@@ -17,17 +19,21 @@
 mod common;
 
 use std::collections::VecDeque;
-use vellev_core::RequestId;
+use vellev_core::{RequestId, Version};
 use vellev_storage::coordinator::{KeyHash, Point, Restore, RestorePoint, Restored, TenantKey};
 
 use common::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
-use vellev_storage::{Batch, Embedded, Merging, Outcome};
+use vellev_storage::{Batch, Embedded, Live, Merging, Outcome};
 
 const COLLECTION: &str = "sim";
 
+/// The id of the `n`th row written: spread over the id space, so that
+/// id order is not write order.
 fn row(n: u64) -> ObjectId {
-    ObjectId(uuid::Uuid::from_u128(u128::from(n)))
+    ObjectId(uuid::Uuid::from_u128(u128::from(
+        n.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    )))
 }
 
 fn counter() -> ObjectId {
@@ -425,6 +431,15 @@ enum Action {
         rows: u64,
         delete: Option<usize>,
     },
+    /// A request of its own that changes one of the rows there are, or
+    /// deletes it, only if it is at the version a reader last gave for
+    /// it or, when not `fresh`, at a version nothing is at.
+    Conditional {
+        who: Who,
+        pick: usize,
+        kind: u8,
+        fresh: bool,
+    },
     /// Make one of the requests made before again, as a caller that never
     /// heard its answer would.
     Again {
@@ -483,9 +498,17 @@ fn action() -> impl Strategy<Value = Action> {
         2 => any::<bool>().prop_map(|first| Some((Beside::Clean, first))),
     ];
     let write = |(who, rows, delete)| Action::Write { who, rows, delete };
+    let conditional = |(who, pick, kind, fresh)| Action::Conditional {
+        who,
+        pick,
+        kind,
+        fresh,
+    };
     let restore = |(who, back, beside)| Action::Restore { who, back, beside };
     prop_oneof![
         14 => (who(), 1..4u64, delete).prop_map(write),
+        6 => (who(), any::<usize>(), 0..4u8, prop_oneof![3 => Just(true), 1 => Just(false)])
+            .prop_map(conditional),
         2 => (who(), any::<usize>()).prop_map(|(who, pick)| Action::Again { who, pick }),
         4 => who().prop_map(|who| Action::Flush { who }),
         3 => who().prop_map(|who| Action::Merge { who }),
@@ -502,37 +525,157 @@ fn action() -> impl Strategy<Value = Action> {
     ]
 }
 
-/// One request: the rows it inserts and the one it deletes, as it was
-/// asked, what its writer was told, and whether the coordinator recorded
-/// it or it was refused, which is its answer for good.
+/// What a request does to the rows if it is made.
+#[derive(Debug, Clone)]
+enum Effect {
+    /// Inserts `rows` and deletes `deleted`.
+    Write {
+        rows: Vec<u64>,
+        deleted: Option<ObjectId>,
+    },
+    /// Changes the row `id`, only if it is at `version`.
+    Conditional {
+        id: ObjectId,
+        version: Version,
+        change: Change,
+    },
+}
+
+/// What a conditional request does to its row: the whole of what the row
+/// becomes is known when the request is made, since it is made only on
+/// the content the version names.
+#[derive(Debug, Clone, PartialEq)]
+enum Change {
+    /// A patch that sets `n`, which may be what it is already.
+    Patch(i64),
+    /// A replace that keeps `n` and gives this vector.
+    Vector(Vec<f32>),
+    Delete,
+}
+
+/// One request: what it does, as it was asked, what its writer was told,
+/// and whether the coordinator recorded its answer or it was refused,
+/// either of which is its answer for good.
 #[derive(Debug)]
 struct Attempt {
     batch: Batch,
-    rows: Vec<u64>,
-    deleted: Option<ObjectId>,
+    effect: Effect,
     acknowledged: bool,
     recorded: bool,
     refused: bool,
 }
 
-/// Rows as a checker compares them: `n` and the vector by id.
-type Rows = BTreeMap<ObjectId, (i64, Vec<f32>)>;
+/// A row as a checker compares it: `n`, the vector, and the version.
+type Row = (i64, Vec<f32>, Version);
+
+/// Rows as a checker compares them, by id.
+type Rows = BTreeMap<ObjectId, Row>;
+
+/// The row of `n` and `vector`, with the version such content has; a
+/// row with no vector has none.
+fn value(n: i64, vector: Vec<f32>) -> Row {
+    let properties = BTreeMap::from([("n".to_string(), Value::Int(n))]);
+    let version = Version::of(&properties, (!vector.is_empty()).then_some(&vector[..]));
+    (n, vector, version)
+}
 
 /// A partition's rows and the position they are at.
 type Snapshot = (LogPosition, Rows);
 
+fn n_of(found: &Live<'_>) -> i64 {
+    match found.object.properties.get("n") {
+        Some(Value::Int(n)) => *n,
+        other => panic!("{other:?}"),
+    }
+}
+
 fn snapshot(state: &State) -> Snapshot {
     let rows = state
         .scan(&name(COLLECTION))
-        .map(|found| match found.object.properties.get("n") {
-            Some(Value::Int(n)) => {
-                let vector = found.vector.map(<[f32]>::to_vec).unwrap_or_default();
-                (found.id(), (*n, vector))
-            }
-            other => panic!("{other:?}"),
+        .map(|found| {
+            let vector = found.vector.map(<[f32]>::to_vec).unwrap_or_default();
+            (found.id(), (n_of(&found), vector, found.version()))
         })
         .collect();
     (state.position(), rows)
+}
+
+/// The rows as a walk of pages lists them, `page` at a time from the
+/// start, with `filter`, which must be every row that passes in id order:
+/// what `scan` finds, which the snapshot is checked by.
+fn walked(state: &State, page: usize, filter: Option<&Filter>, step: usize) -> Violation {
+    // A copy from before the collection was made has nothing to page.
+    if state.collection(&name(COLLECTION)).is_none() {
+        return Ok(());
+    }
+    let passes = |n: i64| match filter {
+        None => true,
+        Some(Filter::Gte { value, .. }) => n >= value.as_i64().unwrap(),
+        Some(Filter::Eq { value, .. }) => n == value.as_i64().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let expected: Vec<(ObjectId, i64)> = state
+        .scan(&name(COLLECTION))
+        .map(|found| (found.id(), n_of(&found)))
+        .filter(|(_, n)| passes(*n))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    let mut listed = Vec::new();
+    let mut after = None;
+    loop {
+        let found = state
+            .list(&name(COLLECTION), filter, after, page)
+            .map_err(|error| format!("a page could not be listed: {error}"))?;
+        check(found.len() <= page, || {
+            format!("a page of {page} held {} rows", found.len())
+        })?;
+        let ids: Vec<ObjectId> = found.iter().map(Live::id).collect();
+        let ascending = ids.windows(2).all(|pair| pair[0] < pair[1]);
+        let onward = after.is_none_or(|after| ids.first().is_none_or(|id| *id > after));
+        check(ascending && onward, || {
+            format!("a page after {after:?} held {ids:?}")
+        })?;
+        listed.extend(found.iter().map(|found| (found.id(), n_of(found))));
+        if found.len() < page {
+            break;
+        }
+        after = listed.last().map(|(id, _)| *id);
+    }
+    check(listed == expected, || {
+        format!(
+            "at step {step} a walk of pages of {page} with {filter:?} listed {listed:?}, \
+             and the rows are {expected:?}"
+        )
+    })
+}
+
+/// The pages of a walk made at `step`: a size and a filter that vary
+/// with it, so that over a history every size from one up, no filter, a
+/// filter most rows pass and one few pass are all walked, and the way a
+/// filtered page is taken, by sorting the few or by meeting the many in
+/// order, is both.
+fn walk_at(step: usize) -> (usize, Option<Filter>) {
+    let page = 1 + step % 5;
+    let filter = match step % 3 {
+        0 => None,
+        1 => Some(Filter::Gte {
+            property: "n".into(),
+            value: json!((step % 7) as i64),
+        }),
+        _ => Some(Filter::Eq {
+            property: "n".into(),
+            value: json!((step / 3) as i64),
+        }),
+    };
+    (page, filter)
+}
+
+/// A snapshot of `state`, once its pages are seen to list the same rows.
+fn snapshot_walked(state: &State, step: usize) -> std::result::Result<Snapshot, String> {
+    let (page, filter) = walk_at(step);
+    walked(state, page, filter.as_ref(), step)?;
+    Ok(snapshot(state))
 }
 
 /// A writer, and whether it can still commit. Any failed write closes one,
@@ -649,7 +792,7 @@ impl World {
             seats: vec![Seat { writer, open: true }],
             follower,
             attempts: Vec::new(),
-            base: BTreeMap::from([(counter(), (0, Vec::new()))]),
+            base: BTreeMap::from([(counter(), value(0, Vec::new()))]),
             since: Vec::new(),
             readings: Vec::new(),
             next_row: 0,
@@ -730,6 +873,7 @@ impl World {
         let delete = deleted.map(|id| Mutation::Delete {
             collection: name(COLLECTION),
             id,
+            only_if_version: None,
         });
         let mutations = rows.iter().map(insert).chain(delete).chain([count]);
         self.attempts.push(Attempt {
@@ -737,8 +881,78 @@ impl World {
                 request: Some(RequestId::generate()),
                 mutations: mutations.collect(),
             },
-            rows,
-            deleted,
+            effect: Effect::Write { rows, deleted },
+            acknowledged: false,
+            recorded: false,
+            refused: false,
+        });
+        self.attempt(who, self.attempts.len() - 1).await
+    }
+
+    /// A write to one of the rows a reader last saw, conditional on the
+    /// version the reader gave for it, or on one nothing is at: `kind`
+    /// picks a patch that changes `n`, a patch that leaves it as it is, a
+    /// replace that changes the vector alone, or a delete. The request
+    /// counts like any other.
+    async fn conditional(&mut self, who: Who, pick: usize, kind: u8, fresh: bool) -> Violation {
+        let read = self.history.values().next_back().expect("a reading");
+        let rows: Vec<(&ObjectId, &Row)> =
+            read.iter().filter(|(id, _)| **id != counter()).collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let (id, (n, _, version)) = rows[pick % rows.len()];
+        let attempt = self.attempts.len() as i64;
+        let version = match fresh {
+            true => *version,
+            // Content nothing has: a row's `n` is never negative.
+            false => value(-1 - attempt, Vec::new()).2,
+        };
+        let change = match kind % 4 {
+            0 => Change::Patch(attempt),
+            1 => Change::Patch(*n),
+            2 => Change::Vector(vec![attempt as f32, 0.25]),
+            _ => Change::Delete,
+        };
+        let properties = |n: i64| json!({ "n": n }).as_object().unwrap().clone();
+        let mutation = match &change {
+            Change::Patch(n) => Mutation::Patch {
+                collection: name(COLLECTION),
+                id: *id,
+                properties: properties(*n),
+                vector: None,
+                only_if: None,
+                only_if_version: Some(version),
+            },
+            Change::Vector(vector) => Mutation::Upsert {
+                collection: name(COLLECTION),
+                id: *id,
+                properties: properties(*n),
+                vector: Some(vector.clone()),
+                only_if_version: Some(version),
+            },
+            Change::Delete => Mutation::Delete {
+                collection: name(COLLECTION),
+                id: *id,
+                only_if_version: Some(version),
+            },
+        };
+        let count = Mutation::Increment {
+            collection: name(COLLECTION),
+            id: counter(),
+            property: "n".into(),
+            by: 1.0,
+        };
+        self.attempts.push(Attempt {
+            batch: Batch {
+                request: Some(RequestId::generate()),
+                mutations: vec![mutation, count],
+            },
+            effect: Effect::Conditional {
+                id: *id,
+                version,
+                change,
+            },
             acknowledged: false,
             recorded: false,
             refused: false,
@@ -748,7 +962,9 @@ impl World {
 
     /// Make the request of attempt `made`, for the first time or again. One
     /// recorded already is answered and makes nothing; one refused stays
-    /// refused; any other is made now if its commit is recorded.
+    /// refused; any other is made now if its commit is recorded, or
+    /// refused for good by that commit, which is what a conditional
+    /// request whose condition does not hold comes to.
     async fn attempt(&mut self, who: Who, made: usize) -> Violation {
         let seat = self.seat(who).await;
         let before = self.coordinator.recorded.load(Ordering::SeqCst);
@@ -759,6 +975,16 @@ impl World {
         let committed = self.coordinator.recorded.load(Ordering::SeqCst) > before;
         self.seats[seat].open = !self.seats[seat].writer.is_closed();
 
+        // Whether a conditional request's object is at its version in
+        // what is committed, by which the commit that answers it must
+        // have made it or refused it: the writer that committed had seen
+        // everything committed before.
+        let holds = match &self.attempts[made].effect {
+            Effect::Write { .. } => true,
+            Effect::Conditional { id, version, .. } => {
+                self.expected().get(id).map(|row| row.2) == Some(*version)
+            }
+        };
         let refused = matches!(&outcome, Err(error) if error.refusal().is_some());
         let attempt = &mut self.attempts[made];
         if attempt.recorded {
@@ -766,7 +992,15 @@ impl World {
                 format!("request {made}, answered before, was made again")
             });
         }
-        attempt.refused |= refused;
+        if committed && !attempt.refused {
+            check(holds || outcome.is_err(), || {
+                format!("request {made} was made while its object was not at the version given")
+            })?;
+            check(!holds || !refused, || {
+                format!("request {made} was refused while its object was at the version given")
+            })?;
+        }
+        attempt.refused |= refused || (committed && !holds);
         attempt.acknowledged |= outcome.is_ok();
         if attempt.refused {
             return check(outcome.is_err(), || {
@@ -795,13 +1029,34 @@ impl World {
     fn expected(&self) -> Rows {
         let mut rows = self.base.clone();
         for made in &self.since {
-            let attempt = &self.attempts[*made];
-            let written = (*made as i64, vec![*made as f32, 0.5]);
-            rows.extend(attempt.rows.iter().map(|n| (row(*n), written.clone())));
-            if let Some(deleted) = attempt.deleted {
-                rows.remove(&deleted);
+            match &self.attempts[*made].effect {
+                Effect::Write {
+                    rows: written,
+                    deleted,
+                } => {
+                    let value = value(*made as i64, vec![*made as f32, 0.5]);
+                    rows.extend(written.iter().map(|n| (row(*n), value.clone())));
+                    if let Some(deleted) = deleted {
+                        rows.remove(deleted);
+                    }
+                }
+                Effect::Conditional { id, change, .. } => {
+                    let held = rows.get(id).cloned().expect("made at its version");
+                    match change {
+                        Change::Patch(n) => {
+                            rows.insert(*id, value(*n, held.1));
+                        }
+                        Change::Vector(vector) => {
+                            rows.insert(*id, value(held.0, vector.clone()));
+                        }
+                        Change::Delete => {
+                            rows.remove(id);
+                        }
+                    }
+                }
             }
-            rows.get_mut(&counter()).expect("the counter").0 += 1;
+            let counted = rows.get(&counter()).expect("the counter").0 + 1;
+            rows.insert(counter(), value(counted, Vec::new()));
         }
         rows
     }
@@ -903,6 +1158,12 @@ impl World {
         self.blobs.step.store(self.step, Ordering::SeqCst);
         match action {
             Action::Write { who, rows, delete } => return self.write(who, rows, delete).await,
+            Action::Conditional {
+                who,
+                pick,
+                kind,
+                fresh,
+            } => return self.conditional(who, pick, kind, fresh).await,
             Action::Again { who, pick } => {
                 if self.attempts.is_empty() {
                     return Ok(());
@@ -996,14 +1257,16 @@ impl World {
     /// The committed state as a node starting with nothing reads it from a
     /// healthy store.
     async fn truth(&self, committed: &Committed) -> std::result::Result<Snapshot, String> {
-        Follower::open(
+        let fresh = Follower::open(
             self.cluster.key.clone(),
             self.blobs.clean.clone(),
             committed,
         )
         .await
-        .map(|fresh| fresh.partition().read(snapshot))
-        .map_err(|error| format!("the committed state cannot be read: {error}"))
+        .map_err(|error| format!("the committed state cannot be read: {error}"))?;
+        fresh
+            .partition()
+            .read(|state| snapshot_walked(state, self.step))
     }
 
     async fn verify(&mut self) -> Violation {
@@ -1052,14 +1315,17 @@ impl World {
             self.points.push((self.step, committed));
         }
 
-        let copies = self
+        let mut copies = self
             .seats
             .iter()
             .map(|seat| seat.writer.partition())
             .chain([self.follower.partition()]);
-        copies.map(|copy| copy.read(snapshot)).try_for_each(|(position, held)| {
+        copies.try_for_each(|copy| {
+            let (position, held) = copy.read(|state| snapshot_walked(state, self.step))?;
             check(self.history.get(&position) == Some(&held), || {
-                format!("a copy at {position:?} holds rows that were never committed there: {held:?}")
+                format!(
+                    "a copy at {position:?} holds rows that were never committed there: {held:?}"
+                )
             })
         })
     }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use vellev_core::{CollectionName, ModelFault, ObjectError, ObjectId, SchemaError};
+use vellev_core::{CollectionName, ModelFault, ObjectError, ObjectId, SchemaError, Version};
 
 use crate::coordinator::CoordinatorError;
 use crate::mutation::Unembedded;
@@ -41,11 +41,22 @@ pub enum StorageError {
         collection: CollectionName,
         id: ObjectId,
     },
+    /// A conditional write whose property condition did not hold;
+    /// `stored` is the version the object is at.
     #[error("object {id} in {collection} does not have the expected {property:?}")]
     ConditionFailed {
         collection: CollectionName,
         id: ObjectId,
         property: String,
+        stored: Version,
+    },
+    /// A conditional write made at another version than the object is at,
+    /// which is `stored`.
+    #[error("object {id} in {collection} is not at the version given; it is at {stored}")]
+    StaleVersion {
+        collection: CollectionName,
+        id: ObjectId,
+        stored: Version,
     },
     #[error("{0}")]
     InvalidMutation(String),
@@ -114,6 +125,14 @@ pub struct Refusal {
         deserialize_with = "if_known"
     )]
     pub over: Option<Over>,
+    /// The version the object was at when a conditional write was
+    /// refused: kept, and read by other releases, just as `lacking` is.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "if_known"
+    )]
+    pub version: Option<Version>,
 }
 
 /// What was kept, if it is something this release has a name for.
@@ -196,7 +215,8 @@ impl StorageError {
             Self::UnknownCollection(_) | Self::UnknownObject { .. } => Refused::NotFound,
             Self::CollectionExists(_)
             | Self::ObjectExists { .. }
-            | Self::ConditionFailed { .. } => Refused::Conflict,
+            | Self::ConditionFailed { .. }
+            | Self::StaleVersion { .. } => Refused::Conflict,
             Self::InvalidMutation(_)
             | Self::TooMany { .. }
             | Self::InvalidQuery(_)
@@ -214,7 +234,20 @@ impl StorageError {
                 Self::TooMany { over, .. } => Some(*over),
                 _ => None,
             },
+            version: self.stored_version(),
         })
+    }
+
+    /// The version an object was at when a write conditional on it was
+    /// refused, if that is what this is.
+    pub fn stored_version(&self) -> Option<Version> {
+        match self.root() {
+            Self::ConditionFailed { stored, .. } | Self::StaleVersion { stored, .. } => {
+                Some(*stored)
+            }
+            Self::Refused(refusal) => refusal.version,
+            _ => None,
+        }
     }
 
     pub(crate) fn corrupt(key: &str, reason: impl Into<String>) -> Self {

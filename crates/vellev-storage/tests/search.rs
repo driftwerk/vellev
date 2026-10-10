@@ -23,6 +23,7 @@ fn put(n: u64, group: i64, vector: Option<Vec<f32>>) -> Mutation {
         id: row(n),
         properties: json!({ "n": group }).as_object().unwrap().clone(),
         vector,
+        only_if_version: None,
     }
 }
 
@@ -30,6 +31,7 @@ fn remove(n: u64) -> Mutation {
     Mutation::Delete {
         collection: name(VECTORS),
         id: row(n),
+        only_if_version: None,
     }
 }
 

@@ -54,6 +54,13 @@ pub struct Scored<'a> {
     pub score: f32,
 }
 
+impl Scored<'_> {
+    /// The object's version: of its properties and its stored vector.
+    pub fn version(&self) -> vellev_core::Version {
+        vellev_core::Version::of(&self.object.properties, self.vector)
+    }
+}
+
 /// A match ordered so that the greatest is the worst: the one a full list
 /// of the best gives up first.
 struct Worst<'a>(Scored<'a>);

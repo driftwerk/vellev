@@ -319,6 +319,22 @@ catches up that far before it answers (the Rust client does this for you).
 `x-vellev-consistency: strong` waits for everything committed, and
 `eventual` answers with whatever the node has, at most about a second old.
 
+Every object read carries a `version`, and a `PUT`, `PATCH` or `DELETE` of
+an object can be made `only_if_version` it is still at: in the body of a
+`PUT` or `PATCH`, on an `upsert`, `patch` or `delete` in a batch, and as
+`?only_if_version=` on a `DELETE`. A node of 0.1 ignores that query and
+deletes, so send a conditional delete in a batch until every node is 0.2.
+Two writers that read the same object cannot each overwrite the other's
+change unknowing, as the one that comes second is refused with `conflict`
+and the version the object has now, and reads again. The
+version is of the object's content, properties and vector, so an object
+changed and changed back is at its old version again, and a write
+conditional on it then finds exactly the content it read. It is opaque:
+compare versions for equality and hand them back as given; never order,
+parse or make them. A conditional write of an object that is not there is
+`not_found`. Pages of a collection (`/list`) come in id order at a cost of
+their own size, so a walk of a whole collection costs its size once.
+
 The API is described at `/openapi.json`, and by `vellev openapi` without a
 running node. Every route under `/v1` needs one of the configured keys. A
 collection may only name an embedding endpoint listed in

@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use vellev_core::{
     Collection, CollectionName, DataType, Embedding, EmbeddingProvider, Object, ObjectError,
-    ObjectId, Value,
+    ObjectId, Value, Version,
 };
 
 use vellev_index::filter::Predicate;
@@ -217,6 +217,39 @@ impl Batch<'_> {
             })
     }
 
+    /// The version the object under `key` is at, which there must be one
+    /// of, as the batch sees it: a conditional write on an object that is
+    /// not there is not found, whatever the condition.
+    fn version_of(&self, name: &CollectionName, key: RowKey) -> Result<Version> {
+        self.row(key)
+            .map(|found| found.version())
+            .ok_or_else(|| StorageError::UnknownObject {
+                collection: name.clone(),
+                id: key.1,
+            })
+    }
+
+    /// That the object under `key` is at `version`, if a write asks it.
+    fn at_version(
+        &self,
+        name: &CollectionName,
+        key: RowKey,
+        version: Option<Version>,
+    ) -> Result<()> {
+        let Some(version) = version else {
+            return Ok(());
+        };
+        let stored = self.version_of(name, key)?;
+        if stored != version {
+            return Err(StorageError::StaleVersion {
+                collection: name.clone(),
+                id: key.1,
+                stored,
+            });
+        }
+        Ok(())
+    }
+
     /// Write `next` under its key, unless that is what is stored already.
     ///
     /// Where the collection embeds its own objects and the caller
@@ -280,8 +313,10 @@ impl Batch<'_> {
                 id,
                 properties,
                 vector,
+                only_if_version,
             } => {
                 let (cid, schema) = self.collection(&collection)?;
+                self.at_version(&collection, (cid, id), only_if_version)?;
                 let supplied = vector.is_some();
                 let object = Object::from_json(&schema, id, &properties, vector)?;
                 Ok(self.write(cid, &schema, object, supplied))
@@ -306,6 +341,7 @@ impl Batch<'_> {
                 properties,
                 vector,
                 only_if,
+                only_if_version,
             } => {
                 let (cid, schema) = self.collection(&collection)?;
                 let stored = self.stored(&collection, (cid, id))?;
@@ -316,9 +352,11 @@ impl Batch<'_> {
                             collection,
                             id,
                             property,
+                            stored: stored.version(),
                         });
                     }
                 }
+                self.at_version(&collection, (cid, id), only_if_version)?;
                 let supplied = vector.is_some();
                 let patched = stored.patched(&schema, &properties, vector)?;
                 Ok(self.write(cid, &schema, patched, supplied))
@@ -355,8 +393,13 @@ impl Batch<'_> {
                     .insert(property, Value::TextArray(appended));
                 Ok(self.write(cid, &schema, object, false))
             }
-            Mutation::Delete { collection, id } => {
+            Mutation::Delete {
+                collection,
+                id,
+                only_if_version,
+            } => {
                 let (cid, _) = self.collection(&collection)?;
+                self.at_version(&collection, (cid, id), only_if_version)?;
                 if self.row((cid, id)).is_none() {
                     return Ok(Outcome::Unchanged);
                 }

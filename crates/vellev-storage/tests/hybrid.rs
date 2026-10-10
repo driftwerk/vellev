@@ -16,6 +16,7 @@ fn note(object: u8, title: &str, n: i64, vector: Option<[f32; 2]>) -> Mutation {
             .unwrap()
             .clone(),
         vector: vector.map(Vec::from),
+        only_if_version: None,
     }
 }
 

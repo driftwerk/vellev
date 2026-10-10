@@ -24,7 +24,7 @@ use vellev_api::{
     RestorePoints, RestoreTo, RestoreWindow, Restored, Results, Stored, TenantKey, TenantKeys,
     Tenants, Written, AFTER, REQUEST, ROOT,
 };
-use vellev_core::{Collection, CollectionName, ObjectId, Property, RequestId, TenantId};
+use vellev_core::{Collection, CollectionName, ObjectId, Property, RequestId, TenantId, Version};
 use vellev_index::filter::Filter;
 
 pub use vellev_api as api;
@@ -58,6 +58,9 @@ pub enum Error {
         /// said: as one does that is answering as many reads as it does
         /// at once.
         wait: Option<Duration>,
+        /// The version an object is at, when a write conditional on it
+        /// was refused.
+        version: Option<Version>,
     },
     /// The tenant asked more of the node than it may; the request had no
     /// effect, and may be sent again after `wait`.
@@ -159,6 +162,17 @@ impl Error {
         match self {
             Self::Api { reason, .. } => *reason,
             Self::Partial { source, .. } => source.reason(),
+            _ => None,
+        }
+    }
+
+    /// The version an object is at, if a write conditional on it, by
+    /// `only_if` or `only_if_version`, was refused as [`Code::Conflict`]:
+    /// what to send to write it as it is now.
+    pub fn version(&self) -> Option<Version> {
+        match self {
+            Self::Api { version, .. } => *version,
+            Self::Partial { source, .. } => source.version(),
             _ => None,
         }
     }
@@ -644,6 +658,7 @@ impl Client {
                 limit: error.limit,
                 missing: error.missing,
                 reason: error.reason,
+                version: error.version,
                 wait: retry_after,
             },
             Err(_) => Error::Status {
@@ -925,6 +940,19 @@ impl Records {
         self.tenant.write(Method::DELETE, &path, None::<&()>).await
     }
 
+    /// Delete the object only if it is stored and still at `version`:
+    /// [`Code::Conflict`] otherwise, with [`Error::version`] the one it
+    /// is at, and [`Code::NotFound`] if it is not stored.
+    ///
+    /// Sent as a batch of one change rather than as a `DELETE` with the
+    /// condition in its query: a node of 0.1 ignores a query it does not
+    /// know and would delete unconditionally, where it refuses a change
+    /// it does not know.
+    pub async fn delete_if_version(&self, id: ObjectId, version: Version) -> Result<Written> {
+        let delete = Change::delete_if_version(self.name.clone(), id, version);
+        self.tenant.batch(vec![delete]).await
+    }
+
     /// Store every object whole, several to a request, each request one
     /// atomic step. Returns the position of the last, or `None` if there
     /// was nothing to store. If a request fails, those before it stay
@@ -938,12 +966,9 @@ impl Records {
         let mut position = None;
         let mut batch: Vec<Change> = Vec::new();
         let mut bytes = 0;
-        let upserts = objects.into_iter().map(|(id, content)| Change::Upsert {
-            collection: self.name.clone(),
-            id,
-            properties: content.properties,
-            vector: content.vector,
-        });
+        let upserts = objects
+            .into_iter()
+            .map(|(id, content)| Change::upsert(self.name.clone(), id, content));
         for upsert in upserts.map(Some).chain([None]) {
             let size = match &upsert {
                 Some(upsert) => serde_json::to_vec(upsert)?.len(),

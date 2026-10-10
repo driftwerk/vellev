@@ -111,6 +111,60 @@ before runs on the migrated database.
 - **Vectors are never held in memory by a node with a cache directory.**
   A tenant whose vectors the cache cannot take, or whose disk does not
   answer, does not open, and is `unavailable` until it does.
+- **Every object read carries `version`**: 32 hexadecimal characters, a
+  hash of its properties and vector (docs/compatibility.md says exactly
+  how), from `GET …/objects/{id}`, `/list`, `/nearest`, `/keyword` and
+  `/hybrid`, whether or not the vector is sent along. Opaque: compare
+  for equality only. The same content has the same version under any
+  id, on any node, after any restore; a vector-only change gives a new
+  one; an object changed and changed back has its old one. It is
+  computed as an object is answered, never stored: in the same runs as
+  below, about 1.6 µs an object with a 768-dimension vector (`get` 0.4
+  µs → 1.6 µs; a page of 1,000 with versions 1.7 ms, where writing that
+  page as JSON with its vectors takes 15 ms and without them about 0.3
+  ms; a top-100 search gains 0.2 ms on 38 ms), and under 0.2 µs with a
+  2-dimension one. On x86-64 the version costs about 1.6 µs per
+  768-dimension object with the SHA extensions (Zen and later, Ice Lake
+  and later); without them about 9 µs, which is about 9 ms of CPU per
+  1,000-row page: check for `sha_ni` in `/proc/cpuinfo` on your hosts.
+  On aarch64 the fast path takes `sha2`'s assembly backend, which
+  `vellev-core` now builds with there.
+- **A write can be made only if an object is still at a version**:
+  `only_if_version` in the body of `PUT` and `PATCH …/objects/{id}`, as
+  `?only_if_version=` on `DELETE …/objects/{id}`, and on `upsert`,
+  `patch` and `delete` in `POST …/changes`. At any other version the
+  write is refused as `conflict` (409) and `version` in the failure says
+  the one the object is at; a `patch` with `only_if` too must pass both,
+  and a `patch` refused by `only_if` now says `version` as well. On an
+  object that is not stored, a conditional write is `not_found` (404,
+  `missing: object`), as a `patch` is; a plain `delete` of one still
+  changes nothing. A change that leaves the content as it is is still
+  `unchanged`, and the version stays. In a batch, one change at a stale
+  version refuses the whole batch, as `only_if` does; a request named
+  again (`x-vellev-request`) is answered as it was, version and all. A
+  node of 0.1 refuses the field in a body as one it does not know, so a
+  conditional `PUT`, `PATCH` or batch is never made unconditionally by
+  mistake; **but it ignores `?only_if_version=` on a `DELETE`, and
+  deletes**. Until every node is 0.2, send a conditional delete as a
+  `delete` in `POST …/changes`, which is what the client crate's
+  `delete_if_version` does. `DELETE …/objects/{id}` now refuses a query
+  parameter it does not know as `invalid` (400), where 0.1 ignored it.
+- **A page of a collection costs its own size.** `/list` used to find
+  and sort every row of the collection for each page, so walking a
+  collection of N rows cost about N²/page. Measured in process, release
+  build, random ids, several segments and a memtable, before → after: a
+  page of 50 from the start of 4M rows 460 ms → 0.8 µs, of 1,000 483 ms
+  → 9 µs, of 50 from the middle 282 ms → 0.6 µs; a page of 50 under a
+  filter half the rows pass 246 ms → about 0.5 ms; a whole walk of
+  300k rows at page 50 77.9 s → 15 ms, of 4M rows at page 100 (about
+  3.7 hours before, by its per-page cost) 0.3–0.5 s, and under that
+  filter about 10 s. A filter few rows pass was and stays microseconds
+  a page. The live rows are now kept in key order for this, which costs
+  a lookup a little: on an idle machine, `get` 250 ns → 208 ns (noise),
+  writing 4M rows in commits of 8,192 34.3 s → 33.5 s (bulk 13,828 →
+  13,340 objects/s, group commits unchanged), opening 4M rows from
+  their segments about 12% longer, resident memory about 10% more.
+  Searches are unchanged.
 
 ### vellev-client
 
@@ -153,6 +207,9 @@ New:
 - `Error::Api` has `wait`: how long the node said to leave it before
   asking again, if it said.
 - `Options::better_within`.
+- `Records::delete_if_version(id, version)`, and `Error::version()`: the
+  version an object is at, when a write conditional on it was refused.
+  `Stored::version` on everything read.
 
 ### vellev-api
 
@@ -196,8 +253,18 @@ Breaking:
 - `Change::DeleteWhere` gains `limit: Option<u32>`, so writing the variant
   out needs the field. `Change::delete_where(collection, filter)` and
   `Change::delete_up_to(collection, filter, limit)` build it.
+- `Change::Upsert`, `Change::Patch` and `Change::Delete` gain
+  `only_if_version: Option<Version>`, so writing them out needs the
+  field. `Change::upsert(collection, id, content)`,
+  `Change::patch(collection, id, changes)`, `Change::delete(collection,
+  id)` and `Change::delete_if_version(collection, id, version)` build
+  them.
+- `Stored::new` takes the object's `version` as a fourth argument, and
+  `Stored` gains `version: Option<Version>`: `None` from a node of 0.1.
+- `Problem` gains `version`.
 
-New: `Bounded`, `Limit`, `Limits`, `Missing`, `Reason`, `Code::status()`.
+New: `Bounded`, `Limit`, `Limits`, `Missing`, `Reason`, `Code::status()`,
+`Content::only_if_version`, `Changes::only_if_version`.
 
 Not changed, and why: `Change`, `RestoreTo` and `Consistency` stay
 exhaustive, and `OnlyIf` and `Weighted` stay plain structs. A caller only
@@ -213,7 +280,9 @@ Breaking:
 
 - `ObjectError` is `#[non_exhaustive]`.
 
-New: `ModelFault`, itself `#[non_exhaustive]`.
+New: `ModelFault`, itself `#[non_exhaustive]`; `Version` and
+`VersionError`, with `Version::of(properties, vector)` and
+`Object::version()`.
 
 Not changed, and why: `EmbeddingProvider`, `HttpApi`, `DataType` and
 `Distance` stay exhaustive. They are stored, so a new variant of any is a

@@ -73,6 +73,7 @@ pub fn upsert(collection: &str, object: u8, n: i64) -> Mutation {
             .unwrap()
             .clone(),
         vector: Some(vec![n as f32, 0.5]),
+        only_if_version: None,
     }
 }
 
@@ -80,6 +81,7 @@ pub fn delete(collection: &str, object: u8) -> Mutation {
     Mutation::Delete {
         collection: name(collection),
         id: id(object),
+        only_if_version: None,
     }
 }
 

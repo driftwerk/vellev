@@ -76,6 +76,7 @@ fn note(object: u8, properties: serde_json::Value, vector: Option<Vec<f32>>) -> 
         id: id(object),
         properties: properties.as_object().unwrap().clone(),
         vector,
+        only_if_version: None,
     }
 }
 
@@ -86,6 +87,7 @@ fn patch(object: u8, properties: serde_json::Value, vector: Option<Vec<f32>>) ->
         properties: properties.as_object().unwrap().clone(),
         vector,
         only_if: None,
+        only_if_version: None,
     }
 }
 
@@ -387,6 +389,7 @@ async fn a_writer_with_nothing_to_embed_with_refuses_only_what_needs_it() {
         properties: json!({ "title": "changed" }).as_object().unwrap().clone(),
         vector: None,
         only_if: None,
+        only_if_version: None,
     };
     writer.commit(vec![plain]).await.unwrap();
     let kept = writer.partition().read(|state| {
@@ -416,6 +419,7 @@ fn other(object: u8, title: &str, vector: Option<Vec<f32>>) -> Mutation {
         id: id(object),
         properties: json!({ "title": title }).as_object().unwrap().clone(),
         vector,
+        only_if_version: None,
     }
 }
 
@@ -441,6 +445,7 @@ async fn a_batch_whose_vectors_cannot_be_made_is_rejected_alone() {
                 properties: json!({ "n": 1 }).as_object().unwrap().clone(),
                 vector: None,
                 only_if: None,
+                only_if_version: None,
             }],
             vec![
                 note(2, json!({ "title": "fox" }), None),

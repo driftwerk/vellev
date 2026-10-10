@@ -18,6 +18,7 @@ fn tagged(object: u8, n: i64, tags: &[&str]) -> Mutation {
         id: id(object),
         properties: json!({ "n": n, "tags": tags }).as_object().unwrap().clone(),
         vector: None,
+        only_if_version: None,
     }
 }
 
@@ -117,6 +118,7 @@ async fn tags_match_exactly_and_a_property_added_later_is_absent_on_older_rows()
         properties: json!({ "reviewed": true }).as_object().unwrap().clone(),
         vector: None,
         only_if: None,
+        only_if_version: None,
     };
     writer.commit(vec![reviewed, mark]).await.unwrap();
 

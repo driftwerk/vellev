@@ -175,6 +175,7 @@ async fn main() {
                         id: vellev_core::ObjectId(uuid::Uuid::new_v4()),
                         properties: object.properties_json(),
                         vector: object.vector,
+                        only_if_version: None,
                     }
                 })
             })
@@ -211,6 +212,7 @@ async fn main() {
             id: vellev_core::ObjectId(uuid::Uuid::new_v4()),
             properties,
             vector,
+            only_if_version: None,
         },
         other => other,
     };
@@ -246,6 +248,7 @@ async fn main() {
             Mutation::Upsert { collection, id, .. } => Some(Mutation::Delete {
                 collection: collection.clone(),
                 id: *id,
+                only_if_version: None,
             }),
             _ => None,
         })

@@ -164,6 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("an object")
                     .clone(),
                     vector: Some(vector(start + i, 0)),
+                    only_if_version: None,
                 })
                 .collect();
             writer.commit(mutations).await?;
@@ -189,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .expect("an object")
                         .clone(),
                     vector: Some(vector(n, 7)),
+                    only_if_version: None,
                 }])
                 .await?;
             waited = waited.max(commit.elapsed());

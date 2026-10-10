@@ -25,6 +25,7 @@ fn row(collection: &str, n: u32, vector: Vec<f32>) -> Mutation {
             .unwrap()
             .clone(),
         vector: Some(vector),
+        only_if_version: None,
     }
 }
 
