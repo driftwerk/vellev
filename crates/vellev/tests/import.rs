@@ -4709,6 +4709,19 @@ async fn a_comparison_counts_what_a_run_that_copies_then_counts() {
     };
     let sampled = importing.run_as(&sampling).await.unwrap();
     assert_eq!(said(&sampled), said(&copied));
+    // Weaviate holds a note under that id again, made anew and so not
+    // as the collection holds it: withheld once more, and no longer
+    // unknown.
+    weaviate.add(class, 2..3).await;
+    let compared = importing.run_as(&comparing).await.unwrap();
+    let copied = importing.run().await.unwrap();
+    assert_eq!(said(&compared), said(&copied));
+    assert_eq!(said(&copied).0, [5, 1, 0, 0]);
+    let entry = importing.entry(2).await.unwrap();
+    assert_eq!(
+        (entry.get("withheld"), entry.get("gone")),
+        (Some(&json!(true)), None)
+    );
 }
 
 #[tokio::test]
