@@ -59,6 +59,31 @@ const READINESS: &str = "vellev-readiness";
 /// How many commits and restores of a removed tenant are forgotten at once.
 const FORGOTTEN_AT_ONCE: usize = 10_000;
 
+/// The least [`Settings::grace`] a node runs with, however quick its store:
+/// [`Settings::check`] refuses less, and less than three requests to object
+/// storage ([`RequestBounds::least_grace`]).
+///
+/// The grace is all that stands between cleaning up and a restore to a
+/// point of the window: nothing else keeps a file such a restore names
+/// from being deleted. With every clock right it must cover
+///
+/// - the time a head file is in the store before its commit, up to one
+///   upload and three tries to commit: under four minutes as a node is set
+///   up by default, and longer the longer a request to the store may take,
+///   which is why three of those are the least where they come to more;
+/// - the time a restore that has found its target waits behind a clean-up
+///   under way, up to two minutes;
+/// - what the node's clock, the store's and the database's differ by,
+///   seconds on machines that keep time;
+/// - a reader that took a committed position and has yet to fetch its
+///   files.
+///
+/// That is six to seven minutes, and this about twice it. It does not
+/// cover a clock wrong by more than the grace, nor a flush or a merge that
+/// keeps a restore waiting for longer than the grace: no margin of time
+/// does.
+pub const LEAST_GRACE: Duration = Duration::from_secs(15 * 60);
+
 /// How long object storage having answered counts for readiness, so that
 /// health checks do not ask it every few seconds.
 const STORE_ANSWERED: Duration = Duration::from_secs(30);
@@ -84,6 +109,9 @@ pub struct Settings {
     /// How much longer than its restore window a file nothing reaches any
     /// more is kept: files are written a little before they are committed,
     /// and a reader that took a committed position still finds its files.
+    /// At least [`LEAST_GRACE`] and three requests to object storage, as
+    /// [`Settings::check`] makes sure: it is the whole margin between
+    /// cleaning up and a restore to a point of the window.
     pub grace: Duration,
     /// How often a copy of a tenant kept for reads looks for new commits.
     pub follow_every: Duration,
@@ -194,6 +222,7 @@ impl Settings {
     pub fn check(&self) -> Result<()> {
         self.request_bounds
             .claim_problem(self.backup_claim)
+            .or_else(|| self.request_bounds.grace_problem(self.grace))
             .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
     }
 }
@@ -205,6 +234,30 @@ impl Settings {
 pub struct RequestBounds {
     pub store: Duration,
     pub coordinator: Duration,
+}
+
+impl RequestBounds {
+    /// The least [`Settings::grace`] a node runs with as these bounds say:
+    /// [`LEAST_GRACE`], or three requests to object storage if those take
+    /// longer.
+    pub fn least_grace(&self) -> Duration {
+        LEAST_GRACE.max(self.store * 3)
+    }
+
+    /// Why a node cannot run with a grace of `grace` and requests that
+    /// take as long as these bounds say, if it cannot: it is below
+    /// [`Self::least_grace`].
+    pub fn grace_problem(&self, grace: Duration) -> Option<String> {
+        let least = self.least_grace();
+        (grace < least).then(|| {
+            format!(
+                "a grace of {grace:?} is too short to keep the files a restore within a \
+                 tenant's window needs from being cleaned up: it must be at least {least:?}, \
+                 the longer of {LEAST_GRACE:?} and three requests to object storage, {:?} each",
+                self.store
+            )
+        })
+    }
 }
 
 impl Default for RequestBounds {
@@ -673,6 +726,13 @@ impl Tenant {
     /// Merge segments until a merge finds nothing to do, and then delete
     /// the files nothing needs any more, as [`Writer::clean`] with `grace`,
     /// which deletes so many at once, until one finds fewer than that.
+    ///
+    /// `grace` is taken as it is given, and nothing here checks it. A node
+    /// looking after its tenants gives the tenant's restore window and
+    /// [`Settings::grace`] on top, which is at least
+    /// [`RequestBounds::least_grace`]; whoever calls this with less may
+    /// delete files a restore to a point of that window names, and that is
+    /// the caller's breach.
     pub async fn compact(&self, grace: Duration) -> Result<usize> {
         while self
             .writer

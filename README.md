@@ -103,7 +103,14 @@ call -X POST "$notes/hybrid" -d '{"text":"fox","vector":[1,0],"limit":5}'
 A tenant's segments are merged in the background once enough small ones
 have piled up or one is half deleted rows. Files nothing needs any more are
 deleted once no restore within the tenant's window can need them, and
-`VELLEV_GRACE_SECS` (an hour) later.
+`VELLEV_GRACE_SECS` (an hour) later. A node does not start with a grace
+below fifteen minutes, or below three times what one request to the store
+may take with its tries where that is longer (it is 9 minutes 21 seconds as
+a node is set up by default, so fifteen minutes is the least): the grace is
+all that keeps a file a restore within the window names from being deleted,
+and it must cover a file being written a few minutes before it is
+committed, a restore waiting behind a clean-up, and what the clocks of the
+node, the store and Postgres differ by.
 
 A tenant can be put back as it stood at any moment of its restore window:
 14 days unless `VELLEV_RESTORE_WINDOW_SECS` or the tenant says otherwise.

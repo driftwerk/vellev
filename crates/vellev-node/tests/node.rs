@@ -3854,6 +3854,70 @@ async fn pruning_stops_once_a_renewal_finds_the_claim_lost() {
 }
 
 #[test]
+fn a_grace_below_fifteen_minutes_or_three_requests_to_the_store_is_refused() {
+    let seconds = Duration::from_secs;
+    // A backup claim long enough for every store here, so that nothing
+    // but the grace is refused.
+    let graced = |grace, store| {
+        Settings {
+            grace,
+            backup_claim: seconds(6 * 60 * 60),
+            request_bounds: RequestBounds {
+                store,
+                coordinator: seconds(10),
+            },
+            ..Settings::new(NodeId::generate("node"))
+        }
+        .check()
+    };
+    let refusal = |checked: Result<(), NodeError>| match checked {
+        Err(NodeError::Settings(problem)) => problem,
+        other => panic!("not refused for its settings: {other:?}"),
+    };
+    let just_under = |floor: Duration| floor - Duration::from_millis(1);
+    let unset = Settings::new(NodeId::generate("node"));
+    assert_eq!(unset.grace, seconds(60 * 60));
+    unset.check().unwrap();
+
+    // As a node is set up unless told otherwise, three requests to the
+    // store take less than fifteen minutes, and fifteen minutes it is: to
+    // the millisecond.
+    let floor = vellev_node::LEAST_GRACE;
+    assert_eq!(floor, seconds(15 * 60));
+    let store = RequestBounds::default().store;
+    assert_eq!(store, seconds(187));
+    assert_eq!(RequestBounds::default().least_grace(), floor);
+    graced(floor, store).unwrap();
+    graced(floor + seconds(1), store).unwrap();
+    let refused = refusal(graced(just_under(floor), store));
+    assert!(refused.contains("a grace of 899.999s"), "{refused}");
+    assert!(refused.contains("at least 900s"), "{refused}");
+    assert!(refusal(graced(floor - seconds(1), store)).contains("at least 900s"));
+    assert!(refusal(graced(Duration::ZERO, store)).contains("at least 900s"));
+    // However quick the store, no less.
+    graced(floor, Duration::ZERO).unwrap();
+    assert!(refusal(graced(just_under(floor), Duration::ZERO)).contains("at least 900s"));
+
+    // A store given longer for a request moves the floor up with it, to
+    // three times as long.
+    graced(floor, seconds(300)).unwrap();
+    assert!(refusal(graced(just_under(floor), seconds(300))).contains("at least 900s"));
+    graced(seconds(903), seconds(301)).unwrap();
+    let refused = refusal(graced(just_under(seconds(903)), seconds(301)));
+    assert!(refused.contains("at least 903s"), "{refused}");
+    assert!(refused.contains("object storage, 301s"), "{refused}");
+    graced(seconds(1_200), seconds(400)).unwrap();
+    let refused = refusal(graced(just_under(seconds(1_200)), seconds(400)));
+    assert!(refused.contains("a grace of 1199.999s"), "{refused}");
+    assert!(refused.contains("at least 1200s"), "{refused}");
+    assert!(refusal(graced(floor, seconds(400))).contains("at least 1200s"));
+    assert!(
+        refusal(graced(seconds(60 * 60), seconds(1_201))).contains("at least 3603s"),
+        "the grace a node has unless told otherwise is refused too, under a store that slow"
+    );
+}
+
+#[test]
 fn a_backup_claim_must_outlast_a_request_and_leave_time_to_renew_it() {
     let seconds = Duration::from_secs;
     let claimed = |backup_claim, store, coordinator| {

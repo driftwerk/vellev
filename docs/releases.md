@@ -24,6 +24,23 @@ never looks, so that a tenant backed up by both has two sets until the
 window ends, and nothing either release keeps is pruned by the other: see
 `docs/compatibility.md`.
 
+Before you upgrade, look at `VELLEV_GRACE_SECS`: **a node set to a grace
+below the least it may be no longer starts**, where any number, 0 among
+them, used to be taken. The least is fifteen minutes (900), or three times
+what one request to the store may take with its tries where that is longer:
+9 minutes 21 seconds as a node is set up by default, so fifteen minutes,
+and more only where a request is given longer than by default
+(`VELLEV_STORE_TIMEOUT_SECS`, `VELLEV_STORE_MIN_BYTES_PER_SEC`,
+`VELLEV_UPLOAD_PART_MIB`). The grace is how much longer than
+a tenant's restore window a file nothing reaches any more is kept, and it
+is all that keeps cleaning up from deleting a file a restore within the
+window names: it has to cover a file being written a few minutes before
+its commit, a restore waiting behind a clean-up, and what the clocks of
+the node, the store and Postgres differ by. A node left at the default, an
+hour, starts as before. Whoever builds on `vellev-node` gets the same
+refusal from `Settings::check`; `Writer::clean` and `Tenant::compact` take
+any grace still, and say what the caller then answers for.
+
 ### What a node answers
 
 - **A new code, `model_unavailable` (501)**, where a node used to answer

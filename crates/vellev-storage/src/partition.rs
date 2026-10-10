@@ -1605,6 +1605,16 @@ impl Writer {
     /// which keeps a newer writer's uploads safe whatever the clocks say.
     /// Returns how many files were deleted.
     ///
+    /// `grace` is taken as it is given, and nothing here checks it: it is
+    /// the whole margin between this and a restore to a point of the
+    /// partition's restore window, which names files this takes for litter
+    /// once they are older. Whoever calls this with less than that window
+    /// and, on top, the time a file may be in the store before its commit,
+    /// a restore may wait behind a call of this, and the clocks may differ
+    /// by (a node allows a quarter of an hour, or three requests to the
+    /// store if those take longer) may delete files such a restore needs,
+    /// and that is the caller's breach.
+    ///
     /// What is needed is decided by the committed chain alone: it is walked
     /// back to the latest checkpoint before the oldest recent file, and
     /// everything before that checkpoint which no checkpoint on the way
