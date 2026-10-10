@@ -46,18 +46,18 @@
 //! lost file no later backup lists is never mended, and fails at restore
 //! for as long as it is kept.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, SubsecRound, Utc};
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vellev_core::{Partition as PartitionNumber, TenantId};
 
-use crate::blobs::{is_plain, Blobs, Layout};
+use crate::blobs::{is_plain, Blobs, Layout, Listed};
 use crate::coordinator::{
     Clock, ClusterId, Coordinator, Identity, Incarnation, Lineage, LogPosition, PartitionKey,
     SystemClock, TenantKey,
@@ -654,19 +654,10 @@ impl Backups {
     /// in it: what is still to be fetched back before `backup` can be
     /// restored, or went since it was.
     pub async fn lacking(&self, primary: &Arc<dyn Blobs>, backup: &Backup) -> Result<Vec<String>> {
+        lists_its_own(backup)?;
         let mut present = HashSet::new();
         for taken in &backup.partitions {
             let layout = Layout(&taken.key(&backup.tenant)).prefix();
-            if let Some(stray) = taken
-                .files
-                .iter()
-                .find(|key| !(is_plain(key) && key.starts_with(&layout)))
-            {
-                return Err(StorageError::corrupt(
-                    stray,
-                    format!("backup {} lists it, outside {layout}", backup.id),
-                ));
-            }
             present.extend(
                 primary
                     .list(&layout)
@@ -680,6 +671,24 @@ impl Backups {
             .filter(|key| !present.contains(*key))
             .cloned()
             .collect())
+    }
+
+    /// The files of `backup`, to be read by the keys they had in the
+    /// tenant's store, and only read: what a restore takes them from.
+    /// Refused for a backup that lists a file outside the partition it
+    /// lists it for. Nothing is asked of the store until a file is read.
+    pub fn source(&self, backup: &Backup) -> Result<Source> {
+        lists_its_own(backup)?;
+        let prefix = backup.home().files();
+        Ok(Source {
+            store: self.store.clone(),
+            tenant: backup.tenant.clone(),
+            backup: backup.id,
+            kept: backup
+                .files()
+                .map(|key| (key.clone(), format!("{prefix}{key}")))
+                .collect(),
+        })
     }
 
     /// Forget `backup`, complete or pending, and leave its files, for
@@ -723,6 +732,111 @@ impl Backups {
             .into_iter()
             .map(|listed| listed.key)
             .collect())
+    }
+}
+
+/// Refused, naming the file, if `backup` lists one outside the partition
+/// it lists it for, or by a key that is not a plain one: such a record is
+/// not restored from.
+fn lists_its_own(backup: &Backup) -> Result<()> {
+    for taken in &backup.partitions {
+        let layout = Layout(&taken.key(&backup.tenant)).prefix();
+        if let Some(stray) = taken
+            .files
+            .iter()
+            .find(|key| !(is_plain(key) && key.starts_with(&layout)))
+        {
+            return Err(StorageError::corrupt(
+                stray,
+                format!("backup {} lists it, outside {layout}", backup.id),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The files one backup lists, read from where the cluster that took it
+/// keeps them, by the keys they had in the tenant's store. A file is read
+/// whole or a part at a time, as the backup store gives it; one the backup
+/// lists and the store no longer has is said of the backup, as it is when
+/// its files are fetched back. A key the backup does not list is not read,
+/// whatever lies in the store. Nothing is written, deleted or listed
+/// through it, and it keeps no copy of anything on local disk.
+#[derive(Debug)]
+pub struct Source {
+    store: Arc<dyn Blobs>,
+    tenant: TenantId,
+    backup: Uuid,
+    /// Where each file the backup lists is kept, by the key it had.
+    kept: HashMap<String, String>,
+}
+
+impl Source {
+    /// Where the file that was under `key` is kept, if the backup lists it.
+    fn kept(&self, key: &str) -> Result<&String> {
+        self.kept.get(key).ok_or_else(|| {
+            StorageError::corrupt(key, format!("backup {} does not list it", self.backup))
+        })
+    }
+
+    /// `error`, met reading the file that was under `key`, as it is said
+    /// to whoever restores: that the file is missing as a fact about the
+    /// backup, and anything else as it is.
+    fn said(&self, key: &str, error: StorageError) -> StorageError {
+        match error {
+            StorageError::Missing { .. } => StorageError::BackupLacks {
+                tenant: self.tenant.clone(),
+                backup: self.backup,
+                file: key.to_string(),
+            },
+            error => error,
+        }
+    }
+
+    /// The refusal of anything but a read of `key`.
+    fn only_read(&self, key: &str) -> StorageError {
+        StorageError::Blob {
+            key: key.to_string(),
+            source: format!("backup {} is only read from", self.backup).into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Blobs for Source {
+    async fn put(&self, key: &str, _bytes: Bytes) -> Result<()> {
+        Err(self.only_read(key))
+    }
+
+    async fn get(&self, key: &str) -> Result<Bytes> {
+        let kept = self.kept(key)?;
+        self.store
+            .get(kept)
+            .await
+            .map_err(|error| self.said(key, error))
+    }
+
+    /// Refused: what a backup holds is what its record lists, and what
+    /// lies beside its files in the store may be another backup's.
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        Err(self.only_read(prefix))
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        Err(self.only_read(key))
+    }
+
+    /// As the backup store gives the file, so that one larger than memory
+    /// can be restored.
+    fn parts<'a>(&'a self, key: &'a str) -> BoxStream<'a, Result<Bytes>> {
+        match self.kept(key) {
+            Ok(kept) => self
+                .store
+                .parts(kept)
+                .map_err(move |error| self.said(key, error))
+                .boxed(),
+            Err(unlisted) => stream::once(async { Err(unlisted) }).boxed(),
+        }
     }
 }
 

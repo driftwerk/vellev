@@ -6,6 +6,7 @@ use common::*;
 use vellev_storage::backups::{Backup, Backups, Held, Owner, DELETED_AT_ONCE, RECORD_VERSION};
 use vellev_storage::blobs::unanswered;
 use vellev_storage::coordinator::{ClusterId, Lineage};
+use vellev_storage::{Merging, Transfers};
 
 /// The right to delete backup files, held or not, as a claim would say.
 struct Claimed(bool);
@@ -973,6 +974,11 @@ async fn a_backup_listing_a_file_outside_its_partition_is_not_restored() {
         .await
         .unwrap_err();
     assert!(matches!(refused, StorageError::Corrupt { .. }), "{refused}");
+    let refused = backups.source(&backup).unwrap_err();
+    assert!(
+        matches!(&refused, StorageError::Corrupt { key, .. } if key == "beta/0/segment/stray.segment"),
+        "{refused}"
+    );
 }
 
 /// A store that loses the first file written to it, as if a prune had
@@ -1561,4 +1567,359 @@ async fn a_backup_says_when_it_was_taken_by_its_clock_to_the_microsecond() {
     assert_eq!(backup.taken_at.timestamp_subsec_nanos(), 123_456_000);
     let own = owner(&cluster).await;
     assert_eq!(backups.list(&own).await.unwrap(), [backup]);
+}
+
+/// Object storage that notes everything asked of it, by what was asked
+/// and of which key, and reads nothing once told to go unanswered.
+#[derive(Debug)]
+struct Asked {
+    inner: Arc<dyn Blobs>,
+    asked: std::sync::Mutex<Vec<(&'static str, String)>>,
+    unanswering: AtomicBool,
+}
+
+impl Asked {
+    /// A store that hands a file on a thousand bytes at a time.
+    fn of_small_parts() -> Arc<Self> {
+        let parts = Transfers {
+            part_bytes: 1_000,
+            ..Transfers::default()
+        };
+        Arc::new(Self {
+            inner: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(parts)),
+            asked: std::sync::Mutex::default(),
+            unanswering: AtomicBool::new(false),
+        })
+    }
+
+    /// What was asked since last asked.
+    fn asked(&self) -> Vec<(&'static str, String)> {
+        std::mem::take(&mut self.asked.lock().unwrap())
+    }
+
+    fn note(&self, asked: &'static str, key: &str) {
+        self.asked.lock().unwrap().push((asked, key.to_string()));
+    }
+}
+
+#[async_trait]
+impl Blobs for Asked {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.note("put", key);
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.note("get", key);
+        if self.unanswering.load(Ordering::SeqCst) {
+            return Err(unanswered(key, Duration::from_secs(1)));
+        }
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.note("list", prefix);
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.note("delete", key);
+        self.inner.delete(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        use futures::StreamExt;
+        self.note("parts", key);
+        if self.unanswering.load(Ordering::SeqCst) {
+            let unanswered = unanswered(key, Duration::from_secs(1));
+            return futures::stream::once(async { Err(unanswered) }).boxed();
+        }
+        self.inner.parts(key)
+    }
+}
+
+/// The parts `store` hands the file under `key` on in, or why not.
+async fn parts_of(store: &dyn Blobs, key: &str) -> vellev_storage::Result<Vec<Bytes>> {
+    use futures::TryStreamExt;
+    store.parts(key).try_collect().await
+}
+
+/// The first file `backup` lists of `kind`.
+fn file_of<'a>(backup: &'a Backup, kind: &str) -> &'a String {
+    let of_kind = |key: &&String| key.contains(&format!("/{kind}/"));
+    let found = backup.files().find(of_kind);
+    found.unwrap_or_else(|| panic!("the backup lists no {kind}"))
+}
+
+/// A tenant whose backup lists a file of every kind there is: a segment
+/// large enough to have an index, its vectors, the checkpoint, and a log
+/// committed since.
+async fn written_of_every_kind(cluster: &Cluster) -> Writer {
+    let writer = cluster.writer().await.merging_with(Merging {
+        clustered_above: 4_000,
+        ..Merging::default()
+    });
+    writer.commit(vec![create("notes")]).await.unwrap();
+    let rows: Vec<u32> = (0..4_100).collect();
+    for batch in rows.chunks(250) {
+        let row = |n: &u32| {
+            let angle = (n % 8) as f32 * std::f32::consts::FRAC_PI_4 + (n % 97) as f32 * 1e-3;
+            Mutation::Upsert {
+                collection: name("notes"),
+                id: ObjectId(uuid::Uuid::from_u128(u128::from(*n))),
+                properties: json!({ "n": n }).as_object().unwrap().clone(),
+                vector: Some(vec![angle.cos(), angle.sin()]),
+                only_if_version: None,
+            }
+        };
+        writer
+            .commit(batch.iter().map(row).collect())
+            .await
+            .unwrap();
+    }
+    writer.flush().await.unwrap();
+    writer.commit(vec![upsert("notes", 1, 10)]).await.unwrap();
+    writer
+}
+
+const KINDS: [&str; 5] = ["segment", "vectors", "index", "manifest", "log"];
+
+#[tokio::test]
+async fn a_backups_source_reads_every_file_the_backup_lists_by_the_key_it_had() {
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    written_of_every_kind(&cluster).await;
+    let backup = take(&backups, &cluster).await;
+    let head = backup.partitions[0].head.as_ref().unwrap();
+    assert!(
+        backup.files().any(|key| key == head),
+        "the head is among them"
+    );
+    let source = backups.source(&backup).unwrap();
+    store.asked();
+    for kind in KINDS {
+        let key = file_of(&backup, kind);
+        let written = cluster.blobs.get(key).await.unwrap();
+        assert_eq!(source.get(key).await.unwrap(), written, "{key}");
+        let parts = parts_of(&source, key).await.unwrap();
+        assert_eq!(parts.concat(), written, "{key} in parts");
+    }
+    for key in backup.files() {
+        let written = cluster.blobs.get(key).await.unwrap();
+        assert_eq!(source.get(key).await.unwrap(), written, "{key}");
+    }
+
+    // Each was read from where the cluster that took the backup keeps it,
+    // of the tenant of the backup's lineage, and nothing else was asked.
+    let asked = store.asked();
+    assert_eq!(asked.len(), 2 * KINDS.len() + backup.files().count());
+    let kept = files(&owner(&cluster).await);
+    for (asked, key) in asked {
+        assert!(matches!(asked, "get" | "parts"), "{asked} {key}");
+        let had = key.strip_prefix(&kept);
+        let had = had.unwrap_or_else(|| panic!("{key} was read, outside {kept}"));
+        assert!(backup.files().any(|listed| listed == had), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn a_backups_source_hands_a_file_on_a_part_at_a_time_and_never_reads_it_whole() {
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    written_of_every_kind(&cluster).await;
+    let backup = take(&backups, &cluster).await;
+    let source = backups.source(&backup).unwrap();
+    let kept = files(&owner(&cluster).await);
+    for kind in ["segment", "vectors", "index"] {
+        let key = file_of(&backup, kind);
+        store.asked();
+        let parts = parts_of(&source, key).await.unwrap();
+        assert!(parts.len() > 1, "{key} came as {} part", parts.len());
+        assert!(parts.iter().all(|part| part.len() <= 1_000), "{key}");
+        assert_eq!(
+            store.asked(),
+            [("parts", format!("{kept}{key}"))],
+            "the store was asked for it in parts, and never for the whole of it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nothing_is_written_deleted_or_listed_through_a_backups_source() {
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    written(&cluster).await;
+    let backup = take(&backups, &cluster).await;
+    let source = backups.source(&backup).unwrap();
+    let dyn_store: Arc<dyn Blobs> = store.clone();
+    let before = keys(&dyn_store, "").await;
+    store.asked();
+
+    let listed = file_of(&backup, "segment");
+    let kept = format!("{}{listed}", files(&owner(&cluster).await));
+    let prefix = Layout(&cluster.key).prefix();
+    let refused = |refused: StorageError, of: &str| match refused {
+        StorageError::Blob { key, source } => {
+            assert_eq!(key, of);
+            assert!(source.to_string().contains("only read from"), "{source}");
+        }
+        other => panic!("{of}: {other}"),
+    };
+    for key in [
+        listed.as_str(),
+        kept.as_str(),
+        "tenant-a/0/segment/new.segment",
+    ] {
+        refused(source.put(key, Bytes::from("x")).await.unwrap_err(), key);
+        refused(source.delete(key).await.unwrap_err(), key);
+    }
+    for prefix in [prefix.as_str(), "", "_backups/"] {
+        refused(source.list(prefix).await.unwrap_err(), prefix);
+        let within = source.list_within(prefix, Duration::from_secs(1)).await;
+        refused(within.unwrap_err(), prefix);
+    }
+    assert_eq!(store.asked(), [], "nothing was asked of the store");
+    assert_eq!(keys(&dyn_store, "").await, before);
+    store.asked();
+
+    // Nor does it keep a copy of anything on local disk, or fetch one.
+    assert!(source.local(listed).await.unwrap().is_none());
+    assert!(source.fetch_local(listed).await.unwrap().is_none());
+    source.forget_local(&prefix).await.unwrap();
+    assert_eq!(store.asked(), []);
+}
+
+#[tokio::test]
+async fn a_file_a_backup_lists_and_the_store_lost_is_said_of_the_backup_however_it_is_read() {
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    written(&cluster).await;
+    let backup = take(&backups, &cluster).await;
+    let source = backups.source(&backup).unwrap();
+    let (lost, there) = (file_of(&backup, "segment"), file_of(&backup, "manifest"));
+    let kept = format!("{}{lost}", files(&owner(&cluster).await));
+    store.delete(&kept).await.unwrap();
+
+    let lacks = |error: StorageError| match error {
+        StorageError::BackupLacks {
+            tenant,
+            backup: id,
+            file,
+        } => {
+            assert_eq!((tenant, id), (cluster.key.tenant.clone(), backup.id));
+            assert_eq!(&file, lost, "by the key it had, not where it was kept");
+        }
+        other => panic!("{other}"),
+    };
+    lacks(source.get(lost).await.unwrap_err());
+    lacks(parts_of(&source, lost).await.unwrap_err());
+    assert!(source.get(there).await.is_ok());
+    assert!(parts_of(&source, there).await.is_ok());
+
+    // A store that does not answer has not lost the file: the backup is
+    // not said to lack it.
+    store.unanswering.store(true, Ordering::SeqCst);
+    for key in [lost, there] {
+        for failed in [
+            source.get(key).await.unwrap_err(),
+            parts_of(&source, key).await.unwrap_err(),
+        ] {
+            assert!(matches!(failed, StorageError::Blob { .. }), "{failed}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_backups_source_reads_no_file_the_backup_does_not_list() {
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    let writer = written(&cluster).await;
+    let first = take(&backups, &cluster).await;
+    writer.flush().await.unwrap();
+    let second = take(&backups, &cluster).await;
+    // A file the cluster keeps for its second backup, beside those of the
+    // first, in the one place it keeps both.
+    let later = second
+        .files()
+        .find(|key| !first.files().any(|had| had == *key));
+    let later = later.expect("the second backup lists a file the first does not");
+    let kept = format!("{}{later}", files(&owner(&cluster).await));
+    let dyn_store: Arc<dyn Blobs> = store.clone();
+    assert!(keys(&dyn_store, "").await.contains(&kept));
+
+    let source = backups.source(&first).unwrap();
+    store.asked();
+    let unlisted = |error: StorageError, of: &str| match error {
+        StorageError::Corrupt { key, reason } => {
+            assert_eq!(key, of);
+            assert_eq!(reason, format!("backup {} does not list it", first.id));
+        }
+        other => panic!("{of}: {other}"),
+    };
+    for key in [later.as_str(), kept.as_str(), "", "../x"] {
+        unlisted(source.get(key).await.unwrap_err(), key);
+        unlisted(parts_of(&source, key).await.unwrap_err(), key);
+    }
+    assert_eq!(store.asked(), [], "nothing was asked of the store");
+    let written = cluster.blobs.get(later).await.unwrap();
+    let second = backups.source(&second).unwrap();
+    assert_eq!(second.get(later).await.unwrap(), written);
+}
+
+#[tokio::test]
+async fn a_backups_source_reads_only_what_the_cluster_that_took_the_backup_keeps() {
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    written(&cluster).await;
+    // Two clusters' backups of the one tenant: each lists the same files
+    // by the same keys, and keeps its own copy of each.
+    let live = owner(&cluster).await;
+    let taken_live = take(&backups, &cluster).await;
+    let drill = elsewhere(&live);
+    let copied = backups.copy(
+        &cluster.blobs,
+        cluster.coordinator.as_ref(),
+        &drill,
+        std::slice::from_ref(&cluster.key),
+        &Claimed(true),
+    );
+    let copied = copied.await.unwrap().unwrap();
+    let taken_drill = backups.complete(copied, &Claimed(true)).await.unwrap();
+    let listed: Vec<&String> = taken_live.files().collect();
+    assert_eq!(taken_drill.files().collect::<Vec<_>>(), listed);
+
+    let (of_live, of_drill) = (
+        backups.source(&taken_live).unwrap(),
+        backups.source(&taken_drill).unwrap(),
+    );
+    store.asked();
+    for (source, by) in [(&of_live, &live), (&of_drill, &drill)] {
+        for key in &listed {
+            source.get(key).await.unwrap();
+            parts_of(source, key).await.unwrap();
+        }
+        let asked = store.asked();
+        assert_eq!(asked.len(), 2 * listed.len());
+        for (_, key) in asked {
+            assert!(key.starts_with(&files(by)), "{key} was read");
+        }
+    }
+
+    // So what one cluster's copy lost, only its own backup lacks.
+    let lost = file_of(&taken_live, "segment");
+    store
+        .delete(&format!("{}{lost}", files(&drill)))
+        .await
+        .unwrap();
+    assert!(of_live.get(lost).await.is_ok());
+    let lacking = of_drill.get(lost).await.unwrap_err();
+    assert!(
+        matches!(&lacking, StorageError::BackupLacks { backup, .. } if *backup == taken_drill.id),
+        "{lacking}"
+    );
 }
