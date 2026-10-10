@@ -2479,12 +2479,13 @@ async fn a_node_looking_after_a_tenant_keeps_its_files_for_the_grace_it_is_set_t
     let minutes = |n: u64| Duration::from_secs(n * 60);
     // The tenant is flushed at every write, and looked after once each
     // flush is made; nothing may be restored, so the grace is all its
-    // files are kept for. Not the coordinator's clock, by which the lease
-    // runs out.
+    // files are kept for: thirty minutes, twice the least a node takes
+    // (`LEAST_GRACE`), so that files kept for that least instead are gone
+    // too soon. Not the coordinator's clock, by which the lease runs out.
     let clock = Arc::new(ManualClock::starting_at(Utc::now()));
     let node = cluster.node_from(Settings {
         flush_rows: 1,
-        grace: minutes(15),
+        grace: minutes(30),
         clock: clock.clone(),
         ..cluster.settings()
     });
@@ -2520,20 +2521,20 @@ async fn a_node_looking_after_a_tenant_keeps_its_files_for_the_grace_it_is_set_t
     let first = heads().await;
     assert!(first.len() >= 4, "{first:?}");
 
-    clock.advance(minutes(10));
+    clock.advance(minutes(20));
     looked_after(2).await;
     let kept = heads().await;
     assert!(
         first.iter().all(|key| kept.contains(key)),
-        "ten minutes old, and kept fifteen: {first:?} of {kept:?}"
+        "twenty minutes old, and kept thirty: {first:?} of {kept:?}"
     );
 
-    clock.advance(minutes(10));
+    clock.advance(minutes(20));
     looked_after(4).await;
     let kept = heads().await;
     assert!(
         !first.iter().any(|key| kept.contains(key)),
-        "twenty minutes old, and nothing reaches them: {first:?} of {kept:?}"
+        "forty minutes old, and nothing reaches them: {first:?} of {kept:?}"
     );
     assert_eq!(acme.read(count), 6);
 }

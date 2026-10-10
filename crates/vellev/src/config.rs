@@ -175,15 +175,22 @@ pub struct Config {
     /// minutes, and at least three times what one request to object
     /// storage may take with its tries, or the node does not start. It is
     /// all that keeps a file a restore within the window names from being
-    /// deleted, where a file is written a little before it is committed, a
-    /// restore waits behind a clean-up, and the clocks of the node, the
-    /// store and Postgres differ. The least covers a node set up near its
-    /// defaults and no more: raise this with `VELLEV_LEASE_SECS` and
-    /// `VELLEV_DATABASE_TIMEOUT_SECS`, to more than one request to the
-    /// store and three times the lesser of a quarter of the lease and the
-    /// database timeout, with room to spare. Nor does it cover one write
-    /// larger than a part (`VELLEV_UPLOAD_PART_MIB`), a clock wrong by more
-    /// than it, or a flush or merge that takes longer than it.
+    /// deleted, where a file is written a little before it is committed
+    /// (its upload, its copy to local disk and three tries to commit), a
+    /// restore waits up to a minute for a clean-up to settle what it
+    /// deletes, and the clocks of the node, the store and Postgres differ.
+    /// The least covers a node set up near its defaults and no more: raise
+    /// this with `VELLEV_LEASE_SECS` and `VELLEV_DATABASE_TIMEOUT_SECS`,
+    /// and with both, as one alone may change nothing, to more than one
+    /// request to the store plus three times the lesser of a quarter of
+    /// the lease and the database timeout, plus some twenty seconds for
+    /// the file's copy to local disk, with room to spare. Nor does it
+    /// cover a head file of more than one part (`VELLEV_UPLOAD_PART_MIB`),
+    /// a reader still fetching a segment of several parts under a short
+    /// restore window of the tenant's own, a clock wrong by more than it,
+    /// or a flush or merge that takes longer than it. Cleaning up by the
+    /// commits Postgres still holds instead of by time is DW-681, with
+    /// DW-668.
     #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 60 * 60, value_parser = clap::value_parser!(u64).range(vellev_node::LEAST_GRACE.as_secs()..))]
     pub grace_secs: u64,
     /// How long a tenant this node writes for may go unused before it is

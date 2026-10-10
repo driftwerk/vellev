@@ -1614,9 +1614,17 @@ impl Writer {
     /// by, may delete files such a restore needs, and that is the caller's
     /// breach. The first of those is as long as a publish may take: the
     /// head file's upload, one request to the store for a file of one part
-    /// and as many as its parts and three more for a larger one, and three
+    /// and as many as its parts and three more for a larger one, plus its
+    /// copy to local disk, which is made once the store has it, plus three
     /// tries to commit, each a quarter of the lease or as long as the
-    /// coordinator is given if that is less. A node refuses a margin under
+    /// coordinator is given if that is less, and the waits between them.
+    /// The second is the minute a call of this is given to find what to
+    /// delete, in which it reads the clock: it may hold the building lock
+    /// for longer, but deletes only what it found then. A reader of a
+    /// committed position has that window and the margin to fetch its
+    /// files in, each given two requests a part
+    /// ([`Transfers::read_within`]), which a file of several parts may
+    /// outlast where the window is short. A node refuses a margin under
     /// a quarter of an hour, or under three requests to the store, which
     /// covers a head file of one part under a lease and a coordinator's
     /// bound near their defaults and no more; nor does any margin cover a
