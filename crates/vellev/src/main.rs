@@ -191,6 +191,11 @@ struct ImportWeaviate {
     /// enough; under its limit on a request's body.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     batch_bytes: usize,
+    /// The most changes to send the node in one request; no more than it
+    /// commits together with other writers' requests, which it is unless
+    /// given.
+    #[arg(long)]
+    batch_changes: Option<usize>,
     /// The most objects to ask of Weaviate a second.
     #[arg(long)]
     per_second: Option<f64>,
@@ -211,9 +216,10 @@ struct ImportWeaviate {
     /// Weaviate emptied, restored or mistaken for another looks the same.
     #[arg(long, default_value_t = 1_000)]
     max_deletes: u64,
-    /// The most of a class a run may delete, as a part of what was
-    /// imported of it, between 0 and 1; the fewer of this and
-    /// --max-deletes holds.
+    /// The most of a class a run may delete, as a part, between 0 and 1,
+    /// of what was imported of it or of what the collection holds,
+    /// whichever is less; the fewer of this and --max-deletes holds, and
+    /// the last object a collection holds is deleted only if this is 1.
     #[arg(long, default_value_t = 0.05)]
     max_delete_fraction: f64,
     /// How many seconds after Weaviate first says it holds no such object
@@ -241,7 +247,7 @@ struct ImportWeaviate {
     /// up, its objects are among them and are deleted. Within what a run
     /// may delete, and only once Weaviate has twice said it does not hold
     /// each. Nothing stored since the taking up is ever deleted by this.
-    #[arg(long, requires = "sole_writer")]
+    #[arg(long, requires = "sole_writer", conflicts_with = "other_writers")]
     delete_unknown: bool,
     /// Say that something else has written to the collections found
     /// without a ledger: what was withheld from them, and what they held
@@ -394,6 +400,7 @@ async fn main() -> Result<ExitCode> {
                 updated_as,
                 page,
                 batch_bytes,
+                batch_changes,
                 per_second,
                 skew_secs,
                 state,
@@ -462,6 +469,10 @@ async fn main() -> Result<ExitCode> {
                 skip_refused,
                 mode,
                 ..vellev::import::Options::new(state)
+            };
+            let options = vellev::import::Options {
+                batch_changes: batch_changes.unwrap_or(options.batch_changes),
+                ..options
             };
             let report =
                 vellev::import::weaviate(&source, &client.tenant(&tenant), &options).await?;
@@ -573,5 +584,42 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    fn import(more: &[&str]) -> Result<Cli, clap::Error> {
+        let always = "vellev import weaviate --from http://weaviate --key k --tenant acme";
+        Cli::try_parse_from(always.split(' ').chain(more.iter().copied()))
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn what_is_unknown_is_deleted_only_on_the_word_of_a_sole_writer() {
+        assert!(import(&[]).is_ok());
+        assert!(import(&["--sole-writer"]).is_ok());
+        assert!(import(&["--sole-writer", "--delete-unknown"]).is_ok());
+        assert!(import(&["--other-writers"]).is_ok());
+        assert!(import(&["--delete-unknown"]).is_err());
+        // Something else having written, nothing is deleted for being
+        // unknown, in whichever order it is said.
+        for said in [
+            ["--other-writers", "--delete-unknown"],
+            ["--delete-unknown", "--other-writers"],
+            ["--sole-writer", "--other-writers"],
+        ] {
+            assert!(import(&said).is_err(), "{said:?}");
+        }
+        let all = ["--sole-writer", "--delete-unknown", "--other-writers"];
+        assert!(import(&all).is_err());
     }
 }

@@ -327,8 +327,9 @@ and say what the caller then answers for.
   withheld, and `--delete-unknown` beside it, which deletes what was
   noted, within the usual bound, if it is still as it was noted. If
   something else has written to the collection, `--other-writers`
-  leaves all of it alone for good. Otherwise import into a collection
-  made anew.
+  leaves all of it alone for good, in one run, and no later run copies
+  over it, deletes it or stores it again, whatever that run is told.
+  Otherwise import into a collection made anew.
 - **`vellev import finalise`** ends an import: it drops the ledgers and
   notes that the collections are no longer imported.
 - **The exit status says what is left**: 0 when everything that is the
@@ -339,11 +340,12 @@ and say what the caller then answers for.
 - **The report is exact, and the same every run.** An object deleted
   from Weaviate between being listed and being fetched is deleted in the
   same run. `changed` no longer counts objects stored again unchanged.
-  New fields: `kept`, `withheld`, `unknown`, `left`, `pending`,
-  `budget`, `refused`, `too_large`, `imported`, `verified`, and `ended`
-  beside the classes. An object gone from Weaviate that stays in the
-  collection as another writer's keeps its ledger entry, and is counted
-  as `left` on every run.
+  New fields: `kept`, `withheld`, `unknown`, `barred`, `left`,
+  `pending`, `budget`, `refused`, `too_large`, `imported`, `verified`,
+  and `ended` beside the classes. An object gone from Weaviate that
+  stays in the collection as another writer's keeps its ledger entry,
+  and is counted as `left` on every run, until the collection no longer
+  holds it.
 - **`--verify` and `--verify-all`** compare what a collection holds with
   what Weaviate does, object by object, and change nothing. They fail
   on what a run that imports fails on, and `--verify-all` counts what
@@ -365,7 +367,9 @@ and say what the caller then answers for.
   time. A rate that is not a number is refused.
 - `--page` is the node's limit on results unless given, where it was
   100. `--batch-bytes` is the most bytes sent to the node in one
-  request, 8 MiB unless given.
+  request, 8 MiB unless given, and `--batch-changes` the most changes,
+  8,192 unless given: what a node commits together with other writers'
+  requests.
 - Two runs with the same state file: the second is refused.
 
 ### vellev-client

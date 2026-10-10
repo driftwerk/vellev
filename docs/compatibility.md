@@ -411,8 +411,9 @@ release before stopped.
 - A collection imported before there was a ledger is taken up, not
   caught up as it was: what it lacks or holds otherwise is withheld, not
   copied, what it holds that Weaviate does not is noted and not
-  deleted, and the run fails until one is told whose they are. See the
-  README.
+  deleted, and the run fails until one is told whose they are. What a
+  run is told is another writer's stays so in the ledger for as long as
+  the import does. See the README.
 - The report may gain fields. Its exit status is 0 when everything that
   is the import's is settled, 3 when another run is all it takes, and 1
   otherwise; before, it was 1 whenever the counts differed.

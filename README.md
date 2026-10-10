@@ -65,13 +65,16 @@ rule is:
   changed or replaced in vellev since the import stored it, one deleted
   there, one written under Weaviate's id by something else. The ledger
   keeps the entry of an object it leaves for as long as the collection
-  holds it, so the same is said of it on every run. An object under an
+  holds it, so the same is said of it on every run, and forgets it once
+  neither Weaviate nor the collection holds the object. An object under an
   id Weaviate never had is never looked at, with one exception, below,
   for a collection taken up without a ledger. So a writer that has
   moved to vellev, or one that mirrors Weaviate into vellev under
   Weaviate's ids, is not undone by a later run. An object a mirror
-  stores exactly as the import would is the import's too: it goes when
-  Weaviate's does.
+  stores exactly as the import would is the import's too, from the run
+  that reads the two and finds them the same: it then goes when
+  Weaviate's does. One the ledger still marks as another writer's when
+  Weaviate deletes it is left, whatever it holds.
 
 In short: the import deletes or writes over nothing in vellev it cannot
 show it put there, but for one narrow act an operator asks for in so
@@ -158,10 +161,23 @@ object again gives it a new time of creation. So, by default:
   object is noted in the ledger as `unknown`, with a hash of it as it
   was then, and counted under that name on every run; the run fails
   until somebody says whose they are. This noting is the one time the
-  import looks at an object under an id Weaviate never had. No later
-  run notes any, not even a taking up begun again because the ledger
-  was lost: what the collection holds by then may have been written
-  since.
+  import looks at an object under an id Weaviate never had. It lasts as
+  long as that taking up does, across runs if the taking up is stopped
+  and begun again, so the answer `--sole-writer --delete-unknown` asks
+  for covers all that time. No later run notes any, not even a taking
+  up begun again because the ledger was lost: what the collection holds
+  by then may have been written since. Two imports of a tenant must not
+  run at once; one that finds an object already noted by another while
+  it notes them stops, saying so, and deletes nothing.
+
+The import keeps one more collection in the tenant, `vellev_imports`,
+which says of each class where it was imported from and how. If that
+alone is lost and the ledger is still there, the next run takes the
+collection up again beside the ledger: every entry stands as it is,
+nothing is noted as unknown, and an object of Weaviate's without an
+entry is withheld as above. The run records the Weaviate it is given as
+the one imported, having nothing to hold it against, so give it the
+right one.
 
 The taking up over, an object Weaviate lists without an entry is new to
 Weaviate, and is stored. Two things settle what was withheld or is
@@ -185,9 +201,16 @@ unknown, and the run fails until one of them is said:
   or settled, nothing is owed, and the two flags do nothing more.
 - **`--other-writers`** says something else has written to the
   collection: what was withheld, and what is unknown, is marked as
-  another writer's and left alone for good. A later run with the other
-  flags copies nothing over it and deletes none of it. The two cannot
-  both be said.
+  another writer's and left alone for good, all of it in that one run,
+  whatever Weaviate has deleted of it since and however much. The
+  ledger then keeps no hash of any of it, so nothing a later run reads
+  can make it the import's again: no run, whatever it is told, copies
+  over it, deletes it, or stores it again if the other writer deletes
+  it, not even when Weaviate comes to hold another object under the id.
+  These entries stay for as long as the import does. It cannot be said
+  with `--sole-writer` or `--delete-unknown`, and there is no taking it
+  back but ending the import and importing into a collection made
+  anew.
 
 ### Ending an import
 
@@ -218,7 +241,12 @@ Per class:
 - `left`: objects gone from Weaviate that stay in the collection because
   they were not as the import had stored them: another writer's, and no
   fault of the import's. Their entries are kept, so the same on every
-  run, and Weaviate is not asked about them again.
+  run, and Weaviate is not asked about them again. Once the other
+  writer removes one from the collection, its entry is forgotten and it
+  is counted no more.
+- `barred`: ids said, with `--other-writers`, to be another writer's,
+  which neither Weaviate nor the collection holds now. Their entries
+  are kept so that nothing is stored under them again.
 - `pending` and `budget`: see above.
 - `refused`: objects vellev cannot hold, by id, with why. One stops the
   run unless `--skip-refused` is given.
@@ -258,7 +286,9 @@ listing the ledger once. It reports, under `verified`, how many it
 `different` or `missing`, with some of their ids, and how many are
 `kept` by another writer, `withheld`, `unaccounted` for, or `gone` from
 Weaviate while the collection still holds them. It counts `withheld`,
-`unknown` and `left` over the whole ledger as a run that imports does,
+`unknown`, `left` and `barred` over the whole ledger as a run that
+imports does, asking the collection which of those objects it still
+holds,
 and fails on the same terms: on anything withheld, unknown, different,
 missing or gone, and on looking at nothing of a class that holds
 objects. `--verify-all` also counts, as `extra`, the objects the
@@ -288,6 +318,15 @@ told to be `--strict`. `--verify` of some pages cannot see them.
   object at a time where little did. With the default `--skew-secs` of
   300 it also fetches again whatever changed in the five minutes before
   the last catch-up began, and stores none of it that is unchanged.
+- Each run asks the collection whether it still holds every object the
+  ledger says was left or is unknown: one at a time where a page of the
+  ledger has few, and by listing the ids between them where it has
+  many. A collection with a great many of another writer's objects that
+  Weaviate deleted pays for that on every run.
+- A request to the node carries at most `--batch-bytes` (8 MiB) and at
+  most `--batch-changes` changes (8,192, what a node commits together
+  with other writers' requests), an object and its entry always in the
+  same one.
 - A request Weaviate fails or turns away is asked again for
   `--patience-secs` (600) before the run stops.
 
