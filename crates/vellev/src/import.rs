@@ -575,6 +575,14 @@ impl Entry {
         }
     }
 
+    /// Whether the entry is of an object Weaviate lists, last changed
+    /// at `updated`: then it says all there is to say until Weaviate
+    /// changes the object. An entry of an object Weaviate did not hold,
+    /// or was found not to, is of another object once it lists the id.
+    fn listed(&self, updated: Option<i64>) -> bool {
+        (self.updated, self.gone) == (updated, false) && self.mark != Mark::Unknown
+    }
+
     /// The entry as the ledger holds it. One the node gives no version
     /// for is not read: nothing could then tell that it had been written
     /// by another run since.
@@ -644,35 +652,70 @@ fn later(version: Option<&Value>, what: &str) -> Result<()> {
     }
 }
 
+impl Options {
+    /// Refuse what no run can be told, before anything is asked of
+    /// Weaviate or the node.
+    fn check(&self) -> Result<()> {
+        if self.page == 0 {
+            bail!("a page holds at least one object");
+        }
+        if self.batch_bytes == 0 || self.batch_changes == 0 {
+            bail!("a request holds at least one byte, and one change");
+        }
+        if self
+            .per_second
+            .is_some_and(|rate| !(rate.is_finite() && rate > 0.0))
+        {
+            bail!("the rate of copying must be a number more than nothing");
+        }
+        if self.other_writers && self.sole_writer {
+            bail!("either nothing else wrote to the collections, or something did");
+        }
+        if self.delete_unknown && !self.sole_writer {
+            bail!(
+                "what a collection held that Weaviate did not is deleted only once nothing but an import is said to have written to it"
+            );
+        }
+        if let Deletes::UpTo { fraction, .. } = self.deletes {
+            if !(0.0..=1.0).contains(&fraction) {
+                bail!("the part of a class a run may delete is between nothing and all of it");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How a run goes about a collection that is already there, by the note
+/// of where it was imported from, if there is one, whether it has a
+/// ledger, and whether that ledger was `emptied`: has no entry, though
+/// the collection holds objects and the note says no taking up is under
+/// way. Answers with whether the collection is being taken up, whether
+/// what it holds that Weaviate does not is noted meanwhile, and whether
+/// its copying begins from the start.
+///
+/// What a collection holds that Weaviate does not is noted only on the
+/// first taking up of one nothing has ever kept a ledger of, and on that
+/// taking up gone on with after a stop. A ledger or a note found without
+/// the other, or a ledger found emptied, says the collection was
+/// imported before: what it holds by now may have been written since,
+/// and nothing of it is noted, nor is anything it lacks stored for
+/// having no entry.
+fn taking_up(bound: Option<&Binding>, ledgered: bool, emptied: bool) -> (bool, bool, bool) {
+    match bound {
+        Some(bound) => {
+            let begins = !ledgered || emptied;
+            let census = bound.census && bound.adopting && !begins;
+            (bound.adopting || begins, census, begins)
+        }
+        None => (true, !ledgered, true),
+    }
+}
+
 /// Copy the classes `options` names from `source` into `tenant`, and
 /// catch up with what changed in Weaviate meanwhile; or, asked only to
 /// verify, compare the two.
 pub async fn weaviate(source: &Source, tenant: &Tenant, options: &Options) -> Result<Report> {
-    if options.page == 0 {
-        bail!("a page holds at least one object");
-    }
-    if options.batch_bytes == 0 || options.batch_changes == 0 {
-        bail!("a request holds at least one byte, and one change");
-    }
-    if options
-        .per_second
-        .is_some_and(|rate| !(rate.is_finite() && rate > 0.0))
-    {
-        bail!("the rate of copying must be a number more than nothing");
-    }
-    if options.other_writers && options.sole_writer {
-        bail!("either nothing else wrote to the collections, or something did");
-    }
-    if options.delete_unknown && !options.sole_writer {
-        bail!(
-            "what a collection held that Weaviate did not is deleted only once nothing but an import is said to have written to it"
-        );
-    }
-    if let Deletes::UpTo { fraction, .. } = options.deletes {
-        if !(0.0..=1.0).contains(&fraction) {
-            bail!("the part of a class a run may delete is between nothing and all of it");
-        }
-    }
+    options.check()?;
     let weaviate = Weaviate::new(source, options.patience)?;
     let classes = weaviate.classes(&options.classes).await?;
     let named = options.embeddings.keys().chain(options.vectors.keys());
@@ -925,32 +968,18 @@ async fn prepare(
             wanted
         }
         Some(mut stored) => {
-            match &bound {
-                Some(bound) => {
-                    bound.agrees(&binding, &name, options.accept_remade)?;
-                    // A collection with no ledger, or whose ledger began
-                    // after it did, is being taken up; one whose ledger
-                    // is gone is taken up from the start.
-                    binding.adopting = bound.adopting || ledgered.is_none();
-                    begins = ledgered.is_none();
-                    // The first taking up, stopped part way, goes on
-                    // noting what it finds; one begun because a ledger
-                    // was lost does not, since what the collection holds
-                    // by then may have been written since.
-                    binding.census = bound.census && bound.adopting && !begins;
-                }
-                None => {
-                    // Taken up from the start. What it holds that
-                    // Weaviate does not is noted only if nothing has
-                    // ever kept a ledger of it: with a ledger and no
-                    // note of where it came from, the note alone was
-                    // lost, and what the collection holds may have been
-                    // written since it was imported.
-                    binding.adopting = true;
-                    binding.census = ledgered.is_none();
-                    begins = true;
-                }
+            if let Some(bound) = &bound {
+                bound.agrees(&binding, &name, options.accept_remade)?;
             }
+            // A ledger with no entry beside a collection that holds
+            // objects, no taking up being under way, was emptied.
+            let walked = bound.as_ref().is_some_and(|bound| !bound.adopting);
+            let emptied = ledgered.is_some()
+                && walked
+                && tenant.collection(&ledger).count(None).await? == 0
+                && records.count(None).await? > 0;
+            (binding.adopting, binding.census, begins) =
+                taking_up(bound.as_ref(), ledgered.is_some(), emptied);
             let (gained, differing) = reconcile(&stored, &wanted)
                 .wrap_err_with(|| format!("class {} no longer fits its collection", class.class))?;
             warnings.extend(differing);
@@ -2018,7 +2047,7 @@ impl<'a> Copying<'a> {
                     && !past(stored.id)
                     && !known.contains_key(&stored.id)
                 {
-                    unknown.push(self.note(&self.unknown(&stored), None));
+                    unknown.push(self.census(&stored));
                 }
             }
             if unknown.len() >= self.options.page {
@@ -2057,6 +2086,13 @@ impl<'a> Copying<'a> {
         self.noted(notes)
             .await
             .wrap_err_with(|| format!("noting what collection {name} holds that Weaviate does not"))
+    }
+
+    /// Note an object the collection holds that Weaviate does not, only
+    /// where the ledger has no entry for it: one it has was written by
+    /// another run, and is not written over.
+    fn census(&self, stored: &Stored) -> Change {
+        self.note(&self.unknown(stored), None)
     }
 
     /// The entry of an object the collection holds that Weaviate does
@@ -2223,10 +2259,9 @@ impl<'a> Copying<'a> {
                 let mark = entry.as_ref().map(|entry| entry.mark);
                 // An entry of an object Weaviate did not hold, or was
                 // found not to, is of another object now.
-                let noted = entry.as_ref().is_some_and(|entry| {
-                    (entry.updated, entry.gone) == (seen.updated, false)
-                        && entry.mark != Mark::Unknown
-                });
+                let noted = entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.listed(seen.updated));
                 let owed = mark == Some(Mark::Withheld) && said;
                 if !noted || owed || seen.updated.unwrap_or(i64::MAX) >= since {
                     wanted.push((id, entry));
@@ -4246,6 +4281,149 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_collection_already_there_is_taken_up_by_what_is_left_of_its_import() {
+        let bound = |adopting: bool, census: bool| Binding {
+            adopting,
+            census,
+            ..Fixture::new(options()).plan.binding.clone()
+        };
+        // (taken up, noting what Weaviate does not hold, from the start)
+        // Never imported with a ledger: taken up, and what it holds that
+        // Weaviate does not noted.
+        assert_eq!(taking_up(None, false, false), (true, true, true));
+        // Its note alone lost: taken up again beside its ledger, and
+        // nothing noted, whatever the ledger holds.
+        assert_eq!(taking_up(None, true, false), (true, false, true));
+        assert_eq!(taking_up(None, true, true), (true, false, true));
+        // Imported, and both there: caught up.
+        let imported = bound(false, false);
+        assert_eq!(
+            taking_up(Some(&imported), true, false),
+            (false, false, false)
+        );
+        // Its ledger lost, or emptied: taken up from the start, and
+        // nothing noted.
+        assert_eq!(
+            taking_up(Some(&imported), false, false),
+            (true, false, true)
+        );
+        assert_eq!(taking_up(Some(&imported), true, true), (true, false, true));
+        // A first taking up stopped part way goes on, noting still.
+        let taking = bound(true, true);
+        assert_eq!(taking_up(Some(&taking), true, false), (true, true, false));
+        // Its ledger lost meanwhile, it begins again and notes nothing:
+        // what the collection holds by then may have been written since.
+        assert_eq!(taking_up(Some(&taking), false, false), (true, false, true));
+        // A later taking up, which noted nothing, goes on so.
+        let again = bound(true, false);
+        assert_eq!(taking_up(Some(&again), true, false), (true, false, false));
+        // A note that says to note what is found, of no taking up, says
+        // nothing.
+        let stray = bound(false, true);
+        assert_eq!(taking_up(Some(&stray), true, false), (false, false, false));
+    }
+
+    #[test]
+    fn a_run_is_refused_what_it_cannot_be_told() {
+        let told = |sole_writer: bool, delete_unknown: bool, other_writers: bool| {
+            let options = Options {
+                sole_writer,
+                delete_unknown,
+                other_writers,
+                ..options()
+            };
+            options.check().map_err(|refused| refused.to_string())
+        };
+        for said in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(told(said.0, said.1, said.2), Ok(()), "{said:?}");
+        }
+        let both = told(true, false, true).unwrap_err();
+        assert!(both.contains("either nothing else wrote"), "{both}");
+        for others in [false, true] {
+            let unasked = told(false, true, others).unwrap_err();
+            assert!(
+                unasked.contains("deleted only once nothing but an import"),
+                "{unasked}"
+            );
+        }
+        assert!(told(true, true, true).is_err());
+        let sized = |page: usize, batch_bytes: usize, batch_changes: usize| Options {
+            page,
+            batch_bytes,
+            batch_changes,
+            ..options()
+        };
+        assert!(sized(1, 1, 1).check().is_ok());
+        for none in [sized(0, 1, 1), sized(1, 0, 1), sized(1, 1, 0)] {
+            assert!(none.check().is_err());
+        }
+    }
+
+    #[test]
+    fn an_entry_says_all_there_is_to_say_only_of_an_object_weaviate_lists_unchanged() {
+        let fixture = Fixture::new(options());
+        for mark in [Mark::Stored, Mark::Foreign, Mark::Withheld, Mark::Theirs] {
+            let entry = fixture.entry("fox", 1, mark);
+            assert!(entry.listed(Some(1)), "{mark:?}");
+            assert!(!entry.listed(Some(2)), "{mark:?}");
+            assert!(!entry.listed(None), "{mark:?}");
+            let gone = Entry {
+                gone: true,
+                ..entry
+            };
+            assert!(!gone.listed(Some(1)), "{mark:?}");
+        }
+        // What was noted as held by the collection alone is of another
+        // object once Weaviate lists the id, whenever that changed.
+        let unknown = Entry {
+            updated: None,
+            ..fixture.entry("fox", 1, Mark::Unknown)
+        };
+        assert!(!unknown.listed(None));
+        assert!(!fixture.entry("fox", 1, Mark::Unknown).listed(Some(1)));
+    }
+
+    #[test]
+    fn what_a_collection_holds_alone_is_noted_only_where_the_ledger_has_no_entry() {
+        let fixture = Fixture::new(options());
+        let copying = fixture.copying();
+        let fox = fixture.stored("fox");
+        let Change::Insert {
+            collection,
+            id,
+            properties,
+            ..
+        } = copying.census(&fox)
+        else {
+            panic!("{:?}", copying.census(&fox));
+        };
+        assert_eq!((collection.as_str(), id), (ENTRY, fox.id));
+        assert_eq!(properties.get("unknown"), Some(&json!(true)));
+        assert_eq!(
+            properties.get("hash"),
+            Some(&json!(fixture.item("fox", 0).hash))
+        );
+    }
+
+    #[test]
+    fn what_the_ledger_accounts_for_leaves_out_every_entry_of_nothing_weaviate_holds() {
+        let copied = Copied {
+            withheld: 1,
+            unknown: 20,
+            left: 300,
+            barred: 4_000,
+            kept: 50_000,
+            ..Copied::default()
+        };
+        assert_eq!(copied.unvouched(), 4_321);
     }
 
     #[test]
