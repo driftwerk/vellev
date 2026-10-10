@@ -1546,12 +1546,15 @@ impl<'a> Copying<'a> {
         };
         let sole = unvouched && self.options.sole_writer;
         match (entry, stored) {
+            // What the collection holds exactly as Weaviate does is the
+            // import's, whatever the run is told: there is nothing of
+            // another writer's in it to keep.
+            (_, Some(_)) if held.as_deref() == Some(item.hash.as_str()) => {
+                (self.noting(item, entry, Mark::Stored), Settled::Same)
+            }
             _ if unvouched && self.options.other_writers => {
                 let theirs = Entry::of(item, Mark::Theirs).theirs(item.updated, false);
                 (self.renoting(theirs, entry), Settled::Foreign)
-            }
-            (_, Some(_)) if held.as_deref() == Some(item.hash.as_str()) => {
-                (self.noting(item, entry, Mark::Stored), Settled::Same)
             }
             (Some(_), Some(stored)) if ours => {
                 (self.replace(stored, item, true), Settled::Replaced)
@@ -3792,8 +3795,13 @@ mod tests {
     }
 
     const ENTRY: &str = "vellev_imported_Memory";
-    /// How many cells the table of everything a run can meet has.
-    const CELLS: usize = 4_580;
+    /// How many cells the table of everything a run can meet has: those
+    /// where what a run may do is checked, those among them where it
+    /// must do something, and those where the last guard on deleting is
+    /// asked by itself.
+    const SAFETY: usize = 7_780;
+    const LIVENESS: usize = 404;
+    const DIRECT: usize = 440;
 
     fn only(changes: &[&str]) -> Vec<String> {
         let changes = changes.iter();
@@ -4018,6 +4026,21 @@ mod tests {
             settling(Some(&withheld), Some(&fox), false),
             theirs("upsert ENTRY theirs")
         );
+        // What the collection holds exactly as Weaviate does is not
+        // another writer's for that being said: it is the import's, met
+        // while the collection is taken up or after.
+        let same = others.stored("hen");
+        assert_eq!(
+            settling(None, Some(&same), true),
+            (only(&["insert ENTRY"]), Settled::Same)
+        );
+        let unknown = others.entry("fox", 1, Mark::Unknown);
+        for entry in [&withheld, &unknown] {
+            assert_eq!(
+                settling(Some(entry), Some(&same), false),
+                (only(&["upsert ENTRY"]), Settled::Same)
+            );
+        }
         // What is new to Weaviate is still stored.
         assert_eq!(
             settling(None, None, false),
@@ -4383,29 +4406,35 @@ mod tests {
     ) {
         let plain = Fixture::new(options());
         let hash = |title: &str| plain.item(title, 0).hash;
+        // What Weaviate holds under the id, where it holds anything.
+        let hen = hash("hen");
         // Every entry there can be: of each mark, found or not to be gone
-        // from Weaviate; what was withheld, with and without what the
-        // collection was found to hold.
+        // from Weaviate, of what Weaviate holds now or of something it
+        // held before; what was withheld, with and without what the
+        // collection was found to hold; and what was said to be another
+        // writer's.
         let mut entries: Vec<Option<Entry>> = vec![None];
         for gone in [false, true] {
-            for mark in [Mark::Stored, Mark::Foreign, Mark::Withheld, Mark::Unknown] {
-                let entry = Entry {
-                    gone,
-                    ..plain.entry("fox", 1, mark)
-                };
-                entries.push(Some(entry.clone()));
-                if mark == Mark::Withheld {
-                    entries.push(Some(Entry {
-                        found: Some(hash("owl")),
-                        ..entry
-                    }));
+            for (title, updated) in [("fox", 1), ("hen", 2)] {
+                for mark in [Mark::Stored, Mark::Foreign, Mark::Withheld, Mark::Unknown] {
+                    let entry = Entry {
+                        gone,
+                        ..plain.entry(title, updated, mark)
+                    };
+                    entries.push(Some(entry.clone()));
+                    if mark == Mark::Withheld {
+                        entries.push(Some(Entry {
+                            found: Some(hash("owl")),
+                            ..entry
+                        }));
+                    }
                 }
             }
             let theirs = plain.entry("fox", 1, Mark::Stored).theirs(Some(1), gone);
             entries.push(Some(theirs));
         }
         // Everything the collection can hold under the id: nothing; what
-        // the entry hashes as; what it was found to hold; what Weaviate
+        // an entry hashes as; what it was found to hold; what Weaviate
         // holds now; something else.
         let held: Vec<Option<Stored>> = [None, Some("fox"), Some("owl"), Some("hen"), Some("emu")]
             .map(|title| title.map(|title| plain.stored(title)))
@@ -4414,9 +4443,44 @@ mod tests {
             stored.and_then(|stored| plain.plan.hash(stored)).as_deref() == Some(hash)
         };
         let has = |changes: &[Change], kind: &str| kinds(changes).iter().any(|k| k == kind);
+        // Whether each change to the collection is made only if the
+        // object is still at the version it was read at.
+        let versioned = |changes: &[Change], stored: Option<&Stored>| {
+            let read = stored.and_then(|stored| stored.version);
+            changes.iter().all(|change| match change {
+                Change::Upsert {
+                    collection,
+                    only_if_version,
+                    ..
+                }
+                | Change::Delete {
+                    collection,
+                    only_if_version,
+                    ..
+                } if collection.as_str() == "Memory" => read.is_some() && *only_if_version == read,
+                _ => true,
+            })
+        };
+        // What makes an object the import's to delete, by the entry and
+        // what the collection holds: that the import stored it and it is
+        // still so; or that it was there at the taking up and is still
+        // as it was found.
+        let as_stored = |entry: Option<&Entry>, stored: Option<&Stored>| {
+            entry.is_some_and(|entry| entry.mark == Mark::Stored && is(stored, &entry.hash))
+        };
+        let as_found = |entry: Option<&Entry>, stored: Option<&Stored>| {
+            entry.is_some_and(|entry| match entry.mark {
+                Mark::Unknown => is(stored, &entry.hash),
+                Mark::Withheld => entry
+                    .found
+                    .as_deref()
+                    .is_some_and(|found| is(stored, found)),
+                _ => false,
+            })
+        };
         let fixtures = TOLD.map(told);
         let fixture = |said: Told| &fixtures[TOLD.iter().position(|told| *told == said).unwrap()];
-        let mut cells = 0;
+        let (mut safety, mut liveness, mut direct) = (0, 0, 0);
         for entry in &entries {
             for weaviate in [true, false] {
                 for stored in &held {
@@ -4425,7 +4489,7 @@ mod tests {
                             if adopted && !weaviate {
                                 continue;
                             }
-                            cells += 1;
+                            safety += 1;
                             let (entry, stored) = (entry.as_ref(), stored.as_ref());
                             let changes = done(fixture(said), entry, weaviate, stored, adopted);
                             let cell = format!(
@@ -4439,19 +4503,14 @@ mod tests {
                                 matches!(said, Told::Sole | Told::SoleAndDelete),
                                 said == Told::SoleAndDelete,
                             );
-                            let as_stored = entry.is_some_and(|entry| {
-                                entry.mark == Mark::Stored && is(stored, &entry.hash)
-                            });
-                            let as_found = entry.is_some_and(|entry| match entry.mark {
-                                Mark::Unknown => is(stored, &entry.hash),
-                                Mark::Withheld => entry
-                                    .found
-                                    .as_deref()
-                                    .is_some_and(|found| is(stored, found)),
-                                _ => false,
-                            });
+                            let (as_stored, as_found) =
+                                (as_stored(entry, stored), as_found(entry, stored));
                             let unvouched = matches!(mark, Some(Mark::Withheld | Mark::Unknown));
                             let taken_up = entry.is_none() && adopted;
+                            // The collection holds exactly what Weaviate
+                            // does.
+                            let same = weaviate && is(stored, &hen);
+                            let after = noted(entry, &changes);
 
                             // (a) An object is deleted only if the import
                             // stored it and it is still so; or it was
@@ -4482,24 +4541,7 @@ mod tests {
                             }
                             // And then only if it is still at the
                             // version it was read at.
-                            for change in &changes {
-                                if let Change::Upsert {
-                                    collection,
-                                    only_if_version,
-                                    ..
-                                }
-                                | Change::Delete {
-                                    collection,
-                                    only_if_version,
-                                    ..
-                                } = change
-                                {
-                                    let read = stored.and_then(|stored| stored.version);
-                                    let data = collection.as_str() == "Memory";
-                                    assert!(!data || read.is_some(), "{cell}");
-                                    assert!(!data || *only_if_version == read, "{cell}");
-                                }
-                            }
+                            assert!(versioned(&changes, stored), "{cell}");
                             // (d) Without an entry, and outside a taking
                             // up, nothing is deleted or written over.
                             if entry.is_none() && !adopted {
@@ -4513,28 +4555,100 @@ mod tests {
                                 assert!(deleted || stored.is_none(), "{cell}");
                             }
                             // What is another writer's on somebody's word
-                            // has nothing done to it, and stays so.
-                            let after = noted(entry, &changes);
+                            // has nothing done to it, and stays so, even
+                            // where it is now exactly what Weaviate
+                            // holds; its entry says only whether Weaviate
+                            // lists the id.
                             if mark == Some(Mark::Theirs) {
                                 let untouched = ["delete Memory", "upsert Memory", "insert Memory"];
                                 assert!(
                                     !untouched.iter().any(|kind| has(&changes, kind)),
                                     "{cell}"
                                 );
-                                let theirs = after
-                                    .as_ref()
-                                    .map(|after| (after.mark, after.hash.as_str()));
-                                assert_eq!(theirs, Some((Mark::Theirs, "")), "{cell}");
+                                let theirs = after.as_ref().expect(&cell);
+                                assert_eq!(
+                                    (theirs.mark, theirs.hash.as_str(), theirs.gone),
+                                    (Mark::Theirs, "", !weaviate),
+                                    "{cell}"
+                                );
                             }
 
+                            // What the import must do, and not only may.
+                            let theirs = mark == Some(Mark::Theirs);
+                            let copied = |cell: &str| {
+                                let entry = after.as_ref().expect(cell);
+                                assert_eq!(
+                                    (entry.mark, entry.hash.as_str(), entry.gone),
+                                    (Mark::Stored, hen.as_str(), false),
+                                    "{cell}"
+                                );
+                            };
+                            let mut owed = false;
+                            // What the collection holds exactly as
+                            // Weaviate does is the import's, whatever
+                            // the run is told and whatever the entry
+                            // said, and nothing is written to it.
+                            if same && !theirs {
+                                owed = true;
+                                copied(&cell);
+                                assert!(!has(&changes, "upsert Memory"), "{cell}");
+                            }
+                            // What the import stored, nobody changed and
+                            // Weaviate holds otherwise is replaced.
+                            if weaviate && as_stored && !same {
+                                owed = true;
+                                copied(&cell);
+                                assert!(has(&changes, "upsert Memory"), "{cell}");
+                            }
+                            // What was withheld or unknown, or is met
+                            // with no entry while the collection is
+                            // taken up, is brought to what Weaviate
+                            // holds once nothing else is said to have
+                            // written.
+                            if weaviate && sole && (unvouched || taken_up) && !same {
+                                owed = true;
+                                copied(&cell);
+                                let kind = match stored {
+                                    Some(_) => "upsert Memory",
+                                    None => "insert Memory",
+                                };
+                                assert!(has(&changes, kind), "{cell}");
+                            }
+                            // What is new to Weaviate is stored.
+                            if weaviate && entry.is_none() && !adopted && stored.is_none() {
+                                owed = true;
+                                copied(&cell);
+                                assert!(has(&changes, "insert Memory"), "{cell}");
+                            }
+                            // What the import stored, nobody changed and
+                            // Weaviate no longer holds is deleted, unless
+                            // it was found gone before and left: that is
+                            // not asked about again.
+                            let left = entry.is_some_and(|entry| entry.gone);
+                            if !weaviate && as_stored && !left {
+                                owed = true;
+                                assert!(has(&changes, "delete Memory"), "{cell}");
+                                assert_eq!(after, None, "{cell}");
+                            }
+                            // And what was there at the taking up, still
+                            // as it was found, once that is asked for.
+                            if !weaviate && sweeps && as_found {
+                                owed = true;
+                                assert!(has(&changes, "delete Memory"), "{cell}");
+                                assert_eq!(after, None, "{cell}");
+                            }
+                            liveness += usize::from(owed);
+
                             // (c) Once something else is said to have
-                            // written, what was withheld or unknown is
+                            // written, what was withheld or unknown and
+                            // is not exactly what Weaviate holds is
                             // another writer's, whatever Weaviate and the
                             // collection hold; and no later run, whatever
                             // it is told and whatever they hold by then,
                             // deletes it, writes over it, brings it back
                             // or takes it for anything else.
-                            if said != Told::Others || !(unvouched || (taken_up && weaviate)) {
+                            let said_theirs = unvouched || (taken_up && weaviate);
+                            if said != Told::Others || !said_theirs || same {
                                 continue;
                             }
                             let theirs = after.expect(&cell);
@@ -4547,7 +4661,7 @@ mod tests {
                             for later in TOLD {
                                 for weaviate in [true, false] {
                                     for stored in &held {
-                                        cells += 1;
+                                        safety += 1;
                                         let stored = stored.as_ref();
                                         let later = fixture(later);
                                         let changes =
@@ -4572,9 +4686,59 @@ mod tests {
                 }
             }
         }
+
+        // The last guard, asked by itself: whatever brought an entry to
+        // be settled as of an id Weaviate does not hold, what the
+        // collection holds under it is deleted on the same terms and no
+        // others.
+        for entry in entries.iter().flatten() {
+            for stored in &held {
+                for said in TOLD {
+                    direct += 1;
+                    let stored = stored.as_ref();
+                    let copying = fixture(said).copying();
+                    let (changes, settled) = copying.removing(entry, stored);
+                    let cell = format!(
+                        "{entry:?} removed, vellev holds {:?}, told {said:?}: {:?}",
+                        stored.map(|stored| &stored.properties["title"]),
+                        kinds(&changes)
+                    );
+                    let sweeps = said == Told::SoleAndDelete;
+                    let mine =
+                        as_stored(Some(entry), stored) || (sweeps && as_found(Some(entry), stored));
+                    let after = noted(Some(entry), &changes);
+                    assert_eq!(has(&changes, "delete Memory"), mine, "{cell}");
+                    assert_eq!(settled == Settled::Deleted, mine, "{cell}");
+                    assert!(versioned(&changes, stored), "{cell}");
+                    for kind in ["upsert Memory", "insert Memory"] {
+                        assert!(!has(&changes, kind), "{cell}");
+                    }
+                    if matches!(entry.mark, Mark::Foreign | Mark::Theirs) {
+                        assert!(!mine, "{cell}");
+                    }
+                    let unvouched = matches!(entry.mark, Mark::Withheld | Mark::Unknown);
+                    let theirs = entry.mark == Mark::Theirs || (unvouched && said == Told::Others);
+                    match (mine, stored, theirs) {
+                        (true, ..) => assert_eq!(after, None, "{cell}"),
+                        // What is left keeps its entry, saying so.
+                        (false, Some(_), _) | (false, None, true) => {
+                            let after = after.expect(&cell);
+                            assert!(after.gone, "{cell}");
+                            let mark = match theirs {
+                                true => Mark::Theirs,
+                                false => entry.mark,
+                            };
+                            assert_eq!(after.mark, mark, "{cell}");
+                            assert!(!theirs || after.hash.is_empty(), "{cell}");
+                        }
+                        (false, None, false) => assert_eq!(after, None, "{cell}"),
+                    }
+                }
+            }
+        }
         // Every cell was looked at: change the tables above, and say so
         // here.
-        assert_eq!(cells, CELLS);
+        assert_eq!((safety, liveness, direct), (SAFETY, LIVENESS, DIRECT));
     }
 
     #[test]
