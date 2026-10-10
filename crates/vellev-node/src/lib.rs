@@ -133,8 +133,10 @@ pub struct Settings {
     /// The clock backup claims are measured on, which counts the time the
     /// machine was suspended, as the coordinator's does.
     pub claim_clock: Arc<dyn ClaimClock>,
-    /// What tells the time of day: when a backup is taken, and how old one
-    /// is when backups are pruned. The machine's, unless told otherwise.
+    /// What tells the time of day: when a backup is taken, how old one is
+    /// when backups are pruned, and how old a tenant's file is when what
+    /// nothing needs any more is cleaned up. The machine's, unless told
+    /// otherwise.
     pub clock: Arc<dyn Clock>,
     /// How often the node looks for tenants due a backup, the first time
     /// at a moment of its own within as long, so that nodes started
@@ -1491,7 +1493,8 @@ impl Inner {
                 Arc::new(
                     writer
                         .embedding_with(documents)
-                        .transferring(self.settings.transfers),
+                        .transferring(self.settings.transfers)
+                        .timed_by(self.settings.clock.clone()),
                 )
             }
             Ok(_) if self.opened().stopped => {
