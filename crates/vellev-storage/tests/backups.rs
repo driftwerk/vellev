@@ -1576,6 +1576,8 @@ struct Asked {
     inner: Arc<dyn Blobs>,
     asked: std::sync::Mutex<Vec<(&'static str, String)>>,
     unanswering: AtomicBool,
+    /// Whether a file read in parts goes after its first part.
+    going: AtomicBool,
 }
 
 impl Asked {
@@ -1589,6 +1591,7 @@ impl Asked {
             inner: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(parts)),
             asked: std::sync::Mutex::default(),
             unanswering: AtomicBool::new(false),
+            going: AtomicBool::new(false),
         })
     }
 
@@ -1632,6 +1635,11 @@ impl Blobs for Asked {
         if self.unanswering.load(Ordering::SeqCst) {
             let unanswered = unanswered(key, Duration::from_secs(1));
             return futures::stream::once(async { Err(unanswered) }).boxed();
+        }
+        if self.going.load(Ordering::SeqCst) {
+            let gone =
+                futures::stream::once(async { Err(StorageError::Missing { key: key.into() }) });
+            return self.inner.parts(key).take(1).chain(gone).boxed();
         }
         self.inner.parts(key)
     }
@@ -1922,4 +1930,125 @@ async fn a_backups_source_reads_only_what_the_cluster_that_took_the_backup_keeps
         matches!(&lacking, StorageError::BackupLacks { backup, .. } if *backup == taken_drill.id),
         "{lacking}"
     );
+}
+
+/// A file that goes from the store while it is read in parts, as one
+/// pruned from under a restore whose claim ran out would: the parts that
+/// came are handed on, and the backup is said to lack the file from there.
+#[tokio::test]
+async fn a_file_that_goes_while_it_is_read_in_parts_is_said_of_the_backup_from_there() {
+    use futures::StreamExt;
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    written_of_every_kind(&cluster).await;
+    let backup = take(&backups, &cluster).await;
+    let source = backups.source(&backup).unwrap();
+    let key = file_of(&backup, "segment");
+    let whole = parts_of(&source, key).await.unwrap();
+    assert!(whole.len() > 1);
+
+    store.going.store(true, Ordering::SeqCst);
+    let read: Vec<vellev_storage::Result<Bytes>> = source.parts(key).collect().await;
+    assert_eq!(read.len(), 2);
+    assert_eq!(read[0].as_ref().unwrap(), &whole[0]);
+    assert!(
+        matches!(
+            &read[1],
+            Err(StorageError::BackupLacks { tenant, backup: id, file })
+                if *tenant == cluster.key.tenant && *id == backup.id && file == key
+        ),
+        "{:?}",
+        read[1]
+    );
+}
+
+/// A backup of two partitions, as its record would say it: the one
+/// `cluster` wrote, and partition 1, which lists `also`.
+async fn of_two_partitions(backups: &Backups, cluster: &Cluster, also: &[String]) -> Backup {
+    let mut backup = take(backups, cluster).await;
+    let second = vellev_storage::backups::Taken {
+        partition: PartitionNumber(1),
+        files: also.to_vec(),
+        ..backup.partitions[0].clone()
+    };
+    backup.partitions.push(second);
+    backup
+}
+
+/// Whether a record lists only its own partitions' files, by plain keys,
+/// is all that keeps what is read through a source, and what is fetched
+/// back, inside the tenant: each key a record could stray by is refused
+/// by both, whichever partition lists it, naming it, before anything is
+/// asked of either store.
+#[tokio::test]
+async fn a_record_listing_a_key_that_strays_is_restored_from_by_nothing() {
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    written(&cluster).await;
+    let tenant = &cluster.key.tenant;
+    let primary = Arc::new(Listings {
+        inner: memory(),
+        listed: std::sync::Mutex::default(),
+    });
+    let lost: Arc<dyn Blobs> = primary.clone();
+    // Each with the partition whose files it is listed among.
+    let strays = [
+        (0, format!("{tenant}/0/../x")),
+        (0, format!("{tenant}/0//x")),
+        (0, format!("{tenant}/0/./x")),
+        (0, format!("{tenant}/0\\x")),
+        (0, format!("{tenant}/1/segment/x.segment")),
+        (0, String::new()),
+        (1, format!("{tenant}/0/segment/x.segment")),
+        (1, format!("{tenant}/1/../0/x")),
+    ];
+    for (partition, stray) in strays {
+        let mut backup = of_two_partitions(&backups, &cluster, &[]).await;
+        backup.partitions[partition].files.push(stray.clone());
+        store.asked();
+        let strayed = |refused: StorageError| match refused {
+            StorageError::Corrupt { key, reason } => {
+                assert_eq!(key, stray);
+                assert!(reason.contains(&backup.id.to_string()), "{reason}");
+            }
+            other => panic!("{stray:?}: {other}"),
+        };
+        strayed(backups.source(&backup).unwrap_err());
+        strayed(backups.lacking(&lost, &backup).await.unwrap_err());
+        let fetched = backups.fetch_back(&lost, &backup, &Claimed(true)).await;
+        strayed(fetched.unwrap_err());
+        assert_eq!(store.asked(), [], "{stray:?}: the backup store was asked");
+        assert_eq!(
+            primary.listed(),
+            NONE,
+            "{stray:?}: the tenant's store was listed before the record was refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_backups_source_reads_the_files_of_every_partition_the_backup_lists() {
+    let cluster = Cluster::new().await;
+    let store = Asked::of_small_parts();
+    let backups = Backups::new(store.clone());
+    written(&cluster).await;
+    let own = owner(&cluster).await;
+    let second = format!("{}/1/segment/x.segment", cluster.key.tenant);
+    let backup = of_two_partitions(&backups, &cluster, std::slice::from_ref(&second)).await;
+    let held = Bytes::from(vec![7; 2_500]);
+    let kept = format!("{}{second}", files(&own));
+    store.put(&kept, held.clone()).await.unwrap();
+
+    let source = backups.source(&backup).unwrap();
+    store.asked();
+    assert_eq!(source.get(&second).await.unwrap(), held);
+    let parts = parts_of(&source, &second).await.unwrap();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts.concat(), held);
+    assert_eq!(store.asked(), [("get", kept.clone()), ("parts", kept)]);
+    let first = file_of(&backup, "segment");
+    assert!(first.starts_with(&Layout(&cluster.key).prefix()));
+    assert!(source.get(first).await.is_ok(), "and those of the first");
 }

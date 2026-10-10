@@ -808,6 +808,9 @@ impl Blobs for Source {
         Err(self.only_read(key))
     }
 
+    /// The whole file at once, held in memory: for the small ones, a
+    /// manifest or a log. A segment, its vectors or its index is read by
+    /// [`Self::parts`].
     async fn get(&self, key: &str) -> Result<Bytes> {
         let kept = self.kept(key)?;
         self.store
