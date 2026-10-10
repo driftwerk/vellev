@@ -1265,7 +1265,24 @@ enum Refusal {
     TooLarge,
     /// The node cannot hold what it was sent.
     Unfit(String),
+    /// The node does not know a write conditional on a version: it is
+    /// of a release before there were any.
+    Old,
 }
+
+/// Whether a refusal as invalid is of the condition on a version and not
+/// of what was to be written: a node of 0.1 refuses a field it does not
+/// know by naming it, in one of two ways, and as a release already made
+/// it will go on doing so.
+fn unversed(code: Code, message: &str) -> bool {
+    code == Code::Invalid && message.contains("unknown field") && message.contains(CONDITION)
+}
+
+/// The field of a change that makes it conditional on a version.
+const CONDITION: &str = "only_if_version";
+
+/// What stops a run that met a node of a release before versions.
+const OLD_NODE: &str = "the node refused a write conditional on an object's version, which every node of 0.2 knows: one of an earlier release is among those asked, and the import replaces and deletes nothing through it";
 
 fn refusal(error: &vellev_client::Error) -> Option<Refusal> {
     let large =
@@ -1273,7 +1290,12 @@ fn refusal(error: &vellev_client::Error) -> Option<Refusal> {
     if large || error.limit_max(Bounded::BodyBytes).is_some() {
         return Some(Refusal::TooLarge);
     }
+    let message = match error {
+        vellev_client::Error::Api { message, .. } => message.as_str(),
+        _ => "",
+    };
     match error.code()? {
+        code if unversed(code, message) => Some(Refusal::Old),
         Code::Conflict => Some(Refusal::Overtaken),
         Code::NotFound if error.missing() == Some(Missing::Object) => Some(Refusal::Overtaken),
         Code::Invalid => Some(Refusal::Unfit(error.to_string())),
@@ -1843,6 +1865,9 @@ impl<'a> Copying<'a> {
                         format!("{name} changed under the import: {OTHER_IMPORT}")
                     });
                 }
+                Err(error) if refusal(&error) == Some(Refusal::Old) => {
+                    return Err(error).wrap_err(OLD_NODE)
+                }
                 Err(error) => return Err(error).wrap_err_with(|| format!("writing {name}")),
             }
         }
@@ -1930,6 +1955,9 @@ impl<'a> Copying<'a> {
                     }
                     before = Some(read);
                 }
+                // Nothing a run is told lets it go on past a node too
+                // old to hold a write to a version.
+                (Some(Refusal::Old), error) => return Err(error).wrap_err(OLD_NODE),
                 (Some(Refusal::TooLarge), error) | (Some(Refusal::Unfit(_)), error)
                     if self.options.skip_refused && matches!(now, Now::Holds(_)) =>
                 {
@@ -1969,6 +1997,9 @@ impl<'a> Copying<'a> {
             };
             match refused {
                 None => made.extend(batch.into_iter().map(|step| (step.item.id, step.settled))),
+                Some(error) if refusal(&error) == Some(Refusal::Old) => {
+                    return Err(error).wrap_err(OLD_NODE)
+                }
                 Some(error) if refusal(&error).is_some() => {
                     for step in batch {
                         let id = step.item.id;
@@ -4324,6 +4355,28 @@ mod tests {
         // nothing.
         let stray = bound(false, true);
         assert_eq!(taking_up(Some(&stray), true, false), (false, false, false));
+    }
+
+    #[test]
+    fn a_node_that_does_not_know_a_condition_on_a_version_is_told_from_an_object_it_cannot_hold() {
+        // As a node of 0.1 refuses a change with a field it does not
+        // know, by either of the ways it reads a body.
+        let old = [
+            "unknown field `only_if_version`, expected one of `collection`, `id`, `properties`, `vector`",
+            "unknown field `changes[3].only_if_version`",
+        ];
+        for message in old {
+            assert!(unversed(Code::Invalid, message), "{message}");
+            assert!(!unversed(Code::Conflict, message), "{message}");
+        }
+        // What a node says of an object it cannot hold is not that.
+        for message in [
+            "property title: too long",
+            "unknown field `colour`",
+            "the object is not at the version given as only_if_version",
+        ] {
+            assert!(!unversed(Code::Invalid, message), "{message}");
+        }
     }
 
     #[test]
