@@ -4076,3 +4076,60 @@ async fn a_request_carries_no_more_changes_than_it_is_told_to() {
     assert_eq!(importing.counts().await, ([0, 40, 0, 0, 0], [40; 3]));
     assert_eq!(importing.front.asked("/changes").len(), 1 + 4);
 }
+
+/// Note `n` as a node of a release before versions answers with it.
+async fn unversioned(importing: &Importing, n: u64) -> Value {
+    let held = importing.get(n).await.unwrap();
+    json!({ "id": held.id, "properties": held.properties, "vector": held.vector })
+}
+
+#[tokio::test]
+async fn nothing_is_replaced_or_deleted_on_the_word_of_a_node_that_gives_no_version() {
+    let Some(importing) = Importing::new("VellevImportUnversioned", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    let stops = |stopped: eyre::Result<Report>| {
+        let stopped = format!("{:#}", stopped.unwrap_err());
+        assert!(stopped.contains("gave no version"), "{stopped}");
+    };
+    // Changed in Weaviate, and read to be replaced.
+    weaviate.put(class, 4, changed(4)).await;
+    let read = importing.read(4);
+    let held = unversioned(&importing, 4).await;
+    importing
+        .front
+        .answer(0, &["GET", &read], StatusCode::OK, held);
+    stops(importing.run().await);
+    assert!(importing.front.spent());
+    assert_eq!(importing.get(4).await.unwrap().properties["n"], json!(4));
+    assert_eq!(importing.counts().await, ([0, 1, 0, 0, 0], [10; 3]));
+    // Gone from Weaviate, and read to be deleted.
+    weaviate.delete(class, 3).await;
+    let read = importing.read(3);
+    let held = unversioned(&importing, 3).await;
+    importing
+        .front
+        .answer(0, &["GET", &read], StatusCode::OK, held);
+    stops(importing.run().await);
+    assert!(importing.front.spent());
+    assert!(importing.get(3).await.is_some());
+    assert_eq!(importing.counts().await, ([0, 0, 1, 0, 0], [9; 3]));
+    // Taken up without a ledger by a run told nothing else wrote, which
+    // replaces what the collection holds otherwise than Weaviate does.
+    importing.unledgered().await;
+    weaviate.put(class, 6, changed(6)).await;
+    let mut held = Vec::new();
+    for n in (0..10).filter(|n| *n != 3) {
+        held.push(unversioned(&importing, n).await);
+    }
+    let read = format!("/collections/{class}/list");
+    let listed = json!({ "objects": held });
+    importing
+        .front
+        .answer(0, &["POST", &read], StatusCode::OK, listed);
+    stops(importing.run_as(&sole(&importing.options)).await);
+    assert!(importing.front.spent());
+    assert_eq!(importing.get(6).await.unwrap().properties["n"], json!(6));
+}
