@@ -2324,6 +2324,10 @@ impl RestoreFrom<'_> {
         let frame = encode(Kind::Manifest, &manifest)?;
         let state = target.restore(&key, manifest, held).await?;
         let turn = writer.turn().await?;
+        // Nothing moves the partition while the building lock is held and
+        // writes are refused, and a commit that follows anything else the
+        // coordinator refuses: this only says so before the copies are
+        // kept, as `put_back` does, and no test can tell it from that.
         if writer.partition.read(State::position) != current {
             return Err(StorageError::Diverged {
                 head: writer.partition.read(State::at).1,
@@ -3266,7 +3270,15 @@ mod tests {
                 ready.rested_on = Some(file("manifest", "x"))
             }),
         ];
+        let stored = || async {
+            let listed = writer.partition.blobs.list("").await.unwrap();
+            listed
+                .into_iter()
+                .map(|file| file.key)
+                .collect::<HashSet<_>>()
+        };
         for (what, tamper) in tampered {
+            let had = stored().await;
             let blobs = source.partition.blobs.clone();
             let ready = writer.restore_from(blobs, head.as_ref(), restore(), None, &Held);
             let mut ready = ready.await.unwrap();
@@ -3279,6 +3291,15 @@ mod tests {
             let after = coordinator.committed(&writer.lease.key).await.unwrap();
             assert_eq!(after, before, "{what}");
             assert!(!writer.is_closed(), "{what}: nothing was tried");
+            // Refused before they were kept, its copies are deleted.
+            let started = std::time::Instant::now();
+            while stored().await != had {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "{what}: copies kept"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 }

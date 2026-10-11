@@ -35,14 +35,15 @@ impl Held for Holding {
 /// What another store holds of a partition, as a backup's source gives
 /// it: read by the keys the files had, and never written. What is read
 /// whole and what a part at a time is noted, and so is how many index
-/// files are being read at once, each of which takes a moment.
+/// files are in hand at once: from when one is asked for, which takes a
+/// moment, until its copy has gone up (see [`IndexesPut`]).
 #[derive(Debug)]
 struct Source {
     inner: Arc<dyn Blobs>,
     keys: BTreeSet<String>,
     whole: Mutex<Vec<String>>,
     in_parts: Mutex<Vec<String>>,
-    indexes: AtomicUsize,
+    indexes: Arc<AtomicUsize>,
     most_indexes: AtomicUsize,
 }
 
@@ -82,7 +83,6 @@ impl Blobs for Source {
             let now = self.indexes.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_indexes.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(5)).await;
-            self.indexes.fetch_sub(1, Ordering::SeqCst);
         }
         self.inner.get(key).await
     }
@@ -141,7 +141,7 @@ async fn frozen(cluster: &Cluster) -> Frozen {
             keys: files.into_iter().collect(),
             whole: Mutex::default(),
             in_parts: Mutex::default(),
-            indexes: AtomicUsize::new(0),
+            indexes: Arc::default(),
             most_indexes: AtomicUsize::new(0),
         }),
         head: committed.manifest,
@@ -699,8 +699,45 @@ async fn a_segments_index_file_is_copied_as_its_copys_or_passed_over_as_unusable
     }
 }
 
+/// A store that, as each index file's copy goes up, which takes a moment,
+/// tells the source it came from that it is no longer in hand.
+#[derive(Debug)]
+struct IndexesPut {
+    inner: Arc<dyn Blobs>,
+    in_hand: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Blobs for IndexesPut {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        let put = self.inner.put(key, bytes).await;
+        if key.contains("/index/") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.in_hand.fetch_sub(1, Ordering::SeqCst);
+        }
+        put
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
 /// Index files, which are read whole and held twice over while they are
-/// given their copy's key, are copied one at a time.
+/// given their copy's key, are copied one at a time: no second is asked
+/// for until the first has gone up.
 #[tokio::test]
 async fn a_restore_from_a_source_copies_one_index_file_at_a_time() {
     let source = Cluster::new().await;
@@ -712,7 +749,14 @@ async fn a_restore_from_a_source_copies_one_index_file_at_a_time() {
         .iter()
         .filter(|segment| segment.index.is_some());
     assert_eq!(with_index.count(), 2);
-    let target = Cluster::new().await;
+    let plain = Cluster::new().await;
+    let target = Cluster {
+        blobs: Arc::new(IndexesPut {
+            inner: plain.blobs.clone(),
+            in_hand: frozen.source.indexes.clone(),
+        }),
+        ..plain
+    };
     let writer = lived_in(&target).await;
 
     restored_from(&target, &writer, &frozen).await.unwrap();
@@ -1059,4 +1103,362 @@ async fn a_restore_from_a_source_whose_commit_is_made_unanswered_keeps_its_copie
     assert!(target.committed().await.log_position > before.log_position);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(target.open().await.partition().read(ns), frozen.rows);
+}
+
+/// Notes written and flushed five times, the first three segments merged
+/// into one: a source of several segments, each with its vectors.
+async fn of_several_segments(cluster: &Cluster) {
+    let writer = cluster.writer().await.merging_with(Merging {
+        fanout: 3,
+        ..Merging::default()
+    });
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    for n in 2..6 {
+        writer
+            .commit(vec![upsert("notes", n, i64::from(n))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    writer.commit(vec![upsert("notes", 6, 6)]).await.unwrap();
+}
+
+/// A source whose files stop coming from the `after`th asked for a part
+/// at a time on.
+#[derive(Debug)]
+struct Losing {
+    inner: Arc<dyn Blobs>,
+    after: usize,
+    asked: AtomicUsize,
+}
+
+#[async_trait]
+impl Blobs for Losing {
+    async fn put(&self, key: &str, _bytes: Bytes) -> vellev_storage::Result<()> {
+        Err(only_read(key))
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        use futures::StreamExt;
+        if self.asked.fetch_add(1, Ordering::SeqCst) >= self.after {
+            let gone = StorageError::Missing {
+                key: key.to_string(),
+            };
+            return futures::stream::once(async move { Err(gone) }).boxed();
+        }
+        self.inner.parts(key)
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        Err(only_read(prefix))
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        Err(only_read(key))
+    }
+}
+
+/// A restore from a source that stops giving its files part way through
+/// the copies, at each file in turn, commits nothing, leaves none of the
+/// copies it made, and takes writes again.
+#[tokio::test]
+async fn a_restore_from_a_source_that_fails_part_way_leaves_nothing() {
+    let source = Cluster::new().await;
+    of_several_segments(&source).await;
+    let frozen = frozen(&source).await;
+    let streamed = 2 * frozen.checkpoint.as_ref().unwrap().segments.len();
+    for after in 0..streamed {
+        let target = Cluster::new().await;
+        let writer = lived_in(&target).await;
+        let before = target.committed().await;
+        let had = keys(&target).await;
+        let losing = Arc::new(Losing {
+            inner: frozen.source.clone(),
+            after,
+            asked: AtomicUsize::new(0),
+        });
+        let restore = restore(&target, frozen.at);
+        let head = frozen.head.as_ref();
+        let outcome = match writer
+            .restore_from(losing, head, restore, None, &Holding(true))
+            .await
+        {
+            Ok(ready) => ready.commit().await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+
+        assert!(
+            matches!(outcome, Err(StorageError::Missing { .. })),
+            "{after}: {outcome:?}"
+        );
+        assert_eq!(target.committed().await, before, "{after}");
+        let started = std::time::Instant::now();
+        loop {
+            let now = keys(&target).await;
+            let left: Vec<&String> = now.difference(&had).collect();
+            if left.is_empty() {
+                break;
+            }
+            let waited = started.elapsed();
+            assert!(waited < Duration::from_secs(30), "{after}: left {left:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        writer.commit(vec![upsert("notes", 7, 7)]).await.unwrap();
+    }
+}
+
+/// A store that, once told, never answers the `at`th request made of it
+/// from then on, and says so when it comes to it; and that notes each
+/// request made of it.
+#[derive(Debug)]
+struct Stopping {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    made: AtomicUsize,
+    at: usize,
+    stopped: tokio::sync::Notify,
+    asked: Mutex<Vec<String>>,
+}
+
+impl Stopping {
+    async fn asked(&self, what: &str, key: &str) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.asked.lock().unwrap().push(format!("{what} {key}"));
+        if self.made.fetch_add(1, Ordering::SeqCst) == self.at {
+            self.armed.store(false, Ordering::SeqCst);
+            self.stopped.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[async_trait]
+impl Blobs for Stopping {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.asked("put", key).await;
+        self.inner.put(key, bytes).await
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.asked("put_parts", key).await;
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.asked("get", key).await;
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.asked("list", prefix).await;
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        self.inner.parts(key)
+    }
+    async fn fetch_local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
+        self.asked("fetch_local", key).await;
+        self.inner.fetch_local(key).await
+    }
+}
+
+/// A restore from a source given up at each request it makes of the
+/// partition's store in turn, by a caller that stops waiting there: the
+/// partition is as it was, or restored, and opens; nothing of what it put
+/// is left that the head does not need, but where the checkpoint itself
+/// was put, whose commit may then have been made; and writes are taken.
+#[tokio::test]
+async fn a_restore_from_a_source_given_up_at_any_point_leaves_no_copies_unneeded() {
+    let source = Cluster::new().await;
+    of_several_segments(&source).await;
+    let frozen = Arc::new(frozen(&source).await);
+    let mut at = 0;
+    loop {
+        let plain = Cluster::new().await;
+        let stopping = Arc::new(Stopping {
+            inner: plain.blobs.clone(),
+            armed: AtomicBool::new(false),
+            made: AtomicUsize::new(0),
+            at,
+            stopped: tokio::sync::Notify::new(),
+            asked: Mutex::default(),
+        });
+        let target = Cluster {
+            blobs: stopping.clone(),
+            ..plain
+        };
+        let writer = Arc::new(lived_in(&target).await);
+        let before = target.committed().await;
+        let rows_before = target.open().await.partition().read(ns);
+        let had: BTreeSet<String> = (stopping.inner.list("").await.unwrap())
+            .into_iter()
+            .map(|file| file.key)
+            .collect();
+        let restore = restore(&target, frozen.at);
+        stopping.armed.store(true, Ordering::SeqCst);
+        let restoring = tokio::spawn({
+            let (writer, frozen) = (writer.clone(), frozen.clone());
+            async move {
+                let head = frozen.head.as_ref();
+                let ready = writer
+                    .restore_from(frozen.as_source(), head, restore, None, &Holding(true))
+                    .await?;
+                ready.commit().await
+            }
+        });
+        let stopped = tokio::time::timeout(Duration::from_secs(30), async {
+            while !restoring.is_finished() && stopping.armed.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        stopped.await.expect("the restore stops or ends");
+        if stopping.armed.load(Ordering::SeqCst) {
+            restoring.await.unwrap().unwrap();
+            assert!(at > 10, "made {at} requests in all");
+            break;
+        }
+        let what = stopping.asked.lock().unwrap().last().cloned().unwrap();
+        restoring.abort();
+        let _ = restoring.await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let after = target.committed().await;
+        let opened = target.open_on(stopping.inner.clone()).await;
+        let opened = opened.unwrap_or_else(|error| panic!("{at} ({what}): {error}"));
+        let read = opened.partition().read(ns);
+        let needed = Partition::files(target.key.clone(), stopping.inner.clone(), &after);
+        let needed: BTreeSet<String> = needed.await.unwrap().into_iter().collect();
+        let now: BTreeSet<String> = (stopping.inner.list("").await.unwrap())
+            .into_iter()
+            .map(|file| file.key)
+            .collect();
+        let litter: Vec<&String> = now
+            .difference(&had)
+            .filter(|key| !needed.contains(*key))
+            .collect();
+        match after == before {
+            true => {
+                assert_eq!(read, rows_before, "{at} ({what})");
+                let asked = stopping.asked.lock().unwrap();
+                let tried = asked.iter().any(|asked| asked.contains("/manifest/"));
+                assert!(tried || litter.is_empty(), "{at} ({what}): {litter:?}");
+            }
+            false => assert_eq!(read, frozen.rows, "{at} ({what})"),
+        }
+        if writer.commit(vec![upsert("notes", 7, 7)]).await.is_err() {
+            let again = target.writer().await;
+            again.commit(vec![upsert("notes", 7, 7)]).await.unwrap();
+        }
+        at += 1;
+        assert!(at < 400, "too many requests");
+    }
+}
+
+/// A right that runs out once it has been asked about `left` times.
+struct RunningOut(AtomicUsize);
+
+#[async_trait]
+impl Held for RunningOut {
+    async fn held(&self) -> vellev_storage::Result<bool> {
+        Ok(self.still())
+    }
+    fn still(&self) -> bool {
+        let left = self.0.load(Ordering::SeqCst);
+        self.0.store(left.saturating_sub(1), Ordering::SeqCst);
+        left > 0
+    }
+}
+
+/// A restore from a source asks whether its right still holds before it
+/// reads the source's head and before each file it copies: once the right
+/// runs out, it puts no other file and commits nothing.
+#[tokio::test]
+async fn a_restore_from_a_source_whose_right_runs_out_copies_no_file_after() {
+    let source = Cluster::new().await;
+    of_several_segments(&source).await;
+    let frozen = frozen(&source).await;
+    let files = 2 * frozen.checkpoint.as_ref().unwrap().segments.len();
+    for left in 0..=files {
+        let plain = Cluster::new().await;
+        let counted = Arc::new(Counted {
+            inner: plain.blobs.clone(),
+            gets: Mutex::default(),
+        });
+        let puts = Arc::new(AtomicUsize::new(0));
+        let target = Cluster {
+            blobs: Arc::new(PutsCounted {
+                inner: counted,
+                puts: puts.clone(),
+            }),
+            ..plain
+        };
+        let writer = lived_in(&target).await;
+        let before = target.committed().await;
+        puts.store(0, Ordering::SeqCst);
+        let held = RunningOut(AtomicUsize::new(left));
+        let outcome = writer
+            .restore_from(
+                frozen.as_source(),
+                frozen.head.as_ref(),
+                restore(&target, frozen.at),
+                None,
+                &held,
+            )
+            .await;
+
+        assert!(matches!(outcome, Err(StorageError::Unheld(_))), "{left}");
+        // The head is read once the right is asked about the first time,
+        // and each file is put once it is asked about again.
+        let put = puts.load(Ordering::SeqCst);
+        assert!(put < left.max(1), "{left}: {put} files put");
+        assert_eq!(target.committed().await, before, "{left}");
+    }
+}
+
+/// A store that counts the files put into it, whole or a part at a time.
+#[derive(Debug)]
+struct PutsCounted {
+    inner: Arc<dyn Blobs>,
+    puts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Blobs for PutsCounted {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        self.inner.put(key, bytes).await
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
 }
