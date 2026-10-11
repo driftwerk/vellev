@@ -2154,11 +2154,11 @@ impl World {
     ///
     /// Such a file comes to be without any fault. A merge made while the
     /// head is a checkpoint names its segment at that checkpoint's
-    /// position, and so does a restore; a clean may keep more than the one
-    /// before it, as one with grace does after one with none, and as a
-    /// node's does once a tenant's window has been made longer; and an
-    /// upload that lands late, or a writer left behind, leaves a file
-    /// under an old position.
+    /// position (a restore names its own at the checkpoint it commits,
+    /// past it: DW-685); a clean may keep more than the one before it, as
+    /// one with grace does after one with none, and as a node's does once
+    /// a tenant's window has been made longer; and an upload that lands
+    /// late, or a writer left behind, leaves a file under an old position.
     async fn walks_into_what_was_cleaned(&self, grace: Duration) -> Option<String> {
         let (files, young) = self.blobs.files(self.young_from(grace)).await;
         let heads = self.coordinator.heads.lock().unwrap();
@@ -3604,4 +3604,73 @@ fn a_clean_by_a_node_whose_clock_runs_ahead_deletes_what_a_restore_may_go_to() {
         assert!(loaded.is_err(), "{head:?} a restore may go to loads still");
         panic!("{violation}");
     });
+}
+
+/// A clean with grace made an hour after an idle partition was cleaned
+/// with that grace, its head C a checkpoint that replays a write and its
+/// files all old, with the partition put back as C held it in that hour
+/// if `restored`. The first clean ends its walk at C and deletes the
+/// checkpoint before it. Returns C, the checkpoint before it, and what the
+/// second clean came to.
+async fn cleaned_after_an_idle_head(
+    restored: bool,
+) -> (String, String, vellev_storage::Result<usize>) {
+    let who = Who::Current;
+    let beside = Action::WriteBesideFlush {
+        who,
+        rows: 1,
+        delete: None,
+        first: false,
+    };
+    let mut world = after(vec![
+        written(),
+        Action::Flush { who },
+        written(),
+        beside,
+        Action::Wait(GRACE),
+        Action::Clean { who, aged: true },
+    ])
+    .await;
+    let committed = world.cluster.committed().await;
+    let head = committed.manifest.clone().expect("a head").0;
+    let prev = match world.landed_head(&head) {
+        Some(Stored::Manifest(checkpoint)) if !checkpoint.replay.is_empty() => {
+            checkpoint.prev.expect("a checkpoint before it")
+        }
+        other => panic!("the head {head} is no checkpoint that replays a write: {other:?}"),
+    };
+    assert!(world.made.aged > 0, "{:?}", world.made);
+    let (files, _) = world.blobs.files(world.young_from(Duration::ZERO)).await;
+    assert!(!files.contains(&prev), "the first clean left {prev}");
+    world.pass(1);
+    let writer = &world.seats[0].writer;
+    if restored {
+        let at = committed.manifest.as_ref();
+        writer.restore(at, committed.log_position).await.unwrap();
+    }
+    (head, prev, writer.clean(STEP * GRACE as u32).await)
+}
+
+/// DW-685: a point-in-time restore to an idle partition's head names what
+/// it uploads at the checkpoint it commits, not at that head. A segment
+/// of the rows the head replays, named at the head's own position, is a
+/// young file there: the next clean then walks past the head to the
+/// checkpoint before it, which the clean before deleted, and every clean fails until
+/// that segment is old.
+#[test]
+fn a_clean_after_a_restore_to_an_idle_head_succeeds() {
+    let (head, prev, cleaned) = paused().block_on(cleaned_after_an_idle_head(true));
+    if let Err(error) = cleaned {
+        panic!("DW-685: a clean after a restore to {head} walked to {prev}: {error}");
+    }
+}
+
+/// The control for the test above: with no restore, the second clean
+/// succeeds.
+#[test]
+fn a_clean_after_a_clean_of_an_idle_head_succeeds() {
+    let (head, prev, cleaned) = paused().block_on(cleaned_after_an_idle_head(false));
+    if let Err(error) = cleaned {
+        panic!("a clean after a clean of {head} walked to {prev}: {error}");
+    }
 }
