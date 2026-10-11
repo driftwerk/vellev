@@ -1268,7 +1268,8 @@ impl Writer {
     ///
     /// It holds the building lock throughout, as cleaning up does, so the
     /// target's files are not deleted while it is read, and the segment,
-    /// named at the position the partition is at, stays until committed.
+    /// named at the position the checkpoint is committed at, stays until
+    /// committed.
     pub async fn restore(
         &self,
         head: Option<&ManifestRef>,
@@ -1320,12 +1321,16 @@ impl Writer {
         // With writes refused and the building lock held nothing commits,
         // so the position the partition is at is the one it will be
         // restored from, and all but the commit is done before the writer
-        // is held.
+        // is held. The segment is named at the position the restore
+        // commits, past the latest checkpoint: at that checkpoint's own, it
+        // would be a young file there, and a clean would walk past it to
+        // the checkpoint before, which an earlier clean may have deleted.
         let current = self.partition.read(State::position);
+        let restored = following(current.max(position))?;
         let segment = match target.read(State::snapshot) {
             Some(mut snapshot) => {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
-                match self.uploaded(&mut snapshot, current, &mut staged).await? {
+                match self.uploaded(&mut snapshot, restored, &mut staged).await? {
                     Some(prepared) => {
                         let (meta, loaded) = self.loaded(prepared).await?;
                         held.insert(meta.key.clone(), loaded);
@@ -1336,7 +1341,6 @@ impl Writer {
             }
             None => None,
         };
-        let restored = following(current.max(position))?;
         let key = Layout(&self.lease.key).manifest(restored, &self.author);
         let manifest = self.partition.read(|current| {
             target.read(|target| current.restored_manifest(restored, target, segment))
@@ -1440,9 +1444,10 @@ impl Writer {
         }
     }
 
-    /// Names for the files of a segment built from the partition as it was
-    /// at `position`, apart from those of any other build from there, each
-    /// ending in `marker`.
+    /// Names for the files of a segment at `position`, apart from those of
+    /// any other build there, each ending in `marker`. That is at or past
+    /// the latest checkpoint: a flush's or a merge's at the position of the
+    /// partition it was built from, a restore's at the position it commits.
     fn named(&self, position: LogPosition, marker: &str) -> Names {
         let nonce = uuid::Uuid::new_v4().as_u64_pair().0;
         let suffix = format!("-{nonce:016x}{marker}");
@@ -1644,15 +1649,17 @@ impl Writer {
     /// failed.
     ///
     /// A flush, a merge and a restore upload their segments' files without
-    /// the writer, under the position of the partition they were built from
-    /// and a name of their own, and all of them, like this, hold the
-    /// building lock from before they read the partition until they commit
-    /// or fail. Only they commit checkpoints, so none is committed past that
-    /// position while such files wait to be published, and log commits do
-    /// not move the checkpoint this deletes below. Those files therefore sit
-    /// at or past the latest checkpoint, never below it, and are not deleted
-    /// until a checkpoint after them has been committed and, if they were
-    /// never published, until they are older than `grace`.
+    /// the writer, under a name of their own: a flush's and a merge's under
+    /// the position of the partition they were built from, a restore's
+    /// under the position it commits, which is past that. All of them, like
+    /// this, hold the building lock from before they read the partition
+    /// until they commit or fail. Only they commit checkpoints, so none is
+    /// committed past the partition's position while such files wait to be
+    /// published, and log commits do not move the checkpoint this deletes
+    /// below. Those files therefore sit at or past the latest checkpoint,
+    /// never below it, and are not deleted until a checkpoint after them
+    /// has been committed and, if they were never published, until they
+    /// are older than `grace`.
     ///
     /// The building lock is held until the last file is deleted, not only
     /// while what to delete is worked out. Let go before, a restore could
