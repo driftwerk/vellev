@@ -369,6 +369,14 @@ impl Copied {
         self.withheld + self.unknown + self.left + self.barred
     }
 
+    /// Count an object settled as another writer's, or withheld, as
+    /// such: what a run that copies says of every such object it
+    /// settles, besides what [`Self::count`] says of each.
+    fn mark(&mut self, settled: &Settled) {
+        self.kept += u64::from(*settled == Settled::Foreign);
+        self.withheld += u64::from(*settled == Settled::Withheld);
+    }
+
     fn count(&mut self, id: ObjectId, settled: Settled) {
         match settled {
             Settled::Stored => self.stored += 1,
@@ -1695,6 +1703,23 @@ impl<'a> Copying<'a> {
         stored.map(Entry::read).transpose()
     }
 
+    /// Whether an entry says all there is to say of an object Weaviate
+    /// lists, last changed at `updated`, so that a run passes it over,
+    /// counting it by its mark; and counted so if it does. Not if it is
+    /// of what was withheld and the run is told whose that is.
+    fn passed(&self, entry: Option<&Entry>, updated: Option<i64>, copied: &mut Copied) -> bool {
+        let said = self.options.sole_writer || self.options.other_writers;
+        let Some(entry) = entry.filter(|entry| entry.listed(updated)) else {
+            return false;
+        };
+        if entry.mark == Mark::Withheld && said {
+            return false;
+        }
+        copied.kept += u64::from(matches!(entry.mark, Mark::Foreign | Mark::Theirs));
+        copied.withheld += u64::from(entry.mark == Mark::Withheld);
+        true
+    }
+
     /// Whether settling the item takes reading what the collection holds
     /// under its id: not while the ledger says the import stored exactly
     /// this, and it is nobody else's; nor of what was said to be another
@@ -2378,7 +2403,6 @@ impl<'a> Copying<'a> {
         let mut entries = Entries::new(&self.plan.ledger, self.options.page, None);
         let mut pacer = Pacer::new(self.options.per_second);
         let mut cursor: Option<(String, ObjectId)> = None;
-        let said = self.options.sole_writer || self.options.other_writers;
         loop {
             let from = cursor.clone();
             let from_id = from.as_ref().map(|(_, id)| *id);
@@ -2406,19 +2430,9 @@ impl<'a> Copying<'a> {
                     unlisted.push(entry);
                 }
                 let entry = entries.at(id).await?;
-                let mark = entry.as_ref().map(|entry| entry.mark);
-                // An entry of an object Weaviate did not hold, or was
-                // found not to, is of another object now.
-                let noted = entry
-                    .as_ref()
-                    .is_some_and(|entry| entry.listed(seen.updated));
-                let owed = mark == Some(Mark::Withheld) && said;
-                if !noted || owed || seen.updated.unwrap_or(i64::MAX) >= since {
+                let before = seen.updated.unwrap_or(i64::MAX) < since;
+                if !(before && self.passed(entry.as_ref(), seen.updated, copied)) {
                     wanted.push((id, entry));
-                } else {
-                    let theirs = matches!(mark, Some(Mark::Foreign | Mark::Theirs));
-                    copied.kept += u64::from(theirs);
-                    copied.withheld += u64::from(mark == Some(Mark::Withheld));
                 }
             }
             let Some((_, through)) = cursor.clone() else {
@@ -2501,9 +2515,9 @@ impl<'a> Copying<'a> {
         };
         let steps = settling.into_iter().map(step).collect();
         let made = self.make(steps, false, copied).await?;
-        let marked = |mark: Settled| made.iter().filter(|(_, settled)| *settled == mark).count();
-        copied.kept += marked(Settled::Foreign) as u64;
-        copied.withheld += marked(Settled::Withheld) as u64;
+        for (_, settled) in &made {
+            copied.mark(settled);
+        }
         Ok(())
     }
 
@@ -2572,8 +2586,7 @@ impl<'a> Copying<'a> {
             let settled = self
                 .settle(id, Now::Holds(&item), Some(entry), false)
                 .await?;
-            copied.kept += u64::from(settled == Settled::Foreign);
-            copied.withheld += u64::from(settled == Settled::Withheld);
+            copied.mark(&settled);
             copied.count(id, settled);
         }
         Ok(true)
@@ -2600,27 +2613,23 @@ impl<'a> Copying<'a> {
         };
         let mut entries = Entries::new(&self.plan.ledger, self.options.page, None);
         let (mut from, mut nth, mut on_page) = (None, 0, 0);
-        let (mut left, mut stale) = (Vec::new(), 0);
+        let (mut asked, mut stale) = (Vec::new(), 0);
         while let Some(entry) = entries.next().await? {
-            let (id, mark, gone) = (entry.id, entry.mark, entry.gone);
-            copied.kept += u64::from(mark == Mark::Theirs && !gone);
-            copied.withheld += u64::from(mark == Mark::Withheld && !gone);
-            let pre = mark == Mark::Unknown || (mark == Mark::Withheld && gone);
-            if pre && self.relisted(&entry, copied).await? {
-                // Counted as a run that copies would settle it.
-            } else if gone || mark == Mark::Unknown {
-                left.push(entry);
+            let id = entry.id;
+            match Self::asks(&entry) {
+                Asks::Nothing => stale += u64::from(self.tally(&entry, Seen::Unasked, copied)),
+                asks => asked.push((entry, asks)),
             }
             on_page += 1;
             if on_page == self.options.page {
-                stale += self.leaving(from, &mut left, copied).await?;
+                stale += self.seeing(from, &mut asked, copied).await?;
                 if picked.next_if_eq(&nth).is_some() {
                     self.compare(from, Some(id), &mut verified).await?;
                 }
                 (from, nth, on_page) = (Some(id), nth + 1, 0);
             }
         }
-        stale += self.leaving(from, &mut left, copied).await?;
+        stale += self.seeing(from, &mut asked, copied).await?;
         if picked.next_if_eq(&nth).is_some() {
             self.compare(from, None, &mut verified).await?;
         }
@@ -2631,59 +2640,108 @@ impl<'a> Copying<'a> {
         Ok((verified, stale))
     }
 
-    /// Count the entries `left`, all of ids after `from`, that are of
-    /// nothing Weaviate holds: each as a run that copies counts it, by
-    /// whether the collection holds its object still. Answers with how
-    /// many of them such a run forgets.
-    async fn leaving(
+    /// What a comparison must find out before it can count an entry as
+    /// a run that copies would: nothing, for one that says Weaviate
+    /// lists its object; and for one that says Weaviate does not, or
+    /// that it is of what the collection held at the taking up, whether
+    /// the collection holds its object still, and, of some, whether
+    /// Weaviate has come to hold the id.
+    fn asks(entry: &Entry) -> Asks {
+        let pre = entry.mark == Mark::Unknown || (entry.mark == Mark::Withheld && entry.gone);
+        match () {
+            _ if pre => Asks::Weaviate,
+            _ if entry.gone => Asks::Collection,
+            _ => Asks::Nothing,
+        }
+    }
+
+    /// Count the entries `asked`, all of ids after `from`, by what was
+    /// to be asked of each: of Weaviate, and of the collection. Answers
+    /// with how many of them a run that copies would forget.
+    async fn seeing(
         &self,
         from: Option<ObjectId>,
-        left: &mut Vec<Entry>,
+        asked: &mut Vec<(Entry, Asks)>,
         copied: &mut Copied,
     ) -> Result<u64> {
-        let Some(through) = left.last().map(|entry| entry.id) else {
-            return Ok(0);
-        };
-        let ids: Vec<ObjectId> = left.iter().map(|entry| entry.id).collect();
-        let held = self.present(from, through, &ids).await?;
-        let stale = |entry: Entry| self.stale(&entry, held.contains(&entry.id), copied);
-        Ok(left.drain(..).map(stale).map(u64::from).sum())
-    }
-
-    /// Whether Weaviate holds after all the id of an entry that says it
-    /// did not when the collection was taken up, or since. A run that
-    /// copies settles such an entry by what Weaviate holds, and it is
-    /// counted here as that run would leave it.
-    async fn relisted(&self, entry: &Entry, copied: &mut Copied) -> Result<bool> {
         let (class, vectors) = (&self.plan.class, self.plan.vectors());
-        let object = self
-            .weaviate
-            .object(class, entry.id, vectors, Asked::Any)
-            .await?;
-        let listed = object.is_some();
-        if let Some(item) = self.items(object.as_slice(), copied)?.pop() {
-            let stored = self.plan.records.get(entry.id).await?;
-            self.relisting(&item, stored.as_ref(), copied);
+        let (mut stale, mut unlisted) = (0, Vec::new());
+        for (entry, asks) in asked.drain(..) {
+            if asks != Asks::Weaviate {
+                unlisted.push(entry);
+                continue;
+            }
+            let object = self
+                .weaviate
+                .object(class, entry.id, vectors, Asked::Any)
+                .await?;
+            match self.items(object.as_slice(), copied)?.pop() {
+                Some(item) => {
+                    let stored = self.plan.records.get(entry.id).await?;
+                    let seen = Seen::Listed(&item, stored.as_ref());
+                    stale += u64::from(self.tally(&entry, seen, copied));
+                }
+                // Listed, and passed over as nothing vellev can hold, as
+                // a run that copies passes it over.
+                None if object.is_some() => {}
+                None => unlisted.push(entry),
+            }
         }
-        Ok(listed)
+        let Some(through) = unlisted.last().map(|entry| entry.id) else {
+            return Ok(stale);
+        };
+        let ids: Vec<ObjectId> = unlisted.iter().map(|entry| entry.id).collect();
+        let held = self.present(from, through, &ids).await?;
+        for entry in unlisted {
+            let seen = Seen::Unlisted {
+                holds: held.contains(&entry.id),
+            };
+            stale += u64::from(self.tally(&entry, seen, copied));
+        }
+        Ok(stale)
     }
 
-    /// Count what was unknown, or withheld and gone, and is listed by
-    /// Weaviate after all, as a run that copies and is told nothing
-    /// leaves it: the import's, if the collection holds exactly what
-    /// Weaviate does, and withheld otherwise.
-    fn relisting(&self, item: &Item, stored: Option<&Stored>, copied: &mut Copied) {
-        let held = stored.and_then(|stored| self.plan.hash(stored));
-        copied.withheld += u64::from(held.as_deref() != Some(item.hash.as_str()));
+    /// Count one entry of the ledger as a run that copies, told
+    /// nothing, would count it, by what was `seen` of its id. Answers
+    /// whether that run would forget it: it then accounts for nothing.
+    fn tally(&self, entry: &Entry, seen: Seen<'_>, copied: &mut Copied) -> bool {
+        match seen {
+            Seen::Unasked => {
+                copied.kept += u64::from(entry.mark == Mark::Theirs);
+                copied.withheld += u64::from(entry.mark == Mark::Withheld);
+                false
+            }
+            Seen::Listed(item, stored) => {
+                let held = stored.and_then(|stored| self.plan.hash(stored));
+                copied.withheld += u64::from(held.as_deref() != Some(item.hash.as_str()));
+                false
+            }
+            Seen::Unlisted { holds } => {
+                let kept = self.keeping(entry, None, holds, copied);
+                kept.iter()
+                    .any(|change| matches!(change, Change::Delete { .. }))
+            }
+        }
     }
 
-    /// Count an entry kept though Weaviate does not hold its id as a run
-    /// that copies does, and say whether that run forgets it: it then
-    /// accounts for nothing, and is not counted at all.
-    fn stale(&self, entry: &Entry, holds: bool, copied: &mut Copied) -> bool {
-        let kept = self.keeping(entry, None, holds, copied);
-        kept.iter()
-            .any(|change| matches!(change, Change::Delete { .. }))
+    /// How a comparison counts the item Weaviate lists, by the ledger's
+    /// entry for it and what the collection holds there.
+    fn compared(&self, entry: Option<&Entry>, item: &Item, stored: Option<&Stored>) -> Found {
+        let hash = stored.and_then(|stored| self.plan.hash(stored));
+        match (entry.map(|entry| entry.mark), stored) {
+            _ if hash.as_ref() == Some(&item.hash) => Found::Same,
+            (None, _) => Found::Unaccounted,
+            (Some(Mark::Foreign | Mark::Theirs), _) => Found::Kept,
+            (Some(Mark::Withheld | Mark::Unknown), _) => Found::Withheld,
+            (Some(Mark::Stored), None) => Found::Missing,
+            (Some(Mark::Stored), Some(_)) => Found::Different,
+        }
+    }
+
+    /// Whether a comparison counts an entry of an id Weaviate does not
+    /// list as gone: if the ledger takes Weaviate to hold it.
+    fn unseen(entry: &Entry) -> bool {
+        !(matches!(entry.mark, Mark::Unknown | Mark::Theirs) || entry.gone)
     }
 
     /// How many objects the collection holds that the ledger has no
@@ -2725,11 +2783,8 @@ impl<'a> Copying<'a> {
         let mut entries = Entries::new(&self.plan.ledger, self.options.page, from);
         let mut cursor = from;
         let within = |id: ObjectId| through.is_none_or(|through| id <= through);
-        // An entry of an id Weaviate does not list: gone, if the ledger
-        // takes Weaviate to hold it.
         let unlisted = |entry: Entry, verified: &mut Verified| {
-            let kept = matches!(entry.mark, Mark::Unknown | Mark::Theirs) || entry.gone;
-            verified.gone += u64::from(!kept);
+            verified.gone += u64::from(Self::unseen(&entry));
             verified.looked += 1;
         };
         loop {
@@ -2757,16 +2812,7 @@ impl<'a> Copying<'a> {
                 }
                 let entry = entries.at(item.id).await?;
                 let stored = held.get(&item.id);
-                let hash = stored.and_then(|stored| self.plan.hash(stored));
-                let found = match (entry.map(|entry| entry.mark), stored) {
-                    _ if hash.as_ref() == Some(&item.hash) => &mut verified.same,
-                    (None, _) => &mut verified.unaccounted,
-                    (Some(Mark::Foreign | Mark::Theirs), _) => &mut verified.kept,
-                    (Some(Mark::Withheld | Mark::Unknown), _) => &mut verified.withheld,
-                    (Some(Mark::Stored), None) => &mut verified.missing,
-                    (Some(Mark::Stored), Some(_)) => &mut verified.different,
-                };
-                *found += 1;
+                *verified.found(self.compared(entry.as_ref(), &item, stored)) += 1;
                 verified.looked += 1;
                 let wrong = (verified.missing + verified.different) as usize;
                 let shown = verified.examples.len();
@@ -2796,6 +2842,52 @@ impl<'a> Copying<'a> {
         verified.unaccounted += unreadable;
         verified.looked += unreadable;
         Ok(())
+    }
+}
+
+/// What a comparison must find out of an entry before it counts it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Asks {
+    Nothing,
+    /// Whether the collection holds its object still.
+    Collection,
+    /// What Weaviate holds under its id, and then what the collection
+    /// does, or whether it holds anything.
+    Weaviate,
+}
+
+/// What a comparison found of an entry's id.
+#[derive(Debug, Clone, Copy)]
+enum Seen<'s> {
+    /// It asked nothing.
+    Unasked,
+    /// Weaviate holds this, and the collection that.
+    Listed(&'s Item, Option<&'s Stored>),
+    /// Weaviate holds nothing, and the collection something or not.
+    Unlisted { holds: bool },
+}
+
+/// How a comparison counts an object Weaviate lists.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Found {
+    Same,
+    Different,
+    Missing,
+    Kept,
+    Withheld,
+    Unaccounted,
+}
+
+impl Verified {
+    fn found(&mut self, found: Found) -> &mut u64 {
+        match found {
+            Found::Same => &mut self.same,
+            Found::Different => &mut self.different,
+            Found::Missing => &mut self.missing,
+            Found::Kept => &mut self.kept,
+            Found::Withheld => &mut self.withheld,
+            Found::Unaccounted => &mut self.unaccounted,
+        }
     }
 }
 
@@ -4678,9 +4770,11 @@ mod tests {
     fn a_comparison_counts_what_weaviate_lists_after_all_as_a_run_that_copies_would_leave_it() {
         let fixture = Fixture::new(options());
         let hen = fixture.item("hen", 2);
+        let unknown = fixture.entry("fox", 1, Mark::Unknown);
         let counted = |stored: Option<&Stored>| {
             let mut copied = Copied::default();
-            fixture.copying().relisting(&hen, stored, &mut copied);
+            let seen = Seen::Listed(&hen, stored);
+            assert!(!fixture.copying().tally(&unknown, seen, &mut copied));
             copied.withheld
         };
         // Lacking, held otherwise, or held as nothing the collection
@@ -4756,7 +4850,8 @@ mod tests {
         let fixture = Fixture::new(options());
         let counted = |entry: &Entry, holds: bool| {
             let mut copied = Copied::default();
-            let stale = fixture.copying().stale(entry, holds, &mut copied);
+            let seen = Seen::Unlisted { holds };
+            let stale = fixture.copying().tally(entry, seen, &mut copied);
             (stale, copied.left, copied.unknown, copied.barred)
         };
         let left = |mark: Mark| Entry {
