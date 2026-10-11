@@ -11,16 +11,40 @@
 //! with their versions and as a walk of pages, and checked against what
 //! the coordinator really recorded, whatever the writers were told.
 //!
-//! A step stands for an hour in the age of a file: the store says each was
-//! written as many hours ago as there have been steps since, so that
-//! cleaning up with a grace of some hours deletes what is older and keeps
-//! what is not, as it does where files age by the clock.
+//! A step takes an hour, and a wait as many more as it says, by the one
+//! clock the coordinator, the store and every writer go by: the store dates
+//! each file by it as the file lands and a writer cleaning up reads it, so
+//! that cleaning up with a grace of some hours deletes what is older and
+//! keeps what is not, and commits pass out of the window a restore may
+//! reach back and are forgotten. What a step leaves to be done on a task of
+//! its own, as a writer deletes files it never published, is done before
+//! the next begins.
+//!
+//! A delete may be given up by whoever asked for it and land later, as a
+//! put may. Every head the coordinator recorded is kept with the rows
+//! committed at it. After every step each of them a restore may still go
+//! to by the coordinator's clock is seen to be listed by the coordinator,
+//! asked by its position and by its time, and no other is; and each that
+//! every clean there has been was to keep is seen to load as those rows. A
+//! clean with nothing in its way must succeed, but for one known to fail,
+//! which must fail just so: see `World::walks_into_what_was_cleaned`.
+//!
+//! One pairing is not made: a restore to a state that a clean was not to
+//! keep, while a delete of one of that state's files, given up, is yet to
+//! land or may come to be. Only a clean with no grace, which no node makes,
+//! keeps less than a restore may go back to; the restore would find the
+//! file there still and put it back into use, and the delete would then
+//! take it, by what the clean was asked and by no fault of the writer.
 
 mod common;
 
+use chrono::{DateTime, SubsecRound};
 use std::collections::VecDeque;
 use vellev_core::{RequestId, Version};
-use vellev_storage::coordinator::{KeyHash, Point, Restore, RestorePoint, Restored, TenantKey};
+use vellev_storage::coordinator::{
+    Clock, KeyHash, Point, Restore, RestorePoint, Restored, TenantKey,
+};
+use vellev_storage::format::{decode_head, Head as Stored};
 
 use common::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
@@ -68,6 +92,26 @@ enum Canary {
     AcknowledgesUnrecordedCommits,
     /// The store accepts a segment and keeps nothing.
     DropsSegments,
+    /// Cleaning up keeps nothing for its age, whatever grace it is asked
+    /// to give.
+    CleansWithNoGrace,
+    /// The coordinator forgets every commit but the newest, whatever
+    /// window it is asked to keep.
+    ForgetsWithinTheWindow,
+    /// A file whose delete was given up is written again once the delete
+    /// has landed, as by a restore that fetches it back from a backup.
+    WritesAgainAfterALateDelete,
+    /// A restore is made to a state no clean was to keep while a delete
+    /// given up is yet to land: the file is there still, the restore's
+    /// checkpoint lists it, and the delete then takes it.
+    RestoresUnderALateDelete,
+    /// The store refuses every delete, and makes none of them.
+    RefusesDeletes,
+    /// The coordinator lets a restore go to a commit by its position for
+    /// twice as long as the window it is asked to keep.
+    ListsOutOfReach,
+    /// The coordinator forgets what it should and says it forgot one more.
+    MiscountsTheForgotten,
 }
 
 #[derive(Debug, Default)]
@@ -75,23 +119,75 @@ struct Faults {
     puts: VecDeque<PutFault>,
     commits: VecDeque<CommitFault>,
     failing_gets: usize,
+    /// How many deletes are answered before one is held, if one is to be.
+    held_delete: Option<usize>,
 }
 
-/// A store that fails on command and records every file it was given, so a
-/// second write to one key is noticed. Whoever asks anything of it waits a
-/// moment for the answer, as of any store, so that what is done at once
-/// takes turns.
+/// A store that fails on command and records every file it was ever given,
+/// deleted since or not, so a second write to one key is noticed. Whoever
+/// asks anything of it waits a moment for the answer, as of any store, so
+/// that what is done at once takes turns.
 #[derive(Debug)]
 struct SimBlobs {
     clean: Arc<dyn Blobs>,
     faults: Arc<Mutex<Faults>>,
     canary: Option<Canary>,
+    /// The clock every file is dated by as it lands.
+    clock: Arc<ManualClock>,
     written: Mutex<BTreeSet<String>>,
+    /// How many files had ever landed when the store was last asked to
+    /// list them, which only a clean asks.
+    listed: AtomicUsize,
     delayed: Mutex<Vec<(String, Bytes)>>,
     rewritten: Mutex<Vec<String>>,
-    /// How many steps the history has taken, and at which each file landed.
-    step: AtomicUsize,
-    landed: Mutex<BTreeMap<String, usize>>,
+    /// The deletes given up by whoever asked for them, which the store has
+    /// yet to make.
+    held: Mutex<Vec<String>>,
+    /// How many of those were held for want of an answer alone: the
+    /// request was dropped while the store had it; and how many deletes
+    /// the store answered as lost.
+    unanswered: AtomicUsize,
+    refused: AtomicUsize,
+    /// How many deletes the store has been asked for, and how many it has
+    /// made.
+    asked: AtomicUsize,
+    deleted: AtomicUsize,
+    /// How many deletes the store has been asked for and has neither
+    /// answered nor seen dropped.
+    deleting: AtomicUsize,
+    /// When each file landed, and how many had before it.
+    landed: Mutex<BTreeMap<String, (DateTime<Utc>, usize)>>,
+    /// Whether the next upload of a file that is not a head is to wait:
+    /// `waiting` is told when it does, and it goes on once `resumed` is.
+    pausing: AtomicBool,
+    waiting: tokio::sync::Notify,
+    resumed: tokio::sync::Notify,
+}
+
+/// A delete the store has been asked for. Dropped unanswered, it is held:
+/// a request given up may be made all the same.
+struct Asked<'a> {
+    blobs: &'a SimBlobs,
+    key: Option<String>,
+    refused: bool,
+}
+
+impl Drop for Asked<'_> {
+    fn drop(&mut self) {
+        self.blobs.deleting.fetch_sub(1, Ordering::SeqCst);
+        if let Some(key) = self.key.take() {
+            self.blobs.held.lock().unwrap().push(key);
+            let unanswered = usize::from(!self.refused);
+            self.blobs
+                .unanswered
+                .fetch_add(unanswered, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The position in the name of a partition's file.
+fn position(key: &str) -> Option<u64> {
+    key.rsplit('/').next()?.get(..20)?.parse().ok()
 }
 
 /// How long a step is, in the age of a file.
@@ -107,12 +203,22 @@ impl SimBlobs {
         if !self.written.lock().unwrap().insert(key.to_string()) {
             self.rewritten.lock().unwrap().push(key.to_string());
         }
-        let step = self.step.load(Ordering::SeqCst);
-        self.landed.lock().unwrap().insert(key.to_string(), step);
+        {
+            let mut landed = self.landed.lock().unwrap();
+            let before = landed.len();
+            let now = self.clock.now();
+            landed.entry(key.to_string()).or_insert((now, before));
+        }
         match self.canary {
             Some(Canary::DropsSegments) if key.contains("/segment/") => Ok(()),
             _ => self.clean.put(key, bytes).await,
         }
+    }
+
+    /// How many deletes the store has been asked for, and how many made.
+    fn deletes(&self) -> (usize, usize) {
+        let asked = self.asked.load(Ordering::SeqCst);
+        (asked, self.deleted.load(Ordering::SeqCst))
     }
 
     async fn deliver_delayed(&self) {
@@ -121,12 +227,65 @@ impl SimBlobs {
             self.land(&key, bytes).await.unwrap();
         }
     }
+
+    async fn remove(&self, key: &str) -> vellev_storage::Result<()> {
+        self.deleted.fetch_add(1, Ordering::SeqCst);
+        self.clean.delete(key).await
+    }
+
+    /// The files there are, and the lowest position of any that landed at
+    /// or after `from`.
+    async fn files(&self, from: DateTime<Utc>) -> (BTreeSet<String>, Option<u64>) {
+        let files = self.clean.list("").await.unwrap();
+        let landed = self.landed.lock().unwrap();
+        let young = files
+            .iter()
+            .filter(|file| landed.get(&file.key).is_some_and(|(at, _)| *at >= from))
+            .filter_map(|file| position(&file.key))
+            .min();
+        (files.into_iter().map(|file| file.key).collect(), young)
+    }
+
+    /// Wait until whatever was asked of the store on a task of its own has
+    /// been answered: a writer deletes the files it uploaded for a commit
+    /// it never tried on one, and the store answers a delete only as the
+    /// clock moves.
+    async fn settle(&self) {
+        loop {
+            tokio::task::yield_now().await;
+            if self.deleting.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Make the deletes that were given up, and say how many there were
+    /// and how many of them took a file that was there still.
+    async fn deliver_held_deletes(&self) -> (usize, usize) {
+        let held = std::mem::take(&mut *self.held.lock().unwrap());
+        let mut took = 0;
+        for key in &held {
+            let there = self.clean.get(key).await.ok();
+            took += usize::from(there.is_some());
+            self.remove(key).await.unwrap();
+            if let (Some(Canary::WritesAgainAfterALateDelete), Some(bytes)) = (self.canary, there) {
+                self.land(key, bytes).await.unwrap();
+            }
+        }
+        (held.len(), took)
+    }
 }
 
 #[async_trait]
 impl Blobs for SimBlobs {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         tokio::task::yield_now().await;
+        let head = key.ends_with(".log") || key.ends_with(".manifest");
+        if !head && self.pausing.swap(false, Ordering::SeqCst) {
+            self.waiting.notify_one();
+            self.resumed.notified().await;
+        }
         let fault = self.faults.lock().unwrap().puts.pop_front();
         match fault {
             None => self.land(key, bytes).await,
@@ -159,34 +318,91 @@ impl Blobs for SimBlobs {
     ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
         tokio::task::yield_now().await;
         let mut listed = self.clean.list(prefix).await?;
-        let (now, step) = (Utc::now(), self.step.load(Ordering::SeqCst));
         let landed = self.landed.lock().unwrap();
+        self.listed.store(landed.len(), Ordering::SeqCst);
         for file in &mut listed {
-            let steps = step - landed.get(&file.key).copied().unwrap_or(step);
-            file.modified = now - STEP * steps as u32;
+            file.modified = landed[&file.key].0;
         }
+        // By name, as a store lists, but for the files of one kind at one
+        // position, whose names differ only in what their writer drew at
+        // random: those as they landed, so that which of two a delete to
+        // be held falls on is not left to the draw.
+        listed.sort_by_key(|file| {
+            let named = file.key.rfind('/').map_or(0, |at| at + 1) + 20;
+            let stem = file.key[..named.min(file.key.len())].to_string();
+            (stem, landed[&file.key].1)
+        });
         Ok(listed)
     }
     /// A delete is answered only once nothing else has anything to do, on
     /// the simulation's clock, which moves only then: whatever may run
-    /// while files are being deleted does, to its end.
+    /// while files are being deleted does, to its end. One the store is to
+    /// hold is answered as lost, and made when the held deletes are.
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        self.deleting.fetch_add(1, Ordering::SeqCst);
+        let mut asked = Asked {
+            blobs: self,
+            key: Some(key.to_string()),
+            refused: false,
+        };
         tokio::time::sleep(Duration::from_millis(1)).await;
-        self.clean.delete(key).await
+        let held = {
+            let mut faults = self.faults.lock().unwrap();
+            let held = faults.held_delete == Some(0);
+            faults.held_delete = faults.held_delete.and_then(|after| after.checked_sub(1));
+            held
+        };
+        if held {
+            asked.refused = true;
+            self.refused.fetch_add(1, Ordering::SeqCst);
+            return Err(lost());
+        }
+        asked.key = None;
+        if self.canary == Some(Canary::RefusesDeletes) {
+            self.refused.fetch_add(1, Ordering::SeqCst);
+            return Err(lost());
+        }
+        self.remove(key).await
     }
 }
 
-/// A coordinator that fails on command, counts the commits it recorded, and
-/// notes any it recorded for a lease that was no longer the current one.
+/// A head the coordinator recorded, and when by its clock.
+#[derive(Debug, Clone, PartialEq)]
+struct Head {
+    position: LogPosition,
+    key: ManifestRef,
+    at: DateTime<Utc>,
+    /// Whether the commit that made it was a restore.
+    restore: bool,
+}
+
+/// A coordinator that fails on command, counts the commits it recorded,
+/// keeps every head they made, and notes any commit it recorded for a
+/// lease that was no longer the current one.
 #[derive(Debug)]
 struct SimCoordinator {
     clean: Arc<MemoryCoordinator>,
+    clock: Arc<ManualClock>,
+    /// Every head recorded, oldest first. A commit made again, which the
+    /// coordinator answers as it did, makes none.
+    heads: Mutex<Vec<Head>>,
     faults: Arc<Mutex<Faults>>,
     canary: Option<Canary>,
     recorded: AtomicUsize,
     /// How many of the commits recorded made a restore.
     restores: AtomicUsize,
     unfenced: Mutex<Vec<String>>,
+}
+
+impl SimCoordinator {
+    /// How many of the heads recorded are logs, as every write's is and no
+    /// checkpoint's.
+    fn logs(&self) -> usize {
+        let heads = self.heads.lock().unwrap();
+        let logs = heads.iter().filter(|head| head.key.0.ends_with(".log"));
+        logs.count()
+    }
 }
 
 #[async_trait]
@@ -223,6 +439,20 @@ impl Coordinator for SimCoordinator {
                 self.recorded.fetch_add(1, Ordering::SeqCst);
                 let restores = usize::from(commit.restore.is_some());
                 self.restores.fetch_add(restores, Ordering::SeqCst);
+                let mut heads = self.heads.lock().unwrap();
+                let newest = heads.last().map(|head: &Head| head.position);
+                if let Some(key) = commit
+                    .manifest
+                    .clone()
+                    .filter(|_| newest.is_none_or(|newest| commit.log_position > newest))
+                {
+                    heads.push(Head {
+                        position: commit.log_position,
+                        key,
+                        at: self.clock.now().trunc_subsecs(6),
+                        restore: commit.restore.is_some(),
+                    });
+                }
                 if committed.generation != lease.generation {
                     let stale = format!("{:?} at {:?}", lease.generation, commit.log_position);
                     self.unfenced.lock().unwrap().push(stale);
@@ -307,6 +537,10 @@ impl Coordinator for SimCoordinator {
         point: Point,
         window: Duration,
     ) -> Result<Option<RestorePoint>, CoordinatorError> {
+        let window = match (self.canary, point) {
+            (Some(Canary::ListsOutOfReach), Point::Position(_)) => window * 2,
+            _ => window,
+        };
         self.clean.restore_point(key, point, window).await
     }
 
@@ -323,7 +557,15 @@ impl Coordinator for SimCoordinator {
         key: &PartitionKey,
         window: Duration,
     ) -> Result<u64, CoordinatorError> {
-        self.clean.forget_history(key, window).await
+        let window = match self.canary {
+            Some(Canary::ForgetsWithinTheWindow) => Duration::ZERO,
+            _ => window,
+        };
+        let forgotten = self.clean.forget_history(key, window).await?;
+        Ok(match self.canary {
+            Some(Canary::MiscountsTheForgotten) => forgotten + 1,
+            _ => forgotten,
+        })
     }
 
     async fn restored(
@@ -500,6 +742,14 @@ enum Action {
         rows: u64,
         delete: Option<usize>,
     },
+    /// A write as [`Action::Write`] makes, made while a checkpoint is
+    /// being written: the checkpoint is built of the rows there were when
+    /// it began, and replays the write over them.
+    WriteBesideFlush {
+        who: Who,
+        rows: u64,
+        delete: Option<usize>,
+    },
     /// A request of its own that changes one of the rows there are, or
     /// deletes it, only if it is at the version a reader last gave for
     /// it or, when not `fresh`, at a version nothing is at.
@@ -545,6 +795,16 @@ enum Action {
     FailCommits(CommitFault, usize),
     FailReads(usize),
     DeliverDelayed,
+    /// The store answers so many deletes and then holds one, which whoever
+    /// asked for it is told was lost.
+    DelayDelete(usize),
+    /// The store makes the deletes that were given up.
+    DeliverDelayedDeletes,
+    /// So many hours pass with nothing done.
+    Wait(usize),
+    /// The coordinator forgets the commits no restore may go back to, as a
+    /// node has it do before it cleans.
+    ForgetHistory,
     Follow,
     FollowStale(usize),
 }
@@ -559,7 +819,7 @@ fn action() -> impl Strategy<Value = Action> {
     let commit_fault = prop_oneof![Just(CommitFault::Refuse), Just(CommitFault::LoseResponse)];
     // Three failed tries close a writer, so most runs of faults stop short of that.
     let times = prop_oneof![3 => 1..3usize, 1 => 3..5usize];
-    let delete = prop_oneof![2 => Just(None), 1 => any::<usize>().prop_map(Some)];
+    let delete = || prop_oneof![2 => Just(None), 1 => any::<usize>().prop_map(Some)];
     let beside = prop_oneof![
         3 => Just(None),
         1 => any::<bool>().prop_map(|first| Some((Beside::Flush, first))),
@@ -567,6 +827,7 @@ fn action() -> impl Strategy<Value = Action> {
         2 => any::<bool>().prop_map(|first| Some((Beside::Clean, first))),
     ];
     let write = |(who, rows, delete)| Action::Write { who, rows, delete };
+    let beside_flush = |(who, rows, delete)| Action::WriteBesideFlush { who, rows, delete };
     let conditional = |(who, pick, kind, fresh)| Action::Conditional {
         who,
         pick,
@@ -575,7 +836,8 @@ fn action() -> impl Strategy<Value = Action> {
     };
     let restore = |(who, back, beside)| Action::Restore { who, back, beside };
     prop_oneof![
-        14 => (who(), 1..4u64, delete).prop_map(write),
+        14 => (who(), 1..4u64, delete()).prop_map(write),
+        4 => (who(), 1..4u64, delete()).prop_map(beside_flush),
         6 => (who(), any::<usize>(), 0..4u8, prop_oneof![3 => Just(true), 1 => Just(false)])
             .prop_map(conditional),
         2 => (who(), any::<usize>()).prop_map(|(who, pick)| Action::Again { who, pick }),
@@ -589,6 +851,10 @@ fn action() -> impl Strategy<Value = Action> {
         2 => (commit_fault, times).prop_map(|(fault, times)| Action::FailCommits(fault, times)),
         1 => (1..4usize).prop_map(Action::FailReads),
         1 => Just(Action::DeliverDelayed),
+        1 => (0..6usize).prop_map(Action::DelayDelete),
+        1 => Just(Action::DeliverDelayedDeletes),
+        1 => (1..GRACE).prop_map(Action::Wait),
+        2 => Just(Action::ForgetHistory),
         3 => Just(Action::Follow),
         1 => any::<usize>().prop_map(Action::FollowStale),
     ]
@@ -747,6 +1013,39 @@ fn snapshot_walked(state: &State, step: usize) -> std::result::Result<Snapshot, 
     Ok(snapshot(state))
 }
 
+/// A head the coordinator recorded and the rows committed at it.
+#[derive(Debug)]
+struct Recorded {
+    head: Head,
+    rows: Rows,
+}
+
+/// Where, in `heads`, those to be had still begin, when those `within` are
+/// and the one before them is, which is how the partition stood when they
+/// began: what the coordinator lets a restore go back to, of commits and a
+/// window, and what a clean keeps, of files and a grace.
+fn reach(heads: &[Recorded], within: impl Fn(&Recorded) -> bool) -> usize {
+    heads
+        .partition_point(|head| !within(head))
+        .saturating_sub(1)
+}
+
+/// How far back a restore may go, as the coordinator is asked.
+const REACH: Duration = Duration::from_secs(STEP.as_secs() * WINDOW as u64);
+
+/// What is in the way of a clean.
+#[derive(Debug, Clone, PartialEq)]
+enum Way {
+    /// A fault to come, or a writer not the partition's own, not open or
+    /// not abreast of what is committed: the clean may fail or not.
+    Hindered,
+    /// Nothing: the clean must succeed.
+    Clear,
+    /// Nothing but DW-681, by which the clean fails for this head
+    /// missing: see `World::walks_into_what_was_cleaned`.
+    KnownToFail(String),
+}
+
 /// A writer, and whether it can still commit. Any failed write closes one,
 /// and so does anything else that leaves it saying it is closed.
 struct Seat {
@@ -776,7 +1075,22 @@ struct World {
     /// Every head there has been, each a state to go back to, with the
     /// step it was first seen at.
     points: Vec<(usize, Committed)>,
-    /// The step at which a clean last deleted anything.
+    /// Every head the coordinator recorded, oldest first: `points` and
+    /// whatever was committed and then committed over within one step.
+    heads: Vec<Recorded>,
+    /// How many of them the coordinator was last told to forget.
+    forgotten: usize,
+    /// The time from which every clean so far was to keep what was
+    /// committed, with the head before it: the latest any of them began
+    /// its grace, as a clean with none begins it as it is made.
+    kept_from: DateTime<Utc>,
+    /// How many deletes had been given up unanswered, and how many
+    /// answered as lost, when that was last looked at.
+    given_up: (usize, usize),
+    /// How many heads had been loaded when those kept last were, and how
+    /// many deletes the store had made.
+    loaded: (usize, usize),
+    /// The step at which the store last deleted anything.
     cleaned_at: Option<usize>,
     step: usize,
     made: Made,
@@ -792,6 +1106,63 @@ struct Made {
     aged: usize,
     restores: usize,
     raced: usize,
+    /// Times the store was told to hold a delete, and the deletes it held:
+    /// the one it was told to, and every other given up with it.
+    delays: usize,
+    held: usize,
+    /// Times held deletes were made, and how many of them took a file that
+    /// was there still.
+    deliveries: usize,
+    late: usize,
+    /// Waits, and the heads that had passed out of a restore's reach by
+    /// the end.
+    waits: usize,
+    passed: usize,
+    /// Times the coordinator was told to forget, and the commits it forgot.
+    forgets: usize,
+    forgotten: usize,
+    /// Heads other than the newest loaded and compared with what was
+    /// committed at them.
+    reloaded: usize,
+    /// Restores recorded while a delete given up was yet to land, and
+    /// those not made because it would have taken what they put back.
+    under: usize,
+    avoided: usize,
+    /// Cleans that had nothing in their way and so had to succeed, and
+    /// those known to fail all the same, which did not have to.
+    unhindered: usize,
+    excused: usize,
+    /// Checkpoints recorded, and those of them that replay logs committed
+    /// while they were written.
+    checkpoints: usize,
+    replaying: usize,
+}
+
+impl Made {
+    fn and(self, other: Self) -> Self {
+        Self {
+            merges: self.merges + other.merges,
+            cleaned: self.cleaned + other.cleaned,
+            aged: self.aged + other.aged,
+            restores: self.restores + other.restores,
+            raced: self.raced + other.raced,
+            delays: self.delays + other.delays,
+            held: self.held + other.held,
+            deliveries: self.deliveries + other.deliveries,
+            late: self.late + other.late,
+            waits: self.waits + other.waits,
+            passed: self.passed + other.passed,
+            forgets: self.forgets + other.forgets,
+            forgotten: self.forgotten + other.forgotten,
+            reloaded: self.reloaded + other.reloaded,
+            under: self.under + other.under,
+            avoided: self.avoided + other.avoided,
+            unhindered: self.unhindered + other.unhindered,
+            excused: self.excused + other.excused,
+            checkpoints: self.checkpoints + other.checkpoints,
+            replaying: self.replaying + other.replaying,
+        }
+    }
 }
 
 /// Merges as soon as two segments lie side by side.
@@ -814,6 +1185,8 @@ impl World {
         let faults = Arc::new(Mutex::new(Faults::default()));
         let coordinator = Arc::new(SimCoordinator {
             clean: cluster.coordinator.clone(),
+            clock: cluster.clock.clone(),
+            heads: Mutex::default(),
             faults: faults.clone(),
             canary,
             recorded: AtomicUsize::new(0),
@@ -824,11 +1197,21 @@ impl World {
             clean: cluster.blobs.clone(),
             faults: faults.clone(),
             canary,
+            clock: cluster.clock.clone(),
             written: Mutex::default(),
+            listed: AtomicUsize::new(0),
             delayed: Mutex::default(),
             rewritten: Mutex::default(),
-            step: AtomicUsize::new(0),
+            held: Mutex::default(),
+            unanswered: AtomicUsize::new(0),
+            refused: AtomicUsize::new(0),
+            asked: AtomicUsize::new(0),
+            deleted: AtomicUsize::new(0),
+            deleting: AtomicUsize::new(0),
             landed: Mutex::default(),
+            pausing: AtomicBool::new(false),
+            waiting: tokio::sync::Notify::new(),
+            resumed: tokio::sync::Notify::new(),
         });
         let follower = Follower::open(
             cluster.key.clone(),
@@ -841,7 +1224,8 @@ impl World {
         let writer = Writer::open(blobs.clone(), coordinator.clone(), held.clone(), &committed)
             .await
             .unwrap()
-            .merging_with(MERGING);
+            .merging_with(MERGING)
+            .timed_by(cluster.clock.clone());
         let setup = vec![
             create(COLLECTION),
             Mutation::Insert {
@@ -867,6 +1251,11 @@ impl World {
             next_row: 0,
             history: BTreeMap::from([(LogPosition(0), BTreeMap::new())]),
             points: Vec::new(),
+            heads: Vec::new(),
+            forgotten: 0,
+            kept_from: DateTime::<Utc>::MIN_UTC,
+            given_up: (0, 0),
+            loaded: (0, 0),
             cleaned_at: None,
             step: 0,
             made: Made::default(),
@@ -894,7 +1283,9 @@ impl World {
                 committed,
             );
             if let Ok(writer) = opened.await {
-                let writer = writer.merging_with(MERGING);
+                let writer = writer
+                    .merging_with(MERGING)
+                    .timed_by(self.cluster.clock.clone());
                 self.seats.push(Seat { writer, open: true });
                 return;
             }
@@ -916,7 +1307,13 @@ impl World {
         }
     }
 
-    async fn write(&mut self, who: Who, rows: u64, delete: Option<usize>) -> Violation {
+    async fn write(
+        &mut self,
+        who: Who,
+        rows: u64,
+        delete: Option<usize>,
+        beside_a_flush: bool,
+    ) -> Violation {
         let rows: Vec<u64> = (self.next_row..self.next_row + rows).collect();
         self.next_row += rows.len() as u64;
         let attempt = self.attempts.len() as i64;
@@ -955,7 +1352,8 @@ impl World {
             recorded: false,
             refused: false,
         });
-        self.attempt(who, self.attempts.len() - 1).await
+        let made = self.attempts.len() - 1;
+        self.attempt(who, made, beside_a_flush).await
     }
 
     /// A write to one of the rows a reader last saw, conditional on the
@@ -1026,7 +1424,7 @@ impl World {
             recorded: false,
             refused: false,
         });
-        self.attempt(who, self.attempts.len() - 1).await
+        self.attempt(who, self.attempts.len() - 1, false).await
     }
 
     /// Make the request of attempt `made`, for the first time or again. One
@@ -1034,14 +1432,51 @@ impl World {
     /// refused; any other is made now if its commit is recorded, or
     /// refused for good by that commit, which is what a conditional
     /// request whose condition does not hold comes to.
-    async fn attempt(&mut self, who: Who, made: usize) -> Violation {
+    ///
+    /// `beside_a_flush`, the request is made while a checkpoint is being
+    /// written: after the checkpoint has taken the rows it is of, and
+    /// before it has uploaded the segment of them, if it has any to
+    /// write. The checkpoint's commit is recorded like any other, so there
+    /// the request's was if a log was: a write's head is a log and a
+    /// checkpoint's is not.
+    async fn attempt(&mut self, who: Who, made: usize, beside_a_flush: bool) -> Violation {
         let seat = self.seat(who).await;
         let before = self.coordinator.recorded.load(Ordering::SeqCst);
+        let logged = self.coordinator.logs();
         let batch = self.attempts[made].batch.clone();
         let writer = &self.seats[seat].writer;
-        let outcome = writer.commit_batches(vec![batch], Embedded::new()).await;
+        let writing = writer.commit_batches(vec![batch], Embedded::new());
+        let (outcome, committed) = match beside_a_flush {
+            true => {
+                // The checkpoint is written as far as its first upload,
+                // which the store keeps waiting; the request is made, and
+                // the checkpoint then goes on. Were the two left to take
+                // turns as they came, which came first would lie with the
+                // threads that build a segment and encode a commit, and no
+                // history would be made the same way twice.
+                let flushing = writer.flush();
+                tokio::pin!(flushing);
+                self.blobs.pausing.store(true, Ordering::SeqCst);
+                let paused = tokio::select! {
+                    biased;
+                    _ = &mut flushing => false,
+                    () = self.blobs.waiting.notified() => true,
+                };
+                self.blobs.pausing.store(false, Ordering::SeqCst);
+                let outcome = writing.await;
+                if paused {
+                    self.blobs.resumed.notify_one();
+                    let _ = flushing.await;
+                }
+                (outcome, self.coordinator.logs() > logged)
+            }
+            false => {
+                let outcome = writing.await;
+                let recorded = self.coordinator.recorded.load(Ordering::SeqCst);
+                (outcome, recorded > before)
+            }
+        };
         let outcome = outcome.and_then(|mut answers| answers.pop().expect("one batch"));
-        let committed = self.coordinator.recorded.load(Ordering::SeqCst) > before;
         self.seats[seat].open = !self.seats[seat].writer.is_closed();
 
         // Whether a conditional request's object is at its version in
@@ -1130,13 +1565,20 @@ impl World {
         rows
     }
 
-    /// Flush, merge or clean from `writer`, and say how many files a clean
-    /// deleted.
-    async fn beside(writer: &Writer, beside: Beside, grace: Duration) -> (usize, usize) {
+    /// Flush, merge or clean from `writer`, and say how many merges were
+    /// made and what came of a clean.
+    async fn beside(
+        writer: &Writer,
+        beside: Beside,
+        grace: Duration,
+    ) -> (usize, vellev_storage::Result<usize>) {
         match beside {
-            Beside::Flush => writer.flush().await.map_or((0, 0), |_| (0, 0)),
-            Beside::Merge => (usize::from(matches!(writer.merge().await, Ok(Some(_)))), 0),
-            Beside::Clean => (0, writer.clean(grace).await.unwrap_or(0)),
+            Beside::Flush => writer.flush().await.map_or((0, Ok(0)), |_| (0, Ok(0))),
+            Beside::Merge => (
+                usize::from(matches!(writer.merge().await, Ok(Some(_)))),
+                Ok(0),
+            ),
+            Beside::Clean => (0, writer.clean(grace).await),
         }
     }
 
@@ -1158,6 +1600,30 @@ impl World {
         else {
             return Ok(());
         };
+        // Only the partition's own writer cleans with no grace.
+        let grace = match who {
+            Who::Current => Duration::ZERO,
+            Who::Any(_) => STEP * GRACE as u32,
+        };
+        let cleaning = matches!(beside, Some((Beside::Clean, _))).then_some(grace);
+        // What begins first takes the building lock first, and holds it
+        // until it is done.
+        let clean_first = matches!(beside, Some((Beside::Clean, true)));
+        let made_anyway = self.blobs.canary == Some(Canary::RestoresUnderALateDelete);
+        if !made_anyway
+            && self
+                .taken_by_a_late_delete(&point, cleaning, clean_first)
+                .await
+        {
+            self.made.avoided += 1;
+            return Ok(());
+        }
+        let under = !self.blobs.held.lock().unwrap().is_empty();
+        let way = match cleaning {
+            Some(grace) => Some(self.way(seat, grace, true).await),
+            None => None,
+        };
+        let landed = self.blobs.landed.lock().unwrap().len();
         let faulty = {
             let faults = self.faults.lock().unwrap();
             !faults.puts.is_empty() || !faults.commits.is_empty() || faults.failing_gets > 0
@@ -1170,33 +1636,51 @@ impl World {
             && self.cluster.committed().await.log_position == at;
         let current = abreast && seat + 1 == self.seats.len() && self.seats[seat].open;
         let before = self.coordinator.restores.load(Ordering::SeqCst);
+        let (asked, deleted) = self.blobs.deletes();
+        let given = self.given(grace);
         let writer = &self.seats[seat].writer;
         let restore = Restore {
             request: RequestId::generate(),
             asked: [0; 32],
             from: point.log_position,
-            from_at: Utc::now(),
+            from_at: self.cluster.clock.now(),
         };
         let restoring = writer.restore_recorded(point.manifest.as_ref(), restore, None);
-        // Only the partition's own writer cleans with no grace.
-        let grace = match who {
-            Who::Current => Duration::ZERO,
-            Who::Any(_) => STEP * GRACE as u32,
-        };
         let (outcome, (merged, cleaned)) = match beside {
-            None => (restoring.await, (0, 0)),
-            Some((beside, false)) => tokio::join!(restoring, Self::beside(writer, beside, grace)),
+            None => (restoring.await, (0, Ok(0))),
+            Some((beside, false)) => tokio::join!(restoring, Self::beside(writer, beside, given)),
             Some((beside, true)) => {
-                let (made, outcome) = tokio::join!(Self::beside(writer, beside, grace), restoring);
+                let (made, outcome) = tokio::join!(Self::beside(writer, beside, given), restoring);
                 (outcome, made)
             }
         };
         let recorded = self.coordinator.restores.load(Ordering::SeqCst) > before;
         self.seats[seat].open = !self.seats[seat].writer.is_closed();
+        if let (Some(grace), Some(way)) = (cleaning, way) {
+            // Whether the clean listed the files after the restore had
+            // uploaded its own, and so was made after it.
+            let after = self.blobs.listed.load(Ordering::SeqCst) > landed;
+            check(after || clean_first || !recorded, || {
+                format!("a clean begun after a restore to {point:?} was made before it")
+            })?;
+            // What the restore uploaded is young to a clean made after it,
+            // and its head is where that clean walks from: what is in the
+            // way of such a clean is told only now. Whatever the clean
+            // deleted lies before where its walk ended.
+            let way = match (after, way) {
+                (_, Way::Hindered) => Way::Hindered,
+                (true, _) => self.walk(grace).await,
+                (false, way) => way,
+            };
+            self.cleaned(grace, asked);
+            self.came_to(way, &cleaned)?;
+        }
+        let cleaned = cleaned.unwrap_or(0);
         self.made.merges += merged;
         self.made.cleaned += cleaned;
         self.made.raced += usize::from(beside.is_some() && recorded);
-        if cleaned > 0 {
+        self.made.under += usize::from(under && recorded);
+        if self.blobs.deletes().1 > deleted {
             self.cleaned_at = Some(self.step);
         }
         check(recorded || outcome.is_err(), || {
@@ -1222,11 +1706,232 @@ impl World {
         Ok(())
     }
 
+    /// What a clean asked to give `grace` is given.
+    fn given(&self, grace: Duration) -> Duration {
+        match self.blobs.canary {
+            Some(Canary::CleansWithNoGrace) => Duration::ZERO,
+            _ => grace,
+        }
+    }
+
+    /// Note what a clean with `grace` was to keep, if it asked the store
+    /// to delete anything, as the store had been `asked` so many times
+    /// before it: what was committed within its grace and the head before.
+    fn cleaned(&mut self, grace: Duration, asked: usize) {
+        if self.blobs.deletes().0 > asked {
+            self.kept_from = self.kept_from.max(self.young_from(grace));
+        }
+    }
+
+    /// The time from which a file is young to a clean made now with
+    /// `grace`, and a commit one it is to keep: a file just as old as the
+    /// grace is young still.
+    fn young_from(&self, grace: Duration) -> DateTime<Utc> {
+        self.cluster.clock.now() - grace
+    }
+
+    /// Where in `heads` those begin that a restore may go to by the
+    /// coordinator's clock.
+    fn in_reach(&self) -> usize {
+        let start = self.cluster.clock.now() - REACH;
+        reach(&self.heads, |recorded| recorded.head.at >= start)
+    }
+
+    /// Whether a restore to `point`, beside a clean with the grace of
+    /// `cleaning` if beside one, which begins before it if `clean_first`,
+    /// would have what it puts back into use taken by a delete that lands
+    /// late.
+    ///
+    /// A clean holds the building lock until the store has answered every
+    /// delete, but one answered as lost, or dropped with the rest of its
+    /// lot, may be made later all the same. A restore meanwhile to a state
+    /// that lists such a file finds it there still and commits a
+    /// checkpoint that lists it, and the delete then takes it from under
+    /// what is committed. Only a state some clean was not to keep has
+    /// files a clean asked to be deleted, and only a clean with no grace
+    /// keeps less than a restore may go back to: a node cleans with the
+    /// tenant's window and more. So this is what such a clean was asked
+    /// for, and no fault of the writer.
+    ///
+    /// The restore is not made to a state no clean was to keep in just two
+    /// cases. One is that a delete given up and yet to land is of a file
+    /// that state needs: its head, the logs and the checkpoint behind it,
+    /// or a file the checkpoint lists. The other is that such a delete may
+    /// come to be beside it: a clean with no grace begins before the
+    /// restore with a delete to be held. A clean that begins after the
+    /// restore is made after it, from the restore's own head, which lists
+    /// what the state needs, and so asks for none of it; and a clean with
+    /// grace keeps every state a restore here goes to, which is one whose
+    /// head is younger than that grace. Every other restore is made,
+    /// whatever is on its way.
+    async fn taken_by_a_late_delete(
+        &self,
+        point: &Committed,
+        cleaning: Option<Duration>,
+        clean_first: bool,
+    ) -> bool {
+        let kept_from = cleaning.map_or(self.kept_from, |grace| {
+            self.kept_from.max(self.young_from(grace))
+        });
+        let kept = reach(&self.heads, |recorded| recorded.head.at >= kept_from);
+        let at = |recorded: &Recorded| recorded.head.position == point.log_position;
+        if self.heads.iter().position(at).is_some_and(|at| at >= kept) {
+            return false;
+        }
+        let armed = self.faults.lock().unwrap().held_delete.is_some();
+        if armed && clean_first && cleaning.is_some_and(|grace| grace.is_zero()) {
+            return true;
+        }
+        let held = self.blobs.held.lock().unwrap().clone();
+        if held.is_empty() {
+            return false;
+        }
+        let needed = self.needed_at(point.manifest.as_ref()).await;
+        needed.is_some_and(|needed| held.iter().any(|key| needed.contains(key)))
+    }
+
+    /// Every file the state at `head` needs: the head, the logs behind it
+    /// back to its checkpoint, and what that lists. None if any of the
+    /// heads cannot be read.
+    async fn needed_at(&self, head: Option<&ManifestRef>) -> Option<BTreeSet<String>> {
+        let mut needed = BTreeSet::new();
+        let mut cursor = head.map(|head| head.0.clone());
+        while let Some(key) = cursor {
+            let frame = self.blobs.clean.get(&key).await.ok()?;
+            cursor = match decode_head(&key, &frame).ok()? {
+                Stored::Log(log) => log.prev,
+                Stored::Manifest(checkpoint) => {
+                    for segment in checkpoint.segments {
+                        needed.insert(segment.key);
+                        needed.extend(segment.index);
+                        needed.extend(segment.vectors);
+                    }
+                    needed.extend(checkpoint.replay);
+                    None
+                }
+            };
+            needed.insert(key);
+        }
+        Some(needed)
+    }
+
+    /// What is in the way of a clean from `seat` with `grace`, beside a
+    /// restore or by itself. A clean reads and deletes; it uploads nothing
+    /// and commits nothing, so an upload or a commit that is to fail is in
+    /// the way only of a restore beside it, which may then leave anything.
+    async fn way(&self, seat: usize, grace: Duration, beside_a_restore: bool) -> Way {
+        let faulty = {
+            let faults = self.faults.lock().unwrap();
+            let failing = !faults.puts.is_empty() || !faults.commits.is_empty();
+            let failing = beside_a_restore && failing;
+            failing || faults.failing_gets > 0 || faults.held_delete.is_some()
+        };
+        let writer = &self.seats[seat].writer;
+        let at = writer.partition().read(State::position);
+        let abreast = writer.lease().generation == self.held.generation
+            && self.cluster.committed().await.log_position == at;
+        if faulty || !abreast || seat + 1 != self.seats.len() || writer.is_closed() {
+            return Way::Hindered;
+        }
+        self.walk(grace).await
+    }
+
+    /// What is in the way of a clean with `grace` that no fault is and
+    /// whose writer is the partition's own.
+    async fn walk(&self, grace: Duration) -> Way {
+        match self.walks_into_what_was_cleaned(grace).await {
+            Some(head) => Way::KnownToFail(head),
+            None => Way::Clear,
+        }
+    }
+
+    /// See that a clean with `way` before it came to what it had to: with
+    /// nothing in its way it succeeded, and where it is known to fail it
+    /// failed just so, for the very head missing that its walk meets, and
+    /// for nothing else.
+    fn came_to(&mut self, way: Way, cleaned: &vellev_storage::Result<usize>) -> Violation {
+        self.made.unhindered += usize::from(way == Way::Clear);
+        self.made.excused += usize::from(matches!(way, Way::KnownToFail(_)));
+        match (way, cleaned) {
+            (Way::Hindered, _) | (Way::Clear, Ok(_)) => Ok(()),
+            (Way::KnownToFail(head), Err(StorageError::Missing { key })) if *key == head => Ok(()),
+            (Way::KnownToFail(head), Ok(_)) => Err(format!(
+                "a clean known to fail for the head {head} missing succeeded"
+            )),
+            (Way::KnownToFail(head), Err(error)) => Err(format!(
+                "a clean known to fail for the head {head} missing failed otherwise: {error}"
+            )),
+            (Way::Clear, Err(error)) => {
+                Err(format!("a clean failed with nothing in its way: {error}"))
+            }
+        }
+    }
+
+    /// The head a clean with `grace` walks back into that has been
+    /// deleted, for which it fails, if there is one: DW-681. A clean walks
+    /// from the newest head back to the last checkpoint before the oldest
+    /// young file, log by log to the first checkpoint and checkpoint by
+    /// checkpoint from there, and takes it that every one on the way is
+    /// there. One an earlier clean deleted is not. The earlier clean
+    /// deleted every checkpoint before the one its own walk ended at, and
+    /// this walk goes past that one whenever a file young by this clean's
+    /// grace is named at its position or below: at it is enough, since the
+    /// walk ends only at a checkpoint before the oldest young file. Every
+    /// clean then fails until that file is old. The walk is made here over
+    /// the heads the coordinator recorded.
+    ///
+    /// Such a file comes to be without any fault. A merge made while the
+    /// head is a checkpoint names its segment at that checkpoint's
+    /// position, and so does a restore; a clean may keep more than the one
+    /// before it, as one with grace does after one with none, and as a
+    /// node's does once a tenant's window has been made longer; and an
+    /// upload that lands late, or a writer left behind, leaves a file
+    /// under an old position.
+    async fn walks_into_what_was_cleaned(&self, grace: Duration) -> Option<String> {
+        let (files, young) = self.blobs.files(self.young_from(grace)).await;
+        let heads = self.coordinator.heads.lock().unwrap();
+        let newest = heads.last().map_or(0, |head| head.position.0);
+        let floor = young.map_or(newest, |young| newest.min(young.saturating_sub(1)));
+        let mut past_logs = false;
+        for head in heads.iter().rev() {
+            let checkpoint = head.key.0.ends_with(".manifest");
+            if past_logs && !checkpoint {
+                continue;
+            }
+            if !files.contains(&head.key.0) {
+                return Some(head.key.0.clone());
+            }
+            if checkpoint && head.position.0 <= floor {
+                break;
+            }
+            past_logs |= checkpoint;
+        }
+        None
+    }
+
+    /// Let `hours` pass, for the store and for the coordinator alike.
+    fn pass(&mut self, hours: usize) {
+        self.step += hours;
+        self.cluster.clock.advance(STEP * hours as u32);
+    }
+
+    /// An hour passes and `action` is made in it, with whatever it leaves
+    /// to be done on a task of its own.
     async fn step(&mut self, action: Action) -> Violation {
-        self.step += 1;
-        self.blobs.step.store(self.step, Ordering::SeqCst);
+        self.pass(1);
+        let made = self.act(action).await;
+        self.blobs.settle().await;
+        made
+    }
+
+    async fn act(&mut self, action: Action) -> Violation {
         match action {
-            Action::Write { who, rows, delete } => return self.write(who, rows, delete).await,
+            Action::Write { who, rows, delete } => {
+                return self.write(who, rows, delete, false).await
+            }
+            Action::WriteBesideFlush { who, rows, delete } => {
+                return self.write(who, rows, delete, true).await
+            }
             Action::Conditional {
                 who,
                 pick,
@@ -1237,7 +1942,7 @@ impl World {
                 if self.attempts.is_empty() {
                     return Ok(());
                 }
-                return self.attempt(who, pick % self.attempts.len()).await;
+                return self.attempt(who, pick % self.attempts.len(), false).await;
             }
             Action::Flush { who } => {
                 let seat = self.seat(who).await;
@@ -1256,12 +1961,20 @@ impl World {
                     (Who::Current, false) => Duration::ZERO,
                     _ => STEP * GRACE as u32,
                 };
-                let cleaned = self.seats[seat].writer.clean(grace).await.unwrap_or(0);
+                let (asked, deleted) = self.blobs.deletes();
+                let way = self.way(seat, grace, false).await;
+                let cleaning = self.seats[seat].writer.clean(self.given(grace));
+                let cleaned = cleaning.await;
+                self.cleaned(grace, asked);
+                self.came_to(way, &cleaned)?;
+                let cleaned = cleaned.unwrap_or(0);
                 match grace.is_zero() {
                     true => self.made.cleaned += cleaned,
                     false => self.made.aged += cleaned,
                 }
-                if cleaned > 0 {
+                // Whatever the writer was told: a clean that fails may have
+                // deleted some of what it meant to.
+                if self.blobs.deletes().1 > deleted {
                     self.cleaned_at = Some(self.step);
                 }
                 self.seats[seat].open = !self.seats[seat].writer.is_closed();
@@ -1281,6 +1994,38 @@ impl World {
                 .extend(std::iter::repeat_n(fault, times)),
             Action::FailReads(times) => self.faults.lock().unwrap().failing_gets += times,
             Action::DeliverDelayed => self.blobs.deliver_delayed().await,
+            Action::DelayDelete(after) => {
+                self.faults.lock().unwrap().held_delete = Some(after);
+                self.made.delays += 1;
+            }
+            Action::DeliverDelayedDeletes => {
+                let (held, took) = self.blobs.deliver_held_deletes().await;
+                self.made.deliveries += 1;
+                self.made.held += held;
+                self.made.late += took;
+                if took > 0 {
+                    self.cleaned_at = Some(self.step);
+                }
+            }
+            Action::Wait(hours) => {
+                self.pass(hours);
+                self.made.waits += 1;
+            }
+            Action::ForgetHistory => {
+                let key = &self.cluster.key;
+                let forgot = self.coordinator.forget_history(key, REACH).await;
+                let forgot = forgot.map_err(|error| format!("nothing was forgotten: {error}"))?;
+                self.listed().await?;
+                let passed = self.in_reach() - self.forgotten;
+                self.forgotten += passed;
+                self.made.forgets += 1;
+                self.made.forgotten += forgot as usize;
+                return check(forgot as usize == passed, || {
+                    format!(
+                        "the coordinator forgot {forgot} commits when {passed} had passed out of reach"
+                    )
+                });
+            }
             Action::Follow => return self.follow().await,
             Action::FollowStale(pick) => return self.follow_stale(pick).await,
         }
@@ -1338,6 +2083,186 @@ impl World {
             .read(|state| snapshot_walked(state, self.step))
     }
 
+    /// Keep the heads the coordinator recorded since the last step, each
+    /// with the rows committed at it: those the step ended with for the
+    /// head of a write or of a restore, and for a checkpoint's, which
+    /// changes none, those of the head before it.
+    fn record(&mut self, expected: &Rows, committed: &Committed) -> Violation {
+        let heads = self.coordinator.heads.lock().unwrap();
+        let mut rows = match self.heads.last() {
+            Some(newest) => newest.rows.clone(),
+            None => expected.clone(),
+        };
+        for head in &heads[self.heads.len()..] {
+            if head.restore || head.key.0.ends_with(".log") {
+                rows.clone_from(expected);
+            }
+            self.heads.push(Recorded {
+                head: head.clone(),
+                rows: rows.clone(),
+            });
+        }
+        let newest = heads.last().map(|head| (head.position, &head.key));
+        let head = committed.manifest.as_ref();
+        check(
+            newest == head.map(|head| (committed.log_position, head)),
+            || format!("{committed:?} is committed, and the newest head recorded is {newest:?}"),
+        )?;
+        check(rows == *expected, || {
+            format!("the rows committed changed with no write or restore recorded: {heads:?}")
+        })
+    }
+
+    /// Count the checkpoints among the heads recorded from the `had`th on,
+    /// and those of them that replay logs.
+    async fn count_checkpoints(&mut self, had: usize) {
+        for recorded in &self.heads[had..] {
+            let key = &recorded.head.key.0;
+            let Ok(frame) = self.blobs.clean.get(key).await else {
+                continue;
+            };
+            if let Ok(Stored::Manifest(checkpoint)) = decode_head(key, &frame) {
+                self.made.checkpoints += 1;
+                self.made.replaying += usize::from(!checkpoint.replay.is_empty());
+            }
+        }
+    }
+
+    /// See that the coordinator lists for a restore just the heads in
+    /// reach: every head recorded within the window, as its clock has it,
+    /// and the one before them, whatever it has been told to forget. Asked
+    /// by position it lists each of those and no other; asked by a time
+    /// within the window it lists the newest recorded by then, and asked
+    /// by one before the window, none.
+    async fn listed(&self) -> Violation {
+        let reach = self.in_reach();
+        let start = self.cluster.clock.now() - REACH;
+        let coordinator = &self.coordinator;
+        for (index, recorded) in self.heads.iter().enumerate() {
+            let head = &recorded.head;
+            let listed = coordinator
+                .restore_point(&self.cluster.key, Point::Position(head.position), REACH)
+                .await
+                .map_err(|error| format!("the coordinator lists no restore points: {error}"))?;
+            let point = RestorePoint {
+                position: head.position,
+                head: head.key.clone(),
+                at: head.at,
+            };
+            match (index >= reach, listed) {
+                (true, None) => {
+                    return Err(format!(
+                        "a restore point within reach is not listed by the coordinator: {point:?}"
+                    ))
+                }
+                (false, Some(listed)) => {
+                    return Err(format!(
+                        "the coordinator lists a restore point out of reach: {listed:?}"
+                    ))
+                }
+                (true, Some(listed)) => check(listed == point, || {
+                    format!("the coordinator lists {listed:?} where {point:?} was recorded")
+                })?,
+                (false, None) => {}
+            }
+            let listed = coordinator
+                .restore_point(&self.cluster.key, Point::At(head.at), REACH)
+                .await
+                .map_err(|error| format!("the coordinator lists no restore points: {error}"))?;
+            let by_then = self.heads.partition_point(|other| other.head.at <= head.at);
+            let newest = &self.heads[by_then - 1].head;
+            let point = (head.at >= start).then(|| RestorePoint {
+                position: newest.position,
+                head: newest.key.clone(),
+                at: newest.at,
+            });
+            match (point, listed) {
+                (Some(point), None) => {
+                    return Err(format!(
+                        "a restore point within reach is not listed by the coordinator \
+                         for its time: {point:?}"
+                    ))
+                }
+                (None, Some(listed)) => {
+                    return Err(format!(
+                        "the coordinator lists a restore point out of reach, for {:?}: {listed:?}",
+                        head.at
+                    ))
+                }
+                (Some(point), Some(listed)) => check(listed == point, || {
+                    format!(
+                        "the coordinator lists {listed:?} for {:?}, and the newest recorded \
+                         by then is {point:?}",
+                        head.at
+                    )
+                })?,
+                (None, None) => {}
+            }
+        }
+        let ends = coordinator.restore_points(&self.cluster.key, REACH).await;
+        let ends =
+            ends.map_err(|error| format!("the coordinator lists no restore points: {error}"))?;
+        let ends = ends.map(|(oldest, newest)| (oldest.position, newest.position));
+        let reached = &self.heads[reach..];
+        let reached = reached.first().zip(reached.last());
+        let reached = reached.map(|(oldest, newest)| (oldest.head.position, newest.head.position));
+        check(ends == reached, || {
+            format!("the coordinator lists restore points from and to {ends:?}, and in reach are {reached:?}")
+        })
+    }
+
+    /// See that every head that every clean so far was to keep loads, from
+    /// a healthy store, as the rows committed at it: each clean is held to
+    /// its own promise, whatever the coordinator would still let a restore
+    /// go to. A node forgets what is out of the tenant's window and then
+    /// cleans with that window and more for grace, so by its cleans these
+    /// are every head a restore may go to and some more. A clean with no
+    /// grace, which no node makes, was to keep only the newest.
+    ///
+    /// A file once written is never written again, so a head that loaded
+    /// loads until the store deletes something: each is loaded when it is
+    /// first seen and again whenever a delete has been made since. The
+    /// newest is `committed`, read already as the truth.
+    async fn reload(&mut self, committed: &Committed) -> Violation {
+        let kept = reach(&self.heads, |recorded| recorded.head.at >= self.kept_from);
+        let deleted = self.blobs.deletes().1;
+        let newest = self.heads.len() - 1;
+        let from = match deleted > self.loaded.1 {
+            true => kept,
+            false => kept.max(self.loaded.0),
+        };
+        for recorded in &self.heads[from.min(newest)..newest] {
+            let at = Committed {
+                log_position: recorded.head.position,
+                manifest: Some(recorded.head.key.clone()),
+                ..committed.clone()
+            };
+            let key = self.cluster.key.clone();
+            let loaded = Follower::open(key, self.blobs.clean.clone(), &at)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "a head every clean was to keep, {:?}, cannot be loaded: {error}",
+                        recorded.head
+                    )
+                })?;
+            let (position, rows) = loaded.partition().read(snapshot);
+            check(
+                position == recorded.head.position && rows == recorded.rows,
+                || {
+                    format!(
+                        "a head every clean was to keep, {:?}, loads at {position:?} as \
+                         {rows:?}, and {:?} was committed at it",
+                        recorded.head, recorded.rows
+                    )
+                },
+            )?;
+            self.made.reloaded += 1;
+        }
+        self.loaded = (self.heads.len(), deleted);
+        Ok(())
+    }
+
     async fn verify(&mut self) -> Violation {
         let rewritten = self.blobs.rewritten.lock().unwrap().clone();
         check(rewritten.is_empty(), || {
@@ -1381,8 +2306,30 @@ impl World {
         })?;
         self.history.insert(committed.log_position, rows);
         if self.points.last().map(|(_, point)| point) != Some(&committed) {
-            self.points.push((self.step, committed));
+            self.points.push((self.step, committed.clone()));
         }
+        let had = self.heads.len();
+        self.record(&expected, &committed)?;
+        self.count_checkpoints(had).await;
+        self.listed().await?;
+        self.reload(&committed).await?;
+        // A delete is given up unanswered only with one the store answered
+        // as lost: whoever asked for them together stops at the first to
+        // fail. So none is since this was last seen unless one was lost
+        // since, which only a delete that was to be held is.
+        let unanswered = self.blobs.unanswered.load(Ordering::SeqCst);
+        let refused = self.blobs.refused.load(Ordering::SeqCst);
+        let (had_unanswered, had_refused) = self.given_up;
+        check(
+            unanswered == had_unanswered || refused > had_refused,
+            || {
+                format!(
+                    "{} deletes were given up with none of them held",
+                    unanswered - had_unanswered
+                )
+            },
+        )?;
+        self.given_up = (unanswered, refused);
 
         let mut copies = self
             .seats
@@ -1415,10 +2362,14 @@ async fn simulate(actions: Vec<Action>, canary: Option<Canary>) -> Result<Made, 
     }
     world.faults.lock().unwrap().failing_gets = 0;
     world.blobs.deliver_delayed().await;
+    let (held, took) = world.blobs.deliver_held_deletes().await;
+    world.made.held += held;
+    world.made.late += took;
+    world.made.passed = world.in_reach();
     world
         .verify()
         .await
-        .map_err(|violation| format!("after late uploads arrived: {violation}"))?;
+        .map_err(|violation| format!("after late uploads and deletes arrived: {violation}"))?;
     world
         .follow()
         .await
@@ -1457,7 +2408,7 @@ proptest! {
 /// the histories without one made between them.
 fn first_violation(canary: Option<Canary>) -> (Option<String>, Made) {
     let config = Config {
-        cases: 200,
+        cases: 300,
         failure_persistence: None,
         max_shrink_iters: 0,
         ..Config::default()
@@ -1469,11 +2420,7 @@ fn first_violation(canary: Option<Canary>) -> (Option<String>, Made) {
         let mut found = found.lock().unwrap();
         match outcome {
             Ok(made) => {
-                found.1.merges += made.merges;
-                found.1.cleaned += made.cleaned;
-                found.1.aged += made.aged;
-                found.1.restores += made.restores;
-                found.1.raced += made.raced;
+                found.1 = found.1.and(made);
                 Ok(())
             }
             Err(violation) => {
@@ -1483,6 +2430,13 @@ fn first_violation(canary: Option<Canary>) -> (Option<String>, Made) {
         }
     });
     found.into_inner().unwrap()
+}
+
+/// The first violation reported with `canary`, which some history of the
+/// fixed set must meet.
+fn caught(canary: Canary) -> String {
+    let (violation, _) = first_violation(Some(canary));
+    violation.unwrap_or_else(|| panic!("no history caught the canary {canary:?}"))
 }
 
 #[test]
@@ -1496,17 +2450,239 @@ fn the_checker_passes_a_healthy_system_and_catches_a_broken_one() {
         "{made:?}"
     );
     assert!(made.aged > 20 && made.raced > 20, "{made:?}");
+    // So are deletes that land late, commits passing out of reach and being
+    // forgotten, and the loading of heads a restore may still go to.
+    assert!(made.held > 100 && made.late > 100, "{made:?}");
+    assert!(made.passed > 1_000 && made.forgotten > 500, "{made:?}");
+    assert!(made.reloaded > 100 && made.under > 0, "{made:?}");
+    // And checkpoints written while commits go on, which replay them.
+    assert!(made.replaying > 100, "{made:?}");
+    // Cleans alone and beside a restore, and no restore that had no clean
+    // beside it: most have nothing in their way, and few are known to fail.
+    assert!(
+        made.unhindered > 300 && made.unhindered > 10 * made.excused,
+        "{made:?}"
+    );
 
     // A commit acknowledged without being recorded shows up as whichever of
     // its symptoms the history reaches first.
     let symptoms = ["never recorded", "never committed", "was told the counter"];
-    let (unrecorded, _) = first_violation(Some(Canary::AcknowledgesUnrecordedCommits));
-    let unrecorded = unrecorded.unwrap();
+    let unrecorded = caught(Canary::AcknowledgesUnrecordedCommits);
     assert!(
         symptoms.iter().any(|symptom| unrecorded.contains(symptom)),
         "{unrecorded}"
     );
 
-    let dropped = first_violation(Some(Canary::DropsSegments)).0.unwrap();
+    let dropped = caught(Canary::DropsSegments);
     assert!(dropped.contains("cannot be read"), "{dropped}");
+
+    let cleaned = caught(Canary::CleansWithNoGrace);
+    // A clean that keeps too little is caught by the head it left a restore
+    // unable to go to, not by the newest, which it keeps.
+    assert!(
+        cleaned.contains("every clean was to keep") && cleaned.contains("cannot be loaded"),
+        "{cleaned}"
+    );
+
+    let forgotten = caught(Canary::ForgetsWithinTheWindow);
+    assert!(
+        forgotten.contains("is not listed by the coordinator"),
+        "{forgotten}"
+    );
+
+    // The store keeps every key it was ever given, deleted since or not.
+    let rewritten = caught(Canary::WritesAgainAfterALateDelete);
+    assert!(rewritten.contains("written twice"), "{rewritten}");
+
+    let refused = caught(Canary::RefusesDeletes);
+    assert!(
+        refused.contains("a clean failed with nothing in its way"),
+        "{refused}"
+    );
+
+    let listed = caught(Canary::ListsOutOfReach);
+    assert!(
+        listed.contains("the coordinator lists a restore point out of reach"),
+        "{listed}"
+    );
+
+    let miscounted = caught(Canary::MiscountsTheForgotten);
+    assert!(
+        miscounted.contains("commits when") && miscounted.contains("had passed out of reach"),
+        "{miscounted}"
+    );
+}
+
+/// The store of the simulation answers a delete it is to hold as lost and
+/// keeps the file, holds with it whatever delete is dropped unanswered, and
+/// makes them all when told to.
+#[test]
+fn the_store_holds_a_delete_it_gave_up_and_makes_it_later() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let world = World::new(None).await;
+        let blobs = &world.blobs;
+        for key in ["answered", "held", "dropped"] {
+            blobs.put(key, Bytes::from_static(b"file")).await.unwrap();
+        }
+        world.faults.lock().unwrap().held_delete = Some(1);
+        blobs.delete("answered").await.unwrap();
+        let lot = ["held", "dropped"].map(|key| blobs.delete(key));
+        futures::future::try_join_all(lot).await.unwrap_err();
+        assert!(blobs.clean.get("answered").await.is_err());
+        assert!(blobs.clean.get("held").await.is_ok() && blobs.clean.get("dropped").await.is_ok());
+        assert_eq!(blobs.unanswered.load(Ordering::SeqCst), 1);
+
+        assert_eq!(blobs.deliver_held_deletes().await, (2, 2));
+        assert!(
+            blobs.clean.get("held").await.is_err() && blobs.clean.get("dropped").await.is_err()
+        );
+        assert_eq!(blobs.deliver_held_deletes().await, (0, 0));
+    });
+}
+
+/// The one pairing no history makes, and what it comes to when made. Two
+/// segments are merged into one; a clean with no grace asks the store to
+/// delete them and is told the delete was lost; a restore goes back, within
+/// its window, to the checkpoint that lists them, finds them there still
+/// and commits a checkpoint that lists them too; and the delete lands.
+/// Nothing is written twice: the file was there, a head came to name it,
+/// and the delete took it.
+///
+/// The clean was asked to keep nothing of that window, so this is what it
+/// was asked for: a node cleans with the tenant's window and more for
+/// grace, and never with less. A history is spared the restore and nothing
+/// else of it: the delete is held, and lands, all the same.
+#[test]
+fn a_late_delete_takes_what_a_restore_put_back_only_of_a_clean_with_no_grace() {
+    let who = Who::Current;
+    let write = || Action::Write {
+        who,
+        rows: 1,
+        delete: None,
+    };
+    let history = vec![
+        write(),
+        Action::Flush { who },
+        write(),
+        Action::Flush { who },
+        Action::Merge { who },
+        Action::DelayDelete(0),
+        Action::Clean { who, aged: false },
+        Action::Restore {
+            who,
+            back: 1,
+            beside: None,
+        },
+        Action::DeliverDelayedDeletes,
+    ];
+    let made = run(history.clone(), None).unwrap();
+    assert_eq!((made.merges, made.restores, made.avoided), (1, 0, 1));
+    assert!(made.held > 0 && made.late == made.held, "{made:?}");
+
+    let lost = run(history, Some(Canary::RestoresUnderALateDelete)).unwrap_err();
+    assert!(
+        lost.contains("DeliverDelayedDeletes") && lost.contains("cannot be read"),
+        "{lost}"
+    );
+    assert!(!lost.contains("written twice"), "{lost}");
+}
+
+/// A world in which the partition's own writer has made `actions`, an
+/// hour each, and all was well after each.
+async fn after(actions: Vec<Action>) -> World {
+    let mut world = World::new(None).await;
+    for action in actions {
+        world.step(action).await.unwrap();
+        world.verify().await.unwrap();
+    }
+    world
+}
+
+fn paused() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
+
+/// Known to fail, and DW-681: a clean fails for a checkpoint an earlier
+/// clean deleted, whenever a file young by its grace is named at or below
+/// the checkpoint the earlier one deleted up to. Here the file lies below
+/// it, and the second clean is to keep more than the first. The first,
+/// with no grace, deletes every checkpoint before the newest; the second,
+/// with some hours', finds the first segment young, walks back past the
+/// newest checkpoint to the one deleted, and fails. So does every clean
+/// after it until that segment is as old as the grace. A node meets it
+/// when a tenant's window is made longer.
+///
+/// Once it passes, every clean with nothing in its way is to be held to
+/// succeeding, and `Way::KnownToFail` is to go.
+#[test]
+#[should_panic(expected = "DW-681: a clean failed with nothing in its way")]
+fn a_clean_that_keeps_more_than_the_last_fails_for_what_the_last_deleted() {
+    paused().block_on(async {
+        let who = Who::Current;
+        let write = Action::Write {
+            who,
+            rows: 1,
+            delete: None,
+        };
+        let mut world = after(vec![Action::Flush { who }, write, Action::Flush { who }]).await;
+        world.pass(1);
+        let writer = &world.seats[0].writer;
+        assert!(writer.clean(Duration::ZERO).await.unwrap() > 0);
+        if let Err(error) = writer.clean(STEP * GRACE as u32).await {
+            panic!("DW-681: a clean failed with nothing in its way: {error}");
+        }
+    });
+}
+
+/// Known to fail, and DW-681 with one grace throughout, no fault, no file
+/// left under an old position and no writer left behind: what a node does
+/// by itself. Two checkpoints are written and nine hours pass; a clean
+/// with eight hours' grace deletes the first, as it should. A merge, made
+/// while the head is the second checkpoint, names its segment at that
+/// checkpoint's position: a young file at the checkpoint the clean deleted
+/// up to, not below it. The next clean ends its walk only at a checkpoint
+/// before the oldest young file, so it walks past the second checkpoint
+/// to the first, which is deleted, and fails; and so does every clean for
+/// the eight hours until the merged segment is old.
+#[test]
+#[should_panic(expected = "DW-681: a clean failed with nothing in its way")]
+fn a_clean_fails_after_a_merge_for_what_the_clean_before_it_deleted() {
+    paused().block_on(async {
+        let who = Who::Current;
+        let write = || Action::Write {
+            who,
+            rows: 1,
+            delete: None,
+        };
+        let flush = || Action::Flush { who };
+        let world = after(vec![
+            write(),
+            flush(),
+            write(),
+            flush(),
+            Action::Wait(7),
+            Action::Clean { who, aged: true },
+            Action::Merge { who },
+        ])
+        .await;
+        assert!(
+            world.made.aged > 0 && world.made.merges == 1,
+            "{:?}",
+            world.made
+        );
+        assert_eq!((world.made.unhindered, world.made.excused), (1, 0));
+        let grace = STEP * GRACE as u32;
+        if let Err(error) = world.seats[0].writer.clean(grace).await {
+            panic!("DW-681: a clean failed with nothing in its way: {error}");
+        }
+    });
 }
