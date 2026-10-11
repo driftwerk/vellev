@@ -1755,6 +1755,7 @@ async fn a_backups_source_hands_a_file_on_a_part_at_a_time_and_never_reads_it_wh
 
 #[tokio::test]
 async fn nothing_is_written_deleted_or_listed_through_a_backups_source() {
+    use futures::StreamExt;
     let cluster = Cluster::new().await;
     let store = Asked::of_small_parts();
     let backups = Backups::new(store.clone());
@@ -1781,6 +1782,12 @@ async fn nothing_is_written_deleted_or_listed_through_a_backups_source() {
         "tenant-a/0/segment/new.segment",
     ] {
         refused(source.put(key, Bytes::from("x")).await.unwrap_err(), key);
+        // Nor a part at a time, of which none is taken.
+        let untouched = futures::stream::poll_fn(|_| -> std::task::Poll<Option<_>> {
+            panic!("a part was taken");
+        });
+        let in_parts = source.put_parts(key, untouched.boxed()).await;
+        refused(in_parts.unwrap_err(), key);
         refused(source.delete(key).await.unwrap_err(), key);
     }
     for prefix in [prefix.as_str(), "", "_backups/"] {

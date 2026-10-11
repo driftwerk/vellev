@@ -54,6 +54,22 @@ pub trait Blobs: fmt::Debug + Send + Sync {
         use futures::StreamExt;
         futures::stream::once(self.get(key)).boxed()
     }
+    /// Put a file that comes a part at a time, in order, as [`Self::parts`]
+    /// of another store gives one, without ever holding it whole. Nothing
+    /// is under `key` for it until all of it has come: a failure of
+    /// `parts` fails the put and leaves nothing. By default refused, with
+    /// nothing taken from `parts`: a store that gathered them to put the
+    /// file as one would hold it whole, unseen.
+    async fn put_parts(
+        &self,
+        key: &str,
+        _parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+    ) -> Result<()> {
+        Err(StorageError::Blob {
+            key: key.to_string(),
+            source: "this store takes no file a part at a time".into(),
+        })
+    }
     /// Fetch the file afresh into the store's copy of it on local disk, in
     /// place of whatever copy is there, a part at a time and never held
     /// whole in memory, and say where it lies. `None` from a store that
@@ -1067,6 +1083,83 @@ impl Blobs for ObjectBlobs {
             .map(|_| ())
     }
 
+    /// As [`Self::put`] sends the same file, whatever the sizes its parts
+    /// come in: parts of [`Transfers::part_bytes`] and a last one of what
+    /// is left, each sent once it is known that more follows it, or whole
+    /// if a part or less is all that comes. No more than a part of what
+    /// came is held beside what last came; but a piece cut from a part
+    /// that came keeps all of that part alive, so what is held at once is
+    /// as many of the parts that came as one part is cut from, the first
+    /// perhaps only for its end, and the one that came last. An empty one
+    /// is let go at once. How large the file is cannot be known before it
+    /// has come, so one too large for [`MOST_PARTS`] is refused only at the
+    /// first part too many, and what went up of it aborted.
+    async fn put_parts(
+        &self,
+        key: &str,
+        mut parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+    ) -> Result<()> {
+        use futures::TryStreamExt;
+        let path = ObjectPath::from(key);
+        let within = self.transfers.request_within;
+        let part = self.transfers.part_bytes.max(1);
+        let mut upload = Unfinished {
+            upload: None,
+            within,
+        };
+        // What has come and not gone up, no more than a part of it, and
+        // how many parts have.
+        let (mut held, mut holding, mut sent) = (Vec::new(), 0, 0);
+        let too_many = || StorageError::Blob {
+            key: key.to_string(),
+            source: format!("more than {MOST_PARTS} parts of {part} bytes came").into(),
+        };
+        let uploaded = async {
+            while let Some(mut came) = parts.try_next().await? {
+                if came.is_empty() {
+                    continue;
+                }
+                while holding + came.len() > part {
+                    held.push(came.split_to(part - holding));
+                    if upload.upload.is_none() {
+                        let started = bounded(key, within, self.store.put_multipart(&path));
+                        upload.upload = Some(started.await?);
+                    }
+                    if sent == MOST_PARTS {
+                        return Err(too_many());
+                    }
+                    let piece = PutPayload::from_iter(std::mem::take(&mut held));
+                    bounded(key, within, upload.parts().put_part(piece)).await?;
+                    (holding, sent) = (0, sent + 1);
+                }
+                holding += came.len();
+                held.push(came);
+            }
+            let last = PutPayload::from_iter(held);
+            if upload.upload.is_none() {
+                let put = bounded(key, within, self.store.put(&path, last));
+                return put.await.map(|_| ());
+            }
+            if sent == MOST_PARTS {
+                return Err(too_many());
+            }
+            bounded(key, within, upload.parts().put_part(last)).await?;
+            bounded(key, within, upload.parts().complete()).await?;
+            Ok(())
+        }
+        .await;
+        match uploaded {
+            Ok(()) => {
+                upload.upload = None;
+                Ok(())
+            }
+            Err(error) => {
+                upload.abort(key).await;
+                Err(error)
+            }
+        }
+    }
+
     /// A file comes down a range of [`Transfers::part_bytes`] at a time,
     /// each its own request, every range after the first pinned to the
     /// version and size the first was of.
@@ -1233,6 +1326,23 @@ impl CachedBlobs {
         }
     }
 
+    /// Remove the copy on local disk of the file under `key`, if there is
+    /// one, and what was known of it.
+    async fn forget(&self, key: &str) -> Result<()> {
+        let Some(path) = self.path(key) else {
+            return Ok(());
+        };
+        crate::column::forget_summed(&path);
+        let removed = self.disk.run(0, move || match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        });
+        removed.await.map_err(|error| StorageError::Blob {
+            key: key.to_string(),
+            source: error.into(),
+        })
+    }
+
     /// Written under a name of its own and then renamed, so a reader never
     /// sees a partly written file. Nothing is synced: an entry torn by a
     /// crash fails its checksum and is fetched again. The whole of it runs
@@ -1314,6 +1424,28 @@ impl Drop for Partial {
     }
 }
 
+/// The copy of the file under `key` to forget once the file is put, and
+/// forgotten on a task of its own if this is dropped before.
+struct Forgetting {
+    blobs: Option<CachedBlobs>,
+    key: String,
+}
+
+impl Drop for Forgetting {
+    fn drop(&mut self) {
+        let (Some(blobs), Ok(runtime)) = (self.blobs.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let key = std::mem::take(&mut self.key);
+        runtime.spawn(async move {
+            if let Err(error) = blobs.forget(&key).await {
+                tracing::warn!(key, %error, "a copy of a file put in parts was not forgotten");
+            }
+        });
+    }
+}
+
 /// Delete every file under `dir` left part written [`PARTIAL_STALE`] ago
 /// or more, returning how many. A file or directory that cannot be read,
 /// or goes meanwhile, is passed over.
@@ -1351,6 +1483,33 @@ impl Blobs for CachedBlobs {
         Ok(())
     }
 
+    /// Handed to the store as it comes, and no copy of it made: one is
+    /// made when it is first read. Any copy of a file that was under `key`
+    /// goes first, as for [`Self::delete`], and nothing goes up if it
+    /// cannot. Whatever copy there is goes again once the store has
+    /// answered, whether the put succeeded or not, and on a task of its
+    /// own if the put is dropped before: a read while the file went up
+    /// kept a copy of the one that was there. A copy that cannot be
+    /// forgotten then fails the put, though the file may be there. What
+    /// remains is as beside a put: a read that fetched the file that was
+    /// there before this one landed, and keeps its copy after that last
+    /// forgetting, leaves the old copy.
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+    ) -> Result<()> {
+        self.forget(key).await?;
+        let mut forgetting = Forgetting {
+            blobs: Some(self.clone()),
+            key: key.to_string(),
+        };
+        let put = self.inner.put_parts(key, parts).await;
+        let forgot = self.forget(key).await;
+        forgetting.blobs = None;
+        put.and(forgot)
+    }
+
     async fn get(&self, key: &str) -> Result<Bytes> {
         if let Some(path) = self.path(key) {
             if let Some(cached) = self.cached(key, &path).await {
@@ -1374,17 +1533,7 @@ impl Blobs for CachedBlobs {
     /// were the file deleted and its copy left, a read would be answered
     /// with a file the store no longer has.
     async fn delete(&self, key: &str) -> Result<()> {
-        if let Some(path) = self.path(key) {
-            crate::column::forget_summed(&path);
-            let removed = self.disk.run(0, move || match std::fs::remove_file(path) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-                _ => Ok(()),
-            });
-            removed.await.map_err(|error| StorageError::Blob {
-                key: key.to_string(),
-                source: error.into(),
-            })?;
-        }
+        self.forget(key).await?;
         self.inner.delete(key).await
     }
 
