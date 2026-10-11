@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use vellev_storage::backups::{Backup, Backups, Held, Owner, DELETED_AT_ONCE, RECORD_VERSION};
 use vellev_storage::blobs::unanswered;
-use vellev_storage::coordinator::{ClusterId, Lineage};
+use vellev_storage::coordinator::{ClusterId, Lineage, Restore};
 use vellev_storage::{Merging, Transfers};
 
 /// The right to delete backup files, held or not, as a claim would say.
@@ -2058,4 +2058,120 @@ async fn a_backups_source_reads_the_files_of_every_partition_the_backup_lists() 
     let first = file_of(&backup, "segment");
     assert!(first.starts_with(&Layout(&cluster.key).prefix()));
     assert!(source.get(first).await.is_ok(), "and those of the first");
+}
+
+/// A store that gives up the delete of one file, once: the deleter is
+/// told it was lost, and the file is kept, to be deleted later.
+#[derive(Debug)]
+struct GivingUp {
+    inner: Arc<dyn Blobs>,
+    on: Mutex<Option<String>>,
+    given_up: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Blobs for GivingUp {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        let given_up = {
+            let mut on = self.on.lock().unwrap();
+            let it = on.as_deref() == Some(key);
+            it.then(|| on.take()).is_some()
+        };
+        if given_up {
+            self.given_up.lock().unwrap().push(key.to_string());
+            return Err(unanswered(key, Duration::from_secs(187)));
+        }
+        self.inner.delete(key).await
+    }
+}
+
+/// DW-680, T1 for an index file, which a node test cannot make cheaply: a
+/// segment large enough to have one is backed up, merged away and cleaned
+/// with the delete of its index given up unanswered; the partition is put
+/// back from the backup as a node does it today, fetching back what the
+/// store lacks and restoring to the backup's head, and the delete lands.
+/// The head opens, as it does when an index file cannot be read, and must
+/// still have its index to search by.
+#[tokio::test]
+#[should_panic(expected = "DW-680 K3: an index file the head names is not used")]
+async fn a_late_delete_of_an_index_a_backup_lists_leaves_the_partition_restored_from_it_indexed() {
+    let giving_up = Arc::new(GivingUp {
+        inner: memory(),
+        on: Mutex::default(),
+        given_up: Mutex::default(),
+    });
+    let cluster = Cluster {
+        blobs: giving_up.clone(),
+        ..Cluster::new().await
+    };
+    // Merged as soon as two segments lie side by side, the large one too.
+    let writer = written_of_every_kind(&cluster).await.merging_with(Merging {
+        fanout: 2,
+        rows: 1_000_000,
+        clustered_above: 4_000,
+        ..Merging::default()
+    });
+    let backups = Backups::new(memory());
+    let backup = take(&backups, &cluster).await;
+    let index = file_of(&backup, "index").clone();
+
+    writer.commit(vec![upsert("notes", 1, 1)]).await.unwrap();
+    writer.flush().await.unwrap();
+    assert!(writer.merge().await.unwrap().is_some());
+    *giving_up.on.lock().unwrap() = Some(index.clone());
+    assert!(writer.clean(Duration::ZERO).await.is_err());
+    assert_eq!(
+        *giving_up.given_up.lock().unwrap(),
+        std::slice::from_ref(&index)
+    );
+
+    backups
+        .fetch_back(&cluster.blobs, &backup, &Claimed(true))
+        .await
+        .unwrap();
+    let taken = &backup.partitions[0];
+    let restore = Restore {
+        request: RequestId::generate(),
+        asked: [0; 32],
+        from: taken.position,
+        from_at: backup.taken_at,
+    };
+    let head = taken.head.clone().map(ManifestRef);
+    writer
+        .restore_recorded(head.as_ref(), restore, None)
+        .await
+        .unwrap();
+    giving_up.inner.delete(&index).await.unwrap();
+
+    let opened = cluster.open().await;
+    assert_eq!(opened.partition().read(|state| ns(state, &[1])), [Some(10)]);
+    let head = cluster.committed().await.manifest.unwrap().0;
+    let frame = cluster.blobs.get(&head).await.unwrap();
+    let manifest: Manifest = format::decode(&head, Kind::Manifest, &frame).unwrap();
+    let indexed: Vec<(&String, &String)> = manifest
+        .segments
+        .iter()
+        .filter_map(|segment| Some((segment.index.as_ref()?, &segment.key)))
+        .collect();
+    assert!(!indexed.is_empty(), "the head names an index file");
+    for (index, segment) in indexed {
+        let read = match cluster.blobs.get(index).await {
+            Ok(frame) => format::decode::<SegmentIndex>(index, Kind::Index, &frame)
+                .map(|stored| stored.segment == *segment),
+            Err(error) => Err(error),
+        };
+        assert!(
+            matches!(read, Ok(true)),
+            "DW-680 K3: an index file the head names is not used, {index} of {segment}: {read:?}"
+        );
+    }
 }

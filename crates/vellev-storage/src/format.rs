@@ -1162,6 +1162,25 @@ mod tests {
         }
     }
 
+    /// A checkpoint that names one file twice, as no writer makes one, is
+    /// not refused for it: both names are given the file's one new key. A
+    /// restore that is to refuse such a checkpoint must say so itself.
+    #[test]
+    fn a_file_a_checkpoint_names_twice_is_given_its_one_new_key_both_times() {
+        let log = old("log", "00000000000000000015-w");
+        let bare = old("segment", "00000000000000000016-w-5b");
+        let twice = checkpoint(
+            None,
+            vec![segment(bare.clone(), None, None); 2],
+            vec![log.clone(), log.clone()],
+        );
+        let fresh = mapping(&[bare.clone(), log.clone()]);
+        let remapped = twice.remapped("k", &fresh).unwrap();
+        let keys: Vec<&String> = remapped.segments.iter().map(|s| &s.key).collect();
+        assert_eq!(keys, [&fresh[&bare], &fresh[&bare]]);
+        assert_eq!(remapped.replay, [fresh[&log].clone(), fresh[&log].clone()]);
+    }
+
     #[test]
     fn a_checkpoint_remapped_to_the_keys_it_had_is_written_as_it_was() {
         for (case, manifest, names) in checkpoints() {

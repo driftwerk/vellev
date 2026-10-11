@@ -28,6 +28,7 @@ use vellev_storage::coordinator::{
     KeyHash, Lease, LogPosition, ManualClock, MemoryCoordinator, PartitionKey, Point, RestorePoint,
     Restored, TenantKey, Versions, MAX_BACKUP_HOLD,
 };
+use vellev_storage::format::{decode_head, Head};
 use vellev_storage::{Batch, Mutation, Outcome, Refused, State, StorageError, Transfers, Writer};
 
 const LEASE: Duration = Duration::from_secs(30);
@@ -6794,9 +6795,10 @@ async fn a_restore_says_when_what_it_went_back_to_was_as_its_source_says_on_a_cl
 /// A tenants' store that goes wrong as a test has it: the delete of one
 /// file given up unanswered, once, and remembered, to be landed late; a file
 /// written with every delete, as by a node still writing; listings that
-/// fail; a delete that never answers, once it is said to have been sent;
-/// a file that goes just after the next listing; and one that goes as
-/// soon as it is written, every time.
+/// fail; a delete that never answers, once it is said to have been sent,
+/// and remembered, to be landed late; a file that goes just after the next
+/// listing; and one that goes as soon as it is written, every time. It
+/// remembers every key it was given.
 #[derive(Debug)]
 struct Troubled {
     inner: Arc<Store>,
@@ -6807,8 +6809,10 @@ struct Troubled {
     lists_fail: AtomicBool,
     deletes_hang: AtomicBool,
     delete_sent: tokio::sync::Notify,
+    hung: std::sync::Mutex<Vec<String>>,
     lost_after_listing: std::sync::Mutex<Option<String>>,
     lost_as_written: std::sync::Mutex<Option<String>>,
+    put: std::sync::Mutex<Vec<String>>,
 }
 
 impl Troubled {
@@ -6822,8 +6826,10 @@ impl Troubled {
             lists_fail: AtomicBool::new(false),
             deletes_hang: AtomicBool::new(false),
             delete_sent: tokio::sync::Notify::new(),
+            hung: std::sync::Mutex::default(),
             lost_after_listing: std::sync::Mutex::new(None),
             lost_as_written: std::sync::Mutex::new(None),
+            put: std::sync::Mutex::default(),
         })
     }
 }
@@ -6831,6 +6837,7 @@ impl Troubled {
 #[async_trait]
 impl Blobs for Troubled {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.put.lock().unwrap().push(key.to_string());
         self.inner.put(key, bytes).await?;
         let lost = self.lost_as_written.lock().unwrap().as_deref() == Some(key);
         if lost {
@@ -6869,6 +6876,7 @@ impl Blobs for Troubled {
             ));
         }
         if self.deletes_hang.load(Ordering::SeqCst) {
+            self.hung.lock().unwrap().push(key.to_string());
             self.delete_sent.notify_one();
             std::future::pending::<()>().await;
         }
@@ -7108,6 +7116,189 @@ async fn a_restore_looks_again_that_every_file_is_there_just_before_it_commits()
     cluster.clock.advance(LEASE + Duration::from_secs(1));
     let fresh = backing_up_to(&cluster, store);
     assert_eq!(notes_held(&fresh).await, [true, true]);
+}
+
+/// Acme on a node over a troubled store: notes 1 and 2 written, with
+/// `vector` if any, note 1 in a segment, and backed up; then notes 3 to 5
+/// written, a checkpoint made after each, so that once the tenant is
+/// compacted, which merges its four segments first, every file the backup
+/// lists lies below its newest checkpoint, which lists none of them, and
+/// goes. The node is returned with
+/// its cluster, its tenants' store and the backup.
+async fn backed_up_and_merged_past(
+    vector: Option<Vec<f32>>,
+) -> (Cluster, Arc<dyn Blobs>, Arc<Troubled>, Node, Backup) {
+    let cluster = Cluster::new();
+    let store = backup_store();
+    let blobs = Troubled::over(cluster.store.clone());
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over(&cluster, coordinator, blobs.clone(), store.clone());
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let tenant = node.tenant(&acme).await.unwrap();
+    let written = |n, title| note(n, title, vector.clone());
+    tenant
+        .write(vec![schema(EmbeddingProvider::None), written(1, "fox")])
+        .await
+        .unwrap();
+    tenant.flush().await.unwrap();
+    tenant.write(vec![written(2, "hen")]).await.unwrap();
+    let backup = node.back_up(&acme).await.unwrap();
+    for (n, title) in [(3, "owl"), (4, "elk"), (5, "bee")] {
+        tenant.write(vec![written(n, title)]).await.unwrap();
+        tenant.flush().await.unwrap();
+    }
+    drop(tenant);
+    (cluster, store, blobs, node, backup)
+}
+
+/// The one file of `kind` the backup lists, by the directory it lies in.
+fn listed_of_kind(backup: &Backup, kind: &str) -> String {
+    let mut listed = backup
+        .files()
+        .filter(|key| key.contains(&format!("/{kind}/")));
+    let file = listed.next().cloned();
+    assert!(listed.next().is_none(), "the backup lists one {kind} file");
+    file.unwrap_or_else(|| panic!("the backup lists no {kind} file"))
+}
+
+/// Every segment, index and vectors file the checkpoint acme is committed
+/// at names, and the logs it replays.
+async fn named_by_the_head(cluster: &Cluster) -> Vec<String> {
+    let committed = cluster.coordinator.committed(&key("acme")).await.unwrap();
+    let head = committed.and_then(|committed| committed.manifest).unwrap();
+    let frame = cluster.store.get(&head.0).await.unwrap();
+    let Ok(Head::Manifest(checkpoint)) = decode_head(&head.0, &frame) else {
+        panic!("a restore commits a checkpoint, and {head:?} is none");
+    };
+    let segments = checkpoint.segments.into_iter();
+    let named = segments.flat_map(|segment| [Some(segment.key), segment.index, segment.vectors]);
+    named.flatten().chain(checkpoint.replay).collect()
+}
+
+/// Acme restored from `backup` on `node`, which must succeed, and seen to
+/// have put no key the backup lists and to name none: DW-680's rule, that
+/// nothing comes in from outside a tenant's store under the key it had.
+/// It does both today, and a delete of one of those keys sent before the
+/// restore, and landing after it, takes it from under the head.
+async fn restored_under_no_key_the_backup_lists(
+    cluster: &Cluster,
+    blobs: &Troubled,
+    node: &Node,
+    backup: &Backup,
+) {
+    let had = blobs.put.lock().unwrap().len();
+    node.restore_backup(&tenant("acme"), backup.id, RequestId::generate())
+        .await
+        .unwrap();
+    let listed: Vec<&String> = backup.files().collect();
+    let put = blobs.put.lock().unwrap()[had..].to_vec();
+    let put: Vec<&String> = put.iter().filter(|key| listed.contains(key)).collect();
+    let named = named_by_the_head(cluster).await;
+    let named: Vec<&String> = named.iter().filter(|key| listed.contains(key)).collect();
+    assert!(
+        put.is_empty() && named.is_empty(),
+        "DW-680 K4: a restore from a backup put {put:?} and its head names {named:?}, \
+         keys the backup lists"
+    );
+}
+
+/// DW-680, T1: a clean gives up the delete of the one file of `kind` the
+/// backup lists; the tenant is restored from that backup, which it took
+/// itself, and the delete lands. A node with nothing of its own opens the
+/// tenant and holds every note the backup held, and the tenant is backed
+/// up again. With `rule`, the restore is first seen to keep DW-680's rule.
+async fn a_delete_given_up_lands_after_a_restore_from_the_tenants_own_backup(
+    kind: &str,
+    vector: Option<Vec<f32>>,
+    rule: bool,
+) {
+    let (cluster, store, blobs, node, backup) = backed_up_and_merged_past(vector).await;
+    let acme = tenant("acme");
+    let file = listed_of_kind(&backup, kind);
+    *blobs.giving_up_on.lock().unwrap() = Some(file.clone());
+    let cleaned = node.tenant(&acme).await.unwrap();
+    let cleaned = cleaned.compact(Duration::ZERO).await;
+    assert!(cleaned.is_err(), "the clean was told a delete was lost");
+    assert_eq!(*blobs.given_up.lock().unwrap(), std::slice::from_ref(&file));
+    assert!(keys_under(cluster.store.as_ref(), "acme/")
+        .await
+        .contains(&file));
+
+    if rule {
+        restored_under_no_key_the_backup_lists(&cluster, &blobs, &node, &backup).await;
+    } else {
+        node.restore_backup(&acme, backup.id, RequestId::generate())
+            .await
+            .unwrap();
+    }
+    cluster.store.delete(&file).await.unwrap();
+    node.shutdown().await;
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+    let fresh = backing_up_to(&cluster, store);
+    assert_eq!(notes_held(&fresh).await, [true, true]);
+    let held = fresh.tenant(&acme).await.unwrap();
+    assert!(held.read(|state| state.get(&notes(), id(3)).is_none()));
+    fresh.back_up(&acme).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_late_delete_of_a_checkpoint_a_backup_lists_spares_the_tenant_restored_from_it() {
+    a_delete_given_up_lands_after_a_restore_from_the_tenants_own_backup("manifest", None, false)
+        .await;
+}
+
+#[tokio::test]
+async fn a_late_delete_of_a_log_a_backup_lists_spares_the_tenant_restored_from_it() {
+    a_delete_given_up_lands_after_a_restore_from_the_tenants_own_backup("log", None, false).await;
+}
+
+/// The reported bug: the restore finds the segment there still, writes
+/// nothing, and commits a checkpoint that names it; the delete then takes
+/// it, and no node with nothing of its own can open the tenant.
+#[tokio::test]
+#[should_panic(expected = "DW-680 K4: a restore from a backup put")]
+async fn a_late_delete_of_a_segment_a_backup_lists_spares_the_tenant_restored_from_it() {
+    a_delete_given_up_lands_after_a_restore_from_the_tenants_own_backup("segment", None, true)
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "DW-680 K4: a restore from a backup put")]
+async fn a_late_delete_of_a_vectors_file_a_backup_lists_spares_the_tenant_restored_from_it() {
+    let vector = Some(vec![1.0, 0.5]);
+    a_delete_given_up_lands_after_a_restore_from_the_tenants_own_backup("vectors", vector, true)
+        .await;
+}
+
+/// DW-680, T2: a clean's minute runs out with its deletes sent and none
+/// answered, and it returns as if all were well. The tenant is restored
+/// from its own backup, and the deletes land.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "DW-680 K4: a restore from a backup put")]
+async fn deletes_a_clean_stopped_waiting_for_land_after_a_restore_from_the_tenants_own_backup() {
+    let (cluster, store, blobs, node, backup) = backed_up_and_merged_past(None).await;
+    let acme = tenant("acme");
+    blobs.deletes_hang.store(true, Ordering::SeqCst);
+    let cleaned = node.tenant(&acme).await.unwrap();
+    let cleaned = cleaned.compact(Duration::ZERO).await;
+    assert_eq!(cleaned.unwrap(), 0, "a pass that ran out of time");
+    blobs.deletes_hang.store(false, Ordering::SeqCst);
+    let hung = blobs.hung.lock().unwrap().clone();
+    let segment = listed_of_kind(&backup, "segment");
+    assert!(hung.contains(&segment), "{hung:?}");
+    let kept = keys_under(cluster.store.as_ref(), "acme/").await;
+    assert!(hung.iter().all(|key| kept.contains(key)), "{hung:?}");
+
+    restored_under_no_key_the_backup_lists(&cluster, &blobs, &node, &backup).await;
+    for key in &hung {
+        cluster.store.delete(key).await.unwrap();
+    }
+    node.shutdown().await;
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+    let fresh = backing_up_to(&cluster, store);
+    assert_eq!(notes_held(&fresh).await, [true, true]);
+    fresh.back_up(&acme).await.unwrap();
 }
 
 #[tokio::test]
