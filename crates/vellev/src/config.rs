@@ -171,8 +171,27 @@ pub struct Config {
     pub upload_part_mib: u64,
     /// How much longer than a tenant's restore window its files that
     /// nothing reaches any more, such as segments a merge replaced, are
-    /// kept before they are deleted, in seconds.
-    #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 60 * 60)]
+    /// kept before they are deleted, in seconds: at least 900, fifteen
+    /// minutes, and at least three times what one request to object
+    /// storage may take with its tries, or the node does not start. It is
+    /// all that keeps a file a restore within the window names from being
+    /// deleted, where a file is written a little before it is committed
+    /// (its upload, its copy to local disk and three tries to commit), a
+    /// restore waits up to a minute for a clean-up to settle what it
+    /// deletes, and the clocks of the node, the store and Postgres differ.
+    /// The least covers a node set up near its defaults and no more: raise
+    /// this with `VELLEV_LEASE_SECS` and `VELLEV_DATABASE_TIMEOUT_SECS`,
+    /// and with both, as one alone may change nothing, to more than one
+    /// request to the store plus three times the lesser of a quarter of
+    /// the lease and the database timeout, plus some twenty seconds for
+    /// the file's copy to local disk, with room to spare. Nor does it
+    /// cover a head file of more than one part (`VELLEV_UPLOAD_PART_MIB`),
+    /// a reader still fetching a segment of several parts under a short
+    /// restore window of the tenant's own, a clock wrong by more than it,
+    /// or a flush or merge that takes longer than it. Cleaning up by the
+    /// commits Postgres still holds instead of by time is DW-681, with
+    /// DW-668.
+    #[arg(long, env = "VELLEV_GRACE_SECS", default_value_t = 60 * 60, value_parser = clap::value_parser!(u64).range(vellev_node::LEAST_GRACE.as_secs()..))]
     pub grace_secs: u64,
     /// How long a tenant this node writes for may go unused before it is
     /// let go, its memory given back, in seconds.
@@ -514,6 +533,9 @@ impl Config {
                 .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
             ..Settings::new(node)
         };
+        if let Some(problem) = settings.request_bounds.grace_problem(settings.grace) {
+            bail!("VELLEV_GRACE_SECS cannot be as it is set: {problem}");
+        }
         settings
             .check()
             .wrap_err("VELLEV_BACKUP_CLAIM_SECS cannot be as it is set")?;
@@ -783,6 +805,66 @@ mod tests {
             "86401",
         ];
         assert!(Parsed::try_parse_from(too_long).is_err());
+    }
+
+    #[test]
+    fn a_grace_below_fifteen_minutes_or_three_requests_to_the_store_is_refused() {
+        assert_eq!(config(&[]).grace_secs, 60 * 60);
+        assert!(config(&[]).checked().is_ok());
+        // Fifteen minutes at the least, which is more than three requests
+        // to the store as a node is set up to make them: refused as soon
+        // as it is read.
+        let least = vellev_node::RequestBounds::default()
+            .least_grace()
+            .as_secs();
+        assert_eq!(least, 15 * 60, "as the README and the release notes say");
+        assert!(config(&["--grace-secs", &least.to_string()])
+            .checked()
+            .is_ok());
+        let parsed = |secs: u64| {
+            let (secs, required) = (secs.to_string(), ["vellev", "--database-url", "x"]);
+            let rest = ["--store", "memory://", "--grace-secs", &secs];
+            Parsed::try_parse_from(required.iter().chain(&rest)).map(drop)
+        };
+        assert!(parsed(least).is_ok());
+        let refused = parsed(least - 1).unwrap_err().to_string();
+        assert!(refused.contains("--grace-secs"), "{refused}");
+        assert!(refused.contains("899 is not in 900.."), "{refused}");
+        assert!(parsed(0).is_err());
+
+        // A store given longer to answer in takes longer over a request,
+        // and three of them are then the least: with a backup claim long
+        // enough for that store, so that nothing but the grace is refused.
+        let graced = |secs: u64| {
+            let (secs, slow) = (secs.to_string(), ["--store-timeout-secs", "120"]);
+            let rest = ["--backup-claim-secs", "3600", "--grace-secs", &secs];
+            let config = config(&[slow.as_slice(), rest.as_slice()].concat());
+            let request = config.store_client().transfers().request_within;
+            (config.checked().map(drop), request)
+        };
+        let (checked, request) = graced(60 * 60);
+        assert!(checked.is_ok());
+        let least = 3 * request.as_secs();
+        assert_eq!(least, 27 * 60 + 21);
+        assert!(graced(least).0.is_ok());
+        let refused = format!("{:#}", graced(least - 1).0.unwrap_err());
+        assert!(refused.contains("VELLEV_GRACE_SECS"), "{refused}");
+        assert!(refused.contains("at least 1641s"), "{refused}");
+        assert!(!refused.contains("VELLEV_BACKUP_CLAIM_SECS"), "{refused}");
+        let refused = format!("{:#}", graced(15 * 60).0.unwrap_err());
+        assert!(refused.contains("VELLEV_GRACE_SECS"), "{refused}");
+        // And a backup claim too short is still said to be that.
+        let claimed = config(&["--backup-claim-secs", "600"]).checked();
+        let refused = format!("{:#}", claimed.map(drop).unwrap_err());
+        assert!(refused.contains("VELLEV_BACKUP_CLAIM_SECS"), "{refused}");
+        assert!(!refused.contains("VELLEV_GRACE_SECS"), "{refused}");
+        // With both wrong it is the grace that is spoken of, as by
+        // `Settings::check`.
+        let slow = ["--store-timeout-secs", "120", "--grace-secs", "900"];
+        let both = config(&slow).settings(NodeId::generate("node"), None);
+        let refused = format!("{:#}", both.map(drop).unwrap_err());
+        assert!(refused.contains("VELLEV_GRACE_SECS"), "{refused}");
+        assert!(!refused.contains("VELLEV_BACKUP_CLAIM_SECS"), "{refused}");
     }
 
     #[test]

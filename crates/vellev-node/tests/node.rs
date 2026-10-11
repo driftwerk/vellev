@@ -2474,6 +2474,72 @@ async fn how_old_a_tenants_files_are_is_told_by_the_clock_the_node_is_given() {
 }
 
 #[tokio::test]
+async fn a_node_looking_after_a_tenant_keeps_its_files_for_the_grace_it_is_set_to() {
+    let cluster = Cluster::new();
+    let minutes = |n: u64| Duration::from_secs(n * 60);
+    // The tenant is flushed at every write, and looked after once each
+    // flush is made; nothing may be restored, so the grace is all its
+    // files are kept for: thirty minutes, twice the least a node takes
+    // (`LEAST_GRACE`), so that files kept for that least instead are gone
+    // too soon. Not the coordinator's clock, by which the lease runs out.
+    let clock = Arc::new(ManualClock::starting_at(Utc::now()));
+    let node = cluster.node_from(Settings {
+        flush_rows: 1,
+        grace: minutes(30),
+        clock: clock.clone(),
+        ..cluster.settings()
+    });
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    // Two writes, each flushed: the node looks the tenant over after each
+    // flush and before the next, so by the second flush it has looked it
+    // over as it stood at the first.
+    let looked_after = |from: u64| {
+        let acme = acme.clone();
+        async move {
+            for n in from..from + 2 {
+                acme.write(vec![note(n, "fox", None)]).await.unwrap();
+                for _ in 0..500 {
+                    if acme.read(State::unflushed) == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(acme.read(State::unflushed), 0, "flushed at every write");
+            }
+        }
+    };
+    let heads = || async {
+        let mut keys = keys_under(cluster.store.as_ref(), "acme/").await;
+        keys.retain(|key| key.ends_with(".log") || key.ends_with(".manifest"));
+        keys
+    };
+    looked_after(0).await;
+    let first = heads().await;
+    assert!(first.len() >= 4, "{first:?}");
+
+    clock.advance(minutes(20));
+    looked_after(2).await;
+    let kept = heads().await;
+    assert!(
+        first.iter().all(|key| kept.contains(key)),
+        "twenty minutes old, and kept thirty: {first:?} of {kept:?}"
+    );
+
+    clock.advance(minutes(20));
+    looked_after(4).await;
+    let kept = heads().await;
+    assert!(
+        !first.iter().any(|key| kept.contains(key)),
+        "forty minutes old, and nothing reaches them: {first:?} of {kept:?}"
+    );
+    assert_eq!(acme.read(count), 6);
+}
+
+#[tokio::test]
 async fn a_point_past_anything_committed_is_refused_rather_than_waited_for() {
     let cluster = Cluster::new();
     let (writing, reading) = (cluster.node(), cluster.reading_node());
@@ -3851,6 +3917,83 @@ async fn pruning_stops_once_a_renewal_finds_the_claim_lost() {
         [first, second],
         "the older backup is not pruned without the claim"
     );
+}
+
+#[test]
+fn a_grace_below_fifteen_minutes_or_three_requests_to_the_store_is_refused() {
+    let seconds = Duration::from_secs;
+    // A backup claim long enough for every store here, so that nothing
+    // but the grace is refused.
+    let graced = |grace, store| {
+        Settings {
+            grace,
+            backup_claim: seconds(6 * 60 * 60),
+            request_bounds: RequestBounds {
+                store,
+                coordinator: seconds(10),
+            },
+            ..Settings::new(NodeId::generate("node"))
+        }
+        .check()
+    };
+    let refusal = |checked: Result<(), NodeError>| match checked {
+        Err(NodeError::Settings(problem)) => problem,
+        other => panic!("not refused for its settings: {other:?}"),
+    };
+    let just_under = |floor: Duration| floor - Duration::from_millis(1);
+    let unset = Settings::new(NodeId::generate("node"));
+    assert_eq!(unset.grace, seconds(60 * 60));
+    unset.check().unwrap();
+
+    // As a node is set up unless told otherwise, three requests to the
+    // store take less than fifteen minutes, and fifteen minutes it is: to
+    // the millisecond.
+    let floor = vellev_node::LEAST_GRACE;
+    assert_eq!(floor, seconds(15 * 60));
+    let store = RequestBounds::default().store;
+    assert_eq!(store, seconds(187));
+    assert_eq!(RequestBounds::default().least_grace(), floor);
+    graced(floor, store).unwrap();
+    graced(floor + seconds(1), store).unwrap();
+    let refused = refusal(graced(just_under(floor), store));
+    assert!(refused.contains("a grace of 899.999s"), "{refused}");
+    assert!(refused.contains("at least 900s"), "{refused}");
+    assert!(refusal(graced(floor - seconds(1), store)).contains("at least 900s"));
+    assert!(refusal(graced(Duration::ZERO, store)).contains("at least 900s"));
+    // However quick the store, no less.
+    graced(floor, Duration::ZERO).unwrap();
+    assert!(refusal(graced(just_under(floor), Duration::ZERO)).contains("at least 900s"));
+
+    // A store given longer for a request moves the floor up with it, to
+    // three times as long.
+    graced(floor, seconds(300)).unwrap();
+    assert!(refusal(graced(just_under(floor), seconds(300))).contains("at least 900s"));
+    graced(seconds(903), seconds(301)).unwrap();
+    let refused = refusal(graced(just_under(seconds(903)), seconds(301)));
+    assert!(refused.contains("at least 903s"), "{refused}");
+    assert!(refused.contains("object storage, 301s"), "{refused}");
+    graced(seconds(1_200), seconds(400)).unwrap();
+    let refused = refusal(graced(just_under(seconds(1_200)), seconds(400)));
+    assert!(refused.contains("a grace of 1199.999s"), "{refused}");
+    assert!(refused.contains("at least 1200s"), "{refused}");
+    assert!(refusal(graced(floor, seconds(400))).contains("at least 1200s"));
+    assert!(
+        refusal(graced(seconds(60 * 60), seconds(1_201))).contains("at least 3603s"),
+        "the grace a node has unless told otherwise is refused too, under a store that slow"
+    );
+
+    // With a backup claim that cannot be held either, it is the grace
+    // that is spoken of, as by the binary.
+    let both = Settings {
+        grace: Duration::ZERO,
+        backup_claim: seconds(60),
+        ..Settings::new(NodeId::generate("node"))
+    };
+    let claim = both.request_bounds.claim_problem(both.backup_claim);
+    assert!(claim.unwrap().contains("a backup claim of 60s"));
+    let refused = refusal(both.check());
+    assert!(refused.contains("a grace of 0ns"), "{refused}");
+    assert!(!refused.contains("backup claim"), "{refused}");
 }
 
 #[test]

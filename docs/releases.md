@@ -24,6 +24,50 @@ never looks, so that a tenant backed up by both has two sets until the
 window ends, and nothing either release keeps is pruned by the other: see
 `docs/compatibility.md`.
 
+Before you upgrade, look at `VELLEV_GRACE_SECS`: **a node set to a grace
+below the least it may be no longer starts**, where any number, 0 among
+them, used to be taken. The least is fifteen minutes (900), or three times
+what one request to the store may take with its tries where that is longer:
+9 minutes 21 seconds as a node is set up by default, so fifteen minutes,
+and more only where a request is given longer than by default
+(`VELLEV_STORE_TIMEOUT_SECS`, `VELLEV_STORE_MIN_BYTES_PER_SEC`,
+`VELLEV_UPLOAD_PART_MIB`) and `VELLEV_BACKUP_CLAIM_SECS` is raised too:
+at its default of fifteen minutes the backup claim already refuses a
+request of more than four and a half. The grace is how much longer than
+a tenant's restore window a file nothing reaches any more is kept, and it
+is all that keeps cleaning up from deleting a file a restore within the
+window names: it has to cover a file being written a few minutes before
+its commit (its upload, its copy to local disk and three tries to commit:
+3 minutes 51 seconds at most by default), a restore waiting up to a minute
+for a clean-up to settle what it deletes, and what the clocks of the node,
+the store and Postgres differ by. A node left at the default, an hour,
+starts as before.
+
+The least is a stop-gap, and covers a node set up near its defaults and no
+more. It follows the store's bound only, and does not cover a long lease
+with a long database timeout (a file waits for its commit through three
+tries, each a quarter of `VELLEV_LEASE_SECS` or
+`VELLEV_DATABASE_TIMEOUT_SECS` if that is shorter), a head file of more
+than one part (16 MiB by default), a clock wrong by more than the grace,
+or a flush or merge that takes longer than the grace. Nor does it cover a
+reader still fetching a segment of several parts under a short restore
+window of the tenant's own: each file is given two requests a part, 6
+minutes 14 seconds a part by default. Until cleaning up goes by the
+commits Postgres still holds instead of by time (DW-681, with DW-668), a
+node whose lease and database timeout are both longer should have a longer
+grace: more than what one request to the store may take plus three times
+the lesser of a quarter of the lease and the database timeout, plus some
+twenty seconds for the file's copy to local disk, with room to spare.
+Raising one of the two alone may change nothing: it is the lesser that
+counts, so a longer database timeout does nothing while a quarter of the
+lease is shorter, nor a longer lease once a quarter of it is past the
+database timeout.
+
+Whoever builds on `vellev-node` gets the same refusal from
+`Settings::check`, and only by calling it: `Node::new` takes its settings
+as they are. `Writer::clean` and `Tenant::compact` take any grace still,
+and say what the caller then answers for.
+
 ### What a node answers
 
 - **A new code, `model_unavailable` (501)**, where a node used to answer
