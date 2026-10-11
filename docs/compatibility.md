@@ -380,6 +380,44 @@ do the same until every node is 0.2, and may use the query after. A node
 of 0.1 answers objects without `version`, which the client crate reads as
 `None`.
 
+## The Weaviate import
+
+`vellev import weaviate` of one release goes on from where that of the
+release before stopped.
+
+- The state file keeps its fields and their meaning; a release may add
+  fields that the one before ignores.
+- A tenant imported into holds the import's own collections beside the
+  imported ones: `vellev_imported_CLASS` for each class and
+  `vellev_imports`. No Weaviate class can be named so, since theirs begin
+  with a capital. A release may add properties to them, which it does to
+  those already there, and never changes what one means. Each object in
+  them has a version, the first when it says none; an import that reads
+  a later one than it knows stops, and changes nothing.
+- The ledger's hash is of an object as that release's nodes return it.
+  If a release changes how a stored value is written out, the import of
+  that release takes the objects for another writer's and leaves them,
+  rather than replacing or deleting them on a hash it can no longer make.
+  A test holds the hash of fixed objects to what it was.
+- **Numbers.** A node of this release reads the numbers in a request
+  exactly. One of an earlier release read about three in ten doubles
+  with a full set of digits as a neighbouring double, and stored that.
+  Whatever such a node stored stays as it stored it, so a filter for a
+  number equal to one a client sent then may not find it, the stored
+  number being its neighbour; one stored since is found. Storing the
+  object again puts it right. Run no import that keeps a ledger against
+  nodes from before this release: the hashes it would keep are of
+  numbers the node did not store.
+- A collection imported before there was a ledger is taken up, not
+  caught up as it was: what it lacks or holds otherwise is withheld, not
+  copied, what it holds that Weaviate does not is noted and not
+  deleted, and the run fails until one is told whose they are. What a
+  run is told is another writer's stays so in the ledger for as long as
+  the import does. See the README.
+- The report may gain fields. Its exit status is 0 when everything that
+  is the import's is settled, 3 when another run is all it takes, and 1
+  otherwise; before, it was 1 whenever the counts differed.
+
 ## Between nodes
 
 A node sends writes for a tenant on to the node that holds it, marked
