@@ -2154,11 +2154,11 @@ impl World {
     ///
     /// Such a file comes to be without any fault. A merge made while the
     /// head is a checkpoint names its segment at that checkpoint's
-    /// position, and so does a restore; a clean may keep more than the one
-    /// before it, as one with grace does after one with none, and as a
-    /// node's does once a tenant's window has been made longer; and an
-    /// upload that lands late, or a writer left behind, leaves a file
-    /// under an old position.
+    /// position (a restore names its own at the checkpoint it commits,
+    /// past it: DW-685); a clean may keep more than the one before it, as
+    /// one with grace does after one with none, and as a node's does once
+    /// a tenant's window has been made longer; and an upload that lands
+    /// late, or a writer left behind, leaves a file under an old position.
     async fn walks_into_what_was_cleaned(&self, grace: Duration) -> Option<String> {
         let (files, young) = self.blobs.files(self.young_from(grace)).await;
         let heads = self.coordinator.heads.lock().unwrap();
