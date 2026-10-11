@@ -2074,6 +2074,13 @@ impl Blobs for GivingUp {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         self.inner.put(key, bytes).await
     }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await
+    }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         self.inner.get(key).await
     }
@@ -2097,12 +2104,12 @@ impl Blobs for GivingUp {
 /// DW-680, T1 for an index file, which a node test cannot make cheaply: a
 /// segment large enough to have one is backed up, merged away and cleaned
 /// with the delete of its index given up unanswered; the partition is put
-/// back from the backup as a node does it today, fetching back what the
-/// store lacks and restoring to the backup's head, and the delete lands.
+/// back from the backup as a node does it, from the backup's files read by
+/// the keys they had and copied in under keys of the restore's own, and
+/// the delete lands.
 /// The head opens, as it does when an index file cannot be read, and must
 /// still have its index to search by.
 #[tokio::test]
-#[should_panic(expected = "DW-680 K3: an index file the head names is not used")]
 async fn a_late_delete_of_an_index_a_backup_lists_leaves_the_partition_restored_from_it_indexed() {
     let giving_up = Arc::new(GivingUp {
         inner: memory(),
@@ -2134,10 +2141,7 @@ async fn a_late_delete_of_an_index_a_backup_lists_leaves_the_partition_restored_
         std::slice::from_ref(&index)
     );
 
-    backups
-        .fetch_back(&cluster.blobs, &backup, &Claimed(true))
-        .await
-        .unwrap();
+    let source: Arc<dyn Blobs> = Arc::new(backups.source(&backup).unwrap());
     let taken = &backup.partitions[0];
     let restore = Restore {
         request: RequestId::generate(),
@@ -2146,10 +2150,8 @@ async fn a_late_delete_of_an_index_a_backup_lists_leaves_the_partition_restored_
         from_at: backup.taken_at,
     };
     let head = taken.head.clone().map(ManifestRef);
-    writer
-        .restore_recorded(head.as_ref(), restore, None)
-        .await
-        .unwrap();
+    let ready = writer.restore_from(source, head.as_ref(), restore, None, &Claimed(true));
+    ready.await.unwrap().commit().await.unwrap();
     giving_up.inner.delete(&index).await.unwrap();
 
     let opened = cluster.open().await;

@@ -7255,8 +7255,8 @@ async fn named_by_the_head(cluster: &Cluster) -> Vec<String> {
 /// Acme restored from `backup` on `node`, which must succeed, and seen to
 /// have put no key the backup lists and to name none: DW-680's rule, that
 /// nothing comes in from outside a tenant's store under the key it had.
-/// It does both today, and a delete of one of those keys sent before the
-/// restore, and landing after it, takes it from under the head.
+/// Before DW-680 it did both, and a delete of one of those keys sent before
+/// the restore, and landing after it, took it from under the head.
 async fn restored_under_no_key_the_backup_lists(
     cluster: &Cluster,
     blobs: &Troubled,
@@ -7329,18 +7329,17 @@ async fn a_late_delete_of_a_log_a_backup_lists_spares_the_tenant_restored_from_i
     a_delete_given_up_lands_after_a_restore_from_the_tenants_own_backup("log", None, false).await;
 }
 
-/// The reported bug: the restore finds the segment there still, writes
-/// nothing, and commits a checkpoint that names it; the delete then takes
-/// it, and no node with nothing of its own can open the tenant.
+/// The reported bug: before DW-680 the restore found the segment there
+/// still, wrote nothing, and committed a checkpoint that named it; the
+/// delete then took it, and no node with nothing of its own could open the
+/// tenant.
 #[tokio::test]
-#[should_panic(expected = "DW-680 K4: a restore from a backup put")]
 async fn a_late_delete_of_a_segment_a_backup_lists_spares_the_tenant_restored_from_it() {
     a_delete_given_up_lands_after_a_restore_from_the_tenants_own_backup("segment", None, true)
         .await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "DW-680 K4: a restore from a backup put")]
 async fn a_late_delete_of_a_vectors_file_a_backup_lists_spares_the_tenant_restored_from_it() {
     let vector = Some(vec![1.0, 0.5]);
     a_delete_given_up_lands_after_a_restore_from_the_tenants_own_backup("vectors", vector, true)
@@ -7351,7 +7350,6 @@ async fn a_late_delete_of_a_vectors_file_a_backup_lists_spares_the_tenant_restor
 /// answered, and it returns as if all were well. The tenant is restored
 /// from its own backup, and the deletes land.
 #[tokio::test(start_paused = true)]
-#[should_panic(expected = "DW-680 K4: a restore from a backup put")]
 async fn deletes_a_clean_stopped_waiting_for_land_after_a_restore_from_the_tenants_own_backup() {
     let (cluster, store, blobs, node, backup) = backed_up_and_merged_past(None).await;
     let acme = tenant("acme");
