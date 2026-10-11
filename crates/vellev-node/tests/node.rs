@@ -65,11 +65,9 @@ impl Store {
     fn fault(&self, faulty: Option<(&'static str, Fault)>) {
         *self.faulty.lock().unwrap() = faulty;
     }
-}
 
-#[async_trait]
-impl Blobs for Store {
-    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+    /// A write of `key` goes wrong, if it is to, as it is to.
+    async fn written(&self, key: &str) -> vellev_storage::Result<()> {
         let fault = {
             let mut faulty = self.faulty.lock().unwrap();
             let fault = faulty
@@ -89,7 +87,24 @@ impl Blobs for Store {
                 source: "connection reset".into(),
             });
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Blobs for Store {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.written(key).await?;
         self.inner.put(key, bytes).await
+    }
+    /// Goes wrong as a write of the same file whole does.
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.written(key).await?;
+        self.inner.put_parts(key, parts).await
     }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         let delay = *self.slow.lock().unwrap();
@@ -6921,6 +6936,20 @@ impl Blobs for Troubled {
         }
         Ok(())
     }
+    /// As a write whole: noted, and lost once written if it is to be.
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.put.lock().unwrap().push(key.to_string());
+        self.inner.put_parts(key, parts).await?;
+        let lost = self.lost_as_written.lock().unwrap().as_deref() == Some(key);
+        if lost {
+            self.inner.delete(key).await?;
+        }
+        Ok(())
+    }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         self.inner.get(key).await
     }
@@ -7008,6 +7037,7 @@ async fn a_delete_given_up_by_a_purge_that_failed_lands_before_the_name_can_be_t
             .await
     };
     adopt().await.unwrap();
+    let purged = acme_keys(cluster.store.as_ref()).await;
     node.drop_tenant(&acme).await.unwrap();
     cluster.clock.advance(hold());
 
@@ -7038,19 +7068,17 @@ async fn a_delete_given_up_by_a_purge_that_failed_lands_before_the_name_can_be_t
     );
 
     // It lands. Only once the claim has run out is the tenant purged, and
-    // then its lineage taken up again from the same backup, which writes
-    // the same keys: nothing is on its way to take them from under it.
+    // then its lineage taken up again from the same backup (DW-680, T5),
+    // under keys of its own: none the tenant purged had, so that no delete
+    // of one of those, however late it lands, takes anything from it.
     cluster.store.delete(&given_up[0]).await.unwrap();
     cluster.clock.advance(hold() + Duration::from_secs(1));
     node.purge_due().await.unwrap();
     assert!(keys_under(cluster.store.as_ref(), "acme/").await.is_empty());
     adopt().await.unwrap();
-    assert!(
-        keys_under(cluster.store.as_ref(), "acme/")
-            .await
-            .contains(&given_up[0]),
-        "the key the delete given up named is the tenant's again"
-    );
+    let adopted = acme_keys(cluster.store.as_ref()).await;
+    let again: Vec<&String> = adopted.intersection(&purged).collect();
+    assert!(again.is_empty(), "the tenant taken up again has {again:?}");
     node.shutdown().await;
     cluster.clock.advance(LEASE + Duration::from_secs(1));
     let fresh = backing_up_to(&cluster, store.clone());
@@ -7809,4 +7837,306 @@ async fn a_node_cleans_after_the_tenants_window_was_made_longer() {
     if let Err(error) = acme.compact(4 * hour).await {
         panic!("DW-681: a clean failed with nothing in its way: {error}");
     }
+}
+
+/// Every key acme has in `store`.
+async fn acme_keys(store: &dyn Blobs) -> std::collections::BTreeSet<String> {
+    keys_under(store, "acme/").await.into_iter().collect()
+}
+
+/// DW-680, T4: a node's clean sends its deletes and hears nothing, the
+/// lease runs out and a second node takes the tenant up and restores it
+/// from its own backup, and only then do the deletes the first node sent
+/// land. A third node, with nothing of its own, opens the tenant and holds
+/// every note the backup held.
+#[tokio::test]
+async fn deletes_a_deposed_node_sent_land_after_another_restores_the_tenant_from_its_backup() {
+    let (cluster, store, blobs, first, backup) = backed_up_and_merged_past(None).await;
+    let acme = tenant("acme");
+    blobs.deletes_hang.store(true, Ordering::SeqCst);
+    let cleaning = tokio::spawn({
+        let first = first.clone();
+        let acme = acme.clone();
+        async move {
+            first
+                .tenant(&acme)
+                .await
+                .unwrap()
+                .compact(Duration::ZERO)
+                .await
+        }
+    });
+    let sent = tokio::time::timeout(Duration::from_secs(30), blobs.delete_sent.notified());
+    sent.await.expect("the clean sends its deletes");
+    let hung = blobs.hung.lock().unwrap().clone();
+    assert!(
+        hung.contains(&listed_of_kind(&backup, "segment")),
+        "{hung:?}"
+    );
+
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let second = node_over(&cluster, coordinator, blobs.clone(), store.clone());
+    restored_under_no_key_the_backup_lists(&cluster, &blobs, &second, &backup).await;
+
+    // The first node's clean is stopped where it is, and what it sent
+    // lands.
+    cleaning.abort();
+    blobs.deletes_hang.store(false, Ordering::SeqCst);
+    for key in &hung {
+        cluster.store.delete(key).await.unwrap();
+    }
+    first.shutdown().await;
+    second.shutdown().await;
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+    let third = backing_up_to(&cluster, store);
+    assert_eq!(notes_held(&third).await, [true, true]);
+    third.back_up(&acme).await.unwrap();
+}
+
+/// DW-680, T6: a restore from a backup whose claim is lost while it copies
+/// the backup's files commits nothing: the tenant reads as it did, takes
+/// writes again, and keeps none of what was copied.
+#[tokio::test]
+async fn a_restore_whose_claim_is_lost_while_it_copies_leaves_the_tenant_as_it_was() {
+    let cluster = Cluster::new();
+    let store = Arc::new(SlowStore::new(Duration::ZERO));
+    let writing = cluster.node_from(Settings {
+        backups: Some(store.clone()),
+        ..cluster.settings()
+    });
+    let backup = written_and_backed_up(&writing).await;
+    noted(&writing, 3, "owl").await;
+    writing.shutdown().await;
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+
+    *store.file_reads.lock().unwrap() = Duration::from_secs(2);
+    let coordinator = Arc::new(Unrenewing {
+        disowning: AtomicBool::new(true),
+        ..Unrenewing::new(cluster.coordinator.clone())
+    });
+    let node = restoring_node(&cluster, coordinator, store.clone());
+    let tenant_id = tenant("acme");
+    let opened = node.tenant(&tenant_id).await.unwrap();
+    let before = cluster.coordinator.committed(&acme()).await.unwrap();
+    let had = acme_keys(cluster.store.as_ref()).await;
+    drop(opened);
+
+    let stopped = node
+        .restore_backup(&tenant_id, backup.id, RequestId::generate())
+        .await;
+    assert!(
+        matches!(stopped, Err(NodeError::ClaimLost(_))),
+        "{stopped:?}"
+    );
+    assert_eq!(
+        cluster.coordinator.committed(&acme()).await.unwrap(),
+        before
+    );
+    let opened = node.tenant(&tenant_id).await.unwrap();
+    assert!(opened.read(|state| state.get(&notes(), id(3)).is_some()));
+    opened.write(vec![note(4, "elk", None)]).await.unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let now = acme_keys(cluster.store.as_ref()).await;
+        let restored: Vec<&String> = now
+            .difference(&had)
+            .filter(|key| key.contains("-restored."))
+            .collect();
+        if restored.is_empty() {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "copies kept: {restored:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// DW-680, T7: a backup one of whose files the backup store no longer
+/// has is refused, saying which backup and which file, and nothing is
+/// committed.
+#[tokio::test]
+async fn a_restore_from_a_backup_lacking_a_file_says_which_and_commits_nothing() {
+    let (store, kept, (hidden, _)) = backed_up_elsewhere_lacking_a_file().await;
+    let cluster = Cluster::new();
+    let node = cluster.node_from(Settings {
+        backups: Some(store),
+        ..cluster.settings()
+    });
+    let failed = node
+        .adopt_backup(&tenant("acme"), kept.id, true, RequestId::generate())
+        .await;
+    match failed {
+        Err(NodeError::Storage(StorageError::BackupLacks { backup, file, .. })) => {
+            assert_eq!(backup, kept.id);
+            assert!(hidden.ends_with(&file), "{hidden} {file}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let committed = cluster.coordinator.committed(&acme()).await.unwrap();
+    assert_eq!(committed.and_then(|committed| committed.manifest), None);
+}
+
+/// DW-680, T9: a backup taken of a tenant restored from a backup lists the
+/// files the restore copied, and another cluster that takes it up reads
+/// the tenant as it was.
+#[tokio::test]
+async fn a_backup_of_a_tenant_restored_from_one_travels_to_another_cluster() {
+    let store = backup_store();
+    let cluster = Cluster::new();
+    let node = backing_up_to(&cluster, store.clone());
+    let first = written_and_backed_up(&node).await;
+    noted(&node, 3, "owl").await;
+    let acme = tenant("acme");
+    node.restore_backup(&acme, first.id, RequestId::generate())
+        .await
+        .unwrap();
+    let second = node.back_up(&acme).await.unwrap();
+    assert!(second.files().any(|key| key.contains("-restored.")));
+    assert!(second
+        .files()
+        .all(|key| !first.files().any(|had| had == key) || key.contains("/manifest/")));
+
+    let elsewhere = Cluster::new();
+    let adopting = backing_up_to(&elsewhere, store);
+    adopting
+        .adopt_backup(&acme, second.id, false, RequestId::generate())
+        .await
+        .unwrap();
+    assert_eq!(notes_held(&adopting).await, [true, true]);
+    let held = adopting.tenant(&acme).await.unwrap();
+    assert!(held.read(|state| state.get(&notes(), id(3)).is_none()));
+}
+
+/// A store whose next file put a part at a time, once told, waits until
+/// let go, and says when it does.
+#[derive(Debug)]
+struct Copying {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    waiting: tokio::sync::Notify,
+    go_on: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Blobs for Copying {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.waiting.notify_one();
+            self.go_on.notified().await;
+        }
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// DW-680, T10: writes are refused from the start of a restore from a
+/// backup, while it copies the backup's files, and taken again once it is
+/// made; reads are served throughout.
+#[tokio::test]
+async fn writes_are_refused_while_a_restore_copies_a_backups_files_and_reads_served() {
+    let cluster = Cluster::new();
+    let copying = Arc::new(Copying {
+        inner: cluster.store.clone(),
+        armed: AtomicBool::new(false),
+        waiting: tokio::sync::Notify::new(),
+        go_on: tokio::sync::Notify::new(),
+    });
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over(&cluster, coordinator, copying.clone(), backup_store());
+    let backup = written_and_backed_up(&node).await;
+    noted(&node, 3, "owl").await;
+    let acme = tenant("acme");
+    let opened = node.tenant(&acme).await.unwrap();
+
+    copying.armed.store(true, Ordering::SeqCst);
+    let restoring = tokio::spawn({
+        let (node, acme) = (node.clone(), acme.clone());
+        async move {
+            node.restore_backup(&acme, backup.id, RequestId::generate())
+                .await
+        }
+    });
+    let copied = tokio::time::timeout(Duration::from_secs(30), copying.waiting.notified());
+    copied
+        .await
+        .expect("the restore copies a file into the tenant's store");
+    let refused = opened.write(vec![note(4, "elk", None)]).await;
+    assert!(
+        matches!(&refused, Err(NodeError::Storage(StorageError::Restoring))),
+        "{refused:?}"
+    );
+    assert!(opened.read(|state| state.get(&notes(), id(3)).is_some()));
+
+    copying.go_on.notify_one();
+    restoring.await.unwrap().unwrap();
+    let opened = node.tenant(&acme).await.unwrap();
+    assert!(opened.read(|state| state.get(&notes(), id(3)).is_none()));
+    opened.write(vec![note(4, "elk", None)]).await.unwrap();
+}
+
+/// DW-680, T11: two callers asking for one restore, the first of whose
+/// tries fails with nothing recorded: the second waits for it, and then
+/// makes a try of its own, once. Neither makes the restore's work twice.
+#[tokio::test]
+async fn two_callers_of_one_restore_each_make_it_at_most_once() {
+    let cluster = Cluster::new();
+    let store = Arc::new(SlowStore::new(Duration::ZERO));
+    let writing = cluster.node_from(Settings {
+        backups: Some(store.clone()),
+        ..cluster.settings()
+    });
+    let backup = written_and_backed_up(&writing).await;
+    writing.shutdown().await;
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+
+    *store.file_reads.lock().unwrap() = Duration::from_millis(200);
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            backups: Some(store.clone()),
+            ..cluster.settings()
+        },
+    );
+    let acme = tenant("acme");
+    node.tenant(&acme).await.unwrap();
+    let claims = coordinator.claims.load(Ordering::SeqCst);
+    // The first try's copies fail to go up.
+    cluster.store.fault(Some(("segment", Fault::FailsOnce)));
+    let request = RequestId::generate();
+    let ask = || {
+        let (node, acme) = (node.clone(), acme.clone());
+        tokio::spawn(async move { node.restore_backup(&acme, backup.id, request).await })
+    };
+    let first = ask();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = ask();
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    assert!(first.is_err(), "{first:?}");
+    second.unwrap();
+    assert_eq!(
+        coordinator.claims.load(Ordering::SeqCst) - claims,
+        2,
+        "one try each"
+    );
 }
