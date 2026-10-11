@@ -5376,7 +5376,10 @@ mod tests {
                             // import stored and Weaviate has not changed,
                             // and does not read the collection: one that
                             // somebody changed since is for a comparison
-                            // to find, and the two say different things.
+                            // to find. Both runs write nothing and say
+                            // all is settled, and count alike; the
+                            // comparison counts the same, and says the
+                            // import's object is missing or different.
                             let hen = plain.item("hen", 2);
                             let trusted = entry.is_some_and(|entry| {
                                 entry.mark == Mark::Stored && !Copying::reads(&hen, Some(entry))
@@ -5384,6 +5387,25 @@ mod tests {
                             let held = stored.and_then(|stored| plain.plan.hash(stored));
                             if weaviate && trusted && held.as_deref() != Some(hen.hash.as_str()) {
                                 blind += 1;
+                                let cell = format!(
+                                    "{entry:?}, vellev holds {:?}, told {said_:?}, taken up: {adopted}",
+                                    stored.map(|stored| &stored.properties["title"]),
+                                );
+                                let (changes, first) =
+                                    ran(fixture, entry, weaviate, stored, (adopted, false));
+                                assert_eq!(kinds(&changes), Vec::<String>::new(), "{cell}");
+                                let first = after_run(first, entry, stored, weaviate);
+                                let (again, next) =
+                                    ran(fixture, entry, weaviate, stored, (false, true));
+                                assert_eq!(kinds(&again), Vec::<String>::new(), "{cell}");
+                                let next = after_run(next, entry, stored, weaviate);
+                                assert_eq!(said(&first).1, Outcome::Settled, "{cell}");
+                                assert_eq!(said(&next), said(&first), "next run: {cell}");
+                                let compared = compared_as(fixture, entry, weaviate, stored);
+                                assert_eq!(said(&compared).0, said(&first).0, "{cell}");
+                                assert_ne!(said(&compared).1, Outcome::Settled, "{cell}");
+                                let verified = compared.verified.unwrap();
+                                assert_eq!(verified.missing + verified.different, 1, "{cell}");
                                 continue;
                             }
                             cells += 1;

@@ -5339,3 +5339,50 @@ async fn a_first_entry_alone_that_a_node_calls_invalid_stops_a_run_not_told_to_s
     assert_eq!(importing.entry(4).await, None);
     assert_eq!(importing.counts().await, ([0, 0, 0, 1, 0], [10; 3]));
 }
+
+#[tokio::test]
+async fn a_sole_writers_store_of_what_was_withheld_that_a_node_calls_invalid_is_not_skipped() {
+    let Some(importing) = Importing::new("VellevImportInvalidWithheld", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    importing.unledgered().await;
+    // Weaviate gains a note while the collection has no ledger: taken
+    // up, it is withheld.
+    weaviate.add(class, 20..21).await;
+    let report = importing.run().await.unwrap();
+    assert_eq!(withheld(&report, class), 1);
+    // Told nothing else wrote, a run stores it, and writes its entry
+    // over the one read: a step whose write to the object is not
+    // conditional, and whose write to the entry is. The node calls the
+    // step invalid, as part of the page and by itself; the first
+    // request to change the tenant, which sees to its collections, is
+    // let through.
+    let said = json!({ "error": { "code": "invalid", "message": "it cannot be" } });
+    for skip in [1, 0] {
+        importing.front.answer(
+            skip,
+            &["POST", "/changes"],
+            StatusCode::BAD_REQUEST,
+            said.clone(),
+        );
+    }
+    let told = Options {
+        skip_refused: true,
+        ..sole(&importing.options)
+    };
+    let stopped = importing.run_as(&told).await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("conditional on a version"),
+        "{stopped:#}"
+    );
+    assert!(importing.get(20).await.is_none());
+    assert_eq!(importing.entry(20).await.unwrap()["withheld"], json!(true));
+    let report = importing.run_as(&told).await.unwrap();
+    assert_eq!(
+        (report.classes[class].stored, withheld(&report, class)),
+        (1, 0)
+    );
+}
