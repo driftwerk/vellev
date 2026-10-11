@@ -2142,9 +2142,9 @@ async fn a_class_vellev_embeds_is_caught_up_by_its_properties_alone() {
     };
     let class = "VellevImportEmbedded";
     let weaviate = Weaviate::load(&url, class, 10).await;
-    let model = keyed_embedding_server("sk-right").await;
+    let model = keyed_embedding_server("sk-right-0123456789abcdef").await;
     let served = Cluster::new()
-        .serve_embedding_keyed(&model, "sk-right")
+        .serve_embedding_keyed(&model, "sk-right-0123456789abcdef")
         .await;
     let tenant = tenant(&served.url, "embedded").await;
     let dir = tempfile::tempdir().unwrap();
