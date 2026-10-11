@@ -33,9 +33,9 @@
 //! which must fail just so: see `World::walks_into_what_was_cleaned`. The
 //! store notes every delete as it is asked for, and every file as it first
 //! landed, and no head is to name a file whose delete was asked for before
-//! it was committed: see `World::never_named_again`. Nothing a restore may
-//! go to lies before what a clean with grace let go: see
-//! `World::graced_within_reach`.
+//! it was committed: see `World::never_named_again`. A clean with grace
+//! asks for the delete of no file a head a restore may go to needs: see
+//! `World::cleaned`.
 //!
 //! One pairing is not made: a restore to a state that a clean was not to
 //! keep, while a delete of one of that state's files, given up, is yet to
@@ -1177,12 +1177,12 @@ struct World {
     /// The floors of the cleans so far that asked the store to delete
     /// anything, every one of them and those with grace, each the highest
     /// there has been: a clean keeps every head from the newest at or below
-    /// its floor on (see `World::floor`).
+    /// its floor on (see `World::floor`). The second is only counted.
     kept_at: Option<u64>,
     graced_at: Option<u64>,
-    /// The head each restore to a point in the window that was recorded
-    /// went back to, by the position of the head it made.
-    targets: BTreeMap<LogPosition, LogPosition>,
+    /// Which of the deletes the store has been asked for, by their place
+    /// among them, cleans with no grace asked for.
+    unkept: BTreeSet<usize>,
     /// How many deletes had been given up unanswered, and how many
     /// answered as lost, when that was last looked at.
     given_up: (usize, usize),
@@ -1437,7 +1437,7 @@ impl World {
             ahead: clocks.node,
             kept_at: None,
             graced_at: None,
-            targets: BTreeMap::new(),
+            unkept: BTreeSet::new(),
             given_up: (0, 0),
             loaded: (0, 0),
             cleaned_at: None,
@@ -1836,6 +1836,7 @@ impl World {
         let current = abreast && seat + 1 == self.seats.len() && self.seats[seat].open;
         let before = self.coordinator.restores.load(Ordering::SeqCst);
         let (asked, deleted) = self.blobs.deletes();
+        let (reach, sent) = (self.in_reach(), self.blobs.sent.lock().unwrap().len());
         let given = self.given(grace);
         let writer = &self.seats[seat].writer;
         let restore = Restore {
@@ -1877,7 +1878,7 @@ impl World {
                 true => self.floor(grace).await,
                 false => floor,
             };
-            self.cleaned(grace, asked, floor);
+            self.cleaned(grace, asked, floor, reach, sent)?;
             self.came_to(way, &cleaned)?;
         }
         let cleaned = cleaned.unwrap_or(0);
@@ -1904,9 +1905,6 @@ impl World {
             })?;
         }
         if recorded {
-            let made = self.coordinator.heads.lock().unwrap().last().cloned();
-            let made = made.expect("a restore recorded makes a head");
-            self.targets.insert(made.position, head.position);
             self.made.restores += 1;
             self.base = rows;
             self.since.clear();
@@ -1965,14 +1963,57 @@ impl World {
     /// Note what a clean with `grace` and `floor` was to keep, if it asked
     /// the store to delete anything, as the store had been `asked` so many
     /// times before it: every head from the newest at or below its floor.
-    /// One with grace was to keep every head a restore may go to as well.
-    fn cleaned(&mut self, grace: Duration, asked: usize, floor: u64) {
+    /// Note too which of the deletes asked for, from the `sent`th on, a
+    /// clean with no grace asked for.
+    ///
+    /// And see that a clean given grace let go nothing a restore may go
+    /// to needs: of the deletes it asked for, none that had not been asked
+    /// for before is of a file one of the heads from the `reach`th on, as
+    /// the coordinator lets a restore reach them when it began, needs.
+    /// What a restore may reach only moves on, so this, at each such
+    /// clean, is that at every step. It holds while the node's clock runs
+    /// no more ahead of the store's than such a clean keeps more than a
+    /// restore may go back to, [`AHEAD`] steps, whatever the coordinator's
+    /// clock says, which it sets against its own times alone. DW-680's K2
+    /// for a restore to a point in the window rests on it. A node whose
+    /// clock runs further ahead breaks it, and DW-681, which is to cap what
+    /// a clean deletes by the commits the coordinator still has, is to
+    /// mend that. What a clean with no grace let go before is not this
+    /// one's to answer for.
+    fn cleaned(
+        &mut self,
+        grace: Duration,
+        asked: usize,
+        floor: u64,
+        reach: usize,
+        sent: usize,
+    ) -> Violation {
         if self.blobs.deletes().0 > asked {
             self.kept_at = self.kept_at.max(Some(floor));
             if grace >= STEP * GRACE as u32 {
                 self.graced_at = self.graced_at.max(Some(floor));
             }
         }
+        let now = self.blobs.sent.lock().unwrap().clone();
+        let given = self.given(grace);
+        if given.is_zero() {
+            self.unkept.extend(sent..now.len());
+            return Ok(());
+        }
+        let (before, after) = now.split_at(sent);
+        let newly: Vec<&String> = after.iter().filter(|key| !before.contains(key)).collect();
+        for recorded in self.heads.get(reach..).unwrap_or_default() {
+            let needed = self.named_at(&recorded.head.key)?;
+            let let_go = newly.iter().find(|key| needed.contains(**key));
+            check(let_go.is_none(), || {
+                format!(
+                    "DW-681: a clean with grace asked for the delete of {let_go:?}, which {:?}, \
+                     a head a restore may go to, needs",
+                    recorded.head
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// The time from which a file is young to a clean made now with
@@ -2246,10 +2287,11 @@ impl World {
                 };
                 let (asked, deleted) = self.blobs.deletes();
                 let floor = self.floor(grace).await;
+                let (reach, sent) = (self.in_reach(), self.blobs.sent.lock().unwrap().len());
                 let way = self.way(seat, grace, false).await;
                 let cleaning = self.seats[seat].writer.clean(self.given(grace));
                 let cleaned = cleaning.await;
-                self.cleaned(grace, asked, floor);
+                self.cleaned(grace, asked, floor, reach, sent)?;
                 self.came_to(way, &cleaned)?;
                 let cleaned = cleaned.unwrap_or(0);
                 match grace.is_zero() {
@@ -2508,28 +2550,33 @@ impl World {
     ///
     /// For a head a restore to a point in the window made, this holds only
     /// while every clean keeps what such a restore may go back to: one
-    /// that kept less may have asked for the deletes of a state the
-    /// restore then names (see `World::taken_by_a_late_delete`, by which a
-    /// history is spared that pairing). Such a head is excused just when
-    /// the state it went back to is one some clean was not to keep and
-    /// every clean with grace was: one with none let it go. Every other
-    /// head is held to it, and so is every restore to a state a clean with
-    /// grace let go, which `World::graced_within_reach` keeps a restore from.
+    /// with no grace keeps less, and may have asked for the deletes of a
+    /// state the restore then names (see `World::taken_by_a_late_delete`,
+    /// by which a history is spared that pairing). Such a head is excused
+    /// for a file it names just when every delete of it asked for came
+    /// from a clean with no grace. Every other head is held to it for
+    /// every file, and so is such a head for one a clean with grace, or
+    /// anything else, asked to be deleted.
+    ///
+    /// While `World::cleaned` holds every clean with grace to asking for
+    /// no file a head a restore may go to needs, such a head never names a
+    /// file a clean with grace asked to be deleted, and the excuse could
+    /// as well take every clean's deletes. It is kept to those of cleans
+    /// with no grace as the rule for when DW-681 lets that check go.
     fn never_named_again(&mut self) -> Violation {
         let heads = self.coordinator.heads.lock().unwrap().clone();
         let sent = self.blobs.sent.lock().unwrap().clone();
-        let (kept, graced) = (self.index_of(self.kept_at), self.index_of(self.graced_at));
         for head in &heads[self.named..] {
             let named = self.named_at(&head.key)?;
-            let target = self.targets.get(&head.position).and_then(|target| {
-                self.heads
-                    .iter()
-                    .position(|recorded| recorded.head.position == *target)
-            });
-            let excused = target.is_some_and(|target| target < kept && target >= graced);
+            let restored = head.restore && !self.sourced.contains(&head.position);
+            let unkept = |key: &String| {
+                let asked = sent[..head.sent].iter().enumerate();
+                let mut asked = asked.filter(|(_, other)| *other == key);
+                asked.all(|(at, _)| self.unkept.contains(&at))
+            };
             let again = sent[..head.sent]
                 .iter()
-                .find(|key| named.contains(*key) && !excused);
+                .find(|key| named.contains(*key) && !(restored && unkept(key)));
             check(again.is_none(), || {
                 format!(
                     "DW-680 K2: the head {} at {:?} names {again:?}, whose delete had been \
@@ -2750,27 +2797,16 @@ impl World {
     /// loads until the store deletes something: each is loaded when it is
     /// first seen and again whenever a delete has been made since. The
     /// newest is `committed`, read already as the truth.
-    /// See that nothing the coordinator lets a restore go to lies before
-    /// what a clean with grace let go: DW-680's K2 for a restore to a point
-    /// in the window rests on it. It holds while the node's clock runs no
-    /// more ahead of the store's than such a clean keeps more than a
-    /// restore may go back to, [`AHEAD`] steps; whatever the coordinator's
-    /// clock says, which it sets against its own times alone. A node whose
-    /// clock runs further ahead breaks it, and DW-681, which is to cap what
-    /// a clean deletes by the commits the coordinator still has, is to
-    /// mend that.
-    fn graced_within_reach(&mut self) -> Violation {
+    /// Count a step that ends with the oldest head a restore may go to the
+    /// very one a clean with grace kept from, by its floor, and those of
+    /// them with the node's clock as far ahead as it may be: the edge at
+    /// which `World::cleaned` is to hold. Only counted: the floor is of
+    /// the files the clean found, which a clean before it may have thinned.
+    fn at_the_edge(&mut self) {
         let (reach, graced) = (self.in_reach(), self.index_of(self.graced_at));
         let edge = self.graced_at.is_some() && graced == reach;
         self.made.edge += usize::from(edge);
         self.made.edge_ahead += usize::from(edge && self.ahead == AHEAD);
-        check(reach >= graced, || {
-            format!(
-                "DW-681: a restore may go to {:?}, before {:?}, from which on a clean with \
-                 grace kept what it did",
-                self.heads[reach].head, self.heads[graced].head
-            )
-        })
     }
 
     async fn reload(&mut self, committed: &Committed) -> Violation {
@@ -2860,7 +2896,7 @@ impl World {
         self.count_checkpoints(had).await;
         self.listed().await?;
         self.reload(&committed).await?;
-        self.graced_within_reach()?;
+        self.at_the_edge();
         // A delete is given up unanswered only with one the store answered
         // as lost: whoever asked for them together stops at the first to
         // fail. So none is since this was last seen unless one was lost
@@ -3560,7 +3596,7 @@ fn a_clean_fails_after_a_restore_puts_back_what_the_clean_before_it_deleted() {
 /// DW-681 is to cap what a clean deletes by the commits the coordinator
 /// still has.
 #[test]
-#[should_panic(expected = "DW-681: a restore may go to")]
+#[should_panic(expected = "DW-681: a clean with grace asked for the delete of")]
 fn a_clean_by_a_node_whose_clock_runs_ahead_deletes_what_a_restore_may_go_to() {
     paused().block_on(async {
         let who = Who::Current;
@@ -3582,8 +3618,8 @@ fn a_clean_by_a_node_whose_clock_runs_ahead_deletes_what_a_restore_may_go_to() {
             world.step(action).await.unwrap();
             world.verify().await.unwrap();
         }
-        world.step(Action::Clean { who, aged: true }).await.unwrap();
-        let violation = world.verify().await.unwrap_err();
+        let violation = world.step(Action::Clean { who, aged: true }).await;
+        let violation = violation.unwrap_err();
         let oldest = world.in_reach();
         let head = world.heads[oldest].head.clone();
         assert!(head.key.0.ends_with(".log"), "{head:?}: {violation}");
@@ -3673,4 +3709,208 @@ fn a_clean_after_a_clean_of_an_idle_head_succeeds() {
     if let Err(error) = cleaned {
         panic!("a clean after a clean of {head} walked to {prev}: {error}");
     }
+}
+
+/// A clean with no grace by the partition's own writer deletes the logs
+/// of two heads a restore may still go to, as such a clean may; a clean
+/// with grace after it, by a node one step ahead, finds the oldest young
+/// files gone and so a floor above them. It deletes nothing the first had
+/// not asked for already, and nothing the oldest head a restore may go to
+/// needs that was there still: what was let go below its floor the first
+/// let go. A random history came to this (DW-680, PR 6's runs).
+///
+/// Told by its floor, taken from the files it lists, the second clean
+/// would be charged with what the first let go: hence what a clean with
+/// grace is held to is what it asks to be deleted itself (`World::cleaned`).
+#[test]
+fn a_clean_with_grace_answers_only_for_what_it_lets_go_itself() {
+    paused().block_on(async {
+        let who = Who::Current;
+        let written = || Action::Write {
+            who,
+            rows: 1,
+            delete: None,
+        };
+        let restored = || Action::Restore {
+            who,
+            back: 0,
+            beside: None,
+        };
+        let mut world = after(vec![
+            Action::Takeover,
+            Action::Takeover,
+            Action::Takeover,
+            Action::Snapshot,
+            Action::Takeover,
+            Action::Takeover,
+            Action::Flush { who },
+            restored(),
+            restored(),
+            written(),
+            Action::FailCommits(CommitFault::Refuse, 1),
+            written(),
+            Action::DelayDelete(3),
+            restored(),
+            written(),
+            Action::Clean { who, aged: false },
+            Action::NodeAhead(1),
+        ])
+        .await;
+        let sent = world.blobs.sent.lock().unwrap().clone();
+        world.step(Action::Clean { who, aged: true }).await.unwrap();
+        world.verify().await.unwrap();
+        let asked = world.blobs.sent.lock().unwrap()[sent.len()..].to_vec();
+        assert!(!asked.is_empty(), "the clean with grace asked for deletes");
+        assert!(
+            asked.iter().all(|key| sent.contains(key)),
+            "the clean with grace asked for {asked:?}, not all of them asked for before"
+        );
+        let oldest = world.heads[world.in_reach()].head.clone();
+        let needed = world.named_at(&oldest.key).unwrap();
+        let files = world.blobs.clean.list("").await.unwrap();
+        let there: BTreeSet<String> = files.into_iter().map(|file| file.key).collect();
+        let gone: Vec<&String> = needed.iter().filter(|key| !there.contains(*key)).collect();
+        assert!(!gone.is_empty(), "{oldest:?} has all it needs");
+        assert!(
+            gone.iter().all(|key| sent.contains(*key)),
+            "{oldest:?} lost {gone:?}, not all of them asked for before the clean with grace"
+        );
+        let graced = world.index_of(world.graced_at);
+        assert!(graced > world.in_reach(), "and its floor is past it");
+    });
+}
+
+/// Known to fail, and DW-681 by a node's clock, as O1 is, where what a
+/// clean with grace lets go is to be told by what it asks to be deleted
+/// and not by its floor over every file that ever landed. With the node's
+/// clock three steps ahead, a write and a checkpoint, then a write the
+/// partition's writer is taken over from, and a write beside a checkpoint:
+/// the oldest step a restore may go to. The writer left behind uploads
+/// files for a checkpoint of its own, named at its old position; the
+/// first lands, it is told otherwise and deletes it. A write, hours pass,
+/// and a clean with grace finds that write the oldest young file. It
+/// keeps from the checkpoint beside the write, and asks for the deletes
+/// of the logs and the checkpoint the head before them needs, and the
+/// write beside that checkpoint too.
+#[test]
+#[should_panic(expected = "DW-681: a clean with grace asked for the delete of")]
+fn a_clean_by_a_node_whose_clock_runs_ahead_is_not_excused_by_a_file_it_never_saw() {
+    let who = Who::Current;
+    let history = vec![
+        written(),
+        Action::Flush { who },
+        written(),
+        Action::Takeover,
+        Action::WriteBesideFlush {
+            who,
+            rows: 1,
+            delete: None,
+            first: false,
+        },
+        Action::FailUpload(PutFault::LandThenFail),
+        Action::Flush { who: Who::Any(0) },
+        written(),
+        Action::Wait(1),
+        Action::Clean { who, aged: true },
+    ];
+    let ahead = Clocks {
+        coordinator: 0,
+        node: AHEAD + 1,
+    };
+    let violation = run_on((ahead, history), None).unwrap_err();
+    assert!(violation.starts_with("step 9 "), "{violation}");
+    panic!("{violation}");
+}
+
+/// Known to fail, and DW-681 by a node's clock, as O1 is, for a clean
+/// with grace beside a restore to a point in the window: one made by a
+/// node whose writer is the partition's own, which cleans with the window
+/// and more, begun just after the restore or just before it. With the
+/// node's clock three steps ahead, either way the clean asks for the
+/// deletes of what the oldest head a restore may go to needs.
+#[test]
+#[should_panic(expected = "DW-681: a clean with grace asked for the delete of")]
+fn a_clean_beside_a_restore_by_a_node_whose_clock_runs_ahead_deletes_what_a_restore_may_go_to() {
+    let who = Who::Current;
+    let ahead = Clocks {
+        coordinator: 0,
+        node: AHEAD + 1,
+    };
+    let caught = [false, true].map(|clean_first| {
+        let history = vec![
+            written(),
+            Action::Flush { who },
+            written(),
+            Action::Flush { who },
+            written(),
+            Action::Wait(3),
+            Action::Restore {
+                who: Who::Any(0),
+                back: 0,
+                beside: Some((Beside::Clean, clean_first)),
+            },
+        ];
+        let violation = run_on((ahead, history), None).unwrap_err();
+        let restore = "step 6 (Restore { who: Any(0), back: 0, beside: Some((Clean,";
+        assert!(violation.starts_with(restore), "{violation}");
+        violation
+    });
+    assert!(
+        caught[1].contains("DW-681: a clean with grace"),
+        "{}",
+        caught[1]
+    );
+    panic!("{}", caught[0]);
+}
+
+/// A clean with no grace asks for the deletes of the logs below its
+/// checkpoint and of the two checkpoints before it, the first of which a
+/// head a restore may still go to needs, and its deletes from that one on
+/// are held. Two steps on, a clean with grace, by a node three steps
+/// ahead, finds those checkpoints there still and asks for the first one's
+/// delete again. It asks for nothing that had not been asked for, and is
+/// not to answer for what a clean with none let go.
+#[test]
+fn a_clean_with_grace_is_not_charged_with_a_delete_it_asks_for_again() {
+    paused().block_on(async {
+        let who = Who::Current;
+        let ahead = Clocks {
+            coordinator: 0,
+            node: AHEAD + 1,
+        };
+        let mut world = World::with_clocks(None, ahead).await;
+        let history = [
+            written(),
+            Action::Flush { who },
+            written(),
+            written(),
+            Action::Flush { who },
+            written(),
+            Action::Merge { who },
+            Action::DelayDelete(5),
+            Action::Clean { who, aged: false },
+            Action::Follow,
+        ];
+        for action in history {
+            world.step(action).await.unwrap();
+            world.verify().await.unwrap();
+        }
+        assert!(
+            !world.blobs.held.lock().unwrap().is_empty(),
+            "deletes are held"
+        );
+        let sent = world.blobs.sent.lock().unwrap().len();
+        world.step(Action::Clean { who, aged: true }).await.unwrap();
+        world.verify().await.unwrap();
+        let all = world.blobs.sent.lock().unwrap().clone();
+        let (before, again) = all.split_at(sent);
+        assert!(!again.is_empty(), "the clean with grace asked for deletes");
+        assert!(again.iter().all(|key| before.contains(key)), "{again:?}");
+        let oldest = world.heads[world.in_reach()].head.clone();
+        let needed = world.named_at(&oldest.key).unwrap();
+        assert!(
+            again.iter().any(|key| needed.contains(key)),
+            "{oldest:?} needs none of {again:?}"
+        );
+    });
 }
