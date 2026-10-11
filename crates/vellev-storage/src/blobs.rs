@@ -54,6 +54,22 @@ pub trait Blobs: fmt::Debug + Send + Sync {
         use futures::StreamExt;
         futures::stream::once(self.get(key)).boxed()
     }
+    /// Put a file that comes a part at a time, in order, as [`Self::parts`]
+    /// of another store gives one, without ever holding it whole. Nothing
+    /// is under `key` for it until all of it has come: a failure of
+    /// `parts` fails the put and leaves nothing. By default refused, with
+    /// nothing taken from `parts`: a store that gathered them to put the
+    /// file as one would hold it whole, unseen.
+    async fn put_parts(
+        &self,
+        key: &str,
+        _parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+    ) -> Result<()> {
+        Err(StorageError::Blob {
+            key: key.to_string(),
+            source: "this store takes no file a part at a time".into(),
+        })
+    }
     /// Fetch the file afresh into the store's copy of it on local disk, in
     /// place of whatever copy is there, a part at a time and never held
     /// whole in memory, and say where it lies. `None` from a store that
@@ -1067,6 +1083,76 @@ impl Blobs for ObjectBlobs {
             .map(|_| ())
     }
 
+    /// As [`Self::put`] sends the same file, whatever the sizes its parts
+    /// come in: parts of [`Transfers::part_bytes`] and a last one of what
+    /// is left, each sent once it is known that more follows it, or whole
+    /// if a part or less is all that comes. No more than a part is held
+    /// beside what last came. How large the file is cannot be known
+    /// before it has come, so one too large for [`MOST_PARTS`] is refused
+    /// only at the first part too many, and what went up of it aborted.
+    async fn put_parts(
+        &self,
+        key: &str,
+        mut parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+    ) -> Result<()> {
+        use futures::TryStreamExt;
+        let path = ObjectPath::from(key);
+        let within = self.transfers.request_within;
+        let part = self.transfers.part_bytes.max(1);
+        let mut upload = Unfinished {
+            upload: None,
+            within,
+        };
+        // What has come and not gone up, no more than a part of it, and
+        // how many parts have.
+        let (mut held, mut holding, mut sent) = (Vec::new(), 0, 0);
+        let too_many = || StorageError::Blob {
+            key: key.to_string(),
+            source: format!("more than {MOST_PARTS} parts of {part} bytes came").into(),
+        };
+        let uploaded = async {
+            while let Some(mut came) = parts.try_next().await? {
+                while holding + came.len() > part {
+                    held.push(came.split_to(part - holding));
+                    if upload.upload.is_none() {
+                        let started = bounded(key, within, self.store.put_multipart(&path));
+                        upload.upload = Some(started.await?);
+                    }
+                    if sent == MOST_PARTS {
+                        return Err(too_many());
+                    }
+                    let piece = PutPayload::from_iter(std::mem::take(&mut held));
+                    bounded(key, within, upload.parts().put_part(piece)).await?;
+                    (holding, sent) = (0, sent + 1);
+                }
+                holding += came.len();
+                held.push(came);
+            }
+            let last = PutPayload::from_iter(held);
+            if upload.upload.is_none() {
+                let put = bounded(key, within, self.store.put(&path, last));
+                return put.await.map(|_| ());
+            }
+            if sent == MOST_PARTS {
+                return Err(too_many());
+            }
+            bounded(key, within, upload.parts().put_part(last)).await?;
+            bounded(key, within, upload.parts().complete()).await?;
+            Ok(())
+        }
+        .await;
+        match uploaded {
+            Ok(()) => {
+                upload.upload = None;
+                Ok(())
+            }
+            Err(error) => {
+                upload.abort(key).await;
+                Err(error)
+            }
+        }
+    }
+
     /// A file comes down a range of [`Transfers::part_bytes`] at a time,
     /// each its own request, every range after the first pinned to the
     /// version and size the first was of.
@@ -1349,6 +1435,16 @@ impl Blobs for CachedBlobs {
         self.inner.put(key, bytes.clone()).await?;
         self.remember(key, &bytes).await;
         Ok(())
+    }
+
+    /// Handed to the store as it comes, and no copy of it kept on local
+    /// disk: one is made when the file is first read.
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+    ) -> Result<()> {
+        self.inner.put_parts(key, parts).await
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {

@@ -86,6 +86,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -734,7 +735,9 @@ enum Asked {
 
 /// A store each request to which is given up, as failed, after `within`;
 /// a listing, once any one answer of it has taken that long, however many
-/// it takes. A request given up may still land: the store had it already.
+/// it takes; and a file read or put a part at a time, once the store has
+/// taken that long over any one part handed on, however many there are. A
+/// request given up may still land: the store had it already.
 #[derive(Debug)]
 pub(crate) struct Within {
     pub(crate) inner: Arc<dyn Blobs>,
@@ -753,10 +756,70 @@ impl Within {
     }
 }
 
+/// Word that a store putting a file a part at a time waits for the next
+/// part to come, and, once this goes, of when it stopped waiting: with the
+/// part, or because it no longer asked for one.
+struct Awaited<'a>(&'a watch::Sender<Option<tokio::time::Instant>>);
+
+impl<'a> Awaited<'a> {
+    fn begun(left: &'a watch::Sender<Option<tokio::time::Instant>>) -> Self {
+        left.send_replace(None);
+        Self(left)
+    }
+}
+
+impl Drop for Awaited<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(Some(tokio::time::Instant::now()));
+    }
+}
+
 #[async_trait::async_trait]
 impl Blobs for Within {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         self.bounded(key, self.inner.put(key, bytes)).await
+    }
+    /// The store is given `within` each time it is left to itself: from
+    /// when it is asked until it asks for the first part, from each part
+    /// it is handed until it asks for the next, and from the end of them
+    /// until it answers. So a file is given as long as its parts take,
+    /// however many they are, and a store that stops is given up on. The
+    /// bound is on each such time, not on each request the store makes
+    /// in it: a store that starts an upload, sends a part and completes
+    /// it has two of them in the first and in the last. How long a part
+    /// takes to come is not counted against it: whatever the parts are
+    /// read from gives that up itself.
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        // Since when the store has been left to itself; `None` while it
+        // waits for a part to come.
+        let (left, mut leaving) = watch::channel(Some(tokio::time::Instant::now()));
+        let left = &left;
+        let handed = stream::unfold(parts, move |mut parts| async move {
+            let _awaited = Awaited::begun(left);
+            let part = parts.next().await;
+            part.map(|part| (part, parts))
+        });
+        let put = self.inner.put_parts(key, handed.boxed());
+        tokio::pin!(put);
+        loop {
+            let since = *leaving.borrow_and_update();
+            let overdue = async {
+                match since {
+                    Some(since) => tokio::time::sleep_until(since + self.within).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                put = &mut put => return put,
+                _ = leaving.changed() => {}
+                () = overdue => return Err(unanswered(key, self.within)),
+            }
+        }
     }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         self.bounded(key, self.inner.get(key)).await
@@ -774,6 +837,19 @@ impl Blobs for Within {
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.bounded(key, self.inner.delete(key)).await
     }
+    /// As the store gives the file, each part given up once it has taken
+    /// `within` to come, after which no more of it is asked for.
+    fn parts<'a>(&'a self, key: &'a str) -> BoxStream<'a, vellev_storage::Result<Bytes>> {
+        let parts = Some(self.inner.parts(key));
+        stream::unfold(parts, move |parts| async move {
+            let mut parts = parts?;
+            match tokio::time::timeout(self.within, parts.next()).await {
+                Ok(part) => part.map(|part| (part, Some(parts))),
+                Err(_) => Some((Err(unanswered(key, self.within)), None)),
+            }
+        })
+        .boxed()
+    }
 }
 
 /// A store that notes, before it is asked for each, that a delete was sent
@@ -789,6 +865,13 @@ struct Deleting {
 impl Blobs for Deleting {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         self.inner.put(key, bytes).await
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await
     }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         self.inner.get(key).await
@@ -1167,4 +1250,260 @@ async fn finished<T: Send + 'static>(
     tokio::spawn(work)
         .await
         .map_err(|error| StorageError::Background(error.to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use futures::TryStreamExt;
+    use tokio::time::Instant;
+
+    use super::*;
+
+    const WITHIN: Duration = Duration::from_secs(10);
+    /// Less than the bound, and more than it by the second time.
+    const EACH: Duration = Duration::from_secs(6);
+
+    /// A store of one file, read and put a part at a time and no other
+    /// way, that takes `each` before it asks for a part put or hands on
+    /// one read, the end of them included, and stops for good in place of
+    /// the `silent`th time.
+    #[derive(Debug, Default)]
+    struct Paced {
+        each: Duration,
+        silent: Option<usize>,
+        kept: Mutex<Vec<Bytes>>,
+    }
+
+    impl Paced {
+        async fn paced(&self, time: usize) {
+            if self.silent == Some(time) {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(self.each).await;
+        }
+    }
+
+    /// The failure of anything asked of it but a file a part at a time.
+    fn whole(key: &str) -> StorageError {
+        StorageError::Missing {
+            key: key.to_string(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Blobs for Paced {
+        async fn put(&self, key: &str, _bytes: Bytes) -> vellev_storage::Result<()> {
+            Err(whole(key))
+        }
+        async fn put_parts(
+            &self,
+            _key: &str,
+            mut parts: BoxStream<'_, vellev_storage::Result<Bytes>>,
+        ) -> vellev_storage::Result<()> {
+            let mut taken = Vec::new();
+            loop {
+                self.paced(taken.len()).await;
+                match parts.try_next().await? {
+                    Some(part) => taken.push(part),
+                    None => break,
+                }
+            }
+            // The end of them was the time after the last.
+            self.paced(taken.len() + 1).await;
+            *self.kept.lock().unwrap() = taken;
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+            Err(whole(key))
+        }
+        async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+            Err(whole(prefix))
+        }
+        async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+            Err(whole(key))
+        }
+        fn parts<'a>(&'a self, _key: &'a str) -> BoxStream<'a, vellev_storage::Result<Bytes>> {
+            let kept = self.kept.lock().unwrap().clone();
+            stream::unfold(0, move |time| {
+                let part = kept.get(time).cloned();
+                async move {
+                    self.paced(time).await;
+                    part.map(|part| (Ok(part), time + 1))
+                }
+            })
+            .boxed()
+        }
+    }
+
+    /// What `work` came to, failing the test rather than letting it hang
+    /// if that took an hour, which on a paused clock means it never ends.
+    async fn ended<T>(work: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(60 * 60), work)
+            .await
+            .expect("done within its bound")
+    }
+
+    fn file() -> Vec<Bytes> {
+        ["one", "two", "three"].map(Bytes::from).to_vec()
+    }
+
+    fn coming(file: Vec<Bytes>) -> BoxStream<'static, vellev_storage::Result<Bytes>> {
+        stream::iter(file.into_iter().map(Ok)).boxed()
+    }
+
+    fn bounded(inner: Arc<Paced>) -> Within {
+        let within = WITHIN;
+        Within { inner, within }
+    }
+
+    fn unanswered_within(result: vellev_storage::Result<()>) {
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            unanswered("file", WITHIN).to_string(),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_put_a_part_at_a_time_through_a_bounded_store_is_given_its_bound_for_each_part()
+    {
+        let each = EACH;
+        let inner = Arc::new(Paced {
+            each,
+            ..Paced::default()
+        });
+        let started = Instant::now();
+        let store = bounded(inner.clone());
+        ended(store.put_parts("file", coming(file())))
+            .await
+            .unwrap();
+        // Longer than the bound in all, and no time it was left to itself.
+        assert_eq!(started.elapsed(), EACH * 5);
+        assert!(started.elapsed() > WITHIN);
+        assert_eq!(*inner.kept.lock().unwrap(), file());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_stops_while_a_file_is_put_a_part_at_a_time_is_given_up_within_the_bound()
+    {
+        // Before it asks for the first part, between two, once it has
+        // been told there are no more, and with them all, before it
+        // answers.
+        for silent in [0, 2, 3, 4] {
+            let inner = Arc::new(Paced {
+                each: EACH,
+                silent: Some(silent),
+                ..Paced::default()
+            });
+            let started = Instant::now();
+            let store = bounded(inner.clone());
+            unanswered_within(ended(store.put_parts("file", coming(file()))).await);
+            let before = u32::try_from(silent).unwrap();
+            assert_eq!(started.elapsed(), EACH * before + WITHIN, "{silent}");
+            assert_eq!(*inner.kept.lock().unwrap(), Vec::<Bytes>::new());
+        }
+    }
+
+    /// A store that asks for a part, stops waiting for it once `each` has
+    /// passed, and never answers.
+    #[derive(Debug)]
+    struct Abandoning(Duration);
+
+    #[async_trait::async_trait]
+    impl Blobs for Abandoning {
+        async fn put(&self, key: &str, _bytes: Bytes) -> vellev_storage::Result<()> {
+            Err(whole(key))
+        }
+        async fn put_parts(
+            &self,
+            _key: &str,
+            mut parts: BoxStream<'_, vellev_storage::Result<Bytes>>,
+        ) -> vellev_storage::Result<()> {
+            let _ = tokio::time::timeout(self.0, parts.next()).await;
+            drop(parts);
+            std::future::pending().await
+        }
+        async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+            Err(whole(key))
+        }
+        async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+            Err(whole(prefix))
+        }
+        async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+            Err(whole(key))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_stops_waiting_for_a_part_and_never_answers_is_given_up_within_the_bound()
+    {
+        let store = Within {
+            inner: Arc::new(Abandoning(EACH)),
+            within: WITHIN,
+        };
+        let started = Instant::now();
+        let never = stream::pending().boxed();
+        unanswered_within(ended(store.put_parts("file", never)).await);
+        assert_eq!(started.elapsed(), EACH + WITHIN);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn how_long_a_part_takes_to_come_is_not_counted_against_the_store_it_is_put_to() {
+        let inner = Arc::new(Paced::default());
+        let slow = coming(file()).then(|part| async {
+            tokio::time::sleep(WITHIN * 3).await;
+            part
+        });
+        let started = Instant::now();
+        let store = bounded(inner.clone());
+        ended(store.put_parts("file", slow.boxed())).await.unwrap();
+        assert_eq!(started.elapsed(), WITHIN * 9);
+        assert_eq!(*inner.kept.lock().unwrap(), file());
+
+        // Nor is a failure of theirs taken for the store's.
+        let lost = stream::iter([Ok(Bytes::from("one")), Err(whole("from"))]);
+        let failed = store.put_parts("file", lost.boxed()).await.unwrap_err();
+        assert!(matches!(failed, StorageError::Missing { .. }), "{failed}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_is_read_a_part_at_a_time_through_a_bounded_store_each_part_within_the_bound() {
+        let paced = |silent| {
+            Arc::new(Paced {
+                each: EACH,
+                silent,
+                kept: Mutex::new(file()),
+            })
+        };
+        let started = Instant::now();
+        let store = bounded(paced(None));
+        let read: Vec<Bytes> = ended(store.parts("file").try_collect()).await.unwrap();
+        assert_eq!(read, file(), "as the store parts it, never asked for whole");
+        assert_eq!(started.elapsed(), EACH * 4);
+
+        let (started, store) = (Instant::now(), bounded(paced(Some(1))));
+        let mut parts = store.parts("file");
+        assert_eq!(parts.try_next().await.unwrap(), Some(Bytes::from("one")));
+        unanswered_within(ended(parts.try_next()).await.map(|_| ()));
+        assert_eq!(started.elapsed(), EACH + WITHIN);
+        assert!(
+            ended(parts.next()).await.is_none(),
+            "and no more is asked for"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_put_a_part_at_a_time_under_a_claim_is_put_and_no_delete_noted() {
+        let inner = Arc::new(Paced::default());
+        let deleting = Deleting {
+            inner: inner.clone(),
+            sent: Arc::default(),
+        };
+        deleting.put_parts("file", coming(file())).await.unwrap();
+        assert_eq!(*inner.kept.lock().unwrap(), file());
+        assert!(!deleting.sent.load(Ordering::SeqCst));
+    }
 }
