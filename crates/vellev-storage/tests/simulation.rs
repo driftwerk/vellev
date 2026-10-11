@@ -45,9 +45,11 @@
 //! take it, by what the clean was asked and by no fault of the writer.
 //!
 //! The committed head's files may be copied out, as a backup copies them,
-//! and the partition put back from the copy, as from a backup. That is
-//! made only in the histories a test sets out: as a node makes it today,
-//! it breaks DW-680's rule every time. See `World::restore_from`.
+//! and the partition put back from the copy, as from a backup: copied in
+//! under keys of its own, as DW-680 has it, and held to that rule. The way
+//! a node made such a restore before DW-680, which breaks the rule every
+//! time, is made only in the histories a test sets out. See
+//! `World::restore_from`.
 
 mod common;
 
@@ -180,6 +182,8 @@ struct SimBlobs {
     /// Every file that ever landed, as it first did, so that a head can be
     /// read once its files are gone.
     shadow: Mutex<BTreeMap<String, Bytes>>,
+    /// Every file that was read, in the order it was.
+    read: Mutex<Vec<String>>,
     /// Every key a delete has been asked for, in the order it was: sent,
     /// whatever became of it. The coordinator notes how many there were
     /// with each head it records.
@@ -368,7 +372,20 @@ impl Blobs for SimBlobs {
         if failing {
             return Err(lost());
         }
+        self.read.lock().unwrap().push(key.to_string());
         self.clean.get(key).await
+    }
+
+    /// Put as [`Self::put`] puts, with its faults, once every part has
+    /// come: what lands is noted as any file that lands is.
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        use futures::TryStreamExt;
+        let parts: Vec<Bytes> = parts.try_collect().await?;
+        self.put(key, Bytes::from(parts.concat())).await
     }
 
     async fn list(
@@ -887,9 +904,11 @@ enum Action {
     /// rows committed at it, as a backup of the partition is.
     Snapshot,
     /// The partition is put back as one of the snapshots holds it, as a
-    /// node puts a tenant back from a backup. Made only in the histories a
-    /// test sets out, never in random ones: see `World::restore_from`.
+    /// node puts a tenant back from a backup: see `World::restore_from`.
     RestoreFrom(usize),
+    /// As [`Action::RestoreFrom`], the way a node did before DW-680. Made
+    /// only in the histories a test sets out, never in random ones.
+    RestoreFromAsToday(usize),
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -1226,6 +1245,56 @@ struct FromSource {
     head: ManifestRef,
 }
 
+/// What a snapshot holds, as a backup's source gives it: by the keys the
+/// files had, and never written.
+#[derive(Debug)]
+struct Snapshotted(BTreeMap<String, Bytes>);
+
+#[async_trait]
+impl Blobs for Snapshotted {
+    async fn put(&self, key: &str, _bytes: Bytes) -> vellev_storage::Result<()> {
+        Err(only_read(key))
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        tokio::task::yield_now().await;
+        self.0
+            .get(key)
+            .cloned()
+            .ok_or_else(|| StorageError::Missing {
+                key: key.to_string(),
+            })
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        Err(only_read(prefix))
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        Err(only_read(key))
+    }
+}
+
+fn only_read(key: &str) -> StorageError {
+    StorageError::Corrupt {
+        key: key.to_string(),
+        reason: "a snapshot is only read".to_string(),
+    }
+}
+
+/// The right to read a snapshot, which is never lost.
+struct Held;
+
+#[async_trait]
+impl vellev_storage::backups::Held for Held {
+    async fn held(&self) -> vellev_storage::Result<bool> {
+        Ok(true)
+    }
+    fn still(&self) -> bool {
+        true
+    }
+}
+
 /// How much a history did of what could as well have found nothing to do:
 /// merges made, files cleaned away with no grace and for their age,
 /// restores recorded, and those of them made beside something else.
@@ -1271,6 +1340,10 @@ struct Made {
     /// clock as far ahead as it may be.
     edge: usize,
     edge_ahead: usize,
+    /// Restores from a snapshot recorded, and those of them recorded while
+    /// a delete given up was yet to land.
+    sourced: usize,
+    sourced_under: usize,
 }
 
 impl Made {
@@ -1298,6 +1371,8 @@ impl Made {
             replaying: self.replaying + other.replaying,
             edge: self.edge + other.edge,
             edge_ahead: self.edge_ahead + other.edge_ahead,
+            sourced: self.sourced + other.sourced,
+            sourced_under: self.sourced_under + other.sourced_under,
         }
     }
 }
@@ -1388,6 +1463,7 @@ impl World {
             landed: Mutex::default(),
             landings: Mutex::default(),
             shadow: Mutex::default(),
+            read: Mutex::default(),
             sent,
             pausing: Mutex::default(),
             waiting: tokio::sync::Notify::new(),
@@ -2360,7 +2436,8 @@ impl World {
             Action::Follow => return self.follow().await,
             Action::FollowStale(pick) => return self.follow_stale(pick).await,
             Action::Snapshot => self.snapshot().await,
-            Action::RestoreFrom(pick) => return self.restore_from(pick).await,
+            Action::RestoreFrom(pick) => return self.restore_from(pick, false).await,
+            Action::RestoreFromAsToday(pick) => return self.restore_from(pick, true).await,
         }
         Ok(())
     }
@@ -2426,21 +2503,22 @@ impl World {
     }
 
     /// Put the partition back as snapshot `pick` holds it, from its current
-    /// writer, as a node puts a tenant back from a backup before DW-680:
-    /// each file of the snapshot the store lacks is put back under the key
-    /// it had, and the partition restored to the snapshot's head, whose
-    /// checkpoint then names by their old keys the files the store had
-    /// still. A restore recorded is where everything committed goes on
-    /// from, with the rows the snapshot holds; one that fails changes
-    /// nothing, which every step is checked for.
+    /// writer, as a node puts a tenant back from a backup: the snapshot's
+    /// files read by the keys they had and copied in under keys of the
+    /// restore's own (`Writer::restore_from`). A restore recorded is where
+    /// everything committed goes on from, with the rows the snapshot holds;
+    /// one that fails changes nothing, which every step is checked for, and
+    /// must have a reason to: a fault in the store or the coordinator, or a
+    /// writer no longer the partition's. Either way it is held to DW-680's
+    /// rule (`World::kept_out_of_old_keys`).
     ///
-    /// That way breaks DW-680's rule, that nothing comes into a partition's
-    /// store under the key it had, every time, so it is made only in the
-    /// histories a test sets out: to show the checker catches each way it
-    /// goes wrong, with the rule (`World::kept_out_of_old_keys`) and
-    /// without. When the restore DW-680 builds is made here instead, what
-    /// this does is to stay as a canary.
-    async fn restore_from(&mut self, pick: usize) -> Violation {
+    /// `as_today`, it is made as a node made it before DW-680: each file of
+    /// the snapshot the store lacks is put back under the key it had, and
+    /// the partition restored to the snapshot's head, whose checkpoint then
+    /// names by their old keys the files the store had still. That breaks
+    /// the rule every time, so it is made only in the histories a test sets
+    /// out, to show the checker catches each way it goes wrong.
+    async fn restore_from(&mut self, pick: usize, as_today: bool) -> Violation {
         let Some(frozen) = self
             .snapshots
             .get(pick % self.snapshots.len().max(1))
@@ -2453,25 +2531,49 @@ impl World {
         let rested_on = self.checkpoint_of(committed.manifest.as_ref());
         let landed = self.blobs.landings.lock().unwrap().len();
         let before = self.coordinator.restores.load(Ordering::SeqCst);
-        let mut fetched = Ok(());
-        for (key, bytes) in &frozen.files {
-            if self.blobs.clean.get(key).await.is_err() {
-                fetched = fetched.and(self.blobs.put(key, bytes.clone()).await);
+        let faulty = {
+            let faults = self.faults.lock().unwrap();
+            !faults.puts.is_empty() || !faults.commits.is_empty() || faults.failing_gets > 0
+        };
+        let at = self.seats[seat].writer.partition().read(State::position);
+        let current = self.seats[seat].writer.lease().generation == self.held.generation
+            && committed.log_position == at
+            && seat + 1 == self.seats.len()
+            && self.seats[seat].open;
+        let restore = Restore {
+            request: RequestId::generate(),
+            asked: [0; 32],
+            from: frozen.at.log_position,
+            from_at: frozen.taken_at,
+        };
+        let head = frozen.at.manifest.as_ref();
+        let outcome = match as_today {
+            true => {
+                let mut fetched = Ok(());
+                for (key, bytes) in &frozen.files {
+                    if self.blobs.clean.get(key).await.is_err() {
+                        fetched = fetched.and(self.blobs.put(key, bytes.clone()).await);
+                    }
+                }
+                match fetched {
+                    Ok(()) => {
+                        let writer = &self.seats[seat].writer;
+                        writer.restore_recorded(head, restore, None).await
+                    }
+                    Err(error) => Err(error),
+                }
             }
-        }
-        let outcome = match fetched {
-            Ok(()) => {
-                let restore = Restore {
-                    request: RequestId::generate(),
-                    asked: [0; 32],
-                    from: frozen.at.log_position,
-                    from_at: frozen.taken_at,
-                };
+            false => {
+                let source: Arc<dyn Blobs> = Arc::new(Snapshotted(frozen.files.clone()));
                 let writer = &self.seats[seat].writer;
-                let head = frozen.at.manifest.as_ref();
-                writer.restore_recorded(head, restore, None).await
+                match writer
+                    .restore_from(source, head, restore, None, &Held)
+                    .await
+                {
+                    Ok(ready) => ready.commit().await,
+                    Err(error) => Err(error),
+                }
             }
-            Err(error) => Err(error),
         };
         let recorded = self.coordinator.restores.load(Ordering::SeqCst) > before;
         self.seats[seat].open = !self.seats[seat].writer.is_closed();
@@ -2481,6 +2583,14 @@ impl World {
                 frozen.at
             )
         })?;
+        if let (Err(error), false) = (&outcome, as_today) {
+            check(faulty || !current, || {
+                format!(
+                    "a restore from the snapshot of {:?} failed with nothing in its way: {error}",
+                    frozen.at
+                )
+            })?;
+        }
         if recorded {
             let head = self.coordinator.heads.lock().unwrap().last().cloned();
             let head = head.expect("a restore recorded makes a head");
@@ -2492,6 +2602,8 @@ impl World {
                 head: head.key,
             });
             self.made.restores += 1;
+            self.made.sourced += 1;
+            self.made.sourced_under += usize::from(!self.blobs.held.lock().unwrap().is_empty());
             self.base = frozen.rows;
             self.since.clear();
         }
@@ -3347,9 +3459,12 @@ fn written() -> Action {
 /// A snapshot of a checkpoint, two checkpoints after it merged into one,
 /// and every file the snapshot holds cleaned away by a clean with no
 /// grace, with its deletes held from the one `held` on if any; then the
-/// partition is put back from the snapshot. The store has the snapshot's
-/// files still only if their deletes are held.
-fn restored_from_a_snapshot_cleaned_away(held: Option<usize>) -> Vec<Action> {
+/// partition is put back from the snapshot by `restoring`. The store has
+/// the snapshot's files still only if their deletes are held.
+fn restored_from_a_snapshot_cleaned_away(
+    held: Option<usize>,
+    restoring: fn(usize) -> Action,
+) -> Vec<Action> {
     let who = Who::Current;
     [
         vec![
@@ -3363,7 +3478,7 @@ fn restored_from_a_snapshot_cleaned_away(held: Option<usize>) -> Vec<Action> {
         held.map(Action::DelayDelete).into_iter().collect(),
         vec![
             Action::Clean { who, aged: false },
-            Action::RestoreFrom(0),
+            restoring(0),
             Action::DeliverDelayedDeletes,
         ],
     ]
@@ -3379,18 +3494,107 @@ fn restored_from_a_snapshot_cleaned_away(held: Option<usize>) -> Vec<Action> {
 /// once, and the delete then takes it.
 #[test]
 fn a_restore_from_a_snapshot_as_a_node_makes_one_today_is_caught_either_way() {
-    let rewritten = run(restored_from_a_snapshot_cleaned_away(None), None).unwrap_err();
+    let today = Action::RestoreFromAsToday;
+    let rewritten = run(restored_from_a_snapshot_cleaned_away(None, today), None).unwrap_err();
     assert!(
         rewritten.contains("RestoreFrom") && rewritten.contains("written twice"),
         "{rewritten}"
     );
 
-    let present = run(restored_from_a_snapshot_cleaned_away(Some(0)), None).unwrap_err();
+    let present = run(restored_from_a_snapshot_cleaned_away(Some(0), today), None).unwrap_err();
     assert!(
         present.contains("RestoreFrom") && present.contains("DW-680 K2"),
         "{present}"
     );
     assert!(!present.contains("written twice"), "{present}");
+}
+
+/// The same two histories, the partition put back from the snapshot as
+/// DW-680 has it: each file copied in under a key of the restore's own,
+/// whether the store has the file still under the key it had, its delete
+/// given up by a clean with no grace and yet to land, or not. Nothing is
+/// written twice, no head names a file whose delete was asked for, the
+/// rule is kept, and what is read is what the snapshot held: with no
+/// margin of time to stand on, as the late delete of a clean with no grace
+/// leaves none.
+#[test]
+fn a_restore_from_a_snapshot_of_files_cleaned_away_is_made_whole() {
+    for held in [None, Some(0)] {
+        let history = restored_from_a_snapshot_cleaned_away(held, Action::RestoreFrom);
+        let made = run(history, None).unwrap();
+        assert_eq!(made.sourced, 1, "{held:?}");
+        assert_eq!(made.sourced_under, usize::from(held.is_some()), "{held:?}");
+    }
+}
+
+/// A restore as DW-680 makes it puts nothing at an old position, so the
+/// next clean, of the same history in which a restore made as a node made
+/// it before DW-680 fails it (see the test of DW-681 below), succeeds.
+#[test]
+fn a_clean_after_a_restore_from_a_snapshot_of_files_cleaned_away_succeeds() {
+    paused().block_on(async {
+        let mut history = restored_from_a_snapshot_cleaned_away(None, Action::RestoreFrom);
+        history.truncate(history.len() - 2);
+        let mut world = after(history).await;
+        assert!(world.made.cleaned > 0, "{:?}", world.made);
+        world.step(Action::RestoreFrom(0)).await.unwrap();
+        assert_eq!(world.made.restores, 1);
+        assert!(world.blobs.rewritten.lock().unwrap().is_empty());
+        world.pass(1);
+        let writer = &world.seats[world.seats.len() - 1].writer;
+        writer.clean(STEP * GRACE as u32).await.unwrap();
+        world.verify().await.unwrap();
+    });
+}
+
+/// A copy a restore from a snapshot gave up on, which lands only after the
+/// restore failed and its copies were deleted, lies under a key nothing
+/// names: no head the coordinator records names it, and nothing reads it.
+#[test]
+fn a_copy_a_restore_from_a_snapshot_gave_up_on_that_lands_late_is_never_read() {
+    let who = Who::Current;
+    paused().block_on(async {
+        let mut world = after(vec![
+            written(),
+            Action::Flush { who },
+            Action::Snapshot,
+            written(),
+            Action::FailUpload(PutFault::Delay),
+            Action::RestoreFrom(0),
+        ])
+        .await;
+        assert_eq!(world.made.restores, 0, "given up");
+        let landed = world.blobs.landings.lock().unwrap().len();
+        world.step(Action::DeliverDelayed).await.unwrap();
+        let late: Vec<String> = world.blobs.landings.lock().unwrap()[landed..].to_vec();
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert!(late[0].contains("-restored"), "{late:?}");
+        let read = world.blobs.read.lock().unwrap().len();
+        for action in [
+            written(),
+            Action::Flush { who },
+            Action::Merge { who },
+            Action::RestoreFrom(0),
+            Action::Follow,
+            Action::Clean { who, aged: true },
+        ] {
+            world.step(action).await.unwrap();
+            world.verify().await.unwrap();
+        }
+        assert_eq!(world.made.restores, 1);
+        let reads = world.blobs.read.lock().unwrap()[read..].to_vec();
+        assert!(!reads.contains(&late[0]), "read {}", late[0]);
+        let heads = world.coordinator.heads.lock().unwrap().clone();
+        for head in heads {
+            let named = world.named_at(&head.key).unwrap();
+            assert!(
+                !named.contains(&late[0]),
+                "{} names {}",
+                head.key.0,
+                late[0]
+            );
+        }
+    });
 }
 
 /// What is checked of a history is blind, as it should not be, to a head
@@ -3400,7 +3604,7 @@ fn a_restore_from_a_snapshot_as_a_node_makes_one_today_is_caught_either_way() {
 /// but only for breaking DW-680's rule, which it does in any case.
 #[test]
 fn a_late_delete_noted_only_once_made_goes_unseen_by_what_a_head_names() {
-    let history = restored_from_a_snapshot_cleaned_away(Some(0));
+    let history = restored_from_a_snapshot_cleaned_away(Some(0), Action::RestoreFromAsToday);
     let unseen = run(history, Some(Canary::NotesDeletesOnlyMade)).unwrap_err();
     assert!(
         unseen.contains("RestoreFrom") && !unseen.contains("DW-680 K2"),
@@ -3437,7 +3641,6 @@ fn snapshot_checkpoint(world: &World) -> Manifest {
 /// checkpoint it commits the files it finds in the store by the keys they
 /// had.
 #[test]
-#[should_panic(expected = "DW-680 K4: a restore from a snapshot")]
 fn a_restore_from_a_snapshot_brings_nothing_in_under_the_key_it_had() {
     let who = Who::Current;
     let flush = || Action::Flush { who };
@@ -3565,11 +3768,12 @@ fn a_restore_from_a_snapshot_that_fails_changes_nothing() {
 #[should_panic(expected = "DW-681: a clean failed with nothing in its way")]
 fn a_clean_fails_after_a_restore_puts_back_what_the_clean_before_it_deleted() {
     paused().block_on(async {
-        let mut history = restored_from_a_snapshot_cleaned_away(None);
+        let today = Action::RestoreFromAsToday;
+        let mut history = restored_from_a_snapshot_cleaned_away(None, today);
         history.truncate(history.len() - 2);
         let mut world = after(history).await;
         assert!(world.made.cleaned > 0, "{:?}", world.made);
-        world.step(Action::RestoreFrom(0)).await.unwrap();
+        world.step(Action::RestoreFromAsToday(0)).await.unwrap();
         assert_eq!(world.made.restores, 1);
         assert!(!world.blobs.rewritten.lock().unwrap().is_empty());
         world.pass(1);
