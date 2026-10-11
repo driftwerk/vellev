@@ -1424,6 +1424,28 @@ impl Drop for Partial {
     }
 }
 
+/// The copy of the file under `key` to forget once the file is put, and
+/// forgotten on a task of its own if this is dropped before.
+struct Forgetting {
+    blobs: Option<CachedBlobs>,
+    key: String,
+}
+
+impl Drop for Forgetting {
+    fn drop(&mut self) {
+        let (Some(blobs), Ok(runtime)) = (self.blobs.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let key = std::mem::take(&mut self.key);
+        runtime.spawn(async move {
+            if let Err(error) = blobs.forget(&key).await {
+                tracing::warn!(key, %error, "a copy of a file put in parts was not forgotten");
+            }
+        });
+    }
+}
+
 /// Delete every file under `dir` left part written [`PARTIAL_STALE`] ago
 /// or more, returning how many. A file or directory that cannot be read,
 /// or goes meanwhile, is passed over.
@@ -1461,17 +1483,31 @@ impl Blobs for CachedBlobs {
         Ok(())
     }
 
-    /// Handed to the store as it comes. Any copy of a file that was under
-    /// `key` goes first, as for [`Self::delete`], and no copy of this one
-    /// is made: one is made when it is first read. A read that runs beside
-    /// it may keep a copy of the file that was there, as beside a put.
+    /// Handed to the store as it comes, and no copy of it made: one is
+    /// made when it is first read. Any copy of a file that was under `key`
+    /// goes first, as for [`Self::delete`], and nothing goes up if it
+    /// cannot. Whatever copy there is goes again once the store has
+    /// answered, whether the put succeeded or not, and on a task of its
+    /// own if the put is dropped before: a read while the file went up
+    /// kept a copy of the one that was there. A copy that cannot be
+    /// forgotten then fails the put, though the file may be there. What
+    /// remains is as beside a put: a read that fetched the file that was
+    /// there before this one landed, and keeps its copy after that last
+    /// forgetting, leaves the old copy.
     async fn put_parts(
         &self,
         key: &str,
         parts: futures::stream::BoxStream<'_, Result<Bytes>>,
     ) -> Result<()> {
         self.forget(key).await?;
-        self.inner.put_parts(key, parts).await
+        let mut forgetting = Forgetting {
+            blobs: Some(self.clone()),
+            key: key.to_string(),
+        };
+        let put = self.inner.put_parts(key, parts).await;
+        let forgot = self.forget(key).await;
+        forgetting.blobs = None;
+        put.and(forgot)
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {

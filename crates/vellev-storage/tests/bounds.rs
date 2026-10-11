@@ -728,9 +728,10 @@ async fn a_file_cached_and_put_again_a_part_at_a_time_is_read_as_it_was_last_put
     assert_eq!(cached.get(&key).await.unwrap(), old);
 }
 
-/// A store whose every put in parts lands, and is answered as failed.
+/// A store whose every put in parts lands, and is then answered as
+/// failed, or, if it `stops`, never answered.
 #[derive(Debug)]
-struct LandingUnsaid(Arc<dyn Blobs>);
+struct LandingUnsaid(Arc<dyn Blobs>, bool);
 
 #[async_trait]
 impl Blobs for LandingUnsaid {
@@ -743,6 +744,9 @@ impl Blobs for LandingUnsaid {
         parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
     ) -> vellev_storage::Result<()> {
         self.0.put_parts(key, parts).await?;
+        if self.1 {
+            std::future::pending::<()>().await;
+        }
         Err(vellev_storage::blobs::unanswered(key, Duration::ZERO))
     }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
@@ -760,14 +764,133 @@ impl Blobs for LandingUnsaid {
 async fn a_file_put_again_a_part_at_a_time_that_landed_unsaid_is_read_as_it_landed() {
     let dir = tempfile::tempdir().unwrap();
     let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
-    let cached = CachedBlobs::new(Arc::new(LandingUnsaid(inner)), dir.path());
+    let landing = Arc::new(LandingUnsaid(inner, false));
+    let cached = Arc::new(CachedBlobs::new(landing, dir.path()));
     let ((key, old), (_, new)) = (entry(1), entry(2));
-    cached.put(&key, old).await.unwrap();
-    let sizes = [20, new.len() - 20];
-    let put = cached.put_parts(&key, coming(&new, &sizes)).await;
+    cached.put(&key, old.clone()).await.unwrap();
+    let (send, parts) = sent_by_hand();
+    let putting = tokio::spawn({
+        let (cached, key) = (cached.clone(), key.clone());
+        async move { cached.put_parts(&key, parts).await }
+    });
+    dropped(&cached, &key, "before it goes up").await;
+    // Read while it goes up, and so kept a copy of.
+    assert_eq!(cached.get(&key).await.unwrap(), old);
+    send.unbounded_send(Ok(new.clone())).unwrap();
+    drop(send);
+    let put = putting.await.unwrap();
     assert!(put.is_err(), "{put:?}");
     // The store may have it, and does: the copy of what was there is gone.
     assert_eq!(cached.get(&key).await.unwrap(), new);
+}
+
+#[tokio::test]
+async fn a_file_put_a_part_at_a_time_whose_old_copy_cannot_be_dropped_after_is_answered_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let cached = CachedBlobs::new(inner.clone(), dir.path());
+    let (key, new) = entry(2);
+    // Once it has begun to go up, something no file removal removes
+    // comes where its copy would be.
+    let in_the_way = dir.path().join(&key).join("in the way");
+    let parts = futures::stream::once({
+        let new = new.clone();
+        async move {
+            std::fs::create_dir_all(in_the_way).unwrap();
+            Ok(new)
+        }
+    });
+    let failed = cached.put_parts(&key, parts.boxed()).await;
+    assert!(
+        matches!(&failed, Err(StorageError::Blob { key: of, .. }) if *of == key),
+        "{failed:?}"
+    );
+    assert_eq!(inner.get(&key).await.unwrap(), new, "though it went up");
+}
+
+/// Wait until `cached` keeps no copy of the file under `key`, failing
+/// the test if it still does after half a minute.
+async fn dropped(cached: &CachedBlobs, key: &str, when: &str) {
+    let started = std::time::Instant::now();
+    while cached.local(key).await.unwrap().is_some() {
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(30),
+            "the old copy is kept {when}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_file_read_while_it_goes_up_again_a_part_at_a_time_is_read_as_last_put_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let cached = Arc::new(CachedBlobs::new(inner.clone(), dir.path()));
+    let ((key, old), (_, new)) = (entry(1), entry(2));
+    cached.put(&key, old.clone()).await.unwrap();
+    let (send, parts) = sent_by_hand();
+    let putting = tokio::spawn({
+        let (cached, key) = (cached.clone(), key.clone());
+        async move { cached.put_parts(&key, parts).await }
+    });
+    dropped(&cached, &key, "before it goes up").await;
+    // A read while it goes up is of the file that is there, and keeps a
+    // copy of it, rightly then.
+    assert_eq!(cached.get(&key).await.unwrap(), old);
+    assert!(cached.local(&key).await.unwrap().is_some());
+
+    send.unbounded_send(Ok(new.clone())).unwrap();
+    drop(send);
+    putting.await.unwrap().unwrap();
+    assert_eq!(cached.get(&key).await.unwrap(), new, "as after a put");
+}
+
+#[tokio::test]
+async fn a_file_that_landed_a_part_at_a_time_and_was_given_up_on_is_read_as_it_landed() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let landing = Arc::new(LandingUnsaid(inner.clone(), true));
+    let cached = Arc::new(CachedBlobs::new(landing, dir.path()));
+    let ((key, old), (_, new)) = (entry(1), entry(2));
+    cached.put(&key, old.clone()).await.unwrap();
+    let (send, parts) = sent_by_hand();
+    let putting = tokio::spawn({
+        let (cached, key) = (cached.clone(), key.clone());
+        async move { cached.put_parts(&key, parts).await }
+    });
+    dropped(&cached, &key, "before it goes up").await;
+    assert_eq!(cached.get(&key).await.unwrap(), old);
+    send.unbounded_send(Ok(new.clone())).unwrap();
+    drop(send);
+    while inner.get(&key).await.unwrap() != new {
+        tokio::task::yield_now().await;
+    }
+    // Landed, never answered, and the caller stops waiting.
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+    dropped(&cached, &key, "once the put is dropped").await;
+    assert_eq!(cached.get(&key).await.unwrap(), new);
+}
+
+#[tokio::test]
+async fn a_file_whose_old_copy_cannot_be_dropped_is_not_put_a_part_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let cached = CachedBlobs::new(inner.clone(), dir.path());
+    let (key, new) = entry(2);
+    // Where its copy would be, something no file removal removes.
+    std::fs::create_dir_all(dir.path().join(&key).join("in the way")).unwrap();
+    let sizes = [20, new.len() - 20];
+    let refused = cached.put_parts(&key, coming(&new, &sizes)).await;
+    assert!(
+        matches!(&refused, Err(StorageError::Blob { key: of, .. }) if *of == key),
+        "{refused:?}"
+    );
+    assert!(matches!(
+        inner.get(&key).await,
+        Err(StorageError::Missing { .. })
+    ));
 }
 
 /// A request an object store is asked to make for an upload.
