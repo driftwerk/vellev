@@ -813,6 +813,9 @@ impl Blobs for Within {
                     None => std::future::pending().await,
                 }
             };
+            // A put that has answered is taken as answered, though its
+            // bound ran out at the same moment: given up, a file that
+            // went up whole would be taken for one that did not.
             tokio::select! {
                 biased;
                 put = &mut put => return put,

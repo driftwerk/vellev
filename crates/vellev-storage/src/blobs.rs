@@ -1086,10 +1086,14 @@ impl Blobs for ObjectBlobs {
     /// As [`Self::put`] sends the same file, whatever the sizes its parts
     /// come in: parts of [`Transfers::part_bytes`] and a last one of what
     /// is left, each sent once it is known that more follows it, or whole
-    /// if a part or less is all that comes. No more than a part is held
-    /// beside what last came. How large the file is cannot be known
-    /// before it has come, so one too large for [`MOST_PARTS`] is refused
-    /// only at the first part too many, and what went up of it aborted.
+    /// if a part or less is all that comes. No more than a part of what
+    /// came is held beside what last came; but a piece cut from a part
+    /// that came keeps all of that part alive, so what is held at once is
+    /// as many of the parts that came as one part is cut from, the first
+    /// perhaps only for its end, and the one that came last. An empty one
+    /// is let go at once. How large the file is cannot be known before it
+    /// has come, so one too large for [`MOST_PARTS`] is refused only at the
+    /// first part too many, and what went up of it aborted.
     async fn put_parts(
         &self,
         key: &str,
@@ -1112,6 +1116,9 @@ impl Blobs for ObjectBlobs {
         };
         let uploaded = async {
             while let Some(mut came) = parts.try_next().await? {
+                if came.is_empty() {
+                    continue;
+                }
                 while holding + came.len() > part {
                     held.push(came.split_to(part - holding));
                     if upload.upload.is_none() {
@@ -1319,6 +1326,23 @@ impl CachedBlobs {
         }
     }
 
+    /// Remove the copy on local disk of the file under `key`, if there is
+    /// one, and what was known of it.
+    async fn forget(&self, key: &str) -> Result<()> {
+        let Some(path) = self.path(key) else {
+            return Ok(());
+        };
+        crate::column::forget_summed(&path);
+        let removed = self.disk.run(0, move || match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        });
+        removed.await.map_err(|error| StorageError::Blob {
+            key: key.to_string(),
+            source: error.into(),
+        })
+    }
+
     /// Written under a name of its own and then renamed, so a reader never
     /// sees a partly written file. Nothing is synced: an entry torn by a
     /// crash fails its checksum and is fetched again. The whole of it runs
@@ -1437,13 +1461,16 @@ impl Blobs for CachedBlobs {
         Ok(())
     }
 
-    /// Handed to the store as it comes, and no copy of it kept on local
-    /// disk: one is made when the file is first read.
+    /// Handed to the store as it comes. Any copy of a file that was under
+    /// `key` goes first, as for [`Self::delete`], and no copy of this one
+    /// is made: one is made when it is first read. A read that runs beside
+    /// it may keep a copy of the file that was there, as beside a put.
     async fn put_parts(
         &self,
         key: &str,
         parts: futures::stream::BoxStream<'_, Result<Bytes>>,
     ) -> Result<()> {
+        self.forget(key).await?;
         self.inner.put_parts(key, parts).await
     }
 
@@ -1470,17 +1497,7 @@ impl Blobs for CachedBlobs {
     /// were the file deleted and its copy left, a read would be answered
     /// with a file the store no longer has.
     async fn delete(&self, key: &str) -> Result<()> {
-        if let Some(path) = self.path(key) {
-            crate::column::forget_summed(&path);
-            let removed = self.disk.run(0, move || match std::fs::remove_file(path) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-                _ => Ok(()),
-            });
-            removed.await.map_err(|error| StorageError::Blob {
-                key: key.to_string(),
-                source: error.into(),
-            })?;
-        }
+        self.forget(key).await?;
         self.inner.delete(key).await
     }
 
