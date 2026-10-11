@@ -351,7 +351,8 @@ test holds for every state the ledger can be in; that is all that is
 promised of them. With something changed, they may differ, and the
 comparison is the more wary: where Weaviate has deleted an id since
 the last run, it counts the object `gone`, and fails, though the next
-run may find it another writer's, leave it, and settle. `--verify-all` also counts, as `extra`, the objects the
+run may delete it, if it is the import's own, or find it another
+writer's and leave it, and settle. `--verify-all` also counts, as `extra`, the objects the
 collection holds that the ledger has no entry for: another writer's,
 under ids Weaviate never had, and no fault of the import's unless it is
 told to be `--strict`. `--verify` of some pages cannot see them.
