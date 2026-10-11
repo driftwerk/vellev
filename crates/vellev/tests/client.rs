@@ -1507,10 +1507,14 @@ async fn a_node_that_cannot_is_left_out_while_the_others_are_tried_again() {
 
 #[tokio::test]
 async fn a_search_a_node_cannot_embed_for_is_answered_by_one_that_can() {
-    let url = keyed_embedding_server("sk-right").await;
+    let url = keyed_embedding_server("sk-right-0123456789abcdef").await;
     let cluster = Cluster::new();
-    let right = cluster.serve_embedding_keyed(&url, "sk-right").await;
-    let wrong = cluster.serve_embedding_keyed(&url, "sk-wrong").await;
+    let right = cluster
+        .serve_embedding_keyed(&url, "sk-right-0123456789abcdef")
+        .await;
+    let wrong = cluster
+        .serve_embedding_keyed(&url, "sk-wrong-0123456789abcdef")
+        .await;
     let embedding = json!({
         "provider": "http",
         "api": "openai",

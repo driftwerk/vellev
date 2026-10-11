@@ -782,7 +782,8 @@ dead connection passes to another node rather than waiting with it:
   with the same text, it is not counted again, so long as the text is of
   no more than 1,024 bytes, was embedded, and its vector is still kept; and answered at last, it
   is counted for the answer, twice in all. A search waits no longer than
-  two minutes for its text's vector, whatever makes it.
+  ten seconds (`VELLEV_EMBED_QUERY_SECS`) for its text's vector, whatever
+  makes it.
 - A commit does up to three steps on a thread of its own. One that finds
   no thread free for a step is given a quarter of its lease to get one,
   each step, before the wait counts against its writer; a writer held for
@@ -895,7 +896,8 @@ send it again once the node is put right; one that brings its own vector
 needs no model. Three things are promised of a node that meets such a
 fault, and no more:
 
-- It logs the fault at most once in 20 seconds for each way of embedding
+- It logs the fault at most once in 20 seconds for each model, as it is
+  reached and with the key it is sent, whatever collections embed with it,
   and each `reason`, however many requests meet it, at once or one after
   another, hybrid searches that fall back among them, and whatever the
   model does meanwhile.
@@ -912,7 +914,31 @@ model once and are each refused.
 What a model's server says is logged, and passed on, without what is
 shaped like a key in it. In what an HTTP endpoint answers, keys are
 looked for in the first four kilobytes, before it is cut to the 300
-characters that are kept. Nothing is decoded to find one.
+characters that are kept.
+
+The node knows its own key for an endpoint exactly, and takes it out
+wherever it is: any run of eight characters of it or more, in any case
+of ASCII letters, among the characters the endpoint's escapes stand for,
+JSON's `\uXXXX` (surrogate pairs too), `\/` and `\\`, and `%XX`, in
+either case of hex, and among the characters as they were said. What
+stands for the run is taken out. Up to seven characters of it in a row
+stay, as any word may share them; and anything escaped twice over, which
+is not undone. Looking costs the length of what is looked through times
+the key's, whatever both are made of: a key of 2,000 characters against
+four kilobytes is some milliseconds of the node's time for each refusal.
+A key for an endpoint is sixteen characters or more, with no space in
+it, or the node does not start; nor is an endpoint reached with one in
+code that makes it with `Http::new`.
+
+What an endpoint said is known to be whole only when it said how much
+it would send and sent it: by `content-length` with no coding, or in
+chunks with `chunked` the last of its codings; over HTTP/2, only when
+the stream ended. What is not known whole, as when the endpoint sends
+until it hangs up, or hangs up short of what it said, or names another
+coding, may be cut anywhere: whatever run of a key's characters it ends
+with is left out, with any part of a character or of an escape it was
+cut off in; and the start of the node's own key, four characters or
+more, is left out of the end of what was said however it was framed.
 
 A key known by how it begins is taken out anywhere but straight after a
 letter, unless that letter ends one of the escapes `\n`, `\r`, `\t`,
@@ -945,6 +971,28 @@ Deliberately left: a key glued to the end of a word, since `task-…` and
 `Bearer` or `Basic` that is all lower-case letters; a key with no shape
 of its own, such as an AWS secret or an Azure key; and anything written
 with escapes inside it.
+
+So what an endpoint says can carry, of a key that is not the node's own
+for it:
+
+- a piece of a key followed by any character not of a key, in any
+  framing, as one cut off inside an escape that follows it is;
+- a key split by a line break, or by the end of a JSON string;
+- keys of shapes not listed above: `gsk_`, `xai-`, `pk-`, `pa-`, `ghp_`,
+  an Azure key of 32 hex digits, a Cohere key of 40 characters, an AWS
+  secret access key;
+- the value of a JSON field named `api_key` or `token`, or of an echoed
+  `api-key` or `x-api-key` header, a Basic credential shorter than 16
+  characters, a URL-encoded `api-key%3D…`, a lower-case `bearer`, and a
+  key straight after a letter;
+- a piece of another key that an endpoint sends as all it has to say,
+  of the length it says; and a key with a byte in it that is no
+  character.
+
+And what is no key can be taken out: a word of 16 characters or more
+after `Bearer` or `Basic`, as in `Basic authentication_required_here`,
+and the end of what is not known whole, if it is a run of a key's
+characters, as `try again later` loses `later`.
 
 The 20 seconds cut the other way too: something in front of an OpenAI
 endpoint that answers `model_not_found` or `invalid_api_key` for a moment,
@@ -1001,6 +1049,257 @@ that doubles up to five seconds; a node that turns a request away with
 `Retry-After` is waited on that long, up to a minute: the same node for a
 tenant asking too much (429), and for a node too busy to answer a read
 (503) after any other address has been asked first.
+
+### How a node embeds
+
+What is set per node, each with its default:
+
+| Setting | Default | What it is |
+| --- | --- | --- |
+| `VELLEV_LOCAL_MODEL` | `BAAI/bge-base-en-v1.5` | The node's own local model, which a collection may always name. Blank for none. |
+| `VELLEV_LOCAL_MODELS_ALLOWED` | none | The other local models collections may embed with, by name. |
+| `VELLEV_LOCAL_MODELS` | 2 | How many local models are loaded at once; one of the places is the node's own model's. |
+| `VELLEV_LOCAL_MODEL_IDLE_SECS` | 900 | How long a local model other than the node's own goes unused before it is let go. |
+| `VELLEV_BEDROCK_REGIONS` | the node's own | The regions collections may embed through Bedrock in, five at the most. Unset, it is `AWS_REGION`, or `AWS_DEFAULT_REGION` if that is unset or blank, read from the environment and nowhere else; with neither, none. Set but blank, in the environment or on the command line, it is none, the node's own included. |
+| `VELLEV_EMBED_QUERY_SECS` | 10 | How long a search waits for its text's vector; 120 at the most. |
+| `VELLEV_EMBED_DOCUMENTS_SECS` | 60 | How long a model may make nothing for anyone before a write waiting on it is given up on. |
+
+A collection names the model it embeds with; a node has no model that
+collections embed with unless they say. A node told what it cannot do
+does not start: a local model the release does not run, other local
+models allowed when it has room for its own alone, more than five
+regions, or a search kept waiting more than two minutes. One that allows
+more local models than it has places for starts, and says so in its log:
+a collection whose model there is no place for waits for another to go
+unused. A region is the same region however it is cased and whatever
+space is about its name, in the setting and in a collection alike; named
+twice, it is counted once.
+
+A collection can be made only with what its node is set up for: a local
+model that is the node's own or one it allows, and Bedrock in a region the
+node calls. Anything else is `invalid` when the collection is made. A
+collection that is there already, on a node since set up otherwise, is
+kept: its searches and writes are `model_unavailable` with `reason:
+"setup"` until the node is set up for it again.
+
+A local model is loaded when first used, if the node has a place for it,
+and is `unavailable` (503) while it has none. `bge-base-en-v1.5` takes
+some 840 to 1,010 MB of memory while it runs; a model let go may not give
+its memory back to the operating system. A node keeps what it knows of
+64 models served elsewhere at the most, an endpoint or region with a
+model name and a size being one model: with 64 in use at once, a request
+for another is `unavailable` until one is no longer in use.
+
+What holds on a local model:
+
+- One thread runs the model, a run at a time. The model is given the
+  texts of a run padded to the longest of them, so a run costs its texts
+  times the longest, in tokens. The node does not count tokens: it
+  counts bytes, a byte being a token at the most, up to the 512 tokens a
+  model reads of a text. A run is of as many texts, in the order they
+  wait, as come to 2,048 so counted: 32 texts of up to 64 bytes, 8 of
+  256, 4 of 512 or more; and of one text at the least. A text is
+  counted as it is sent to the model, with what its collection puts
+  before it: the 57 bytes `bge-base-en-v1.5` has before a search make a
+  search of 48 bytes one of 105, of which 19 go to a run, and only a
+  search of 7 bytes or fewer one of "up to 64".
+- Such a run takes about a second of the densest text there is, a token
+  to the byte, as rows of JSON, digits and punctuation nearly are; and
+  less of prose, a fifth of a second for 32 texts of 64 bytes or 8 of
+  256, up to a second for 4 of 2,048 bytes or more. That is
+  `bge-base-en-v1.5` in a release build on an Apple M2 Max of 12 cores,
+  busy with other work at a load of 11 to 24: 0.63 to 1.0 seconds for
+  the densest runs there, and 0.74 to 1.2 on the same machine busier
+  still. It is a measurement, and a slower machine takes longer.
+- Searches go first. While a write waits, it has a run after every two
+  runs of searches: so searches, however many and however fast they
+  come, leave writes one run in three.
+- A search waits for the run under way; then for as many runs of
+  searches as it takes to come to its own, all tenants' searches being
+  in one line, first come, first served, and a run holding what any run
+  does; and, while a write waits, for a run of writes after every two
+  of those: one more or one fewer by how many runs of searches the
+  write has waited through already when the search comes, and a search
+  that comes when the write has waited through two waits for the
+  write's run though no search is ahead of it. So, with a write
+  waiting, a search behind 254 searches of up to 64 bytes as sent waits
+  8 runs of searches and 3 or 4 of writes; one behind 249 searches of
+  105 bytes, as searches of 48 are with the default model, 14 and 6 or
+  7; and one behind 63 searches of 512 bytes or more, 16 and 7 or 8.
+  Measured on the machine above: beside 8, 40 and 64 searchers in a
+  closed loop with short searches, and a write, the slowest search
+  took about a third of a second, half to two thirds, and one to one
+  and a third; busier still, up to 1.4 and 2.2 seconds for 40 and 64.
+- Writes are served first come, first served, whoever's they are, and no
+  text is passed over for one behind it.
+- A write is given up on, as `unavailable`, when it has waited for
+  `VELLEV_EMBED_DOCUMENTS_SECS` with the model not at work: not for how
+  long it waits its turn or how long it takes. Only a vector made, for
+  anyone, is the model at work. A load is not, but the time a load takes
+  that ends with the model loaded is not held against those who wait,
+  nor that of a load under way, up to the ten minutes a load is given.
+  The time of a load that fails, of a run that fails or panics, and of
+  callers arriving, is held against them: a load that fails is taken
+  back from the time it was given while it was under way. So a write
+  waits out a load under way, and is given up on within
+  `VELLEV_EMBED_DOCUMENTS_SECS` of the load failing; a load is excused
+  for ten minutes at the most, so that is within ten minutes and
+  `VELLEV_EMBED_DOCUMENTS_SECS` of the model last being at work. A load
+  that never ends is so given up on eleven minutes after it began, with
+  the default of a minute. A node fetching its model with no network so
+  gives up on writes, and does not keep them for as many loads as there
+  are writes ahead. A
+  write that arrives while the model loads waits for it, however many
+  arrive. A search does not: it waits its ten seconds, so searches made
+  during a load longer than that, as the first fetch of a model is, are
+  `unavailable` until the load is done.
+- A run the model fails fails the writes with texts in it, and no others.
+- A text is cut to its first 51,200 characters before it goes to a local
+  model. No model here reads more than 512 tokens of a text, so for
+  most texts nothing a model would have read is lost. A text's vector
+  can differ from what the uncut text gave before where much of its
+  first 51,200 characters is what a tokenizer makes one token of or
+  none: words longer than a hundred characters, as long runs of hex or
+  base64 and URLs without a break are, which are one token each
+  whatever their length; and white space, control characters and
+  characters of no width, which are dropped.
+
+What holds on Bedrock and HTTP endpoints:
+
+- A node has ten calls to Bedrock at once at the most, shared equally
+  among the regions it calls and among every size of Titan in a region,
+  each region with a call kept for searches at the least. For one to
+  five regions, a region has 10, 5, 3, 2 or 2 calls, of which writes
+  have 8, 4, 2, 1 or 1: so three regions have nine calls between them
+  and four have eight. One region that is slow or has stopped holds its
+  own calls and no other region's, and a search does not wait behind a
+  write's texts.
+- A region that could not be reached at all is not tried again for five
+  seconds: texts meant for it meanwhile fail at once. So is one whose
+  call a caller gave up on after thirty seconds unanswered, which a
+  search given ten seconds never does: a region that has hung is found
+  out by writes, and searches of it each wait their ten seconds until
+  one is. A call that is slow and being tried again, and would
+  have been answered, is taken for the same if its caller gives up on
+  it then. A region that answers, though it be to refuse, deny or
+  throttle, has been reached.
+- A node with no AWS credentials, or with credentials set up wrong, is
+  `model_unavailable` with `reason: "setup"`, and nothing is said of the
+  region. On a machine that has its credentials from the instance
+  metadata service, that service not being there to connect to for a
+  moment reads the same, as a `setup` fault that stands for 20 seconds
+  and then clears by itself when the service answers; one that is
+  connected to and does not answer in time is a failure that may pass,
+  and nothing stands.
+- A write is given up on only when Bedrock in that region, or the
+  endpoint, has answered no text or batch with its vectors, for anyone,
+  for `VELLEV_EMBED_DOCUMENTS_SECS`. A refusal, or being told to wait and
+  ask again, is not an answer. A single text or batch that takes longer
+  than that by itself, with no other being answered, is given up on.
+- Every HTTP endpoint is reached through one client. A batch is given
+  two minutes at the most, every try included: a write alone on an
+  endpoint is given up on before that, by the rule above.
+
+A search's vector is kept by the text the model was sent, the
+collection's prefix included: collections that word a search alike share
+it, and others do not. The 1,024 first asked last are kept, of texts up to
+1,024 bytes. Searchers that wait on the same text are all told what the
+first of them is, a failure as much as a vector; a failure is not kept,
+and the next to ask asks the model.
+
+What is not promised:
+
+- Fairness between tenants on a local model. Writes are first come, first
+  served: a tenant that sends a great deal is ahead of whoever comes
+  after, and their write waits for all of it. All tenants' searches share
+  one line too. A scheduler that shares a model among tenants is not in
+  this release.
+- That a search is answered within its ten seconds whatever others
+  search with. Long searches from anyone delay everyone's: four to a
+  run, with a run of writes after every two. Beside 40 searchers in a
+  closed loop with searches of 2,048 bytes, searches fail at the ten
+  seconds: measured on the machine above, a short search beside them
+  took 5.4 to 9.2 seconds with no write waiting, and with a write
+  waiting too, and the machine busier, 32 to 152 searches failed at
+  the deadline in each run of the measurement.
+- That bulk loading through a node is fast while it is searched. A run
+  is sized for the densest text, so a run of prose is a quarter or so
+  of what the model could take in the same time; and with searches
+  always waiting, writes have one run in three, each holding as much
+  less than a run of 32 texts did. For prose of 65 to 2,047 bytes that
+  is up to about five times slower than the model could go, the most
+  for texts of a little over 400 bytes. With no searches waiting, bulk
+  loading is unchanged: the same texts in more runs, each as much
+  shorter. Measured, a write of 320
+  rows of JSON of 256 bytes took 60 to 92 seconds beside 16 searchers
+  in a closed loop, whose slowest search took 3.4 to 5.0 seconds. Load
+  in bulk by embedding outside the node and sending the vectors with
+  the objects, to a collection whose clients supply them.
+- That a write is refused quickly when a model has more to do than it
+  can. It waits its turn, however long, while the model works; a client
+  that will not wait gives up by its own timeout, and what it sent is
+  then not embedded.
+- That a write behind runs the model fails is not given up on. A run
+  that fails is not the model at work: should every run ahead of a write
+  fail for `VELLEV_EMBED_DOCUMENTS_SECS`, as with texts the model cannot
+  take, the write is given up on though the line was moving. Likewise a
+  single run that takes longer than that by itself.
+- Anything of Bedrock's quota for the account, which every node and
+  everything else that calls Bedrock with it shares, or of how fast an
+  HTTP endpoint answers.
+
+Before you upgrade to this release:
+
+- A key in `VELLEV_EMBEDDING_KEYS` must be sixteen characters or more
+  with no space in it, or the node does not start: a node that starts
+  today with a shorter one would not. Leave the key out if the endpoint
+  needs none.
+- A search now waits ten seconds for its text's vector, not two minutes.
+  A node whose model takes longer than that to come to one search, as a
+  local model on a machine with few cores under long searches or a large
+  write may, will answer `nearest` as `unavailable` and `hybrid` by the
+  words alone: set `VELLEV_EMBED_QUERY_SECS` to what it needs, up to 120.
+- Searchers that wait on the same text are now all told the first
+  asker's failure, at once. Before, each waiter in turn asked the model
+  again when the one before it failed.
+- A node embeds through Bedrock only in the regions it is told, or in
+  its own: set `VELLEV_BEDROCK_REGIONS`, or `AWS_REGION`, before
+  upgrading a node whose collections embed in a region that is neither.
+  Collections in other regions are kept, and are `model_unavailable`
+  until the node is told of the region.
+- A collection's Bedrock model must be named `amazon.titan-embed-text-v2`
+  or `amazon.titan-embed-text-v2:0`, exactly. Any name that began with
+  the first was taken before; a collection made under another such name
+  is kept, and is `model_unavailable` (`reason: "build"`) from this
+  release on.
+- A node has fewer calls to Bedrock at once. Before, every model a
+  collection named, in each region and at each size, had ten of its own,
+  none kept for searches: a node with Titan at two sizes in one region
+  had twenty, and one calling five regions fifty or more. Now a node has
+  ten in all, shared among its regions and among every size in a region:
+  writes have 8 of them on a node that calls one region, and 4, 2, 1 or
+  1 in each of two to five.
+- A write through Bedrock or an HTTP endpoint is given up on sooner when
+  nothing is answered. Before, a call to an endpoint had two minutes in
+  all and each text sent to Bedrock two minutes. Now a write alone on an
+  endpoint or a region is given up on once nothing has been answered
+  with vectors, for anyone, for `VELLEV_EMBED_DOCUMENTS_SECS` (60): the
+  two minutes a batch or a text is given are an upper bound that a write
+  alone does not reach. A write of many batches is no longer bounded as
+  a whole.
+- A node runs its own local model and no other unless told: set
+  `VELLEV_LOCAL_MODELS_ALLOWED` to the other local models its
+  collections embed with, and `VELLEV_LOCAL_MODELS` to as many as should
+  be loaded at once.
+- A node keeps what it knows of 64 models served elsewhere at the most,
+  a model being an endpoint or region, a model name and a size. With 64
+  in use at once, a request for a sixty-fifth is `unavailable` (503)
+  until one of them is no longer in use.
+- A run of a local model is smaller: as many texts as cost what 32 of
+  64 bytes do, where it was 32 texts whatever their length. Loading in
+  bulk through a node while it is searched is slower for it, as above.
+- A text longer than 51,200 characters is cut before a local model is
+  given it, as above.
 
 ## Vector search
 

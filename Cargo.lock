@@ -4298,6 +4298,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-bedrockruntime",
  "axum",
  "fastembed",

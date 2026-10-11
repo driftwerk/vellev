@@ -7,12 +7,14 @@ mod http;
 mod local;
 mod registry;
 
-pub use bedrock::Bedrock;
-pub use embedder::{Embedder, FAULT_STANDS, QUERY_WITHIN};
+pub use bedrock::{Bedrock, UNREACHED_FOR};
+pub use embedder::{Embedder, DOCUMENTS_WITHIN, FAULT_STANDS, LONGEST_QUERY_WITHIN, QUERY_WITHIN};
 pub use http::Http;
 #[cfg(feature = "local")]
 pub use local::Local;
-pub use registry::{Embedders, Settings};
+pub use registry::{
+    Embedders, Settings, DEFAULT_LOCAL_MODEL, LOCAL_MODELS, LOCAL_MODEL_IDLE, SHORTEST_KEY,
+};
 
 use std::sync::LazyLock;
 
@@ -317,6 +319,18 @@ fn without(said: &str, shape: &Shape) -> String {
     without
 }
 
+/// Whether `c` is a character a key can be made of, whichever of the
+/// [`KEYS`] it is shaped as, the value in a query string apart: a letter
+/// or a digit, one of `_-.~+/=`, or what masks one, `*` and `…`.
+///
+/// So where what is said is cut short for looking through, whatever of a
+/// key was left at the cut, too short to be told for one, lies wholly in
+/// the run of these that ends there. The value in a query string is
+/// taken out whole however little of it there is, cut short or not.
+pub(crate) fn of_a_key(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_-.~+/=*\u{2026}".contains(c)
+}
+
 /// What texts are embedded for. Someone is waiting on a query, so where a
 /// model has a queue, queries go ahead of documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,16 +339,173 @@ pub enum Purpose {
     Query,
 }
 
+/// What a model that many wait on at once has lately done, for anyone.
+/// A write that waits its turn behind others is not given up on while
+/// the model is at work, for whomever: only when it has not been, for as
+/// long as a model may go without.
+///
+/// Only a vector made is the model at work. A load is not, but the time
+/// a load takes that ends with the model loaded is not held against
+/// those who wait: nor that of a load under way, for as long as a load
+/// is given. The time of a load that fails, of a run that fails or
+/// panics, of anything but loading that makes no vector, is held against
+/// them, as it was spent: a load that fails is taken back from the time
+/// it was given while it was under way.
+#[derive(Debug, Default)]
+pub struct Activity(std::sync::Mutex<Acted>);
+
+/// The most loads that ended well, since the last vector, kept to be
+/// set against the time a waiter has waited. One more lets the oldest
+/// go, which is then held against waiters: they are given up on sooner,
+/// never later.
+const LOADS_KEPT: usize = 256;
+
+#[derive(Debug, Default)]
+struct Acted {
+    /// When a vector was last made.
+    made: Option<tokio::time::Instant>,
+    /// The loads that ended well since then: when each began and ended.
+    loaded: std::collections::VecDeque<(tokio::time::Instant, tokio::time::Instant)>,
+    /// A load under way: when it began, and when it is no longer given.
+    loading: Option<(tokio::time::Instant, tokio::time::Instant)>,
+}
+
+impl Activity {
+    /// The model has made a vector, for whomever.
+    pub fn made(&self) {
+        let mut acted = self.0.lock().expect("activity lock");
+        acted.made = Some(tokio::time::Instant::now());
+        acted.loaded.clear();
+    }
+
+    /// The model has begun to load, and is given `at_most` to.
+    pub fn loading(&self, at_most: std::time::Duration) {
+        let now = tokio::time::Instant::now();
+        let until = now.checked_add(at_most).unwrap_or(now + LONGEST);
+        self.0.lock().expect("activity lock").loading = Some((now, until));
+    }
+
+    /// The load under way has ended with the model loaded: the time it
+    /// took is not held against those who wait. It made no vector.
+    pub fn loaded(&self) {
+        let mut acted = self.0.lock().expect("activity lock");
+        if let Some((began, _)) = acted.loading.take() {
+            if acted.loaded.len() == LOADS_KEPT {
+                acted.loaded.pop_front();
+            }
+            acted.loaded.push_back((began, tokio::time::Instant::now()));
+        }
+    }
+
+    /// No load is under way, whether or not one was: one that was ended
+    /// without the model loaded, and its time is held against those
+    /// who wait.
+    pub fn not_loading(&self) {
+        self.0.lock().expect("activity lock").loading = None;
+    }
+
+    /// How long one who has waited on the model since `since` has waited
+    /// with the model not at work: the time since the later of then and
+    /// the model's last vector, less what loads have taken that ended
+    /// with the model loaded, and what a load under way has taken, up to
+    /// what a load is given.
+    pub(crate) fn quiet(&self, since: tokio::time::Instant) -> std::time::Duration {
+        let acted = self.0.lock().expect("activity lock");
+        let now = tokio::time::Instant::now();
+        let from = acted.made.map_or(since, |made| made.max(since));
+        let taken = |began: tokio::time::Instant, ended: tokio::time::Instant| {
+            ended.saturating_duration_since(began.max(from))
+        };
+        let loaded = acted
+            .loaded
+            .iter()
+            .map(|(began, ended)| taken(*began, *ended));
+        let loading = acted
+            .loading
+            .map(|(began, until)| taken(began, now.min(until)));
+        let excused: std::time::Duration = loaded.chain(loading).sum();
+        now.saturating_duration_since(from).saturating_sub(excused)
+    }
+
+    /// When the load under way is no longer given, if one is.
+    #[cfg(test)]
+    pub(crate) fn loading_until(&self) -> Option<tokio::time::Instant> {
+        self.0
+            .lock()
+            .expect("activity lock")
+            .loading
+            .map(|(_, until)| until)
+    }
+}
+
+/// A time that can be added to any instant a node will see.
+const LONGEST: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// A model that turns texts into vectors.
 #[async_trait]
 pub trait Provider: std::fmt::Debug + Send + Sync {
     /// One vector for each text, in order. No text is blank.
     async fn embed(&self, texts: Vec<String>, purpose: Purpose) -> Result<Vec<Vec<f32>>>;
+
+    /// What the model has lately done for anyone, if it says: one that
+    /// many wait on at once, each in turn, says, so that a write waiting
+    /// its turn is given up on only when the model has stopped.
+    fn activity(&self) -> Option<&Activity> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A load under way is set against the time a waiter has waited only
+    /// for what of it comes after the waiter did, and only for as long
+    /// as a load is given: one that came after the load was given up on
+    /// waits with nothing set against it.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_under_way_is_set_against_a_wait_only_after_it_and_within_its_time() {
+        let secs = std::time::Duration::from_secs;
+        let activity = Activity::default();
+        let began = tokio::time::Instant::now();
+        activity.loading(secs(600));
+        // One that came at the start: ten minutes set against its wait.
+        tokio::time::advance(secs(700)).await;
+        let came = tokio::time::Instant::now();
+        assert_eq!(activity.quiet(began), secs(100));
+        // One that came at 700 s, past the ten minutes: nothing set
+        // against its hundred.
+        tokio::time::advance(secs(100)).await;
+        assert_eq!(activity.quiet(came), secs(100));
+        // One that came at 300 s: three hundred set against its five.
+        assert_eq!(activity.quiet(began + secs(300)), secs(500) - secs(300));
+    }
+
+    /// A load that ended well is set against the time a waiter has
+    /// waited only for what of it came after the waiter did, and after
+    /// the model's last vector: what came before is no part of its wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_is_set_against_a_wait_only_for_what_of_it_came_after() {
+        let secs = std::time::Duration::from_secs;
+        let activity = Activity::default();
+        let began = tokio::time::Instant::now();
+        // A load of fifty seconds, from nothing.
+        activity.loading(secs(600));
+        tokio::time::advance(secs(50)).await;
+        activity.loaded();
+        // A waiter comes ten seconds after it ended, and has waited forty.
+        tokio::time::advance(secs(10)).await;
+        let came = tokio::time::Instant::now();
+        tokio::time::advance(secs(40)).await;
+        assert_eq!(activity.quiet(came), secs(40));
+        // One that came twenty seconds into the load: thirty of it are
+        // set against its wait of eighty.
+        assert_eq!(activity.quiet(began + secs(20)), secs(80) - secs(30));
+        // A vector made: the load is no part of anyone's wait from then.
+        activity.made();
+        tokio::time::advance(secs(5)).await;
+        assert_eq!(activity.quiet(began), secs(5));
+    }
 
     #[test]
     fn what_is_shaped_like_a_key_is_taken_out_wherever_it_lies() {
@@ -653,6 +824,39 @@ mod tests {
         ];
         for said in said.into_iter().chain(glued.iter().map(String::as_str)) {
             assert_eq!(without_keys(said), said);
+        }
+    }
+
+    /// What is dropped where looking for keys ends is the run of these
+    /// characters that ends there: a shape whose keys had some other
+    /// character in them would leave the start of one behind.
+    #[test]
+    fn a_key_of_any_shape_is_made_only_of_the_characters_a_key_is_made_of() {
+        let keys = [
+            "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz_-",
+            "sk-ab\u{2026}wxyz",
+            "sk-ab...wxyz",
+            "sk-****abcd",
+            "hf_AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh",
+            "hf_abcd\u{2026}",
+            "hf_ab***wxyz",
+            "AKIAIOSFODNN7EXAMPLE",
+            "AIzaSyA-0123456789abcdefghijklmnopqrstu",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl",
+            // Every character a credential after `Bearer` or `Basic` has.
+            "dXNlcjpwYXNzd29yZA==",
+            "ABCdef012._~+/=-ABCdef012",
+        ];
+        for key in keys {
+            // Each is a key, all of it, said after `Bearer` as the last
+            // two are only then.
+            let said = format!("Bearer {key}");
+            assert_eq!(without_keys(&said), format!("Bearer {REDACTED}"), "{key}");
+            assert!(key.chars().all(of_a_key), "{key}");
+        }
+        for not in [' ', '\n', '"', '\'', '&', '?', '<', ':', ',', '\\', '密'] {
+            assert!(!of_a_key(not), "{not:?}");
         }
     }
 
