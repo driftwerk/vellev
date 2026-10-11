@@ -27,7 +27,10 @@
 //! asked by its position and by its time, and no other is; and each that
 //! every clean there has been was to keep is seen to load as those rows. A
 //! clean with nothing in its way must succeed, but for one known to fail,
-//! which must fail just so: see `World::walks_into_what_was_cleaned`.
+//! which must fail just so: see `World::walks_into_what_was_cleaned`. The
+//! store notes every delete as it is asked for, and every file as it first
+//! landed, and no head is to name a file whose delete was asked for before
+//! it was committed: see `World::never_named_again`.
 //!
 //! One pairing is not made: a restore to a state that a clean was not to
 //! keep, while a delete of one of that state's files, given up, is yet to
@@ -35,6 +38,11 @@
 //! keeps less than a restore may go back to; the restore would find the
 //! file there still and put it back into use, and the delete would then
 //! take it, by what the clean was asked and by no fault of the writer.
+//!
+//! The committed head's files may be copied out, as a backup copies them,
+//! and the partition put back from the copy, as from a backup. That is
+//! made only in the histories a test sets out: as a node makes it today,
+//! it breaks DW-680's rule every time. See `World::restore_from`.
 
 mod common;
 
@@ -112,6 +120,11 @@ enum Canary {
     ListsOutOfReach,
     /// The coordinator forgets what it should and says it forgot one more.
     MiscountsTheForgotten,
+    /// The store notes a delete only once it makes it, not when it is
+    /// asked for it: the checker is then blind to a head that names a file
+    /// whose delete was given up and is yet to land, and must be shown to
+    /// be, so that what it notes cannot be made less unseen.
+    NotesDeletesOnlyMade,
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +170,15 @@ struct SimBlobs {
     deleting: AtomicUsize,
     /// When each file landed, and how many had before it.
     landed: Mutex<BTreeMap<String, (DateTime<Utc>, usize)>>,
+    /// Every file that landed, in the order it did, again if it did again.
+    landings: Mutex<Vec<String>>,
+    /// Every file that ever landed, as it first did, so that a head can be
+    /// read once its files are gone.
+    shadow: Mutex<BTreeMap<String, Bytes>>,
+    /// Every key a delete has been asked for, in the order it was: sent,
+    /// whatever became of it. The coordinator notes how many there were
+    /// with each head it records.
+    sent: Arc<Mutex<Vec<String>>>,
     /// Whether a checkpoint's next uploads are to wait, and where:
     /// `waiting` is told when they do, and they go on once `resumed` is.
     pausing: Mutex<Option<Pause>>,
@@ -221,6 +243,10 @@ impl SimBlobs {
             let now = self.clock.now();
             landed.entry(key.to_string()).or_insert((now, before));
         }
+        self.landings.lock().unwrap().push(key.to_string());
+        (self.shadow.lock().unwrap())
+            .entry(key.to_string())
+            .or_insert_with(|| bytes.clone());
         match self.canary {
             Some(Canary::DropsSegments) if key.contains("/segment/") => Ok(()),
             _ => self.clean.put(key, bytes).await,
@@ -242,6 +268,9 @@ impl SimBlobs {
 
     async fn remove(&self, key: &str) -> vellev_storage::Result<()> {
         self.deleted.fetch_add(1, Ordering::SeqCst);
+        if self.canary == Some(Canary::NotesDeletesOnlyMade) {
+            self.sent.lock().unwrap().push(key.to_string());
+        }
         self.clean.delete(key).await
     }
 
@@ -367,6 +396,9 @@ impl Blobs for SimBlobs {
     /// hold is answered as lost, and made when the held deletes are.
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.asked.fetch_add(1, Ordering::SeqCst);
+        if self.canary != Some(Canary::NotesDeletesOnlyMade) {
+            self.sent.lock().unwrap().push(key.to_string());
+        }
         self.deleting.fetch_add(1, Ordering::SeqCst);
         let mut asked = Asked {
             blobs: self,
@@ -402,6 +434,8 @@ struct Head {
     at: DateTime<Utc>,
     /// Whether the commit that made it was a restore.
     restore: bool,
+    /// How many deletes the store had been asked for when it was.
+    sent: usize,
 }
 
 /// A coordinator that fails on command, counts the commits it recorded,
@@ -420,6 +454,8 @@ struct SimCoordinator {
     /// How many of the commits recorded made a restore.
     restores: AtomicUsize,
     unfenced: Mutex<Vec<String>>,
+    /// The deletes the store has been asked for.
+    sent: Arc<Mutex<Vec<String>>>,
 }
 
 impl SimCoordinator {
@@ -478,6 +514,7 @@ impl Coordinator for SimCoordinator {
                         key,
                         at: self.clock.now().trunc_subsecs(6),
                         restore: commit.restore.is_some(),
+                        sent: self.sent.lock().unwrap().len(),
                     });
                 }
                 if committed.generation != lease.generation {
@@ -838,6 +875,13 @@ enum Action {
     ForgetHistory,
     Follow,
     FollowStale(usize),
+    /// The committed head's files are copied out of the store, with the
+    /// rows committed at it, as a backup of the partition is.
+    Snapshot,
+    /// The partition is put back as one of the snapshots holds it, as a
+    /// node puts a tenant back from a backup. Made only in the histories a
+    /// test sets out, never in random ones: see `World::restore_from`.
+    RestoreFrom(usize),
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -1128,8 +1172,42 @@ struct World {
     loaded: (usize, usize),
     /// The step at which the store last deleted anything.
     cleaned_at: Option<usize>,
+    /// The files every clean that kept less than a restore may go back to
+    /// asked the store to delete: only a clean with no grace does.
+    unkept: BTreeSet<String>,
+    /// How many of the heads the coordinator recorded have been seen to
+    /// name no file whose delete was asked for before them.
+    named: usize,
+    /// The snapshots taken, oldest first, and the positions of the heads
+    /// that restores from them committed.
+    snapshots: Vec<Frozen>,
+    sourced: BTreeSet<LogPosition>,
+    /// What the last restore from a snapshot did, to be held to DW-680's
+    /// rule once the step it was made in is checked.
+    from_source: Option<FromSource>,
     step: usize,
     made: Made,
+}
+
+/// The files of a committed head, by key, as a snapshot took them, with
+/// the rows committed at it and when it was taken.
+#[derive(Debug, Clone)]
+struct Frozen {
+    at: Committed,
+    files: BTreeMap<String, Bytes>,
+    rows: Rows,
+    taken_at: DateTime<Utc>,
+}
+
+/// A restore from a snapshot that was recorded: the files the snapshot
+/// holds, those the restore put into the store, the checkpoint the
+/// partition's head rested on when it began, and the head it committed.
+#[derive(Debug)]
+struct FromSource {
+    source: BTreeSet<String>,
+    put: Vec<String>,
+    rested_on: Option<String>,
+    head: ManifestRef,
 }
 
 /// How much a history did of what could as well have found nothing to do:
@@ -1219,6 +1297,7 @@ impl World {
     async fn new(canary: Option<Canary>) -> Self {
         let cluster = Cluster::new().await;
         let faults = Arc::new(Mutex::new(Faults::default()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
         let coordinator = Arc::new(SimCoordinator {
             clean: cluster.coordinator.clone(),
             clock: cluster.clock.clone(),
@@ -1228,6 +1307,7 @@ impl World {
             recorded: AtomicUsize::new(0),
             restores: AtomicUsize::new(0),
             unfenced: Mutex::default(),
+            sent: sent.clone(),
         });
         let blobs = Arc::new(SimBlobs {
             clean: cluster.blobs.clone(),
@@ -1245,6 +1325,9 @@ impl World {
             deleted: AtomicUsize::new(0),
             deleting: AtomicUsize::new(0),
             landed: Mutex::default(),
+            landings: Mutex::default(),
+            shadow: Mutex::default(),
+            sent,
             pausing: Mutex::default(),
             waiting: tokio::sync::Notify::new(),
             resumed: tokio::sync::Notify::new(),
@@ -1293,6 +1376,11 @@ impl World {
             given_up: (0, 0),
             loaded: (0, 0),
             cleaned_at: None,
+            unkept: BTreeSet::new(),
+            named: 0,
+            snapshots: Vec::new(),
+            sourced: BTreeSet::new(),
+            from_source: None,
             step: 0,
             made: Made::default(),
         };
@@ -1673,6 +1761,7 @@ impl World {
         let current = abreast && seat + 1 == self.seats.len() && self.seats[seat].open;
         let before = self.coordinator.restores.load(Ordering::SeqCst);
         let (asked, deleted) = self.blobs.deletes();
+        let sent = self.blobs.sent.lock().unwrap().len();
         let given = self.given(grace);
         let writer = &self.seats[seat].writer;
         let restore = Restore {
@@ -1708,7 +1797,7 @@ impl World {
                 (true, _) => self.walk(grace).await,
                 (false, way) => way,
             };
-            self.cleaned(grace, asked);
+            self.cleaned(grace, asked, sent);
             self.came_to(way, &cleaned)?;
         }
         let cleaned = cleaned.unwrap_or(0);
@@ -1753,9 +1842,15 @@ impl World {
     /// Note what a clean with `grace` was to keep, if it asked the store
     /// to delete anything, as the store had been `asked` so many times
     /// before it: what was committed within its grace and the head before.
-    fn cleaned(&mut self, grace: Duration, asked: usize) {
+    /// And if it was to keep less than a restore may go back to, note the
+    /// files it asked to be deleted, of those `sent` on.
+    fn cleaned(&mut self, grace: Duration, asked: usize, sent: usize) {
         if self.blobs.deletes().0 > asked {
             self.kept_from = self.kept_from.max(self.young_from(grace));
+        }
+        if self.given(grace) < REACH {
+            let asked = self.blobs.sent.lock().unwrap();
+            self.unkept.extend(asked[sent..].iter().cloned());
         }
     }
 
@@ -2007,10 +2102,11 @@ impl World {
                     _ => STEP * GRACE as u32,
                 };
                 let (asked, deleted) = self.blobs.deletes();
+                let sent = self.blobs.sent.lock().unwrap().len();
                 let way = self.way(seat, grace, false).await;
                 let cleaning = self.seats[seat].writer.clean(self.given(grace));
                 let cleaned = cleaning.await;
-                self.cleaned(grace, asked);
+                self.cleaned(grace, asked, sent);
                 self.came_to(way, &cleaned)?;
                 let cleaned = cleaned.unwrap_or(0);
                 match grace.is_zero() {
@@ -2073,6 +2169,8 @@ impl World {
             }
             Action::Follow => return self.follow().await,
             Action::FollowStale(pick) => return self.follow_stale(pick).await,
+            Action::Snapshot => self.snapshot().await,
+            Action::RestoreFrom(pick) => return self.restore_from(pick).await,
         }
         Ok(())
     }
@@ -2110,6 +2208,233 @@ impl World {
         let after = self.follower.partition().read(snapshot);
         check(outcome.is_ok() && after == before, || {
             format!("a stale reading moved a follower from {before:?} to {after:?} ({outcome:?})")
+        })
+    }
+
+    /// Copy the committed head's files out of the store, with the rows
+    /// committed at it: every file the state there needs, read through a
+    /// healthy handle, as a backup reads them. None is taken if any cannot
+    /// be read.
+    async fn snapshot(&mut self) {
+        let committed = self.cluster.committed().await;
+        let Some(needed) = self.needed_at(committed.manifest.as_ref()).await else {
+            return;
+        };
+        let mut files = BTreeMap::new();
+        for key in needed {
+            let Ok(bytes) = self.blobs.clean.get(&key).await else {
+                return;
+            };
+            files.insert(key, bytes);
+        }
+        self.snapshots.push(Frozen {
+            at: committed,
+            files,
+            rows: self.expected(),
+            taken_at: self.cluster.clock.now(),
+        });
+    }
+
+    /// Put the partition back as snapshot `pick` holds it, from its current
+    /// writer, as a node puts a tenant back from a backup before DW-680:
+    /// each file of the snapshot the store lacks is put back under the key
+    /// it had, and the partition restored to the snapshot's head, whose
+    /// checkpoint then names by their old keys the files the store had
+    /// still. A restore recorded is where everything committed goes on
+    /// from, with the rows the snapshot holds; one that fails changes
+    /// nothing, which every step is checked for.
+    ///
+    /// That way breaks DW-680's rule, that nothing comes into a partition's
+    /// store under the key it had, every time, so it is made only in the
+    /// histories a test sets out: to show the checker catches each way it
+    /// goes wrong, with the rule (`World::kept_out_of_old_keys`) and
+    /// without. When the restore DW-680 builds is made here instead, what
+    /// this does is to stay as a canary.
+    async fn restore_from(&mut self, pick: usize) -> Violation {
+        let Some(frozen) = self
+            .snapshots
+            .get(pick % self.snapshots.len().max(1))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let seat = self.seat(Who::Current).await;
+        let committed = self.cluster.committed().await;
+        let rested_on = self.checkpoint_of(committed.manifest.as_ref());
+        let landed = self.blobs.landings.lock().unwrap().len();
+        let before = self.coordinator.restores.load(Ordering::SeqCst);
+        let mut fetched = Ok(());
+        for (key, bytes) in &frozen.files {
+            if self.blobs.clean.get(key).await.is_err() {
+                fetched = fetched.and(self.blobs.put(key, bytes.clone()).await);
+            }
+        }
+        let outcome = match fetched {
+            Ok(()) => {
+                let restore = Restore {
+                    request: RequestId::generate(),
+                    asked: [0; 32],
+                    from: frozen.at.log_position,
+                    from_at: frozen.taken_at,
+                };
+                let writer = &self.seats[seat].writer;
+                let head = frozen.at.manifest.as_ref();
+                writer.restore_recorded(head, restore, None).await
+            }
+            Err(error) => Err(error),
+        };
+        let recorded = self.coordinator.restores.load(Ordering::SeqCst) > before;
+        self.seats[seat].open = !self.seats[seat].writer.is_closed();
+        check(recorded || outcome.is_err(), || {
+            format!(
+                "a restore from the snapshot of {:?} was acknowledged and never recorded",
+                frozen.at
+            )
+        })?;
+        if recorded {
+            let head = self.coordinator.heads.lock().unwrap().last().cloned();
+            let head = head.expect("a restore recorded makes a head");
+            self.sourced.insert(head.position);
+            self.from_source = Some(FromSource {
+                source: frozen.files.keys().cloned().collect(),
+                put: self.blobs.landings.lock().unwrap()[landed..].to_vec(),
+                rested_on,
+                head: head.key,
+            });
+            self.made.restores += 1;
+            self.base = frozen.rows;
+            self.since.clear();
+        }
+        Ok(())
+    }
+
+    /// The head named `key`, read from what landed under it, whether it is
+    /// there still or not.
+    fn landed_head(&self, key: &str) -> Option<Stored> {
+        let shadow = self.blobs.shadow.lock().unwrap();
+        decode_head(key, shadow.get(key)?).ok()
+    }
+
+    /// The checkpoint the state at `head` rests on: the head itself, if it
+    /// is one, or the one its logs follow. None if there is none, or a
+    /// head on the way never landed.
+    fn checkpoint_of(&self, head: Option<&ManifestRef>) -> Option<String> {
+        let mut cursor = head.map(|head| head.0.clone());
+        while let Some(key) = cursor {
+            cursor = match self.landed_head(&key)? {
+                Stored::Log(log) => log.prev,
+                Stored::Manifest(_) => return Some(key),
+            };
+        }
+        None
+    }
+
+    /// Every file the state at `head` names, as `World::needed_at` finds
+    /// them, read from what landed rather than from what is there.
+    fn named_at(&self, head: &ManifestRef) -> std::result::Result<BTreeSet<String>, String> {
+        let mut named = BTreeSet::new();
+        let mut cursor = Some(head.0.clone());
+        while let Some(key) = cursor {
+            let read = self.landed_head(&key);
+            cursor = match read.ok_or_else(|| format!("the head {key} never landed whole"))? {
+                Stored::Log(log) => log.prev,
+                Stored::Manifest(checkpoint) => {
+                    for segment in checkpoint.segments {
+                        named.insert(segment.key);
+                        named.extend(segment.index);
+                        named.extend(segment.vectors);
+                    }
+                    named.extend(checkpoint.replay);
+                    None
+                }
+            };
+            named.insert(key);
+        }
+        Ok(named)
+    }
+
+    /// DW-680's K2: no head the coordinator recorded names a file whose
+    /// delete the store had been asked for before it was, whatever became
+    /// of the delete. A delete may be given up and land later, so a head
+    /// that names such a file may lose it at any time.
+    ///
+    /// For a head a restore to a point in the window made, this holds only
+    /// while every clean keeps what such a restore may go back to: one
+    /// that kept less may have asked for the deletes of a state the
+    /// restore then names (see `World::taken_by_a_late_delete`, by which a
+    /// history is spared that pairing). Such a head is not held to it for
+    /// the files a clean that kept less asked to be deleted, and every
+    /// other head is held to it for all of them.
+    fn never_named_again(&mut self) -> Violation {
+        let heads = self.coordinator.heads.lock().unwrap().clone();
+        let sent = self.blobs.sent.lock().unwrap().clone();
+        for head in &heads[self.named..] {
+            let named = self.named_at(&head.key)?;
+            let excused = head.restore && !self.sourced.contains(&head.position);
+            let again = sent[..head.sent]
+                .iter()
+                .find(|key| named.contains(*key) && !(excused && self.unkept.contains(*key)));
+            check(again.is_none(), || {
+                format!(
+                    "DW-680 K2: the head {} at {:?} names {again:?}, whose delete had been \
+                     asked for before it was committed",
+                    head.key.0, head.position
+                )
+            })?;
+        }
+        self.named = heads.len();
+        Ok(())
+    }
+
+    /// DW-680's K4, the rule, for the restore from a snapshot made in the
+    /// step just checked, if one was recorded: it put no file under a key
+    /// the snapshot had; every segment, index and vectors file the head it
+    /// committed names is one it put; that head replays no log; and the
+    /// checkpoint before it is the one the partition's head rested on when
+    /// the restore began, which may be one the snapshot had too.
+    fn kept_out_of_old_keys(&mut self) -> Violation {
+        let Some(restored) = self.from_source.take() else {
+            return Ok(());
+        };
+        let FromSource {
+            source,
+            put,
+            rested_on,
+            head,
+        } = restored;
+        let again: Vec<&String> = put.iter().filter(|key| source.contains(*key)).collect();
+        check(again.is_empty(), || {
+            format!("DW-680 K4: a restore from a snapshot put {again:?}, the keys they had")
+        })?;
+        let Some(Stored::Manifest(checkpoint)) = self.landed_head(&head.0) else {
+            return Err(format!(
+                "a restore from a snapshot committed {head:?}, no checkpoint"
+            ));
+        };
+        let named = checkpoint.segments.iter().flat_map(|segment| {
+            let files = [&segment.index, &segment.vectors];
+            files.into_iter().flatten().chain([&segment.key])
+        });
+        let unput: Vec<&String> = named.filter(|key| !put.contains(*key)).collect();
+        check(unput.is_empty(), || {
+            format!(
+                "DW-680 K4: a restore from a snapshot committed {} naming {unput:?}, which it \
+                 did not put",
+                head.0
+            )
+        })?;
+        check(checkpoint.replay.is_empty(), || {
+            format!(
+                "DW-680 K4: a restore from a snapshot committed {} replaying {:?}",
+                head.0, checkpoint.replay
+            )
+        })?;
+        check(checkpoint.prev == rested_on, || {
+            format!(
+                "DW-680 K4: a restore from a snapshot committed {} after {:?}, and the \
+                 partition rested on {rested_on:?}",
+                head.0, checkpoint.prev
+            )
         })
     }
 
@@ -2391,7 +2716,10 @@ impl World {
                     "a copy at {position:?} holds rows that were never committed there: {held:?}"
                 )
             })
-        })
+        })?;
+        drop(copies);
+        self.never_named_again()?;
+        self.kept_out_of_old_keys()
     }
 }
 
@@ -2767,6 +3095,251 @@ fn a_clean_fails_after_a_merge_for_what_the_clean_before_it_deleted() {
         assert_eq!((world.made.unhindered, world.made.excused), (1, 0));
         let grace = STEP * GRACE as u32;
         if let Err(error) = world.seats[0].writer.clean(grace).await {
+            panic!("DW-681: a clean failed with nothing in its way: {error}");
+        }
+    });
+}
+
+/// A write of one row from the partition's own writer.
+fn written() -> Action {
+    Action::Write {
+        who: Who::Current,
+        rows: 1,
+        delete: None,
+    }
+}
+
+/// A snapshot of a checkpoint, two checkpoints after it merged into one,
+/// and every file the snapshot holds cleaned away by a clean with no
+/// grace, with its deletes held from the one `held` on if any; then the
+/// partition is put back from the snapshot. The store has the snapshot's
+/// files still only if their deletes are held.
+fn restored_from_a_snapshot_cleaned_away(held: Option<usize>) -> Vec<Action> {
+    let who = Who::Current;
+    [
+        vec![
+            written(),
+            Action::Flush { who },
+            Action::Snapshot,
+            written(),
+            Action::Flush { who },
+            Action::Merge { who },
+        ],
+        held.map(Action::DelayDelete).into_iter().collect(),
+        vec![
+            Action::Clean { who, aged: false },
+            Action::RestoreFrom(0),
+            Action::DeliverDelayedDeletes,
+        ],
+    ]
+    .concat()
+}
+
+/// The two ways a restore from a backup goes wrong as a node makes it
+/// before DW-680, each caught by what is checked of every history whatever
+/// the rule is. Gone from the store, a file the snapshot holds is put back
+/// under its key, which is to write it twice. There still, with its delete
+/// given up and yet to land, it is put back into use by the checkpoint the
+/// restore commits, which names a file whose delete was asked for: written
+/// once, and the delete then takes it.
+#[test]
+fn a_restore_from_a_snapshot_as_a_node_makes_one_today_is_caught_either_way() {
+    let rewritten = run(restored_from_a_snapshot_cleaned_away(None), None).unwrap_err();
+    assert!(
+        rewritten.contains("RestoreFrom") && rewritten.contains("written twice"),
+        "{rewritten}"
+    );
+
+    let present = run(restored_from_a_snapshot_cleaned_away(Some(0)), None).unwrap_err();
+    assert!(
+        present.contains("RestoreFrom") && present.contains("DW-680 K2"),
+        "{present}"
+    );
+    assert!(!present.contains("written twice"), "{present}");
+}
+
+/// What is checked of a history is blind, as it should not be, to a head
+/// that names a file whose delete is yet to land, where the store notes a
+/// delete only once it makes it: the restore of a snapshot whose files are
+/// there still, their deletes held, is not then caught for what it names,
+/// but only for breaking DW-680's rule, which it does in any case.
+#[test]
+fn a_late_delete_noted_only_once_made_goes_unseen_by_what_a_head_names() {
+    let history = restored_from_a_snapshot_cleaned_away(Some(0));
+    let unseen = run(history, Some(Canary::NotesDeletesOnlyMade)).unwrap_err();
+    assert!(
+        unseen.contains("RestoreFrom") && !unseen.contains("DW-680 K2"),
+        "{unseen}"
+    );
+    assert!(unseen.contains("DW-680 K4"), "{unseen}");
+}
+
+/// Whether a world has made the head a history is for.
+type MadeHead = fn(&World) -> bool;
+
+/// The head the first snapshot holds.
+fn snapshot_head(world: &World) -> String {
+    world.snapshots[0].at.manifest.clone().unwrap().0
+}
+
+/// The checkpoint the state the first snapshot holds rests on.
+fn snapshot_checkpoint(world: &World) -> Manifest {
+    let head = world.snapshots[0].at.manifest.as_ref();
+    let checkpoint = world.checkpoint_of(head).expect("a checkpoint");
+    match world.landed_head(&checkpoint) {
+        Some(Stored::Manifest(checkpoint)) => checkpoint,
+        other => panic!("{checkpoint} is no checkpoint: {other:?}"),
+    }
+}
+
+/// DW-680's rule, K4, held to by every restore from a snapshot of each
+/// kind of head there is: a checkpoint a flush made; a log after one; a
+/// checkpoint that replays a write made while it was written; one a merge
+/// made; one a restore made; and the very checkpoint the partition rests
+/// on when it is restored, which its committed head is then to follow.
+/// Each history is seen to have made the head it is for before the
+/// restore is. A node breaks the rule today, each time, by naming in the
+/// checkpoint it commits the files it finds in the store by the keys they
+/// had.
+#[test]
+#[should_panic(expected = "DW-680 K4: a restore from a snapshot")]
+fn a_restore_from_a_snapshot_brings_nothing_in_under_the_key_it_had() {
+    let who = Who::Current;
+    let flush = || Action::Flush { who };
+    let beside = Action::WriteBesideFlush {
+        who,
+        rows: 1,
+        delete: None,
+        first: false,
+    };
+    let restore = Action::Restore {
+        who,
+        back: 1,
+        beside: None,
+    };
+    let histories: [(&str, Vec<Action>, MadeHead); 6] = [
+        (
+            "a checkpoint a flush made",
+            vec![written(), flush(), Action::Snapshot, written()],
+            |world| snapshot_head(world).ends_with(".manifest"),
+        ),
+        (
+            "a log after a checkpoint",
+            vec![written(), flush(), written(), Action::Snapshot, written()],
+            |world| snapshot_head(world).ends_with(".log"),
+        ),
+        (
+            "a checkpoint that replays a write",
+            vec![written(), beside, Action::Snapshot, written()],
+            |world| !snapshot_checkpoint(world).replay.is_empty(),
+        ),
+        (
+            "a checkpoint a merge made",
+            vec![
+                written(),
+                flush(),
+                written(),
+                flush(),
+                Action::Merge { who },
+                Action::Snapshot,
+                written(),
+            ],
+            |world| {
+                let checkpoint = snapshot_checkpoint(world);
+                let segments = checkpoint.segments.iter();
+                segments
+                    .into_iter()
+                    .any(|segment| segment.key.contains("-merged"))
+            },
+        ),
+        (
+            "a checkpoint a restore made",
+            vec![written(), flush(), written(), restore, Action::Snapshot],
+            |world| {
+                let heads = world.coordinator.heads.lock().unwrap();
+                let at = world.snapshots[0].at.log_position;
+                heads.iter().any(|head| head.position == at && head.restore)
+            },
+        ),
+        (
+            "the checkpoint the partition rests on",
+            vec![written(), flush(), Action::Snapshot],
+            |world| {
+                let newest = world.coordinator.heads.lock().unwrap().last().cloned();
+                Some(snapshot_head(world)) == newest.map(|head| head.key.0)
+            },
+        ),
+    ];
+    let mut broken = Vec::new();
+    for (what, history, made) in histories {
+        let violation = paused().block_on(async {
+            let mut world = after(history).await;
+            assert!(made(&world), "the snapshot is not of {what}");
+            let restores = world.made.restores;
+            world.step(Action::RestoreFrom(0)).await.unwrap();
+            assert_eq!(world.made.restores, restores + 1, "{what}");
+            world.verify().await.err()
+        });
+        if let Some(violation) = violation {
+            assert!(violation.contains("DW-680 K4"), "{what}: {violation}");
+            broken.push(format!("{what}: {violation}"));
+        }
+    }
+    if let Some(first) = broken.first() {
+        panic!(
+            "DW-680 K4: a restore from a snapshot broke the rule in {} histories: {first}",
+            broken.len()
+        );
+    }
+}
+
+/// A restore from a snapshot that fails changes nothing: the partition
+/// stays as it was committed, whatever the snapshot holds.
+#[test]
+fn a_restore_from_a_snapshot_that_fails_changes_nothing() {
+    let who = Who::Current;
+    let history = [
+        written(),
+        Action::Flush { who },
+        Action::Snapshot,
+        written(),
+        Action::FailCommits(CommitFault::Refuse, 3),
+        Action::RestoreFrom(0),
+        written(),
+    ];
+    paused().block_on(async {
+        let mut world = after(history[..5].to_vec()).await;
+        let before = world.cluster.committed().await;
+        world.step(history[5].clone()).await.unwrap();
+        world.verify().await.unwrap();
+        assert_eq!(world.made.restores, 0);
+        assert_eq!(world.cluster.committed().await, before);
+        world.step(history[6].clone()).await.unwrap();
+        world.verify().await.unwrap();
+    });
+}
+
+/// Known to fail, and DW-681 by the way in a restore from a backup makes
+/// today: it puts back, under their keys and young, files a clean deleted
+/// from below the checkpoint it deleted up to. The next clean finds them
+/// young, walks past that checkpoint to the one before it, which the first
+/// deleted, and fails, as every clean does until they are old. DW-680's
+/// restore puts nothing at an old position, and takes this way in away;
+/// this test keeps the record of it, made the way a node made it.
+#[test]
+#[should_panic(expected = "DW-681: a clean failed with nothing in its way")]
+fn a_clean_fails_after_a_restore_puts_back_what_the_clean_before_it_deleted() {
+    paused().block_on(async {
+        let mut history = restored_from_a_snapshot_cleaned_away(None);
+        history.truncate(history.len() - 2);
+        let mut world = after(history).await;
+        assert!(world.made.cleaned > 0, "{:?}", world.made);
+        world.step(Action::RestoreFrom(0)).await.unwrap();
+        assert_eq!(world.made.restores, 1);
+        assert!(!world.blobs.rewritten.lock().unwrap().is_empty());
+        world.pass(1);
+        let writer = &world.seats[world.seats.len() - 1].writer;
+        if let Err(error) = writer.clean(STEP * GRACE as u32).await {
             panic!("DW-681: a clean failed with nothing in its way: {error}");
         }
     });
