@@ -1217,18 +1217,17 @@ impl Binding {
                 // restored: reading the note again tells which.
                 let noted = tenant.collection(&imports());
                 let again = noted.get(Self::id(collection)).await;
-                let at = again
-                    .ok()
-                    .map(|again| again.and_then(|again| again.version));
-                match at {
-                    Some(at) if at != was => Err(error).wrap_err_with(|| {
-                        format!(
-                            "the note of where collection {collection} was imported from changed under the import: {OTHER_IMPORT}"
-                        )
+                let what = format!("the note of where collection {collection} was imported from");
+                match again.map(|again| again.and_then(|again| again.version)) {
+                    Ok(at) if at != was => Err(error).wrap_err_with(|| {
+                        format!("{what} changed under the import: {OTHER_IMPORT}")
                     }),
-                    _ => Err(error).wrap_err_with(|| {
+                    Ok(_) => Err(error).wrap_err_with(|| {
+                        format!("the node refused to write {what}, which is as the import read it")
+                    }),
+                    Err(read) => Err(error).wrap_err_with(|| {
                         format!(
-                            "the node refused to write the note of where collection {collection} was imported from, which is as the import read it"
+                            "the node refused to write {what}, and reading it again to say why failed too: {read}"
                         )
                     }),
                 }
@@ -1380,6 +1379,24 @@ fn unversed(code: Code, message: &str) -> bool {
 
 /// The field of a change that makes it conditional on a version.
 const CONDITION: &str = "only_if_version";
+
+/// Whether a change is made only if what it changes is still at the
+/// version it was read at.
+fn conditional(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::Upsert {
+            only_if_version: Some(_),
+            ..
+        } | Change::Delete {
+            only_if_version: Some(_),
+            ..
+        } | Change::Patch {
+            only_if_version: Some(_),
+            ..
+        }
+    )
+}
 
 /// What stops a run that met a node of a release before versions.
 const OLD_NODE: &str = "the node refused a write conditional on an object's version, which every node of 0.2 knows: one of an earlier release is among those asked, and the import replaces and deletes nothing through it";
@@ -2087,6 +2104,7 @@ impl<'a> Copying<'a> {
             if changes.is_empty() {
                 return Ok(settled);
             }
+            let versioned = changes.iter().any(conditional);
             let refused = match self.tenant.apply(changes).await {
                 Ok(_) => return Ok(settled),
                 Err(error) => (refusal(&error), error),
@@ -2102,18 +2120,17 @@ impl<'a> Copying<'a> {
                 // Nothing a run is told lets it go on past a node too
                 // old to hold a write to a version.
                 (Some(Refusal::Old), error) => return Err(error).wrap_err(OLD_NODE),
-                // Nor past a write conditional on a version that a node
-                // calls invalid. What vellev cannot hold of an object is
-                // found before anything is sent, and a node that refuses
-                // one says nothing that tells an object it cannot hold
-                // from a condition it cannot read: the object is not
-                // passed over on a guess.
-                (Some(Refusal::Unfit(_)), error)
-                    if matches!(settled, Settled::Replaced | Settled::Deleted) =>
-                {
+                // Nor past a write conditional on a version, of the
+                // object or of its entry, that a node calls invalid. What
+                // vellev cannot hold of an object is found before
+                // anything is sent, and a node that refuses one says
+                // nothing that tells an object it cannot hold from a
+                // condition it cannot read: the object is not passed over
+                // on a guess.
+                (Some(Refusal::Unfit(_)), error) if versioned => {
                     return Err(error).wrap_err_with(|| {
                         format!(
-                            "the node refused as invalid a write to object {id} conditional on its version, and does not say whether the object or the condition is at fault; nothing is skipped on that"
+                            "the node refused as invalid a write to object {id} or its entry, conditional on a version, and does not say whether the object or the condition is at fault; nothing is skipped on that"
                         )
                     })
                 }

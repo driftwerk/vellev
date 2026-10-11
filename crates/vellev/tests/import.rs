@@ -1847,8 +1847,12 @@ async fn what_a_collection_held_that_weaviate_did_not_is_deleted_only_when_asked
     let report = importing.run_as(&all_at_once).await.unwrap();
     let asked = importing.proxy.asked("consistency_level=ALL");
     assert_eq!(asked.len() as u64, 2 * (left - 55));
+    // The one it leaves stays unknown, as every later run counts it.
     let copied = &report.classes[class];
-    assert_eq!((copied.deleted, copied.left), (left - 56, 1));
+    assert_eq!(
+        (copied.deleted, copied.unknown, copied.left),
+        (left - 56, 1, 0)
+    );
     assert_eq!(
         [copied.weaviate, copied.imported, copied.vellev],
         [55, 55, 56]
@@ -2670,6 +2674,9 @@ impl Container {
             "DEFAULT_VECTORIZER_MODULE=none",
             "PERSISTENCE_DATA_PATH=/var/lib/weaviate",
             "CLUSTER_HOSTNAME=node1",
+            // A Docker disk nearly full would otherwise stop its shards
+            // serving, which is not what is tested here.
+            "DISK_USE_READONLY_PERCENTAGE=99",
         ];
         // A port of its own that stays the same across restarts: one Docker
         // picks changes with each.
@@ -2754,12 +2761,18 @@ async fn a_weaviate_restarted_under_a_catch_up_has_nothing_it_holds_deleted() {
     let importing = Importing::of(&container.url, "VellevImportRestart", 600).await;
     let (class, weaviate) = (importing.class, importing.weaviate.clone());
     RESTARTED.set(container.name.clone()).unwrap();
-    importing.run().await.unwrap();
+    // A Weaviate just restarted, on a machine under load, may take a
+    // while to say it is ready again: a run waits up to this for it,
+    // and goes on as soon as it is.
+    let patient = Options {
+        patience: Duration::from_secs(300),
+        ..importing.options.clone()
+    };
+    importing.run_as(&patient).await.unwrap();
     let paced = Options {
         per_second: Some(300.0),
         confirm: Duration::from_secs(2),
-        patience: Duration::from_secs(120),
-        ..importing.options.clone()
+        ..patient.clone()
     };
     let all = "consistency_level=ALL";
     for round in 0..9u64 {
@@ -2824,7 +2837,7 @@ async fn a_weaviate_restarted_under_a_catch_up_has_nothing_it_holds_deleted() {
             "round {round}: deleted though Weaviate holds them: {lost:?}"
         );
         // A quiet run then settles everything.
-        let report = importing.run().await.unwrap();
+        let report = importing.run_as(&patient).await.unwrap();
         assert_eq!(report.outcome(true), Outcome::Settled, "round {round}");
         importing.assert_same().await;
     }
@@ -3414,14 +3427,15 @@ async fn what_was_withheld_and_then_goes_from_weaviate_is_left_with_its_entry() 
     let plain = &importing.options;
     assert_eq!(all(plain).await, (21, 0, 0, 0));
     weaviate.delete(class, 2).await;
-    assert_eq!(all(plain).await, (20, 0, 1, 0));
+    // From the run that finds it gone on, it is one of what the
+    // collection held that Weaviate does not: unknown, and nothing a
+    // sole writer's word deletes.
+    assert_eq!(all(plain).await, (20, 1, 0, 0));
     let entry = importing.entry(2).await.unwrap();
     assert_eq!(
         (&entry["withheld"], &entry["gone"]),
         (&json!(true), &json!(true))
     );
-    // From then on it is one of what the collection held that Weaviate
-    // does not: unknown, and nothing a sole writer's word deletes.
     assert_eq!(all(plain).await, (20, 1, 0, 0));
     assert_eq!(all(&sole(plain)).await, (0, 1, 0, 0));
     assert_eq!(
@@ -4881,4 +4895,415 @@ async fn a_tenant_the_node_is_busy_with_is_not_taken_for_another_import() {
     assert!(refused.contains("being restored"), "{refused}");
     assert!(!refused.contains("another import"), "{refused}");
     assert_eq!(importing.counts().await, ([0; 5], [10; 3]));
+}
+
+// What an eighth review asked of the import.
+
+/// What of a report bears on how a class ends, and the end.
+fn ended(report: &Report, class: &str) -> ([u64; 9], Outcome, Outcome) {
+    let copied = &report.classes[class];
+    let counted = [
+        copied.withheld,
+        copied.unknown,
+        copied.left,
+        copied.barred,
+        copied.kept,
+        copied.pending,
+        copied.weaviate,
+        copied.imported,
+        copied.vellev,
+    ];
+    (counted, report.outcome(false), report.outcome(true))
+}
+
+fn comparing(options: &Options, pages: Option<usize>) -> Options {
+    Options {
+        mode: Mode::Verify { pages },
+        ..options.clone()
+    }
+}
+
+#[tokio::test]
+async fn what_was_withheld_and_is_left_when_weaviate_deletes_it_is_unknown_from_the_run_that_finds_it_gone(
+) {
+    let Some(importing) = Importing::new("VellevImportWithheldLeft", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    importing.unledgered().await;
+    importing.records.put(oid(2), &foreign(2)).await.unwrap();
+    let report = importing.run().await.unwrap();
+    assert_eq!(withheld(&report, class), 1);
+    weaviate.delete(class, 2).await;
+    // The run that finds it gone, a comparison straight after it, and
+    // the next run, nothing changed in between, say the same: unknown,
+    // and not settled.
+    let found = importing.run().await.unwrap();
+    let said = ended(&found, class);
+    assert_eq!((said.0[1], said.0[2], said.1), (1, 0, Outcome::Unsettled));
+    for pages in [None, Some(100)] {
+        let compared = importing
+            .run_as(&comparing(&importing.options, pages))
+            .await
+            .unwrap();
+        assert_eq!(ended(&compared, class), said, "{pages:?}");
+    }
+    let next = importing.run().await.unwrap();
+    assert_eq!(ended(&next, class), said);
+}
+
+#[tokio::test]
+async fn an_object_left_whose_id_weaviate_holds_again_is_compared_as_a_run_settles_it() {
+    let Some(importing) = Importing::new("VellevImportLeftRelisted", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // Another writer's object under an id Weaviate then deletes: left.
+    importing.records.put(oid(3), &foreign(3)).await.unwrap();
+    weaviate.delete(class, 3).await;
+    let report = importing.run().await.unwrap();
+    assert_eq!(report.classes[class].left, 1);
+    // Weaviate holds the id again. A comparison says what the next run
+    // says: another writer's, kept; nothing different; settled.
+    weaviate.add(class, 3..4).await;
+    let all = importing
+        .run_as(&comparing(&importing.options, None))
+        .await
+        .unwrap();
+    let some = importing
+        .run_as(&comparing(&importing.options, Some(100)))
+        .await
+        .unwrap();
+    let verified = all.classes[class].verified.clone().unwrap();
+    assert_eq!((verified.different, verified.kept), (0, 1), "{verified:?}");
+    let run = importing.run().await.unwrap();
+    assert_eq!(run.outcome(false), Outcome::Settled);
+    assert_eq!(importing.entry(3).await.unwrap()["foreign"], json!(true));
+    for compared in [&all, &some] {
+        assert_eq!(ended(compared, class), ended(&run, class));
+    }
+    // So too once the run has marked it so.
+    let after = importing
+        .run_as(&comparing(&importing.options, None))
+        .await
+        .unwrap();
+    assert_eq!(ended(&after, class), ended(&run, class));
+    assert_eq!(
+        importing.get(3).await.unwrap().properties,
+        foreign(3).properties
+    );
+}
+
+#[tokio::test]
+async fn a_comparison_of_an_imported_class_writes_nothing() {
+    let Some(importing) = Importing::new("VellevImportVerifyReads", 20).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // Something of every kind for a comparison to look at: another
+    // writer's object, one left, and one changed in Weaviate.
+    importing.records.put(oid(4), &foreign(4)).await.unwrap();
+    importing.records.put(oid(5), &foreign(5)).await.unwrap();
+    weaviate.delete(class, 5).await;
+    importing.run().await.unwrap();
+    weaviate.put(class, 6, changed(6)).await;
+    let imports = CollectionName::new("vellev_imports").unwrap();
+    let everything = |records: Records| async move {
+        let listed = records.list(&Page::new(50)).await.unwrap();
+        let seen = listed.objects.iter();
+        let seen = seen.map(|stored| (stored.id, stored.version, stored.properties.clone()));
+        seen.collect::<Vec<_>>()
+    };
+    let notes = importing.tenant.collection(&imports);
+    let before = (
+        everything(importing.ledger()).await,
+        everything(notes.clone()).await,
+        everything(importing.records.clone()).await,
+    );
+    importing.front.listen();
+    for pages in [None, Some(1), Some(100)] {
+        let compared = importing
+            .run_as(&comparing(&importing.options, pages))
+            .await;
+        compared.unwrap();
+    }
+    // Not a request that changes anything reaches the node.
+    let asked = importing.front.asked("");
+    let changing: Vec<_> = asked
+        .iter()
+        .map(|(_, line)| line)
+        .filter(|line| {
+            !line.starts_with("GET ") && !line.ends_with("/list") && !line.ends_with("/count")
+        })
+        .collect();
+    assert_eq!(changing, Vec::<&String>::new());
+    let after = (
+        everything(importing.ledger()).await,
+        everything(notes).await,
+        everything(importing.records.clone()).await,
+    );
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn what_was_unknown_and_weaviate_comes_to_hold_alike_vector_and_all_is_the_imports() {
+    // The collection holds a note Weaviate does not, which Weaviate then
+    // makes: exactly so, vector and all; and with another vector.
+    let mut differs = mirrored(1_000);
+    differs.vector = Some(vec![0.0, 0.0, 0.0, 1.0]);
+    let cases = [
+        ("VellevImportUnknownAlike", mirrored(1_000), 0),
+        ("VellevImportUnknownVector", differs, 1),
+    ];
+    for (class, held, withheld) in cases {
+        let Some(mut importing) = Importing::new(class, 10).await else {
+            return;
+        };
+        importing.options.created_as = None;
+        importing.run().await.unwrap();
+        importing.unledgered().await;
+        importing.records.put(oid(1_000), &held).await.unwrap();
+        let report = importing.run().await.unwrap();
+        assert_eq!(unknown(&report, class), 1, "{class}");
+        importing.weaviate.add(class, 1_000..1_001).await;
+        let compared = importing
+            .run_as(&comparing(&importing.options, None))
+            .await
+            .unwrap();
+        let said = ended(&compared, class);
+        assert_eq!((said.0[0], said.0[1]), (withheld, 0), "{class}");
+        let settled = match withheld {
+            0 => Outcome::Settled,
+            _ => Outcome::Unsettled,
+        };
+        assert_eq!(said.1, settled, "{class}");
+        let run = importing.run().await.unwrap();
+        assert_eq!(ended(&run, class), said, "{class}");
+        let entry = importing.entry(1_000).await.unwrap();
+        assert_eq!(entry.get("unknown"), None, "{class}");
+        assert_eq!(entry.get("withheld").is_some(), withheld == 1, "{class}");
+    }
+}
+
+#[tokio::test]
+async fn an_object_vellev_cannot_hold_under_an_id_that_was_unknown_is_compared_as_a_run_meets_it() {
+    let Some(importing) = Importing::new("VellevImportUnknownUnfit", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    importing.unledgered().await;
+    importing
+        .records
+        .put(oid(1_000), &foreign(1_000))
+        .await
+        .unwrap();
+    importing.run().await.unwrap();
+    // Weaviate comes to hold, under that id, an object with a vector
+    // longer than vellev measures.
+    weaviate
+        .post(class, 1_000, object(1_000), vec![3.0e30, 0.0, 0.0, 0.0])
+        .await;
+    // Not told to pass over what it cannot hold, a comparison stops at
+    // it, as a run does.
+    let stopped = importing
+        .run_as(&comparing(&importing.options, None))
+        .await
+        .unwrap_err();
+    assert!(format!("{stopped:#}").contains(&uuid(1_000)), "{stopped:#}");
+    let stopped = importing.run().await.unwrap_err();
+    assert!(format!("{stopped:#}").contains(&uuid(1_000)), "{stopped:#}");
+    // Told to, it reports it refused, as a run does, and not as unknown.
+    let skipping = Options {
+        skip_refused: true,
+        ..importing.options.clone()
+    };
+    let compared = importing.run_as(&comparing(&skipping, None)).await.unwrap();
+    let copied = &compared.classes[class];
+    assert_eq!(copied.refused.keys().collect::<Vec<_>>(), [&uuid(1_000)]);
+    assert_eq!(copied.unknown, 0);
+    let run = importing.run_as(&skipping).await.unwrap();
+    assert_eq!(ended(&run, class), ended(&compared, class));
+    assert_eq!(run.classes[class].refused.len(), 1);
+}
+
+#[tokio::test]
+async fn a_weaviate_that_fails_while_a_comparison_asks_after_an_unknown_id_fails_the_comparison() {
+    let Some(importing) = Importing::new("VellevImportVerifyFails", 10).await else {
+        return;
+    };
+    let class = importing.class;
+    importing.run().await.unwrap();
+    importing.unledgered().await;
+    importing
+        .records
+        .put(oid(1_000), &foreign(1_000))
+        .await
+        .unwrap();
+    importing.run().await.unwrap();
+    let ledger = |records: Records| async move {
+        let listed = records.list(&Page::new(50)).await.unwrap();
+        let seen = listed.objects.into_iter();
+        seen.map(|stored| (stored.id, stored.version))
+            .collect::<Vec<_>>()
+    };
+    let before = ledger(importing.ledger()).await;
+    // Weaviate fails every asking after the id, for longer than the
+    // comparison waits.
+    let asked = importing.object(1_000);
+    let failing = json!({ "error": [{ "message": "it is down" }] });
+    for _ in 0..40 {
+        importing.proxy.answer(
+            0,
+            &[&asked],
+            StatusCode::INTERNAL_SERVER_ERROR,
+            failing.clone(),
+        );
+    }
+    let impatient = Options {
+        patience: Duration::from_secs(1),
+        ..comparing(&importing.options, None)
+    };
+    let failed = importing.run_as(&impatient).await.unwrap_err();
+    assert!(format!("{failed:#}").contains("500"), "{failed:#}");
+    importing.proxy.rules.lock().unwrap().clear();
+    assert_eq!(ledger(importing.ledger()).await, before);
+    let report = importing.run().await.unwrap();
+    assert_eq!(unknown(&report, class), 1);
+}
+
+#[tokio::test]
+async fn a_write_to_an_entry_alone_that_a_node_calls_invalid_stops_the_run() {
+    let Some(importing) = Importing::new("VellevImportInvalidEntry", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // Another writer's change to note 4, and Weaviate's: the run marks
+    // the note as the other writer's, writing its entry alone, over the
+    // one it read.
+    importing.records.put(oid(4), &foreign(4)).await.unwrap();
+    weaviate.put(class, 4, changed(4)).await;
+    let said = json!({ "error": { "code": "invalid", "message": "it cannot be" } });
+    for skip in [1, 0] {
+        importing.front.answer(
+            skip,
+            &["POST", "/changes"],
+            StatusCode::BAD_REQUEST,
+            said.clone(),
+        );
+    }
+    let skipping = Options {
+        skip_refused: true,
+        ..importing.options.clone()
+    };
+    for options in [importing.options.clone(), skipping] {
+        let stopped = importing.run_as(&options).await.unwrap_err();
+        assert!(importing.front.spent());
+        assert!(
+            format!("{stopped:#}").contains("conditional on a version"),
+            "{stopped:#}"
+        );
+        assert_eq!(importing.entry(4).await.unwrap().get("foreign"), None);
+        for skip in [1, 0] {
+            importing.front.answer(
+                skip,
+                &["POST", "/changes"],
+                StatusCode::BAD_REQUEST,
+                said.clone(),
+            );
+        }
+    }
+    importing.front.rules.lock().unwrap().clear();
+    assert_eq!(importing.counts().await, ([0, 0, 0, 1, 0], [10; 3]));
+}
+
+#[tokio::test]
+async fn a_delete_that_a_node_calls_invalid_stops_the_run_whatever_is_skipped() {
+    let Some(importing) = Importing::new("VellevImportInvalidDelete", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    weaviate.delete(class, 5).await;
+    let said = json!({ "error": { "code": "invalid", "message": "it cannot be" } });
+    importing
+        .front
+        .answer(1, &["POST", "/changes"], StatusCode::BAD_REQUEST, said);
+    let skipping = Options {
+        skip_refused: true,
+        ..importing.options.clone()
+    };
+    let stopped = importing.run_as(&skipping).await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}")
+            .contains("does not say whether the object or the condition is at fault"),
+        "{stopped:#}"
+    );
+    assert!(importing.get(5).await.is_some());
+    assert_eq!(importing.counts().await, ([0, 0, 1, 0, 0], [9; 3]));
+}
+
+#[tokio::test]
+async fn a_forgetting_that_a_node_calls_invalid_stops_the_run_whatever_is_skipped() {
+    let Some(importing) = Importing::new("VellevImportInvalidForget", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // An entry to forget: of another writer's object, left when Weaviate
+    // deleted the id, and since removed from the collection.
+    importing.records.put(oid(3), &foreign(3)).await.unwrap();
+    weaviate.delete(class, 3).await;
+    importing.run().await.unwrap();
+    importing.records.delete(oid(3)).await.unwrap();
+    let said = json!({ "error": { "code": "invalid", "message": "it cannot be" } });
+    importing
+        .front
+        .answer(1, &["POST", "/changes"], StatusCode::BAD_REQUEST, said);
+    let skipping = Options {
+        skip_refused: true,
+        ..importing.options.clone()
+    };
+    let stopped = importing.run_as(&skipping).await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("it cannot be"),
+        "{stopped:#}"
+    );
+    assert!(importing.entry(3).await.is_some());
+    assert_eq!(importing.counts().await, ([0; 5], [9; 3]));
+}
+
+#[tokio::test]
+async fn a_note_refused_that_cannot_be_read_again_is_not_taken_for_another_imports() {
+    let Some(importing) = Importing::new("VellevImportNoteUnread", 10).await else {
+        return;
+    };
+    importing.run().await.unwrap();
+    let message = "tenant is being restored already, as another request asked";
+    let busy = json!({ "error": { "code": "conflict", "message": message } });
+    importing
+        .front
+        .answer(0, &["POST", "/changes"], StatusCode::CONFLICT, busy);
+    // Reading the note again, to say why, fails too: after the reading
+    // a run begins with.
+    let noted = "/collections/vellev_imports/objects/";
+    let unread = json!({ "error": { "code": "invalid", "message": "not now" } });
+    importing
+        .front
+        .answer(1, &["GET", noted], StatusCode::BAD_REQUEST, unread);
+    let refused = importing.run().await.unwrap_err();
+    assert!(importing.front.spent());
+    let refused = format!("{refused:#}");
+    assert!(
+        refused.contains("reading it again to say why failed too"),
+        "{refused}"
+    );
+    assert!(refused.contains("being restored"), "{refused}");
+    assert!(!refused.contains("another import"), "{refused}");
 }

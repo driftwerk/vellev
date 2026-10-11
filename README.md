@@ -335,12 +335,19 @@ listing the ledger once. It reports, under `verified`, how many it
 `different` or `missing`, with some of their ids, and how many are
 `kept` by another writer, `withheld`, `unaccounted` for, or `gone` from
 Weaviate while the collection still holds them. It counts `withheld`,
-`unknown`, `left` and `barred` over the whole ledger as a run that
-imports does, asking the collection which of those objects it still
-holds, and Weaviate whether it has come to hold what was unknown,
-and fails on the same terms: on anything withheld, unknown, different,
-missing or gone, and on looking at nothing of a class that holds
-objects. `--verify-all` also counts, as `extra`, the objects the
+`unknown`, `left`, `barred` and `kept` over the whole ledger as a run
+that imports does, and fails on the same terms: on anything withheld,
+unknown, different, missing or gone, and on looking at nothing of a
+class that holds objects. Of every entry that says Weaviate no longer
+holds its object, or that is of what the collection held when it was
+taken up, it asks Weaviate whether it has come to hold the id; one
+Weaviate holds is counted as the next run would settle it, by the run's
+own rule: the import's if the collection holds exactly Weaviate's,
+another writer's if it holds something else, withheld if it was there
+at the taking up, and `different` only if it is still what the import
+stored. Told the same and with nothing changed in between, a run, a
+comparison straight after it and the next run say the same, which a
+test holds for every state the ledger can be in. `--verify-all` also counts, as `extra`, the objects the
 collection holds that the ledger has no entry for: another writer's,
 under ids Weaviate never had, and no fault of the import's unless it is
 told to be `--strict`. `--verify` of some pages cannot see them.
@@ -367,6 +374,13 @@ told to be `--strict`. `--verify` of some pages cannot see them.
   object at a time where little did. With the default `--skew-secs` of
   300 it also fetches again whatever changed in the five minutes before
   the last catch-up began, and stores none of it that is unchanged.
+- A comparison asks Weaviate for each entry that says Weaviate no
+  longer holds its object, and each of what the collection held when it
+  was taken up that Weaviate did not: one request each, one after
+  another, whether it compares everything or some pages, since it counts
+  those entries over the whole ledger. For each such id Weaviate holds,
+  it reads the collection's object too: one more request. The rest of
+  the entries cost it nothing but the listing of the ledger.
 - Each run asks the collection whether it still holds every object the
   ledger says was left or is unknown: one at a time where a page of the
   ledger has few, and by listing the ids between them where it has
