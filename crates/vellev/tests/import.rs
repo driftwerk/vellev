@@ -5307,3 +5307,35 @@ async fn a_note_refused_that_cannot_be_read_again_is_not_taken_for_another_impor
     assert!(refused.contains("being restored"), "{refused}");
     assert!(!refused.contains("another import"), "{refused}");
 }
+
+#[tokio::test]
+async fn a_first_entry_alone_that_a_node_calls_invalid_stops_a_run_not_told_to_skip() {
+    let Some(importing) = Importing::new("VellevImportInvalidFirstEntry", 10).await else {
+        return;
+    };
+    let (class, weaviate) = (importing.class, &importing.weaviate);
+    importing.run().await.unwrap();
+    // Note 4 loses its entry, and Weaviate changes it: the collection
+    // holds something other than Weaviate's under an id the ledger has
+    // no entry for, and the run notes it as another writer's, writing a
+    // first entry and nothing else.
+    importing.ledger().delete(oid(4)).await.unwrap();
+    weaviate.put(class, 4, changed(4)).await;
+    let said = json!({ "error": { "code": "invalid", "message": "it cannot be" } });
+    for skip in [1, 0] {
+        importing.front.answer(
+            skip,
+            &["POST", "/changes"],
+            StatusCode::BAD_REQUEST,
+            said.clone(),
+        );
+    }
+    let stopped = importing.run().await.unwrap_err();
+    assert!(importing.front.spent());
+    assert!(
+        format!("{stopped:#}").contains("it cannot be"),
+        "{stopped:#}"
+    );
+    assert_eq!(importing.entry(4).await, None);
+    assert_eq!(importing.counts().await, ([0, 0, 0, 1, 0], [10; 3]));
+}

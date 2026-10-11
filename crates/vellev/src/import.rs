@@ -4677,6 +4677,8 @@ mod tests {
             "the object is not at the version given as only_if_version",
             "unknown field",
             "unknown field `only_if_version",
+            "unknown field `not_only_if_version`",
+            "unknown field `changes[0].only_if_version`",
         ] {
             assert!(!unversed(Code::Invalid, message), "{message}");
         }
@@ -5416,10 +5418,23 @@ mod tests {
                             let after = noted(Some(now), &writes);
                             let relisting = after_run(relisting, after.as_ref(), holds, true);
                             let compared = compared_as(nothing, Some(now), true, holds);
+                            // A comparison is told nothing of who wrote,
+                            // whatever flags it is given.
+                            for told in &fixtures {
+                                let flagged = compared_as(told, Some(now), true, holds);
+                                assert_eq!(said(&flagged), said(&compared), "told: {cell}");
+                            }
                             let to_collection = ["delete Memory", "insert Memory", "upsert Memory"];
                             let collection = kinds(&writes)
                                 .iter()
                                 .any(|kind| to_collection.contains(&kind.as_str()));
+                            // What it finds the same is what the run
+                            // takes for the import's.
+                            let imports = after.as_ref().is_some_and(|after| {
+                                (after.mark, after.gone) == (Mark::Stored, false)
+                            });
+                            let same = compared.verified.as_ref().unwrap().same == 1;
+                            assert_eq!(same, imports && !collection, "same: {cell}");
                             match collection {
                                 true => assert_ne!(
                                     said(&compared).1,
