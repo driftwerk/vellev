@@ -983,6 +983,10 @@ impl Tenant {
 
 type Opening = Arc<OnceCell<Arc<Tenant>>>;
 
+/// How many tries of a restore by others one caller waits for before it is
+/// told a restore is running, rather than making a try of its own.
+const RESTORE_WAITS: usize = 3;
+
 /// How long a tenant or copy is kept after it was last used, whatever the
 /// memory budget.
 const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
@@ -1254,7 +1258,11 @@ impl Node {
     /// Restore `tenant` as `work` does with the tenant as it is opened, as
     /// [`Tenant::restoring`] does, asking again of the tenant opened afresh
     /// whenever a try of the same request that ran meanwhile ended without
-    /// being recorded, as one whose writer closed under it.
+    /// being recorded, as one whose writer closed under it. Whoever asks
+    /// makes the restore's work once at most: only a caller that waited for
+    /// another's try asks again, and one that has waited for
+    /// [`RESTORE_WAITS`] of them is told a restore is running instead, to
+    /// ask again later.
     async fn restoring<F>(
         &self,
         tenant: &TenantId,
@@ -1264,13 +1272,14 @@ impl Node {
     where
         F: Future<Output = Result<Restored>> + Send + 'static,
     {
-        loop {
+        for _ in 0..=RESTORE_WAITS {
             let opened = self.tenant(tenant).await?;
             let made = work(self.clone(), opened.clone());
             if let Some(restored) = opened.restoring(&self.0.coordinator, asking, made).await? {
                 return Ok(restored);
             }
         }
+        Err(NodeError::Restoring(tenant.clone()))
     }
 
     /// The earliest and the latest state `tenant` may be restored to, with

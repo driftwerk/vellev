@@ -178,6 +178,31 @@ async fn written(cluster: &Cluster) -> Writer {
     writer
 }
 
+/// The partition of `into` put back from `backup`, through a writer of
+/// its own, as a node restores one: the backup's files read by the keys
+/// they had and copied in under keys of the restore's own, each while
+/// `held` still is.
+async fn restored_from(
+    backups: &Backups,
+    backup: &Backup,
+    into: &Cluster,
+    held: &dyn Held,
+) -> vellev_storage::Result<Committed> {
+    let source: Arc<dyn Blobs> = Arc::new(backups.source(backup)?);
+    let writer = into.writer().await;
+    let taken = &backup.partitions[0];
+    let restore = Restore {
+        request: RequestId::generate(),
+        asked: [0; 32],
+        from: taken.position,
+        from_at: backup.taken_at,
+    };
+    let head = taken.head.clone().map(ManifestRef);
+    let ready = writer.restore_from(source, head.as_ref(), restore, None, held);
+    ready.await?.commit().await?;
+    Ok(into.committed().await)
+}
+
 #[tokio::test]
 async fn a_backup_puts_a_tenant_back_in_a_store_that_lost_it() {
     let cluster = Cluster::new().await;
@@ -194,31 +219,21 @@ async fn a_backup_puts_a_tenant_back_in_a_store_that_lost_it() {
         blobs: memory(),
         ..Cluster::new().await
     };
-    let copied = backups
-        .fetch_back(&lost.blobs, &backup, &Claimed(true))
-        .await
-        .unwrap();
-    assert_eq!(copied, backup.partitions[0].files.len());
-    let taken = &backup.partitions[0];
-    let committed = Committed {
-        log_position: taken.position,
-        manifest: taken.head.clone().map(ManifestRef),
-        ..lost.committed().await
-    };
-    let follower = Follower::open(lost.key.clone(), lost.blobs.clone(), &committed)
-        .await
-        .unwrap();
-    assert_eq!(
-        follower.partition().read(|state| ns(state, &[1, 2])),
-        [Some(10), Some(2)]
-    );
-    assert_eq!(
-        backups
-            .fetch_back(&lost.blobs, &backup, &Claimed(true))
+    // Put back twice: each time under keys of its own, none of them one
+    // the backup lists.
+    for _ in 0..2 {
+        let committed = restored_from(&backups, &backup, &lost, &Claimed(true));
+        let committed = committed.await.unwrap();
+        let follower = Follower::open(lost.key.clone(), lost.blobs.clone(), &committed)
             .await
-            .unwrap(),
-        0
-    );
+            .unwrap();
+        assert_eq!(
+            follower.partition().read(|state| ns(state, &[1, 2])),
+            [Some(10), Some(2)]
+        );
+        let there = keys(&lost.blobs, "").await;
+        assert!(backup.files().all(|file| !there.contains(file)));
+    }
 }
 
 #[tokio::test]
@@ -820,20 +835,23 @@ async fn a_file_read_as_the_claim_was_lost_is_not_written() {
 }
 
 #[tokio::test]
-async fn nothing_is_fetched_back_once_the_claim_is_lost() {
+async fn nothing_is_copied_from_a_backup_once_the_claim_is_lost() {
     let cluster = Cluster::new().await;
     let backups = Backups::new(memory());
     written(&cluster).await;
     let backup = take(&backups, &cluster).await;
-    let lost = memory();
-    let refused = backups
-        .fetch_back(&lost, &backup, &Expiring::after(1))
+    let into = Cluster {
+        blobs: memory(),
+        ..Cluster::new().await
+    };
+    let lost = into.blobs.clone();
+    let refused = restored_from(&backups, &backup, &into, &Expiring::after(1))
         .await
         .unwrap_err();
     assert!(matches!(refused, StorageError::Unheld(_)), "{refused}");
     assert!(
         keys(&lost, "").await.is_empty(),
-        "the file asked for while the claim was held is read, and not written once it is not"
+        "the head is read while the claim is held, and nothing written once it is not"
     );
 }
 
@@ -969,11 +987,6 @@ async fn a_backup_listing_a_file_outside_its_partition_is_not_restored() {
     backup.partitions[0]
         .files
         .push("beta/0/segment/stray.segment".into());
-    let refused = backups
-        .fetch_back(&memory(), &backup, &Claimed(true))
-        .await
-        .unwrap_err();
-    assert!(matches!(refused, StorageError::Corrupt { .. }), "{refused}");
     let refused = backups.source(&backup).unwrap_err();
     assert!(
         matches!(&refused, StorageError::Corrupt { key, .. } if key == "beta/0/segment/stray.segment"),
@@ -1128,9 +1141,13 @@ async fn a_cluster_restores_from_what_another_took_of_its_tenant_and_deletes_non
         std::slice::from_ref(&taken_live),
         "it lists what the other took of its tenant"
     );
-    let lost = memory();
-    let fetched = backups.fetch_back(&lost, &taken_live, &Claimed(true));
-    assert_eq!(fetched.await.unwrap(), taken_live.files().count());
+    let lost = Cluster {
+        blobs: memory(),
+        ..Cluster::new().await
+    };
+    restored_from(&backups, &taken_live, &lost, &Claimed(true))
+        .await
+        .unwrap();
     writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
     let copied = backups.copy(
         &cluster.blobs,
@@ -1425,7 +1442,7 @@ impl Blobs for LosingAsFetched {
 }
 
 #[tokio::test]
-async fn a_file_fetched_as_the_claim_was_lost_is_not_put_back() {
+async fn a_file_read_as_the_claim_was_lost_is_not_copied() {
     let cluster = Cluster::new().await;
     let store = memory();
     written(&cluster).await;
@@ -1435,8 +1452,12 @@ async fn a_file_fetched_as_the_claim_was_lost_is_not_put_back() {
         inner: store,
         lost: lost.clone(),
     }));
-    let primary = memory();
-    let refused = slow.fetch_back(&primary, &backup, &Until(lost)).await;
+    let into = Cluster {
+        blobs: memory(),
+        ..Cluster::new().await
+    };
+    let primary = into.blobs.clone();
+    let refused = restored_from(&slow, &backup, &into, &Until(lost)).await;
     let refused = refused.unwrap_err();
     assert!(matches!(refused, StorageError::Unheld(_)), "{refused}");
     assert!(
@@ -1999,7 +2020,6 @@ async fn a_record_listing_a_key_that_strays_is_restored_from_by_nothing() {
         inner: memory(),
         listed: std::sync::Mutex::default(),
     });
-    let lost: Arc<dyn Blobs> = primary.clone();
     // Each with the partition whose files it is listed among.
     let strays = [
         (0, format!("{tenant}/0/../x")),
@@ -2023,9 +2043,6 @@ async fn a_record_listing_a_key_that_strays_is_restored_from_by_nothing() {
             other => panic!("{stray:?}: {other}"),
         };
         strayed(backups.source(&backup).unwrap_err());
-        strayed(backups.lacking(&lost, &backup).await.unwrap_err());
-        let fetched = backups.fetch_back(&lost, &backup, &Claimed(true)).await;
-        strayed(fetched.unwrap_err());
         assert_eq!(store.asked(), [], "{stray:?}: the backup store was asked");
         assert_eq!(
             primary.listed(),

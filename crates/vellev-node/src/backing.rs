@@ -16,17 +16,22 @@
 //!    asked to renew it, on a clock that counts the time the system was
 //!    suspended ([`ClaimClock`]). Every check reads that deadline against
 //!    the clock: before each file a backup copies, once it is read; its
-//!    complete record; each file a restore fetches, once it is read, and
-//!    its commit; and each file deleted. A node
-//!    that stalled or slept past the deadline does nothing more. The margin
-//!    is at least as long as the node waits for a request to the backup
-//!    store ([`Settings::check`]), each of which it gives up after that
-//!    long, so that while the machine runs it waits for no write once
-//!    another may take the claim. That wait is timed by the runtime, whose
-//!    clock stops with the machine: a request in flight when the machine
-//!    slept is still waited for when it wakes, and may have landed since,
-//!    as may one the node gave up on, the store having had it. Those are
-//!    the third layer's to put right.
+//!    complete record; before a restore reads the backup's head, before
+//!    each file it copies, and before its commit; and each file deleted. A
+//!    node that stalled or slept past the deadline does nothing more. The
+//!    margin is at least as long as the node waits for a request to the
+//!    backup store ([`Settings::check`]), each of which it gives up after
+//!    that long, so that while the machine runs it waits for no write to
+//!    that store once another may take the claim. That wait is timed by the
+//!    runtime, whose clock stops with the machine: a request in flight when
+//!    the machine slept is still waited for when it wakes, and may have
+//!    landed since, as may one the node gave up on, the store having had
+//!    it. Those are the third layer's to put right. A restore writes
+//!    nothing to the backup store, and what it writes to the tenant's
+//!    store goes under keys of its own, which nothing else names (DW-680):
+//!    a copy that lands once the claim is lost is litter, and the claim
+//!    does not fence it. Its reads of the backup store are given up a part
+//!    at a time, as the store client gives a part up (see `Within`).
 //! 2. Deleting goes [`DELETED_AT_ONCE`] files at a time, each batch once
 //!    the coordinator has renewed the claim, so a node whose claim another
 //!    took deletes nothing more once it asks. This is the fence that needs
@@ -97,7 +102,7 @@ use vellev_storage::coordinator::{
     Adoption, Coordinator, CoordinatorError, Generation, Identity, LogPosition, ManifestRef,
     PartitionKey, Restored, MAX_BACKUP_HOLD,
 };
-use vellev_storage::StorageError;
+use vellev_storage::{StorageError, Transfers};
 
 use crate::{
     key, Asking, ClaimClock, Inner, Node, NodeError, RequestBounds, Result, Target, Tenant,
@@ -119,9 +124,6 @@ const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(200);
 pub const LANDED_AFTER: Duration = Duration::from_secs(30);
 /// How many tenants are looked through at a time.
 const PAGE: usize = 256;
-/// How many times a restore starts again when cleaning up deletes a file
-/// it needs from the store before it is read.
-const ATTEMPTS: usize = 3;
 
 impl RequestBounds {
     /// Why a backup claim of `hold` cannot be held with requests that take
@@ -311,6 +313,17 @@ impl Node {
     /// The restore of [`Self::restored`] into `opened`, under `claim`,
     /// which may stop any step before the commit; the commit, once begun,
     /// runs to its end.
+    ///
+    /// Nothing of the backup comes into the tenant's store under the key it
+    /// had (DW-680): its files are read by the keys they had, through the
+    /// backup store, and copied in under keys of the restore's own
+    /// ([`Writer::restore_from`]). The claim keeps pruning off the files
+    /// while they are read, and is asked about before each; it fences no
+    /// write into the tenant's store, for a copy that lands after it is
+    /// given up lies under a key nothing names. The commit reads nothing of
+    /// the backup, so a claim lost once it has begun takes nothing from it.
+    ///
+    /// [`Writer::restore_from`]: vellev_storage::Writer::restore_from
     async fn restored_from(
         &self,
         backups: &Backups,
@@ -332,67 +345,39 @@ impl Node {
             })?;
         let head = taken.head.clone().map(ManifestRef);
         let restore = asking.to(taken.position, backup.taken_at);
-        // Each write into the tenant's store is given up as one to the
-        // backup store is, so that none is waited for past the claim.
-        let primary: Arc<dyn Blobs> = Arc::new(Within {
-            inner: self.0.blobs.clone(),
-            within: self.0.settings.request_bounds.store,
-        });
-        let mut attempt = 1;
-        loop {
-            let fetching = backups.fetch_back(&primary, backup, claim);
-            let copied = claim
-                .during(async { fetching.await.map_err(claimed) })
-                .await?;
-            let adopting = matches!(asked, Asked::ToAdopt { .. }).then_some(backup.lineage);
-            if let Asked::ToAdopt { with_keys } = asked {
-                let generation = opened.generation();
-                let noting = self
-                    .0
-                    .adopting(backup, taken.position, with_keys, generation);
-                claim.during(noting).await?;
-            }
-            // Looked for again just before the commit, under the claim:
-            // loading the state to restore reads the files it does not
-            // hold already, and no others, so one that went since it was
-            // fetched, as by a delete sent long before and landing late,
-            // could be committed to unseen. Any that went is fetched again
-            // with the next try, and the restore refused if it keeps on.
-            let looking = backups.lacking(&primary, backup);
-            let lacking = claim
-                .during(async { looking.await.map_err(claimed) })
-                .await?;
-            claim.still()?;
-            let restored = match lacking.into_iter().next() {
-                Some(key) => Err(NodeError::Storage(StorageError::Missing { key })),
-                None => {
-                    opened
-                        .restored(head.clone(), restore.clone(), adopting)
-                        .await
-                }
-            };
-            match restored {
-                Err(NodeError::Storage(StorageError::Missing { key })) if attempt < ATTEMPTS => {
-                    tracing::info!(%tenant, key, "a file went before it was restored; again");
-                    attempt += 1;
-                }
-                // Gone again each time it was fetched back: said of the
-                // backup, with the file, rather than as a file missing
-                // from somewhere.
-                Err(NodeError::Storage(StorageError::Missing { key })) => {
-                    let reason = format!(
-                        "backup {id} of tenant {tenant} lists it, and it went from the \
-                         tenant's store each of the {ATTEMPTS} times it was fetched back"
-                    );
-                    return Err(StorageError::Corrupt { key, reason }.into());
-                }
-                restored => {
-                    let restored = restored?;
-                    tracing::info!(%tenant, backup = %id, copied, ?restored, "restored from a backup");
-                    return Ok(restored);
-                }
-            }
+        let adopting = matches!(asked, Asked::ToAdopt { .. }).then_some(backup.lineage);
+        // Read through the backup store, each part of a file given up as
+        // the store client gives one up: see `Within`.
+        let source: Arc<dyn Blobs> = Arc::new(backups.source(backup)?);
+        let told = |error: StorageError| match error {
+            StorageError::Unheld(tenant) => NodeError::ClaimLost(tenant),
+            error => opened.told(error),
+        };
+        let preparing =
+            opened
+                .writer
+                .restore_from(source, head.as_ref(), restore.clone(), adopting, claim);
+        let prepared = claim
+            .during(async { preparing.await.map_err(told) })
+            .await?;
+        // The tenant the backup is to make it is noted just before the
+        // commit that makes it, under the lease the node holds then.
+        if let Asked::ToAdopt { with_keys } = asked {
+            let generation = opened.generation();
+            let noting = self
+                .0
+                .adopting(backup, taken.position, with_keys, generation);
+            claim.during(noting).await?;
         }
+        claim.still()?;
+        let position = prepared.commit().await.map_err(told)?;
+        let restored = Restored {
+            restore,
+            incarnation: opened.writer.partition().incarnation(),
+            position,
+        };
+        tracing::info!(%tenant, backup = %id, ?restored, "restored from a backup");
+        Ok(restored)
     }
 
     /// Back up each tenant whose last backup is as old as the node backs
@@ -446,7 +431,7 @@ impl Inner {
     ) -> Result<Backups> {
         let within = self.settings.request_bounds.store;
         let inner = self.settings.backups.clone().ok_or(NodeError::NoBackups)?;
-        let store = through(Arc::new(Within { inner, within }));
+        let store = through(Arc::new(Within::new(inner, within)));
         Ok(Backups::new(store).timed_by(self.settings.clock.clone()))
     }
 
@@ -735,16 +720,50 @@ enum Asked {
 
 /// A store each request to which is given up, as failed, after `within`;
 /// a listing, once any one answer of it has taken that long, however many
-/// it takes; and a file read or put a part at a time, once the store has
-/// taken that long over any one part handed on, however many there are. A
+/// it takes; and a file put a part at a time, once the store has taken
+/// that long over any one part handed on, however many there are. A
 /// request given up may still land: the store had it already.
+///
+/// A file read, whole or a part at a time, is given up once any one part
+/// of it has taken `part` to come, however many parts it has: as long as
+/// the store client gives one range, each asked for as often as it may
+/// be. Whole, it is read a part at a time and the parts put together,
+/// which, unlike a read whole by the store client, cannot make room for
+/// the whole file once its size is known: for a moment it is held twice,
+/// in its parts and put together, and the parts go before it is handed on.
+/// Read so, a file comes from the store and never from a copy a store
+/// keeps on local disk (see [`CachedBlobs::parts`]); no store is wrapped
+/// so that keeps one and is read through it.
+///
+/// [`CachedBlobs::parts`]: vellev_storage::blobs::CachedBlobs
+/// A read outlasting a claim writes nothing, so only writes are held to
+/// `within`, which a claim's margin is checked against.
 #[derive(Debug)]
 pub(crate) struct Within {
     pub(crate) inner: Arc<dyn Blobs>,
     pub(crate) within: Duration,
+    pub(crate) part: Duration,
 }
 
 impl Within {
+    /// Over `inner`, each request given up after `within`, and each part
+    /// read after as long as the store client gives a range of a file
+    /// whose every request it gives up after `within`. A node's stores,
+    /// the tenants' and the backup store, are both made of the one store
+    /// client set up as `request_bounds.store` says (see `vellev::config`),
+    /// so that is the bound the backup store's client keeps to itself.
+    pub(crate) fn new(inner: Arc<dyn Blobs>, within: Duration) -> Self {
+        let read = Transfers {
+            request_within: within,
+            ..Transfers::default()
+        };
+        Self {
+            inner,
+            within,
+            part: read.part_within(),
+        }
+    }
+
     async fn bounded<T>(
         &self,
         key: &str,
@@ -831,8 +850,14 @@ impl Blobs for Within {
             }
         }
     }
+    /// The file's parts, each within its bound, put together: see above.
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
-        self.bounded(key, self.inner.get(key)).await
+        use futures::TryStreamExt;
+        let mut parts: Vec<Bytes> = self.parts(key).try_collect().await?;
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("one part"));
+        }
+        Ok(Bytes::from(parts.concat()))
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
         self.inner.list_within(prefix, self.within).await
@@ -848,14 +873,14 @@ impl Blobs for Within {
         self.bounded(key, self.inner.delete(key)).await
     }
     /// As the store gives the file, each part given up once it has taken
-    /// `within` to come, after which no more of it is asked for.
+    /// `part` to come, after which no more of it is asked for.
     fn parts<'a>(&'a self, key: &'a str) -> BoxStream<'a, vellev_storage::Result<Bytes>> {
         let parts = Some(self.inner.parts(key));
         stream::unfold(parts, move |parts| async move {
             let mut parts = parts?;
-            match tokio::time::timeout(self.within, parts.next()).await {
+            match tokio::time::timeout(self.part, parts.next()).await {
                 Ok(part) => part.map(|part| (part, Some(parts))),
-                Err(_) => Some((Err(unanswered(key, self.within)), None)),
+                Err(_) => Some((Err(unanswered(key, self.part)), None)),
             }
         })
         .boxed()
@@ -1377,8 +1402,7 @@ mod tests {
     }
 
     fn bounded(inner: Arc<Paced>) -> Within {
-        let within = WITHIN;
-        Within { inner, within }
+        Within::new(inner, WITHIN)
     }
 
     fn unanswered_within(result: vellev_storage::Result<()>) {
@@ -1463,10 +1487,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_store_that_stops_waiting_for_a_part_and_never_answers_is_given_up_within_the_bound()
     {
-        let store = Within {
-            inner: Arc::new(Abandoning(EACH)),
-            within: WITHIN,
-        };
+        let store = Within::new(Arc::new(Abandoning(EACH)), WITHIN);
         let started = Instant::now();
         let never = stream::pending().boxed();
         unanswered_within(ended(store.put_parts("file", never)).await);
@@ -1572,12 +1593,102 @@ mod tests {
         let (started, store) = (Instant::now(), bounded(paced(Some(1))));
         let mut parts = store.parts("file");
         assert_eq!(parts.try_next().await.unwrap(), Some(Bytes::from("one")));
-        unanswered_within(ended(parts.try_next()).await.map(|_| ()));
-        assert_eq!(started.elapsed(), EACH + WITHIN);
+        let given_up = ended(parts.try_next()).await.unwrap_err();
+        assert_eq!(given_up.to_string(), unanswered("file", PART).to_string());
+        assert_eq!(started.elapsed(), EACH + PART);
         assert!(
             ended(parts.next()).await.is_none(),
             "and no more is asked for"
         );
+    }
+
+    /// How long one part of a file read through a store bounded by
+    /// `WITHIN` may take: as the store client gives a range, asked for
+    /// twice.
+    const PART: Duration = Duration::from_secs(20);
+
+    /// A file read through a bounded store, whole or a part at a time, is
+    /// given each part as long as the store client gives a range, and so
+    /// as long as all of them take: each part slower than one request may
+    /// be, and the whole far slower, is waited for; one part that stalls is
+    /// given up once it has taken as long as a range may.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_read_through_a_bounded_store_is_given_each_part_as_long_as_a_range_may_take() {
+        assert_eq!(Within::new(Arc::new(Paced::default()), WITHIN).part, PART);
+        let slow = WITHIN + WITHIN / 2;
+        let paced = |silent| {
+            Arc::new(Paced {
+                each: slow,
+                silent,
+                kept: Mutex::new(file()),
+            })
+        };
+        let (started, store) = (Instant::now(), bounded(paced(None)));
+        let read: Vec<Bytes> = ended(store.parts("file").try_collect()).await.unwrap();
+        assert_eq!(read, file());
+        assert_eq!(started.elapsed(), slow * 4);
+        let (started, store) = (Instant::now(), bounded(paced(None)));
+        let whole = ended(store.get("file")).await.unwrap();
+        assert_eq!(whole, file().concat(), "the parts put together");
+        assert_eq!(started.elapsed(), slow * 4);
+
+        let (started, store) = (Instant::now(), bounded(paced(Some(2))));
+        let given_up = ended(store.get("file")).await.unwrap_err();
+        assert_eq!(given_up.to_string(), unanswered("file", PART).to_string());
+        assert_eq!(started.elapsed(), slow * 2 + PART);
+    }
+
+    /// A backup's file of several parts, an index file as a restore reads
+    /// it, read whole through its source over a bounded backup store: each
+    /// part as long as a range may take, one slower than a request waited
+    /// for, and one that stalls given up as a range is.
+    #[tokio::test(start_paused = true)]
+    async fn a_backups_file_read_whole_through_its_source_is_given_each_part_as_a_range() {
+        let backup = |files: Vec<String>| Backup {
+            version: vellev_storage::backups::RECORD_VERSION,
+            id: Uuid::new_v4(),
+            tenant: TenantId::new("acme").unwrap(),
+            lineage: vellev_storage::coordinator::Lineage(Uuid::new_v4()),
+            cluster: vellev_storage::coordinator::ClusterId(Uuid::new_v4()),
+            taken_at: chrono::Utc::now(),
+            partitions: vec![vellev_storage::backups::Taken {
+                partition: vellev_core::Partition::DEFAULT,
+                incarnation: vellev_storage::coordinator::Incarnation(1),
+                position: LogPosition(1),
+                head: None,
+                files,
+            }],
+            keys: Vec::new(),
+            restore_window: None,
+        };
+        let index = "acme/0/index/00000000000000000001-x.index".to_string();
+        let backup = backup(vec![index.clone()]);
+        let slow = WITHIN + WITHIN / 2;
+        for (silent, read) in [(None, true), (Some(2), false)] {
+            let inner = Arc::new(Paced {
+                each: slow,
+                silent,
+                kept: Mutex::new(file()),
+            });
+            let backups = Backups::new(Arc::new(bounded(inner)));
+            let source = backups.source(&backup).unwrap();
+            let started = Instant::now();
+            let got = ended(source.get(&index)).await;
+            match read {
+                true => {
+                    assert_eq!(got.unwrap(), file().concat());
+                    assert_eq!(started.elapsed(), slow * 4);
+                }
+                false => {
+                    let given_up = got.unwrap_err();
+                    assert!(
+                        given_up.to_string().contains("no answer within 20s"),
+                        "{given_up}"
+                    );
+                    assert_eq!(started.elapsed(), slow * 2 + PART);
+                }
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
