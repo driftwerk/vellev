@@ -1367,7 +1367,9 @@ async fn a_restore_from_a_source_given_up_at_any_point_leaves_no_copies_unneeded
             true => {
                 assert_eq!(read, rows_before, "{at} ({what})");
                 let asked = stopping.asked.lock().unwrap();
-                let tried = asked.iter().any(|asked| asked.contains("/manifest/"));
+                let put =
+                    |asked: &String| asked.starts_with("put ") && asked.contains("/manifest/");
+                let tried = asked.iter().any(put);
                 assert!(tried || litter.is_empty(), "{at} ({what}): {litter:?}");
             }
             false => assert_eq!(read, frozen.rows, "{at} ({what})"),
