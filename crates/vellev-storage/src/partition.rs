@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
 
+use crate::backups::Held;
 use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Listed, Local, Transfers};
 use crate::catalog::Catalog;
 use crate::column::{self, Column};
@@ -19,8 +20,8 @@ use crate::coordinator::{
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
-    decode, decode_head, encode, Answer, Answered, Head, Kind, LogSegment, Manifest, Op,
-    SegmentFile, SegmentIndex, SegmentMeta, SUMMED_AT_ONCE,
+    decode, decode_head, encode, rekeyed_index, Answer, Answered, Head, Kind, LogSegment, Manifest,
+    Op, SegmentFile, SegmentIndex, SegmentMeta, SUMMED_AT_ONCE,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
@@ -33,6 +34,8 @@ use crate::{Refusal, Result, StorageError};
 const COMMIT_ATTEMPTS: u32 = 3;
 /// How many rows a flush copies from memory while commits wait.
 const COPIED_AT_ONCE: usize = 4_096;
+/// How many segments a restore from another store is copying at once.
+const SEGMENTS_COPIED_AT_ONCE: usize = 4;
 /// How many of the files a clean deletes are being deleted at any moment.
 const CLEANING_AT_ONCE: usize = 16;
 /// How long a clean goes on finding what to delete, and how long again
@@ -1372,6 +1375,198 @@ impl Writer {
         Ok(restored)
     }
 
+    /// Make ready to put the partition back as `source` holds it at `head`,
+    /// at `restore.from`, from files that were in another store: a backup
+    /// of this tenant or of the one it is to become, `adopting`. `source`
+    /// answers by the keys the files had there, and nothing is written to
+    /// it. The restore is made by [`RestoreFrom::commit`].
+    ///
+    /// Nothing is brought in under the key it had (DW-680): every segment,
+    /// index and vectors file is copied into this partition's store under
+    /// a key drawn for this restore, and the logs and checkpoint of the
+    /// source's head are read into memory and never put. The state is
+    /// loaded from those copies alone, read back from the store, as a node
+    /// with nothing would load it.
+    ///
+    /// The copies are named at the position of the checkpoint the restore
+    /// is to commit, past where the partition and the source are: never at
+    /// the source's, which would put young files below what a clean has
+    /// let go, and never at the partition's, which may be its latest
+    /// checkpoint's own. A file young at a position has a clean keep the
+    /// checkpoints from one before it on, and from one before the latest
+    /// the walk would reach a checkpoint an earlier clean deleted.
+    ///
+    /// Writes are refused, and the building lock held, from the start
+    /// until the restore is committed or fails. Dropped, the value made
+    /// gives both up and deletes the copies.
+    pub async fn restore_from<'a>(
+        &'a self,
+        source: Arc<dyn Blobs>,
+        head: Option<&ManifestRef>,
+        restore: Restore,
+        adopting: Option<Lineage>,
+        held: &dyn Held,
+    ) -> Result<RestoreFrom<'a>> {
+        let building = self.building.lock().await;
+        let refusing = Refusing::writes(self).await;
+        self.abreast().await?;
+        // With writes refused and the building lock held nothing commits
+        // and no checkpoint is made, so the copies, named at the position
+        // of the checkpoint to be committed, lie past the latest one until
+        // the restore is committed, as every upload not yet published does.
+        let (current, rested_on) = self.partition.read(|state| {
+            let rested_on = state.checkpoint().map(str::to_string);
+            (state.position(), rested_on)
+        });
+        let restored = following(current.max(restore.from))?;
+        let key = self.lease.key.clone();
+        let at = Committed {
+            generation: self.lease.generation,
+            incarnation: self.partition.incarnation,
+            log_position: restore.from,
+            manifest: head.cloned(),
+        };
+        self.still(held)?;
+        let chain = Partition::empty(key.clone(), source.clone(), self.partition.incarnation);
+        let Tail { checkpoint, logs } = chain
+            .tail(&at, LogPosition::default(), None)
+            .await?
+            .ok_or_else(|| {
+                let reason = format!(
+                    "the source's history at {:?} reaches neither a checkpoint nor the start",
+                    restore.from
+                );
+                StorageError::corrupt(&Layout(&key).prefix(), reason)
+            })?;
+        let mut memory = HashMap::new();
+        let mut sourced = HashSet::new();
+        for (key, log) in &logs {
+            memory.insert(key.clone(), encode(Kind::Log, log)?);
+            sourced.insert(key.clone());
+        }
+        let mut staged = self.staging();
+        let mut put = HashSet::new();
+        if let Some((checkpoint_key, manifest)) = checkpoint {
+            sourced.insert(checkpoint_key.clone());
+            sourced.extend(listed_by(&manifest).map(str::to_string));
+            // The logs it replays are read with it, by the keys they had.
+            for log in &manifest.replay {
+                self.still(held)?;
+                memory.insert(log.clone(), chain.fetch(log).await?);
+            }
+            let copies: Vec<(SegmentMeta, Names)> = manifest
+                .segments
+                .iter()
+                .map(|meta| (meta.clone(), self.named(restored, "-restored")))
+                .collect();
+            for (meta, names) in &copies {
+                let named = [
+                    meta.vectors.as_ref().map(|_| &names.vectors),
+                    meta.index.as_ref().map(|_| &names.index),
+                    Some(&names.segment),
+                ];
+                staged.keys.extend(named.into_iter().flatten().cloned());
+            }
+            use futures::{StreamExt, TryStreamExt};
+            let indexing = Mutex::new(());
+            let copied: Vec<Copied> = futures::stream::iter(copies)
+                .map(|(meta, names)| self.copied(&*source, meta, names, &indexing, held))
+                .buffered(SEGMENTS_COPIED_AT_ONCE)
+                .try_collect()
+                .await?;
+            let mut fresh = HashMap::new();
+            let mut dropped = HashSet::new();
+            for Copied { files, unused } in copied {
+                put.extend(files.iter().map(|(_, to)| to.clone()));
+                fresh.extend(files);
+                dropped.extend(unused);
+            }
+            let loading = loading(&checkpoint_key, manifest, &fresh, &dropped)?;
+            memory.insert(checkpoint_key, encode(Kind::Manifest, &loading)?);
+        }
+        // The state is loaded from the copies alone, read back from the
+        // store and summed, as a node with nothing would read them: the
+        // one check that each came out whole.
+        let overlay = Overlay {
+            memory,
+            put: put.clone(),
+            primary: self.partition.blobs.clone(),
+        };
+        let target = Partition::load_reusing(key, Arc::new(overlay), &at, None).await?;
+        Ok(RestoreFrom {
+            writer: self,
+            _building: building,
+            _refusing: refusing,
+            staged,
+            target,
+            put,
+            source: sourced,
+            rested_on,
+            current,
+            restored,
+            restore,
+            adopting,
+        })
+    }
+
+    /// `Unheld` unless `held` still is.
+    fn still(&self, held: &dyn Held) -> Result<()> {
+        match held.still() {
+            true => Ok(()),
+            false => Err(StorageError::Unheld(self.lease.key.tenant.clone())),
+        }
+    }
+
+    /// Copy the segment `meta` names in `source`, with its vectors and its
+    /// index, under `names`: the vectors and the segment a part at a time,
+    /// the segment last, as an upload puts it, and the index, read whole
+    /// and given the copy's key, one at a time of all a restore copies, by
+    /// `indexing`. An index that cannot be read as one, or that indexes
+    /// another segment, is passed over, as every load of the source passed
+    /// it over; one the source cannot give fails the copy, as any file it
+    /// cannot give does.
+    async fn copied(
+        &self,
+        source: &dyn Blobs,
+        meta: SegmentMeta,
+        names: Names,
+        indexing: &Mutex<()>,
+        held: &dyn Held,
+    ) -> Result<Copied> {
+        let blobs = &self.partition.blobs;
+        let mut files = Vec::new();
+        let mut unused = None;
+        if let Some(vectors) = meta.vectors {
+            self.still(held)?;
+            blobs
+                .put_parts(&names.vectors, source.parts(&vectors))
+                .await?;
+            files.push((vectors, names.vectors));
+        }
+        if let Some(index) = meta.index {
+            self.still(held)?;
+            let _one = indexing.lock().await;
+            let frame = source.get(&index).await?;
+            match rekeyed_index(&index, &frame, &meta.key, &names.segment) {
+                Ok(rekeyed) => {
+                    drop(frame);
+                    blobs.put(&names.index, rekeyed).await?;
+                    files.push((index, names.index));
+                }
+                Err(error) => {
+                    tracing::warn!(key = index, %error, "a segment's index file is not copied");
+                    unused = Some(index);
+                }
+            }
+        }
+        self.still(held)?;
+        blobs
+            .put_parts(&names.segment, source.parts(&meta.key))
+            .await?;
+        files.push((meta.key, names.segment));
+        Ok(Copied { files, unused })
+    }
+
     /// See that the partition is committed just where this writer has it,
     /// and under its lease, as it is for the one writer of a lease still
     /// current.
@@ -2042,6 +2237,296 @@ impl Drop for Refusing<'_> {
     }
 }
 
+/// A restore from another store made ready by [`Writer::restore_from`]:
+/// its copies made, and the state it puts back loaded from them, with
+/// writes refused and the building lock held. Committed, or dropped, which
+/// deletes the copies.
+pub struct RestoreFrom<'a> {
+    writer: &'a Writer,
+    _building: MutexGuard<'a, ()>,
+    _refusing: Refusing<'a>,
+    staged: Staged,
+    /// The state put back, loaded from the copies.
+    target: Partition,
+    /// Every file the restore put, and the keys the source's files had.
+    put: HashSet<String>,
+    source: HashSet<String>,
+    /// The checkpoint the partition's head rested on when it began, and
+    /// the position it was at.
+    rested_on: Option<String>,
+    current: LogPosition,
+    /// The position of the checkpoint it is to commit, its files' too.
+    restored: LogPosition,
+    restore: Restore,
+    adopting: Option<Lineage>,
+}
+
+/// A segment a restore copied: each of its files by the key it had and
+/// the one it was given, and its index file if that was passed over.
+struct Copied {
+    files: Vec<(String, String)>,
+    unused: Option<String>,
+}
+
+impl RestoreFrom<'_> {
+    /// Commit the restore: the state loaded, with whatever the source's
+    /// logs left in memory written as one more segment, as a checkpoint
+    /// past where the partition is and where the source was, resting on
+    /// the partition's own checkpoint and replaying nothing. Its position.
+    ///
+    /// The checkpoint is held to DW-680's rule before it is published, and
+    /// one that breaks it is refused with nothing committed (see
+    /// [`kept_out`]). Taken by value, so that the copies are not deleted
+    /// while the commit is tried: from then on they are kept whatever comes
+    /// of it, for it may have been made.
+    pub async fn commit(self) -> Result<LogPosition> {
+        let Self {
+            writer,
+            _building,
+            _refusing,
+            mut staged,
+            target,
+            mut put,
+            source,
+            rested_on,
+            current,
+            restored,
+            restore,
+            adopting,
+        } = self;
+        let mut held = target.held();
+        let segment = match target.read(State::snapshot) {
+            Some(mut snapshot) => {
+                target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
+                match writer
+                    .uploaded(&mut snapshot, restored, &mut staged)
+                    .await?
+                {
+                    Some(prepared) => {
+                        let meta = &prepared.meta;
+                        let named = [meta.index.as_ref(), meta.vectors.as_ref()];
+                        put.extend(named.into_iter().flatten().cloned());
+                        put.insert(meta.key.clone());
+                        let (meta, loaded) = writer.loaded(prepared).await?;
+                        held.insert(meta.key.clone(), loaded);
+                        Some(meta)
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        let key = Layout(&writer.lease.key).manifest(restored, &writer.author);
+        let manifest = writer
+            .partition
+            .read(|now| target.read(|target| now.restored_manifest(restored, target, segment)));
+        kept_out(&manifest, &put, &source, rested_on.as_deref())?;
+        let frame = encode(Kind::Manifest, &manifest)?;
+        let state = target.restore(&key, manifest, held).await?;
+        let turn = writer.turn().await?;
+        // Nothing moves the partition while the building lock is held and
+        // writes are refused, and a commit that follows anything else the
+        // coordinator refuses: this only says so before the copies are
+        // kept, as `put_back` does, and no test can tell it from that.
+        if writer.partition.read(State::position) != current {
+            return Err(StorageError::Diverged {
+                head: writer.partition.read(State::at).1,
+            });
+        }
+        staged.keep();
+        let replaced = writer
+            .attempt(async {
+                writer
+                    .publish(&turn, &key, frame, restored, Some(restore), adopting)
+                    .await?;
+                Ok(std::mem::replace(
+                    &mut *writer.partition.state.write().expect("partition lock"),
+                    state,
+                ))
+            })
+            .await?;
+        drop(turn);
+        blocking(move || drop((replaced, target))).await?;
+        Ok(restored)
+    }
+}
+
+/// The checkpoint a restore from another store loads what it copied
+/// through, made of the source's `checkpoint`, read from under `key`: each
+/// segment, index and vectors file by the key `fresh` gives it, the index
+/// of each segment whose index is among `dropped` none, no checkpoint
+/// before it, and the logs to replay as the source has them.
+///
+/// The map is what says which files were copied, and is held to that: one
+/// that gives a file the key it had, or that names a log or a checkpoint,
+/// which are never copied, is refused; and so is one that lacks a key for
+/// any file the checkpoint names (see [`Manifest::remapped`]), but for the
+/// logs to replay, which are read from memory by the keys they had: they
+/// cannot be named anew, for each says by key the head it follows.
+fn loading(
+    key: &str,
+    checkpoint: Manifest,
+    fresh: &HashMap<String, String>,
+    dropped: &HashSet<String>,
+) -> Result<Manifest> {
+    for (old, new) in fresh {
+        if old == new {
+            let reason = format!("{old} is given the key it had");
+            return Err(StorageError::corrupt(key, reason));
+        }
+        for named in [old, new] {
+            if matches!(named.rsplit('/').nth(1), Some("log" | "manifest")) {
+                let reason = format!("{named} is a log or a checkpoint, which is never copied");
+                return Err(StorageError::corrupt(key, reason));
+            }
+        }
+    }
+    let mut checkpoint = checkpoint;
+    checkpoint.prev = None;
+    for segment in &mut checkpoint.segments {
+        if segment
+            .index
+            .as_ref()
+            .is_some_and(|index| dropped.contains(index))
+        {
+            segment.index = None;
+        }
+    }
+    let replay = std::mem::take(&mut checkpoint.replay);
+    let mut loading = checkpoint.remapped(key, fresh)?;
+    loading.replay = replay;
+    Ok(loading)
+}
+
+/// What a restore from another store loads the state it puts back
+/// through: the files of the source's head chain, held in memory under the
+/// keys they had, its checkpoint as [`loading`] made it; and the files the
+/// restore put, under the keys it gave them, from the partition's store.
+/// Nothing else is read, and nothing written: a file of the source's that
+/// the partition's store holds still under the key it had is not one of
+/// the restore's, and is refused.
+#[derive(Debug)]
+struct Overlay {
+    memory: HashMap<String, Bytes>,
+    put: HashSet<String>,
+    primary: Arc<dyn Blobs>,
+}
+
+impl Overlay {
+    /// Refused unless the file under `key` is one the restore put.
+    fn put_by_the_restore(&self, key: &str) -> Result<()> {
+        match self.put.contains(key) {
+            true => Ok(()),
+            false => Err(StorageError::corrupt(
+                key,
+                "a restore from another store reads only the source's head and its own copies",
+            )),
+        }
+    }
+}
+
+/// The refusal of a write to what a restore loads through.
+fn loads_only(key: &str) -> StorageError {
+    StorageError::corrupt(
+        key,
+        "a restore from another store writes nothing as it loads",
+    )
+}
+
+#[async_trait::async_trait]
+impl Blobs for Overlay {
+    async fn put(&self, key: &str, _bytes: Bytes) -> Result<()> {
+        Err(loads_only(key))
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        _parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+    ) -> Result<()> {
+        Err(loads_only(key))
+    }
+    async fn get(&self, key: &str) -> Result<Bytes> {
+        if let Some(bytes) = self.memory.get(key) {
+            return Ok(bytes.clone());
+        }
+        self.put_by_the_restore(key)?;
+        self.primary.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        Err(loads_only(prefix))
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        Err(loads_only(key))
+    }
+    async fn local(&self, key: &str) -> Result<Option<Local>> {
+        if self.memory.contains_key(key) {
+            return Ok(None);
+        }
+        self.put_by_the_restore(key)?;
+        self.primary.local(key).await
+    }
+    fn parts<'a>(&'a self, key: &'a str) -> futures::stream::BoxStream<'a, Result<Bytes>> {
+        use futures::StreamExt;
+        if let Some(bytes) = self.memory.get(key) {
+            return futures::stream::once(std::future::ready(Ok(bytes.clone()))).boxed();
+        }
+        match self.put_by_the_restore(key) {
+            Ok(()) => self.primary.parts(key),
+            Err(refused) => futures::stream::once(std::future::ready(Err(refused))).boxed(),
+        }
+    }
+    async fn fetch_local(&self, key: &str) -> Result<Option<Local>> {
+        if self.memory.contains_key(key) {
+            return Ok(None);
+        }
+        self.put_by_the_restore(key)?;
+        self.primary.fetch_local(key).await
+    }
+}
+
+/// Whether the checkpoint a restore from another store is to commit, as
+/// `manifest`, keeps DW-680's rule (K4).
+///
+/// It holds when the restore, which put `put`, put no key the `source`'s
+/// files had; every segment, index and vectors file the checkpoint names
+/// is one the restore put; the checkpoint replays no log; and it rests on
+/// `rested_on`, the checkpoint the partition rested on when the restore
+/// began, which may be one the source has too.
+fn kept_out(
+    manifest: &Manifest,
+    put: &HashSet<String>,
+    source: &HashSet<String>,
+    rested_on: Option<&str>,
+) -> Result<()> {
+    let key = format!("the checkpoint at {:?}", manifest.position);
+    let broken = |reason: String| {
+        let reason = format!("DW-680 K4: {reason}");
+        Err(StorageError::corrupt(&key, reason))
+    };
+    if let Some(again) = put.iter().find(|key| source.contains(*key)) {
+        return broken(format!(
+            "the restore put {again}, a key the source's files had"
+        ));
+    }
+    let named = manifest.segments.iter().flat_map(|segment| {
+        let files = [segment.index.as_ref(), segment.vectors.as_ref()];
+        files.into_iter().flatten().chain([&segment.key])
+    });
+    if let Some(unput) = named.into_iter().find(|key| !put.contains(*key)) {
+        return broken(format!("it names {unput}, which the restore did not put"));
+    }
+    if !manifest.replay.is_empty() {
+        return broken(format!("it replays {:?}", manifest.replay));
+    }
+    if manifest.prev.as_deref() != rested_on {
+        return broken(format!(
+            "it rests on {:?}, and the partition rested on {rested_on:?}",
+            manifest.prev
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2455,5 +2940,366 @@ mod tests {
         let now = writer.partition.read(State::taken);
         let manifest = |state: &State| state.flushed_manifest(position, &now, None);
         assert!(writer.partition.read(manifest).is_ok());
+    }
+
+    /// Keys of the partition's files, of each kind, at `position`.
+    fn file(kind: &str, name: &str) -> String {
+        format!("tenant-a/0/{kind}/{name}.{kind}")
+    }
+
+    fn segment(name: &str, index: bool, vectors: bool) -> SegmentMeta {
+        SegmentMeta {
+            key: file("segment", name),
+            rows: 3,
+            tombstones: 1,
+            index: index.then(|| file("index", name)),
+            vectors: vectors.then(|| file("vectors", name)),
+        }
+    }
+
+    /// A checkpoint of two segments, the first with its index, both with
+    /// their vectors, with a checkpoint before it and logs to replay.
+    fn checkpoint(first: &str) -> Manifest {
+        Manifest {
+            position: LogPosition(7),
+            prev: Some(file("manifest", "before")),
+            next_collection_id: 3,
+            collections: Vec::new(),
+            segments: vec![segment(first, true, true), segment("second", false, true)],
+            replay: vec![file("log", "six"), file("log", "seven")],
+            replay_after: LogPosition(5),
+            answered: Vec::new(),
+        }
+    }
+
+    /// Each of `manifest`'s segment, index and vectors files given a key
+    /// of its own, ending in "-new".
+    fn fresh_for(manifest: &Manifest) -> HashMap<String, String> {
+        let named = manifest.segments.iter().flat_map(|segment| {
+            [
+                Some(&segment.key),
+                segment.index.as_ref(),
+                segment.vectors.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+        });
+        named
+            .map(|key| (key.clone(), key.replace('.', "-new.")))
+            .collect()
+    }
+
+    /// The checkpoint a restore from a source loads through, of each kind
+    /// of checkpoint a source may be at: every segment, index and vectors
+    /// file by its new key, a dropped index none, nothing before it, and
+    /// the logs to replay exactly as the source has them.
+    #[test]
+    fn a_restore_from_a_source_loads_through_its_checkpoint_named_anew() {
+        let restored = Manifest {
+            replay: Vec::new(),
+            replay_after: LogPosition::default(),
+            ..checkpoint("first")
+        };
+        let cases: [(&str, Manifest, bool); 4] = [
+            ("a flush", checkpoint("first"), false),
+            ("a merge", checkpoint("first-merged"), false),
+            ("a restore", restored, false),
+            (
+                "a flush, its first index dropped",
+                checkpoint("first"),
+                true,
+            ),
+        ];
+        for (what, source, drop_index) in cases {
+            let mut fresh = fresh_for(&source);
+            let mut dropped = HashSet::new();
+            let index = source.segments[0].index.clone().unwrap();
+            if drop_index {
+                fresh.remove(&index);
+                dropped.insert(index.clone());
+            }
+            let key = file("manifest", "source");
+            let loading = loading(&key, source.clone(), &fresh, &dropped).unwrap();
+            assert_eq!(loading.prev, None, "{what}");
+            assert_eq!(loading.replay, source.replay, "{what}");
+            assert_eq!(loading.replay_after, source.replay_after, "{what}");
+            assert_eq!(loading.position, source.position, "{what}");
+            assert_eq!(
+                loading.next_collection_id, source.next_collection_id,
+                "{what}"
+            );
+            assert_eq!(loading.segments.len(), source.segments.len(), "{what}");
+            for (new, old) in loading.segments.iter().zip(&source.segments) {
+                assert_eq!(new.key, fresh[&old.key], "{what}");
+                assert_eq!(
+                    new.vectors,
+                    old.vectors.as_ref().map(|key| fresh[key].clone())
+                );
+                assert_eq!((new.rows, new.tombstones), (old.rows, old.tombstones));
+            }
+            let first = &loading.segments[0];
+            match drop_index {
+                true => assert_eq!(first.index, None, "{what}"),
+                false => assert_eq!(first.index.as_ref(), Some(&fresh[&index]), "{what}"),
+            }
+        }
+    }
+
+    /// A change made to the map a restore loads through.
+    type Change<'a> = Box<dyn Fn(&mut HashMap<String, String>) + 'a>;
+
+    /// The map a restore from a source loads through is what says which
+    /// files it copied: one that lacks a segment, an index or vectors
+    /// file, or that gives a file the key it had, or that names a log or
+    /// a checkpoint, which are never copied, is refused.
+    #[test]
+    fn a_restore_from_a_source_refuses_a_map_of_anything_but_its_copies() {
+        let source = checkpoint("first");
+        let key = file("manifest", "source");
+        let none = HashSet::new();
+        let first = source.segments[0].clone();
+        let cases: [(&str, Change<'_>); 7] = [
+            (
+                "lacking a segment",
+                Box::new(|fresh| drop(fresh.remove(&first.key))),
+            ),
+            (
+                "lacking an index",
+                Box::new(|fresh| drop(fresh.remove(first.index.as_ref().unwrap()))),
+            ),
+            (
+                "lacking vectors",
+                Box::new(|fresh| drop(fresh.remove(first.vectors.as_ref().unwrap()))),
+            ),
+            (
+                "a segment kept under its key",
+                Box::new(|fresh| drop(fresh.insert(first.key.clone(), first.key.clone()))),
+            ),
+            (
+                "a log",
+                Box::new(|fresh| {
+                    let log = file("log", "six");
+                    fresh.insert(log.clone(), file("log", "six-new"));
+                }),
+            ),
+            (
+                "a checkpoint",
+                Box::new(|fresh| {
+                    let before = file("manifest", "before");
+                    fresh.insert(before, file("manifest", "before-new"));
+                }),
+            ),
+            (
+                "a log kept under its key",
+                Box::new(|fresh| {
+                    let log = file("log", "six");
+                    fresh.insert(log.clone(), log);
+                }),
+            ),
+        ];
+        for (what, change) in cases {
+            let mut fresh = fresh_for(&source);
+            change(&mut fresh);
+            let refused = loading(&key, source.clone(), &fresh, &none);
+            assert!(
+                matches!(refused, Err(StorageError::Corrupt { .. })),
+                "{what}: {refused:?}"
+            );
+        }
+    }
+
+    /// DW-680's rule as the commit of a restore from a source holds it to:
+    /// it put no key the source's files had; every segment, index and
+    /// vectors file the checkpoint names is one it put; the checkpoint
+    /// replays nothing; and it rests on the checkpoint the partition did,
+    /// which may be one the source has too.
+    #[test]
+    fn a_restore_from_a_source_commits_nothing_that_breaks_dw_680s_rule() {
+        let committed = Manifest {
+            prev: Some(file("manifest", "rested-on")),
+            replay: Vec::new(),
+            replay_after: LogPosition::default(),
+            ..checkpoint("first-new")
+        };
+        let put: HashSet<String> = fresh_for(&committed).into_keys().collect();
+        let source: HashSet<String> = [file("segment", "first"), file("manifest", "rested-on")]
+            .into_iter()
+            .collect();
+        let rested_on = Some(file("manifest", "rested-on"));
+        let held = |manifest: &Manifest, put: &HashSet<String>, rested: Option<&String>| {
+            kept_out(manifest, put, &source, rested.map(String::as_str))
+        };
+        assert!(held(&committed, &put, rested_on.as_ref()).is_ok());
+        let mut unput = put.clone();
+        unput.remove(&committed.segments[1].key);
+        let mut put_again = put.clone();
+        put_again.insert(file("segment", "first"));
+        let replaying = Manifest {
+            replay: vec![file("log", "six")],
+            ..committed.clone()
+        };
+        let elsewhere = Some(file("manifest", "other"));
+        let broken = [
+            (
+                "a key it did not put",
+                held(&committed, &unput, rested_on.as_ref()),
+            ),
+            (
+                "a key the source had",
+                held(&committed, &put_again, rested_on.as_ref()),
+            ),
+            (
+                "a log to replay",
+                held(&replaying, &put, rested_on.as_ref()),
+            ),
+            (
+                "another checkpoint before",
+                held(&committed, &put, elsewhere.as_ref()),
+            ),
+            ("none before", held(&committed, &put, None)),
+        ];
+        for (what, broken) in broken {
+            assert!(
+                matches!(&broken, Err(StorageError::Corrupt { reason, .. }) if reason.contains("DW-680")),
+                "{what}: {broken:?}"
+            );
+        }
+    }
+
+    /// A store a restore loads through, over `primary`, holding `memory`
+    /// and the files `put`.
+    fn overlay(primary: Arc<dyn Blobs>, memory: &[(&str, &str)], put: &[&str]) -> Overlay {
+        Overlay {
+            memory: memory
+                .iter()
+                .map(|(key, bytes)| (key.to_string(), Bytes::from(bytes.to_string())))
+                .collect(),
+            put: put.iter().map(|key| key.to_string()).collect(),
+            primary,
+        }
+    }
+
+    /// What a restore from a source loads through: the source's head chain
+    /// from memory, even where the store holds a file under the same key;
+    /// the files the restore put from the store; and nothing else, even
+    /// what the store holds under a key the source had. Nothing is written.
+    #[tokio::test]
+    async fn a_restore_from_a_source_loads_only_its_chain_and_its_copies() {
+        let primary: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let (chain, copy, old) = (file("log", "a"), file("segment", "b"), file("segment", "c"));
+        for key in [&chain, &copy, &old] {
+            primary.put(key, Bytes::from("in the store")).await.unwrap();
+        }
+        let overlay = overlay(primary.clone(), &[(&chain, "in memory")], &[&copy]);
+
+        assert_eq!(overlay.get(&chain).await.unwrap(), "in memory");
+        assert_eq!(overlay.get(&copy).await.unwrap(), "in the store");
+        use futures::{StreamExt, TryStreamExt};
+        let parts: Vec<Bytes> = overlay.parts(&copy).try_collect().await.unwrap();
+        assert_eq!(parts.concat(), b"in the store");
+        let parts: Vec<Bytes> = overlay.parts(&chain).try_collect().await.unwrap();
+        assert_eq!(parts.concat(), b"in memory");
+        for key in [old.as_str(), "tenant-a/0/segment/nowhere.segment"] {
+            assert!(overlay.get(key).await.is_err(), "{key}");
+            let parts: Result<Vec<Bytes>> = overlay.parts(key).try_collect().await;
+            assert!(parts.is_err(), "{key}");
+            assert!(overlay.local(key).await.is_err(), "{key}");
+            assert!(overlay.fetch_local(key).await.is_err(), "{key}");
+        }
+        assert!(overlay.put(&copy, Bytes::from("x")).await.is_err());
+        let parts = futures::stream::iter([Ok(Bytes::from("x"))]).boxed();
+        assert!(overlay.put_parts(&copy, parts).await.is_err());
+        assert!(overlay.delete(&copy).await.is_err());
+        assert!(overlay.list("").await.is_err());
+        assert_eq!(primary.get(&copy).await.unwrap(), "in the store");
+    }
+
+    /// A file the restore put is read in place from the store's copy on
+    /// local disk, fetched there a part at a time, as any vectors are.
+    #[tokio::test]
+    async fn a_restore_from_a_source_reads_its_copies_through_the_stores_copy_on_local_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let primary: Arc<dyn Blobs> = Arc::new(crate::blobs::CachedBlobs::new(inner, dir.path()));
+        let copy = file("vectors", "b");
+        primary.put(&copy, Bytes::from("vectors")).await.unwrap();
+        primary.forget_local("tenant-a/0/").await.unwrap();
+        let overlay = overlay(primary, &[], &[&copy]);
+
+        assert!(overlay.local(&copy).await.unwrap().is_none());
+        let fetched = overlay.fetch_local(&copy).await.unwrap().unwrap();
+        assert_eq!(std::fs::read(&fetched.path).unwrap(), b"vectors");
+        assert!(overlay.local(&copy).await.unwrap().is_some());
+    }
+
+    /// A restore from a source whose checkpoint would name a file it did
+    /// not put, or rest on another checkpoint than the partition did, is
+    /// refused at its commit, which commits nothing: whatever made it so.
+    #[tokio::test]
+    async fn a_restore_from_a_source_that_would_break_dw_680s_rule_commits_nothing() {
+        let (source, _) = writer_on(Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))).await;
+        source.commit(vec![create(), upsert(1)]).await.unwrap();
+        source.flush().await.unwrap();
+        source.commit(vec![upsert(2)]).await.unwrap();
+        let (at, head) = source.partition.read(State::at);
+        let restore = || Restore {
+            request: vellev_core::RequestId::generate(),
+            asked: [0; 32],
+            from: at,
+            from_at: chrono::Utc::now(),
+        };
+        struct Held;
+        #[async_trait::async_trait]
+        impl crate::backups::Held for Held {
+            async fn held(&self) -> Result<bool> {
+                Ok(true)
+            }
+            fn still(&self) -> bool {
+                true
+            }
+        }
+        let head = head.map(ManifestRef);
+        let (writer, coordinator) =
+            writer_on(Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))).await;
+        writer.commit(vec![create(), upsert(9)]).await.unwrap();
+        let before = coordinator.committed(&writer.lease.key).await.unwrap();
+        type Tamper = fn(&mut RestoreFrom<'_>);
+        let tampered: [(&str, Tamper); 2] = [
+            ("names a file it did not put", |ready| ready.put.clear()),
+            ("rests elsewhere", |ready| {
+                ready.rested_on = Some(file("manifest", "x"))
+            }),
+        ];
+        let stored = || async {
+            let listed = writer.partition.blobs.list("").await.unwrap();
+            listed
+                .into_iter()
+                .map(|file| file.key)
+                .collect::<HashSet<_>>()
+        };
+        for (what, tamper) in tampered {
+            let had = stored().await;
+            let blobs = source.partition.blobs.clone();
+            let ready = writer.restore_from(blobs, head.as_ref(), restore(), None, &Held);
+            let mut ready = ready.await.unwrap();
+            tamper(&mut ready);
+            let refused = ready.commit().await;
+            assert!(
+                matches!(&refused, Err(StorageError::Corrupt { reason, .. }) if reason.contains("DW-680")),
+                "{what}: {refused:?}"
+            );
+            let after = coordinator.committed(&writer.lease.key).await.unwrap();
+            assert_eq!(after, before, "{what}");
+            assert!(!writer.is_closed(), "{what}: nothing was tried");
+            // Refused before they were kept, its copies are deleted.
+            let started = std::time::Instant::now();
+            while stored().await != had {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "{what}: copies kept"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
     }
 }

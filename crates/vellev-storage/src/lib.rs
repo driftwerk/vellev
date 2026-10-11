@@ -27,7 +27,7 @@ pub use keyword::{Keywords, Scored, MAX_WEIGHT};
 pub use mutation::{
     Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
 };
-pub use partition::{Embedded, Follower, Partition, Writer};
+pub use partition::{Embedded, Follower, Partition, RestoreFrom, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::{Live, Merging, State};
 pub use vellev_index::filter::{Filter, FilterError};
