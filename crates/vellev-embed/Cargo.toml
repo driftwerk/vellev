@@ -15,6 +15,9 @@ vellev-core.workspace = true
 
 async-trait.workspace = true
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "sso", "credentials-process"] }
+# Only to know an error of its by type: credentials that could not be
+# loaded are reported as a failure to send, like a region not reached.
+aws-credential-types = "1"
 aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 futures.workspace = true

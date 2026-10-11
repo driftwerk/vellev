@@ -446,8 +446,10 @@ async fn a_version_is_the_same_once_the_object_is_flushed_to_a_segment() {
 
 #[tokio::test]
 async fn a_version_covers_the_vector_a_node_embeds_and_a_conditional_write_passes_at_it() {
-    let url = keyed_embedding_server("sk-right").await;
-    let served = Cluster::new().serve_embedding_keyed(&url, "sk-right").await;
+    let url = keyed_embedding_server("sk-right-0123456789abcdef").await;
+    let served = Cluster::new()
+        .serve_embedding_keyed(&url, "sk-right-0123456789abcdef")
+        .await;
     let embedding = json!({
         "provider": "http",
         "api": "openai",

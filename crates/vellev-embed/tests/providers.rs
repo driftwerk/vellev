@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use vellev_core::HttpApi;
 use vellev_core::{Embedding, EmbeddingProvider, ModelFault};
-use vellev_embed::{Bedrock, EmbedError, Embedders, Http, Provider, Purpose, Settings};
+use vellev_embed::{Bedrock, EmbedError, Embedder, Embedders, Http, Provider, Purpose, Settings};
 
 /// What a stand-in server was sent, and how many of its first requests it
 /// is to refuse.
@@ -148,7 +148,7 @@ async fn an_openai_endpoint_is_sent_the_model_and_key_and_answers_in_any_order()
         &url,
         HttpApi::Openai,
         "text-embedding-3-small",
-        Some("sk-secret".into()),
+        Some("sk-secret-0123456789abcdef".into()),
     )
     .unwrap();
     let vectors = provider
@@ -162,7 +162,7 @@ async fn an_openai_endpoint_is_sent_the_model_and_key_and_answers_in_any_order()
     );
     assert_eq!(
         *seen.authorizations.lock().unwrap(),
-        [Some("Bearer sk-secret".to_string())]
+        [Some("Bearer sk-secret-0123456789abcdef".to_string())]
     );
 }
 
@@ -187,7 +187,7 @@ async fn throttling_and_server_errors_are_tried_again_but_a_refusal_is_final() {
         &openai(seen.clone()).await,
         HttpApi::Openai,
         "m",
-        Some("sk-secret".into()),
+        Some("sk-secret-0123456789abcdef".into()),
     )
     .unwrap();
     let refused = provider
@@ -217,7 +217,7 @@ async fn a_bare_refusal_of_the_key_or_the_route_may_pass_whatever_stands_in_fron
             &openai(seen.clone()).await,
             HttpApi::Openai,
             "m",
-            Some("sk-secret".into()),
+            Some("sk-secret-0123456789abcdef".into()),
         )
         .unwrap();
         let refused = provider
@@ -387,6 +387,171 @@ async fn an_endpoint_that_says_in_its_own_code_that_the_setup_is_wrong_cannot_be
     }
 }
 
+/// A refusal is read as far as 64 KiB and no further, and one that goes
+/// on past that is not read for the fault it names: it may pass.
+#[tokio::test]
+async fn an_endpoint_that_says_a_great_deal_in_refusing_is_read_only_so_far() {
+    let saying = |words: usize| async move {
+        let refusal = json!({ "error": {
+            "message": "no ".repeat(words),
+            "code": "invalid_api_key",
+        } });
+        let said = refusal.to_string();
+        let seen = Arc::new(Seen::default());
+        let url = refusing_as_openai(401, refusal, seen.clone()).await;
+        let provider = Http::new(&url, HttpApi::Openai, "m", None).unwrap();
+        let refused = provider.embed(numbered(1), Purpose::Document).await;
+        assert_eq!(seen.bodies().len(), 1);
+        (said, refused.unwrap_err())
+    };
+    let passed_on = |said: &str| {
+        let start: String = said.chars().take(300).collect();
+        format!("401 Unauthorized: {start}")
+    };
+    let (said, refused) = saying(21_800).await;
+    assert!(said.len() < 64 * 1024, "{}", said.len());
+    assert_eq!(
+        refused,
+        EmbedError::Unusable {
+            model: "m".into(),
+            reason: passed_on(&said),
+            fault: ModelFault::Setup,
+        }
+    );
+    for words in [21_900, 6_000_000] {
+        let (said, refused) = saying(words).await;
+        assert!(said.len() > 64 * 1024, "{}", said.len());
+        assert_eq!(
+            refused,
+            EmbedError::Failed {
+                model: "m".into(),
+                reason: passed_on(&said),
+            },
+            "{words} words"
+        );
+    }
+}
+
+/// An endpoint that answers every request as `respond` writes to it,
+/// byte for byte, once it has been sent a request's head.
+async fn answering<F, R>(respond: F) -> String
+where
+    F: Fn(tokio::net::TcpStream) -> R + Send + Sync + 'static,
+    R: std::future::Future<Output = ()> + Send,
+{
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let respond = Arc::new(respond);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let respond = respond.clone();
+            tokio::spawn(async move {
+                let mut asked = Vec::new();
+                while !asked.windows(4).any(|end| end == b"\r\n\r\n") {
+                    let mut more = [0; 1024];
+                    match socket.read(&mut more).await {
+                        Ok(read) if read > 0 => asked.extend_from_slice(&more[..read]),
+                        _ => return,
+                    }
+                }
+                respond(socket).await;
+            });
+        }
+    });
+    url
+}
+
+/// What is read of a refusal for the fault it names is what the endpoint
+/// said, all of it: not the start of more than is read, and not as much
+/// as came of what was cut off on its way. Either could be made to read
+/// as a refusal that names a fault, and the model would be taken for one
+/// that cannot be used.
+#[tokio::test]
+async fn a_refusal_that_is_not_all_there_is_not_read_for_the_fault_it_names() {
+    use tokio::io::AsyncWriteExt;
+    const CODED: &str = r#"{"error":{"message":"no","type":"t","code":"invalid_api_key"}}"#;
+    let refused = |url: String| async move {
+        let provider = Http::new(&url, HttpApi::Openai, "m", None).unwrap();
+        let asked = provider.embed(numbered(1), Purpose::Document);
+        let refused = tokio::time::timeout(Duration::from_secs(5), asked).await;
+        refused.expect("no more is read than is read").unwrap_err()
+    };
+    let head = |length: usize| {
+        format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+             content-length: {length}\r\nconnection: close\r\n\r\n"
+        )
+    };
+    let unusable = EmbedError::Unusable {
+        model: "m".into(),
+        reason: format!("401 Unauthorized: {CODED}"),
+        fault: ModelFault::Setup,
+    };
+    let may_pass = EmbedError::Failed {
+        model: "m".into(),
+        reason: format!("401 Unauthorized: {CODED}"),
+    };
+
+    // Said whole, it names a fault.
+    let whole = answering(move |mut socket| async move {
+        let said = format!("{}{CODED}", head(CODED.len()));
+        let _ = socket.write_all(said.as_bytes()).await;
+    });
+    assert_eq!(refused(whole.await).await, unusable);
+
+    // Said with more after it than is read: what is read of it would
+    // read as the same refusal, and is not taken for one.
+    let padded = answering(move |mut socket| async move {
+        let padding = " ".repeat(70 * 1024);
+        let said = format!("{}{CODED}{padding}", head(CODED.len() + padding.len()));
+        let _ = socket.write_all(said.as_bytes()).await;
+    });
+    let EmbedError::Failed { reason, .. } = refused(padded.await).await else {
+        panic!("it was read for a fault");
+    };
+    assert_eq!(reason.trim_end(), format!("401 Unauthorized: {CODED}"));
+
+    // To the byte: a refusal of exactly as much as is read is all
+    // there, and one a byte longer is not.
+    for (over, read_for_a_fault) in [(0, true), (1, false)] {
+        let exactly = answering(move |mut socket| async move {
+            let padding = " ".repeat(64 * 1024 + over - CODED.len());
+            let said = format!("{}{CODED}{padding}", head(64 * 1024 + over));
+            let _ = socket.write_all(said.as_bytes()).await;
+        });
+        let lasting = refused(exactly.await).await.lasting();
+        assert_eq!(lasting.is_some(), read_for_a_fault, "{over} over");
+    }
+
+    // Cut off before all that was promised came.
+    let cut_off = answering(move |mut socket| async move {
+        let said = format!("{}{CODED}", head(CODED.len() + 1_000));
+        let _ = socket.write_all(said.as_bytes()).await;
+    });
+    assert_eq!(refused(cut_off.await).await, may_pass);
+
+    // And one that never ends is read as far as any is, and no further:
+    // it does not keep whoever asked until the endpoint tires.
+    let endless = answering(move |mut socket| async move {
+        let head = "HTTP/1.1 401 Unauthorized\r\ntransfer-encoding: chunked\r\n\r\n";
+        let _ = socket.write_all(head.as_bytes()).await;
+        let chunk = format!("{:x}\r\n{}\r\n", 4096, "no! ".repeat(1024));
+        while socket.write_all(chunk.as_bytes()).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let said = refused(endless.await).await;
+    let start = "no! ".repeat(75);
+    assert_eq!(
+        said,
+        EmbedError::Failed {
+            model: "m".into(),
+            reason: format!("401 Unauthorized: {start}"),
+        }
+    );
+}
+
 #[tokio::test]
 async fn a_server_that_never_recovers_or_cannot_be_reached_fails_after_five_tries() {
     let seen = Seen::refusing(usize::MAX, 500);
@@ -446,7 +611,9 @@ async fn bedrock(seen: Arc<Seen>) -> Bedrock {
         assert_eq!(model, TITAN);
         let now = seen.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         seen.most_in_flight.fetch_max(now, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A text that says it is slow takes a second, not 20 ms.
+        let slow = body["inputText"].as_str().unwrap().starts_with("slow");
+        tokio::time::sleep(Duration::from_millis(if slow { 1_000 } else { 20 })).await;
         seen.in_flight.fetch_sub(1, Ordering::SeqCst);
         if let Some((status, _)) = seen.record(&headers, &body) {
             let kind = match status.as_u16() {
@@ -604,16 +771,19 @@ async fn a_key_goes_only_to_the_endpoint_it_is_for_and_never_into_an_error() {
         properties: vec![],
     };
     let embedders = Embedders::new(Settings {
-        keys: [(url.clone(), "sk-secret".to_string())].into(),
+        keys: [(url.clone(), "sk-secret-0123456789abcdef".to_string())].into(),
         ..Settings::default()
     });
     for (asked, sent) in [
-        (format!("{url}/"), Some("Bearer sk-secret".to_string())),
+        (
+            format!("{url}/"),
+            Some("Bearer sk-secret-0123456789abcdef".to_string()),
+        ),
         (format!("{url}/v1"), None),
     ] {
         let embedder = embedders.embedder(&embedding(&asked)).unwrap().unwrap();
         let refused = embedder.query("fox").await.unwrap_err().to_string();
-        assert!(!refused.contains("sk-secret"), "{refused}");
+        assert!(!refused.contains("sk-secret-0123456789abcdef"), "{refused}");
         assert_eq!(seen.authorizations.lock().unwrap().last().unwrap(), &sent);
     }
 
@@ -716,7 +886,7 @@ async fn an_endpoint_is_given_the_wait_it_asks_for_and_a_request_that_cannot_be_
         &tei(seen.clone()).await,
         HttpApi::Tei,
         "m",
-        Some("two\nlines".into()),
+        Some("sk-0123456789abcdef\u{7f}x".into()),
     )
     .unwrap();
     let started = std::time::Instant::now();
@@ -732,8 +902,8 @@ async fn an_endpoint_is_given_the_wait_it_asks_for_and_a_request_that_cannot_be_
     assert!(seen.bodies().is_empty());
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_bedrock_that_never_answers_fails_rather_than_hangs() {
+/// Where something listens, takes every connection, and never answers.
+async fn silent() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -742,6 +912,12 @@ async fn a_bedrock_that_never_answers_fails_rather_than_hangs() {
             held.push(socket);
         }
     });
+    url
+}
+
+/// Titan as it would be reached at `url`, with the tries and the times
+/// the node gives it.
+fn bedrock_at(url: String) -> Bedrock {
     let config = aws_sdk_bedrockruntime::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("eu-west-2"))
@@ -756,15 +932,570 @@ async fn a_bedrock_that_never_answers_fails_rather_than_hangs() {
         .retry_config(Bedrock::retries())
         .timeout_config(Bedrock::timeouts())
         .build();
-    let provider = Bedrock::with_client(
+    Bedrock::with_client(
         aws_sdk_bedrockruntime::Client::from_conf(config),
         TITAN,
         256,
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bedrock_that_never_answers_fails_rather_than_hangs() {
+    let provider = bedrock_at(silent().await);
     let waited = tokio::time::timeout(
         Duration::from_secs(600),
         provider.embed(vec!["fox".into()], Purpose::Document),
     );
     assert!(matches!(waited.await, Ok(Err(EmbedError::Failed { .. }))));
+}
+
+/// Left to themselves, an endpoint that never answers is waited on for
+/// two minutes and Titan for as long for each text, every try included.
+/// Whoever embeds through them waits no longer than a model is given.
+#[tokio::test]
+async fn an_endpoint_or_a_bedrock_that_never_answers_is_given_up_on_in_the_time_a_model_is_given() {
+    let ms = Duration::from_millis;
+    let late = |model: &str, within: &str| EmbedError::Failed {
+        model: model.into(),
+        reason: format!("no answer within {within}"),
+    };
+    // What each of a query and three documents comes to, and that it
+    // comes to it when the time is up, give or take.
+    let given_up_on = |embedder: Arc<Embedder>, model: &'static str| async move {
+        // Left waiting on what never answers, this fails and does not
+        // hang.
+        let seconds = Duration::from_secs(5);
+        let began = std::time::Instant::now();
+        let query = tokio::time::timeout(seconds, embedder.query("fox")).await;
+        assert_eq!(query, Ok(Err(late(model, "1s"))));
+        let took = began.elapsed();
+        assert!((ms(1_000)..ms(3_000)).contains(&took), "{took:?}");
+        let began = std::time::Instant::now();
+        let texts = numbered(3);
+        let documents = tokio::time::timeout(seconds, embedder.documents(&texts)).await;
+        let stalled = EmbedError::Failed {
+            model: model.into(),
+            reason: "the model has made nothing for anyone in 1s".into(),
+        };
+        assert_eq!(documents, Ok(Err(stalled.clone())));
+        let took = began.elapsed();
+        assert!((ms(1_000)..ms(3_000)).contains(&took), "{took:?}");
+        assert_eq!(stalled.lasting(), None, "it may pass");
+    };
+
+    // An endpoint, as a node set up to give so long embeds through it.
+    let url = silent().await;
+    let embedders = Embedders::new(Settings {
+        query_within: ms(1_000),
+        documents_within: ms(1_000),
+        ..Settings::default()
+    });
+    let through = Embedding {
+        provider: EmbeddingProvider::Http {
+            url,
+            api: HttpApi::Tei,
+        },
+        model: "m".into(),
+        dimensions: 1,
+        query_prefix: None,
+        document_prefix: None,
+        properties: vec![],
+    };
+    given_up_on(embedders.embedder(&through).unwrap().unwrap(), "m").await;
+
+    let titan = Embedding {
+        provider: EmbeddingProvider::Bedrock {
+            region: "eu-west-2".into(),
+        },
+        model: TITAN.into(),
+        dimensions: 256,
+        ..through
+    };
+    let embedder = Embedder::new(Arc::new(bedrock_at(silent().await)), titan);
+    let embedder = embedder.answering_within(ms(1_000), ms(1_000));
+    given_up_on(Arc::new(embedder), TITAN).await;
+}
+
+/// Titan stands in at 20 ms a text, so a query alone takes a little over
+/// that. Before queries had calls kept for them, one asked beside many
+/// documents waited for every one of them: 4.8 seconds beside two
+/// thousand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_beside_many_documents_on_bedrock_is_answered_in_about_its_own_time() {
+    let seen = Arc::new(Seen::default());
+    let provider = Arc::new(bedrock(seen.clone()).await);
+    let query = |n: usize| provider.embed(vec![format!("query {n}")], Purpose::Query);
+    // The first call makes the connection, which is not what is timed.
+    query(0).await.unwrap();
+
+    // Documents that Titan is slow over hold no more calls than are
+    // theirs, however many wait: the rest are free for queries, which so
+    // do not wait even for one text of them.
+    let slow = {
+        let provider = provider.clone();
+        let texts = (0..16).map(|n| format!("slow {n}")).collect();
+        tokio::spawn(async move { provider.embed(texts, Purpose::Document).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(seen.in_flight.load(Ordering::SeqCst), 8);
+    let began = std::time::Instant::now();
+    let (one, another) = tokio::join!(query(1), query(2));
+    let beside = began.elapsed();
+    assert!(one.is_ok() && another.is_ok());
+    assert!(beside < Duration::from_millis(600), "two took {beside:?}");
+    assert_eq!(slow.await.unwrap().unwrap().len(), 16);
+    assert_eq!(seen.most_in_flight.load(Ordering::SeqCst), 10);
+
+    let bulk = || {
+        let provider = provider.clone();
+        tokio::spawn(async move { provider.embed(numbered(600), Purpose::Document).await })
+    };
+    let (one, another) = (bulk(), bulk());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let began = std::time::Instant::now();
+    assert_eq!(query(1).await.unwrap(), [vec![7.0, 1.0]]);
+    let alone = began.elapsed();
+    assert!(alone < Duration::from_millis(600), "one took {alone:?}");
+    // Many at once take every call as it comes free: the documents wait
+    // for them, not they for the documents.
+    let began = std::time::Instant::now();
+    let answers = futures::future::join_all((0..20).map(query)).await;
+    let together = began.elapsed();
+    assert!(answers.iter().all(Result::is_ok));
+    assert!(
+        together < Duration::from_millis(1_000),
+        "twenty took {together:?}"
+    );
+    assert!(!one.is_finished() && !another.is_finished());
+
+    // Calls for documents made side by side take turns: a short one made
+    // now is not kept until the long ones are done.
+    let began = std::time::Instant::now();
+    let short = provider.embed(numbered(8), Purpose::Document).await;
+    let beside = began.elapsed();
+    assert_eq!(short.unwrap().len(), 8);
+    assert!(beside < Duration::from_secs(2), "eight took {beside:?}");
+    assert!(!one.is_finished() && !another.is_finished());
+
+    for bulk in [one, another] {
+        let vectors = bulk.await.unwrap().unwrap();
+        assert_eq!(vectors.len(), 600);
+        assert_eq!(vectors[599], [8.0, 1.0], "in the order asked");
+    }
+    let most = seen.most_in_flight.load(Ordering::SeqCst);
+    assert!(most <= 10, "{most} calls in flight");
+}
+
+/// An endpoint has no line of this node's making to stand in: a call
+/// sends its batches one after another, and no call waits on another's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_beside_many_documents_on_an_endpoint_is_sent_at_once() {
+    let slow = |Json(body): Json<Value>| async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let inputs = body["inputs"].as_array().unwrap();
+        Json(json!(inputs
+            .iter()
+            .map(|text| vector_of(text.as_str().unwrap()))
+            .collect::<Vec<_>>()))
+    };
+    let url = serve(Router::new().route("/embed", post(slow))).await;
+    let provider = Arc::new(Http::new(&url, HttpApi::Tei, "bge", None).unwrap());
+    let query = |n: usize| provider.embed(vec![format!("query {n}")], Purpose::Query);
+    query(0).await.unwrap();
+    // Forty batches, at 50 ms each: two seconds.
+    let bulk = {
+        let provider = provider.clone();
+        tokio::spawn(async move { provider.embed(numbered(1_280), Purpose::Document).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let began = std::time::Instant::now();
+    assert_eq!(query(1).await.unwrap(), [vec![1.0]]);
+    let alone = began.elapsed();
+    assert!(alone < Duration::from_millis(700), "one took {alone:?}");
+    let began = std::time::Instant::now();
+    let answers = futures::future::join_all((0..20).map(query)).await;
+    let together = began.elapsed();
+    assert!(answers.iter().all(Result::is_ok));
+    assert!(
+        together < Duration::from_millis(1_000),
+        "twenty took {together:?}"
+    );
+    assert!(!bulk.is_finished());
+    assert_eq!(bulk.await.unwrap().unwrap().len(), 1_280);
+}
+
+/// The way of embedding of a collection whose model is `model`.
+/// Two collections that embed with one model but put different prefixes
+/// before a search's text send the model different texts, and share
+/// nothing kept for a search: what is kept is kept by what was sent. A
+/// collection worded like another shares what it kept.
+#[tokio::test]
+async fn collections_that_word_a_search_differently_share_no_kept_vector() {
+    let seen = Arc::new(Seen::default());
+    let url = tei(seen.clone()).await;
+    let through = EmbeddingProvider::Http {
+        url: url.clone(),
+        api: HttpApi::Tei,
+    };
+    let embedders = Embedders::new(Settings::default());
+    let plain = embedding_with(through, "m", 1);
+    let prefixed = Embedding {
+        query_prefix: Some("query: ".into()),
+        ..plain.clone()
+    };
+    let alike = Embedding {
+        properties: vec!["title".into()],
+        ..plain.clone()
+    };
+    let plain = embedders.embedder(&plain).unwrap().unwrap();
+    let prefixed = embedders.embedder(&prefixed).unwrap().unwrap();
+    let alike = embedders.embedder(&alike).unwrap().unwrap();
+    assert_eq!(embedders.held(), 1, "one model");
+    let sent = |seen: &Seen| -> Vec<Value> {
+        seen.bodies()
+            .iter()
+            .map(|body| body["inputs"].clone())
+            .collect()
+    };
+    assert_eq!(plain.query("3").await.unwrap(), Some(vec![3.0]));
+    assert_eq!(prefixed.query("3").await.unwrap(), Some(vec![3.0]));
+    assert_eq!(sent(&seen), [json!(["3"]), json!(["query: 3"])]);
+    // Asked again, each is answered from what was kept for what it sent,
+    // and the one worded like the first from what the first kept.
+    assert_eq!(plain.query("3").await.unwrap(), Some(vec![3.0]));
+    assert_eq!(prefixed.query("3").await.unwrap(), Some(vec![3.0]));
+    assert_eq!(alike.query("3").await.unwrap(), Some(vec![3.0]));
+    assert_eq!(sent(&seen).len(), 2, "nothing more was sent");
+}
+
+/// A region that answers has been reached, whatever it answers: one
+/// that refuses a text, denies the call, says slow down through every
+/// try, or fails within, is asked again by the next call, and is not
+/// taken to be out of reach.
+#[tokio::test]
+async fn a_region_that_refuses_or_throttles_has_been_reached_and_is_asked_again() {
+    // Refused once for what will not be tried again; and through all
+    // five tries for what is.
+    for (status, tries) in [(400, 1), (403, 1), (429, 5), (500, 5)] {
+        let seen = Seen::refusing(tries, status);
+        let provider = bedrock(seen.clone()).await;
+        let refused = provider.embed(vec!["one".into()], Purpose::Document).await;
+        let said = refused.unwrap_err().to_string();
+        assert!(!said.contains("was not reached"), "{status}: {said}");
+        assert_eq!(seen.bodies().len(), tries, "{status}");
+        // The next call is sent, and answered.
+        let asked = provider.embed(vec!["two".into()], Purpose::Query).await;
+        assert_eq!(asked, Ok(vec![vec![3.0, 1.0]]), "{status}");
+        assert_eq!(seen.bodies().len(), tries + 1, "{status}");
+    }
+}
+
+/// Titan refusing texts is not Titan at work: a write whose text Titan
+/// has yet to answer is given up on when Titan has made no vector for
+/// anyone for as long as a model may go without, however many texts of
+/// other writes it refuses meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_bedrock_refuses_is_not_bedrock_at_work() {
+    let ms = Duration::from_millis;
+    let seen = Seen::refusing(usize::MAX, 400);
+    let titan = EmbeddingProvider::Bedrock {
+        region: "eu-west-2".into(),
+    };
+    let embedder = Embedder::new(
+        Arc::new(bedrock(seen.clone()).await),
+        embedding_with(titan, TITAN, 2),
+    );
+    let embedder = Arc::new(embedder.answering_within(ms(2_000), ms(500)));
+    // Titan takes a second over a text that says it is slow.
+    let began = std::time::Instant::now();
+    let slow = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.documents(&["slow one".to_string()]).await })
+    };
+    // Meanwhile it refuses a text every hundred milliseconds or so.
+    for n in 0..6 {
+        let refused = embedder.documents(&[format!("quick {n}")]).await;
+        let said = refused.unwrap_err().to_string();
+        assert!(said.contains("ValidationException"), "{said}");
+        tokio::time::sleep(ms(80)).await;
+    }
+    let given_up_on = slow.await.unwrap().unwrap_err().to_string();
+    assert!(
+        given_up_on.ends_with("the model has made nothing for anyone in 500ms"),
+        "{given_up_on}"
+    );
+    let took = began.elapsed();
+    assert!((ms(500)..ms(950)).contains(&took), "{took:?}");
+}
+
+/// One batch is given so long, every try included: an endpoint that goes
+/// on saying it is busy is given up on then, and not after every try it
+/// asks for, which here would take seven and a half seconds.
+#[tokio::test]
+async fn a_batch_is_given_so_long_however_many_tries_the_endpoint_asks_for() {
+    let ms = Duration::from_millis;
+    let busy = Seen::refusing(usize::MAX, 503);
+    let url = tei(busy.clone()).await;
+    let provider = Http::new(&url, HttpApi::Tei, "bge", None)
+        .unwrap()
+        .answering_each_batch_within(ms(1_200));
+    let began = std::time::Instant::now();
+    let given_up_on = provider.embed(vec!["fox".into()], Purpose::Document).await;
+    let took = began.elapsed();
+    assert_eq!(
+        given_up_on,
+        Err(EmbedError::Failed {
+            model: "bge".into(),
+            reason: "no answer within 1.2s".into(),
+        })
+    );
+    assert!((ms(1_200)..ms(2_500)).contains(&took), "{took:?}");
+    // It had been asked twice, and was to be asked a third time.
+    assert_eq!(busy.bodies().len(), 2);
+}
+
+/// An endpoint whose refusal is cut off on its way, partway through a
+/// key it was quoting back: nothing of the key is passed on, though what
+/// came of it is far short of where looking for keys ends, and too short
+/// to be shaped like a key.
+#[tokio::test]
+async fn a_refusal_cut_off_on_its_way_passes_on_nothing_of_a_key_it_was_quoting() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (mut caller, _) = listener.accept().await.unwrap();
+            let mut asked = [0; 4096];
+            let _ = caller.read(&mut asked).await;
+            // It says it will say five hundred bytes, says these, and
+            // hangs up.
+            let said = "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\n\
+                        content-length: 500\r\n\r\nno such key: sk-proj-AbCd1234Ef";
+            let _ = caller.write_all(said.as_bytes()).await;
+            let _ = caller.shutdown().await;
+        }
+    });
+    let provider = Http::new(&url, HttpApi::Openai, "m", None).unwrap();
+    let refused = provider.embed(vec!["fox".into()], Purpose::Query).await;
+    let said = refused.unwrap_err().to_string();
+    assert!(
+        said.contains("401") && said.contains("no such key: "),
+        "{said}"
+    );
+    assert!(
+        !said.contains("sk-proj") && !said.contains("AbCd"),
+        "{said}"
+    );
+}
+
+fn embedding_with(provider: EmbeddingProvider, model: &str, dimensions: u32) -> Embedding {
+    Embedding {
+        provider,
+        model: model.into(),
+        dimensions,
+        query_prefix: None,
+        document_prefix: None,
+        properties: vec![],
+    }
+}
+
+/// A write through an endpoint or through Bedrock is given up on when
+/// what serves the model stops answering, and not for how long the write
+/// takes while it is answered: however many batches it is of, and however
+/// many other writes it waits for a call behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_is_not_given_up_on_for_how_many_write_or_how_much_while_it_is_answered() {
+    let ms = Duration::from_millis;
+    // An endpoint that takes 150 ms a batch, and a write of sixteen
+    // batches: 2.4 seconds, given up on only after 500 ms of nothing.
+    let slow = |Json(body): Json<Value>| async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let inputs = body["inputs"].as_array().unwrap();
+        Json(json!(inputs
+            .iter()
+            .map(|text| vector_of(text.as_str().unwrap()))
+            .collect::<Vec<_>>()))
+    };
+    let url = serve(Router::new().route("/embed", post(slow))).await;
+    let endpoint = EmbeddingProvider::Http {
+        url: url.clone(),
+        api: HttpApi::Tei,
+    };
+    let provider = Arc::new(Http::new(&url, HttpApi::Tei, "bge", None).unwrap());
+    let embedder = Embedder::new(provider, embedding_with(endpoint, "bge", 1));
+    let embedder = embedder.answering_within(ms(500), ms(500));
+    let began = std::time::Instant::now();
+    let written = embedder.documents(&numbered(16 * 32)).await;
+    assert_eq!(written.map(|vectors| vectors.len()), Ok(16 * 32));
+    assert!(began.elapsed() > ms(2_000), "{:?}", began.elapsed());
+
+    // An endpoint that is busy says so, and is asked again after half a
+    // second and then a second more. Saying so is not the model at work:
+    // only a vector is. A write given three seconds of nothing waits out
+    // the tries and is made; one given 1.2 seconds is given up on while
+    // the endpoint is still only saying it is busy.
+    let busy = |stalled: Duration| async move {
+        let busy = Seen::refusing(2, 503);
+        let url = tei(busy.clone()).await;
+        let endpoint = EmbeddingProvider::Http {
+            url: url.clone(),
+            api: HttpApi::Tei,
+        };
+        let provider = Arc::new(Http::new(&url, HttpApi::Tei, "bge", None).unwrap());
+        let embedder = Embedder::new(provider, embedding_with(endpoint, "bge", 1));
+        let embedder = embedder.answering_within(ms(1_200), stalled);
+        let began = std::time::Instant::now();
+        let written = embedder.documents(&numbered(3)).await;
+        (written.map(|vectors| vectors.len()), began.elapsed())
+    };
+    let (written, took) = busy(ms(3_000)).await;
+    assert_eq!(written, Ok(3));
+    assert!(took > ms(1_400), "{took:?}");
+    let (written, took) = busy(ms(1_200)).await;
+    let stopped = "the model has made nothing for anyone in 1.2s";
+    assert!(
+        matches!(&written, Err(EmbedError::Failed { reason, .. }) if reason == stopped),
+        "{written:?}"
+    );
+    assert!((ms(1_200)..ms(1_500)).contains(&took), "{took:?}");
+
+    // Titan at 20 ms a text, and twenty-four writes of forty texts at
+    // once, for the eight calls there are for documents: the last is
+    // done after some two and a half seconds. None is given up on,
+    // though each would be after two seconds of Titan answering no one.
+    let seen = Arc::new(Seen::default());
+    let titan = EmbeddingProvider::Bedrock {
+        region: "eu-west-2".into(),
+    };
+    let embedder = Embedder::new(
+        Arc::new(bedrock(seen.clone()).await),
+        embedding_with(titan, TITAN, 2),
+    );
+    let embedder = Arc::new(embedder.answering_within(ms(2_000), ms(2_000)));
+    let writes = (0..24).map(|_| {
+        let embedder = embedder.clone();
+        async move { embedder.documents(&numbered(40)).await }
+    });
+    let began = std::time::Instant::now();
+    let written = futures::future::join_all(writes).await;
+    for (nth, written) in written.into_iter().enumerate() {
+        assert_eq!(written.map(|vectors| vectors.len()), Ok(40), "write {nth}");
+    }
+    assert!(began.elapsed() > ms(2_000), "{:?}", began.elapsed());
+    assert_eq!(seen.bodies().len(), 24 * 40, "and none was asked for twice");
+}
+
+/// A region that cannot be reached is found so by the first texts sent
+/// to it, each after every try a call is given. The texts behind them
+/// are not each sent to find out the same, holding the region's calls
+/// while they do: they fail at once, until it is time to try again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_that_is_not_reached_is_not_tried_again_for_every_text_that_waits() {
+    // Something that takes every connection and closes it unanswered,
+    // counting them.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let reached = Arc::new(AtomicUsize::new(0));
+    let counted = reached.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    let retries = Bedrock::retries().with_initial_backoff(Duration::from_millis(5));
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("eu-west-2"))
+        .credentials_provider(Credentials::new(
+            "AKIDEXAMPLE",
+            "secret",
+            None,
+            None,
+            "test",
+        ))
+        .endpoint_url(url)
+        .retry_config(retries)
+        .timeout_config(Bedrock::timeouts())
+        .build();
+    let client = aws_sdk_bedrockruntime::Client::from_conf(config);
+    let provider = Arc::new(Bedrock::with_client(client, TITAN, 256).unwrap());
+    let tries = || reached.load(Ordering::SeqCst);
+
+    // Forty writes of one text each, at once: eight calls are for
+    // documents, so eight texts are sent, five tries each at the most,
+    // and the other thirty-two are not.
+    let writes = (0..40).map(|nth| {
+        let provider = provider.clone();
+        async move {
+            provider
+                .embed(vec![format!("text {nth}")], Purpose::Document)
+                .await
+        }
+    });
+    let written = futures::future::join_all(writes).await;
+    assert!(written
+        .iter()
+        .all(|written| matches!(written, Err(EmbedError::Failed { .. }))));
+    let unsent = written
+        .iter()
+        .filter(|written| format!("{written:?}").contains("was not reached a moment ago"))
+        .count();
+    assert!(unsent >= 32, "{written:?}");
+    assert!((8..=8 * 5).contains(&tries()), "{} tries", tries());
+    // Nor is a search, meanwhile.
+    let tried = tries();
+    assert!(provider.embed(numbered(1), Purpose::Query).await.is_err());
+    assert_eq!(tries(), tried);
+
+    // When that has stood as long as it stands, the region is tried
+    // again.
+    tokio::time::sleep(vellev_embed::UNREACHED_FOR + Duration::from_millis(200)).await;
+    assert!(provider.embed(numbered(1), Purpose::Query).await.is_err());
+    assert!(tries() > tried, "{} tries", tries());
+}
+
+/// A region that answers no call is never found out by the calls, which
+/// a caller gives up on long before their tries are spent: it is found
+/// out by the caller's giving up, once a call has gone unanswered for
+/// one try's time. What is meant for it meanwhile fails at once. A
+/// caller that gives up sooner than that says nothing of the region.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_a_caller_gives_up_on_unanswered_is_marked_as_not_reached() {
+    let ms = Duration::from_millis;
+    let titan = || EmbeddingProvider::Bedrock {
+        region: "eu-west-2".into(),
+    };
+    let giving_up = |provider: Bedrock| {
+        let embedder = Embedder::new(Arc::new(provider), embedding_with(titan(), TITAN, 2));
+        Arc::new(embedder.answering_within(ms(300), ms(300)))
+    };
+    // Titan takes a second over a text that says it is slow, and the
+    // search is given 300 ms: given up on after 200 ms unanswered marks
+    // the region, and the next search is refused at once, unsent.
+    let seen = Arc::new(Seen::default());
+    let provider = bedrock(seen.clone()).await.unreached_after(ms(200));
+    let embedder = giving_up(provider);
+    let began = std::time::Instant::now();
+    assert!(embedder.query("slow one").await.is_err());
+    let refused = embedder.query("quick").await.unwrap_err().to_string();
+    assert!(
+        refused.contains("was not reached a moment ago") && refused.contains("given up on after"),
+        "{refused}"
+    );
+    assert!(began.elapsed() < ms(600), "{:?}", began.elapsed());
+    // Titan was called once: the quick one was never sent.
+    assert_eq!(seen.most_in_flight.load(Ordering::SeqCst), 1);
+
+    // Given up on sooner than a call may go unanswered, nothing is said
+    // of the region, and the next search goes out.
+    let seen = Arc::new(Seen::default());
+    let provider = bedrock(seen.clone()).await.unreached_after(ms(2_000));
+    let embedder = giving_up(provider);
+    assert!(embedder.query("slow two").await.is_err());
+    assert_eq!(embedder.query("quick").await, Ok(Some(vec![5.0, 1.0])));
 }

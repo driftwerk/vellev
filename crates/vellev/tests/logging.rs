@@ -55,12 +55,12 @@ async fn logged_once() {
     let _listening =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(logged.clone()));
 
-    let url = keyed_embedding_server("sk-right").await;
+    let url = keyed_embedding_server("sk-right-0123456789abcdef").await;
     // The fault stands for as long as one can, which is longer than any
     // run of this could take: how often it is said does not turn on how
     // fast this machine is.
     let embedding = vellev_embed::Settings {
-        keys: [(url.clone(), "sk-wrong".to_string())].into(),
+        keys: [(url.clone(), "sk-wrong-0123456789abcdef".to_string())].into(),
         fault_stands: std::time::Duration::from_secs(60 * 60),
         ..Default::default()
     };
