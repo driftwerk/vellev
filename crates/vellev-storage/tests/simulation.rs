@@ -157,11 +157,23 @@ struct SimBlobs {
     deleting: AtomicUsize,
     /// When each file landed, and how many had before it.
     landed: Mutex<BTreeMap<String, (DateTime<Utc>, usize)>>,
-    /// Whether the next upload of a file that is not a head is to wait:
-    /// `waiting` is told when it does, and it goes on once `resumed` is.
-    pausing: AtomicBool,
+    /// Whether a checkpoint's next uploads are to wait, and where:
+    /// `waiting` is told when they do, and they go on once `resumed` is.
+    pausing: Mutex<Option<Pause>>,
     waiting: tokio::sync::Notify,
     resumed: tokio::sync::Notify,
+}
+
+/// Where the store keeps a checkpoint's uploads waiting. A checkpoint
+/// uploads a segment's vectors, then its index if it has one, then the
+/// segment itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pause {
+    /// Before the first of them.
+    Before,
+    /// Once the segment, the last of them, has landed or failed. Any of
+    /// them that fails ends the checkpoint there, and nothing waits.
+    After,
 }
 
 /// A delete the store has been asked for. Dropped unanswered, it is held:
@@ -282,12 +294,20 @@ impl Blobs for SimBlobs {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         tokio::task::yield_now().await;
         let head = key.ends_with(".log") || key.ends_with(".manifest");
-        if !head && self.pausing.swap(false, Ordering::SeqCst) {
+        let pause = {
+            let mut pausing = self.pausing.lock().unwrap();
+            match *pausing {
+                Some(Pause::Before) if !head => pausing.take(),
+                Some(Pause::After) if key.contains("/segment/") => pausing.take(),
+                _ => None,
+            }
+        };
+        if pause == Some(Pause::Before) {
             self.waiting.notify_one();
             self.resumed.notified().await;
         }
         let fault = self.faults.lock().unwrap().puts.pop_front();
-        match fault {
+        let put = match fault {
             None => self.land(key, bytes).await,
             Some(PutFault::Refuse) => Err(lost()),
             Some(PutFault::LandThenFail) => self.land(key, bytes).await.and(Err(lost())),
@@ -295,7 +315,12 @@ impl Blobs for SimBlobs {
                 self.delayed.lock().unwrap().push((key.to_string(), bytes));
                 Err(lost())
             }
+        };
+        if pause == Some(Pause::After) {
+            self.waiting.notify_one();
+            self.resumed.notified().await;
         }
+        put
     }
 
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
@@ -324,11 +349,13 @@ impl Blobs for SimBlobs {
             file.modified = landed[&file.key].0;
         }
         // By name, as a store lists, but for the files of one kind at one
-        // position, whose names differ only in what their writer drew at
-        // random: those as they landed, so that which of two a delete to
-        // be held falls on is not left to the draw.
+        // position and of one generation, whose names differ only in what
+        // their writer drew at random: those as they landed, so that which
+        // of two a delete to be held falls on is not left to the draw. A
+        // name is the position, a dash and the generation, twenty digits
+        // each, and then the writer and what it drew.
         listed.sort_by_key(|file| {
-            let named = file.key.rfind('/').map_or(0, |at| at + 1) + 20;
+            let named = file.key.rfind('/').map_or(0, |at| at + 1) + 41;
             let stem = file.key[..named.min(file.key.len())].to_string();
             (stem, landed[&file.key].1)
         });
@@ -744,11 +771,15 @@ enum Action {
     },
     /// A write as [`Action::Write`] makes, made while a checkpoint is
     /// being written: the checkpoint is built of the rows there were when
-    /// it began, and replays the write over them.
+    /// it began, and replays the write over them. With `first`, the
+    /// checkpoint's uploads are made, or one fails, before the write: an
+    /// upload to fail fails the checkpoint's, and the write's log lands
+    /// after its segment. Without, the write is made before any of them.
     WriteBesideFlush {
         who: Who,
         rows: u64,
         delete: Option<usize>,
+        first: bool,
     },
     /// A request of its own that changes one of the rows there are, or
     /// deletes it, only if it is at the version a reader last gave for
@@ -827,7 +858,12 @@ fn action() -> impl Strategy<Value = Action> {
         2 => any::<bool>().prop_map(|first| Some((Beside::Clean, first))),
     ];
     let write = |(who, rows, delete)| Action::Write { who, rows, delete };
-    let beside_flush = |(who, rows, delete)| Action::WriteBesideFlush { who, rows, delete };
+    let beside_flush = |(who, rows, delete, first)| Action::WriteBesideFlush {
+        who,
+        rows,
+        delete,
+        first,
+    };
     let conditional = |(who, pick, kind, fresh)| Action::Conditional {
         who,
         pick,
@@ -837,7 +873,7 @@ fn action() -> impl Strategy<Value = Action> {
     let restore = |(who, back, beside)| Action::Restore { who, back, beside };
     prop_oneof![
         14 => (who(), 1..4u64, delete()).prop_map(write),
-        4 => (who(), 1..4u64, delete()).prop_map(beside_flush),
+        4 => (who(), 1..4u64, delete(), any::<bool>()).prop_map(beside_flush),
         6 => (who(), any::<usize>(), 0..4u8, prop_oneof![3 => Just(true), 1 => Just(false)])
             .prop_map(conditional),
         2 => (who(), any::<usize>()).prop_map(|(who, pick)| Action::Again { who, pick }),
@@ -1209,7 +1245,7 @@ impl World {
             deleted: AtomicUsize::new(0),
             deleting: AtomicUsize::new(0),
             landed: Mutex::default(),
-            pausing: AtomicBool::new(false),
+            pausing: Mutex::default(),
             waiting: tokio::sync::Notify::new(),
             resumed: tokio::sync::Notify::new(),
         });
@@ -1312,7 +1348,7 @@ impl World {
         who: Who,
         rows: u64,
         delete: Option<usize>,
-        beside_a_flush: bool,
+        beside_a_flush: Option<Pause>,
     ) -> Violation {
         let rows: Vec<u64> = (self.next_row..self.next_row + rows).collect();
         self.next_row += rows.len() as u64;
@@ -1424,7 +1460,7 @@ impl World {
             recorded: false,
             refused: false,
         });
-        self.attempt(who, self.attempts.len() - 1, false).await
+        self.attempt(who, self.attempts.len() - 1, None).await
     }
 
     /// Make the request of attempt `made`, for the first time or again. One
@@ -1435,11 +1471,11 @@ impl World {
     ///
     /// `beside_a_flush`, the request is made while a checkpoint is being
     /// written: after the checkpoint has taken the rows it is of, and
-    /// before it has uploaded the segment of them, if it has any to
-    /// write. The checkpoint's commit is recorded like any other, so there
-    /// the request's was if a log was: a write's head is a log and a
-    /// checkpoint's is not.
-    async fn attempt(&mut self, who: Who, made: usize, beside_a_flush: bool) -> Violation {
+    /// before it uploads the segment of them, if it has any to write, or
+    /// once it has uploaded it or failed to. The checkpoint's
+    /// commit is recorded like any other, so there the request's was if a
+    /// log was: a write's head is a log and a checkpoint's is not.
+    async fn attempt(&mut self, who: Who, made: usize, beside_a_flush: Option<Pause>) -> Violation {
         let seat = self.seat(who).await;
         let before = self.coordinator.recorded.load(Ordering::SeqCst);
         let logged = self.coordinator.logs();
@@ -1447,22 +1483,22 @@ impl World {
         let writer = &self.seats[seat].writer;
         let writing = writer.commit_batches(vec![batch], Embedded::new());
         let (outcome, committed) = match beside_a_flush {
-            true => {
+            Some(pause) => {
                 // The checkpoint is written as far as its first upload,
-                // which the store keeps waiting; the request is made, and
-                // the checkpoint then goes on. Were the two left to take
+                // where the store keeps it waiting; the request is made,
+                // and the checkpoint then goes on. Were the two left to take
                 // turns as they came, which came first would lie with the
                 // threads that build a segment and encode a commit, and no
                 // history would be made the same way twice.
                 let flushing = writer.flush();
                 tokio::pin!(flushing);
-                self.blobs.pausing.store(true, Ordering::SeqCst);
+                *self.blobs.pausing.lock().unwrap() = Some(pause);
                 let paused = tokio::select! {
                     biased;
                     _ = &mut flushing => false,
                     () = self.blobs.waiting.notified() => true,
                 };
-                self.blobs.pausing.store(false, Ordering::SeqCst);
+                *self.blobs.pausing.lock().unwrap() = None;
                 let outcome = writing.await;
                 if paused {
                     self.blobs.resumed.notify_one();
@@ -1470,7 +1506,7 @@ impl World {
                 }
                 (outcome, self.coordinator.logs() > logged)
             }
-            false => {
+            None => {
                 let outcome = writing.await;
                 let recorded = self.coordinator.recorded.load(Ordering::SeqCst);
                 (outcome, recorded > before)
@@ -1927,10 +1963,19 @@ impl World {
     async fn act(&mut self, action: Action) -> Violation {
         match action {
             Action::Write { who, rows, delete } => {
-                return self.write(who, rows, delete, false).await
+                return self.write(who, rows, delete, None).await
             }
-            Action::WriteBesideFlush { who, rows, delete } => {
-                return self.write(who, rows, delete, true).await
+            Action::WriteBesideFlush {
+                who,
+                rows,
+                delete,
+                first,
+            } => {
+                let pause = match first {
+                    true => Pause::After,
+                    false => Pause::Before,
+                };
+                return self.write(who, rows, delete, Some(pause)).await;
             }
             Action::Conditional {
                 who,
@@ -1942,7 +1987,7 @@ impl World {
                 if self.attempts.is_empty() {
                     return Ok(());
                 }
-                return self.attempt(who, pick % self.attempts.len(), false).await;
+                return self.attempt(who, pick % self.attempts.len(), None).await;
             }
             Action::Flush { who } => {
                 let seat = self.seat(who).await;
@@ -2316,7 +2361,10 @@ impl World {
         // A delete is given up unanswered only with one the store answered
         // as lost: whoever asked for them together stops at the first to
         // fail. So none is since this was last seen unless one was lost
-        // since, which only a delete that was to be held is.
+        // since, which only a delete that was to be held is. Asked of the
+        // step, not of the history: a delete held once does not excuse a
+        // clean that gives deletes up later for want of patience, as one
+        // given a bound too short to wait out the store would.
         let unanswered = self.blobs.unanswered.load(Ordering::SeqCst);
         let refused = self.blobs.refused.load(Ordering::SeqCst);
         let (had_unanswered, had_refused) = self.given_up;
@@ -2386,8 +2434,45 @@ fn run(actions: Vec<Action>, canary: Option<Canary>) -> Result<Made, String> {
         .block_on(simulate(actions, canary))
 }
 
+/// Two writes each with a checkpoint after it, a merge of the two
+/// segments, a clean with no grace that has a delete held, and a restore
+/// back past what it deleted: the restore is then to a state whose
+/// segments are yet to be taken by the deletes held, the one a history is
+/// spared (see `World::taken_by_a_late_delete`). A restore lists the
+/// segments of the state it goes to again, and nothing else of it, so
+/// only these are what a held delete takes from under it. Left to come
+/// about by chance, this comes about in a few histories in a thousand.
+fn restore_past_a_held_delete() -> impl Strategy<Value = Vec<Action>> {
+    let who = Who::Current;
+    (1..4u64, 0..3usize, 1..4usize).prop_map(move |(rows, after, back)| {
+        let write = Action::Write {
+            who,
+            rows,
+            delete: None,
+        };
+        vec![
+            write.clone(),
+            Action::Flush { who },
+            write,
+            Action::Flush { who },
+            Action::Merge { who },
+            Action::DelayDelete(after),
+            Action::Clean { who, aged: false },
+            Action::Restore {
+                who,
+                back,
+                beside: None,
+            },
+        ]
+    })
+}
+
 fn histories() -> impl Strategy<Value = Vec<Action>> {
-    prop::collection::vec(action(), 1..80)
+    let part = prop_oneof![
+        150 => action().prop_map(|action| vec![action]),
+        1 => restore_past_a_held_delete(),
+    ];
+    prop::collection::vec(part, 1..80).prop_map(|parts| parts.concat())
 }
 
 proptest! {
