@@ -250,7 +250,11 @@ impl SimBlobs {
             let mut landed = self.landed.lock().unwrap();
             let before = landed.len();
             let now = self.clock.now();
-            landed.entry(key.to_string()).or_insert((now, before));
+            // A file put again is dated anew, as a store dates it, and
+            // keeps its place among those of its name.
+            (landed.entry(key.to_string()))
+                .and_modify(|(at, _)| *at = now)
+                .or_insert((now, before));
         }
         self.landings.lock().unwrap().push(key.to_string());
         (self.shadow.lock().unwrap())
@@ -965,6 +969,8 @@ fn action() -> impl Strategy<Value = Action> {
         2 => Just(Action::ForgetHistory),
         3 => Just(Action::Follow),
         1 => any::<usize>().prop_map(Action::FollowStale),
+        1 => Just(Action::Snapshot),
+        2 => any::<usize>().prop_map(Action::RestoreFrom),
     ]
 }
 
@@ -3214,6 +3220,9 @@ fn the_checker_passes_a_healthy_system_and_catches_a_broken_one() {
     assert!(made.reloaded > 100 && made.under > 0, "{made:?}");
     // And checkpoints written while commits go on, which replay them.
     assert!(made.replaying > 100, "{made:?}");
+    // And restores from a snapshot, some of them while a delete given up
+    // is yet to land, which DW-680's rule needs no margin of time for.
+    assert!(made.sourced > 50 && made.sourced_under > 10, "{made:?}");
     // Cleans alone and beside a restore, and no restore that had no clean
     // beside it: most have nothing in their way, and few are known to fail.
     assert!(
@@ -3527,19 +3536,47 @@ fn a_restore_from_a_snapshot_of_files_cleaned_away_is_made_whole() {
     }
 }
 
-/// A restore as DW-680 makes it puts nothing at an old position, so the
-/// next clean, of the same history in which a restore made as a node made
-/// it before DW-680 fails it (see the test of DW-681 below), succeeds.
+/// A snapshot of a checkpoint, two checkpoints after it merged into one,
+/// and, once they are old, every file the snapshot holds cleaned away by a
+/// clean with grace, as a node cleans; then another such clean, which,
+/// with nothing put back, succeeds. Every clean keeps the same grace, so
+/// that each takes its base from where the last left it.
+async fn cleaned_long_ago() -> World {
+    let who = Who::Current;
+    let mut world = after(vec![
+        written(),
+        Action::Flush { who },
+        Action::Snapshot,
+        written(),
+        Action::Flush { who },
+        Action::Merge { who },
+        Action::Wait(GRACE + 1),
+        Action::Clean { who, aged: true },
+    ])
+    .await;
+    assert!(world.made.aged > 0, "{:?}", world.made);
+    let mut gone = 0;
+    for key in world.snapshots[0].files.keys() {
+        gone += usize::from(world.blobs.clean.get(key).await.is_err());
+    }
+    assert!(gone > 0, "the clean deleted what the snapshot holds");
+    world.pass(1);
+    let writer = &world.seats[world.seats.len() - 1].writer;
+    writer.clean(STEP * GRACE as u32).await.unwrap();
+    world
+}
+
+/// A restore as DW-680 makes it puts nothing at an old position, nor at
+/// the position of the partition's latest checkpoint: its copies are named
+/// at the checkpoint it commits. So the clean after it, which succeeds
+/// before it, succeeds after it too.
 #[test]
-fn a_clean_after_a_restore_from_a_snapshot_of_files_cleaned_away_succeeds() {
+fn a_clean_after_a_restore_from_a_snapshot_cleaned_away_long_ago_succeeds() {
     paused().block_on(async {
-        let mut history = restored_from_a_snapshot_cleaned_away(None, Action::RestoreFrom);
-        history.truncate(history.len() - 2);
-        let mut world = after(history).await;
-        assert!(world.made.cleaned > 0, "{:?}", world.made);
+        let mut world = cleaned_long_ago().await;
         world.step(Action::RestoreFrom(0)).await.unwrap();
+        world.verify().await.unwrap();
         assert_eq!(world.made.restores, 1);
-        assert!(world.blobs.rewritten.lock().unwrap().is_empty());
         world.pass(1);
         let writer = &world.seats[world.seats.len() - 1].writer;
         writer.clean(STEP * GRACE as u32).await.unwrap();
@@ -3758,21 +3795,19 @@ fn a_restore_from_a_snapshot_that_fails_changes_nothing() {
 }
 
 /// Known to fail, and DW-681 by the way in a restore from a backup makes
-/// today: it puts back, under their keys and young, files a clean deleted
-/// from below the checkpoint it deleted up to. The next clean finds them
-/// young, walks past that checkpoint to the one before it, which the first
-/// deleted, and fails, as every clean does until they are old. DW-680's
-/// restore puts nothing at an old position, and takes this way in away;
-/// this test keeps the record of it, made the way a node made it.
+/// today: of the history above, in which the clean succeeds with nothing
+/// put back, the restore a node made before DW-680 puts back, under their
+/// keys and young, files a clean deleted from below the checkpoint it
+/// deleted up to. The next clean finds them young, walks past that
+/// checkpoint to the one before it, which the first deleted, and fails, as
+/// every clean does until they are old. DW-680's restore puts nothing at
+/// an old position, and takes this way in away (see the test above); this
+/// test keeps the record of it, made the way a node made it.
 #[test]
 #[should_panic(expected = "DW-681: a clean failed with nothing in its way")]
 fn a_clean_fails_after_a_restore_puts_back_what_the_clean_before_it_deleted() {
     paused().block_on(async {
-        let today = Action::RestoreFromAsToday;
-        let mut history = restored_from_a_snapshot_cleaned_away(None, today);
-        history.truncate(history.len() - 2);
-        let mut world = after(history).await;
-        assert!(world.made.cleaned > 0, "{:?}", world.made);
+        let mut world = cleaned_long_ago().await;
         world.step(Action::RestoreFromAsToday(0)).await.unwrap();
         assert_eq!(world.made.restores, 1);
         assert!(!world.blobs.rewritten.lock().unwrap().is_empty());

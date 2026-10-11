@@ -624,6 +624,11 @@ impl State {
         self.position
     }
 
+    /// The checkpoint the state rests on, if any.
+    pub(crate) fn checkpoint(&self) -> Option<&str> {
+        self.checkpoint.as_deref()
+    }
+
     /// About how many bytes the state takes in memory: its rows, what
     /// indexes them, and whatever vectors are held in memory rather than
     /// read in place from local files. Rough, and cheap to ask: each part

@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use vellev_storage::backups::Held;
 use vellev_storage::coordinator::{Clock, Restore};
 use vellev_storage::{Merging, Partition, RestoreFrom};
@@ -318,8 +318,8 @@ fn nothing(cluster: Cluster) -> futures::future::BoxFuture<'static, Cluster> {
 /// each kind of head a source may be at: what the partition reads after
 /// is what the source held; the checkpoint is past where the partition and
 /// the source were; it rests on the partition's own checkpoint; it names
-/// the source's segments by keys drawn for the restore, at the position
-/// the partition was at, in the source's order, and after them one more
+/// the source's segments by keys drawn for the restore, at its own
+/// position, in the source's order, and after them one more
 /// of what the source's logs left in memory; it replays nothing; and the
 /// restore put no key the source's files had.
 #[tokio::test]
@@ -399,7 +399,7 @@ async fn a_restore_from_a_source_commits_a_checkpoint_of_its_own_copies_alone() 
                 "{what}: {}",
                 copy.key
             );
-            assert_eq!(position_of(&copy.key), before.log_position.0, "{what}");
+            assert_eq!(position_of(&copy.key), r.0, "{what}: at the checkpoint's");
             assert_eq!(
                 (copy.rows, copy.tombstones),
                 (of.rows, of.tombstones),
@@ -411,7 +411,7 @@ async fn a_restore_from_a_source_commits_a_checkpoint_of_its_own_copies_alone() 
         if flushed {
             let last = manifest.segments.last().unwrap();
             assert!(!last.key.ends_with("-restored.segment"), "{what}");
-            assert_eq!(position_of(&last.key), before.log_position.0, "{what}");
+            assert_eq!(position_of(&last.key), r.0, "{what}");
         }
         let now = keys(&target).await;
         let put: BTreeSet<&String> = now.difference(&had).collect();
@@ -504,6 +504,49 @@ async fn a_restore_into_a_partition_that_never_committed_rests_on_nothing() {
     assert_eq!(target.open().await.partition().read(ns), frozen.rows);
 }
 
+/// A store that notes every file read from it whole.
+#[derive(Debug)]
+struct Counted {
+    inner: Arc<dyn Blobs>,
+    gets: Mutex<Vec<String>>,
+}
+
+impl Counted {
+    fn fetched(&self) -> Vec<String> {
+        std::mem::take(&mut self.gets.lock().unwrap())
+    }
+}
+
+#[async_trait]
+impl Blobs for Counted {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.gets.lock().unwrap().push(key.to_string());
+        self.inner.get(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        self.inner.parts(key)
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
 /// Segments, and their vectors, come from the source a part at a time and
 /// go into the store so; and the vectors are loaded from the store's copy
 /// on local disk, which it fetches a part at a time, never read whole.
@@ -512,10 +555,9 @@ async fn a_restore_from_a_source_never_reads_a_segment_or_its_vectors_whole_from
     let source = a_merge(Cluster::new().await).await;
     let frozen = frozen(&source).await;
     let dir = tempfile::tempdir().unwrap();
-    let counted = Arc::new(Observed {
+    let counted = Arc::new(Counted {
         inner: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new()))),
         gets: Mutex::default(),
-        fail_puts: AtomicBool::new(false),
     });
     let target = Cluster {
         blobs: Arc::new(CachedBlobs::new(counted.clone(), dir.path())),
@@ -932,5 +974,89 @@ async fn a_flush_and_a_clean_wait_for_a_restore_from_a_source_and_take_none_of_i
     restoring.await.unwrap().unwrap();
     flushing.await.unwrap().unwrap();
     cleaning.await.unwrap().unwrap();
+    assert_eq!(target.open().await.partition().read(ns), frozen.rows);
+}
+
+/// A restore from a source made ready on a partition another writer then
+/// takes and commits to, at the very position the restore's copies are
+/// named at: the restore commits nothing, its copies lie under keys
+/// nothing names, and the other writer's partition, cleaned up with no
+/// grace, reads as it committed it.
+#[tokio::test]
+async fn a_restore_from_a_source_overtaken_at_its_own_position_leaves_only_litter() {
+    let source = a_merge(Cluster::new().await).await;
+    let frozen = frozen(&source).await;
+    let target = Cluster::new().await;
+    let writer = lived_in(&target).await;
+    let before = target.committed().await;
+    let r = before.log_position.max(frozen.at).next().unwrap();
+    let had = keys(&target).await;
+    let ready = writer
+        .restore_from(
+            frozen.as_source(),
+            frozen.head.as_ref(),
+            restore(&target, frozen.at),
+            None,
+            &Holding(true),
+        )
+        .await
+        .unwrap();
+    let copies: Vec<String> = keys(&target).await.difference(&had).cloned().collect();
+    assert!(
+        copies.iter().all(|key| position_of(key) == r.0),
+        "{copies:?}"
+    );
+
+    let other = target.writer().await;
+    let mut position = before.log_position;
+    while position < r {
+        let n = 70 + position.0 as i64;
+        other.commit(vec![upsert("notes", 7, n)]).await.unwrap();
+        position = target.committed().await.log_position;
+    }
+    assert_eq!(position, r, "the other writer is where the copies are");
+    assert!(ready.commit().await.is_err());
+    assert_eq!(target.committed().await.log_position, r);
+
+    other.clean(Duration::ZERO).await.unwrap();
+    let read = target.open().await.partition().read(ns);
+    assert_eq!(read, other.partition().read(ns));
+    assert_eq!(read[6], Some(70 + r.0 as i64 - 1));
+    let head = target.committed().await.manifest.unwrap().0;
+    assert!(!copies.contains(&head));
+}
+
+/// A restore from a source whose commit is made and never answered, and
+/// which its caller then stops waiting for, keeps its copies: the head it
+/// committed names them.
+#[tokio::test]
+async fn a_restore_from_a_source_whose_commit_is_made_unanswered_keeps_its_copies() {
+    let source = a_merge(Cluster::new().await).await;
+    let frozen = frozen(&source).await;
+    let target = Cluster::new().await;
+    let unreliable = Arc::new(Unreliable::over(target.coordinator.clone()));
+    let writer = target.writer_on(unreliable.clone()).await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 9, 9)])
+        .await
+        .unwrap();
+    let before = target.committed().await;
+    let ready = writer
+        .restore_from(
+            frozen.as_source(),
+            frozen.head.as_ref(),
+            restore(&target, frozen.at),
+            None,
+            &Holding(true),
+        )
+        .await
+        .unwrap();
+    unreliable.hang_after_commit.store(true, Ordering::SeqCst);
+
+    let waited = tokio::time::timeout(Duration::from_secs(2), ready.commit()).await;
+
+    assert!(waited.is_err(), "never answered");
+    assert!(target.committed().await.log_position > before.log_position);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(target.open().await.partition().read(ns), frozen.rows);
 }
