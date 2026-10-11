@@ -265,7 +265,9 @@ pub struct Copied {
     /// or deleted by one. The same on every run while they stay so.
     pub kept: u64,
     /// Objects gone from Weaviate that stay in the collection because
-    /// they were not as the import had stored them: another writer's.
+    /// they were not as the import had stored them: another writer's,
+    /// or said to be. What was there when the collection was taken up
+    /// and nobody has said whose it is counts as `unknown` instead.
     /// The ledger keeps their entries while the collection holds them,
     /// so the same on every run until it no longer does.
     pub left: u64,
@@ -383,6 +385,7 @@ impl Copied {
             Settled::Replaced => self.changed += 1,
             Settled::Deleted => self.deleted += 1,
             Settled::Left => self.left += 1,
+            Settled::Unknown => self.unknown += 1,
             Settled::Refused(why) => {
                 self.refused.insert(id.to_string(), why);
             }
@@ -405,6 +408,9 @@ enum Settled {
     /// Gone from Weaviate and not the import's to delete: left, its
     /// entry kept and saying so.
     Left,
+    /// So, and of what the collection held when it was taken up, about
+    /// which nobody has said whose it is: unknown.
+    Unknown,
     /// The collection already held what Weaviate does, or neither held it.
     Same,
     Refused(String),
@@ -1843,7 +1849,16 @@ impl<'a> Copying<'a> {
         };
         match stored {
             Some(stored) if mine => (self.delete(stored, entry), Settled::Deleted),
-            Some(_) => (self.renoting(self.left(entry), Some(entry)), Settled::Left),
+            // What was there at the taking up and is left stays unknown,
+            // as every later run counts it.
+            Some(_) => {
+                let left = self.left(entry);
+                let settled = match Self::unsettled(&left) {
+                    true => Settled::Unknown,
+                    false => Settled::Left,
+                };
+                (self.renoting(left, Some(entry)), settled)
+            }
             None => (self.dropping(entry, self.left(entry)), Settled::Same),
         }
     }
@@ -2644,14 +2659,12 @@ impl<'a> Copying<'a> {
     /// a run that copies would: nothing, for one that says Weaviate
     /// lists its object; and for one that says Weaviate does not, or
     /// that it is of what the collection held at the taking up, whether
-    /// the collection holds its object still, and, of some, whether
-    /// Weaviate has come to hold the id.
+    /// Weaviate has come to hold the id, and what the collection holds
+    /// under it.
     fn asks(entry: &Entry) -> Asks {
-        let pre = entry.mark == Mark::Unknown || (entry.mark == Mark::Withheld && entry.gone);
-        match () {
-            _ if pre => Asks::Weaviate,
-            _ if entry.gone => Asks::Collection,
-            _ => Asks::Nothing,
+        match entry.gone || entry.mark == Mark::Unknown {
+            true => Asks::Weaviate,
+            false => Asks::Nothing,
         }
     }
 
@@ -2666,11 +2679,7 @@ impl<'a> Copying<'a> {
     ) -> Result<u64> {
         let (class, vectors) = (&self.plan.class, self.plan.vectors());
         let (mut stale, mut unlisted) = (0, Vec::new());
-        for (entry, asks) in asked.drain(..) {
-            if asks != Asks::Weaviate {
-                unlisted.push(entry);
-                continue;
-            }
+        for (entry, _) in asked.drain(..) {
             let object = self
                 .weaviate
                 .object(class, entry.id, vectors, Asked::Any)
@@ -2701,19 +2710,33 @@ impl<'a> Copying<'a> {
         Ok(stale)
     }
 
+    /// What a run that copies, told nothing, makes of an id Weaviate
+    /// lists again though its entry says Weaviate does not hold it, or
+    /// is of what the collection held at the taking up: the run's own
+    /// settling decides. A comparison counts the id so.
+    fn relisting(&self, entry: &Entry, item: &Item, stored: Option<&Stored>) -> Settled {
+        let nothing = Options {
+            sole_writer: false,
+            delete_unknown: false,
+            other_writers: false,
+            ..self.options.clone()
+        };
+        let told = Copying::new(self.weaviate, self.tenant, self.plan, &nothing);
+        told.settling(item, Some(entry), stored, false).1
+    }
+
     /// Count one entry of the ledger as a run that copies, told
     /// nothing, would count it, by what was `seen` of its id. Answers
     /// whether that run would forget it: it then accounts for nothing.
     fn tally(&self, entry: &Entry, seen: Seen<'_>, copied: &mut Copied) -> bool {
         match seen {
             Seen::Unasked => {
-                copied.kept += u64::from(entry.mark == Mark::Theirs);
+                copied.kept += u64::from(matches!(entry.mark, Mark::Foreign | Mark::Theirs));
                 copied.withheld += u64::from(entry.mark == Mark::Withheld);
                 false
             }
             Seen::Listed(item, stored) => {
-                let held = stored.and_then(|stored| self.plan.hash(stored));
-                copied.withheld += u64::from(held.as_deref() != Some(item.hash.as_str()));
+                copied.mark(&self.relisting(entry, item, stored));
                 false
             }
             Seen::Unlisted { holds } => {
@@ -2727,6 +2750,14 @@ impl<'a> Copying<'a> {
     /// How a comparison counts the item Weaviate lists, by the ledger's
     /// entry for it and what the collection holds there.
     fn compared(&self, entry: Option<&Entry>, item: &Item, stored: Option<&Stored>) -> Found {
+        if let Some(entry) = entry.filter(|entry| Self::asks(entry) == Asks::Weaviate) {
+            return match self.relisting(entry, item, stored) {
+                Settled::Same => Found::Same,
+                Settled::Foreign => Found::Kept,
+                Settled::Withheld => Found::Withheld,
+                _ => Found::Different,
+            };
+        }
         let hash = stored.and_then(|stored| self.plan.hash(stored));
         match (entry.map(|entry| entry.mark), stored) {
             _ if hash.as_ref() == Some(&item.hash) => Found::Same,
@@ -2849,8 +2880,6 @@ impl<'a> Copying<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Asks {
     Nothing,
-    /// Whether the collection holds its object still.
-    Collection,
     /// What Weaviate holds under its id, and then what the collection
     /// does, or whether it holds anything.
     Weaviate,
@@ -4208,6 +4237,12 @@ mod tests {
     const LATER: usize = 9_456;
     const LIVENESS: usize = 454;
     const DIRECT: usize = 528;
+    /// How many cells the table of a run, a comparison after it and the
+    /// next run has, how many of them it lists again, and how many it
+    /// passes over as a run does not read them.
+    const AGREE: usize = 1_616;
+    const RELISTED: usize = 444;
+    const BLIND: usize = 40;
 
     fn only(changes: &[&str]) -> Vec<String> {
         let changes = changes.iter();
@@ -4500,7 +4535,10 @@ mod tests {
         // What was there when the collection was taken up is not the
         // import's to delete: not for being withheld, not for being as
         // it was found, not for nothing else being said to have written.
-        let unknown = fixture.entry("fox", 1, Mark::Unknown);
+        // It is left, and counted as unknown, as every later run counts
+        // it.
+        let unknown = |kind: &str| (only(&[kind]), Settled::Unknown);
+        let noted = fixture.entry("fox", 1, Mark::Unknown);
         let withheld = Entry {
             found: Some(fixture.item("fox", 0).hash),
             ..fixture.entry("hen", 1, Mark::Withheld)
@@ -4511,12 +4549,12 @@ mod tests {
         });
         for fixture in [&fixture, &sole] {
             assert_eq!(
-                removing(fixture, &unknown, Some(&fox)),
-                left("upsert ENTRY unknown gone")
+                removing(fixture, &noted, Some(&fox)),
+                unknown("upsert ENTRY unknown gone")
             );
             assert_eq!(
                 removing(fixture, &withheld, Some(&fox)),
-                left("upsert ENTRY withheld found gone")
+                unknown("upsert ENTRY withheld found gone")
             );
         }
         // Asked in so many words, it is deleted if it is still as it was
@@ -4526,22 +4564,22 @@ mod tests {
             delete_unknown: true,
             ..options()
         });
-        assert_eq!(removing(&sweeping, &unknown, Some(&fox)), deleted);
+        assert_eq!(removing(&sweeping, &noted, Some(&fox)), deleted);
         assert_eq!(removing(&sweeping, &withheld, Some(&fox)), deleted);
         assert_eq!(
-            removing(&sweeping, &unknown, Some(&owl)),
-            left("upsert ENTRY unknown gone")
+            removing(&sweeping, &noted, Some(&owl)),
+            unknown("upsert ENTRY unknown gone")
         );
         assert_eq!(
             removing(&sweeping, &withheld, Some(&owl)),
-            left("upsert ENTRY withheld found gone")
+            unknown("upsert ENTRY withheld found gone")
         );
         // What was withheld because the collection lacked it was never
         // found as anything.
         let lacked = fixture.entry("hen", 1, Mark::Withheld);
         assert_eq!(
             removing(&sweeping, &lacked, Some(&fox)),
-            left("upsert ENTRY withheld gone")
+            unknown("upsert ENTRY withheld gone")
         );
         // And what another writer is known to have written never is.
         assert_eq!(
@@ -4554,7 +4592,7 @@ mod tests {
             other_writers: true,
             ..options()
         });
-        for entry in [&unknown, &withheld, &lacked] {
+        for entry in [&noted, &withheld, &lacked] {
             for stored in [&fox, &owl] {
                 assert_eq!(
                     removing(&others, entry, Some(stored)),
@@ -5120,18 +5158,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn nothing_is_deleted_or_written_over_but_what_the_rule_allows_whatever_the_ledger_and_the_run_say(
-    ) {
-        let plain = Fixture::new(options());
+    /// Every entry there can be, and nothing: of each mark, found or not
+    /// to be gone from Weaviate, of what Weaviate holds now, "hen", or of
+    /// something it held before; what was withheld, with and without what
+    /// the collection was found to hold; and what was said to be another
+    /// writer's. And everything the collection can hold under the id:
+    /// nothing; what an entry hashes as; what it was found to hold; what
+    /// Weaviate holds now; something else; and something the collection
+    /// as this run knows it could not have been sent, which hashes as
+    /// nothing does.
+    fn states(plain: &Fixture) -> (Vec<Option<Entry>>, Vec<Option<Stored>>) {
         let hash = |title: &str| plain.item(title, 0).hash;
-        // What Weaviate holds under the id, where it holds anything.
-        let hen = hash("hen");
-        // Every entry there can be: of each mark, found or not to be gone
-        // from Weaviate, of what Weaviate holds now or of something it
-        // held before; what was withheld, with and without what the
-        // collection was found to hold; and what was said to be another
-        // writer's.
         let mut entries: Vec<Option<Entry>> = vec![None];
         for gone in [false, true] {
             for (title, updated) in [("fox", 1), ("hen", 2)] {
@@ -5152,17 +5189,248 @@ mod tests {
             let theirs = plain.entry("fox", 1, Mark::Stored).theirs(Some(1), gone);
             entries.push(Some(theirs));
         }
-        // Everything the collection can hold under the id: nothing; what
-        // an entry hashes as; what it was found to hold; what Weaviate
-        // holds now; something else; and something the collection as this
-        // run knows it could not have been sent, which hashes as nothing
-        // does.
         let mut held: Vec<Option<Stored>> =
             [None, Some("fox"), Some("owl"), Some("hen"), Some("emu")]
                 .map(|title| title.map(|title| plain.stored(title)))
                 .into();
         held.push(Some(plain.unhashable()));
         assert_eq!(plain.plan.hash(&plain.unhashable()), None);
+        (entries, held)
+    }
+
+    /// What a run counts of one id, as [`done`] has it: with what
+    /// Weaviate holds under it, "hen", or with Weaviate holding nothing.
+    /// One that may pass the id over does, where its entry says all
+    /// there is to say, and then reads and changes nothing; one that
+    /// may not reads it, as a run does an object Weaviate changed since
+    /// the last.
+    fn ran(
+        fixture: &Fixture,
+        entry: Option<&Entry>,
+        weaviate: bool,
+        stored: Option<&Stored>,
+        (adopted, passing): (bool, bool),
+    ) -> (Vec<Change>, Copied) {
+        let copying = fixture.copying();
+        let hen = fixture.item("hen", 2);
+        let mut copied = Copied::default();
+        if passing && weaviate && copying.passed(entry, hen.updated, &mut copied) {
+            return (Vec::new(), copied);
+        }
+        let changes = match (entry, weaviate) {
+            (_, true) => {
+                let (changes, settled) = copying.settling(&hen, entry, stored, adopted);
+                copied.mark(&settled);
+                copied.count(hen.id, settled);
+                changes
+            }
+            (None, false) => Vec::new(),
+            (Some(entry), false) => match copying.unlisted(entry.clone()) {
+                Unlisted::Ask(entry) => {
+                    let (changes, settled) = copying.removing(&entry, stored);
+                    copied.count(entry.id, settled);
+                    changes
+                }
+                Unlisted::Keep { entry, now } => {
+                    copying.keeping(&entry, now.as_ref(), stored.is_some(), &mut copied)
+                }
+            },
+        };
+        (changes, copied)
+    }
+
+    /// What a comparison counts of one id: with the ledger's `entry`
+    /// for it, what Weaviate holds, "hen", or nothing, and what the
+    /// collection holds there.
+    fn compared_as(
+        fixture: &Fixture,
+        entry: Option<&Entry>,
+        weaviate: bool,
+        stored: Option<&Stored>,
+    ) -> Copied {
+        let copying = fixture.copying();
+        let hen = fixture.item("hen", 2);
+        let mut copied = Copied::default();
+        let mut verified = Verified {
+            looked: 1,
+            ..Verified::default()
+        };
+        let stale = entry.is_some_and(|entry| {
+            let seen = match Copying::asks(entry) {
+                Asks::Nothing => Seen::Unasked,
+                Asks::Weaviate if weaviate => Seen::Listed(&hen, stored),
+                _ => Seen::Unlisted {
+                    holds: stored.is_some(),
+                },
+            };
+            copying.tally(entry, seen, &mut copied)
+        });
+        match (weaviate, entry) {
+            (true, entry) => *verified.found(copying.compared(entry, &hen, stored)) += 1,
+            (false, Some(entry)) => verified.gone += u64::from(Copying::unseen(entry)),
+            (false, None) => {}
+        }
+        Copied {
+            imported: u64::from(entry.is_some() && !stale) - copied.unvouched(),
+            weaviate: u64::from(weaviate),
+            vellev: u64::from(stored.is_some()),
+            verified: Some(verified),
+            ..copied
+        }
+    }
+
+    /// What the collection holds under the id once `changes` are made,
+    /// having held `stored`.
+    fn holding(fixture: &Fixture, stored: Option<&Stored>, changes: &[Change]) -> Option<Stored> {
+        let mut held = stored.cloned();
+        for kind in kinds(changes) {
+            match kind.as_str() {
+                "delete Memory" => held = None,
+                "insert Memory" | "upsert Memory" => held = Some(fixture.stored("hen")),
+                _ => {}
+            }
+        }
+        held
+    }
+
+    /// What of a run's count bears on how it ends, and the end, as one
+    /// class of one id would have it.
+    fn said(copied: &Copied) -> ([u64; 7], Outcome, Outcome) {
+        let report = Report {
+            classes: [("Memory".to_string(), copied.clone())].into(),
+            ended: Vec::new(),
+        };
+        let counted = [
+            copied.withheld,
+            copied.unknown,
+            copied.left,
+            copied.barred,
+            copied.kept,
+            copied.imported,
+            copied.weaviate,
+        ];
+        (counted, report.outcome(false), report.outcome(true))
+    }
+
+    /// A run's count of one id, with how much of the ledger and the
+    /// collection it leaves.
+    fn after_run(
+        copied: Copied,
+        entry: Option<&Entry>,
+        stored: Option<&Stored>,
+        weaviate: bool,
+    ) -> Copied {
+        Copied {
+            imported: u64::from(entry.is_some()) - copied.unvouched(),
+            weaviate: u64::from(weaviate),
+            vellev: u64::from(stored.is_some()),
+            ..copied
+        }
+    }
+
+    #[test]
+    fn a_run_a_comparison_straight_after_it_and_the_next_run_say_the_same_of_every_ledger() {
+        // Told the same, and with nothing changed in between, a run that
+        // read the id, a comparison straight after it and the next run
+        // report the same counts and end the same; and the next run
+        // writes nothing. A run that did not read the id, Weaviate not
+        // having changed it, cannot know what the collection holds of
+        // it: a comparison reads, which is what it is for. And
+        // where Weaviate then lists again an id the ledger says it does
+        // not, a comparison says what the next run, told nothing, says
+        // of it, unless that run has something to write to the
+        // collection, when the comparison does not say all is settled.
+        let plain = Fixture::new(options());
+        let (entries, held) = states(&plain);
+        let fixtures = TOLD.map(told);
+        let (mut cells, mut relisted, mut blind) = (0, 0, 0);
+        for entry in &entries {
+            for weaviate in [true, false] {
+                for stored in &held {
+                    for (said_, fixture) in TOLD.iter().zip(&fixtures) {
+                        for adopted in [false, true] {
+                            if adopted && !weaviate {
+                                continue;
+                            }
+                            let (entry, stored) = (entry.as_ref(), stored.as_ref());
+                            // A run takes the ledger's word for what the
+                            // import stored and Weaviate has not changed,
+                            // and does not read the collection: one that
+                            // somebody changed since is for a comparison
+                            // to find, and the two say different things.
+                            let hen = plain.item("hen", 2);
+                            let trusted = entry.is_some_and(|entry| {
+                                entry.mark == Mark::Stored && !Copying::reads(&hen, Some(entry))
+                            });
+                            let held = stored.and_then(|stored| plain.plan.hash(stored));
+                            if weaviate && trusted && held.as_deref() != Some(hen.hash.as_str()) {
+                                blind += 1;
+                                continue;
+                            }
+                            cells += 1;
+                            let (changes, first) =
+                                ran(fixture, entry, weaviate, stored, (adopted, false));
+                            let now = noted(entry, &changes);
+                            let holds = holding(&plain, stored, &changes);
+                            let (now, holds) = (now.as_ref(), holds.as_ref());
+                            let first = after_run(first, now, holds, weaviate);
+                            let cell = format!(
+                                "{entry:?}, Weaviate holds it: {weaviate}, vellev holds {:?}, \
+                                 told {said_:?}, taken up: {adopted}; then {now:?}, vellev holds {:?}",
+                                stored.map(|stored| &stored.properties["title"]),
+                                holds.map(|stored| &stored.properties["title"]),
+                            );
+                            let (again, next) = ran(fixture, now, weaviate, holds, (false, true));
+                            assert_eq!(kinds(&again), Vec::<String>::new(), "{cell}");
+                            let next = after_run(next, now, holds, weaviate);
+                            let compared = compared_as(fixture, now, weaviate, holds);
+                            assert_eq!(said(&compared), said(&first), "compared: {cell}");
+                            assert_eq!(said(&next), said(&first), "next run: {cell}");
+
+                            // Weaviate lists again an id the ledger has an
+                            // entry for, saying it does not.
+                            let Some(now) = now.filter(|_| !weaviate) else {
+                                continue;
+                            };
+                            relisted += 1;
+                            let nothing = &fixtures[0];
+                            let (writes, relisting) =
+                                ran(nothing, Some(now), true, holds, (false, true));
+                            let after = noted(Some(now), &writes);
+                            let relisting = after_run(relisting, after.as_ref(), holds, true);
+                            let compared = compared_as(nothing, Some(now), true, holds);
+                            let to_collection = ["delete Memory", "insert Memory", "upsert Memory"];
+                            let collection = kinds(&writes)
+                                .iter()
+                                .any(|kind| to_collection.contains(&kind.as_str()));
+                            match collection {
+                                true => assert_ne!(
+                                    said(&compared).1,
+                                    Outcome::Settled,
+                                    "relisted, writing: {cell}"
+                                ),
+                                false => assert_eq!(
+                                    said(&compared),
+                                    said(&relisting),
+                                    "relisted: {cell}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!((cells, relisted, blind), (AGREE, RELISTED, BLIND));
+    }
+
+    #[test]
+    fn nothing_is_deleted_or_written_over_but_what_the_rule_allows_whatever_the_ledger_and_the_run_say(
+    ) {
+        let plain = Fixture::new(options());
+        let hash = |title: &str| plain.item(title, 0).hash;
+        // What Weaviate holds under the id, where it holds anything.
+        let hen = hash("hen");
+        let (entries, held) = states(&plain);
         let is = |stored: Option<&Stored>, hash: &str| {
             stored.and_then(|stored| plain.plan.hash(stored)).as_deref() == Some(hash)
         };

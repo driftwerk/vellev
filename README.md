@@ -232,7 +232,7 @@ unknown, and the run fails until one of them is said:
   before there was a ledger, and is deleted as anything is, within the
   bound, after Weaviate has twice said it does not hold it, and only if
   it is still exactly as it was noted; one changed since is left,
-  counted as `left`, and stays unknown until it is said to be another
+  counted as `unknown`, and stays so until it is said to be another
   writer's. Objects stored in the collection after the taking up are
   never among them, whatever a run is told. An object another writer
   stored during the taking up is among them, which is why the flag is
