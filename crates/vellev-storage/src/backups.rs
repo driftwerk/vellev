@@ -808,6 +808,10 @@ impl Blobs for Source {
         Err(self.only_read(key))
     }
 
+    async fn put_parts(&self, key: &str, _parts: BoxStream<'_, Result<Bytes>>) -> Result<()> {
+        Err(self.only_read(key))
+    }
+
     /// The whole file at once, held in memory: for the small ones, a
     /// manifest or a log. A segment, its vectors or its index is read by
     /// [`Self::parts`].

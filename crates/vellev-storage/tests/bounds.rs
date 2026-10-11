@@ -67,6 +67,8 @@ struct Faulty {
     whole: AtomicUsize,
     in_parts: AtomicUsize,
     parts: Arc<AtomicUsize>,
+    /// How many bytes each part sent had.
+    sizes: Arc<Mutex<Vec<usize>>>,
     /// Every part after the first fails.
     failing_parts: Arc<AtomicBool>,
     aborts: Arc<AtomicUsize>,
@@ -91,6 +93,7 @@ impl Faulty {
             whole: AtomicUsize::new(0),
             in_parts: AtomicUsize::new(0),
             parts: Arc::default(),
+            sizes: Arc::default(),
             failing_parts: Arc::default(),
             aborts: Arc::default(),
             silent_abort: Arc::default(),
@@ -123,6 +126,7 @@ struct Parts {
     inner: Box<dyn MultipartUpload>,
     stalls: bool,
     parts: Arc<AtomicUsize>,
+    sizes: Arc<Mutex<Vec<usize>>>,
     failing: Arc<AtomicBool>,
     aborts: Arc<AtomicUsize>,
     silent_abort: Arc<AtomicBool>,
@@ -132,6 +136,7 @@ struct Parts {
 impl MultipartUpload for Parts {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let first = self.parts.fetch_add(1, Ordering::SeqCst) == 0;
+        self.sizes.lock().unwrap().push(data.content_length());
         match (first, self.stalls, self.failing.load(Ordering::SeqCst)) {
             (false, true, _) => Box::pin(std::future::pending()),
             (false, _, true) => Box::pin(async {
@@ -179,6 +184,7 @@ impl ObjectStore for Faulty {
             inner: self.inner.put_multipart_opts(location, opts).await?,
             stalls: self.stalls(location),
             parts: self.parts.clone(),
+            sizes: self.sizes.clone(),
             failing: self.failing_parts.clone(),
             aborts: self.aborts.clone(),
             silent_abort: self.silent_abort.clone(),
@@ -506,6 +512,781 @@ async fn a_file_too_large_for_the_most_parts_is_refused_before_any_of_it_goes_up
     assert_eq!(store.in_parts.load(Ordering::SeqCst), 0);
     let fits = Bytes::from(vec![0u8; 10_000]);
     blobs.put("fits", fits).await.unwrap();
+}
+
+/// A file's parts as they come from wherever it is read, of these sizes.
+type Coming = futures::stream::BoxStream<'static, vellev_storage::Result<Bytes>>;
+
+fn coming(file: &Bytes, sizes: &[usize]) -> Coming {
+    let mut rest = file.clone();
+    let parts: Vec<_> = sizes.iter().map(|size| Ok(rest.split_to(*size))).collect();
+    assert!(rest.is_empty(), "the sizes are the whole file's");
+    futures::stream::iter(parts).boxed()
+}
+
+/// Parts handed over as the test sends them, and no end to them until it
+/// lets go of the sender.
+fn sent_by_hand() -> (
+    futures::channel::mpsc::UnboundedSender<vellev_storage::Result<Bytes>>,
+    Coming,
+) {
+    let (send, parts) = futures::channel::mpsc::unbounded();
+    (send, parts.boxed())
+}
+
+/// A store with nothing of its own beyond what every store must have.
+#[derive(Debug)]
+struct Bare(Arc<dyn Blobs>);
+
+#[async_trait]
+impl Blobs for Bare {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.0.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.0.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.0.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.0.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_store_that_does_not_say_how_refuses_a_file_put_a_part_at_a_time() {
+    let inner: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let bare = Bare(inner.clone());
+    // Nothing is taken from the parts, to be held whole and put as one.
+    let untouched = futures::stream::poll_fn(|_| -> std::task::Poll<Option<_>> {
+        panic!("a part was taken");
+    });
+    let refused = bare.put_parts("file", untouched.boxed()).await;
+    assert!(
+        matches!(&refused, Err(StorageError::Blob { key, .. }) if key == "file"),
+        "{refused:?}"
+    );
+    assert_eq!(inner.list("").await.unwrap(), []);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_put_a_part_at_a_time_goes_up_as_it_comes_and_is_not_there_until_all_has() {
+    let store = Arc::new(Faulty::new("nothing"));
+    let blobs = Arc::new(ObjectBlobs::new(store.clone()).transferring(SMALL_PARTS));
+    let large = Bytes::from((0..100u8).collect::<Vec<_>>());
+    let (send, parts) = sent_by_hand();
+    let putting = tokio::spawn({
+        let blobs = blobs.clone();
+        async move { blobs.put_parts("large", parts).await }
+    });
+    // Three parts' worth has come and the rest has not: two go up, and
+    // the third is kept until it is known whether it is the last.
+    send.unbounded_send(Ok(large.slice(..48))).unwrap();
+    settled(|| async { store.parts.load(Ordering::SeqCst) == 2 }).await;
+    assert_eq!(store.in_parts.load(Ordering::SeqCst), 1);
+    assert_eq!(store.whole.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        blobs.get("large").await,
+        Err(StorageError::Missing { .. })
+    ));
+
+    send.unbounded_send(Ok(large.slice(48..))).unwrap();
+    drop(send);
+    putting.await.unwrap().unwrap();
+    assert_eq!(blobs.get("large").await.unwrap(), large);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parts_that_come_larger_or_smaller_than_a_part_go_up_a_part_at_a_time() {
+    let store = Arc::new(Faulty::new("nothing"));
+    let blobs = ObjectBlobs::new(store.clone()).transferring(SMALL_PARTS);
+    let large = Bytes::from((0..100u8).collect::<Vec<_>>());
+    let parts = coming(&large, &[40, 3, 5, 20, 0, 32]);
+    blobs.put_parts("large", parts).await.unwrap();
+    // Every part but the last is of a part's size exactly, as a store
+    // asks of an upload in parts, and none is larger.
+    assert_eq!(
+        *store.sizes.lock().unwrap(),
+        [16, 16, 16, 16, 16, 16, 4],
+        "as the same file put whole goes up"
+    );
+    assert_eq!(store.in_parts.load(Ordering::SeqCst), 1);
+    assert_eq!(store.whole.load(Ordering::SeqCst), 0);
+    assert_eq!(blobs.get("large").await.unwrap(), large);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_of_a_part_or_less_put_a_part_at_a_time_goes_up_whole() {
+    let store = Arc::new(Faulty::new("nothing"));
+    let blobs = ObjectBlobs::new(store.clone()).transferring(SMALL_PARTS);
+    let small = Bytes::from_static(b"sixteen bytes ok");
+    let cases: [(&str, Bytes, &[usize]); 5] = [
+        ("one", small.clone(), &[16]),
+        ("several", small.clone(), &[5, 0, 5, 6]),
+        ("short", small.slice(..7), &[7]),
+        ("empty", Bytes::new(), &[0]),
+        ("none", Bytes::new(), &[]),
+    ];
+    for (n, (key, file, sizes)) in cases.into_iter().enumerate() {
+        blobs.put_parts(key, coming(&file, sizes)).await.unwrap();
+        assert_eq!(store.whole.load(Ordering::SeqCst), n + 1, "{key}");
+        assert_eq!(blobs.get(key).await.unwrap(), file, "{key}");
+    }
+    assert_eq!(store.in_parts.load(Ordering::SeqCst), 0);
+
+    // A byte more, and it goes up in parts, as when put whole.
+    let more = Bytes::from_static(b"seventeen bytes .");
+    blobs.put_parts("more", coming(&more, &[17])).await.unwrap();
+    assert_eq!(store.in_parts.load(Ordering::SeqCst), 1);
+    assert_eq!(*store.sizes.lock().unwrap(), [16, 1]);
+    assert_eq!(blobs.get("more").await.unwrap(), more);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_whose_parts_fail_to_come_is_not_put_and_what_went_up_of_it_is_aborted() {
+    let lost = || {
+        Err(StorageError::Missing {
+            key: "where it came from".into(),
+        })
+    };
+    // Whether it fails before anything went up or after, and whether or
+    // not what had come by then would have made a file of its own.
+    for (came, started) in [(0, 0), (10, 0), (16, 0), (40, 1)] {
+        let store = Arc::new(Faulty::new("nothing"));
+        let blobs = ObjectBlobs::new(store.clone()).transferring(SMALL_PARTS);
+        let parts = futures::stream::iter([Ok(Bytes::from(vec![7u8; came])), lost()]);
+        let failed = blobs.put_parts("large", parts.boxed()).await.unwrap_err();
+        assert!(
+            matches!(&failed, StorageError::Missing { key } if key == "where it came from"),
+            "{came}: {failed}"
+        );
+        assert_eq!(store.whole.load(Ordering::SeqCst), 0, "{came}");
+        assert_eq!(store.in_parts.load(Ordering::SeqCst), started, "{came}");
+        assert_eq!(store.aborts.load(Ordering::SeqCst), started, "{came}");
+        assert!(
+            matches!(blobs.get("large").await, Err(StorageError::Missing { .. })),
+            "{came}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_put_a_part_at_a_time_and_dropped_unfinished_is_aborted() {
+    let store = Arc::new(Faulty::new("nothing"));
+    let blobs = Arc::new(ObjectBlobs::new(store.clone()).transferring(SMALL_PARTS));
+    let (send, parts) = sent_by_hand();
+    let putting = tokio::spawn({
+        let blobs = blobs.clone();
+        async move { blobs.put_parts("large", parts).await }
+    });
+    send.unbounded_send(Ok(Bytes::from(vec![7u8; 48]))).unwrap();
+    settled(|| async { store.parts.load(Ordering::SeqCst) == 2 }).await;
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+    settled(|| async { store.aborts.load(Ordering::SeqCst) == 1 }).await;
+    assert!(matches!(
+        blobs.get("large").await,
+        Err(StorageError::Missing { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_file_put_a_part_at_a_time_through_a_cache_goes_to_the_store_and_leaves_no_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Faulty::new("nothing"));
+    let inner = Arc::new(ObjectBlobs::new(store.clone()).transferring(SMALL_PARTS));
+    let cached = CachedBlobs::new(inner.clone(), dir.path());
+    let (key, frame) = entry(1);
+    let sizes = [20, frame.len() - 20];
+    cached
+        .put_parts(&key, coming(&frame, &sizes))
+        .await
+        .unwrap();
+    // In parts, as its store puts it, not gathered and put as one.
+    assert_eq!(store.in_parts.load(Ordering::SeqCst), 1);
+    assert_eq!(inner.get(&key).await.unwrap(), frame);
+    assert!(cached.local(&key).await.unwrap().is_none());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_file_cached_and_put_again_a_part_at_a_time_is_read_as_it_was_last_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let cached = CachedBlobs::new(inner.clone(), dir.path());
+    let ((key, old), (_, new)) = (entry(1), entry(2));
+    assert_ne!(old, new);
+    cached.put(&key, old.clone()).await.unwrap();
+    assert!(cached.local(&key).await.unwrap().is_some());
+
+    let sizes = [20, new.len() - 20];
+    cached.put_parts(&key, coming(&new, &sizes)).await.unwrap();
+    assert_eq!(cached.get(&key).await.unwrap(), new, "as after a put");
+    // As a put of it whole is read.
+    cached.put(&key, old.clone()).await.unwrap();
+    assert_eq!(cached.get(&key).await.unwrap(), old);
+}
+
+/// A store whose every put in parts lands, and is then answered as
+/// failed, or, if it `stops`, never answered.
+#[derive(Debug)]
+struct LandingUnsaid(Arc<dyn Blobs>, bool);
+
+#[async_trait]
+impl Blobs for LandingUnsaid {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.0.put(key, bytes).await
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.0.put_parts(key, parts).await?;
+        if self.1 {
+            std::future::pending::<()>().await;
+        }
+        Err(vellev_storage::blobs::unanswered(key, Duration::ZERO))
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.0.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.0.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.0.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_file_put_again_a_part_at_a_time_that_landed_unsaid_is_read_as_it_landed() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let landing = Arc::new(LandingUnsaid(inner, false));
+    let cached = Arc::new(CachedBlobs::new(landing, dir.path()));
+    let ((key, old), (_, new)) = (entry(1), entry(2));
+    cached.put(&key, old.clone()).await.unwrap();
+    let (send, parts) = sent_by_hand();
+    let putting = tokio::spawn({
+        let (cached, key) = (cached.clone(), key.clone());
+        async move { cached.put_parts(&key, parts).await }
+    });
+    dropped(&cached, &key, "before it goes up").await;
+    // Read while it goes up, and so kept a copy of.
+    assert_eq!(cached.get(&key).await.unwrap(), old);
+    send.unbounded_send(Ok(new.clone())).unwrap();
+    drop(send);
+    let put = putting.await.unwrap();
+    assert!(put.is_err(), "{put:?}");
+    // The store may have it, and does: the copy of what was there is gone.
+    assert_eq!(cached.get(&key).await.unwrap(), new);
+}
+
+#[tokio::test]
+async fn a_file_put_a_part_at_a_time_whose_old_copy_cannot_be_dropped_after_is_answered_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let cached = CachedBlobs::new(inner.clone(), dir.path());
+    let (key, new) = entry(2);
+    // Once it has begun to go up, something no file removal removes
+    // comes where its copy would be.
+    let in_the_way = dir.path().join(&key).join("in the way");
+    let parts = futures::stream::once({
+        let new = new.clone();
+        async move {
+            std::fs::create_dir_all(in_the_way).unwrap();
+            Ok(new)
+        }
+    });
+    let failed = cached.put_parts(&key, parts.boxed()).await;
+    assert!(
+        matches!(&failed, Err(StorageError::Blob { key: of, .. }) if *of == key),
+        "{failed:?}"
+    );
+    assert_eq!(inner.get(&key).await.unwrap(), new, "though it went up");
+}
+
+/// Wait until `cached` keeps no copy of the file under `key`, failing
+/// the test if it still does after half a minute.
+async fn dropped(cached: &CachedBlobs, key: &str, when: &str) {
+    let started = std::time::Instant::now();
+    while cached.local(key).await.unwrap().is_some() {
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(30),
+            "the old copy is kept {when}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_file_read_while_it_goes_up_again_a_part_at_a_time_is_read_as_last_put_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let cached = Arc::new(CachedBlobs::new(inner.clone(), dir.path()));
+    let ((key, old), (_, new)) = (entry(1), entry(2));
+    cached.put(&key, old.clone()).await.unwrap();
+    let (send, parts) = sent_by_hand();
+    let putting = tokio::spawn({
+        let (cached, key) = (cached.clone(), key.clone());
+        async move { cached.put_parts(&key, parts).await }
+    });
+    dropped(&cached, &key, "before it goes up").await;
+    // A read while it goes up is of the file that is there, and keeps a
+    // copy of it, rightly then.
+    assert_eq!(cached.get(&key).await.unwrap(), old);
+    assert!(cached.local(&key).await.unwrap().is_some());
+
+    send.unbounded_send(Ok(new.clone())).unwrap();
+    drop(send);
+    putting.await.unwrap().unwrap();
+    assert_eq!(cached.get(&key).await.unwrap(), new, "as after a put");
+}
+
+#[tokio::test]
+async fn a_file_that_landed_a_part_at_a_time_and_was_given_up_on_is_read_as_it_landed() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let landing = Arc::new(LandingUnsaid(inner.clone(), true));
+    let cached = Arc::new(CachedBlobs::new(landing, dir.path()));
+    let ((key, old), (_, new)) = (entry(1), entry(2));
+    cached.put(&key, old.clone()).await.unwrap();
+    let (send, parts) = sent_by_hand();
+    let putting = tokio::spawn({
+        let (cached, key) = (cached.clone(), key.clone());
+        async move { cached.put_parts(&key, parts).await }
+    });
+    dropped(&cached, &key, "before it goes up").await;
+    assert_eq!(cached.get(&key).await.unwrap(), old);
+    send.unbounded_send(Ok(new.clone())).unwrap();
+    drop(send);
+    while inner.get(&key).await.unwrap() != new {
+        tokio::task::yield_now().await;
+    }
+    // Landed, never answered, and the caller stops waiting.
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+    dropped(&cached, &key, "once the put is dropped").await;
+    assert_eq!(cached.get(&key).await.unwrap(), new);
+}
+
+#[tokio::test]
+async fn a_file_whose_old_copy_cannot_be_dropped_is_not_put_a_part_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(SMALL_PARTS));
+    let cached = CachedBlobs::new(inner.clone(), dir.path());
+    let (key, new) = entry(2);
+    // Where its copy would be, something no file removal removes.
+    std::fs::create_dir_all(dir.path().join(&key).join("in the way")).unwrap();
+    let sizes = [20, new.len() - 20];
+    let refused = cached.put_parts(&key, coming(&new, &sizes)).await;
+    assert!(
+        matches!(&refused, Err(StorageError::Blob { key: of, .. }) if *of == key),
+        "{refused:?}"
+    );
+    assert!(matches!(
+        inner.get(&key).await,
+        Err(StorageError::Missing { .. })
+    ));
+}
+
+/// A request an object store is asked to make for an upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Request {
+    /// A whole file of so many bytes.
+    Put(usize),
+    Start,
+    /// A part of so many bytes.
+    Part(usize),
+    Complete,
+    Abort,
+}
+
+/// An object store that notes every request for an upload in the order
+/// asked, and leaves the one `stops` names unanswered, or fails the one
+/// `fails` names: `put`, `start`, `part:` and its number, `complete`. One
+/// that `discards` keeps nothing it is sent.
+#[derive(Debug, Default)]
+struct Recorded {
+    inner: InMemory,
+    asked: Arc<Mutex<Vec<Request>>>,
+    told: Told,
+    discards: bool,
+}
+
+/// Which request is never answered, and which fails, by name.
+#[derive(Debug, Default, Clone)]
+struct Told {
+    stops: Option<String>,
+    fails: Option<String>,
+}
+
+impl Told {
+    /// Whether `named` is never answered or fails, as told: `None` if
+    /// it is answered as by any store.
+    fn of(&self, named: &str) -> Option<bool> {
+        match (&self.stops, &self.fails) {
+            (Some(stops), _) if stops == named => Some(true),
+            (_, Some(fails)) if fails == named => Some(false),
+            _ => None,
+        }
+    }
+}
+
+impl Recorded {
+    fn asked(&self) -> Vec<Request> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+impl std::fmt::Display for Recorded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Recorded({})", self.inner)
+    }
+}
+
+fn told_to_fail() -> object_store::Error {
+    object_store::Error::Generic {
+        store: "recorded",
+        source: "told to fail".into(),
+    }
+}
+
+/// As the store is told, `named` stops or fails, or else does `then`.
+async fn as_told<T>(
+    told: Option<bool>,
+    then: impl std::future::Future<Output = object_store::Result<T>>,
+) -> object_store::Result<T> {
+    match told {
+        Some(true) => std::future::pending().await,
+        Some(false) => Err(told_to_fail()),
+        None => then.await,
+    }
+}
+
+#[derive(Debug)]
+struct RecordedParts {
+    inner: Option<Box<dyn MultipartUpload>>,
+    asked: Arc<Mutex<Vec<Request>>>,
+    told: Told,
+    sent: usize,
+}
+
+#[async_trait]
+impl MultipartUpload for RecordedParts {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let told = self.told.of(&format!("part:{}", self.sent));
+        self.sent += 1;
+        let asked = Request::Part(data.content_length());
+        self.asked.lock().unwrap().push(asked);
+        let sent = match self.inner.as_mut() {
+            Some(inner) => inner.put_part(data),
+            None => Box::pin(async { Ok(()) }),
+        };
+        Box::pin(as_told(told, sent))
+    }
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        self.asked.lock().unwrap().push(Request::Complete);
+        let done = PutResult {
+            e_tag: None,
+            version: None,
+        };
+        let told = self.told.of("complete");
+        as_told(told, async {
+            match self.inner.as_mut() {
+                Some(inner) => inner.complete().await,
+                None => Ok(done),
+            }
+        })
+        .await
+    }
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.asked.lock().unwrap().push(Request::Abort);
+        match self.inner.as_mut() {
+            Some(inner) => inner.abort().await,
+            None => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectStore for Recorded {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let asked = Request::Put(payload.content_length());
+        self.asked.lock().unwrap().push(asked);
+        let done = PutResult {
+            e_tag: None,
+            version: None,
+        };
+        as_told(self.told.of("put"), async {
+            match self.discards {
+                true => Ok(done),
+                false => self.inner.put_opts(location, payload, opts).await,
+            }
+        })
+        .await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.asked.lock().unwrap().push(Request::Start);
+        let started = as_told(self.told.of("start"), async {
+            match self.discards {
+                true => Ok(None),
+                false => self
+                    .inner
+                    .put_multipart_opts(location, opts)
+                    .await
+                    .map(Some),
+            }
+        });
+        Ok(Box::new(RecordedParts {
+            inner: started.await?,
+            asked: self.asked.clone(),
+            told: self.told.clone(),
+            sent: 0,
+        }))
+    }
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_request_of_a_file_put_a_part_at_a_time_is_given_up_within_its_bound_and_aborted() {
+    use Request::*;
+    // Forty bytes in parts of sixteen, or ten whole; each request that
+    // may be made, whether it is never answered or fails, and the
+    // requests that are then made, in order. What a failure makes is
+    // aborted, once, before the put answers; and nothing that has
+    // answered is aborted.
+    let cases: [(&str, usize, &[Request]); 7] = [
+        ("start", 40, &[Start]),
+        ("part:0", 40, &[Start, Part(16), Abort]),
+        ("part:1", 40, &[Start, Part(16), Part(16), Abort]),
+        ("part:2", 40, &[Start, Part(16), Part(16), Part(8), Abort]),
+        (
+            "complete",
+            40,
+            &[Start, Part(16), Part(16), Part(8), Complete, Abort],
+        ),
+        ("put", 10, &[Put(10)]),
+        (
+            "nothing",
+            40,
+            &[Start, Part(16), Part(16), Part(8), Complete],
+        ),
+    ];
+    for (named, bytes, asked) in cases {
+        for stops in [true, false] {
+            let told = Told {
+                stops: stops.then(|| named.to_string()),
+                fails: (!stops).then(|| named.to_string()),
+            };
+            let store = Arc::new(Recorded {
+                told,
+                ..Recorded::default()
+            });
+            let blobs = ObjectBlobs::new(store.clone()).transferring(SMALL_PARTS);
+            let file = Bytes::from(vec![7u8; bytes]);
+            let sizes = [bytes / 2, bytes - bytes / 2];
+            let started = Instant::now();
+            let put = ended(blobs.put_parts("file", coming(&file, &sizes))).await;
+            let case = format!("{named}, stops {stops}");
+            assert_eq!(store.asked(), asked, "{case}");
+            match named {
+                "nothing" => {
+                    put.unwrap();
+                    assert_eq!(blobs.get("file").await.unwrap(), file, "{case}");
+                }
+                _ => {
+                    assert!(
+                        matches!(&put, Err(StorageError::Blob { .. })),
+                        "{case}: {put:?}"
+                    );
+                    let took = if stops {
+                        SMALL_PARTS.request_within
+                    } else {
+                        Duration::ZERO
+                    };
+                    assert_eq!(started.elapsed(), took, "{case}");
+                    let left = blobs.get("file").await;
+                    assert!(matches!(left, Err(StorageError::Missing { .. })), "{case}");
+                }
+            }
+            // Nor is anything asked once it has answered.
+            tokio::time::sleep(SMALL_PARTS.request_within * 10).await;
+            assert_eq!(store.asked(), asked, "{case}, afterwards");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_part_beyond_the_most_parts_goes_up_however_the_file_comes() {
+    let one_byte = Transfers {
+        part_bytes: 1,
+        ..SMALL_PARTS
+    };
+    // At a part a byte: as many bytes as there may be parts fit, and a
+    // byte or two more do not, whether they come at once or a byte at a
+    // time. How large it is cannot be known before it has come: it is
+    // refused at the first part too many.
+    let most = vellev_storage::blobs::MOST_PARTS;
+    for (bytes, at_once, fits) in [
+        (most, true, true),
+        (most, false, true),
+        (most + 1, true, false),
+        (most + 1, false, false),
+        (most + 2, true, false),
+        (most + 2, false, false),
+    ] {
+        let store = Arc::new(Recorded {
+            discards: true,
+            ..Recorded::default()
+        });
+        let blobs = ObjectBlobs::new(store.clone()).transferring(one_byte);
+        let file = Bytes::from(vec![0u8; bytes]);
+        let sizes = match at_once {
+            true => vec![bytes],
+            false => vec![1; bytes],
+        };
+        let put = blobs.put_parts("file", coming(&file, &sizes)).await;
+        let case = format!("{bytes} bytes at once {at_once}");
+        assert_eq!(put.is_ok(), fits, "{case}: {put:?}");
+        let asked = store.asked();
+        let parts = asked
+            .iter()
+            .filter(|asked| matches!(asked, Request::Part(_)));
+        assert_eq!(parts.count(), most, "{case}");
+        let ended = asked
+            .iter()
+            .filter(|asked| !matches!(asked, Request::Part(_)));
+        let ended: Vec<_> = ended.cloned().collect();
+        let last = if fits {
+            Request::Complete
+        } else {
+            Request::Abort
+        };
+        assert_eq!(ended, [Request::Start, last], "{case}");
+    }
+}
+
+/// How much of what a source gave is alive at once: its bytes and how
+/// many pieces it gave them in, now and at most.
+#[derive(Debug, Default)]
+struct Alive {
+    bytes: AtomicUsize,
+    pieces: AtomicUsize,
+    most_bytes: AtomicUsize,
+    most_pieces: AtomicUsize,
+}
+
+/// A piece a source gave, counted alive until the last of it goes.
+struct Given(Vec<u8>, Arc<Alive>);
+
+impl AsRef<[u8]> for Given {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for Given {
+    fn drop(&mut self) {
+        self.1.bytes.fetch_sub(self.0.len(), Ordering::SeqCst);
+        self.1.pieces.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Alive {
+    fn given(self: &Arc<Self>, bytes: usize) -> Bytes {
+        let now = self.bytes.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        let pieces = self.pieces.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most_bytes.fetch_max(now, Ordering::SeqCst);
+        self.most_pieces.fetch_max(pieces, Ordering::SeqCst);
+        Bytes::from_owner(Given(vec![7u8; bytes], self.clone()))
+    }
+}
+
+/// The most bytes and the most pieces a source gave that are alive at
+/// once, while `count` pieces of `each` bytes are put a part at a time to
+/// a store that keeps nothing.
+async fn most_alive(each: usize, count: usize) -> (usize, usize) {
+    let alive = Arc::new(Alive::default());
+    let store = Arc::new(Recorded {
+        discards: true,
+        ..Recorded::default()
+    });
+    let blobs = ObjectBlobs::new(store).transferring(SMALL_PARTS);
+    let source = {
+        let alive = alive.clone();
+        futures::stream::iter(0..count).map(move |_| Ok(alive.given(each)))
+    };
+    blobs.put_parts("file", source.boxed()).await.unwrap();
+    assert_eq!(alive.bytes.load(Ordering::SeqCst), 0, "none kept after");
+    let most = |most: &AtomicUsize| most.load(Ordering::SeqCst);
+    (most(&alive.most_bytes), most(&alive.most_pieces))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_put_a_part_at_a_time_keeps_no_more_alive_than_a_part_is_cut_from() {
+    let part = SMALL_PARTS.part_bytes;
+    for (each, count) in [
+        (16, 500),
+        (1, 8_000),
+        (15, 500),
+        (17, 500),
+        (64, 100),
+        (1_000, 5),
+    ] {
+        let (bytes, pieces) = most_alive(each, count).await;
+        // A part is cut from as many pieces as it takes, of which the
+        // first may be the end of one, and the piece that came last is
+        // kept until it is known whether more follow.
+        let most = part.div_ceil(each) + 1;
+        assert!(pieces <= most, "pieces of {each}: {pieces} alive at once");
+        assert!(
+            bytes <= most * each,
+            "pieces of {each}: {bytes} bytes alive at once"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_pieces_of_a_file_put_a_part_at_a_time_are_not_kept() {
+    let (bytes, pieces) = most_alive(0, 100_000).await;
+    assert_eq!((bytes, pieces), (0, 1), "each let go as soon as it came");
 }
 
 #[tokio::test(start_paused = true)]
