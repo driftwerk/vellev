@@ -11,7 +11,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{
-    GetOptions, GetRange, GetResultPayload, MultipartUpload, ObjectStore, PutPayload,
+    GetOptions, GetRange, GetResultPayload, MultipartUpload, ObjectStore, PutMode, PutOptions,
+    PutPayload,
 };
 
 use crate::coordinator::{Generation, LogPosition, PartitionKey};
@@ -25,6 +26,25 @@ use crate::{Result, StorageError};
 #[async_trait]
 pub trait Blobs: fmt::Debug + Send + Sync {
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()>;
+    /// Put a file under `key` only if nothing is there, in one request,
+    /// and say which: [`Created::Written`] if this put it there,
+    /// [`Created::AlreadyThere`] if the store refused because a file is
+    /// there, or because another create of it was under way and may have
+    /// put one there. Whatever is there is then read to know what it holds.
+    ///
+    /// Any error leaves it unknown whether the file went up: a create the
+    /// store had but did not answer, or one given up waiting for, may have
+    /// landed. Whoever asks again is answered `AlreadyThere` if it did.
+    ///
+    /// By default refused, with nothing put: a store that cannot refuse a
+    /// second create of a key must never be taken for one that can, and a
+    /// put in its place would replace what is there.
+    async fn put_new(&self, key: &str, _bytes: Bytes) -> Result<Created> {
+        Err(StorageError::Blob {
+            key: key.to_string(),
+            source: "this store does not create a file only if none is there".into(),
+        })
+    }
     async fn get(&self, key: &str) -> Result<Bytes>;
     /// Every file whose key starts with `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>>;
@@ -81,6 +101,43 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     /// local disk, leaving the files themselves be.
     async fn forget_local(&self, _prefix: &str) -> Result<()> {
         Ok(())
+    }
+}
+
+/// What came of [`Blobs::put_new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Created {
+    /// The file is there, put by this request.
+    Written,
+    /// The store refused: a file is under the key, or another create of it
+    /// was under way. Not a failure, and not word of what the file holds.
+    AlreadyThere,
+}
+
+/// Whether `blobs` refuses a second create of a key, by creating `key`: a
+/// store that refuses it, having the file from an earlier check, passes;
+/// one that puts it is asked to create it again, and passes only if it
+/// refuses that. A store that puts it again ignores the condition and
+/// fails; so does one whose create fails, which tells nothing either way.
+/// Whatever is under `key` is left there.
+///
+/// One store at a time can only tell a store that ignores the condition;
+/// one that checks it and writes in two steps, as Adobe's S3Mock does,
+/// lets two creates racing for a key both through, and passes this.
+pub async fn creates_only_once(blobs: &dyn Blobs, key: &str) -> Result<()> {
+    let probe = Bytes::from_static(b"vellev: a file is created here only once\n");
+    let ignored = || StorageError::Blob {
+        key: key.to_string(),
+        source: "the store put a file again where one was already, \
+                 so it does not create a file only if none is there"
+            .into(),
+    };
+    match blobs.put_new(key, probe.clone()).await? {
+        Created::AlreadyThere => Ok(()),
+        Created::Written => match blobs.put_new(key, probe).await? {
+            Created::AlreadyThere => Ok(()),
+            Created::Written => Err(ignored()),
+        },
     }
 }
 
@@ -1083,6 +1140,44 @@ impl Blobs for ObjectBlobs {
             .map(|_| ())
     }
 
+    /// One request, which `object_store` makes create only: on S3 with
+    /// `If-None-Match: *`, refused with 412 or 304, or with 409 while
+    /// another create of the key is under way. An upload in parts cannot
+    /// be made so, so a file larger than [`Transfers::part_bytes`] is
+    /// refused before anything goes up. The client does not try a create
+    /// again by itself, as it does a put, for a create that landed would be
+    /// refused the second time.
+    async fn put_new(&self, key: &str, bytes: Bytes) -> Result<Created> {
+        if bytes.len() > self.transfers.part_bytes {
+            return Err(StorageError::Blob {
+                key: key.to_string(),
+                source: format!(
+                    "{} bytes are more than the {} one request takes, \
+                     and a file is created only once in one request",
+                    bytes.len(),
+                    self.transfers.part_bytes
+                )
+                .into(),
+            });
+        }
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let path = ObjectPath::from(key);
+        let put = self
+            .store
+            .put_opts(&path, PutPayload::from_bytes(bytes), options);
+        let created = async {
+            match put.await {
+                Ok(_) => Ok(Created::Written),
+                Err(object_store::Error::AlreadyExists { .. }) => Ok(Created::AlreadyThere),
+                Err(error) => Err(error),
+            }
+        };
+        bounded(key, self.transfers.request_within, created).await
+    }
+
     /// As [`Self::put`] sends the same file, whatever the sizes its parts
     /// come in: parts of [`Transfers::part_bytes`] and a last one of what
     /// is left, each sent once it is known that more follows it, or whole
@@ -1481,6 +1576,16 @@ impl Blobs for CachedBlobs {
         self.inner.put(key, bytes.clone()).await?;
         self.remember(key, &bytes).await;
         Ok(())
+    }
+
+    /// A copy is made of a file only once this has put it there: one
+    /// refused is not the file under `key`, which is read to be known.
+    async fn put_new(&self, key: &str, bytes: Bytes) -> Result<Created> {
+        let created = self.inner.put_new(key, bytes.clone()).await?;
+        if created == Created::Written {
+            self.remember(key, &bytes).await;
+        }
+        Ok(created)
     }
 
     /// Handed to the store as it comes, and no copy of it made: one is
@@ -2191,5 +2296,174 @@ mod tests {
         let fetched = summed("t/3/fetched.vectors").await;
         cached.fetch_local("t/3/fetched.vectors").await.unwrap();
         assert!(!summed_before(&fetched));
+    }
+
+    /// The stores a file is created in by `object_store` itself: in
+    /// memory, and a directory on local disk, kept for as long as the
+    /// store is.
+    fn creating_stores() -> Vec<(&'static str, ObjectBlobs, Option<tempfile::TempDir>)> {
+        let dir = tempfile::tempdir().unwrap();
+        let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let on_disk = ObjectBlobs::on_disk(Arc::new(local), dir.path());
+        vec![
+            ("memory", ObjectBlobs::new(Arc::new(InMemory::new())), None),
+            ("file", on_disk, Some(dir)),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_file_created_only_once_is_refused_a_second_create_and_keeps_its_first_bytes() {
+        for (store, blobs, _dir) in creating_stores() {
+            let first = blobs.put_new("t/0/link", Bytes::from("A")).await;
+            assert_eq!(first.unwrap(), Created::Written, "{store}");
+            let second = blobs.put_new("t/0/link", Bytes::from("B")).await;
+            assert_eq!(second.unwrap(), Created::AlreadyThere, "{store}");
+            assert_eq!(blobs.get("t/0/link").await.unwrap(), "A", "{store}");
+        }
+    }
+
+    #[tokio::test]
+    async fn of_creates_racing_for_one_key_exactly_one_is_written_and_its_bytes_are_kept() {
+        for (store, blobs, _dir) in creating_stores() {
+            let blobs = Arc::new(blobs);
+            for round in 0..20 {
+                let key = format!("t/0/race-{round}");
+                let racing = (0..20).map(|racer| {
+                    let (blobs, key) = (blobs.clone(), key.clone());
+                    tokio::spawn(async move {
+                        let bytes = Bytes::from(format!("racer {racer}"));
+                        (racer, blobs.put_new(&key, bytes).await.unwrap())
+                    })
+                });
+                let came = futures::future::join_all(racing).await;
+                let written: Vec<_> = came
+                    .into_iter()
+                    .map(|joined| joined.unwrap())
+                    .filter(|(_, created)| *created == Created::Written)
+                    .map(|(racer, _)| racer)
+                    .collect();
+                assert_eq!(written.len(), 1, "{store} round {round}: {written:?}");
+                let kept = blobs.get(&key).await.unwrap();
+                assert_eq!(kept, format!("racer {}", written[0]), "{store} {round}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_larger_than_one_request_takes_is_refused_a_create_and_nothing_goes_up() {
+        let parts = Transfers {
+            part_bytes: 8,
+            ..Transfers::default()
+        };
+        for (store, blobs, _dir) in creating_stores() {
+            let blobs = blobs.transferring(parts);
+            let refused = blobs.put_new("t/0/big", Bytes::from("123456789")).await;
+            assert!(matches!(refused, Err(StorageError::Blob { .. })), "{store}");
+            let missing = blobs.get("t/0/big").await;
+            assert!(
+                matches!(missing, Err(StorageError::Missing { .. })),
+                "{store}"
+            );
+            // One request's worth is created.
+            let fits = blobs.put_new("t/0/big", Bytes::from("12345678")).await;
+            assert_eq!(fits.unwrap(), Created::Written, "{store}");
+        }
+    }
+
+    /// A store that says nothing of creating only once, and notes every
+    /// put it is asked for.
+    #[derive(Debug, Default)]
+    struct Plain(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl Blobs for Plain {
+        async fn put(&self, key: &str, _bytes: Bytes) -> Result<()> {
+            self.0.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            Err(StorageError::Missing {
+                key: key.to_string(),
+            })
+        }
+        async fn list(&self, _prefix: &str) -> Result<Vec<Listed>> {
+            Ok(Vec::new())
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_does_not_say_how_to_create_only_once_refuses_and_puts_nothing() {
+        let plain = Plain::default();
+        let refused = plain.put_new("t/0/link", Bytes::from("A")).await;
+        assert!(matches!(refused, Err(StorageError::Blob { .. })));
+        assert!(plain.0.lock().unwrap().is_empty());
+    }
+
+    /// A store that puts every file it is asked to create, there or not.
+    #[derive(Debug)]
+    struct Careless(ObjectBlobs);
+
+    #[async_trait]
+    impl Blobs for Careless {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn put_new(&self, key: &str, bytes: Bytes) -> Result<Created> {
+            self.0.put(key, bytes).await.map(|()| Created::Written)
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.0.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.0.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_is_taken_to_create_only_once_only_if_it_refuses_a_second_create() {
+        let key = "_backups/_probe/create-only";
+        for (store, blobs, _dir) in creating_stores() {
+            // Its first check, which creates the file, and every one after.
+            creates_only_once(&blobs, key).await.unwrap();
+            creates_only_once(&blobs, key).await.unwrap();
+            assert!(blobs.get(key).await.is_ok(), "{store}");
+        }
+        let careless = Careless(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let ignored = creates_only_once(&careless, key).await;
+        assert!(matches!(ignored, Err(StorageError::Blob { .. })));
+        let unable = creates_only_once(&Plain::default(), key).await;
+        assert!(matches!(unable, Err(StorageError::Blob { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_file_created_through_the_cache_is_copied_there_and_a_create_refused_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let cached = CachedBlobs::new(store.clone(), dir.path());
+        let key = "t/0/log/1.log";
+        let first = crate::format::encode(crate::format::Kind::Log, &"A").unwrap();
+        let other = crate::format::encode(crate::format::Kind::Log, &"B").unwrap();
+        assert_eq!(
+            cached.put_new(key, first.clone()).await.unwrap(),
+            Created::Written
+        );
+        let copy = cached
+            .local(key)
+            .await
+            .unwrap()
+            .expect("a copy on local disk");
+        assert_eq!(std::fs::read(&copy.path).unwrap(), first);
+
+        let refused = cached.put_new(key, other).await.unwrap();
+        assert_eq!(refused, Created::AlreadyThere);
+        assert_eq!(std::fs::read(&copy.path).unwrap(), first);
+        assert_eq!(cached.get(key).await.unwrap(), first);
+        assert_eq!(store.get(key).await.unwrap(), first);
     }
 }
