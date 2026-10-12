@@ -7,6 +7,7 @@ mod common;
 use common::*;
 use futures::FutureExt;
 use vellev_storage::backups::Held;
+use vellev_storage::blobs::Linked;
 use vellev_storage::coordinator::{Clock, Restore};
 use vellev_storage::{Merging, Partition, RestoreFrom};
 
@@ -182,6 +183,16 @@ async fn restored_from(
     writer: &Writer,
     frozen: &Frozen,
 ) -> vellev_storage::Result<LogPosition> {
+    restored_under(cluster, writer, frozen, &Holding(true)).await
+}
+
+/// As [`restored_from`], under the right `held`.
+async fn restored_under(
+    cluster: &Cluster,
+    writer: &Writer,
+    frozen: &Frozen,
+    held: &dyn Held,
+) -> vellev_storage::Result<LogPosition> {
     let restore = restore(cluster, frozen.at);
     let ready: RestoreFrom<'_> = writer
         .restore_from(
@@ -189,7 +200,7 @@ async fn restored_from(
             frozen.head.as_ref(),
             restore,
             None,
-            &Holding(true),
+            held,
         )
         .await?;
     ready.commit().await
@@ -1601,7 +1612,6 @@ async fn a_restore_decodes_its_copies_two_at_a_time_and_an_open_all_at_once() {
     let writer = lived_in(&target).await;
 
     restored_from(&target, &writer, &frozen).await.unwrap();
-    // The copies are streamed back one segment at a time too.
     assert_eq!(crowded.most.load(Ordering::SeqCst), 2, "a restore");
 
     crowded.most.store(0, Ordering::SeqCst);
@@ -1704,13 +1714,34 @@ async fn a_restore_from_its_own_backup_links_the_vectors_it_holds_on_local_disk(
 }
 
 /// A store over a cache whose fetch of each vectors file to local disk
-/// fails the first time as `failure` makes it fail.
+/// fails the first `times` times as `failure` makes it fail.
 #[derive(Debug)]
 struct SlowDisk {
     inner: Arc<CachedBlobs>,
     failure: Failure,
-    failed: Mutex<BTreeSet<String>>,
-    fetches: AtomicUsize,
+    times: usize,
+    /// How many times each file was fetched.
+    fetched: Mutex<BTreeMap<String, usize>>,
+    /// Whether any fetch has failed.
+    failed: Arc<AtomicBool>,
+}
+
+impl SlowDisk {
+    fn over(plain: &Cluster, dir: &std::path::Path, failure: Failure, times: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(CachedBlobs::new(plain.blobs.clone(), dir)),
+            failure,
+            times,
+            fetched: Mutex::default(),
+            failed: Arc::default(),
+        })
+    }
+
+    /// The most times any one file was fetched.
+    fn most_fetched(&self) -> usize {
+        let fetched = self.fetched.lock().unwrap();
+        fetched.values().copied().max().unwrap_or(0)
+    }
 }
 
 #[async_trait]
@@ -1744,11 +1775,20 @@ impl Blobs for SlowDisk {
         self.inner.local(key).await
     }
     async fn fetch_local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
-        self.fetches.fetch_add(1, Ordering::SeqCst);
-        if self.failed.lock().unwrap().insert(key.to_string()) {
+        let fetched = {
+            let mut fetched = self.fetched.lock().unwrap();
+            let fetched = fetched.entry(key.to_string()).or_default();
+            *fetched += 1;
+            *fetched
+        };
+        if fetched <= self.times {
+            self.failed.store(true, Ordering::SeqCst);
             return Err((self.failure)(key));
         }
         self.inner.fetch_local(key).await
+    }
+    async fn link_local(&self, from: &str, to: &str) -> vellev_storage::Result<Linked> {
+        self.inner.link_local(from, to).await
     }
 }
 
@@ -1792,12 +1832,7 @@ async fn a_restore_tries_a_fetch_to_a_slow_local_disk_again_and_nothing_else() {
     for (what, failure, tried_again) in cases {
         let dir = tempfile::tempdir().unwrap();
         let plain = Cluster::new().await;
-        let slow = Arc::new(SlowDisk {
-            inner: Arc::new(CachedBlobs::new(plain.blobs.clone(), dir.path())),
-            failure,
-            failed: Mutex::default(),
-            fetches: AtomicUsize::new(0),
-        });
+        let slow = SlowDisk::over(&plain, dir.path(), failure, 1);
         let target = Cluster {
             blobs: slow.clone(),
             ..plain
@@ -1808,7 +1843,74 @@ async fn a_restore_tries_a_fetch_to_a_slow_local_disk_again_and_nothing_else() {
         let outcome = restored_from(&target, &writer, &frozen).await;
 
         assert_eq!(outcome.is_ok(), tried_again, "{what}: {outcome:?}");
+        let fetched = if tried_again { 2 } else { 1 };
+        assert_eq!(slow.most_fetched(), fetched, "{what}");
         if !tried_again {
+            assert_eq!(target.committed().await, before, "{what}");
+        }
+    }
+}
+
+/// A right held until a fetch has failed, if `failed` is a store's.
+struct HeldUntil(Arc<AtomicBool>);
+
+#[async_trait]
+impl Held for HeldUntil {
+    async fn held(&self) -> vellev_storage::Result<bool> {
+        Ok(self.still())
+    }
+    fn still(&self) -> bool {
+        !self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// A fetch to a local disk that does not answer in time is tried three
+/// times in all, and each time again only while the restore's right
+/// holds; a disk slow every time, or a right lost, fails the restore,
+/// which commits nothing.
+#[tokio::test]
+async fn a_restore_tries_a_slow_local_disk_three_times_in_all_while_its_right_holds() {
+    let slow: Failure = |key| StorageError::Blob {
+        key: key.to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "local disk did not answer within 10.8s",
+        )),
+    };
+    let source = Cluster::new().await;
+    of_five_segments(&source).await;
+    let frozen = frozen(&source).await;
+    let cases = [
+        ("slow twice", 2, false, true, 3),
+        ("slow three times", 3, false, false, 3),
+        ("its right lost once slow", 1, true, false, 1),
+    ];
+    for (what, times, lost, restored, fetched) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = Cluster::new().await;
+        let disk = SlowDisk::over(&plain, dir.path(), slow, times);
+        let target = Cluster {
+            blobs: disk.clone(),
+            ..plain
+        };
+        let writer = lived_in(&target).await;
+        let before = target.committed().await;
+        let failed = match lost {
+            true => disk.failed.clone(),
+            false => Arc::default(),
+        };
+
+        let outcome = restored_under(&target, &writer, &frozen, &HeldUntil(failed)).await;
+
+        assert_eq!(outcome.is_ok(), restored, "{what}: {outcome:?}");
+        if lost {
+            assert!(
+                matches!(outcome, Err(StorageError::Unheld(_))),
+                "{what}: {outcome:?}"
+            );
+        }
+        assert_eq!(disk.most_fetched(), fetched, "{what}");
+        if !restored {
             assert_eq!(target.committed().await, before, "{what}");
         }
     }

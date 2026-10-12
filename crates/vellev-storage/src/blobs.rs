@@ -1567,6 +1567,22 @@ impl Drop for Partial {
     }
 }
 
+/// A link into the cache (see [`CachedBlobs::link_local`]), given up
+/// once this is dropped unanswered: by a failure, a time-out or a caller
+/// that stops waiting.
+struct Linking {
+    given_up: Arc<std::sync::atomic::AtomicBool>,
+    answered: bool,
+}
+
+impl Drop for Linking {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.given_up.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// The copy of the file under `key` to forget once the file is put, and
 /// forgotten on a task of its own if this is dropped before.
 struct Forgetting {
@@ -1779,13 +1795,20 @@ impl Blobs for CachedBlobs {
     /// linked off Unix, where no file is read in place (see
     /// `Partition::column`), and nothing is to be.
     ///
-    /// A link the caller stops waiting for, or that fails, may yet be
-    /// made by the thread still at it, after a delete of `to` has removed
-    /// whatever copy there was: the copy would then lie under a key the
-    /// store no longer has. So it goes as a fetch given up does (see
-    /// [`Partial`]): the new name is removed once the link is given up,
-    /// and the thread removes it itself if it renames after that.
-    /// Whichever of the two comes last leaves nothing under `to`.
+    /// A link the caller stops waiting for, by a failure or by going away,
+    /// may yet be made by the thread still at it, after a delete of `to`
+    /// has removed whatever copy there was: the copy would then lie under
+    /// a key the store no longer has. So the thread looks, before it
+    /// renames and once it has, whether the link was given up, and if so
+    /// removes what it made. What remains is a link given up after that
+    /// last look: it is in place before the caller hears, so a delete of
+    /// `to` that follows removes it, and a fetch of `to` replaces it with
+    /// the same bytes. Nothing but the thread removes the new name, and
+    /// only while it is still the very file linked: a copy of `to` another
+    /// fetch has put in its place, which may be read in place by now, is
+    /// left alone, but for a fetch that renames into place between the
+    /// thread's look and its removal, whose copy goes and is fetched again
+    /// the next time it is read.
     async fn link_local(&self, from: &str, to: &str) -> Result<Linked> {
         let (Some(old), Some(new)) = (self.path(from), self.path(to)) else {
             return Ok(Linked::Unlinked);
@@ -1793,34 +1816,48 @@ impl Blobs for CachedBlobs {
         if cfg!(not(unix)) {
             return Ok(Linked::Unmapped);
         }
-        let mut linking = Partial {
-            disk: self.disk.clone(),
-            path: Some(new.clone()),
+        let mut linking = Linking {
             given_up: Arc::default(),
+            answered: false,
         };
-        let linked = linking.step(move |new| {
+        let given_up = linking.given_up.clone();
+        let linked = move || {
+            let given_up = || given_up.load(Ordering::SeqCst);
+            let gone = || std::io::Error::other("the link was given up");
             let before = crate::column::seen(&old)?;
             let summed = crate::column::summed_before(&before);
             let parent = new
                 .parent()
                 .ok_or_else(|| std::io::Error::other("cache path has no parent"))?;
             std::fs::create_dir_all(parent)?;
-            let partial = partial(new);
+            let partial = partial(&new);
             std::fs::hard_link(&old, &partial)?;
-            crate::column::forget_summed(new);
-            if let Err(error) = std::fs::rename(&partial, new) {
+            if given_up() {
+                let _ = std::fs::remove_file(&partial);
+                return Err(gone());
+            }
+            crate::column::forget_summed(&new);
+            if let Err(error) = std::fs::rename(&partial, &new) {
                 let _ = std::fs::remove_file(&partial);
                 return Err(error);
             }
-            let after = crate::column::seen(new)?;
+            if given_up() {
+                let linked = crate::column::seen(&new);
+                if linked.is_ok_and(|linked| linked.same_file(&before)) {
+                    crate::column::forget_summed(&new);
+                    let _ = std::fs::remove_file(&new);
+                }
+                return Err(gone());
+            }
+            let after = crate::column::seen(&new)?;
             if summed && after.same_file(&before) {
                 crate::column::remember_summed(after);
             }
-            Ok(())
-        });
+            Ok(new)
+        };
         match self.disk.run(0, linked).await {
-            Ok(()) => {
-                linking.path = None;
+            Ok(new) => {
+                linking.answered = true;
                 Ok(Linked::Linked(new))
             }
             Err(error) => {

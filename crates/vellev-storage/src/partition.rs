@@ -1561,6 +1561,7 @@ impl Writer {
                 .try_collect()
                 .await?;
             drop(donors);
+            let segments = copied.len();
             let mut fresh = HashMap::new();
             let mut dropped = HashSet::new();
             for copied in copied {
@@ -1569,6 +1570,13 @@ impl Writer {
                 dropped.extend(copied.unused);
                 reused.extend(copied.reused);
             }
+            tracing::info!(
+                partition = ?self.lease.key,
+                segments,
+                taken_as_held = reused.len(),
+                decoded = segments - reused.len(),
+                "a restore from another store copied the source's segments"
+            );
             let loading = loading(&checkpoint_key, manifest, &fresh, &dropped)?;
             memory.insert(checkpoint_key, encode(Kind::Manifest, &loading)?);
         }
