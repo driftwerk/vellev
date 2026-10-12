@@ -1502,10 +1502,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_is_created_only_once_through_a_bounded_store_as_through_the_store_itself() {
         let inner = in_memory();
-        let store = Within {
-            inner: inner.clone(),
-            within: WITHIN,
-        };
+        let store = Within::new(inner.clone(), WITHIN);
         assert!(inner.creates_at_most().is_some());
         assert_eq!(store.creates_at_most(), inner.creates_at_most());
         let first = store.put_new("file", Bytes::from("A")).await.unwrap();
