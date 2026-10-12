@@ -4,6 +4,7 @@ mod answers;
 pub mod backups;
 pub mod blobs;
 mod catalog;
+pub mod chain;
 mod column;
 pub mod coordinator;
 mod draft;
