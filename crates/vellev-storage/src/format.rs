@@ -459,7 +459,7 @@ pub fn verify(key: &str, frame: &[u8]) -> Result<()> {
 
 /// Decoded through a cursor so that bytes left over after the value, which
 /// `from_slice` would accept, are noticed.
-fn parse<T: DeserializeOwned>(key: &str, body: &[u8]) -> Result<T> {
+pub(crate) fn parse<T: DeserializeOwned>(key: &str, body: &[u8]) -> Result<T> {
     let mut reader = std::io::Cursor::new(body);
     let value =
         rmp_serde::from_read(&mut reader).map_err(|e| StorageError::corrupt(key, e.to_string()))?;
