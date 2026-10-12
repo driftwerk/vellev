@@ -611,6 +611,20 @@ mod tests {
                 position: LogPosition(4)
             })
         );
+        // A checkpoint whose chain skips logs it replays: it replays 3, 4
+        // and 5, and is made on 3.
+        let mut links = logs(5);
+        links.extend([checkpoint(6, Some(3)), log(7, Some(6))]);
+        assert_eq!(
+            needed(
+                &chain(links),
+                LogPosition(7),
+                Some(&manifest(6, &[3, 4, 5]))
+            ),
+            Err(Broken::OtherReplay {
+                position: LogPosition(3)
+            })
+        );
         // A replay that does not end just before the checkpoint.
         let mut out_of_place = manifest(5, &[3, 4]);
         out_of_place.replay_after = LogPosition(1);
