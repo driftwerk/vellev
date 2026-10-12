@@ -1,6 +1,16 @@
 //! Tenants backed up to a second store, daily and when asked, and put back
 //! from it: into their own cluster, or into one that has lost them.
 //!
+//! Nothing of a backup comes into a tenant's store under the key it had:
+//! a restore copies every file it needs from the backup under keys of its
+//! own and commits a head that names only those (DW-680; see
+//! `vellev_storage::blobs`). So a delete sent before the restore, by a
+//! clean, a purge or a node since deposed, and landing after it, takes
+//! nothing the restored tenant names, and no file is taken from the
+//! tenant's store in place of the backup's: a backup that lacks one is
+//! refused, even where the tenant's store still has the file, until the
+//! next backup copies it back.
+//!
 //! One node at a time backs a tenant up or restores it from a backup, by a
 //! claim in the coordinator, so that pruning never deletes a file another
 //! backup is copying or a restore is reading. A claim is taken by an id the
