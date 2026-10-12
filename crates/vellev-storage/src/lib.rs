@@ -13,6 +13,7 @@ pub mod format;
 mod group;
 mod hybrid;
 mod keyword;
+pub mod link;
 mod mutation;
 mod partition;
 mod search;
