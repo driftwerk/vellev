@@ -82,6 +82,9 @@ struct Faulty {
     /// No delete is answered, and no question of how large a file is.
     silent_deletes: AtomicBool,
     silent_heads: AtomicBool,
+    /// Every file put whole fails, as a store that answers 403 or 500 does,
+    /// and nothing is put.
+    failing_puts: AtomicBool,
 }
 
 impl Faulty {
@@ -102,6 +105,7 @@ impl Faulty {
             silent_listing: AtomicBool::new(false),
             silent_deletes: AtomicBool::new(false),
             silent_heads: AtomicBool::new(false),
+            failing_puts: AtomicBool::new(false),
         }
     }
 
@@ -171,6 +175,12 @@ impl ObjectStore for Faulty {
         self.whole.fetch_add(1, Ordering::SeqCst);
         if self.stalls(location) {
             std::future::pending::<()>().await;
+        }
+        if self.failing_puts.load(Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "Faulty",
+                source: "the store failed the put".into(),
+            });
         }
         self.inner.put_opts(location, payload, opts).await
     }
@@ -459,6 +469,35 @@ async fn a_part_that_stalls_is_given_up_within_its_bound_and_the_upload_aborted(
         blobs.get("large").await,
         Err(StorageError::Missing { .. })
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_create_the_store_fails_is_an_error_and_never_taken_for_a_file_already_there() {
+    let store = Arc::new(Faulty::new("nothing"));
+    store.failing_puts.store(true, Ordering::SeqCst);
+    let blobs = ObjectBlobs::new(store.clone()).transferring(WHOLE);
+    let failed = blobs.put_new("link", Bytes::from_static(b"A")).await;
+    // Unknown whether it landed, which is neither "already there" nor
+    // known to have put nothing.
+    assert!(
+        matches!(failed, Err(StorageError::Blob { .. })),
+        "{failed:?}"
+    );
+    assert_eq!(store.whole.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_create_the_store_does_not_answer_is_given_up_within_its_bound() {
+    let store = Arc::new(Faulty::new("link"));
+    store.armed.store(true, Ordering::SeqCst);
+    let blobs = ObjectBlobs::new(store.clone()).transferring(WHOLE);
+    let started = Instant::now();
+    let given_up = ended(blobs.put_new("link", Bytes::from_static(b"A"))).await;
+    assert_eq!(started.elapsed(), WHOLE.request_within);
+    assert!(
+        matches!(given_up, Err(StorageError::Blob { .. })),
+        "{given_up:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

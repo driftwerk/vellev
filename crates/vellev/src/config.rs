@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::{bail, eyre, Result, WrapErr};
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use vellev_core::NodeId;
@@ -366,7 +366,9 @@ fn text(
 
 /// An S3 store's builder for `url`, set up from the `AWS_` variables of
 /// `env`, as `AmazonS3Builder::from_env` sets one up from the process's, and
-/// then as `client` says.
+/// then as `client` says. A file is created only once by `If-None-Match: *`
+/// whatever `AWS_CONDITIONAL_PUT` says: not by a lock table of its own, nor
+/// not at all.
 fn s3(
     url: &str,
     client: StoreClient,
@@ -379,7 +381,10 @@ fn s3(
         .fold(AmazonS3Builder::new(), |builder, (key, value)| {
             builder.with_config(key, value)
         });
-    client.configured(from_env).with_url(url)
+    client
+        .configured(from_env)
+        .with_url(url)
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
 }
 
 /// The store a URL names. A bucket is used whole: a path within one would
@@ -984,6 +989,75 @@ mod tests {
             asked.load(std::sync::atomic::Ordering::SeqCst),
             1 + STORE_RETRIES as usize
         );
+    }
+
+    /// A stand-in for S3 that answers its requests with `answers` in turn,
+    /// and every one after them with the last, counting them.
+    async fn answering(
+        answers: Vec<axum::http::StatusCode>,
+    ) -> (ObjectBlobs, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = asked.clone();
+        let router = axum::Router::new().fallback(move || {
+            let turn = counting.fetch_add(1, Ordering::SeqCst);
+            let answer = answers[turn.min(answers.len() - 1)];
+            async move { answer }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let env = [
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_ENDPOINT", endpoint.as_str()),
+            ("AWS_ACCESS_KEY_ID", "key"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_REGION", "eu-west-1"),
+        ]
+        .map(|(key, value)| (key.to_string(), value.to_string()));
+        let store = s3("s3://bucket", StoreClient::default(), env)
+            .build()
+            .unwrap();
+        (ObjectBlobs::new(Arc::new(store)), asked)
+    }
+
+    #[tokio::test]
+    async fn a_create_that_landed_and_was_answered_unavailable_is_tried_again_and_found_there() {
+        use axum::http::StatusCode;
+        use vellev_storage::blobs::Created;
+        // The create lands and its answer is lost to a 503; the client
+        // tries it again, and the store refuses it, the file being there.
+        let answers = vec![
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::PRECONDITION_FAILED,
+        ];
+        let (blobs, asked) = answering(answers).await;
+        let created = blobs.put_new("link", bytes::Bytes::from_static(b"A")).await;
+        assert_eq!(created.unwrap(), Created::AlreadyThere);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_create_refused_while_another_is_under_way_is_taken_as_maybe_there() {
+        use axum::http::StatusCode;
+        use vellev_storage::blobs::Created;
+        // S3 answers 409 while another create of the key is under way,
+        // which may yet fail: nothing need be there.
+        let (blobs, asked) = answering(vec![StatusCode::CONFLICT]).await;
+        let created = blobs.put_new("link", bytes::Bytes::from_static(b"A")).await;
+        assert_eq!(created.unwrap(), Created::AlreadyThere);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_s3_store_creates_only_with_if_none_match_whatever_its_environment_says() {
+        for given in ["disabled", "dynamo:locks", "etag"] {
+            let env = [("AWS_CONDITIONAL_PUT", given), ("AWS_REGION", "eu-west-1")]
+                .map(|(key, value)| (key.to_string(), value.to_string()));
+            let builder = s3("s3://bucket", StoreClient::default(), env);
+            let conditional = builder.get_config_value(&AmazonS3ConfigKey::ConditionalPut);
+            assert_eq!(conditional.as_deref(), Some("etag"), "{given}");
+        }
     }
 
     #[test]

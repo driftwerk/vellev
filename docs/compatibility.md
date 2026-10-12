@@ -280,6 +280,36 @@ rolling deploy from such a release:
    by itself. A backup of nothing an older node took stays listed, and
    pruning keeps the newest backup that holds data beside it.
 
+## Links
+
+Continuous backup (DW-668) ships one link per committed head to the
+backup store, under
+`_backups/{tenant}/ship/{lineage}/{cluster}/{incarnation}/{partition}/`:
+`links/{position}.link`, and, for a frame too large to go inline,
+`frames/{original key}` (`vellev_storage::link`). Nothing ships links
+yet; this says what holds once something does.
+
+A link is not a file of the cluster's format. It has its own magic
+(`VLNK`), its own version (`vellev_storage::link::LINK_VERSION`) and a
+CRC32 over its header, and it is read only by backup code. So a link
+version is not gated by `FORMAT_VERSION`, and a new link version is not
+a new file format. The frame it carries is a log or a manifest of the
+cluster's format, byte for byte as the primary holds it.
+
+A node refuses a link of a version newer than it reads
+(`StorageError::UnsupportedVersion`). Its header is MessagePack with
+named fields, and a reader skips fields it does not know. A field may be
+added to the header without a new link version only if it is one that two
+links of one commit always agree on, or one that whether two links are
+of one commit may ignore. That is because two links at one position are
+of one commit exactly when every header field but `body` is equal, and
+anything else there is a fork. Anything else is a new link version.
+
+Its tests carry fixtures of every link version under
+`crates/vellev-storage/tests/fixtures/link-N`, which a test reads and
+writes back byte for byte. The fixtures of a released version are never
+written again.
+
 ## The API
 
 Clients and nodes of different releases talk to each other.

@@ -21,6 +21,11 @@ pub enum StorageError {
     },
     #[error("{key} is corrupt: {reason}")]
     Corrupt { key: String, reason: String },
+    /// A create refused before anything was sent, by a store that cannot
+    /// create a file only if none is there or because the file is larger
+    /// than it creates: nothing was put, and asking again is refused again.
+    #[error("{key} was not created, and nothing was put: {reason}")]
+    NotCreated { key: String, reason: String },
     /// A fact about the backup, for whoever asked to restore from it: it
     /// lists a file that is no longer in the backup store, and cannot be
     /// restored from by a cluster that does not have the file itself.
