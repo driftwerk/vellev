@@ -741,6 +741,17 @@ mod tests {
         assert!(read(&framed(&header, Some(&frame))).is_ok());
     }
 
+    /// `link` with its CRC made right again for whatever was changed in
+    /// its version, length or header.
+    fn resummed(mut link: Vec<u8>) -> Vec<u8> {
+        let length = u32::from_le_bytes(link[6..10].try_into().unwrap()) as usize;
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&link[4..10]);
+        crc.update(&link[PREAMBLE..PREAMBLE + length]);
+        link[10..14].copy_from_slice(&crc.finalize().to_le_bytes());
+        link
+    }
+
     #[test]
     fn a_damaged_or_unknown_link_is_refused() {
         let frame = frame(7);
@@ -754,12 +765,25 @@ mod tests {
         flipped[PREAMBLE + 3] ^= 1;
         corrupt(read(&flipped), "a header byte");
 
+        // A change that leaves the header readable and trusted, which only
+        // its CRC tells: a digit of the sum it names of the commit before.
+        let before = Sum::of(b"the frame at six").0;
+        let at = good
+            .windows(before.len())
+            .position(|window| window == before.as_bytes())
+            .unwrap();
+        let mut other = good.clone();
+        other[at] = if other[at] == b'0' { b'1' } else { b'0' };
+        corrupt(read(&other), "another sum of the commit before");
+        let read_so = read(&resummed(other)).unwrap();
+        assert_ne!(read_so.header.before, header(&frame).before);
+
         corrupt(read(&good[..PREAMBLE - 1]), "shorter than a preamble");
         corrupt(read(&good[..PREAMBLE + 5]), "shorter than its header");
 
         let mut zero = good.clone();
         zero[4..6].copy_from_slice(&0u16.to_le_bytes());
-        corrupt(read(&zero), "version zero");
+        corrupt(read(&resummed(zero)), "version zero");
 
         let mut newer = good.clone();
         newer[4..6].copy_from_slice(&(LINK_VERSION + 1).to_le_bytes());
@@ -777,6 +801,14 @@ mod tests {
         let mut longer = framed(&header, Some(&frame));
         longer.push(0);
         corrupt(read(&longer), "a byte after the frame");
+        let wrong_size = Header {
+            size: header.size + 1,
+            ..header.clone()
+        };
+        corrupt(
+            read(&framed(&wrong_size, Some(&frame))),
+            "the frame it sums, of another size than it says",
+        );
         corrupt(
             read(&framed(&header, Some(&frame[..frame.len() - 1]))),
             "a byte short",
@@ -842,7 +874,7 @@ mod tests {
         );
         refused(
             Header {
-                key: good.key.replace("/log/", "/../log/"),
+                key: format!("{}/..", good.key),
                 ..good.clone()
             },
             "a key that is not plain",
@@ -900,7 +932,7 @@ mod tests {
             read(&framed(&with(manifest), None)),
             "a manifest among its files",
         );
-        let unplain = good.files[0].key.replace("/segment/", "/segment/../");
+        let unplain = format!("{}//x", good.files[0].key);
         corrupt(
             read(&framed(&with(unplain), None)),
             "a key that is not plain",
