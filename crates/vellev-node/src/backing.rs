@@ -783,6 +783,9 @@ impl Blobs for Within {
     async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
         self.bounded(key, self.inner.put_new(key, bytes)).await
     }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
+    }
     /// The store is given `within` each time it is left to itself: from
     /// when it is asked until it asks for the first part, from each part
     /// it is handed until it asks for the next, and from the end of them
@@ -875,6 +878,9 @@ impl Blobs for Deleting {
     }
     async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
         self.inner.put_new(key, bytes).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
     }
     async fn put_parts(
         &self,
@@ -1479,6 +1485,8 @@ mod tests {
             inner: inner.clone(),
             within: WITHIN,
         };
+        assert!(inner.creates_at_most().is_some());
+        assert_eq!(store.creates_at_most(), inner.creates_at_most());
         let first = store.put_new("file", Bytes::from("A")).await.unwrap();
         assert_eq!(first, Created::Written);
         let second = store.put_new("file", Bytes::from("B")).await.unwrap();
@@ -1517,6 +1525,8 @@ mod tests {
             inner: inner.clone(),
             sent: sent.clone(),
         };
+        assert!(inner.creates_at_most().is_some());
+        assert_eq!(store.creates_at_most(), inner.creates_at_most());
         let first = store.put_new("file", Bytes::from("A")).await.unwrap();
         assert_eq!(first, Created::Written);
         let second = store.put_new("file", Bytes::from("B")).await.unwrap();

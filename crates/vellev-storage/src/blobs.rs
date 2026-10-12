@@ -28,22 +28,35 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()>;
     /// Put a file under `key` only if nothing is there, in one request,
     /// and say which: [`Created::Written`] if this put it there,
-    /// [`Created::AlreadyThere`] if the store refused because a file is
-    /// there, or because another create of it was under way and may have
-    /// put one there. Whatever is there is then read to know what it holds.
+    /// [`Created::AlreadyThere`] if the store refused it. A refusal says a
+    /// file is, or may be, under `key`, and nothing of whose it is: it may
+    /// be this call's own, landed before a failed answer that the store's
+    /// client tried again; or no file may be there at all, another create
+    /// of it having been under way and failed since. So whoever is told
+    /// `AlreadyThere` reads the key to know what it holds, and one that
+    /// finds nothing there creates it again.
     ///
     /// Any error leaves it unknown whether the file went up: a create the
     /// store had but did not answer, or one given up waiting for, may have
-    /// landed. Whoever asks again is answered `AlreadyThere` if it did.
+    /// landed, and asking again is answered `AlreadyThere` if it did. The
+    /// one exception is [`StorageError::NotCreated`], a create refused
+    /// before anything was sent, which asking again is refused alike: by a
+    /// store that cannot create only once, or for a file larger than
+    /// [`Self::creates_at_most`].
     ///
-    /// By default refused, with nothing put: a store that cannot refuse a
-    /// second create of a key must never be taken for one that can, and a
-    /// put in its place would replace what is there.
+    /// By default refused so, with nothing put: a store that cannot refuse
+    /// a second create of a key must never be taken for one that can, and
+    /// a put in its place would replace what is there.
     async fn put_new(&self, key: &str, _bytes: Bytes) -> Result<Created> {
-        Err(StorageError::Blob {
+        Err(StorageError::NotCreated {
             key: key.to_string(),
-            source: "this store does not create a file only if none is there".into(),
+            reason: "this store does not create a file only if none is there".into(),
         })
+    }
+    /// The most bytes [`Self::put_new`] creates a file of; `None` from a
+    /// store that creates none.
+    fn creates_at_most(&self) -> Option<usize> {
+        None
     }
     async fn get(&self, key: &str) -> Result<Bytes>;
     /// Every file whose key starts with `prefix`.
@@ -121,9 +134,10 @@ pub enum Created {
 /// fails; so does one whose create fails, which tells nothing either way.
 /// Whatever is under `key` is left there.
 ///
-/// One store at a time can only tell a store that ignores the condition;
-/// one that checks it and writes in two steps, as Adobe's S3Mock does,
-/// lets two creates racing for a key both through, and passes this.
+/// This is a tripwire, not a qualification of the store: one store at a
+/// time can only tell a store that ignores the condition. One that checks
+/// it and writes in two steps, as Adobe's S3Mock does, lets two creates
+/// racing for a key both through, and passes this.
 pub async fn creates_only_once(blobs: &dyn Blobs, key: &str) -> Result<()> {
     let probe = Bytes::from_static(b"vellev: a file is created here only once\n");
     let ignored = || StorageError::Blob {
@@ -1144,20 +1158,22 @@ impl Blobs for ObjectBlobs {
     /// `If-None-Match: *`, refused with 412 or 304, or with 409 while
     /// another create of the key is under way. An upload in parts cannot
     /// be made so, so a file larger than [`Transfers::part_bytes`] is
-    /// refused before anything goes up. The client does not try a create
-    /// again by itself, as it does a put, for a create that landed would be
-    /// refused the second time.
+    /// refused before anything goes up. The S3 client tries a create again
+    /// after an answer of 5xx, 429 or 408, and after a request it could not
+    /// send, as it does a put; not after one that timed out or was cut off
+    /// on the way, which it does not know to be safe to repeat. A create
+    /// tried again after its own landed is refused, and so answered
+    /// `AlreadyThere`.
     async fn put_new(&self, key: &str, bytes: Bytes) -> Result<Created> {
         if bytes.len() > self.transfers.part_bytes {
-            return Err(StorageError::Blob {
+            return Err(StorageError::NotCreated {
                 key: key.to_string(),
-                source: format!(
+                reason: format!(
                     "{} bytes are more than the {} one request takes, \
                      and a file is created only once in one request",
                     bytes.len(),
                     self.transfers.part_bytes
-                )
-                .into(),
+                ),
             });
         }
         let options = PutOptions {
@@ -1176,6 +1192,10 @@ impl Blobs for ObjectBlobs {
             }
         };
         bounded(key, self.transfers.request_within, created).await
+    }
+
+    fn creates_at_most(&self) -> Option<usize> {
+        Some(self.transfers.part_bytes)
     }
 
     /// As [`Self::put`] sends the same file, whatever the sizes its parts
@@ -1578,15 +1598,9 @@ impl Blobs for CachedBlobs {
         Ok(())
     }
 
-    /// A copy is made of a file only once this has put it there: one
-    /// refused is not the file under `key`, which is read to be known.
-    async fn put_new(&self, key: &str, bytes: Bytes) -> Result<Created> {
-        let created = self.inner.put_new(key, bytes.clone()).await?;
-        if created == Created::Written {
-            self.remember(key, &bytes).await;
-        }
-        Ok(created)
-    }
+    // No `put_new`, which is refused by default: nothing creates through a
+    // cache, and a copy kept of a create could be bytes the store does not
+    // hold, beside a put or a delete of the same key.
 
     /// Handed to the store as it comes, and no copy of it made: one is
     /// made when it is first read. Any copy of a file that was under `key`
@@ -2357,8 +2371,13 @@ mod tests {
         };
         for (store, blobs, _dir) in creating_stores() {
             let blobs = blobs.transferring(parts);
+            assert_eq!(blobs.creates_at_most(), Some(8), "{store}");
             let refused = blobs.put_new("t/0/big", Bytes::from("123456789")).await;
-            assert!(matches!(refused, Err(StorageError::Blob { .. })), "{store}");
+            // Known to have put nothing, and so not to be asked again.
+            assert!(
+                matches!(refused, Err(StorageError::NotCreated { .. })),
+                "{store}: {refused:?}"
+            );
             let missing = blobs.get("t/0/big").await;
             assert!(
                 matches!(missing, Err(StorageError::Missing { .. })),
@@ -2397,8 +2416,12 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_does_not_say_how_to_create_only_once_refuses_and_puts_nothing() {
         let plain = Plain::default();
+        assert_eq!(plain.creates_at_most(), None);
         let refused = plain.put_new("t/0/link", Bytes::from("A")).await;
-        assert!(matches!(refused, Err(StorageError::Blob { .. })));
+        assert!(
+            matches!(refused, Err(StorageError::NotCreated { .. })),
+            "{refused:?}"
+        );
         assert!(plain.0.lock().unwrap().is_empty());
     }
 
@@ -2438,32 +2461,29 @@ mod tests {
         let ignored = creates_only_once(&careless, key).await;
         assert!(matches!(ignored, Err(StorageError::Blob { .. })));
         let unable = creates_only_once(&Plain::default(), key).await;
-        assert!(matches!(unable, Err(StorageError::Blob { .. })));
+        assert!(
+            matches!(unable, Err(StorageError::NotCreated { .. })),
+            "{unable:?}"
+        );
     }
 
     #[tokio::test]
-    async fn a_file_created_through_the_cache_is_copied_there_and_a_create_refused_is_not() {
+    async fn a_create_through_the_cache_is_refused_and_nothing_is_put_or_copied() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
         let cached = CachedBlobs::new(store.clone(), dir.path());
+        assert_eq!(cached.creates_at_most(), None);
         let key = "t/0/log/1.log";
-        let first = crate::format::encode(crate::format::Kind::Log, &"A").unwrap();
-        let other = crate::format::encode(crate::format::Kind::Log, &"B").unwrap();
-        assert_eq!(
-            cached.put_new(key, first.clone()).await.unwrap(),
-            Created::Written
+        let file = crate::format::encode(crate::format::Kind::Log, &"A").unwrap();
+        let refused = cached.put_new(key, file).await;
+        assert!(
+            matches!(refused, Err(StorageError::NotCreated { .. })),
+            "{refused:?}"
         );
-        let copy = cached
-            .local(key)
-            .await
-            .unwrap()
-            .expect("a copy on local disk");
-        assert_eq!(std::fs::read(&copy.path).unwrap(), first);
-
-        let refused = cached.put_new(key, other).await.unwrap();
-        assert_eq!(refused, Created::AlreadyThere);
-        assert_eq!(std::fs::read(&copy.path).unwrap(), first);
-        assert_eq!(cached.get(key).await.unwrap(), first);
-        assert_eq!(store.get(key).await.unwrap(), first);
+        assert!(matches!(
+            store.get(key).await,
+            Err(StorageError::Missing { .. })
+        ));
+        assert!(cached.local(key).await.unwrap().is_none());
     }
 }
