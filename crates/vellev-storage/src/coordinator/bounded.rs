@@ -7,9 +7,9 @@ use uuid::Uuid;
 use vellev_core::{NodeId, RequestId, TenantId};
 
 use super::{
-    Acquired, Adoption, ClusterId, Commit, Committed, Coordinator, CoordinatorError, Forgotten,
-    Generation, Identity, KeyHash, Lease, PartitionKey, Point, PurgeClaim, Purges, Removed,
-    RestorePoint, Restored, Result, TenantKey, Versions,
+    Acquired, Adoption, Cleaned, ClusterId, Commit, Committed, Coordinator, CoordinatorError,
+    Forgotten, Generation, Identity, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Point,
+    PurgeClaim, Purges, Removed, RestorePoint, Restored, Result, TenantKey, Versions,
 };
 
 /// A coordinator whose every call is given up once it has gone unanswered
@@ -73,6 +73,20 @@ impl Coordinator for Bounded {
 
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>> {
         self.bounded(self.inner.committed(key)).await
+    }
+
+    async fn cleaned(&self, key: &PartitionKey) -> Result<Option<Cleaned>> {
+        self.bounded(self.inner.cleaned(key)).await
+    }
+
+    async fn clean_below(
+        &self,
+        lease: &Lease,
+        base: &ManifestRef,
+        position: LogPosition,
+    ) -> Result<Cleaned> {
+        self.bounded(self.inner.clean_below(lease, base, position))
+            .await
     }
 
     async fn partitions(

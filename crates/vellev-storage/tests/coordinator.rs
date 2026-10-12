@@ -10,8 +10,8 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vellev_core::{NodeId, Partition, RequestId, TenantId};
 use vellev_storage::coordinator::{
-    Acquired, Adoption, Bounded, Commit, Committed, Coordinator, CoordinatorError, Generation,
-    Identity, Lease, Lineage, LogPosition, ManifestRef, ManualClock, MemoryCoordinator,
+    Acquired, Adoption, Bounded, Cleaned, Commit, Committed, Coordinator, CoordinatorError,
+    Generation, Identity, Lease, Lineage, LogPosition, ManifestRef, ManualClock, MemoryCoordinator,
     PartitionKey, Point, PostgresCoordinator, Prior, PurgeClaim, Purges, Removed, Restore,
     RestorePoint, Restored, TenantKey, Versions, MAX_BACKUP_HOLD, MAX_RESTORE_WINDOW, MAX_TTL,
     RESTORES_KEPT_FOR,
@@ -2086,6 +2086,146 @@ async fn registering_and_removing_together_never_leave_a_tenant_to_be_purged(h: 
     }
 }
 
+// DW-681: what a clean of a partition records it deletes below. A clean
+// records its base before its first delete, and may take a checkpoint's
+// missing predecessor for a clean's work only below the record; so the
+// record must be written only by the lease that cleans, never go down, and
+// never outlive the partition it was of.
+
+fn base(position: u64) -> (ManifestRef, LogPosition) {
+    (
+        ManifestRef(format!("tenant/0/manifest/{position:020}.manifest")),
+        LogPosition(position),
+    )
+}
+
+fn cleaned_at(position: u64) -> Cleaned {
+    let (base, position) = base(position);
+    Cleaned { base, position }
+}
+
+async fn record(
+    c: &dyn Coordinator,
+    lease: &Lease,
+    position: u64,
+) -> Result<Cleaned, CoordinatorError> {
+    let (base, position) = base(position);
+    c.clean_below(lease, &base, position).await
+}
+
+async fn a_partition_never_cleaned_has_no_record_and_one_not_registered_is_unknown(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    assert_eq!(c.cleaned(&key).await.unwrap(), None);
+    let (held, _) = lease(h, &key, &node("a")).await;
+    c.commit(&held, commit(1, "m1")).await.unwrap();
+    assert_eq!(
+        c.cleaned(&key).await.unwrap(),
+        None,
+        "a commit records nothing"
+    );
+    let unknown = crate::key();
+    assert!(matches!(
+        c.cleaned(&unknown).await,
+        Err(CoordinatorError::UnknownPartition(_))
+    ));
+}
+
+async fn a_clean_is_recorded_only_by_the_lease_that_is_current(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let holder = node("a");
+    let (first, _) = lease(h, &key, &holder).await;
+    assert_eq!(record(c, &first, 5).await.unwrap(), cleaned_at(5));
+    // Its own lease taken again, and then the lease taken over: either way
+    // the earlier one records nothing, whether higher or not.
+    let (again, _) = lease(h, &key, &holder).await;
+    assert!(fenced(&record(c, &first, 9).await, again.generation));
+    assert!(fenced(&record(c, &first, 3).await, again.generation));
+    h.pass(&key, TTL + Duration::from_secs(1)).await;
+    let (other, _) = lease(h, &key, &node("b")).await;
+    assert!(fenced(&record(c, &again, 9).await, other.generation));
+    assert_eq!(c.cleaned(&key).await.unwrap(), Some(cleaned_at(5)));
+    // A lease released records nothing either.
+    c.release(&other).await.unwrap();
+    let now = generation(h, &key).await;
+    assert!(fenced(&record(c, &other, 9).await, now));
+    assert_eq!(c.cleaned(&key).await.unwrap(), Some(cleaned_at(5)));
+}
+
+async fn what_a_clean_recorded_is_only_ever_raised(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    assert_eq!(record(c, &held, 5).await.unwrap(), cleaned_at(5));
+    // Lower: left as it is, and said, not refused.
+    assert_eq!(record(c, &held, 3).await.unwrap(), cleaned_at(5));
+    // As high, of another key: left as it is too.
+    let other = ManifestRef("tenant/0/manifest/other.manifest".into());
+    let kept = c.clean_below(&held, &other, LogPosition(5)).await.unwrap();
+    assert_eq!(kept, cleaned_at(5));
+    assert_eq!(c.cleaned(&key).await.unwrap(), Some(cleaned_at(5)));
+    // Higher: raised.
+    assert_eq!(record(c, &held, 8).await.unwrap(), cleaned_at(8));
+    assert_eq!(c.cleaned(&key).await.unwrap(), Some(cleaned_at(8)));
+}
+
+async fn what_a_clean_recorded_stays_through_leases_and_commits(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let (first, _) = lease(h, &key, &node("a")).await;
+    c.commit(&first, commit(6, "m6")).await.unwrap();
+    record(c, &first, 4).await.unwrap();
+    c.release(&first).await.unwrap();
+    let (next, _) = lease(h, &key, &node("b")).await;
+    assert_eq!(c.cleaned(&key).await.unwrap(), Some(cleaned_at(4)));
+    c.commit(&next, commit(7, "m7")).await.unwrap();
+    assert_eq!(c.cleaned(&key).await.unwrap(), Some(cleaned_at(4)));
+    assert_eq!(record(c, &next, 2).await.unwrap(), cleaned_at(4));
+}
+
+async fn a_record_is_of_its_own_partition_alone(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    record(c, &held, 6).await.unwrap();
+    let sibling = beside(&key, 1);
+    c.register(&sibling).await.unwrap();
+    assert_eq!(c.cleaned(&sibling).await.unwrap(), None);
+    let (other, _) = lease(h, &sibling, &node("b")).await;
+    assert_eq!(record(c, &other, 2).await.unwrap(), cleaned_at(2));
+    assert_eq!(c.cleaned(&key).await.unwrap(), Some(cleaned_at(6)));
+}
+
+async fn a_partition_removed_loses_its_record_and_one_made_again_starts_with_none(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let (zombie, _) = lease(h, &key, &node("a")).await;
+    record(c, &zombie, 7).await.unwrap();
+    assert!(c.remove(&key).await.unwrap());
+    assert!(matches!(
+        c.cleaned(&key).await,
+        Err(CoordinatorError::UnknownPartition(_))
+    ));
+    assert!(matches!(
+        record(c, &zombie, 9).await,
+        Err(CoordinatorError::UnknownPartition(_))
+    ));
+    purge(c, &key.tenant).await;
+    c.register(&key).await.unwrap();
+    assert_eq!(
+        c.cleaned(&key).await.unwrap(),
+        None,
+        "a new incarnation starts empty"
+    );
+    let (fresh, _) = lease(h, &key, &node("b")).await;
+    assert!(fenced(&record(c, &zombie, 9).await, fresh.generation));
+    assert_eq!(c.cleaned(&key).await.unwrap(), None);
+    assert_eq!(record(c, &fresh, 2).await.unwrap(), cleaned_at(2));
+}
+
 async fn ping_succeeds(h: &dyn Harness) {
     h.coordinator().ping().await.unwrap();
 }
@@ -2166,6 +2306,12 @@ conformance! {
     a_purge_is_claimed_only_once_due_and_renewed_only_while_it_is_the_claims_to_do,
     a_purged_tenant_is_looked_over_by_one_node_now_and_then_while_remembered,
     ping_succeeds,
+    a_partition_never_cleaned_has_no_record_and_one_not_registered_is_unknown,
+    a_clean_is_recorded_only_by_the_lease_that_is_current,
+    what_a_clean_recorded_is_only_ever_raised,
+    what_a_clean_recorded_stays_through_leases_and_commits,
+    a_partition_removed_loses_its_record_and_one_made_again_starts_with_none,
+    a_record_is_of_its_own_partition_alone,
 }
 
 /// The test database's connection options.
@@ -2703,6 +2849,130 @@ async fn a_node_starts_on_a_database_a_newer_release_has_migrated() {
     started.expect("a node of the older release starts");
 }
 
+/// One history of what cleans record, as each coordinator answers it.
+async fn answers_to_cleans(h: &dyn Harness) -> Vec<String> {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let mut said = vec![format!("{:?}", c.cleaned(&key).await.unwrap())];
+    let holder = node("a");
+    let (first, _) = lease(h, &key, &holder).await;
+    for position in [4, 2, 4, 6] {
+        said.push(format!("{:?}", record(c, &first, position).await));
+    }
+    said.push(format!("{:?}", c.cleaned(&key).await));
+    let (again, _) = lease(h, &key, &holder).await;
+    said.push(format!(
+        "{:?}",
+        record(c, &first, 9).await.map_err(|_| "fenced")
+    ));
+    said.push(format!("{:?}", record(c, &again, 9).await));
+    c.remove(&key).await.unwrap();
+    said.push(format!(
+        "{:?}",
+        c.cleaned(&key).await.map_err(|_| "unknown")
+    ));
+    purge(c, &key.tenant).await;
+    c.register(&key).await.unwrap();
+    said.push(format!("{:?}", c.cleaned(&key).await));
+    said
+}
+
+/// DW-681: the memory coordinator, which the simulation cleans against,
+/// answers what cleans record just as Postgres does, call for call.
+#[tokio::test]
+async fn postgres_and_memory_answer_what_cleans_record_alike() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let memory = answers_to_cleans(&Memory::new()).await;
+    assert_eq!(answers_to_cleans(&pg).await, memory);
+    assert_eq!(memory.len(), 10, "{memory:?}");
+}
+
+/// DW-681: a coordinator bounded as a node bounds it answers what cleans
+/// record as the one it wraps.
+#[tokio::test]
+async fn a_bounded_coordinator_answers_what_cleans_record_as_the_one_it_wraps() {
+    struct BoundedMemory {
+        memory: Memory,
+        bounded: Bounded,
+    }
+    #[async_trait]
+    impl Harness for BoundedMemory {
+        fn coordinator(&self) -> &dyn Coordinator {
+            &self.bounded
+        }
+        async fn pass(&self, key: &PartitionKey, duration: Duration) {
+            self.memory.pass(key, duration).await;
+        }
+    }
+    let memory = Memory::new();
+    let inner = Arc::new(MemoryCoordinator::new(memory.clock.clone()));
+    let bounded = BoundedMemory {
+        bounded: Bounded::new(inner, Duration::from_secs(10)),
+        memory,
+    };
+    assert_eq!(
+        answers_to_cleans(&bounded).await,
+        answers_to_cleans(&Memory::new()).await
+    );
+}
+
+/// DW-681's migration, rolled forward over a database the release before
+/// left: its partitions gain no record, a record can then be made, half a
+/// record is refused, and a node of the release before still registers
+/// partitions there, which then have none.
+#[tokio::test]
+async fn postgres_the_cleaned_record_rolls_forward_over_the_release_before() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let before = registered(&pg).await;
+    // As the release before left it: no record anywhere.
+    sqlx::raw_sql(
+        "ALTER TABLE vellev.partitions
+             DROP CONSTRAINT cleaned_whole,
+             DROP COLUMN cleaned_below,
+             DROP COLUMN cleaned_position;
+         DELETE FROM vellev.schema_version WHERE version = 11;",
+    )
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+
+    let migrated = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    assert_eq!(migrated.cleaned(&before).await.unwrap(), None);
+    let (held, _) = lease(&pg, &before, &node("a")).await;
+    let (base, position) = base(3);
+    assert_eq!(
+        migrated.clean_below(&held, &base, position).await.unwrap(),
+        cleaned_at(3)
+    );
+    let half = sqlx::query(
+        "UPDATE vellev.partitions SET cleaned_position = NULL
+         WHERE tenant = $1 AND partition = $2",
+    )
+    .bind(before.tenant.as_str())
+    .bind(i64::from(before.partition.0))
+    .execute(&pg.pool)
+    .await;
+    assert!(half.is_err(), "half a record is refused: {half:?}");
+    // A node of the release before inserts its rows naming none of it.
+    let older = crate::key();
+    sqlx::query(
+        "INSERT INTO vellev.partitions (tenant, partition, generation)
+         VALUES ($1, $2, nextval('vellev.generations'))",
+    )
+    .bind(older.tenant.as_str())
+    .bind(i64::from(older.partition.0))
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(migrated.cleaned(&older).await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn postgres_tenants_there_before_lineages_are_each_given_one() {
     let Some(pg) = Pg::connect_beside(HARNESS).await else {
@@ -2718,9 +2988,15 @@ async fn postgres_tenants_there_before_lineages_are_each_given_one() {
     for key in &keys {
         pg.coordinator.register(key).await.unwrap();
     }
-    // As the release before left it: no lineage anywhere.
+    // As the release before left it: no lineage anywhere, nor anything a
+    // later release added.
     sqlx::raw_sql(
-        "DROP TRIGGER removed_tenant ON vellev.partitions;
+        "ALTER TABLE vellev.partitions
+             DROP CONSTRAINT cleaned_whole,
+             DROP COLUMN cleaned_below,
+             DROP COLUMN cleaned_position;
+         DELETE FROM vellev.schema_version WHERE version = 11;
+         DROP TRIGGER removed_tenant ON vellev.partitions;
          DROP FUNCTION vellev.removed_tenant();
          DROP TRIGGER registered_lineage ON vellev.partitions;
          DROP FUNCTION vellev.registered_lineage();

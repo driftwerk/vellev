@@ -11,10 +11,10 @@ use uuid::Uuid;
 use vellev_core::{NodeId, Partition, RequestId, TenantId};
 
 use super::{
-    checked_hold, checked_ttl, checked_window, Acquired, Adoption, ClusterId, Commit, Committed,
-    Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation, KeyHash, Lease,
-    Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges, Removed, Restore,
-    RestorePoint, Restored, Result, TenantKey, Versions, RESTORES_KEPT_FOR,
+    checked_hold, checked_ttl, checked_window, Acquired, Adoption, Cleaned, ClusterId, Commit,
+    Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation,
+    KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges,
+    Removed, Restore, RestorePoint, Restored, Result, TenantKey, Versions, RESTORES_KEPT_FOR,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -28,6 +28,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (8, include_str!("../../migrations/0008_purges.sql")),
     (9, include_str!("../../migrations/0009_restores.sql")),
     (10, include_str!("../../migrations/0010_lineage.sql")),
+    (11, include_str!("../../migrations/0011_cleaned.sql")),
 ];
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
@@ -236,6 +237,19 @@ impl PostgresCoordinator {
         }
         transaction.commit().await?;
         Ok(done)
+    }
+
+    /// The partition's cleaned record, with its generation; none for a
+    /// partition not registered.
+    async fn cleaned_row(&self, key: &PartitionKey) -> Result<Option<CleanedRow>> {
+        Ok(sqlx::query_as(
+            "SELECT generation, cleaned_below, cleaned_position
+             FROM vellev.partitions WHERE tenant = $1 AND partition = $2",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     /// Why a fenced statement on `lease` changed no row. `Ok` means the
@@ -550,6 +564,33 @@ impl Snapshot {
             .clone()
             .map(NodeId::from)
             .zip(self.lease_expires_at)
+    }
+}
+
+/// What a clean of a partition last recorded it deletes below, as its row
+/// keeps it, with the row's generation.
+#[derive(FromRow)]
+struct CleanedRow {
+    #[sqlx(try_from = "i64")]
+    generation: Generation,
+    cleaned_below: Option<String>,
+    cleaned_position: Option<i64>,
+}
+
+impl CleanedRow {
+    fn cleaned(&self) -> Result<Option<Cleaned>> {
+        match (&self.cleaned_below, self.cleaned_position) {
+            (Some(base), Some(position)) => Ok(Some(Cleaned {
+                base: ManifestRef(base.clone()),
+                position: LogPosition(u64::try_from(position).map_err(|error| {
+                    invariant(format!("a cleaned position {position}: {error}"))
+                })?),
+            })),
+            (None, None) => Ok(None),
+            _ => Err(invariant(
+                "a partition's cleaned record is half there".into(),
+            )),
+        }
     }
 }
 
@@ -879,6 +920,48 @@ impl Coordinator for PostgresCoordinator {
 
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>> {
         Ok(self.row(key).await?.as_ref().map(Snapshot::committed))
+    }
+
+    async fn cleaned(&self, key: &PartitionKey) -> Result<Option<Cleaned>> {
+        self.cleaned_row(key)
+            .await?
+            .ok_or_else(|| CoordinatorError::UnknownPartition(key.clone()))?
+            .cleaned()
+    }
+
+    async fn clean_below(
+        &self,
+        lease: &Lease,
+        base: &ManifestRef,
+        position: LogPosition,
+    ) -> Result<Cleaned> {
+        let raised: Option<CleanedRow> = sqlx::query_as(
+            "UPDATE vellev.partitions
+             SET cleaned_below = $4, cleaned_position = $5
+             WHERE tenant = $1 AND partition = $2 AND generation = $3
+               AND (cleaned_position IS NULL OR cleaned_position < $5)
+             RETURNING generation, cleaned_below, cleaned_position",
+        )
+        .bind(lease.key.tenant.as_str())
+        .bind(i64::from(lease.key.partition.0))
+        .bind(bigint(lease.generation.0)?)
+        .bind(base.0.as_str())
+        .bind(bigint(position.0)?)
+        .fetch_optional(&self.pool)
+        .await?;
+        let row = match raised {
+            Some(row) => row,
+            // Fenced, or the record is as high already: which, the row says.
+            None => match self.cleaned_row(&lease.key).await? {
+                None => return Err(CoordinatorError::UnknownPartition(lease.key.clone())),
+                Some(row) if row.generation != lease.generation => {
+                    return Err(lease.fenced_by(row.generation))
+                }
+                Some(row) => row,
+            },
+        };
+        row.cleaned()?
+            .ok_or_else(|| invariant("a cleaned record neither raised nor there".into()))
     }
 
     async fn partitions(

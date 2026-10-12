@@ -570,6 +570,20 @@ impl Coordinator for SimCoordinator {
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
         self.clean.committed(key).await
     }
+    async fn cleaned(
+        &self,
+        key: &PartitionKey,
+    ) -> Result<Option<vellev_storage::coordinator::Cleaned>, CoordinatorError> {
+        self.clean.cleaned(key).await
+    }
+    async fn clean_below(
+        &self,
+        lease: &Lease,
+        base: &vellev_storage::coordinator::ManifestRef,
+        position: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Cleaned, CoordinatorError> {
+        self.clean.clean_below(lease, base, position).await
+    }
     async fn partitions(
         &self,
         after: Option<&PartitionKey>,
