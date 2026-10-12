@@ -119,8 +119,16 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     /// what the file under `from` holds, the copy on local disk `from` has,
     /// without copying it. Never fails: a store that cannot says so, and
     /// the caller reads `to` as any file.
-    async fn link_local(&self, _from: &str, _to: &str) -> Result<Linked> {
-        Ok(Linked::Unlinked)
+    ///
+    /// By default nothing is linked: a store with a copy of `from` on
+    /// local disk, which may have been read in place, has not given it to
+    /// `to`; one without, whose files are read whole into memory, has
+    /// nothing to give.
+    async fn link_local(&self, from: &str, _to: &str) -> Result<Linked> {
+        Ok(match self.local(from).await {
+            Ok(None) => Linked::Unmapped,
+            Ok(Some(_)) | Err(_) => Linked::Unlinked,
+        })
     }
 }
 
@@ -1757,6 +1765,70 @@ impl Blobs for CachedBlobs {
             source: error.into(),
         })
     }
+
+    /// A hard link of the copy of `from` under the name of `to`'s, made
+    /// under a name drawn at random and renamed into place, so that it is
+    /// there whole or not at all, on one thread of the disk's. Both names
+    /// are one file from then on: a delete of either removes that name
+    /// alone. The new name is taken as summed only if the old one was, as
+    /// it lay just before, and the new is the very file it was.
+    ///
+    /// Not linked if either key is not a plain one, or the copy of `from`
+    /// is not there, or the disk will not make the link, as across disks
+    /// or in time: the caller then reads `to` as any file. Nothing is
+    /// linked off Unix, where no file is read in place (see
+    /// `Partition::column`), and nothing is to be.
+    ///
+    /// A link the caller stops waiting for, or that fails, may yet be
+    /// made by the thread still at it, after a delete of `to` has removed
+    /// whatever copy there was: the copy would then lie under a key the
+    /// store no longer has. So it goes as a fetch given up does (see
+    /// [`Partial`]): the new name is removed once the link is given up,
+    /// and the thread removes it itself if it renames after that.
+    /// Whichever of the two comes last leaves nothing under `to`.
+    async fn link_local(&self, from: &str, to: &str) -> Result<Linked> {
+        let (Some(old), Some(new)) = (self.path(from), self.path(to)) else {
+            return Ok(Linked::Unlinked);
+        };
+        if cfg!(not(unix)) {
+            return Ok(Linked::Unmapped);
+        }
+        let mut linking = Partial {
+            disk: self.disk.clone(),
+            path: Some(new.clone()),
+            given_up: Arc::default(),
+        };
+        let linked = linking.step(move |new| {
+            let before = crate::column::seen(&old)?;
+            let summed = crate::column::summed_before(&before);
+            let parent = new
+                .parent()
+                .ok_or_else(|| std::io::Error::other("cache path has no parent"))?;
+            std::fs::create_dir_all(parent)?;
+            let partial = partial(new);
+            std::fs::hard_link(&old, &partial)?;
+            crate::column::forget_summed(new);
+            if let Err(error) = std::fs::rename(&partial, new) {
+                let _ = std::fs::remove_file(&partial);
+                return Err(error);
+            }
+            let after = crate::column::seen(new)?;
+            if summed && after.same_file(&before) {
+                crate::column::remember_summed(after);
+            }
+            Ok(())
+        });
+        match self.disk.run(0, linked).await {
+            Ok(()) => {
+                linking.path = None;
+                Ok(Linked::Linked(new))
+            }
+            Err(error) => {
+                tracing::warn!(from, to, %error, "a copy on local disk is not linked to a new key");
+                Ok(Linked::Unlinked)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2556,7 +2628,9 @@ mod tests {
     }
 
     /// No copy of the file on local disk, or no plain key, is no link: the
-    /// caller reads the new key as any file.
+    /// caller reads the new key as any file. (Off Unix nothing is read in
+    /// place, and nothing is linked.)
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_copy_not_on_local_disk_is_not_linked() {
         let (_dir, cached) = cache();

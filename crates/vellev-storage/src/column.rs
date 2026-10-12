@@ -203,6 +203,14 @@ struct Lay {
     changed: Option<(i64, i64)>,
 }
 
+impl Seen {
+    /// Whether `other` is the very file this is, under whatever name:
+    /// the same file of the same disk, where the system tells which.
+    pub(crate) fn same_file(&self, other: &Seen) -> bool {
+        self.lay.file.is_some() && self.lay.file == other.lay.file
+    }
+}
+
 /// The file at `path` as it lies now.
 pub(crate) fn seen(path: &Path) -> std::io::Result<Seen> {
     let meta = std::fs::metadata(path)?;

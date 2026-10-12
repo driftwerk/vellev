@@ -1708,7 +1708,7 @@ async fn a_restore_from_its_own_backup_links_the_vectors_it_holds_on_local_disk(
 #[derive(Debug)]
 struct SlowDisk {
     inner: Arc<CachedBlobs>,
-    failure: fn(&str) -> StorageError,
+    failure: Failure,
     failed: Mutex<BTreeSet<String>>,
     fetches: AtomicUsize,
 }
@@ -1752,32 +1752,35 @@ impl Blobs for SlowDisk {
     }
 }
 
+/// How a fetch fails, of the file under the key it is given.
+type Failure = fn(&str) -> StorageError;
+
 /// A local disk that was slow once: what failed to be fetched to it is
 /// fetched again and the restore goes on. Any other failure, of the
 /// store or of what was fetched, is not tried again: it fails the restore.
 #[tokio::test]
 async fn a_restore_tries_a_fetch_to_a_slow_local_disk_again_and_nothing_else() {
-    let slow: fn(&str) -> StorageError = |key| StorageError::Blob {
+    let slow: Failure = |key| StorageError::Blob {
         key: key.to_string(),
         source: Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "local disk did not answer within 10.8s",
         )),
     };
-    let unanswered: fn(&str) -> StorageError =
+    let unanswered: Failure =
         |key| vellev_storage::blobs::unanswered(key, Duration::from_secs(187));
-    let other_disk: fn(&str) -> StorageError = |key| StorageError::Blob {
+    let other_disk: Failure = |key| StorageError::Blob {
         key: key.to_string(),
         source: Box::new(std::io::Error::other("no space left")),
     };
-    let wrapped: fn(&str) -> StorageError = |key| {
+    let wrapped: Failure = |key| {
         let inner = StorageError::Blob {
             key: key.to_string(),
             source: Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow")),
         };
         StorageError::Shared(Arc::new(inner))
     };
-    let cases: [(&str, fn(&str) -> StorageError, bool); 4] = [
+    let cases: [(&str, Failure, bool); 4] = [
         ("a local disk that timed out", slow, true),
         ("a store that did not answer", unanswered, false),
         ("a local disk otherwise failing", other_disk, false),
