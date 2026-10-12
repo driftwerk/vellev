@@ -92,7 +92,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 use vellev_core::{RequestId, TenantId};
 use vellev_storage::backups::{Backup, Backups, Held, Owner};
-use vellev_storage::blobs::{unanswered, Blobs, Listed};
+use vellev_storage::blobs::{unanswered, Blobs, Created, Listed};
 use vellev_storage::coordinator::{
     Adoption, Coordinator, CoordinatorError, Generation, Identity, LogPosition, ManifestRef,
     PartitionKey, Restored, MAX_BACKUP_HOLD,
@@ -779,6 +779,13 @@ impl Blobs for Within {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         self.bounded(key, self.inner.put(key, bytes)).await
     }
+    /// A create given up may have landed, as a put given up may.
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        self.bounded(key, self.inner.put_new(key, bytes)).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
+    }
     /// The store is given `within` each time it is left to itself: from
     /// when it is asked until it asks for the first part, from each part
     /// it is handed until it asks for the next, and from the end of them
@@ -868,6 +875,12 @@ struct Deleting {
 impl Blobs for Deleting {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         self.inner.put(key, bytes).await
+    }
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        self.inner.put_new(key, bytes).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
     }
     async fn put_parts(
         &self,
@@ -1300,6 +1313,13 @@ mod tests {
         async fn put(&self, key: &str, _bytes: Bytes) -> vellev_storage::Result<()> {
             Err(whole(key))
         }
+        /// Answered as created once `each` has passed, or never if silent
+        /// the first time.
+        async fn put_new(&self, _key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+            self.paced(0).await;
+            *self.kept.lock().unwrap() = vec![bytes];
+            Ok(Created::Written)
+        }
         async fn put_parts(
             &self,
             _key: &str,
@@ -1451,6 +1471,68 @@ mod tests {
         let never = stream::pending().boxed();
         unanswered_within(ended(store.put_parts("file", never)).await);
         assert_eq!(started.elapsed(), EACH + WITHIN);
+    }
+
+    fn in_memory() -> Arc<dyn Blobs> {
+        let store = object_store::memory::InMemory::new();
+        Arc::new(vellev_storage::blobs::ObjectBlobs::new(Arc::new(store)))
+    }
+
+    #[tokio::test]
+    async fn a_file_is_created_only_once_through_a_bounded_store_as_through_the_store_itself() {
+        let inner = in_memory();
+        let store = Within {
+            inner: inner.clone(),
+            within: WITHIN,
+        };
+        assert!(inner.creates_at_most().is_some());
+        assert_eq!(store.creates_at_most(), inner.creates_at_most());
+        let first = store.put_new("file", Bytes::from("A")).await.unwrap();
+        assert_eq!(first, Created::Written);
+        let second = store.put_new("file", Bytes::from("B")).await.unwrap();
+        assert_eq!(second, Created::AlreadyThere);
+        assert_eq!(inner.get("file").await.unwrap(), "A");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_create_through_a_bounded_store_is_given_up_within_the_bound() {
+        let answering = Arc::new(Paced {
+            each: EACH,
+            ..Paced::default()
+        });
+        let started = Instant::now();
+        let created = ended(bounded(answering.clone()).put_new("file", "A".into())).await;
+        assert_eq!(created.unwrap(), Created::Written);
+        assert_eq!(started.elapsed(), EACH);
+        assert_eq!(*answering.kept.lock().unwrap(), vec![Bytes::from("A")]);
+
+        let silent = Arc::new(Paced {
+            each: EACH,
+            silent: Some(0),
+            ..Paced::default()
+        });
+        let started = Instant::now();
+        let created = ended(bounded(silent).put_new("file", "A".into())).await;
+        unanswered_within(created.map(|_| ()));
+        assert_eq!(started.elapsed(), WITHIN);
+    }
+
+    #[tokio::test]
+    async fn a_create_through_a_store_that_notes_deletes_is_made_and_is_no_delete() {
+        let inner = in_memory();
+        let sent = Arc::new(AtomicBool::new(false));
+        let store = Deleting {
+            inner: inner.clone(),
+            sent: sent.clone(),
+        };
+        assert!(inner.creates_at_most().is_some());
+        assert_eq!(store.creates_at_most(), inner.creates_at_most());
+        let first = store.put_new("file", Bytes::from("A")).await.unwrap();
+        assert_eq!(first, Created::Written);
+        let second = store.put_new("file", Bytes::from("B")).await.unwrap();
+        assert_eq!(second, Created::AlreadyThere);
+        assert_eq!(inner.get("file").await.unwrap(), "A");
+        assert!(!sent.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]

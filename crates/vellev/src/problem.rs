@@ -181,6 +181,7 @@ fn code(error: &StorageError) -> Code {
         E::BackupLacks { .. } => Code::Conflict,
         E::Missing { .. }
         | E::Corrupt { .. }
+        | E::NotCreated { .. }
         | E::UnusableRecords { .. }
         | E::UnsupportedVersion { .. }
         | E::Exhausted(_)
