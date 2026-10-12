@@ -313,6 +313,12 @@ pub(crate) fn summed_before(file: &Seen) -> bool {
     summed().holds(file)
 }
 
+/// Remember that `file` was summed as it lies: it is another name of a
+/// file this process summed, and proved the same.
+pub(crate) fn remember_summed(file: Seen) {
+    summed().remember(file);
+}
+
 /// Remember no longer that the file at `path` was summed: its copy is
 /// removed or replaced.
 pub(crate) fn forget_summed(path: &Path) {

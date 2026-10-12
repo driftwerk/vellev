@@ -115,6 +115,26 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     async fn forget_local(&self, _prefix: &str) -> Result<()> {
         Ok(())
     }
+    /// Give the file under `to`, which the caller has seen to hold just
+    /// what the file under `from` holds, the copy on local disk `from` has,
+    /// without copying it. Never fails: a store that cannot says so, and
+    /// the caller reads `to` as any file.
+    async fn link_local(&self, _from: &str, _to: &str) -> Result<Linked> {
+        Ok(Linked::Unlinked)
+    }
+}
+
+/// What came of [`Blobs::link_local`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Linked {
+    /// The copy on local disk is the new key's too, lying here.
+    Linked(PathBuf),
+    /// The store keeps no copy it reads in place: nothing to link, and
+    /// nothing of a file read from it is held by a name.
+    Unmapped,
+    /// Not linked: whatever was read of `from` in place is not to be
+    /// taken for `to`'s.
+    Unlinked,
 }
 
 /// What came of [`Blobs::put_new`].
@@ -2485,5 +2505,113 @@ mod tests {
             Err(StorageError::Missing { .. })
         ));
         assert!(cached.local(key).await.unwrap().is_none());
+    }
+
+    /// A cache over a store in memory, in a directory of its own.
+    fn cache() -> (tempfile::TempDir, CachedBlobs) {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let cached = CachedBlobs::new(inner, dir.path());
+        (dir, cached)
+    }
+
+    fn vectors(n: u8) -> String {
+        format!("tenant-a/0/vectors/0000000000000000000{n}-x.vectors")
+    }
+
+    fn frame(n: u8) -> Bytes {
+        crate::format::encode(crate::format::Kind::Index, &n).unwrap()
+    }
+
+    /// A file's copy on local disk is given to another key that holds the
+    /// same, as the one file under both names: either name deleted leaves
+    /// the other, and nothing is left part written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_on_local_disk_is_linked_to_a_key_holding_the_same() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, cached) = cache();
+        let (from, to) = (vectors(1), vectors(2));
+        cached.put(&from, frame(1)).await.unwrap();
+        cached.inner.put(&to, frame(1)).await.unwrap();
+
+        let linked = cached.link_local(&from, &to).await.unwrap();
+
+        let (from_path, to_path) = (dir.path().join(&from), dir.path().join(&to));
+        assert_eq!(linked, Linked::Linked(to_path.clone()));
+        let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+        assert_eq!(inode(&from_path), inode(&to_path));
+        let near: Vec<_> = std::fs::read_dir(to_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(near.len(), 2, "{near:?}");
+
+        cached.delete(&from).await.unwrap();
+        assert_eq!(std::fs::read(&to_path).unwrap(), frame(1));
+        assert!(cached.local(&to).await.unwrap().is_some());
+        cached.put(&from, frame(1)).await.unwrap();
+        cached.delete(&to).await.unwrap();
+        assert!(cached.local(&from).await.unwrap().is_some());
+    }
+
+    /// No copy of the file on local disk, or no plain key, is no link: the
+    /// caller reads the new key as any file.
+    #[tokio::test]
+    async fn a_copy_not_on_local_disk_is_not_linked() {
+        let (_dir, cached) = cache();
+        let (from, to) = (vectors(1), vectors(2));
+        cached.inner.put(&from, frame(1)).await.unwrap();
+        cached.inner.put(&to, frame(1)).await.unwrap();
+        assert_eq!(
+            cached.link_local(&from, &to).await.unwrap(),
+            Linked::Unlinked
+        );
+        assert!(cached.local(&to).await.unwrap().is_none());
+        let stray = "tenant-a/0/../vectors/x.vectors";
+        assert_eq!(
+            cached.link_local(stray, &to).await.unwrap(),
+            Linked::Unlinked
+        );
+    }
+
+    /// A store that reads nothing in place has nothing to link; one that
+    /// reads its own files in place cannot give one key another's.
+    #[tokio::test]
+    async fn a_store_without_a_cache_links_nothing() {
+        let (from, to) = (vectors(1), vectors(2));
+        let memory = ObjectBlobs::new(Arc::new(InMemory::new()));
+        assert_eq!(
+            memory.link_local(&from, &to).await.unwrap(),
+            Linked::Unmapped
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let files = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let on_disk = ObjectBlobs::on_disk(Arc::new(files), dir.path());
+        on_disk.put(&from, frame(1)).await.unwrap();
+        assert_eq!(
+            on_disk.link_local(&from, &to).await.unwrap(),
+            Linked::Unlinked
+        );
+    }
+
+    /// The copy linked is taken as summed under its new name only if it
+    /// was summed under the old, as it lay just before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_copy_is_taken_as_summed_only_if_the_old_one_was() {
+        let (dir, cached) = cache();
+        let (from, to) = (vectors(3), vectors(4));
+        for (summed, from, to) in [(false, vectors(5), vectors(6)), (true, from, to)] {
+            cached.put(&from, frame(1)).await.unwrap();
+            cached.inner.put(&to, frame(1)).await.unwrap();
+            let from_path = dir.path().join(&from);
+            if summed {
+                crate::column::remember_summed(crate::column::seen(&from_path).unwrap());
+            }
+            cached.link_local(&from, &to).await.unwrap();
+            let to_seen = crate::column::seen(&dir.path().join(&to)).unwrap();
+            assert_eq!(crate::column::summed_before(&to_seen), summed, "{summed}");
+        }
     }
 }

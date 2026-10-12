@@ -3302,4 +3302,219 @@ mod tests {
             }
         }
     }
+
+    /// The right a restore from a source is made under, never lost.
+    struct Always;
+
+    #[async_trait::async_trait]
+    impl crate::backups::Held for Always {
+        async fn held(&self) -> Result<bool> {
+            Ok(true)
+        }
+        fn still(&self) -> bool {
+            true
+        }
+    }
+
+    /// The files `writer`'s partition is loaded from, as committed, copied
+    /// into a store of their own by the keys they have: a backup of it.
+    async fn own_backup(
+        writer: &Writer,
+        coordinator: &MemoryCoordinator,
+    ) -> (Arc<dyn Blobs>, Committed) {
+        let committed = coordinator
+            .committed(&writer.lease.key)
+            .await
+            .unwrap()
+            .unwrap();
+        let blobs = writer.partition.blobs.clone();
+        let files = Partition::files(writer.lease.key.clone(), blobs.clone(), &committed);
+        let source: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        for key in files.await.unwrap() {
+            source
+                .put(&key, blobs.get(&key).await.unwrap())
+                .await
+                .unwrap();
+        }
+        (source, committed)
+    }
+
+    /// Restore `writer`'s partition from `source` at `committed`.
+    async fn restored_from(
+        writer: &Writer,
+        source: Arc<dyn Blobs>,
+        committed: &Committed,
+    ) -> Result<LogPosition> {
+        let restore = Restore {
+            request: vellev_core::RequestId::generate(),
+            asked: [0; 32],
+            from: committed.log_position,
+            from_at: chrono::Utc::now(),
+        };
+        let head = committed.manifest.as_ref();
+        let ready = writer
+            .restore_from(source, head, restore, None, &Always)
+            .await?;
+        ready.commit().await
+    }
+
+    /// The segments the partition holds, each file by where it lies in
+    /// memory.
+    fn segment_files(partition: &Partition) -> Vec<*const SegmentFile> {
+        partition.read(|state| {
+            let held = state.loaded_segments();
+            held.map(|(_, loaded)| Arc::as_ptr(&loaded.file)).collect()
+        })
+    }
+
+    /// A writer with two segments flushed, each with its vectors, and a
+    /// row written after them.
+    async fn flushed_twice(blobs: Arc<dyn Blobs>) -> (Writer, Arc<MemoryCoordinator>) {
+        let (writer, coordinator) = writer_on(blobs).await;
+        writer.commit(vec![create(), upsert(1)]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.commit(vec![upsert(2)]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.commit(vec![upsert(3)]).await.unwrap();
+        (writer, coordinator)
+    }
+
+    fn ns(partition: &Partition) -> Vec<bool> {
+        let id = |n: u8| ObjectId(uuid::Uuid::from_u128(u128::from(n)));
+        partition.read(|state| {
+            (1..=3)
+                .map(|n| state.get(&notes(), id(n)).is_some())
+                .collect()
+        })
+    }
+
+    /// A tenant put back from its own backup taken a moment ago takes each
+    /// segment the live state holds as it is, decoded once already: its
+    /// copy is streamed back and seen to be whole and to be what the
+    /// backup sent.
+    #[tokio::test]
+    async fn a_restore_from_its_own_backup_takes_the_segments_it_holds_as_they_are() {
+        let (writer, coordinator) = flushed_twice(memory()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let before = segment_files(&writer.partition);
+        assert_eq!(before.len(), 2);
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        for held in &before {
+            assert!(after.contains(held), "a segment was decoded again");
+        }
+        assert_eq!(ns(&writer.partition), [true, true, true]);
+    }
+
+    /// A store whose `parts` of a file of `kind` fail, the first time each
+    /// such file is asked for, or always.
+    #[derive(Debug)]
+    struct Unstreamed {
+        inner: Arc<dyn Blobs>,
+        kind: &'static str,
+        once: bool,
+        failed: std::sync::Mutex<HashSet<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Blobs for Unstreamed {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
+            self.inner.put(key, bytes).await
+        }
+        async fn put_parts(
+            &self,
+            key: &str,
+            parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+        ) -> Result<()> {
+            self.inner.put_parts(key, parts).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.inner.get(key).await
+        }
+        fn parts<'a>(&'a self, key: &'a str) -> futures::stream::BoxStream<'a, Result<Bytes>> {
+            use futures::StreamExt;
+            let first = self.failed.lock().unwrap().insert(key.to_string());
+            if key.contains(self.kind) && (first || !self.once) {
+                let lost = StorageError::Missing {
+                    key: key.to_string(),
+                };
+                return futures::stream::once(async { Err(lost) }).boxed();
+            }
+            self.inner.parts(key)
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    fn memory() -> Arc<dyn Blobs> {
+        Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))
+    }
+
+    /// A copy that cannot be streamed back is not taken for the segment the
+    /// live state holds: the segment is decoded from it, read as any file.
+    #[tokio::test]
+    async fn a_copy_that_cannot_be_streamed_back_is_decoded_and_not_taken_as_held() {
+        let inner = memory();
+        let (writer, coordinator) = flushed_twice(inner.clone()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let before = segment_files(&writer.partition);
+        // The writer's store, its restores' copies of segments failing to
+        // stream the first time each is asked for.
+        let unstreamed = Arc::new(Unstreamed {
+            inner,
+            kind: "-restored.segment",
+            once: true,
+            failed: Default::default(),
+        });
+        let (lease, at) = (writer.lease.clone(), committed.clone());
+        drop(writer);
+        let writer = Writer::open(unstreamed, coordinator.clone(), lease, &at)
+            .await
+            .unwrap();
+        let before_reopened = segment_files(&writer.partition);
+        assert_ne!(before, before_reopened);
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        for held in &before_reopened {
+            assert!(!after.contains(held), "a segment was taken unproved");
+        }
+        assert_eq!(ns(&writer.partition), [true, true, true]);
+    }
+
+    /// A backup whose file is damaged, copied whole, makes a copy that
+    /// streams back just as the backup sent it; it is not taken for the
+    /// segment the live state holds, whose good copy would hide it. It is
+    /// decoded, which fails, and nothing is committed.
+    #[tokio::test]
+    async fn a_copy_of_a_damaged_backup_file_is_not_taken_as_the_segment_held() {
+        let (writer, coordinator) = flushed_twice(memory()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let listed = source.list("").await.unwrap();
+        let segment = listed
+            .iter()
+            .find(|file| file.key.contains("/segment/"))
+            .unwrap();
+        let mut frame = source.get(&segment.key).await.unwrap().to_vec();
+        let last = frame.len() - 1;
+        frame[last] ^= 1;
+        source.put(&segment.key, Bytes::from(frame)).await.unwrap();
+
+        let refused = restored_from(&writer, source, &committed).await;
+
+        assert!(refused.is_err(), "{refused:?}");
+        let now = coordinator
+            .committed(&writer.lease.key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(now, committed);
+    }
 }
