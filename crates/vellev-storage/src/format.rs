@@ -444,6 +444,20 @@ fn kind(key: &str, header: &[u8]) -> Result<Kind> {
     Kind::from_byte(header[4]).ok_or_else(|| corrupt("unknown file kind"))
 }
 
+/// The kind of file the first [`BODY`] bytes of a frame say it is, if it is
+/// a vellev file of a format this release reads: for a frame read as it
+/// comes, before its body has.
+pub(crate) fn kind_of_header(key: &str, header: &[u8]) -> Result<Kind> {
+    let corrupt = |reason: &str| StorageError::corrupt(key, reason);
+    let header = header
+        .get(..HEADER)
+        .ok_or_else(|| corrupt("shorter than a frame header"))?;
+    if header[..4] != MAGIC {
+        return Err(corrupt("not a vellev file"));
+    }
+    kind(key, header)
+}
+
 /// As [`open`], leaving the checksum to whoever asked: for a file read in
 /// place, too large to sum before anyone may be told how it goes. Until
 /// the sum is seen to hold, the body may be anything.
