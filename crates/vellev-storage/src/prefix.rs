@@ -476,7 +476,10 @@ mod tests {
 
         // Every other form a value may take, each with something after
         // it, so that skipping one too few or too many bytes is seen.
-        let mut body = vec![0x8c];
+        // What a value holds is 0xc1, which MessagePack never uses, so a
+        // misread lands on it and fails rather than reads on out of step.
+        let poison = |count: usize| vec![0xc1; count];
+        let mut body = vec![0x8f];
         let mut entry = |key: &str, value: &[u8]| {
             body.push(0xa0 | key.len() as u8);
             body.extend_from_slice(key.as_bytes());
@@ -492,13 +495,16 @@ mod tests {
         entry("f4", &[0xd6, 1, 9, 9, 9, 9]);
         entry("f8", &[0xd7, 1, 9, 9, 9, 9, 9, 9, 9, 9]);
         entry("float", &[0xca, 0x3f, 0x80, 0, 0]);
+        entry("f64", &[[0xcb].as_slice(), &poison(8)].concat());
+        entry("b8", &[[0xc4, 2].as_slice(), &poison(2)].concat());
+        entry("fs", &[[0xb4].as_slice(), &poison(20)].concat());
         entry("position", &[0x07]);
         entry("prev", &[0xc0]);
         assert_eq!(found(&raw(&body)).unwrap(), found_at(7, None));
 
         // A map of 16 bits of length, and a key that is not text, which
         // is skipped with its value.
-        let mut body = vec![0xde, 0, 3, 0x01, 0xa1, b'x'];
+        let mut body = vec![0xde, 0, 3, 0xcd, 0, 5, 0xa1, 0xc1];
         body.extend_from_slice(&[0xa8]);
         body.extend_from_slice(b"position");
         body.extend_from_slice(&[0xcd, 0x01, 0x2c, 0xa4]);
