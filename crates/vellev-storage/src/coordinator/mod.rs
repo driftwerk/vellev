@@ -110,6 +110,16 @@ pub struct Committed {
     pub manifest: Option<ManifestRef>,
 }
 
+/// What a clean of a partition last recorded it deletes below: the key of
+/// the checkpoint that was its base, and that checkpoint's position. Every
+/// checkpoint a clean has deleted lies below it, since a clean records it
+/// before its first delete and it is only ever raised (DW-681).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cleaned {
+    pub base: ManifestRef,
+    pub position: LogPosition,
+}
+
 /// What a commit was built on: the position and the head committed just
 /// before it, as its writer had them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +374,30 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
 
     /// The committed state, as a follower reads it.
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>>;
+
+    /// What a clean of the partition last recorded it deletes below, if
+    /// any clean of this incarnation has: see [`Self::clean_below`]. Fails
+    /// for a partition not registered.
+    async fn cleaned(&self, key: &PartitionKey) -> Result<Option<Cleaned>>;
+
+    /// Record, as the holder of `lease`, that a clean is about to delete
+    /// below the checkpoint `base` at `position`, and return the record as
+    /// it then stands. Fenced, and nothing recorded, when the lease's
+    /// generation is no longer current, as a commit is. The record is only
+    /// ever raised: one already at `position` or above is left as it is,
+    /// and returned, which is not an error, so that a clean whose base is
+    /// below the record deletes on what the record already says. A record
+    /// returned that names another key at or above `position` is not of
+    /// this partition's chain, and the clean that asked keeps to what it
+    /// would do with none. The record goes with the partition's row when
+    /// it is removed. Every coordinator has its own: there is no default,
+    /// so that one that does not record can never seem to.
+    async fn clean_below(
+        &self,
+        lease: &Lease,
+        base: &ManifestRef,
+        position: LogPosition,
+    ) -> Result<Cleaned>;
 
     /// Up to `limit` registered partitions after `after`, in key order,
     /// tenants comparing byte by byte.
