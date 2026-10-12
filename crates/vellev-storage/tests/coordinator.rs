@@ -2486,6 +2486,20 @@ async fn a_base_below_the_hold_or_its_row_or_a_clean_is_refused(h: &dyn Harness)
         &c.record_base(&key, now, &ship_base(2, 2, "m2")).await,
         Stale::NoRowAtBase
     ));
+    // So with the checkpoint's own row still there: the base's alone gone.
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(h, &key, &[(1, "l1"), (2, "l2"), (3, "m3")]).await;
+    c.hold_for_shipping(&key, now, LogPosition(3))
+        .await
+        .unwrap();
+    h.pass(&key, 2 * HOUR).await;
+    committed_heads(h, &key, &[(4, "l4")]).await;
+    c.forget_history(&key, HOUR).await.unwrap();
+    assert!(stale(
+        &c.record_base(&key, now, &ship_base(2, 3, "m3")).await,
+        Stale::NoRowAtBase
+    ));
     // A clean recorded above the checkpoint, as one may until clean_below
     // honours the cap.
     let key = registered(h).await;
