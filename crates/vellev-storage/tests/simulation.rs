@@ -5618,8 +5618,7 @@ async fn newest_checkpoint(world: &World) -> (LogPosition, ManifestRef) {
         .unwrap();
     let row = rows
         .into_iter()
-        .filter(|row| row.head.0.ends_with(".manifest"))
-        .last()
+        .rfind(|row| row.head.0.ends_with(".manifest"))
         .expect("a checkpoint");
     (row.position, row.head)
 }
