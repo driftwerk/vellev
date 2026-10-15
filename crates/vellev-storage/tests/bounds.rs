@@ -574,9 +574,16 @@ async fn an_abort_answered_is_waited_for_no_longer() {
     settled(|| async { store.parts.load(Ordering::SeqCst) == 2 }).await;
     putting.abort();
     assert!(putting.await.unwrap_err().is_cancelled());
+    let begun = Instant::now();
     assert_eq!(elsewhere.finished(Duration::from_secs(5)).await, 0);
     assert_eq!(aborts.finished(Duration::from_secs(5)).await, 0);
+    assert!(
+        begun.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        begun.elapsed()
+    );
     assert_eq!(store.aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(aborts.pending(), 0);
 }
 
 #[tokio::test(start_paused = true)]

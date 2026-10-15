@@ -455,7 +455,9 @@ so a key is rotated by trusting the new one beside the old.
 ready, keeps serving for `VELLEV_STOP_DELAY_SECS` (a few seconds on Docker
 Swarm; none is needed on ECS), finishes what is in flight within
 `VELLEV_DRAIN_SECS`, and lets go of its tenants; keep both under the
-platform's grace period. A node answers `/health/live` as
+platform's grace period. It then waits, for `VELLEV_DRAIN_SECS` again at
+the most, for the aborts of uploads the stop cut off; keep the delay and
+twice the drain under the grace period for those to be sent too. A node answers `/health/live` as
 soon as it is up and `/health/ready` once it has reached Postgres; until then
 the API answers 503.
 
@@ -686,8 +688,9 @@ dead connection passes to another node rather than waiting with it:
   four tries and the waits could have run out (three minutes and seven
   seconds by default). A range of a file coming down that is given up is
   asked for once more, from the bytes that had come.
-- An upload that fails, or whose caller stops waiting, is aborted. One cut
-  off too abruptly for that, as by a crash, leaves parts in the bucket:
+- An upload that fails, or whose caller stops waiting, is aborted, and a
+  node told to stop waits for those aborts before it exits (see above). One
+  cut off too abruptly for that, as by a crash, leaves parts in the bucket:
   give it a lifecycle rule that aborts incomplete multipart uploads after a
   day (`AbortIncompleteMultipartUpload`).
 - Each step on the cache directory is waited for ten seconds and as long
