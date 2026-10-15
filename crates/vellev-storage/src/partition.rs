@@ -15,8 +15,8 @@ use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Listed, Local, Transfe
 use crate::catalog::Catalog;
 use crate::column::{self, Column};
 use crate::coordinator::{
-    Clock, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation, Lease,
-    Lineage, LogPosition, ManifestRef, PartitionKey, Prior, Restore, SystemClock,
+    Cleaned, Clock, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation,
+    Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Prior, Restore, SystemClock,
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
@@ -1830,13 +1830,35 @@ impl Writer {
     /// bound near their defaults and no more; nor does any margin cover a
     /// clock wrong by more than it, or a flush or a merge that holds the
     /// building lock for longer. Deciding this by the coordinator's rows
-    /// instead of by time is DW-681, with the clean floor of DW-668.
+    /// instead of by time is the clean floor's, a change of its own.
     ///
     /// What is needed is decided by the committed chain alone: it is walked
     /// back to the latest checkpoint before the oldest recent file, and
     /// everything before that checkpoint which no checkpoint on the way
     /// lists goes. A restore's checkpoint lists segments far older than
     /// itself, which stay for as long as it is on the way.
+    ///
+    /// What a clean has deleted stays deleted, and nothing else is taken
+    /// for it (DW-681). Each clean deletes the checkpoint before the one it
+    /// deletes below, and a later one that keeps more, because a file under
+    /// an old position is young to it or because it is given more grace or
+    /// reckons by a clock behind, walks back to that checkpoint. Before its
+    /// first delete a clean therefore records, in the coordinator and as
+    /// the holder of its lease, the checkpoint it deletes below, and the
+    /// record is only ever raised; so every checkpoint a clean has deleted
+    /// lies below the one recorded. A walk that has passed the recorded
+    /// checkpoint and finds a checkpoint's predecessor missing ends there,
+    /// as a walk whose floor were that checkpoint would. Anywhere else a
+    /// predecessor missing is a file lost by something other than a clean,
+    /// and the clean fails for it and deletes nothing, as does one whose
+    /// predecessor cannot be read, or whose record cannot be. A record that
+    /// names no checkpoint of this chain is never passed, and is said so.
+    ///
+    /// Nothing younger than `grace` by this node's clock against the
+    /// store's date is deleted, whatever the chain says: a walk that ends
+    /// at what an earlier clean deleted has young files below it, which a
+    /// writer left behind or a put that landed late put there, or a restore
+    /// from a backup that fetches files back before it commits them.
     /// The files are listed first, and the head read after, with the
     /// writer held for just that reading so that no commit is in flight: a
     /// file this writer uploaded and had not yet published when the
@@ -1869,10 +1891,13 @@ impl Writer {
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
         let _building = self.building.lock().await;
         let unneeded = tokio::time::timeout(CLEANING_WITHIN, self.unneeded(grace));
-        let orphans = unneeded.await.map_err(|_| StorageError::Blob {
+        let Unneeded { orphans, below } = unneeded.await.map_err(|_| StorageError::Blob {
             key: Layout(&self.lease.key).prefix(),
             source: format!("what to clean up was not found within {CLEANING_WITHIN:?}").into(),
         })??;
+        if let (Some(below), false) = (below, orphans.is_empty()) {
+            self.recorded(below).await?;
+        }
         // A few at a time, each lot only once the coordinator has said
         // again that the partition is this writer's still and where it has
         // it: see `current`.
@@ -1916,20 +1941,76 @@ impl Writer {
         Ok(self.partition.read(State::at))
     }
 
+    /// See that the coordinator holds a record at or above the checkpoint
+    /// a clean is about to delete below, raising it if it is lower, before
+    /// anything is deleted: asked as the lots are, with the partition seen
+    /// to be this writer's still. A record it answers with that names
+    /// another checkpoint at or above this one is said so: the partition
+    /// then keeps to what a clean with no record does.
+    async fn recorded(&self, below: Below) -> Result<()> {
+        let Below {
+            base,
+            position,
+            recorded,
+            passed,
+        } = below;
+        let raised = match recorded {
+            Some(recorded) if recorded.position >= position => recorded,
+            _ => {
+                self.current().await?;
+                let within = self.commit_within();
+                let asked = self.coordinator.clean_below(&self.lease, &base, position);
+                tokio::time::timeout(within, asked).await.map_err(|_| {
+                    let reason =
+                        format!("the coordinator did not record a clean within {within:?}");
+                    CoordinatorError::backend(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        reason,
+                    ))
+                })??
+            }
+        };
+        // A record on this chain at or above the base is the base itself,
+        // or one the walk passed on its way down to it.
+        if raised.base != base && !passed {
+            tracing::warn!(
+                partition = %self.lease.key,
+                recorded = %raised.base.0,
+                base = %base.0,
+                "what a clean recorded it deletes below is no checkpoint on this chain; \
+                 a clean here takes no missing checkpoint for a clean's work until it is \
+                 passed"
+            );
+        }
+        Ok(())
+    }
+
+    /// What the coordinator records a clean of this partition deleted
+    /// below, if any: a clean that cannot be told fails.
+    async fn cleaned(&self) -> Result<Option<Cleaned>> {
+        let within = self.commit_within();
+        let asked = self.coordinator.cleaned(&self.lease.key);
+        Ok(tokio::time::timeout(within, asked).await.map_err(|_| {
+            let reason = format!("the coordinator did not say what was cleaned within {within:?}");
+            CoordinatorError::backend(std::io::Error::new(std::io::ErrorKind::TimedOut, reason))
+        })??)
+    }
+
     /// The files [`Self::clean`] with `grace` deletes, as many as it does
     /// at once: every file listed, set against the committed chain. Each
     /// request it makes is given up by the store, but a partition of a
     /// great many files, or of a long chain, takes many, so whoever asks
     /// gives the whole of it up after a while.
-    async fn unneeded(&self, grace: Duration) -> Result<Vec<String>> {
+    async fn unneeded(&self, grace: Duration) -> Result<Unneeded> {
         let layout = Layout(&self.lease.key);
         let listed = self.partition.blobs.list(&layout.prefix()).await?;
         let (position, head) = self.current().await?;
+        let recorded = self.cleaned().await?;
         let cutoff = chrono::Duration::from_std(grace)
             .ok()
             .and_then(|grace| self.clock.now().checked_sub_signed(grace));
         let Some(cutoff) = cutoff else {
-            return Ok(Vec::new());
+            return Ok(Unneeded::default());
         };
         let files: Vec<(&Listed, LogPosition)> = listed
             .iter()
@@ -1943,33 +2024,65 @@ impl Writer {
             .map(|at| LogPosition(at.0.saturating_sub(1)))
             .fold(position, std::cmp::min);
         let mut cursor = head;
-        let mut checkpoints = Vec::new();
+        let mut checkpoints: Vec<(String, Manifest)> = Vec::new();
+        // Whether the walk has passed the checkpoint a clean recorded it
+        // deleted below: past it, and only there, a checkpoint missing is a
+        // clean's work.
+        let mut passed = false;
         let base = loop {
             let Some(key) = cursor else { break None };
-            cursor = match decode_head(&key, &self.partition.fetch(&key).await?)? {
+            let frame = match self.partition.fetch(&key).await {
+                Err(StorageError::Missing { .. }) if passed => {
+                    tracing::debug!(
+                        partition = %self.lease.key,
+                        missing = key,
+                        "a clean's walk ends where an earlier clean deleted"
+                    );
+                    break checkpoints.pop();
+                }
+                fetched => fetched?,
+            };
+            cursor = match decode_head(&key, &frame)? {
                 Head::Log(log) => log.prev,
-                Head::Manifest(manifest) if manifest.position <= floor => break Some(manifest),
+                Head::Manifest(manifest) if manifest.position <= floor => {
+                    break Some((key, manifest))
+                }
                 Head::Manifest(manifest) => {
+                    passed |= recorded
+                        .as_ref()
+                        .is_some_and(|recorded| recorded.base.0 == key);
                     let prev = manifest.prev.clone();
-                    checkpoints.push(manifest);
+                    checkpoints.push((key, manifest));
                     prev
                 }
             };
         };
-        let Some(base) = base else {
-            return Ok(Vec::new());
+        let Some((base_key, base)) = base else {
+            return Ok(Unneeded::default());
         };
         let kept: HashSet<&str> = checkpoints
             .iter()
+            .map(|(_, manifest)| manifest)
             .chain([&base])
             .flat_map(listed_by)
             .collect();
-        Ok(files
+        let orphans = files
             .iter()
-            .filter(|(file, at)| *at < base.position && !kept.contains(file.key.as_str()))
+            .filter(|(file, at)| {
+                *at < base.position && file.modified < cutoff && !kept.contains(file.key.as_str())
+            })
             .map(|(file, _)| file.key.clone())
             .take(Self::CLEANED_AT_ONCE)
-            .collect())
+            .collect();
+        Ok(Unneeded {
+            orphans,
+            below: Some(Below {
+                base: ManifestRef(base_key),
+                position: base.position,
+                recorded,
+                passed,
+            }),
+        })
     }
 
     /// Whether something holds the writer now, as whatever commits does
@@ -2055,6 +2168,24 @@ impl Writer {
             }
         }
     }
+}
+
+/// What a clean is to delete, and the checkpoint it deletes below with
+/// what the coordinator recorded when it began.
+#[derive(Default)]
+struct Unneeded {
+    orphans: Vec<String>,
+    below: Option<Below>,
+}
+
+/// The checkpoint a clean deletes below, at its position; what the
+/// coordinator recorded a clean deleted below when this one began; and
+/// whether this one's walk passed that checkpoint.
+struct Below {
+    base: ManifestRef,
+    position: LogPosition,
+    recorded: Option<Cleaned>,
+    passed: bool,
 }
 
 /// The files a checkpoint lists: its segments' and the logs it replays.

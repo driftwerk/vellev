@@ -7772,7 +7772,6 @@ async fn a_restore_whose_file_goes_each_time_it_is_fetched_back_is_refused_sayin
 /// Today it fails, and every round after it, until every file is older
 /// than four hours.
 #[tokio::test]
-#[should_panic(expected = "DW-681: a clean failed with nothing in its way")]
 async fn a_node_cleans_after_the_tenants_window_was_made_longer() {
     let cluster = Cluster::new();
     let hour = Duration::from_secs(60 * 60);
