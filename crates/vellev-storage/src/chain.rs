@@ -802,6 +802,13 @@ mod tests {
         let files = &mut twice.get_mut(&LogPosition(5)).unwrap().files;
         files.push(files[0].clone());
         assert_eq!(needed(&twice, LogPosition(7), Some(&full)), other_files);
+        // Named twice by the manifest, listed once: no manifest names a
+        // file twice, so one that does is not the one the link was made of.
+        let named_twice = named(vec![segment(5, true, true), segment(5, true, true)]);
+        assert_eq!(
+            needed(&links, LogPosition(7), Some(&named_twice)),
+            other_files
+        );
         // Another segment the manifest names, not listed.
         let more = named(vec![segment(5, true, true), segment(4, false, false)]);
         assert_eq!(needed(&links, LogPosition(7), Some(&more)), other_files);

@@ -13,8 +13,8 @@ use vellev_storage::coordinator::{
     Acquired, Adoption, Bounded, Cleaned, Commit, Committed, Coordinator, CoordinatorError,
     Generation, Identity, Incarnation, Lease, Lineage, LogPosition, ManifestRef, ManualClock,
     MemoryCoordinator, PartitionKey, Point, PostgresCoordinator, Prior, PurgeClaim, Purges,
-    Removed, Restore, RestorePoint, Restored, ShipBase, Shipping, Stale, TenantKey, Versions,
-    MAX_BACKUP_HOLD, MAX_RESTORE_WINDOW, MAX_TTL, RESTORES_KEPT_FOR,
+    Removed, Restore, RestorePoint, Restored, ShipBase, Shipping, Stale, TenantKey, Unshipped,
+    Versions, MAX_BACKUP_HOLD, MAX_RESTORE_WINDOW, MAX_TTL, RESTORES_KEPT_FOR,
 };
 
 const TTL: Duration = Duration::from_secs(30);
@@ -2727,6 +2727,220 @@ async fn a_partition_removed_loses_its_shipping_and_one_made_again_starts_with_n
     assert_eq!(c.shipping(&key).await.unwrap(), not_shipped(now));
 }
 
+// DW-668, 3b: what a shipper reads. The commits of an incarnation above a
+// position, from the rows the commits made; and the partitions whose run
+// of shipping has commits it has yet to ship, in turn by key.
+
+async fn commits_of(
+    h: &dyn Harness,
+    key: &PartitionKey,
+    incarnation: Incarnation,
+    after: u64,
+    limit: usize,
+) -> Result<Vec<u64>, CoordinatorError> {
+    h.coordinator()
+        .commits_after(key, incarnation, LogPosition(after), limit)
+        .await
+        .map(|points| points.into_iter().map(|point| point.position.0).collect())
+}
+
+async fn the_commits_after_a_position_are_read_from_their_rows_in_order(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    assert_eq!(
+        commits_of(h, &key, now, 0, 10).await.unwrap(),
+        Vec::<u64>::new()
+    );
+    committed_heads(
+        h,
+        &key,
+        &[(1, "l1"), (2, "l2"), (3, "m3"), (4, "l4"), (5, "l5")],
+    )
+    .await;
+    let all = c
+        .commits_after(&key, now, LogPosition(0), 10)
+        .await
+        .unwrap();
+    let heads: Vec<(u64, &str)> = all
+        .iter()
+        .map(|point| (point.position.0, point.head.0.as_str()))
+        .collect();
+    assert_eq!(
+        heads,
+        [(1, "l1"), (2, "l2"), (3, "m3"), (4, "l4"), (5, "l5")]
+    );
+    // Each at the time its commit was made, as the history tells it.
+    let (earliest, latest) = c.restore_points(&key, HOUR).await.unwrap().unwrap();
+    assert_eq!(all.first(), Some(&earliest));
+    assert_eq!(all.last(), Some(&latest));
+    assert_eq!(commits_of(h, &key, now, 2, 2).await.unwrap(), [3, 4]);
+    assert_eq!(commits_of(h, &key, now, 4, 10).await.unwrap(), [5]);
+    assert_eq!(
+        commits_of(h, &key, now, 5, 10).await.unwrap(),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        commits_of(h, &key, now, 0, 0).await.unwrap(),
+        Vec::<u64>::new()
+    );
+    let unknown = crate::key();
+    assert!(matches!(
+        commits_of(h, &unknown, now, 0, 10).await,
+        Err(CoordinatorError::UnknownPartition(_))
+    ));
+}
+
+async fn the_commits_read_skip_where_the_positions_do_and_lose_what_is_forgotten(h: &dyn Harness) {
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    // A restore commits after the greater of the current position and the
+    // one it restores.
+    committed_heads(h, &key, &[(1, "l1"), (2, "l2"), (3, "m3")]).await;
+    h.pass(&key, 2 * HOUR).await;
+    committed_heads(h, &key, &[(7, "m7"), (8, "l8")]).await;
+    assert_eq!(
+        commits_of(h, &key, now, 0, 10).await.unwrap(),
+        [1, 2, 3, 7, 8]
+    );
+    assert_eq!(commits_of(h, &key, now, 3, 10).await.unwrap(), [7, 8]);
+    h.coordinator().forget_history(&key, HOUR).await.unwrap();
+    assert_eq!(commits_of(h, &key, now, 0, 10).await.unwrap(), [3, 7, 8]);
+}
+
+async fn the_commits_of_another_incarnation_are_refused(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let old = incarnation_of(h, &key).await;
+    committed_heads(h, &key, &[(1, "l1"), (2, "l2")]).await;
+    let ahead = Incarnation(old.0 + 1);
+    assert!(matches!(
+        commits_of(h, &key, ahead, 0, 10).await,
+        Err(CoordinatorError::OtherIncarnation { .. })
+    ));
+    assert!(c.remove(&key).await.unwrap());
+    purge(c, &key.tenant).await;
+    c.register(&key).await.unwrap();
+    let now = incarnation_of(h, &key).await;
+    committed_heads(h, &key, &[(1, "n1")]).await;
+    assert!(matches!(
+        commits_of(h, &key, old, 0, 10).await,
+        Err(CoordinatorError::OtherIncarnation { .. })
+    ));
+    let fresh = c
+        .commits_after(&key, now, LogPosition(0), 10)
+        .await
+        .unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].head, ManifestRef("n1".into()));
+}
+
+/// A partition, held and based at 1 on its checkpoint at 2, with `more`
+/// committed after.
+async fn based_at_1(h: &dyn Harness, more: &[(u64, &str)]) -> (PartitionKey, Incarnation) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(h, &key, &[(1, "l1"), (2, "m2")]).await;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    c.record_base(&key, now, &ship_base(1, 2, "m2"))
+        .await
+        .unwrap();
+    if !more.is_empty() {
+        committed_heads(h, &key, more).await;
+    }
+    (key, now)
+}
+
+fn behind(
+    key: &PartitionKey,
+    incarnation: Incarnation,
+    shipped: Option<u64>,
+    committed: u64,
+) -> Unshipped {
+    Unshipped {
+        key: key.clone(),
+        incarnation,
+        base: LogPosition(1),
+        shipped: shipped.map(LogPosition),
+        committed: LogPosition(committed),
+    }
+}
+
+async fn a_run_is_unshipped_while_commits_lie_above_what_it_shipped(h: &dyn Harness) {
+    let c = h.coordinator();
+    assert_eq!(c.unshipped(None, 10).await.unwrap(), Vec::new());
+    // Held, with no base: nothing of it is a run's to ship yet.
+    let held_only = registered(h).await;
+    let theirs = incarnation_of(h, &held_only).await;
+    committed_heads(h, &held_only, &[(1, "l1")]).await;
+    c.hold_for_shipping(&held_only, theirs, LogPosition(0))
+        .await
+        .unwrap();
+    assert_eq!(c.unshipped(None, 10).await.unwrap(), Vec::new());
+    // Based, nothing shipped: unshipped from its base.
+    let (key, now) = based_at_1(h, &[]).await;
+    assert_eq!(
+        c.unshipped(None, 10).await.unwrap(),
+        [behind(&key, now, None, 2)]
+    );
+    // Shipped up to what is committed: not.
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(2))
+        .await
+        .unwrap();
+    assert_eq!(c.unshipped(None, 10).await.unwrap(), Vec::new());
+    // Committed past it: again.
+    committed_heads(h, &key, &[(3, "l3")]).await;
+    assert_eq!(
+        c.unshipped(None, 10).await.unwrap(),
+        [behind(&key, now, Some(2), 3)]
+    );
+    // Stalled: an operator's, not a shipper's.
+    c.stall_shipping(&key, now, LogPosition(1), "a fork")
+        .await
+        .unwrap();
+    assert_eq!(c.unshipped(None, 10).await.unwrap(), Vec::new());
+    // A base that is its own checkpoint and the head, nothing committed
+    // past it nor shipped: the base itself is still to ship.
+    let own = registered(h).await;
+    let theirs = incarnation_of(h, &own).await;
+    committed_heads(h, &own, &[(1, "l1"), (2, "m2")]).await;
+    c.hold_for_shipping(&own, theirs, LogPosition(2))
+        .await
+        .unwrap();
+    c.record_base(&own, theirs, &ship_base(2, 2, "m2"))
+        .await
+        .unwrap();
+    let base_alone = Unshipped {
+        base: LogPosition(2),
+        ..behind(&own, theirs, None, 2)
+    };
+    assert_eq!(c.unshipped(None, 10).await.unwrap(), [base_alone]);
+}
+
+async fn unshipped_partitions_are_given_in_turn_by_key(h: &dyn Harness) {
+    let c = h.coordinator();
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let (key, now) = based_at_1(h, &[(3, "l3")]).await;
+        runs.push(behind(&key, now, None, 3));
+    }
+    runs.sort_by(|one, other| one.key.cmp(&other.key));
+    assert_eq!(c.unshipped(None, 10).await.unwrap(), runs);
+    assert_eq!(c.unshipped(None, 2).await.unwrap(), runs[..2]);
+    assert_eq!(c.unshipped(Some(&runs[1].key), 2).await.unwrap(), runs[2..]);
+    assert_eq!(
+        c.unshipped(Some(&runs[2].key), 2).await.unwrap(),
+        Vec::new()
+    );
+    assert_eq!(c.unshipped(None, 0).await.unwrap(), Vec::new());
+    // A partition removed is no one's to ship.
+    assert!(c.remove(&runs[0].key).await.unwrap());
+    assert_eq!(c.unshipped(None, 10).await.unwrap(), runs[1..]);
+}
+
 async fn ping_succeeds(h: &dyn Harness) {
     h.coordinator().ping().await.unwrap();
 }
@@ -2822,6 +3036,11 @@ conformance! {
     a_runs_writes_are_fenced_by_its_base_and_only_raise,
     shipping_stays_through_leases_and_is_of_its_own_partition_alone,
     a_partition_removed_loses_its_shipping_and_one_made_again_starts_with_none,
+    the_commits_after_a_position_are_read_from_their_rows_in_order,
+    the_commits_read_skip_where_the_positions_do_and_lose_what_is_forgotten,
+    the_commits_of_another_incarnation_are_refused,
+    a_run_is_unshipped_while_commits_lie_above_what_it_shipped,
+    unshipped_partitions_are_given_in_turn_by_key,
 }
 
 /// The test database's connection options.
@@ -3590,6 +3809,181 @@ async fn postgres_of_two_holds_at_once_one_stands_and_both_are_told_it() {
 /// recorded. The removal waits for the partition's row, and either takes
 /// the run's record with it or leaves the base refused: no record of a
 /// run outlives its partition.
+/// DW-668, #77 review: a shipping write that ran out of tries tells
+/// whoever asked to ask again, as a backend's failure does.
+#[test]
+fn a_shipping_write_changed_under_it_too_often_may_be_asked_again() {
+    let contended = CoordinatorError::ShippingContended { key: crate::key() };
+    assert!(contended.is_retryable());
+    let stale = CoordinatorError::StaleShipping {
+        key: crate::key(),
+        why: Stale::NotHeld,
+    };
+    assert!(!stale.is_retryable());
+}
+
+/// Hold the partition's row in a transaction of its own, as a statement
+/// of another node's does while it runs, until the transaction ends.
+async fn row_held(
+    pool: &sqlx::PgPool,
+    key: &PartitionKey,
+    sql: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query(sql)
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    held
+}
+
+/// DW-668, #77 review: a base recorded while a clean records itself above
+/// the base's checkpoint, the clean's statement holding the partition's
+/// row first, is refused: the condition is on the row, read again once
+/// the clean is done.
+#[tokio::test]
+async fn postgres_a_base_waiting_on_a_clean_that_records_above_its_checkpoint_is_refused() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "m4")]).await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let clean = row_held(
+        &pg.pool,
+        &key,
+        "UPDATE vellev.partitions SET cleaned_below = 'm4', cleaned_position = 4
+         WHERE tenant = $1 AND partition = $2",
+    )
+    .await;
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let recording = tokio::spawn({
+        let key = key.clone();
+        async move { other.record_base(&key, now, &ship_base(1, 2, "m2")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !recording.is_finished(),
+        "the base waits for the partition's row"
+    );
+    clean.commit().await.unwrap();
+    let refused = recording.await.unwrap();
+    assert!(stale(&refused, Stale::CleanedAbove), "{refused:?}");
+    assert_eq!(
+        pg.coordinator.shipping(&key).await.unwrap(),
+        held(now, 1, 2)
+    );
+}
+
+/// The commit at `position` of `head`, as the commit statement makes it,
+/// the partition's row first, held open in a transaction of its own.
+async fn committing(
+    pool: &sqlx::PgPool,
+    key: &PartitionKey,
+    incarnation: Incarnation,
+    position: i64,
+    head: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut open = row_held(
+        pool,
+        key,
+        &format!(
+            "UPDATE vellev.partitions SET log_position = {position}, manifest = '{head}'
+             WHERE tenant = $1 AND partition = $2"
+        ),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO vellev.commits (tenant, partition, incarnation, position, head)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .bind(i64::try_from(incarnation.0).unwrap())
+    .bind(position)
+    .bind(head)
+    .execute(&mut *open)
+    .await
+    .unwrap();
+    open
+}
+
+/// DW-668, #77 review: a base whose checkpoint's commit has not yet landed
+/// is refused at once, without waiting for the commit: none of its rows
+/// is there to be seen, and the partition's row is not asked for. Asked
+/// again once the commit has landed, it is recorded.
+#[tokio::test]
+async fn postgres_a_base_on_a_checkpoint_still_being_committed_is_refused_and_recorded_once_it_lands(
+) {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "m2")]).await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let open = committing(&pg.pool, &key, now, 3, "m3").await;
+    let base = ship_base(3, 3, "m3");
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        pg.coordinator.record_base(&key, now, &base),
+    )
+    .await
+    .expect("refused at once, not waiting for the commit");
+    assert!(stale(&refused, Stale::NoRowAtBase), "{refused:?}");
+    open.commit().await.unwrap();
+    assert_eq!(
+        pg.coordinator.record_base(&key, now, &base).await.unwrap(),
+        based(now, 1, &base)
+    );
+}
+
+/// DW-668, #77 review: a base whose checkpoint is committed, recorded while
+/// a later commit holds the partition's row, waits for it and is then
+/// recorded: what it reads of the commit rows at the base and checkpoint,
+/// read before the wait, still holds after it, as rows there go only by
+/// forget_history, under the shipping lock.
+#[tokio::test]
+async fn postgres_a_base_waiting_on_a_later_commit_is_recorded_once_it_lands() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "l2"), (3, "m3")]).await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(3))
+        .await
+        .unwrap();
+    let open = committing(&pg.pool, &key, now, 4, "l4").await;
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let base = ship_base(2, 3, "m3");
+    let recording = tokio::spawn({
+        let (key, base) = (key.clone(), base.clone());
+        async move { other.record_base(&key, now, &base).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !recording.is_finished(),
+        "the base waits for the partition's row"
+    );
+    open.commit().await.unwrap();
+    assert_eq!(recording.await.unwrap().unwrap(), based(now, 1, &base));
+}
+
 #[tokio::test]
 async fn postgres_a_removal_beside_a_base_being_recorded_leaves_no_run_behind() {
     let Some(pg) = Pg::connect_beside(HARNESS).await else {
@@ -3880,6 +4274,107 @@ async fn postgres_shipping_rolls_forward_over_the_release_before() {
         .await
         .unwrap();
     assert_eq!(left, 0);
+}
+
+/// One history of what a shipper reads, as each coordinator answers it.
+async fn answers_to_reading(h: &dyn Harness) -> Vec<String> {
+    let c = h.coordinator();
+    let (key, now) = based_at_1(h, &[(3, "l3"), (6, "m6")]).await;
+    let said_points = |points: Result<Vec<RestorePoint>, CoordinatorError>| match points {
+        Ok(points) => format!(
+            "{:?}",
+            points
+                .iter()
+                .map(|point| (point.position.0, point.head.0.clone()))
+                .collect::<Vec<_>>()
+        ),
+        Err(CoordinatorError::UnknownPartition(_)) => "unknown".into(),
+        Err(CoordinatorError::OtherIncarnation { .. }) => "other incarnation".into(),
+        Err(other) => format!("{other:?}"),
+    };
+    let said_runs = |runs: Result<Vec<Unshipped>, CoordinatorError>| match runs {
+        Ok(runs) => format!(
+            "{:?}",
+            runs.iter()
+                .map(|run| {
+                    let ours = run.key == key && run.incarnation == now;
+                    (
+                        ours,
+                        run.base.0,
+                        run.shipped.map(|at| at.0),
+                        run.committed.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+        ),
+        Err(other) => format!("{other:?}"),
+    };
+    let mut answers = Vec::new();
+    for (after, limit) in [(0, 10), (2, 1), (3, 10), (6, 10)] {
+        answers.push(said_points(
+            c.commits_after(&key, now, LogPosition(after), limit).await,
+        ));
+    }
+    let ahead = Incarnation(now.0 + 1);
+    answers.push(said_points(
+        c.commits_after(&key, ahead, LogPosition(0), 10).await,
+    ));
+    answers.push(said_runs(c.unshipped(None, 10).await));
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(3))
+        .await
+        .unwrap();
+    answers.push(said_runs(c.unshipped(None, 10).await));
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(6))
+        .await
+        .unwrap();
+    answers.push(said_runs(c.unshipped(None, 10).await));
+    c.remove(&key).await.unwrap();
+    answers.push(said_points(
+        c.commits_after(&key, now, LogPosition(0), 10).await,
+    ));
+    answers.push(said_runs(c.unshipped(None, 10).await));
+    answers
+}
+
+/// DW-668: the memory coordinator, which the simulation ships against,
+/// answers what a shipper reads just as Postgres does, call for call.
+#[tokio::test]
+async fn postgres_and_memory_answer_what_a_shipper_reads_alike() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let memory = answers_to_reading(&Memory::new()).await;
+    assert_eq!(answers_to_reading(&pg).await, memory);
+    assert_eq!(memory.len(), 10, "{memory:?}");
+}
+
+/// DW-668: a coordinator bounded as a node bounds it answers what a
+/// shipper reads as the one it wraps.
+#[tokio::test]
+async fn a_bounded_coordinator_answers_what_a_shipper_reads_as_the_one_it_wraps() {
+    struct BoundedMemory {
+        memory: Memory,
+        bounded: Bounded,
+    }
+    #[async_trait]
+    impl Harness for BoundedMemory {
+        fn coordinator(&self) -> &dyn Coordinator {
+            &self.bounded
+        }
+        async fn pass(&self, key: &PartitionKey, duration: Duration) {
+            self.memory.pass(key, duration).await;
+        }
+    }
+    let memory = Memory::new();
+    let inner = Arc::new(MemoryCoordinator::new(memory.clock.clone()));
+    let bounded = BoundedMemory {
+        bounded: Bounded::new(inner, Duration::from_secs(10)),
+        memory,
+    };
+    assert_eq!(
+        answers_to_reading(&bounded).await,
+        answers_to_reading(&Memory::new()).await
+    );
 }
 
 #[tokio::test]
