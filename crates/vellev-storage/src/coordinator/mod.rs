@@ -345,6 +345,10 @@ pub enum CoordinatorError {
         asked: LogPosition,
         recorded: Option<LogPosition>,
     },
+    /// A shipping write whose conditions kept moving under it, each time
+    /// it was made: nothing was written, and asking again may succeed.
+    #[error("shipping of {key} was changed under the write too often; nothing was written")]
+    ShippingContended { key: PartitionKey },
     /// A shipping hold or base that no longer stands.
     #[error("shipping of {key} refused as stale: {why:?}")]
     StaleShipping { key: PartitionKey, why: Stale },
@@ -362,7 +366,7 @@ impl CoordinatorError {
     /// A backend failure or transient contention leaves the outcome unknown
     /// and is worth retrying; every other error is a definite answer.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Backend(_))
+        matches!(self, Self::Backend(_) | Self::ShippingContended { .. })
     }
 }
 

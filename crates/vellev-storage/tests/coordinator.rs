@@ -3809,6 +3809,181 @@ async fn postgres_of_two_holds_at_once_one_stands_and_both_are_told_it() {
 /// recorded. The removal waits for the partition's row, and either takes
 /// the run's record with it or leaves the base refused: no record of a
 /// run outlives its partition.
+/// DW-668, #77 review: a shipping write that ran out of tries tells
+/// whoever asked to ask again, as a backend's failure does.
+#[test]
+fn a_shipping_write_changed_under_it_too_often_may_be_asked_again() {
+    let contended = CoordinatorError::ShippingContended { key: crate::key() };
+    assert!(contended.is_retryable());
+    let stale = CoordinatorError::StaleShipping {
+        key: crate::key(),
+        why: Stale::NotHeld,
+    };
+    assert!(!stale.is_retryable());
+}
+
+/// Hold the partition's row in a transaction of its own, as a statement
+/// of another node's does while it runs, until the transaction ends.
+async fn row_held(
+    pool: &sqlx::PgPool,
+    key: &PartitionKey,
+    sql: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query(sql)
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    held
+}
+
+/// DW-668, #77 review: a base recorded while a clean records itself above
+/// the base's checkpoint, the clean's statement holding the partition's
+/// row first, is refused: the condition is on the row, read again once
+/// the clean is done.
+#[tokio::test]
+async fn postgres_a_base_waiting_on_a_clean_that_records_above_its_checkpoint_is_refused() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "m4")]).await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let clean = row_held(
+        &pg.pool,
+        &key,
+        "UPDATE vellev.partitions SET cleaned_below = 'm4', cleaned_position = 4
+         WHERE tenant = $1 AND partition = $2",
+    )
+    .await;
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let recording = tokio::spawn({
+        let key = key.clone();
+        async move { other.record_base(&key, now, &ship_base(1, 2, "m2")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !recording.is_finished(),
+        "the base waits for the partition's row"
+    );
+    clean.commit().await.unwrap();
+    let refused = recording.await.unwrap();
+    assert!(stale(&refused, Stale::CleanedAbove), "{refused:?}");
+    assert_eq!(
+        pg.coordinator.shipping(&key).await.unwrap(),
+        held(now, 1, 2)
+    );
+}
+
+/// The commit at `position` of `head`, as the commit statement makes it,
+/// the partition's row first, held open in a transaction of its own.
+async fn committing(
+    pool: &sqlx::PgPool,
+    key: &PartitionKey,
+    incarnation: Incarnation,
+    position: i64,
+    head: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut open = row_held(
+        pool,
+        key,
+        &format!(
+            "UPDATE vellev.partitions SET log_position = {position}, manifest = '{head}'
+             WHERE tenant = $1 AND partition = $2"
+        ),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO vellev.commits (tenant, partition, incarnation, position, head)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .bind(i64::try_from(incarnation.0).unwrap())
+    .bind(position)
+    .bind(head)
+    .execute(&mut *open)
+    .await
+    .unwrap();
+    open
+}
+
+/// DW-668, #77 review: a base whose checkpoint's commit has not yet landed
+/// is refused at once, without waiting for the commit: none of its rows
+/// is there to be seen, and the partition's row is not asked for. Asked
+/// again once the commit has landed, it is recorded.
+#[tokio::test]
+async fn postgres_a_base_on_a_checkpoint_still_being_committed_is_refused_and_recorded_once_it_lands(
+) {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "m2")]).await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let open = committing(&pg.pool, &key, now, 3, "m3").await;
+    let base = ship_base(3, 3, "m3");
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        pg.coordinator.record_base(&key, now, &base),
+    )
+    .await
+    .expect("refused at once, not waiting for the commit");
+    assert!(stale(&refused, Stale::NoRowAtBase), "{refused:?}");
+    open.commit().await.unwrap();
+    assert_eq!(
+        pg.coordinator.record_base(&key, now, &base).await.unwrap(),
+        based(now, 1, &base)
+    );
+}
+
+/// DW-668, #77 review: a base whose checkpoint is committed, recorded while
+/// a later commit holds the partition's row, waits for it and is then
+/// recorded: what it reads of the commit rows at the base and checkpoint,
+/// read before the wait, still holds after it, as rows there go only by
+/// forget_history, under the shipping lock.
+#[tokio::test]
+async fn postgres_a_base_waiting_on_a_later_commit_is_recorded_once_it_lands() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "l2"), (3, "m3")]).await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(3))
+        .await
+        .unwrap();
+    let open = committing(&pg.pool, &key, now, 4, "l4").await;
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let base = ship_base(2, 3, "m3");
+    let recording = tokio::spawn({
+        let (key, base) = (key.clone(), base.clone());
+        async move { other.record_base(&key, now, &base).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !recording.is_finished(),
+        "the base waits for the partition's row"
+    );
+    open.commit().await.unwrap();
+    assert_eq!(recording.await.unwrap().unwrap(), based(now, 1, &base));
+}
+
 #[tokio::test]
 async fn postgres_a_removal_beside_a_base_being_recorded_leaves_no_run_behind() {
     let Some(pg) = Pg::connect_beside(HARNESS).await else {

@@ -1205,9 +1205,9 @@ impl Coordinator for PostgresCoordinator {
                 return row.shipping();
             }
         }
-        Err(invariant(
-            "a shipping hold neither taken nor refused".into(),
-        ))
+        // Each try's conditions moved under it: nothing was written, and
+        // asking again may well succeed.
+        Err(CoordinatorError::ShippingContended { key: key.clone() })
     }
 
     async fn record_base(
@@ -1271,9 +1271,9 @@ impl Coordinator for PostgresCoordinator {
                 return row.shipping();
             }
         }
-        Err(invariant(
-            "a shipping base neither recorded nor refused".into(),
-        ))
+        // Each try's conditions moved under it: nothing was written, and
+        // asking again may well succeed.
+        Err(CoordinatorError::ShippingContended { key: key.clone() })
     }
 
     async fn note_shipped(
