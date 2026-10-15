@@ -1433,6 +1433,20 @@ impl Coordinator for Unrenewing {
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
         self.inner.committed(key).await
     }
+    async fn cleaned(
+        &self,
+        key: &PartitionKey,
+    ) -> Result<Option<vellev_storage::coordinator::Cleaned>, CoordinatorError> {
+        self.inner.cleaned(key).await
+    }
+    async fn clean_below(
+        &self,
+        lease: &Lease,
+        base: &vellev_storage::coordinator::ManifestRef,
+        position: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Cleaned, CoordinatorError> {
+        self.inner.clean_below(lease, base, position).await
+    }
     async fn partitions(
         &self,
         after: Option<&PartitionKey>,
@@ -7703,4 +7717,37 @@ async fn a_restore_whose_file_goes_each_time_it_is_fetched_back_is_refused_sayin
     assert!(reason.contains("each of the 3 times"), "{reason}");
     let after = cluster.coordinator.committed(&self::acme()).await.unwrap();
     assert_eq!(after, before, "nothing was committed");
+}
+
+/// DW-681 trigger D through a node, F2b: a tenant's restore window made
+/// longer. A node cleans with the window and its grace on top; the first
+/// clean, with one hour in all, deletes below the newest checkpoint, the
+/// one before it among them. Once the window is longer, the next clean
+/// keeps more: it finds files young by four hours below that checkpoint,
+/// walks back past it to the one deleted, and is to succeed all the same.
+/// Today it fails, and every round after it, until every file is older
+/// than four hours.
+#[tokio::test]
+#[should_panic(expected = "DW-681: a clean failed with nothing in its way")]
+async fn a_node_cleans_after_the_tenants_window_was_made_longer() {
+    let cluster = Cluster::new();
+    let hour = Duration::from_secs(60 * 60);
+    let clock = Arc::new(ManualClock::starting_at(Utc::now()));
+    let node = cluster.node_from(Settings {
+        clock: clock.clone(),
+        ..cluster.settings()
+    });
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(0, "ant", None)])
+        .await
+        .unwrap();
+    acme.flush().await.unwrap();
+    acme.write(vec![note(1, "fox", None)]).await.unwrap();
+    acme.flush().await.unwrap();
+    clock.advance(2 * hour);
+    assert!(acme.compact(hour).await.unwrap() > 0);
+    if let Err(error) = acme.compact(4 * hour).await {
+        panic!("DW-681: a clean failed with nothing in its way: {error}");
+    }
 }

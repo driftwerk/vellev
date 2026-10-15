@@ -12,10 +12,11 @@ use uuid::Uuid;
 use vellev_core::{NodeId, RequestId, TenantId};
 
 use super::{
-    checked_hold, checked_ttl, checked_window, window_start, Acquired, Adoption, ClusterId, Commit,
-    Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation,
-    KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges,
-    Removed, RestorePoint, Restored, Result, TenantKey, Versions, RESTORES_KEPT_FOR,
+    checked_hold, checked_ttl, checked_window, window_start, Acquired, Adoption, Cleaned,
+    ClusterId, Commit, Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity,
+    Incarnation, KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point,
+    PurgeClaim, Purges, Removed, RestorePoint, Restored, Result, TenantKey, Versions,
+    RESTORES_KEPT_FOR,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -71,6 +72,8 @@ struct Row {
     /// What its tenant is to become with a commit, and the generation of
     /// the lease that is to make it.
     adopting: Option<(Generation, Adoption)>,
+    /// What a clean last recorded it deletes below.
+    cleaned: Option<Cleaned>,
 }
 
 impl Row {
@@ -239,6 +242,7 @@ impl Coordinator for MemoryCoordinator {
                 backed_up_at: None,
                 backup_claim: None,
                 adopting: None,
+                cleaned: None,
             };
             rows.insert(key.clone(), row);
         }
@@ -458,6 +462,31 @@ impl Coordinator for MemoryCoordinator {
             self.keys.lock().expect("coordinator lock").extend(kept);
         }
         Ok(committed)
+    }
+
+    async fn cleaned(&self, key: &PartitionKey) -> Result<Option<Cleaned>> {
+        self.with_row(key, |row, _| Ok(row.cleaned.clone()))
+    }
+
+    async fn clean_below(
+        &self,
+        lease: &Lease,
+        base: &ManifestRef,
+        position: LogPosition,
+    ) -> Result<Cleaned> {
+        self.with_current(lease, |row, _| {
+            let raised = Cleaned {
+                base: base.clone(),
+                position,
+            };
+            match &row.cleaned {
+                Some(cleaned) if cleaned.position >= position => Ok(cleaned.clone()),
+                _ => {
+                    row.cleaned = Some(raised.clone());
+                    Ok(raised)
+                }
+            }
+        })
     }
 
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>> {
