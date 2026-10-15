@@ -264,6 +264,52 @@ impl Layout<'_> {
         }
         name.get(..20)?.parse().ok().map(LogPosition)
     }
+
+    /// What a key of this partition says of its file, if it is laid out
+    /// exactly as [`Self::named`] lays one out: the kind, position,
+    /// generation and writer, `-merged` only on a segment, index or vectors
+    /// file, and its kind again as its extension. Nothing else passes, so
+    /// every key read is plain: each part of it is one of those.
+    pub(crate) fn named_by<'k>(&self, key: &'k str) -> Option<Named<'k>> {
+        let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
+        let mergeable = matches!(kind, "segment" | "index" | "vectors");
+        if !mergeable && !matches!(kind, "log" | "manifest") {
+            return None;
+        }
+        let stem = name.strip_suffix(kind)?.strip_suffix('.')?;
+        let (stem, merged) = match stem.strip_suffix("-merged") {
+            Some(stem) if mergeable => (stem, true),
+            Some(_) => return None,
+            None => (stem, false),
+        };
+        let mut parts = stem.split('-');
+        let number = |part: &str| {
+            let digits = part.len() == 20 && part.bytes().all(|byte| byte.is_ascii_digit());
+            digits.then(|| part.parse::<u64>().ok()).flatten()
+        };
+        let position = LogPosition(number(parts.next()?)?);
+        let generation = Generation(number(parts.next()?)?);
+        let writer = parts.next()?;
+        let hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+        if writer.len() != 32 || !writer.bytes().all(hex) || parts.next().is_some() {
+            return None;
+        }
+        Some(Named {
+            kind,
+            position,
+            generation,
+            merged,
+        })
+    }
+}
+
+/// What a key laid out by [`Layout`] says of its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Named<'k> {
+    pub kind: &'k str,
+    pub position: LogPosition,
+    pub generation: Generation,
+    pub merged: bool,
 }
 
 /// Whether `key` is a plain path: no empty, `.` or `..` parts and no
@@ -1743,6 +1789,63 @@ impl Blobs for CachedBlobs {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    #[test]
+    fn every_key_a_partition_lays_out_is_read_back_exactly_and_nothing_else_is() {
+        let partition = PartitionKey {
+            tenant: vellev_core::TenantId::new("tenant-a").unwrap(),
+            partition: vellev_core::Partition(0),
+        };
+        let layout = Layout(&partition);
+        let author = Author {
+            generation: Generation(2),
+            writer: uuid::Uuid::from_u128(0xabc),
+        };
+        let at = LogPosition(7);
+        let named = |kind, merged| Named {
+            kind,
+            position: at,
+            generation: Generation(2),
+            merged,
+        };
+        let laid_out = [
+            (layout.log(at, &author), named("log", false)),
+            (layout.manifest(at, &author), named("manifest", false)),
+            (layout.segment(at, &author), named("segment", false)),
+            (layout.merged(at, &author), named("segment", true)),
+            (layout.index(at, &author), named("index", false)),
+            (layout.merged_index(at, &author), named("index", true)),
+            (layout.vectors(at, &author), named("vectors", false)),
+            (layout.merged_vectors(at, &author), named("vectors", true)),
+        ];
+        for (key, named) in &laid_out {
+            assert_eq!(layout.named_by(key), Some(*named), "{key}");
+        }
+
+        let log = layout.log(at, &author);
+        let writer = author.writer.simple().to_string();
+        let refused = [
+            "tenant-a/0/log/00000000000000000007-x/y".to_string(),
+            format!("{log}x"),
+            log.replace(".log", ".manifest"),
+            log.replace(".log", "-merged.log"),
+            layout
+                .manifest(at, &author)
+                .replace(".manifest", "-merged.manifest"),
+            log.replace("/00000000000000000007-", "/0000000000000000007-"),
+            log.replace("-00000000000000000002-", "-0000000000000000002-"),
+            log.replace(&writer, &writer.to_uppercase()),
+            log.replace(&writer, &writer[1..]),
+            log.replace(&writer, &format!("{writer}-x")),
+            log.replace(&writer, &format!("{}g", &writer[..31])),
+            log.replace("tenant-a/0/", "tenant-a/1/"),
+            log.replace("/log/", "/other/").replace(".log", ".other"),
+            log.replace("/00000000000000000007-", "/+0000000000000000007-"),
+        ];
+        for key in &refused {
+            assert_eq!(layout.named_by(key), None, "{key}");
+        }
+    }
 
     #[test]
     fn a_file_written_into_the_cache_goes_under_a_name_drawn_at_random() {

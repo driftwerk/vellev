@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vellev_core::{Partition as PartitionNumber, TenantId};
 
-use crate::blobs::{is_plain, Layout};
+use crate::blobs::Layout;
 use crate::coordinator::{ClusterId, Generation, Incarnation, Lineage, LogPosition, PartitionKey};
 use crate::{Result, StorageError};
 
@@ -321,6 +321,11 @@ pub fn encode(header: &Header, frame: Option<&[u8]>) -> Result<Bytes> {
 /// it does, names a head of its own partition at its own position, lists
 /// only checkpoint files of that partition (none for a log), and, if
 /// inline, carries the frame its header sums.
+///
+/// The version is read before the CRC is checked, as a later version may
+/// frame its header otherwise: so a link whose version bytes are damaged
+/// into a later version is refused as `UnsupportedVersion`, one this
+/// release does not read, rather than as corrupt.
 pub fn decode(key: &str, bytes: &[u8]) -> Result<Link> {
     let corrupt = |reason: String| StorageError::corrupt(key, reason);
     let Some(preamble) = bytes.get(..PREAMBLE) else {
@@ -370,38 +375,45 @@ pub fn decode(key: &str, bytes: &[u8]) -> Result<Link> {
     Ok(Link { header, frame })
 }
 
-/// Why `header` names what no link of its partition may name, if it does.
+/// Why `header` names what no link of its partition may name, if it does:
+/// keys are read exactly as the partition lays them out, as restore puts
+/// the frame back under the head's own key.
 fn trusted(header: &Header) -> std::result::Result<(), String> {
     let partition = PartitionKey {
         tenant: header.tenant.clone(),
         partition: header.partition,
     };
     let layout = Layout(&partition);
-    /// The kind of file `key` is in `layout`'s partition, if it is a
-    /// plain key of one laid out there.
-    fn kind<'k>(layout: &Layout, key: &'k str) -> Option<&'k str> {
-        let (kind, _) = key.strip_prefix(&layout.prefix())?.split_once('/')?;
-        (is_plain(key) && layout.position(key).is_some()).then_some(kind)
-    }
-    let kind = |key| kind(&layout, key);
-    if kind(&header.key) != Some(header.head.kind())
-        || layout.position(&header.key) != Some(header.position)
-    {
+    let named = |key| layout.named_by(key);
+    let head = named(&header.key);
+    let laid_out = head.is_some_and(|named| {
+        named.kind == header.head.kind()
+            && named.position == header.position
+            && named.generation == header.generation
+    });
+    if !laid_out {
         return Err(format!(
-            "it names {} as its partition's {} at position {}",
+            "it names {} as its partition's {} at position {} of generation {}",
             header.key,
             header.head.kind(),
-            header.position.0
+            header.position.0,
+            header.generation.0
         ));
+    }
+    if let Some(before) = &header.before {
+        if before.position >= header.position {
+            return Err(format!(
+                "it says the commit before it is at position {}",
+                before.position.0
+            ));
+        }
     }
     if header.head == Head::Log && !header.files.is_empty() {
         return Err("it is a log's, and lists files".into());
     }
-    match header
-        .files
-        .iter()
-        .find(|file| !matches!(kind(&file.key), Some("segment" | "index" | "vectors")))
-    {
+    let checkpoint =
+        |key| named(key).is_some_and(|named| matches!(named.kind, "segment" | "index" | "vectors"));
+    match header.files.iter().find(|file| !checkpoint(&file.key)) {
         Some(file) => Err(format!(
             "it lists {}, no checkpoint file of its partition",
             file.key
@@ -785,6 +797,8 @@ mod tests {
         zero[4..6].copy_from_slice(&0u16.to_le_bytes());
         corrupt(read(&resummed(zero)), "version zero");
 
+        // Its CRC is left as it was, now wrong: a later version is told
+        // before the CRC is, as `decode` says.
         let mut newer = good.clone();
         newer[4..6].copy_from_slice(&(LINK_VERSION + 1).to_le_bytes());
         assert!(
@@ -937,5 +951,95 @@ mod tests {
             read(&framed(&with(unplain), None)),
             "a key that is not plain",
         );
+    }
+
+    #[test]
+    fn a_head_key_must_be_laid_out_exactly_and_of_the_generation_its_header_says() {
+        let frame = frame(7);
+        let good = header(&frame);
+        let refused = |header: Header, what: &str| {
+            corrupt(read(&framed(&header, Some(&frame))), what);
+        };
+        refused(
+            Header {
+                key: "tenant-a/0/log/00000000000000000007-x/y".into(),
+                ..good.clone()
+            },
+            "a key read by its first twenty characters alone",
+        );
+        refused(
+            Header {
+                key: good
+                    .key
+                    .replace("-00000000000000000002-", "-00000000000000000003-"),
+                ..good.clone()
+            },
+            "a key of another generation than the header's",
+        );
+        refused(
+            Header {
+                generation: Generation(3),
+                ..good.clone()
+            },
+            "a header of another generation than its key's",
+        );
+        refused(
+            Header {
+                key: good.key.replace(".log", "-merged.log"),
+                ..good.clone()
+            },
+            "a merged log",
+        );
+        assert!(read(&framed(&good, Some(&frame))).is_ok());
+    }
+
+    #[test]
+    fn a_checkpoint_file_must_be_laid_out_exactly() {
+        let good = Header {
+            body: Body::Spilled,
+            ..manifest_header()
+        };
+        let with = |key: String| {
+            let mut files = good.files.clone();
+            files[0].key = key;
+            Header {
+                files,
+                ..good.clone()
+            }
+        };
+        let merged = good.files[0].key.replace(".segment", "-merged.segment");
+        assert!(read(&framed(&with(merged), None)).is_ok());
+        let loose = "tenant-a/0/segment/00000000000000000007-x/y".to_string();
+        corrupt(read(&framed(&with(loose), None)), "a loosely laid out file");
+        let other = good.files[0].key.replace(".segment", ".index");
+        corrupt(
+            read(&framed(&with(other), None)),
+            "another kind as its extension",
+        );
+    }
+
+    #[test]
+    fn the_commit_before_a_link_is_at_an_earlier_position() {
+        let frame = frame(7);
+        let good = header(&frame);
+        for position in [7, 8, u64::MAX] {
+            let before = Header {
+                before: Some(Before {
+                    position: LogPosition(position),
+                    sum: Sum::of(b"x"),
+                }),
+                ..good.clone()
+            };
+            corrupt(
+                read(&framed(&before, Some(&frame))),
+                "a commit before at or after it",
+            );
+        }
+        let first = Header {
+            before: None,
+            ..good.clone()
+        };
+        assert!(read(&framed(&first, Some(&frame))).is_ok());
+        assert!(read(&framed(&good, Some(&frame))).is_ok());
     }
 }
