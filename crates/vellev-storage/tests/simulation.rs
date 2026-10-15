@@ -64,7 +64,9 @@ use vellev_storage::format::{decode_head, Head as Stored};
 
 use common::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
-use vellev_storage::{Batch, Embedded, Live, Merging, Outcome};
+use vellev_storage::blobs::Created;
+use vellev_storage::coordinator::ShipBase;
+use vellev_storage::{Batch, Embedded, Live, Merging, Outcome, Transfers};
 
 const COLLECTION: &str = "sim";
 
@@ -474,6 +476,180 @@ impl Blobs for SimBlobs {
             return Err(lost());
         }
         self.remove(key).await
+    }
+}
+
+/// The backup store continuous backup ships to (DW-668): a store of its
+/// own, with faults of its own, which creates a file only if none is there
+/// as the in-memory store does, and keeps each file's first bytes, so that
+/// a file written again with other bytes is noticed and one written again
+/// with the same bytes, as a link shipped twice is, is not.
+#[derive(Debug)]
+struct BackupBlobs {
+    clean: Arc<dyn Blobs>,
+    /// What is to go wrong with the next puts and creates, in turn.
+    faults: Mutex<VecDeque<PutFault>>,
+    /// How many requests more the store fails, of any kind, as one that
+    /// cannot be reached.
+    down: AtomicUsize,
+    /// Requests the store has and has yet to make, each with whether it is
+    /// a create: a create is made, or refused, when delivered; a put lands
+    /// over whatever is there.
+    delayed: Mutex<Vec<(String, Bytes, bool)>>,
+    /// Each file's bytes as it first landed.
+    first: Mutex<BTreeMap<String, Bytes>>,
+    /// Files written again with other bytes than they first had.
+    rewritten: Mutex<Vec<String>>,
+    /// Every file that landed, in the order it did.
+    landings: Mutex<Vec<String>>,
+}
+
+impl BackupBlobs {
+    /// A backup store that creates files of `part_bytes` at most.
+    fn new(part_bytes: usize) -> Self {
+        let store = object_store::memory::InMemory::new();
+        let transfers = Transfers {
+            part_bytes,
+            ..Transfers::default()
+        };
+        Self {
+            clean: Arc::new(ObjectBlobs::new(Arc::new(store)).transferring(transfers)),
+            faults: Mutex::default(),
+            down: AtomicUsize::new(0),
+            delayed: Mutex::default(),
+            first: Mutex::default(),
+            rewritten: Mutex::default(),
+            landings: Mutex::default(),
+        }
+    }
+
+    /// Fail this request if the store cannot be reached now.
+    fn reached(&self) -> vellev_storage::Result<()> {
+        let down = self
+            .down
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |down| {
+                down.checked_sub(1)
+            });
+        match down {
+            Ok(_) => Err(lost()),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Note that `bytes` landed under `key`.
+    fn landed(&self, key: &str, bytes: &Bytes) {
+        let mut first = self.first.lock().unwrap();
+        match first.get(key) {
+            Some(had) if had != bytes => self.rewritten.lock().unwrap().push(key.to_string()),
+            Some(_) => {}
+            None => {
+                first.insert(key.to_string(), bytes.clone());
+            }
+        }
+        self.landings.lock().unwrap().push(key.to_string());
+    }
+
+    /// Make the requests the store has and has yet to make: a create
+    /// refused, and nothing landing, if a file is under its key by then; a
+    /// put landing over whatever is there.
+    async fn deliver_delayed(&self) {
+        let delayed = std::mem::take(&mut *self.delayed.lock().unwrap());
+        for (key, bytes, create) in delayed {
+            let landed = match create {
+                true => self.clean.put_new(&key, bytes.clone()).await.unwrap() == Created::Written,
+                false => self.clean.put(&key, bytes.clone()).await.is_ok(),
+            };
+            if landed {
+                self.landed(&key, &bytes);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Blobs for BackupBlobs {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        tokio::task::yield_now().await;
+        self.reached()?;
+        let fault = self.faults.lock().unwrap().pop_front();
+        match fault {
+            None => {
+                self.clean.put(key, bytes.clone()).await?;
+                self.landed(key, &bytes);
+                Ok(())
+            }
+            Some(PutFault::Refuse) => Err(lost()),
+            Some(PutFault::LandThenFail) => {
+                self.clean.put(key, bytes.clone()).await?;
+                self.landed(key, &bytes);
+                Err(lost())
+            }
+            Some(PutFault::Delay) => {
+                (self.delayed.lock().unwrap()).push((key.to_string(), bytes, false));
+                Err(lost())
+            }
+        }
+    }
+
+    /// Faults as for a put: refused, nothing lands; landed, its answer
+    /// lost; or had and made later, refused then if the key is taken.
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        tokio::task::yield_now().await;
+        self.reached()?;
+        let fault = self.faults.lock().unwrap().pop_front();
+        match fault {
+            Some(PutFault::Refuse) => Err(lost()),
+            Some(PutFault::Delay) => {
+                (self.delayed.lock().unwrap()).push((key.to_string(), bytes, true));
+                Err(lost())
+            }
+            None | Some(PutFault::LandThenFail) => {
+                let created = self.clean.put_new(key, bytes.clone()).await?;
+                if created == Created::Written {
+                    self.landed(key, &bytes);
+                }
+                match fault {
+                    Some(PutFault::LandThenFail) => Err(lost()),
+                    _ => Ok(created),
+                }
+            }
+        }
+    }
+
+    fn creates_at_most(&self) -> Option<usize> {
+        self.clean.creates_at_most()
+    }
+
+    /// Put as [`Self::put`] puts, with its faults, once every part has come.
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        use futures::TryStreamExt;
+        let parts: Vec<Bytes> = parts.try_collect().await?;
+        self.put(key, Bytes::from(parts.concat())).await
+    }
+
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        tokio::task::yield_now().await;
+        self.reached()?;
+        self.clean.get(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        tokio::task::yield_now().await;
+        self.reached()?;
+        self.clean.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        tokio::task::yield_now().await;
+        self.reached()?;
+        self.clean.delete(key).await
     }
 }
 
@@ -1066,6 +1242,16 @@ enum Action {
     /// As [`Action::RestoreFrom`], the way a node did before DW-680. Made
     /// only in the histories a test sets out, never in random ones.
     RestoreFromAsToday(usize),
+    /// The backup store's next put or create goes wrong so (DW-668).
+    FailBackupPut(PutFault),
+    /// The backup store cannot be reached for so many requests.
+    BackupDown(usize),
+    /// The creates the backup store has and has yet to make are made.
+    DeliverDelayedBackup,
+    /// Shipping of the partition begins, as bootstrap begins it: the hold
+    /// is taken, and then a base recorded at the newest checkpoint whose
+    /// row at its base is there, through the coordinator's own calls.
+    BeginShipping,
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -1390,6 +1576,10 @@ struct World {
     /// What the last restore from a snapshot did, to be held to DW-680's
     /// rule once the step it was made in is checked.
     from_source: Option<FromSource>,
+    /// The store continuous backup ships to, and the base shipping began
+    /// from, if it has.
+    backup: Arc<BackupBlobs>,
+    shipping_from: Option<ShipBase>,
     step: usize,
     made: Made,
 }
@@ -1703,11 +1893,69 @@ impl World {
             snapshots: Vec::new(),
             sourced: BTreeSet::new(),
             from_source: None,
+            backup: Arc::new(BackupBlobs::new(Transfers::default().part_bytes)),
+            shipping_from: None,
             step: 0,
             made: Made::default(),
         };
         world.verify().await.unwrap();
         world
+    }
+
+    /// Begin shipping, as bootstrap begins it (DW-668, bootstrap note A),
+    /// through the coordinator's own calls: take the hold, capped at the
+    /// newest checkpoint recorded, and then record a base at the newest
+    /// checkpoint whose row at its base is there, its base where its
+    /// restore starts. Refusals are what the coordinator says they are, and
+    /// leave shipping where they left it.
+    async fn begin_shipping(&mut self) {
+        let key = self.cluster.key.clone();
+        let committed = self.cluster.committed().await;
+        let incarnation = committed.incarnation;
+        let mut checkpoints: Vec<(LogPosition, ManifestRef)> = (self.coordinator.heads)
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|head| head.key.0.ends_with(".manifest"))
+            .filter(|head| head.position <= committed.log_position)
+            .map(|head| (head.position, head.key.clone()))
+            .collect();
+        checkpoints.sort_by_key(|(position, _)| *position);
+        let cap = checkpoints.last().map_or(LogPosition(0), |(at, _)| *at);
+        let held = self
+            .coordinator
+            .hold_for_shipping(&key, incarnation, cap)
+            .await;
+        if held.is_err() {
+            return;
+        }
+        for (at, checkpoint) in checkpoints.into_iter().rev() {
+            let frame = self
+                .blobs
+                .shadow
+                .lock()
+                .unwrap()
+                .get(&checkpoint.0)
+                .cloned();
+            let Some(Ok(Stored::Manifest(manifest))) =
+                frame.map(|frame| decode_head(&checkpoint.0, &frame))
+            else {
+                continue;
+            };
+            let position = match manifest.replay.is_empty() {
+                true => at,
+                false => LogPosition(manifest.replay_after.0 + 1),
+            };
+            let base = ShipBase {
+                position,
+                checkpoint,
+                checkpoint_at: at,
+            };
+            if let Ok(shipping) = self.coordinator.record_base(&key, incarnation, &base).await {
+                self.shipping_from = shipping.base;
+                return;
+            }
+        }
     }
 
     /// The lease expires and a new node takes it; every earlier writer is
@@ -2708,6 +2956,12 @@ impl World {
             Action::Snapshot => self.snapshot().await,
             Action::RestoreFrom(pick) => return self.restore_from(pick, false).await,
             Action::RestoreFromAsToday(pick) => return self.restore_from(pick, true).await,
+            Action::FailBackupPut(fault) => self.backup.faults.lock().unwrap().push_back(fault),
+            Action::BackupDown(requests) => {
+                self.backup.down.fetch_add(requests, Ordering::SeqCst);
+            }
+            Action::DeliverDelayedBackup => self.backup.deliver_delayed().await,
+            Action::BeginShipping => self.begin_shipping().await,
         }
         Ok(())
     }
@@ -3235,6 +3489,10 @@ impl World {
         let rewritten = self.blobs.rewritten.lock().unwrap().clone();
         check(rewritten.is_empty(), || {
             format!("files were written twice: {rewritten:?}")
+        })?;
+        let rewritten = self.backup.rewritten.lock().unwrap().clone();
+        check(rewritten.is_empty(), || {
+            format!("backup files were written again with other bytes: {rewritten:?}")
         })?;
         let unfenced = self.coordinator.unfenced.lock().unwrap().clone();
         check(unfenced.is_empty(), || {
@@ -5118,5 +5376,229 @@ fn what_a_clean_with_no_grace_condemned_is_charged_again_once_a_head_needs_it() 
                 "{key} is excused though the restore needs it"
             );
         }
+    });
+}
+
+// DW-668, S1: the backup store and the start of shipping, which the
+// shipper's simulation is to be built on. Neither is in the histories the
+// checker draws yet: nothing ships until the shipper does.
+
+fn backup() -> BackupBlobs {
+    BackupBlobs::new(Transfers::default().part_bytes)
+}
+
+#[test]
+fn the_backup_store_creates_a_file_once_and_keeps_its_first_bytes() {
+    paused().block_on(async {
+        let store = backup();
+        let created = store.put_new("link", Bytes::from("A")).await.unwrap();
+        assert_eq!(created, Created::Written);
+        let again = store.put_new("link", Bytes::from("B")).await.unwrap();
+        assert_eq!(again, Created::AlreadyThere);
+        assert_eq!(store.get("link").await.unwrap(), "A");
+        assert_eq!(*store.landings.lock().unwrap(), ["link"]);
+        assert_eq!(
+            store.creates_at_most(),
+            Some(Transfers::default().part_bytes)
+        );
+        let small = BackupBlobs::new(64);
+        assert_eq!(small.creates_at_most(), Some(64));
+    });
+}
+
+#[test]
+fn a_create_refused_lands_nothing_and_one_whose_answer_is_lost_lands() {
+    paused().block_on(async {
+        let store = backup();
+        store.faults.lock().unwrap().push_back(PutFault::Refuse);
+        assert!(store.put_new("refused", Bytes::from("A")).await.is_err());
+        assert!(matches!(
+            store.get("refused").await,
+            Err(StorageError::Missing { .. })
+        ));
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push_back(PutFault::LandThenFail);
+        assert!(store.put_new("lost", Bytes::from("A")).await.is_err());
+        assert_eq!(store.get("lost").await.unwrap(), "A");
+        // Asked again: it is there, its own.
+        let again = store.put_new("lost", Bytes::from("A")).await.unwrap();
+        assert_eq!(again, Created::AlreadyThere);
+    });
+}
+
+#[test]
+fn a_create_delayed_lands_when_delivered_unless_its_key_is_taken_by_then() {
+    paused().block_on(async {
+        let store = backup();
+        store.faults.lock().unwrap().push_back(PutFault::Delay);
+        assert!(store.put_new("late", Bytes::from("A")).await.is_err());
+        assert!(matches!(
+            store.get("late").await,
+            Err(StorageError::Missing { .. })
+        ));
+        store.deliver_delayed().await;
+        assert_eq!(store.get("late").await.unwrap(), "A");
+        // Delayed, and the key taken meanwhile: refused when it comes.
+        store.faults.lock().unwrap().push_back(PutFault::Delay);
+        assert!(store.put_new("taken", Bytes::from("A")).await.is_err());
+        assert_eq!(
+            store.put_new("taken", Bytes::from("B")).await.unwrap(),
+            Created::Written
+        );
+        store.deliver_delayed().await;
+        assert_eq!(store.get("taken").await.unwrap(), "B");
+        assert!(store.rewritten.lock().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn a_backup_store_down_fails_every_request_for_as_many_as_it_is_down() {
+    paused().block_on(async {
+        let store = backup();
+        store.down.store(3, Ordering::SeqCst);
+        assert!(store.put_new("link", Bytes::from("A")).await.is_err());
+        assert!(store.get("link").await.is_err());
+        assert!(store.list("").await.is_err());
+        assert_eq!(
+            store.put_new("link", Bytes::from("A")).await.unwrap(),
+            Created::Written
+        );
+        assert!(store.landings.lock().unwrap().len() == 1);
+    });
+}
+
+#[test]
+fn a_backup_file_written_again_is_noticed_only_with_other_bytes() {
+    paused().block_on(async {
+        let store = backup();
+        store.put("file", Bytes::from("A")).await.unwrap();
+        store.put("file", Bytes::from("A")).await.unwrap();
+        assert!(
+            store.rewritten.lock().unwrap().is_empty(),
+            "the same bytes again"
+        );
+        store.put("file", Bytes::from("B")).await.unwrap();
+        assert_eq!(*store.rewritten.lock().unwrap(), ["file"]);
+        // Put in parts, as a spilled frame and a checkpoint's files are.
+        let parts = futures::stream::iter([Ok(Bytes::from("C")), Ok(Bytes::from("D"))]);
+        store.put_parts("parted", Box::pin(parts)).await.unwrap();
+        assert_eq!(store.get("parted").await.unwrap(), "CD");
+        store.faults.lock().unwrap().push_back(PutFault::Refuse);
+        let refused = futures::stream::iter([Ok(Bytes::from("E"))]);
+        assert!(store.put_parts("refused", Box::pin(refused)).await.is_err());
+        assert!(matches!(
+            store.get("refused").await,
+            Err(StorageError::Missing { .. })
+        ));
+    });
+}
+
+#[test]
+fn the_world_notices_a_backup_file_written_again_with_other_bytes() {
+    paused().block_on(async {
+        let mut world = World::new(None).await;
+        world.backup.put("file", Bytes::from("A")).await.unwrap();
+        world.verify().await.unwrap();
+        world.backup.put("file", Bytes::from("B")).await.unwrap();
+        let violation = world.verify().await.unwrap_err();
+        assert!(
+            violation.contains("written again with other bytes"),
+            "{violation}"
+        );
+    });
+}
+
+#[test]
+fn shipping_begins_held_from_the_lowest_row_and_based_where_the_newest_checkpoint_starts() {
+    paused().block_on(async {
+        let who = Who::Current;
+        // No checkpoint yet: held, capped at none, no base.
+        let mut world = after(vec![written(), Action::BeginShipping]).await;
+        let key = world.cluster.key.clone();
+        let shipping = world.coordinator.shipping(&key).await.unwrap();
+        assert_eq!(shipping.hold_from, Some(LogPosition(1)));
+        assert_eq!(shipping.cap, Some(LogPosition(0)));
+        assert_eq!(shipping.base, None);
+        assert_eq!(world.shipping_from, None);
+        // Then a checkpoint replaying nothing: a base there, on it.
+        world.step(Action::Flush { who }).await.unwrap();
+        world.step(Action::BeginShipping).await.unwrap();
+        world.verify().await.unwrap();
+        let shipping = world.coordinator.shipping(&key).await.unwrap();
+        let base = shipping.base.clone().expect("a base");
+        assert_eq!(base.position, base.checkpoint_at);
+        assert!(base.checkpoint.0.ends_with(".manifest"), "{base:?}");
+        assert_eq!(shipping.cap, Some(base.checkpoint_at));
+        assert_eq!(world.shipping_from, Some(base));
+    });
+}
+
+#[test]
+fn shipping_begins_at_the_first_log_a_checkpoint_replays() {
+    paused().block_on(async {
+        let world = after(vec![
+            written(),
+            Action::WriteBesideFlush {
+                who: Who::Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            Action::BeginShipping,
+        ])
+        .await;
+        let key = world.cluster.key.clone();
+        let base = world
+            .coordinator
+            .shipping(&key)
+            .await
+            .unwrap()
+            .base
+            .expect("a base");
+        // The checkpoint replays the write made while it was built.
+        assert!(base.position < base.checkpoint_at, "{base:?}");
+        assert_eq!(world.shipping_from, Some(base));
+    });
+}
+
+#[test]
+fn the_world_fails_the_backup_store_as_its_actions_say() {
+    paused().block_on(async {
+        let mut world = World::new(None).await;
+        world
+            .step(Action::FailBackupPut(PutFault::Refuse))
+            .await
+            .unwrap();
+        assert!(world.backup.put_new("a", Bytes::from("A")).await.is_err());
+        assert!(world.backup.get("a").await.is_err());
+        world.step(Action::BackupDown(1)).await.unwrap();
+        assert!(world.backup.put_new("b", Bytes::from("B")).await.is_err());
+        assert!(world.backup.get("b").await.is_err());
+        world
+            .step(Action::FailBackupPut(PutFault::Delay))
+            .await
+            .unwrap();
+        assert!(world.backup.put_new("c", Bytes::from("C")).await.is_err());
+        world.step(Action::DeliverDelayedBackup).await.unwrap();
+        assert_eq!(world.backup.get("c").await.unwrap(), "C");
+        world.verify().await.unwrap();
+    });
+}
+
+#[test]
+fn a_put_delayed_lands_only_when_delivered_over_whatever_is_there() {
+    paused().block_on(async {
+        let store = backup();
+        store.faults.lock().unwrap().push_back(PutFault::Delay);
+        assert!(store.put("frame", Bytes::from("A")).await.is_err());
+        assert!(matches!(
+            store.get("frame").await,
+            Err(StorageError::Missing { .. })
+        ));
+        store.deliver_delayed().await;
+        assert_eq!(store.get("frame").await.unwrap(), "A");
     });
 }
