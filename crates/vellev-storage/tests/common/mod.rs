@@ -396,6 +396,50 @@ impl Coordinator for Unreliable {
     ) -> Result<vellev_storage::coordinator::Cleaned, CoordinatorError> {
         self.inner.clean_below(lease, base, position).await
     }
+    async fn shipping(
+        &self,
+        key: &PartitionKey,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.shipping(key).await
+    }
+    async fn hold_for_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.hold_for_shipping(key, incarnation, cap).await
+    }
+    async fn record_base(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: &vellev_storage::coordinator::ShipBase,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.record_base(key, incarnation, base).await
+    }
+    async fn note_shipped(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        position: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner
+            .note_shipped(key, incarnation, base, position)
+            .await
+    }
+    async fn stall_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        reason: &str,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner
+            .stall_shipping(key, incarnation, base, reason)
+            .await
+    }
     async fn partitions(
         &self,
         after: Option<&PartitionKey>,
