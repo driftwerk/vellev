@@ -18,7 +18,18 @@
 //!
 //! Logs are encoded as maps with their fields named, in the order they
 //! are declared (`position` first, then `prev`); nothing here relies on
-//! the order.
+//! the order. A key given twice fails, as a full read of the log does.
+//!
+//! What is found is only what the start of the frame says, read before
+//! the rest has come: a [`Found`], as soon as it is said and as often as
+//! it is said again, may be acted on only once the whole frame has come
+//! and its CRC and SHA-256 hold (amendment 1, A2). A later part is neither
+//! read nor checked here.
+//!
+//! The start is read again from its beginning with each part taken in, so
+//! a frame fed a byte at a time costs the square of the start's length;
+//! parts as the store gives them, of `part_bytes`, cost nothing to speak
+//! of.
 
 use crate::coordinator::LogPosition;
 use crate::format::{kind_of_header, Kind, BODY};
@@ -111,6 +122,12 @@ impl Prefix {
     }
 }
 
+/// Whether `key` is one of the two looked for, found already: a log's map
+/// gives each key once, as a full read of it requires.
+fn found_twice(key: &str, position: bool, prev: bool) -> bool {
+    (key == "position" && position) || (key == "prev" && prev)
+}
+
 /// Why reading stopped: the bytes ran out before what was read ended, or
 /// what was read is not what a log's start may be.
 enum Stop {
@@ -168,6 +185,9 @@ impl Reader<'_> {
                 }
             };
             match key.as_str() {
+                "position" | "prev" if found_twice(&key, position.is_some(), prev.is_some()) => {
+                    return Err(Stop::Bad("it gives its position or prev twice"))
+                }
                 "position" => position = Some(LogPosition(self.unsigned()?)),
                 "prev" => prev = Some(self.prev()?),
                 "ops" => return Err(Stop::Bad("it reaches ops before its position and prev")),
@@ -585,6 +605,132 @@ mod tests {
         let mut magic = framed(&log(None));
         magic[0] ^= 1;
         fails(found(&magic), "not a vellev file");
+    }
+
+    #[test]
+    fn a_position_is_read_at_every_width_messagepack_gives_it() {
+        let u32_max = u64::from(u32::MAX);
+        for position in [
+            0x7f,
+            0x80,
+            0xff,
+            0x100,
+            0xffff,
+            0x1_0000,
+            u32_max,
+            u32_max + 1,
+            u64::MAX,
+        ] {
+            let log = LogSegment {
+                position: LogPosition(position),
+                ..log(Some("p"))
+            };
+            assert_eq!(
+                found(&framed(&log)).unwrap(),
+                found_at(position, Some("p")),
+                "{position:#x}"
+            );
+        }
+    }
+
+    /// A body of the entries `position` and `prev` and then `ops`, each key
+    /// and `prev`'s text marked as `marked` marks text of its length: as
+    /// a writer that does not take the shortest form may write them, which
+    /// MessagePack allows.
+    fn marked_body(marked: impl Fn(&str) -> Vec<u8>, prev: &str) -> Vec<u8> {
+        let mut body = vec![0x83];
+        body.extend(marked("position"));
+        body.extend([0xcd, 0x01, 0x2c]);
+        body.extend(marked("prev"));
+        body.extend(marked(prev));
+        body.extend(marked("ops"));
+        body.push(0x90);
+        body
+    }
+
+    #[test]
+    fn keys_and_prev_are_read_however_long_a_length_their_text_is_given() {
+        let str16 = |text: &str| {
+            let mut out = vec![0xda];
+            out.extend((text.len() as u16).to_be_bytes());
+            out.extend(text.as_bytes());
+            out
+        };
+        let str32 = |text: &str| {
+            let mut out = vec![0xdb];
+            out.extend((text.len() as u32).to_be_bytes());
+            out.extend(text.as_bytes());
+            out
+        };
+        let prev = "tenant-a/0/log/00000000000000000299-x.log";
+        assert_eq!(
+            found(&raw(&marked_body(str16, prev))).unwrap(),
+            found_at(300, Some(prev))
+        );
+        assert_eq!(
+            found(&raw(&marked_body(str32, prev))).unwrap(),
+            found_at(300, Some(prev))
+        );
+        // And a long one, which only str16 can say.
+        let long = "p".repeat(300);
+        assert_eq!(
+            found(&raw(&marked_body(str16, &long))).unwrap(),
+            found_at(300, Some(&long))
+        );
+    }
+
+    #[test]
+    fn a_byte_messagepack_never_uses_fails_wherever_it_is_skipped() {
+        let mut body = vec![0x83, 0xa1, b'x', 0xc1];
+        body.extend([0xa8]);
+        body.extend(b"position");
+        body.push(0x07);
+        body.extend([0xa4]);
+        body.extend(b"prev");
+        body.push(0xc0);
+        fails(found(&raw(&body)), "never uses");
+    }
+
+    #[test]
+    fn a_key_given_twice_fails_as_a_full_read_of_the_log_would() {
+        for twice in ["position", "prev"] {
+            let mut body = vec![0x83];
+            let mut entry = |key: &str, value: &[u8]| {
+                body.push(0xa0 | key.len() as u8);
+                body.extend(key.as_bytes());
+                body.extend(value);
+            };
+            let value: &[u8] = if twice == "position" {
+                &[0x07]
+            } else {
+                &[0xc0]
+            };
+            entry(twice, value);
+            entry(twice, value);
+            let other = if twice == "position" {
+                "prev"
+            } else {
+                "position"
+            };
+            let other_value: &[u8] = if other == "position" {
+                &[0x07]
+            } else {
+                &[0xc0]
+            };
+            entry(other, other_value);
+            fails(found(&raw(&body)), "twice");
+        }
+        // As serde's full read does.
+        let mut body = vec![0x83, 0xa8];
+        body.extend(b"position");
+        body.push(0x07);
+        body.push(0xa8);
+        body.extend(b"position");
+        body.push(0x07);
+        body.push(0xa3);
+        body.extend(b"ops");
+        body.push(0x90);
+        assert!(rmp_serde::from_slice::<LogSegment>(&body).is_err());
     }
 
     #[test]
