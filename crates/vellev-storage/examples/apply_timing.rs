@@ -21,7 +21,7 @@ use bytes::Bytes;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use vellev_core::{NodeId, Partition, TenantId};
-use vellev_storage::blobs::{Blobs, Listed, Local, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, Linked, Listed, Local, ObjectBlobs};
 use vellev_storage::coordinator::{
     Acquired, Commit, Coordinator, LogPosition, ManifestRef, MemoryCoordinator, PartitionKey,
 };
@@ -85,6 +85,9 @@ impl Blobs for Overlaid {
     }
     async fn local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
         self.under.local(key).await
+    }
+    async fn link_local(&self, from: &str, to: &str) -> vellev_storage::Result<Linked> {
+        self.under.link_local(from, to).await
     }
 }
 

@@ -7,6 +7,7 @@ mod common;
 use common::*;
 use futures::FutureExt;
 use vellev_storage::backups::Held;
+use vellev_storage::blobs::Linked;
 use vellev_storage::coordinator::{Clock, Restore};
 use vellev_storage::{Merging, Partition, RestoreFrom};
 
@@ -182,6 +183,16 @@ async fn restored_from(
     writer: &Writer,
     frozen: &Frozen,
 ) -> vellev_storage::Result<LogPosition> {
+    restored_under(cluster, writer, frozen, &Holding(true)).await
+}
+
+/// As [`restored_from`], under the right `held`.
+async fn restored_under(
+    cluster: &Cluster,
+    writer: &Writer,
+    frozen: &Frozen,
+    held: &dyn Held,
+) -> vellev_storage::Result<LogPosition> {
     let restore = restore(cluster, frozen.at);
     let ready: RestoreFrom<'_> = writer
         .restore_from(
@@ -189,7 +200,7 @@ async fn restored_from(
             frozen.head.as_ref(),
             restore,
             None,
-            &Holding(true),
+            held,
         )
         .await?;
     ready.commit().await
@@ -1460,5 +1471,447 @@ impl Blobs for PutsCounted {
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.inner.delete(key).await
+    }
+}
+
+/// DW-680, planted bug 13, on the path a restore of a tenant from its own
+/// backup takes: every segment the backup lists is one the live state
+/// holds. A copy that comes out wrong still fails the restore, which
+/// commits nothing: a segment the live state holds is taken in its place
+/// only once its copy is seen, streamed back, to be what the backup sent.
+#[tokio::test]
+async fn a_restore_from_its_own_backup_whose_copy_comes_out_wrong_fails_and_commits_nothing() {
+    let plain = Cluster::new().await;
+    let target = Cluster {
+        blobs: Arc::new(Garbling(plain.blobs.clone())),
+        ..plain
+    };
+    let writer = lived_in(&target).await;
+    let frozen = frozen(&target).await;
+    let before = target.committed().await;
+
+    let outcome = restored_from(&target, &writer, &frozen).await;
+
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(target.committed().await, before);
+    writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+}
+
+/// Five segments flushed apart, none merged, and a note written after.
+async fn of_five_segments(cluster: &Cluster) {
+    let writer = cluster.writer().await;
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for n in 1..=5 {
+        writer
+            .commit(vec![upsert("notes", n, i64::from(n))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    writer.commit(vec![upsert("notes", 6, 6)]).await.unwrap();
+}
+
+/// A store that counts the segment files being read at once, each taking
+/// a moment, whole or a part at a time, and the most at any one time.
+#[derive(Debug)]
+struct Crowded {
+    inner: Arc<dyn Blobs>,
+    reading: Arc<AtomicUsize>,
+    most: AtomicUsize,
+}
+
+impl Crowded {
+    fn over(inner: Arc<dyn Blobs>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            reading: Arc::default(),
+            most: AtomicUsize::new(0),
+        })
+    }
+
+    /// One more segment file being read, until what this gives is dropped.
+    fn begun(&self) -> Reading {
+        let now = self.reading.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        Reading(self.reading.clone())
+    }
+}
+
+struct Reading(Arc<AtomicUsize>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Blobs for Crowded {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        if !key.contains("/segment/") {
+            return self.inner.get(key).await;
+        }
+        let _reading = self.begun();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.inner.get(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        use futures::StreamExt;
+        if !key.contains("/segment/") {
+            return self.inner.parts(key);
+        }
+        let reading = self.begun();
+        let parts = self.inner.parts(key);
+        let slow = futures::stream::once(tokio::time::sleep(Duration::from_millis(20)));
+        let parts = slow
+            .flat_map(move |()| futures::stream::empty())
+            .chain(parts);
+        parts
+            .map(move |part| {
+                let _held = &reading;
+                part
+            })
+            .boxed()
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A restore decodes the segments it loads from its copies two at a time,
+/// so that what it holds beside the live state stays small; an open of
+/// the same partition reads them all at once, as it always has.
+#[tokio::test]
+async fn a_restore_decodes_its_copies_two_at_a_time_and_an_open_all_at_once() {
+    let source = Cluster::new().await;
+    of_five_segments(&source).await;
+    let frozen = frozen(&source).await;
+    assert_eq!(frozen.checkpoint.as_ref().unwrap().segments.len(), 5);
+    let plain = Cluster::new().await;
+    let crowded = Crowded::over(plain.blobs.clone());
+    let target = Cluster {
+        blobs: crowded.clone(),
+        ..plain
+    };
+    let writer = lived_in(&target).await;
+
+    restored_from(&target, &writer, &frozen).await.unwrap();
+    assert_eq!(crowded.most.load(Ordering::SeqCst), 2, "a restore");
+
+    crowded.most.store(0, Ordering::SeqCst);
+    assert_eq!(target.open().await.partition().read(ns), frozen.rows);
+    assert!(crowded.most.load(Ordering::SeqCst) > 2, "an open");
+}
+
+/// A target over a cache in a directory of its own.
+async fn cached(dir: &std::path::Path) -> (Cluster, Arc<CachedBlobs>) {
+    let plain = Cluster::new().await;
+    let cached = Arc::new(CachedBlobs::new(plain.blobs.clone(), dir));
+    let target = Cluster {
+        blobs: cached.clone(),
+        ..plain
+    };
+    (target, cached)
+}
+
+/// The files of `kind` the committed head names.
+async fn named(cluster: &Cluster, kind: &str) -> Vec<String> {
+    let committed = cluster.committed().await;
+    let files = Partition::files(cluster.key.clone(), cluster.blobs.clone(), &committed);
+    let files = files.await.unwrap().into_iter();
+    files.filter(|key| key.contains(kind)).collect()
+}
+
+/// A restore reads the segments it copied without keeping a copy of them
+/// on local disk, which loading them needs none of; the vectors, read in
+/// place, it does keep.
+#[tokio::test]
+async fn a_restore_keeps_no_copy_of_a_segment_on_local_disk() {
+    let source = Cluster::new().await;
+    of_five_segments(&source).await;
+    let frozen = frozen(&source).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (target, cache) = cached(dir.path()).await;
+    let writer = lived_in(&target).await;
+
+    restored_from(&target, &writer, &frozen).await.unwrap();
+
+    let restored = |key: &String| key.contains("-restored.");
+    let segments: Vec<String> = named(&target, "/segment/")
+        .await
+        .into_iter()
+        .filter(restored)
+        .collect();
+    assert_eq!(segments.len(), 5);
+    for segment in &segments {
+        assert!(cache.local(segment).await.unwrap().is_none(), "{segment}");
+    }
+    let vectors: Vec<String> = named(&target, "/vectors/")
+        .await
+        .into_iter()
+        .filter(restored)
+        .collect();
+    assert_eq!(vectors.len(), 5);
+    for vectors in &vectors {
+        assert!(cache.local(vectors).await.unwrap().is_some(), "{vectors}");
+    }
+}
+
+/// A tenant restored from its own backup gives each vectors file it takes
+/// as held the copy on local disk it has, under the new key: no copy is
+/// fetched again, and the old key's going leaves the new key's.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_restore_from_its_own_backup_links_the_vectors_it_holds_on_local_disk() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (target, cache) = cached(dir.path()).await;
+    let writer = lived_in(&target).await;
+    let old = named(&target, "/vectors/").await;
+    assert!(!old.is_empty());
+    let frozen = frozen(&target).await;
+
+    restored_from(&target, &writer, &frozen).await.unwrap();
+
+    let restored = |key: &String| key.contains("-restored.");
+    let new: Vec<String> = named(&target, "/vectors/")
+        .await
+        .into_iter()
+        .filter(restored)
+        .collect();
+    assert_eq!(new.len(), old.len());
+    let inode = |key: &String| std::fs::metadata(dir.path().join(key)).unwrap().ino();
+    let old_inodes: BTreeSet<u64> = old.iter().map(inode).collect();
+    for key in &new {
+        assert!(
+            old_inodes.contains(&inode(key)),
+            "{key} is a copy of its own"
+        );
+    }
+    for key in &old {
+        cache.delete(key).await.unwrap();
+    }
+    for key in &new {
+        assert!(cache.local(key).await.unwrap().is_some(), "{key}");
+    }
+    assert_eq!(target.open().await.partition().read(ns), frozen.rows);
+}
+
+/// A store over a cache whose fetch of each vectors file to local disk
+/// fails the first `times` times as `failure` makes it fail.
+#[derive(Debug)]
+struct SlowDisk {
+    inner: Arc<CachedBlobs>,
+    failure: Failure,
+    times: usize,
+    /// How many times each file was fetched.
+    fetched: Mutex<BTreeMap<String, usize>>,
+    /// Whether any fetch has failed.
+    failed: Arc<AtomicBool>,
+}
+
+impl SlowDisk {
+    fn over(plain: &Cluster, dir: &std::path::Path, failure: Failure, times: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(CachedBlobs::new(plain.blobs.clone(), dir)),
+            failure,
+            times,
+            fetched: Mutex::default(),
+            failed: Arc::default(),
+        })
+    }
+
+    /// The most times any one file was fetched.
+    fn most_fetched(&self) -> usize {
+        let fetched = self.fetched.lock().unwrap();
+        fetched.values().copied().max().unwrap_or(0)
+    }
+}
+
+#[async_trait]
+impl Blobs for SlowDisk {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        self.inner.parts(key)
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
+        self.inner.local(key).await
+    }
+    async fn fetch_local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
+        let fetched = {
+            let mut fetched = self.fetched.lock().unwrap();
+            let fetched = fetched.entry(key.to_string()).or_default();
+            *fetched += 1;
+            *fetched
+        };
+        if fetched <= self.times {
+            self.failed.store(true, Ordering::SeqCst);
+            return Err((self.failure)(key));
+        }
+        self.inner.fetch_local(key).await
+    }
+    async fn link_local(&self, from: &str, to: &str) -> vellev_storage::Result<Linked> {
+        self.inner.link_local(from, to).await
+    }
+}
+
+/// How a fetch fails, of the file under the key it is given.
+type Failure = fn(&str) -> StorageError;
+
+/// A local disk that was slow once: what failed to be fetched to it is
+/// fetched again and the restore goes on. Any other failure, of the
+/// store or of what was fetched, is not tried again: it fails the restore.
+#[tokio::test]
+async fn a_restore_tries_a_fetch_to_a_slow_local_disk_again_and_nothing_else() {
+    let slow: Failure = |key| StorageError::Blob {
+        key: key.to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "local disk did not answer within 10.8s",
+        )),
+    };
+    let unanswered: Failure =
+        |key| vellev_storage::blobs::unanswered(key, Duration::from_secs(187));
+    let other_disk: Failure = |key| StorageError::Blob {
+        key: key.to_string(),
+        source: Box::new(std::io::Error::other("no space left")),
+    };
+    let wrapped: Failure = |key| {
+        let inner = StorageError::Blob {
+            key: key.to_string(),
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow")),
+        };
+        StorageError::Shared(Arc::new(inner))
+    };
+    let cases: [(&str, Failure, bool); 4] = [
+        ("a local disk that timed out", slow, true),
+        ("a store that did not answer", unanswered, false),
+        ("a local disk otherwise failing", other_disk, false),
+        ("a time-out not the failure's own", wrapped, false),
+    ];
+    let source = Cluster::new().await;
+    of_five_segments(&source).await;
+    let frozen = frozen(&source).await;
+    for (what, failure, tried_again) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = Cluster::new().await;
+        let slow = SlowDisk::over(&plain, dir.path(), failure, 1);
+        let target = Cluster {
+            blobs: slow.clone(),
+            ..plain
+        };
+        let writer = lived_in(&target).await;
+        let before = target.committed().await;
+
+        let outcome = restored_from(&target, &writer, &frozen).await;
+
+        assert_eq!(outcome.is_ok(), tried_again, "{what}: {outcome:?}");
+        let fetched = if tried_again { 2 } else { 1 };
+        assert_eq!(slow.most_fetched(), fetched, "{what}");
+        if !tried_again {
+            assert_eq!(target.committed().await, before, "{what}");
+        }
+    }
+}
+
+/// A right held until a fetch has failed, if `failed` is a store's.
+struct HeldUntil(Arc<AtomicBool>);
+
+#[async_trait]
+impl Held for HeldUntil {
+    async fn held(&self) -> vellev_storage::Result<bool> {
+        Ok(self.still())
+    }
+    fn still(&self) -> bool {
+        !self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// A fetch to a local disk that does not answer in time is tried three
+/// times in all, and each time again only while the restore's right
+/// holds; a disk slow every time, or a right lost, fails the restore,
+/// which commits nothing.
+#[tokio::test]
+async fn a_restore_tries_a_slow_local_disk_three_times_in_all_while_its_right_holds() {
+    let slow: Failure = |key| StorageError::Blob {
+        key: key.to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "local disk did not answer within 10.8s",
+        )),
+    };
+    let source = Cluster::new().await;
+    of_five_segments(&source).await;
+    let frozen = frozen(&source).await;
+    let cases = [
+        ("slow twice", 2, false, true, 3),
+        ("slow three times", 3, false, false, 3),
+        ("its right lost once slow", 1, true, false, 1),
+    ];
+    for (what, times, lost, restored, fetched) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = Cluster::new().await;
+        let disk = SlowDisk::over(&plain, dir.path(), slow, times);
+        let target = Cluster {
+            blobs: disk.clone(),
+            ..plain
+        };
+        let writer = lived_in(&target).await;
+        let before = target.committed().await;
+        let failed = match lost {
+            true => disk.failed.clone(),
+            false => Arc::default(),
+        };
+
+        let outcome = restored_under(&target, &writer, &frozen, &HeldUntil(failed)).await;
+
+        assert_eq!(outcome.is_ok(), restored, "{what}: {outcome:?}");
+        if lost {
+            assert!(
+                matches!(outcome, Err(StorageError::Unheld(_))),
+                "{what}: {outcome:?}"
+            );
+        }
+        assert_eq!(disk.most_fetched(), fetched, "{what}");
+        if !restored {
+            assert_eq!(target.committed().await, before, "{what}");
+        }
     }
 }

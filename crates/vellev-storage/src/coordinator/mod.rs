@@ -110,6 +110,56 @@ pub struct Committed {
     pub manifest: Option<ManifestRef>,
 }
 
+/// Where a shipped timeline begins (DW-668): the position `B` its first
+/// link is at, and the checkpoint `C` whose restore starts there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShipBase {
+    pub position: LogPosition,
+    pub checkpoint: ManifestRef,
+    pub checkpoint_at: LogPosition,
+}
+
+/// How a partition's history is shipped to the backup store (DW-668), in
+/// its current incarnation.
+///
+/// - `hold_from` and `cap`: shipping's hold, taken before a base is
+///   chosen. Commit rows at and above `hold_from` are kept from then on,
+///   and a clean records nothing above `cap`, the newest checkpoint when
+///   the hold was taken, or 0 if there was none.
+/// - `base`: the base of the run of shipping now under way, raised only.
+/// - `shipped` and `stalled`: that run's own, fenced by its base: the
+///   newest position up to which every commit from the base on has been
+///   shipped, only ever raised, and why it stopped, if it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shipping {
+    pub incarnation: Incarnation,
+    pub hold_from: Option<LogPosition>,
+    pub cap: Option<LogPosition>,
+    pub base: Option<ShipBase>,
+    pub shipped: Option<LogPosition>,
+    pub stalled: Option<String>,
+}
+
+/// Why a shipping hold or base was refused as stale: what it named no
+/// longer stands, and the caller reads again and asks anew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    /// A clean has recorded it deletes above the checkpoint named.
+    CleanedAbove,
+    /// The checkpoint named is above what is committed.
+    AboveCommitted,
+    /// No hold is taken, which a base needs.
+    NotHeld,
+    /// The hold is above the base named.
+    HoldAbove,
+    /// The cap is above the base's checkpoint, so it would be lowered.
+    CapAbove,
+    /// No commit row is at the base named.
+    NoRowAtBase,
+    /// No commit row at the checkpoint's position names its key.
+    CheckpointNotThere,
+}
+
 /// What a clean of a partition last recorded it deletes below: the key of
 /// the checkpoint that was its base, and that checkpoint's position. Every
 /// checkpoint a clean has deleted lies below it, since a clean records it
@@ -266,6 +316,26 @@ pub enum CoordinatorError {
         committed: LogPosition,
         attempted: LogPosition,
     },
+    /// Shipping was asked about another incarnation than the partition's
+    /// current one: by a shipper of one removed, or not yet seen made
+    /// again.
+    #[error("partition {key} is at incarnation {current:?}, not {asked:?}")]
+    OtherIncarnation {
+        key: PartitionKey,
+        asked: Incarnation,
+        current: Incarnation,
+    },
+    /// A shipper's write names another base than the run under way's, or
+    /// none is under way.
+    #[error("shipping of {key} is from {recorded:?}, not from {asked:?}")]
+    OtherBase {
+        key: PartitionKey,
+        asked: LogPosition,
+        recorded: Option<LogPosition>,
+    },
+    /// A shipping hold or base that no longer stands.
+    #[error("shipping of {key} refused as stale: {why:?}")]
+    StaleShipping { key: PartitionKey, why: Stale },
     #[error("{0}")]
     InvalidArgument(String),
     #[error("coordinator backend failed: {0}")]
@@ -285,6 +355,133 @@ impl CoordinatorError {
 }
 
 pub type Result<T> = std::result::Result<T, CoordinatorError>;
+
+/// What a partition's rows say, for a shipping hold or base to be
+/// decided on: by the memory coordinator, which applies what it decides,
+/// and by Postgres, to say why a conditional write changed nothing.
+#[derive(Debug, Clone)]
+pub(crate) struct ShipFacts {
+    pub shipping: Shipping,
+    pub committed: LogPosition,
+    pub cleaned: Option<LogPosition>,
+    /// Whether a commit row of the incarnation is at the base asked for.
+    pub row_at_base: bool,
+    /// The head of the commit row at the checkpoint's position asked for.
+    pub head_at_checkpoint: Option<ManifestRef>,
+}
+
+/// What a shipping write is to do.
+#[derive(Debug)]
+pub(crate) enum Ship {
+    /// Make it.
+    Write,
+    /// Leave what stands, and return it.
+    Stand,
+}
+
+fn stale(key: &PartitionKey, why: Stale) -> CoordinatorError {
+    CoordinatorError::StaleShipping {
+        key: key.clone(),
+        why,
+    }
+}
+
+/// Refused unless `asked` is `current`, the partition's incarnation.
+pub(crate) fn same_incarnation(
+    key: &PartitionKey,
+    asked: Incarnation,
+    current: Incarnation,
+) -> Result<()> {
+    match asked == current {
+        true => Ok(()),
+        false => Err(CoordinatorError::OtherIncarnation {
+            key: key.clone(),
+            asked,
+            current,
+        }),
+    }
+}
+
+/// Whether a hold with `cap` is taken, given `facts`.
+pub(crate) fn hold_decision(
+    key: &PartitionKey,
+    incarnation: Incarnation,
+    cap: LogPosition,
+    facts: &ShipFacts,
+) -> Result<Ship> {
+    same_incarnation(key, incarnation, facts.shipping.incarnation)?;
+    if facts.shipping.hold_from.is_some() {
+        return Ok(Ship::Stand);
+    }
+    if facts.cleaned.is_some_and(|cleaned| cleaned > cap) {
+        return Err(stale(key, Stale::CleanedAbove));
+    }
+    if cap > facts.committed {
+        return Err(stale(key, Stale::AboveCommitted));
+    }
+    Ok(Ship::Write)
+}
+
+/// Whether `base` is recorded, given `facts`.
+pub(crate) fn base_decision(
+    key: &PartitionKey,
+    incarnation: Incarnation,
+    base: &ShipBase,
+    facts: &ShipFacts,
+) -> Result<Ship> {
+    same_incarnation(key, incarnation, facts.shipping.incarnation)?;
+    let shipping = &facts.shipping;
+    if shipping
+        .base
+        .as_ref()
+        .is_some_and(|recorded| recorded.position >= base.position)
+    {
+        return Ok(Ship::Stand);
+    }
+    let (Some(hold), Some(cap)) = (shipping.hold_from, shipping.cap) else {
+        return Err(stale(key, Stale::NotHeld));
+    };
+    let why = if hold > base.position {
+        Stale::HoldAbove
+    } else if cap > base.checkpoint_at {
+        Stale::CapAbove
+    } else if facts
+        .cleaned
+        .is_some_and(|cleaned| cleaned > base.checkpoint_at)
+    {
+        Stale::CleanedAbove
+    } else if !facts.row_at_base {
+        Stale::NoRowAtBase
+    } else if facts.head_at_checkpoint.as_ref() != Some(&base.checkpoint) {
+        Stale::CheckpointNotThere
+    } else {
+        return Ok(Ship::Write);
+    };
+    Err(stale(key, why))
+}
+
+/// `position` as one noted shipped of the run from `base`: at or above it.
+pub(crate) fn checked_note(base: LogPosition, position: LogPosition) -> Result<()> {
+    if position < base {
+        return Err(CoordinatorError::InvalidArgument(format!(
+            "position {} is below the base {} it is noted shipped from",
+            position.0, base.0
+        )));
+    }
+    Ok(())
+}
+
+/// `base` as one to record: at a commit, and at or below its checkpoint.
+pub(crate) fn checked_ship_base(base: &ShipBase) -> Result<()> {
+    if base.position == LogPosition(0) || base.position > base.checkpoint_at {
+        return Err(CoordinatorError::InvalidArgument(format!(
+            "a shipping base at {} with its checkpoint at {}: a base is at a commit, \
+             and at or below its checkpoint",
+            base.position.0, base.checkpoint_at.0
+        )));
+    }
+    Ok(())
+}
 
 fn checked_ttl(ttl: Duration) -> Result<Duration> {
     (ttl <= MAX_TTL).then_some(ttl).ok_or_else(|| {
@@ -398,6 +595,74 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
         base: &ManifestRef,
         position: LogPosition,
     ) -> Result<Cleaned>;
+
+    /// How the partition's history is shipped, in its current incarnation.
+    /// Fails for a partition not registered.
+    async fn shipping(&self, key: &PartitionKey) -> Result<Shipping>;
+
+    /// Take shipping's hold on the partition's incarnation `incarnation`:
+    /// from the lowest commit row of it still there (or the position after
+    /// the committed one, if none is), rows are kept, and a clean records
+    /// nothing above `cap`, the newest checkpoint the caller knows (0 for
+    /// none). Taken once per incarnation, in a transaction of its own that
+    /// first takes the lock `forget_history` takes, and then reads the
+    /// lowest row afresh. A hold already taken is left and returned, which
+    /// is not an error. Refused unless `cap` is at or above what a clean
+    /// has recorded and at or below what is committed, as stale; and for
+    /// another incarnation. Nothing holds a lease to ship, so the
+    /// incarnation fences, as for every shipping write. No default on any
+    /// coordinator, so that one that does not record can never seem to;
+    /// and nothing but tests calls it until `forget_history` honours it.
+    async fn hold_for_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        cap: LogPosition,
+    ) -> Result<Shipping>;
+
+    /// Record `base` as the base of a run of shipping of the partition's
+    /// incarnation `incarnation`, raise the cap to its checkpoint, and
+    /// begin the run's own record, nothing yet shipped or stalled, in the
+    /// same transaction, the partition's row first. Raised only: a base at
+    /// or above it is left and returned, which is not an error, and the
+    /// caller ships from the base it is given back. Refused, as stale,
+    /// unless the hold is taken and at or below the base, the cap and
+    /// what a clean has recorded are at or below the checkpoint, a commit
+    /// row is at the base, and the row at the checkpoint's position names
+    /// it; and for another incarnation. That the base is where the
+    /// checkpoint's restore starts is for the caller, which has decoded
+    /// the checkpoint. No default, as for [`Self::hold_for_shipping`].
+    async fn record_base(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: &ShipBase,
+    ) -> Result<Shipping>;
+
+    /// Note that every commit of the run from `base` up to `position` has
+    /// been shipped. Only ever raised: a note at or below what stands is
+    /// left, and returned. Fenced by the incarnation and the base on the
+    /// run's own record, never through the partition's row: refused for
+    /// another incarnation, and for another base or none. No default.
+    async fn note_shipped(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        position: LogPosition,
+    ) -> Result<Shipping>;
+
+    /// Note that the run from `base` has stopped, and why. The first
+    /// reason stands; a later one is left, and the record returned.
+    /// Fenced as [`Self::note_shipped`] is, so that a stale run never
+    /// stops the one under way. No default.
+    async fn stall_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        reason: &str,
+    ) -> Result<Shipping>;
 
     /// Up to `limit` registered partitions after `after`, in key order,
     /// tenants comparing byte by byte.
