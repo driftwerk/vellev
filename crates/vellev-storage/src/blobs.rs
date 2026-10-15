@@ -325,8 +325,9 @@ impl Layout<'_> {
     /// kind, the position, the generation, the writer; on a segment, index
     /// or vectors file only, the nonce a writer drew since DW-658, sixteen
     /// lowercase hex digits, and a marker, `-merged` or `-restored`; and the
-    /// kind again as its extension. A log or a manifest is named with
-    /// neither. Nothing else passes, so every key read is plain: each part
+    /// kind again as its extension. `-restored` comes only with a nonce,
+    /// as no writer named a restored file before DW-658; `-merged` comes
+    /// with or without one. A log or a manifest is named with neither. Nothing else passes, so every key read is plain: each part
     /// of it is one of those.
     pub(crate) fn named_by<'k>(&self, key: &'k str) -> Option<Named<'k>> {
         let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
@@ -363,7 +364,9 @@ impl Layout<'_> {
             }
             Some(_) => return None,
         };
-        if parts.next().is_some() {
+        // `restore_from` (DW-680) came after the nonce (DW-658): a file
+        // marked restored without one was never written.
+        if parts.next().is_some() || (restored && nonce.is_none()) {
             return None;
         }
         Some(Named {
@@ -2146,10 +2149,14 @@ mod tests {
                 Some(0),
                 "{key}"
             );
-            // Marked restored with no nonce, as before DW-658.
-            let key = layout.named(kind, at, &author, "-restored");
+            // Merged with no nonce, as before DW-658, read as ever.
+            let key = layout.named(kind, at, &author, "-merged");
             let named = layout.named_by(&key).unwrap();
-            assert!(named.restored && named.nonce.is_none(), "{key}");
+            assert!(named.merged && named.nonce.is_none(), "{key}");
+            // Restored with no nonce: no writer ever named one so, as
+            // `restore_from` (DW-680) came after the nonce (DW-658).
+            let key = layout.named(kind, at, &author, "-restored");
+            assert_eq!(layout.named_by(&key), None, "{key}");
         }
         let segment = layout.nonced("segment", at, &author, nonce, "");
         let drawn = format!("-{nonce:016x}");
