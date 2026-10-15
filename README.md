@@ -692,7 +692,10 @@ dead connection passes to another node rather than waiting with it:
   node told to stop waits for those aborts before it exits (see above). One
   cut off too abruptly for that, as by a crash, leaves parts in the bucket:
   give it a lifecycle rule that aborts incomplete multipart uploads after a
-  day (`AbortIncompleteMultipartUpload`).
+  day (`AbortIncompleteMultipartUpload`). So does a scheduled backup still
+  uploading when the node stops: the stop does not end it, so it is cut off
+  only as the process exits, after the wait for aborts, and its own abort is
+  never sent.
 - Each step on the cache directory is waited for ten seconds and as long
   again as its bytes take at 20 MiB/s, after which the node carries on
   without the copy; the steps run on at most 64 threads of their own. With
