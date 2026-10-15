@@ -867,6 +867,17 @@ impl State {
         })
     }
 
+    /// As [`Self::loaded_segments`], each with the key of its vectors
+    /// file, if it has one.
+    pub(crate) fn loaded_with_vectors(&self) -> impl Iterator<Item = (&str, Option<&str>, Loaded)> {
+        let vectors = self
+            .segments
+            .iter()
+            .map(|segment| segment.meta.vectors.as_deref());
+        let loaded = self.loaded_segments().zip(vectors);
+        loaded.map(|((key, loaded), vectors)| (key, vectors, loaded))
+    }
+
     fn mark_dead(&mut self, location: Location) {
         let (rows, dead, deaths, indexes, row) = match location {
             Location::Memtable(row) => {
