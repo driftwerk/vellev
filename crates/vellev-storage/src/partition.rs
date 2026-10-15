@@ -1840,9 +1840,8 @@ impl Writer {
     /// partition it was built from, a restore's at the position it commits.
     fn named(&self, position: LogPosition, marker: &str) -> Names {
         let nonce = uuid::Uuid::new_v4().as_u64_pair().0;
-        let suffix = format!("-{nonce:016x}{marker}");
         let layout = Layout(&self.lease.key);
-        let named = |kind| layout.named(kind, position, &self.author, &suffix);
+        let named = |kind| layout.nonced(kind, position, &self.author, nonce, marker);
         Names {
             segment: named("segment"),
             index: named("index"),
