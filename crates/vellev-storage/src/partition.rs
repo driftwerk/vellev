@@ -3557,6 +3557,15 @@ mod tests {
         writer: &Writer,
         coordinator: &MemoryCoordinator,
     ) -> (Arc<dyn Blobs>, Committed) {
+        own_backup_in(writer, coordinator, memory()).await
+    }
+
+    /// As [`own_backup`], into `source`.
+    async fn own_backup_in(
+        writer: &Writer,
+        coordinator: &MemoryCoordinator,
+        source: Arc<dyn Blobs>,
+    ) -> (Arc<dyn Blobs>, Committed) {
         let committed = coordinator
             .committed(&writer.lease.key)
             .await
@@ -3564,7 +3573,6 @@ mod tests {
             .unwrap();
         let blobs = writer.partition.blobs.clone();
         let files = Partition::files(writer.lease.key.clone(), blobs.clone(), &committed);
-        let source: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
         for key in files.await.unwrap() {
             source
                 .put(&key, blobs.get(&key).await.unwrap())
@@ -3821,5 +3829,159 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(now, committed);
+    }
+
+    /// A store that links nothing, over another.
+    #[derive(Debug)]
+    struct NoLink(Arc<dyn Blobs>);
+
+    #[async_trait::async_trait]
+    impl Blobs for NoLink {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn put_parts(
+            &self,
+            key: &str,
+            parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+        ) -> Result<()> {
+            self.0.put_parts(key, parts).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.0.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.0.delete(key).await
+        }
+        async fn local(&self, key: &str) -> Result<Option<Local>> {
+            self.0.local(key).await
+        }
+        async fn fetch_local(&self, key: &str) -> Result<Option<Local>> {
+            self.0.fetch_local(key).await
+        }
+        fn parts<'a>(&'a self, key: &'a str) -> futures::stream::BoxStream<'a, Result<Bytes>> {
+            self.0.parts(key)
+        }
+        async fn forget_local(&self, prefix: &str) -> Result<()> {
+            self.0.forget_local(prefix).await
+        }
+        async fn link_local(&self, _from: &str, _to: &str) -> Result<Linked> {
+            Ok(Linked::Unlinked)
+        }
+    }
+
+    /// The vectors files the partition's segments name.
+    fn vectors_named(partition: &Partition) -> Vec<String> {
+        partition.read(|state| {
+            let held = state.loaded_with_vectors();
+            held.filter_map(|(_, vectors, _)| vectors.map(str::to_string))
+                .collect()
+        })
+    }
+
+    /// From the review of #73. A segment whose vectors the store does not
+    /// link to the new key is not taken as held, though its copies are
+    /// proved: it is decoded, and its vectors read anew under the new key,
+    /// which then has a copy of its own on local disk.
+    #[tokio::test]
+    async fn a_restore_whose_vectors_are_not_linked_decodes_and_reads_them_anew() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached: Arc<dyn Blobs> = Arc::new(crate::blobs::CachedBlobs::new(memory(), dir.path()));
+        let blobs: Arc<dyn Blobs> = Arc::new(NoLink(cached));
+        let (writer, coordinator) = flushed_twice(blobs.clone()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let before = segment_files(&writer.partition);
+        let vectors_before = vectors_named(&writer.partition);
+        assert!(!vectors_before.is_empty(), "the segments have vectors");
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        for held in &before {
+            assert!(
+                !after.contains(held),
+                "a segment was taken though its vectors were not linked"
+            );
+        }
+        assert_eq!(ns(&writer.partition), [true, true, true]);
+        let vectors_after = vectors_named(&writer.partition);
+        let new = vectors_after
+            .iter()
+            .filter(|key| !vectors_before.contains(key));
+        for key in new {
+            let local = blobs.local(key).await.unwrap();
+            assert!(local.is_some(), "{key} has no copy of its own");
+        }
+    }
+
+    /// A backup that gives each file in many small parts: what the source
+    /// sent is summed over all of them, and so each segment the live state
+    /// holds is still taken as it is.
+    #[tokio::test]
+    async fn a_restore_from_its_own_backup_sums_every_part_the_source_sends() {
+        let (writer, coordinator) = flushed_twice(memory()).await;
+        let small = Transfers {
+            part_bytes: 16,
+            ..Transfers::default()
+        };
+        let parted = ObjectBlobs::new(Arc::new(InMemory::new())).transferring(small);
+        let (source, committed) = own_backup_in(&writer, &coordinator, Arc::new(parted)).await;
+        let segments = source.list("").await.unwrap();
+        let segment = segments.iter().find(|file| file.key.contains("/segment/"));
+        let parts = source.parts(&segment.unwrap().key);
+        use futures::StreamExt;
+        assert!(parts.count().await > 2, "the backup sends a file in parts");
+        let before = segment_files(&writer.partition);
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        for held in &before {
+            assert!(after.contains(held), "a segment was decoded again");
+        }
+        assert_eq!(ns(&writer.partition), [true, true, true]);
+    }
+
+    /// A backup whose checkpoint names a segment the live state holds,
+    /// with its vectors under another key than the live state's: the
+    /// segment is not taken as held, though both files come out what the
+    /// backup sent. It is decoded from the copies.
+    #[tokio::test]
+    async fn a_segment_held_with_vectors_under_another_key_is_not_taken_as_held() {
+        let (writer, coordinator) = flushed_twice(memory()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let listed = source.list("").await.unwrap();
+        let checkpoint = listed
+            .iter()
+            .find(|file| file.key.contains("/manifest/"))
+            .unwrap();
+        let frame = source.get(&checkpoint.key).await.unwrap();
+        let mut manifest: Manifest = decode(&checkpoint.key, Kind::Manifest, &frame).unwrap();
+        let first = &mut manifest.segments[0];
+        let vectors = first.vectors.clone().unwrap();
+        let elsewhere = vectors.replace(".vectors", "-elsewhere.vectors");
+        let bytes = source.get(&vectors).await.unwrap();
+        source.put(&elsewhere, bytes).await.unwrap();
+        first.vectors = Some(elsewhere);
+        let held = first.key.clone();
+        let frame = encode(Kind::Manifest, &manifest).unwrap();
+        source.put(&checkpoint.key, frame).await.unwrap();
+        let before = writer.partition.read(|state| {
+            let held_now = state.loaded_segments();
+            let mut held_now = held_now.filter(|(key, _)| *key == held);
+            Arc::as_ptr(&held_now.next().unwrap().1.file)
+        });
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        assert!(
+            !after.contains(&before),
+            "a segment was taken though its vectors' key is not the live state's"
+        );
+        assert_eq!(ns(&writer.partition), [true, true, true]);
     }
 }

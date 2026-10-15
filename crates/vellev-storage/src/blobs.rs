@@ -124,6 +124,16 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     /// local disk, which may have been read in place, has not given it to
     /// `to`; one without, whose files are read whole into memory, has
     /// nothing to give.
+    ///
+    /// The default goes by [`Self::local`]. A store over another that
+    /// keeps copies read in place must forward `local`, or forward this
+    /// too: one that forwards neither answers [`Linked::Unmapped`] for a
+    /// file its inner store reads in place, and a caller may then take
+    /// what was read of `from` for `to`'s, whose copy on local disk it is
+    /// not. Such a store answers `local` with none, so nothing read
+    /// through it is read in place: what is held of `from` is in memory,
+    /// and is the same file's. Forwarding `local` alone is safe, and
+    /// links nothing.
     async fn link_local(&self, from: &str, _to: &str) -> Result<Linked> {
         Ok(match self.local(from).await {
             Ok(None) => Linked::Unmapped,
