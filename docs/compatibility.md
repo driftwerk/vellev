@@ -280,6 +280,56 @@ rolling deploy from such a release:
    by itself. A backup of nothing an older node took stays listed, and
    pruning keeps the newest backup that holds data beside it.
 
+## Links
+
+Continuous backup (DW-668) ships one link per committed head to the
+backup store, under
+`_backups/{tenant}/ship/{lineage}/{cluster}/{incarnation}/{partition}/`:
+`links/{position}.link`, and, for a frame too large to go inline,
+`frames/{original key}` (`vellev_storage::link`). Nothing ships links
+yet; this says what holds once something does.
+
+A link is not a file of the cluster's format. It has its own magic
+(`VLNK`), its own version (`vellev_storage::link::LINK_VERSION`) and a
+CRC32 over its header, and it is read only by backup code. So a link
+version is not gated by `FORMAT_VERSION`, and a new link version is not
+a new file format. The frame it carries is a log or a manifest of the
+cluster's format, byte for byte as the primary holds it.
+
+A node refuses a link of a version newer than it reads
+(`StorageError::UnsupportedVersion`). It reads the version before it
+checks the CRC, as a later version may frame its header otherwise, so a
+link whose version bytes were damaged into a later version is refused as
+one it does not read, not as corrupt.
+
+**Every field added to the header is a new link version**, and so is any
+other change to what a header holds or how it is encoded. A field added
+without one breaks both ways:
+- A reader of the release before cannot tell an added field it may
+  ignore from one it must not.
+- Two links at one position are of one commit exactly when every header
+  field but `body` is equal, and anything else is a fork. During a
+  rolling upgrade, a commit shipped by a node of the release before
+  (without the field) and by one of the new release (with it) would
+  compare as a fork.
+
+A new link version follows the rollout of a file format: the release
+reads it, together with every link version back to the previous
+release's, and writes it only once every node of the cluster reads it.
+Until then, links of one commit are of one version, and compare as they
+should. Once it writes the new version, a commit already shipped at the
+version before can be shipped again at the new one, by a node that takes
+the tenant over. So the release that adds a version also says how a link
+of each version before compares with one of the new: by the fields both
+carry, unless what the new field says can be told for the older link
+too. A test pins the encoding of link version 1 byte for byte, so a
+field added without a new version fails it.
+
+Its tests carry fixtures of every link version under
+`crates/vellev-storage/tests/fixtures/link-N`, which a test reads and
+writes back byte for byte. The fixtures of a released version are never
+written again.
+
 ## The API
 
 Clients and nodes of different releases talk to each other.
