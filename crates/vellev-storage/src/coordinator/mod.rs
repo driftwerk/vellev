@@ -778,6 +778,12 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// Forget the commits a restore reaching back `window` can no longer go
     /// to, and the restores recorded over [`RESTORES_KEPT_FOR`] ago.
     /// Returns how many commits.
+    ///
+    /// None of the current incarnation at or above the floor shipping
+    /// needs is forgotten (DW-668): the position after what its run has
+    /// shipped, else its base, else its hold. With no hold, there is no
+    /// floor. The floor is read under the lock a shipping hold is taken
+    /// under, so that no hold taken meanwhile is missed.
     async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64>;
 
     /// The restore of the partition, since it was last registered, that

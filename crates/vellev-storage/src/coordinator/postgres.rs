@@ -1672,19 +1672,42 @@ impl Coordinator for PostgresCoordinator {
         Ok(found.next().transpose()?.zip(found.next().transpose()?))
     }
 
+    /// Nothing at or above the floor shipping needs is forgotten: after
+    /// what the run shipped, else from its base, else from its hold. The
+    /// floor is read by the delete, a statement of its own after the
+    /// shipping lock is taken, so it sees any hold taken before it; a
+    /// base or watermark raised meanwhile, which take no lock, only ever
+    /// rises, so a read that misses one keeps more.
     async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(SHIP_LOCK)
+            .bind(key.tenant.as_str())
+            .bind(i64::from(key.partition.0))
+            .execute(&mut *tx)
+            .await?;
         let done = sqlx::query(&format!(
-            "{REACHABLE}
+            "{REACHABLE}, floor AS (
+                 SELECT p.incarnation,
+                        COALESCE(s.shipped + 1, p.ship_base, p.ship_hold_from) AS position
+                 FROM vellev.partitions p
+                 LEFT JOIN vellev.shipping s
+                   ON s.tenant = p.tenant AND s.partition = p.partition
+                  AND s.incarnation = p.incarnation
+                 WHERE p.tenant = $1 AND p.partition = $2
+             )
              DELETE FROM vellev.commits c
              WHERE c.tenant = $1 AND c.partition = $2
                AND NOT EXISTS (SELECT 1 FROM boundary b
-                               WHERE b.incarnation = c.incarnation AND c.position >= b.position)"
+                               WHERE b.incarnation = c.incarnation AND c.position >= b.position)
+               AND NOT EXISTS (SELECT 1 FROM floor f
+                               WHERE f.incarnation = c.incarnation AND c.position >= f.position)"
         ))
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
         .bind(window.as_secs_f64())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         sqlx::query(
             "DELETE FROM vellev.restores
              WHERE tenant = $1 AND partition = $2 AND made_at < now() - make_interval(secs => $3)",
