@@ -203,6 +203,14 @@ struct Lay {
     changed: Option<(i64, i64)>,
 }
 
+impl Seen {
+    /// Whether `other` is the very file this is, under whatever name:
+    /// the same file of the same disk, where the system tells which.
+    pub(crate) fn same_file(&self, other: &Seen) -> bool {
+        self.lay.file.is_some() && self.lay.file == other.lay.file
+    }
+}
+
 /// The file at `path` as it lies now.
 pub(crate) fn seen(path: &Path) -> std::io::Result<Seen> {
     let meta = std::fs::metadata(path)?;
@@ -311,6 +319,12 @@ fn summed() -> std::sync::MutexGuard<'static, Summed> {
 /// Whether this process has summed `file` as it lies now.
 pub(crate) fn summed_before(file: &Seen) -> bool {
     summed().holds(file)
+}
+
+/// Remember that `file` was summed as it lies: it is another name of a
+/// file this process summed, and proved the same.
+pub(crate) fn remember_summed(file: Seen) {
+    summed().remember(file);
 }
 
 /// Remember no longer that the file at `path` was summed: its copy is

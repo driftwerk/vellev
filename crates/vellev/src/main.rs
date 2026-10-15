@@ -336,6 +336,18 @@ async fn main() -> Result<ExitCode> {
             if let Some(node) = app.started() {
                 node.shutdown().await;
             }
+            // Uploads cut off by the stop are aborted on tasks of their
+            // own, which a process that exits now would never run.
+            let aborting = vellev_storage::blobs::Aborts::process();
+            match aborting.finished(drain).await {
+                0 => {}
+                left => tracing::warn!(
+                    left,
+                    ?drain,
+                    "stopping with uploads whose abort is not answered: \
+                     the bucket's rule for incomplete uploads removes their parts"
+                ),
+            }
             tracing::info!("vellev stopped");
             Ok(ExitCode::SUCCESS)
         }

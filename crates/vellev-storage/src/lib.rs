@@ -17,6 +17,7 @@ mod keyword;
 pub mod link;
 mod mutation;
 mod partition;
+pub mod prefix;
 mod search;
 mod state;
 

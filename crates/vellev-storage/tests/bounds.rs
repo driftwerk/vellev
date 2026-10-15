@@ -14,6 +14,7 @@ use object_store::{
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
 };
 use tokio::time::Instant;
+use vellev_storage::blobs::Aborts;
 use vellev_storage::{Disk, Transfers};
 
 /// Requests to the store given up after a second; parts of 16 bytes.
@@ -513,6 +514,76 @@ async fn an_upload_dropped_unfinished_is_aborted() {
     putting.abort();
     assert!(putting.await.unwrap_err().is_cancelled());
     settled(|| async { store.aborts.load(Ordering::SeqCst) == 1 }).await;
+}
+
+/// An upload dropped unfinished whose abort the store does not answer:
+/// it is counted as on its way until it is given up, at its bound, and a
+/// process that stops waits for it until then, or for as long as it
+/// gives it.
+#[tokio::test(start_paused = true)]
+async fn an_abort_on_its_way_is_waited_for_until_it_is_answered_or_given_up() {
+    let store = Arc::new(Faulty::new("large"));
+    store.armed.store(true, Ordering::SeqCst);
+    store.silent_abort.store(true, Ordering::SeqCst);
+    let aborts = Aborts::default();
+    let blobs = ObjectBlobs::new(store.clone())
+        .transferring(Transfers {
+            request_within: Duration::from_secs(60),
+            ..SMALL_PARTS
+        })
+        .aborting(aborts.clone());
+    let blobs = Arc::new(blobs);
+    assert_eq!(aborts.finished(Duration::from_secs(1)).await, 0);
+    let putting = tokio::spawn({
+        let blobs = blobs.clone();
+        async move { blobs.put("large", Bytes::from(vec![7u8; 100])).await }
+    });
+    settled(|| async { store.parts.load(Ordering::SeqCst) == 2 }).await;
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+    settled(|| async { store.aborts.load(Ordering::SeqCst) == 1 }).await;
+    assert_eq!(aborts.pending(), 1);
+
+    let begun = Instant::now();
+    assert_eq!(aborts.finished(Duration::from_secs(10)).await, 1);
+    assert_eq!(begun.elapsed(), Duration::from_secs(10));
+    assert_eq!(aborts.finished(Duration::from_secs(120)).await, 0);
+    let waited = begun.elapsed();
+    assert!(
+        waited >= Duration::from_secs(60) && waited < Duration::from_secs(61),
+        "{waited:?}"
+    );
+    assert_eq!(aborts.pending(), 0);
+}
+
+/// An abort the store answers is waited for only until it is answered;
+/// and one counted elsewhere is not waited for at all.
+#[tokio::test(start_paused = true)]
+async fn an_abort_answered_is_waited_for_no_longer() {
+    let store = Arc::new(Faulty::new("large"));
+    store.armed.store(true, Ordering::SeqCst);
+    let (aborts, elsewhere) = (Aborts::default(), Aborts::default());
+    let blobs = ObjectBlobs::new(store.clone())
+        .transferring(SMALL_PARTS)
+        .aborting(aborts.clone());
+    let blobs = Arc::new(blobs);
+    let putting = tokio::spawn({
+        let blobs = blobs.clone();
+        async move { blobs.put("large", Bytes::from(vec![7u8; 100])).await }
+    });
+    settled(|| async { store.parts.load(Ordering::SeqCst) == 2 }).await;
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+    let begun = Instant::now();
+    assert_eq!(elsewhere.finished(Duration::from_secs(5)).await, 0);
+    assert_eq!(aborts.finished(Duration::from_secs(5)).await, 0);
+    assert!(
+        begun.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        begun.elapsed()
+    );
+    assert_eq!(store.aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(aborts.pending(), 0);
 }
 
 #[tokio::test(start_paused = true)]

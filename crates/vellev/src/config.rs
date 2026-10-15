@@ -268,10 +268,13 @@ pub struct Config {
     /// sending before it signals, so none is needed there.
     #[arg(long, env = "VELLEV_STOP_DELAY_SECS", default_value_t = 0)]
     pub stop_delay_secs: u64,
-    /// How long requests in flight are then given to finish, in seconds.
-    /// Keep the delay and this under the platform's own grace period (ECS
-    /// `stopTimeout`, Swarm `stop_grace_period`), so that the node lets go
-    /// of its tenants before it is killed.
+    /// How long requests in flight are then given to finish, in seconds,
+    /// and, once the node has let go of its tenants, as long again at the
+    /// most for the aborts of uploads the stop cut off. Keep the delay and
+    /// this under the platform's own grace period (ECS `stopTimeout`, Swarm
+    /// `stop_grace_period`), so that the node lets go of its tenants before
+    /// it is killed; the delay and twice this, so that it aborts what it
+    /// cut off too.
     #[arg(long, env = "VELLEV_DRAIN_SECS", default_value_t = 20)]
     pub drain_secs: u64,
 }

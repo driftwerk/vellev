@@ -8,8 +8,9 @@ use vellev_core::{NodeId, RequestId, TenantId};
 
 use super::{
     Acquired, Adoption, Cleaned, ClusterId, Commit, Committed, Coordinator, CoordinatorError,
-    Forgotten, Generation, Identity, KeyHash, Lease, LogPosition, ManifestRef, PartitionKey, Point,
-    PurgeClaim, Purges, Removed, RestorePoint, Restored, Result, TenantKey, Versions,
+    Forgotten, Generation, Identity, Incarnation, KeyHash, Lease, LogPosition, ManifestRef,
+    PartitionKey, Point, PurgeClaim, Purges, Removed, RestorePoint, Restored, Result, ShipBase,
+    Shipping, TenantKey, Versions,
 };
 
 /// A coordinator whose every call is given up once it has gone unanswered
@@ -86,6 +87,48 @@ impl Coordinator for Bounded {
         position: LogPosition,
     ) -> Result<Cleaned> {
         self.bounded(self.inner.clean_below(lease, base, position))
+            .await
+    }
+
+    async fn shipping(&self, key: &PartitionKey) -> Result<Shipping> {
+        self.bounded(self.inner.shipping(key)).await
+    }
+    async fn hold_for_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        cap: LogPosition,
+    ) -> Result<Shipping> {
+        self.bounded(self.inner.hold_for_shipping(key, incarnation, cap))
+            .await
+    }
+    async fn record_base(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: &ShipBase,
+    ) -> Result<Shipping> {
+        self.bounded(self.inner.record_base(key, incarnation, base))
+            .await
+    }
+    async fn note_shipped(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        position: LogPosition,
+    ) -> Result<Shipping> {
+        self.bounded(self.inner.note_shipped(key, incarnation, base, position))
+            .await
+    }
+    async fn stall_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        reason: &str,
+    ) -> Result<Shipping> {
+        self.bounded(self.inner.stall_shipping(key, incarnation, base, reason))
             .await
     }
 

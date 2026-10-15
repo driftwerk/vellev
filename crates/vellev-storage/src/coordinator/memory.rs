@@ -12,11 +12,12 @@ use uuid::Uuid;
 use vellev_core::{NodeId, RequestId, TenantId};
 
 use super::{
-    checked_hold, checked_ttl, checked_window, window_start, Acquired, Adoption, Cleaned,
-    ClusterId, Commit, Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity,
-    Incarnation, KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point,
-    PurgeClaim, Purges, Removed, RestorePoint, Restored, Result, TenantKey, Versions,
-    RESTORES_KEPT_FOR,
+    base_decision, checked_hold, checked_note, checked_ship_base, checked_ttl, checked_window,
+    hold_decision, same_incarnation, window_start, Acquired, Adoption, Cleaned, ClusterId, Commit,
+    Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation,
+    KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges,
+    Removed, RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts, Shipping, TenantKey,
+    Versions, RESTORES_KEPT_FOR,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -74,9 +75,50 @@ struct Row {
     adopting: Option<(Generation, Adoption)>,
     /// What a clean last recorded it deletes below.
     cleaned: Option<Cleaned>,
+    /// Shipping's hold and cap, and the base of the run under way.
+    ship_hold_from: Option<LogPosition>,
+    ship_cap: Option<LogPosition>,
+    ship_base: Option<ShipBase>,
+    /// The run's own record: its base, what it has shipped, and why it
+    /// stopped.
+    ship_run: Option<ShipRun>,
+}
+
+/// A run of shipping's own record, as `vellev.shipping` keeps it.
+#[derive(Debug, Clone)]
+struct ShipRun {
+    base: LogPosition,
+    shipped: Option<LogPosition>,
+    stalled: Option<String>,
 }
 
 impl Row {
+    fn shipping(&self) -> Shipping {
+        let run = self.ship_run.as_ref();
+        Shipping {
+            incarnation: self.incarnation,
+            hold_from: self.ship_hold_from,
+            cap: self.ship_cap,
+            base: self.ship_base.clone(),
+            shipped: run.and_then(|run| run.shipped),
+            stalled: run.and_then(|run| run.stalled.clone()),
+        }
+    }
+
+    /// What the row says for a shipping hold or base at `base` with its
+    /// checkpoint at `checkpoint_at` to be decided on.
+    fn ship_facts(&self, base: LogPosition, checkpoint_at: LogPosition) -> ShipFacts {
+        let row_at =
+            |position: LogPosition| self.history.iter().find(|row| row.position == position);
+        ShipFacts {
+            shipping: self.shipping(),
+            committed: self.log_position,
+            cleaned: self.cleaned.as_ref().map(|cleaned| cleaned.position),
+            row_at_base: row_at(base).is_some(),
+            head_at_checkpoint: row_at(checkpoint_at).map(|row| row.head.clone()),
+        }
+    }
+
     fn committed(&self) -> Committed {
         Committed {
             generation: self.generation,
@@ -204,6 +246,27 @@ fn expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
         })
 }
 
+/// The run a shipper's write on the run from `base` is made to, as its own
+/// record has it: refused for another incarnation, or for a run of
+/// another base or none.
+fn shipper_run<'a>(
+    key: &PartitionKey,
+    incarnation: Incarnation,
+    base: LogPosition,
+    row: &'a mut Row,
+) -> Result<&'a mut ShipRun> {
+    same_incarnation(key, incarnation, row.incarnation)?;
+    let recorded = row.ship_run.as_ref().map(|run| run.base);
+    match row.ship_run.as_mut() {
+        Some(run) if run.base == base => Ok(run),
+        _ => Err(CoordinatorError::OtherBase {
+            key: key.clone(),
+            asked: base,
+            recorded,
+        }),
+    }
+}
+
 #[async_trait]
 impl Coordinator for MemoryCoordinator {
     async fn cluster(&self) -> Result<ClusterId> {
@@ -243,6 +306,10 @@ impl Coordinator for MemoryCoordinator {
                 backup_claim: None,
                 adopting: None,
                 cleaned: None,
+                ship_hold_from: None,
+                ship_cap: None,
+                ship_base: None,
+                ship_run: None,
             };
             rows.insert(key.clone(), row);
         }
@@ -486,6 +553,80 @@ impl Coordinator for MemoryCoordinator {
                     Ok(raised)
                 }
             }
+        })
+    }
+
+    async fn shipping(&self, key: &PartitionKey) -> Result<Shipping> {
+        self.with_row(key, |row, _| Ok(row.shipping()))
+    }
+
+    async fn hold_for_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        cap: LogPosition,
+    ) -> Result<Shipping> {
+        self.with_row(key, |row, _| {
+            let facts = row.ship_facts(LogPosition(0), LogPosition(0));
+            if let Ship::Write = hold_decision(key, incarnation, cap, &facts)? {
+                let lowest = row.history.first().map(|row| row.position);
+                row.ship_hold_from = Some(lowest.unwrap_or(LogPosition(row.log_position.0 + 1)));
+                row.ship_cap = Some(cap);
+            }
+            Ok(row.shipping())
+        })
+    }
+
+    async fn record_base(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: &ShipBase,
+    ) -> Result<Shipping> {
+        checked_ship_base(base)?;
+        self.with_row(key, |row, _| {
+            let facts = row.ship_facts(base.position, base.checkpoint_at);
+            if let Ship::Write = base_decision(key, incarnation, base, &facts)? {
+                row.ship_base = Some(base.clone());
+                row.ship_cap = Some(base.checkpoint_at);
+                row.ship_run = Some(ShipRun {
+                    base: base.position,
+                    shipped: None,
+                    stalled: None,
+                });
+            }
+            Ok(row.shipping())
+        })
+    }
+
+    async fn note_shipped(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        position: LogPosition,
+    ) -> Result<Shipping> {
+        checked_note(base, position)?;
+        self.with_row(key, |row, _| {
+            let run = shipper_run(key, incarnation, base, row)?;
+            if run.shipped.is_none_or(|shipped| shipped < position) {
+                run.shipped = Some(position);
+            }
+            Ok(row.shipping())
+        })
+    }
+
+    async fn stall_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        reason: &str,
+    ) -> Result<Shipping> {
+        self.with_row(key, |row, _| {
+            let run = shipper_run(key, incarnation, base, row)?;
+            run.stalled.get_or_insert_with(|| reason.to_string());
+            Ok(row.shipping())
         })
     }
 

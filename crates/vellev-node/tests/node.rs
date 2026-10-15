@@ -1447,6 +1447,50 @@ impl Coordinator for Unrenewing {
     ) -> Result<vellev_storage::coordinator::Cleaned, CoordinatorError> {
         self.inner.clean_below(lease, base, position).await
     }
+    async fn shipping(
+        &self,
+        key: &PartitionKey,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.shipping(key).await
+    }
+    async fn hold_for_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.hold_for_shipping(key, incarnation, cap).await
+    }
+    async fn record_base(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: &vellev_storage::coordinator::ShipBase,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.record_base(key, incarnation, base).await
+    }
+    async fn note_shipped(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        position: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner
+            .note_shipped(key, incarnation, base, position)
+            .await
+    }
+    async fn stall_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        reason: &str,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner
+            .stall_shipping(key, incarnation, base, reason)
+            .await
+    }
     async fn partitions(
         &self,
         after: Option<&PartitionKey>,
@@ -7728,7 +7772,6 @@ async fn a_restore_whose_file_goes_each_time_it_is_fetched_back_is_refused_sayin
 /// Today it fails, and every round after it, until every file is older
 /// than four hours.
 #[tokio::test]
-#[should_panic(expected = "DW-681: a clean failed with nothing in its way")]
 async fn a_node_cleans_after_the_tenants_window_was_made_longer() {
     let cluster = Cluster::new();
     let hour = Duration::from_secs(60 * 60);

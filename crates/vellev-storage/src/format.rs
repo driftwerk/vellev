@@ -444,6 +444,20 @@ fn kind(key: &str, header: &[u8]) -> Result<Kind> {
     Kind::from_byte(header[4]).ok_or_else(|| corrupt("unknown file kind"))
 }
 
+/// The kind of file the first [`BODY`] bytes of a frame say it is, if it is
+/// a vellev file of a format this release reads: for a frame read as it
+/// comes, before its body has.
+pub(crate) fn kind_of_header(key: &str, header: &[u8]) -> Result<Kind> {
+    let corrupt = |reason: &str| StorageError::corrupt(key, reason);
+    let header = header
+        .get(..HEADER)
+        .ok_or_else(|| corrupt("shorter than a frame header"))?;
+    if header[..4] != MAGIC {
+        return Err(corrupt("not a vellev file"));
+    }
+    kind(key, header)
+}
+
 /// As [`open`], leaving the checksum to whoever asked: for a file read in
 /// place, too large to sum before anyone may be told how it goes. Until
 /// the sum is seen to hold, the body may be anything.
@@ -478,9 +492,153 @@ pub(crate) fn open<'a>(key: &str, frame: &'a [u8]) -> Result<(Kind, &'a [u8])> {
     Ok((kind(key, header)?, body))
 }
 
+/// What a file came to as it went by a part at a time: how long it was,
+/// and the CRC-32 of all of it. Two files that come to the same are taken
+/// for the same file: what is guarded against is a file damaged in moving
+/// or lying in a store, not one made to look like another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Came {
+    length: u64,
+    crc: u32,
+}
+
+/// [`Came`], taken as a file goes by.
+#[derive(Debug, Default)]
+pub(crate) struct Coming {
+    length: u64,
+    crc: crc32fast::Hasher,
+}
+
+impl Coming {
+    pub fn update(&mut self, part: &[u8]) {
+        self.length += part.len() as u64;
+        self.crc.update(part);
+    }
+
+    pub fn came(self) -> Came {
+        Came {
+            length: self.length,
+            crc: self.crc.finalize(),
+        }
+    }
+}
+
+/// [`Came`] of a file taken as it goes by, and whether it is one whole
+/// frame of a kind: the frame's checksum is summed as the file goes, and
+/// nothing of it is held but its header.
+#[derive(Debug, Default)]
+pub(crate) struct Framed {
+    whole: Coming,
+    header: Vec<u8>,
+    body: crc32fast::Hasher,
+}
+
+impl Framed {
+    pub fn update(&mut self, mut part: &[u8]) {
+        self.whole.update(part);
+        if self.header.len() < HEADER {
+            let taken = (HEADER - self.header.len()).min(part.len());
+            self.header.extend_from_slice(&part[..taken]);
+            part = &part[taken..];
+            if self.header.len() == HEADER {
+                self.body.update(&self.header[MAGIC.len()..15]);
+            }
+        }
+        self.body.update(part);
+    }
+
+    /// What the file came to, if it is one whole frame of `expected`, of
+    /// a format this release reads; a failure saying how it is not
+    /// otherwise.
+    pub fn came(self, key: &str, expected: Kind) -> Result<Came> {
+        let corrupt = |reason: &str| StorageError::corrupt(key, reason);
+        let Self {
+            whole,
+            header,
+            body,
+        } = self;
+        if header.len() < HEADER {
+            return Err(corrupt("shorter than a frame header"));
+        }
+        if header[..4] != MAGIC {
+            return Err(corrupt("not a vellev file"));
+        }
+        if kind(key, &header)? != expected {
+            return Err(corrupt("not the kind of file it is named for"));
+        }
+        let came = whole.came();
+        let length = u64::from_le_bytes(header[7..15].try_into().expect("eight bytes"));
+        if Some(length) != came.length.checked_sub(HEADER as u64) {
+            return Err(corrupt("body length does not match the header"));
+        }
+        let crc = u32::from_le_bytes(header[15..19].try_into().expect("four bytes"));
+        if body.finalize() != crc {
+            return Err(corrupt("checksum mismatch"));
+        }
+        Ok(came)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `file` taken as it goes by in parts of `each` bytes.
+    fn framed_by(file: &[u8], each: usize) -> Framed {
+        let mut framed = Framed::default();
+        file.chunks(each).for_each(|part| framed.update(part));
+        framed
+    }
+
+    /// A file taken as it goes by, in parts of any size, comes to what it
+    /// comes to whole, and is seen to be the frame it is.
+    #[test]
+    fn a_frame_going_by_in_parts_is_seen_whole_and_comes_to_what_it_is() {
+        let frame = encode(Kind::Index, &(7u64, "seven")).unwrap();
+        let mut whole = Coming::default();
+        whole.update(&frame);
+        let whole = whole.came();
+        for each in [1, 3, HEADER - 1, HEADER, HEADER + 1, frame.len()] {
+            let framed = framed_by(&frame, each);
+            assert_eq!(framed.came("k", Kind::Index).unwrap(), whole, "{each}");
+        }
+    }
+
+    /// A file that is not one whole frame of the kind it is named for is
+    /// refused, whatever it comes to; and two files that differ come to
+    /// different things.
+    #[test]
+    fn a_file_going_by_that_is_not_a_whole_frame_of_its_kind_is_refused() {
+        let frame = encode(Kind::Index, &(7u64, "seven")).unwrap();
+        let mut flipped = frame.to_vec();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 1;
+        let mut long = frame.to_vec();
+        long.push(0);
+        let mut unnamed = frame.to_vec();
+        unnamed[0] = b'X';
+        let refused: [(&str, &[u8], Kind); 6] = [
+            ("damaged", &flipped, Kind::Index),
+            ("cut short", &frame[..frame.len() - 1], Kind::Index),
+            ("too long", &long, Kind::Index),
+            ("no header", &frame[..HEADER - 1], Kind::Index),
+            ("no vellev file", &unnamed, Kind::Index),
+            ("another kind", &frame, Kind::Segment),
+        ];
+        for (what, file, kind) in refused {
+            let came = framed_by(file, 5).came("k", kind);
+            assert!(
+                matches!(came, Err(StorageError::Corrupt { .. })),
+                "{what}: {came:?}"
+            );
+        }
+        let other = encode(Kind::Index, &(8u64, "seven")).unwrap();
+        let (one, two) = (
+            framed_by(&frame, 4).came("k", Kind::Index),
+            framed_by(&other, 4).came("k", Kind::Index),
+        );
+        assert_ne!(one.unwrap(), two.unwrap());
+    }
 
     fn log() -> LogSegment {
         LogSegment {
