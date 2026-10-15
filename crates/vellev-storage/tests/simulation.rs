@@ -1305,7 +1305,7 @@ struct World {
     record_seen: Option<u64>,
     /// What cleans with no grace condemned by the checkpoints they recorded
     /// they deleted below: see [`World::condemned_below`].
-    condemned: BTreeSet<String>,
+    condemned: BTreeMap<String, u64>,
     graced_at: Option<u64>,
     /// Which of the deletes the store has been asked for, by their place
     /// among them, cleans with no grace asked for.
@@ -1631,7 +1631,7 @@ impl World {
             kept_at: None,
             records_seen: 0,
             record_seen: None,
-            condemned: BTreeSet::new(),
+            condemned: BTreeMap::new(),
             graced_at: None,
             unkept: BTreeSet::new(),
             given_up: (0, 0),
@@ -2187,16 +2187,18 @@ impl World {
         let given = self.given(grace);
         if given.is_zero() {
             self.unkept.extend(sent..now.len());
-            if let Some(recorded) = recorded {
+            if let (Some(recorded), true) = (recorded, self.blobs.deletes().0 > asked) {
                 self.condemned_below(&recorded)?;
             }
             return Ok(());
         }
         let (before, after) = now.split_at(sent);
-        let newly: Vec<&String> = after
-            .iter()
-            .filter(|key| !before.contains(key) && !self.condemned.contains(*key))
-            .collect();
+        let mut newly: Vec<&String> = Vec::new();
+        for key in after.iter().filter(|key| !before.contains(key)) {
+            if !self.excused(key)? {
+                newly.push(key);
+            }
+        }
         for recorded in self.heads.get(reach..).unwrap_or_default() {
             let needed = self.named_at(&recorded.head.key)?;
             let let_go = newly.iter().find(|key| needed.contains(**key));
@@ -2307,14 +2309,18 @@ impl World {
         Ok(made_now)
     }
 
-    /// Note what a clean with no grace that recorded `recorded` condemned:
-    /// every file below that checkpoint that no head at or above it needs.
+    /// Note what a clean with no grace that recorded `recorded` and sent a
+    /// delete condemned: every file below that checkpoint that no head at
+    /// or above it needs, each with the highest record that condemned it.
     /// A later clean whose walk ends at what that clean deleted deletes
     /// the rest of it, which that clean was to delete and may not have got
     /// to; and a clean with no grace keeps less than a restore may go back
     /// to, which no node does. So a clean with grace is not charged with
     /// those deletes, as one is not with the deletes such a clean asked
-    /// for itself: the files are of heads that clean left unloadable.
+    /// for itself: the files are of heads that clean left unloadable. A
+    /// clean with no grace whose record was made and which deleted nothing,
+    /// as when the record's answer is lost, left none so, and condemned
+    /// nothing; its caller sees to that.
     fn condemned_below(&mut self, recorded: &Cleaned) -> Violation {
         let above: Vec<ManifestRef> = (self.heads.iter())
             .filter(|recorded_head| recorded_head.head.position >= recorded.position)
@@ -2328,8 +2334,29 @@ impl World {
         let below = landed.into_iter().filter(|key| {
             position(key).is_some_and(|at| at < recorded.position.0) && !kept.contains(key)
         });
-        self.condemned.extend(below);
+        for key in below {
+            let at = self.condemned.entry(key).or_insert(0);
+            *at = (*at).max(recorded.position.0);
+        }
         Ok(())
+    }
+
+    /// Whether a clean with grace is not to be charged with asking for the
+    /// delete of `key`: a clean with no grace condemned it (see
+    /// [`Self::condemned_below`]), and no head there is now, at or above
+    /// the highest record that condemned it, needs it. A head committed
+    /// since, such as a restore's to a state below the record whose files
+    /// were there still, may need it, and then it is charged as any other.
+    fn excused(&self, key: &str) -> std::result::Result<bool, String> {
+        let Some(record) = self.condemned.get(key) else {
+            return Ok(false);
+        };
+        for recorded in self.heads.iter().filter(|h| h.head.position.0 >= *record) {
+            if self.named_at(&recorded.head.key)?.contains(key) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// The time from which a file is young to a clean made now with
@@ -4953,4 +4980,81 @@ fn a_clean_with_grace_is_not_charged_with_what_a_clean_with_no_grace_condemned()
         node: -1,
     };
     run_on((clocks, history), None).unwrap();
+}
+
+/// DW-681: a clean with no grace whose record was made but whose answer was
+/// lost deleted nothing, so it left no head unloadable and condemned
+/// nothing: a clean with grace after it is charged with all it asks for.
+#[test]
+fn a_clean_with_no_grace_that_deleted_nothing_condemns_nothing() {
+    paused().block_on(async {
+        let mut world = after(vec![written(), flushed(), written(), flushed()]).await;
+        let lost = Action::FailRecord(RecordFault::LoseResponse);
+        let clean = Action::Clean {
+            who: Who::Current,
+            aged: false,
+        };
+        let asked = world.blobs.deletes().0;
+        for action in [lost, clean] {
+            world.step(action).await.unwrap();
+        }
+        assert!(
+            world.cleaned_record().await.is_some(),
+            "the record was made"
+        );
+        assert_eq!(world.blobs.deletes().0, asked, "and nothing deleted");
+        assert!(world.condemned.is_empty(), "{:?}", world.condemned);
+    });
+}
+
+/// DW-681: what a clean with no grace condemned is excused only while no
+/// head at or above its record needs it. A merge leaves the segments it
+/// replaced to no head at or above it, and a record there condemns them;
+/// a restore since to the state before the merge, whose files are there
+/// still, needs them again, and a clean with grace that deleted them would
+/// be charged.
+#[test]
+fn what_a_clean_with_no_grace_condemned_is_charged_again_once_a_head_needs_it() {
+    paused().block_on(async {
+        let mut world = after(vec![
+            written(),
+            flushed(),
+            written(),
+            flushed(),
+            Action::Merge { who: Who::Current },
+        ])
+        .await;
+        let merged = world.cluster.committed().await;
+        let base = merged.manifest.clone().unwrap();
+        world
+            .condemned_below(&Cleaned {
+                base,
+                position: merged.log_position,
+            })
+            .unwrap();
+        let condemned: Vec<String> = world.condemned.keys().cloned().collect();
+        let segments = || condemned.iter().filter(|key| key.contains("/segment/"));
+        assert!(segments().count() > 0, "{condemned:?}");
+        for key in segments() {
+            assert!(world.excused(key).unwrap(), "{key}");
+        }
+        let restore = Action::Restore {
+            who: Who::Current,
+            back: 1,
+            beside: None,
+        };
+        world.step(restore).await.unwrap();
+        world.verify().await.unwrap();
+        assert_eq!(world.coordinator.restores.load(Ordering::SeqCst), 1);
+        let restored = world.cluster.committed().await.manifest.unwrap();
+        let needed = world.named_at(&restored).unwrap();
+        let again: Vec<&String> = segments().filter(|key| needed.contains(*key)).collect();
+        assert!(!again.is_empty(), "the restore needs none of {condemned:?}");
+        for key in again {
+            assert!(
+                !world.excused(key).unwrap(),
+                "{key} is excused though the restore needs it"
+            );
+        }
+    });
 }
