@@ -2902,6 +2902,22 @@ async fn a_run_is_unshipped_while_commits_lie_above_what_it_shipped(h: &dyn Harn
         .await
         .unwrap();
     assert_eq!(c.unshipped(None, 10).await.unwrap(), Vec::new());
+    // A base that is its own checkpoint and the head, nothing committed
+    // past it nor shipped: the base itself is still to ship.
+    let own = registered(h).await;
+    let theirs = incarnation_of(h, &own).await;
+    committed_heads(h, &own, &[(1, "l1"), (2, "m2")]).await;
+    c.hold_for_shipping(&own, theirs, LogPosition(2))
+        .await
+        .unwrap();
+    c.record_base(&own, theirs, &ship_base(2, 2, "m2"))
+        .await
+        .unwrap();
+    let base_alone = Unshipped {
+        base: LogPosition(2),
+        ..behind(&own, theirs, None, 2)
+    };
+    assert_eq!(c.unshipped(None, 10).await.unwrap(), [base_alone]);
 }
 
 async fn unshipped_partitions_are_given_in_turn_by_key(h: &dyn Harness) {
