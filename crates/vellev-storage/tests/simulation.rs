@@ -702,6 +702,24 @@ impl Coordinator for SimCoordinator {
             .stall_shipping(key, incarnation, base, reason)
             .await
     }
+    async fn commits_after(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        after: vellev_storage::coordinator::LogPosition,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        self.clean
+            .commits_after(key, incarnation, after, limit)
+            .await
+    }
+    async fn unshipped(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::Unshipped>, CoordinatorError> {
+        self.clean.unshipped(after, limit).await
+    }
     async fn partitions(
         &self,
         after: Option<&PartitionKey>,

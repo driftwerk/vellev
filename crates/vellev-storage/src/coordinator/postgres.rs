@@ -15,8 +15,8 @@ use super::{
     hold_decision, same_incarnation, Acquired, Adoption, Cleaned, ClusterId, Commit, Committed,
     Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation, KeyHash, Lease,
     Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges, Removed, Restore,
-    RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts, Shipping, TenantKey, Versions,
-    RESTORES_KEPT_FOR,
+    RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts, Shipping, TenantKey, Unshipped,
+    Versions, RESTORES_KEPT_FOR,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -748,6 +748,42 @@ impl ShipRow {
     }
 }
 
+/// A partition whose run of shipping is behind, as the two rows keep it.
+#[derive(FromRow)]
+struct UnshippedRow {
+    tenant: String,
+    partition: i64,
+    incarnation: i64,
+    base: i64,
+    shipped: Option<i64>,
+    log_position: i64,
+}
+
+impl UnshippedRow {
+    fn unshipped(self) -> Result<Unshipped> {
+        let stored = || {
+            invariant(format!(
+                "{}/{} is not a partition key",
+                self.tenant, self.partition
+            ))
+        };
+        let key = PartitionKey {
+            tenant: TenantId::new(self.tenant.as_str()).map_err(|_| stored())?,
+            partition: u32::try_from(self.partition)
+                .map(Partition)
+                .map_err(|_| stored())?,
+        };
+        Ok(Unshipped {
+            key,
+            incarnation: Incarnation::try_from(self.incarnation)
+                .map_err(|error| invariant(format!("a stored incarnation: {error}")))?,
+            base: stored_position(self.base)?,
+            shipped: self.shipped.map(stored_position).transpose()?,
+            committed: stored_position(self.log_position)?,
+        })
+    }
+}
+
 /// A restore as recorded.
 #[derive(FromRow)]
 struct Recorded {
@@ -1291,6 +1327,64 @@ impl Coordinator for PostgresCoordinator {
             1 => self.shipping(key).await,
             _ => self.shipper_refusal(key, incarnation, base).await,
         }
+    }
+
+    async fn commits_after(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        after: LogPosition,
+        limit: usize,
+    ) -> Result<Vec<RestorePoint>> {
+        // Of the partition's current incarnation only, in one statement
+        // with its row, so that none of one removed is read.
+        let found: Vec<Noted> = sqlx::query_as(
+            "SELECT c.position, c.head, c.committed_at
+             FROM vellev.commits c
+             JOIN vellev.partitions p ON p.tenant = c.tenant AND p.partition = c.partition
+                                     AND p.incarnation = c.incarnation
+             WHERE c.tenant = $1 AND c.partition = $2 AND c.incarnation = $3
+               AND c.position > $4
+             ORDER BY c.position
+             LIMIT $5",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(bigint(incarnation.0)?)
+        .bind(bigint(after.0)?)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        if found.is_empty() {
+            // None, or none of this incarnation: which, the row says.
+            let row = self.ship_facts(key, LogPosition(0), LogPosition(0)).await?;
+            same_incarnation(key, incarnation, row.current()?)?;
+        }
+        found.into_iter().map(Noted::point).collect()
+    }
+
+    async fn unshipped(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<Unshipped>> {
+        let rows: Vec<UnshippedRow> = sqlx::query_as(
+            "SELECT p.tenant, p.partition, s.incarnation, s.base, s.shipped, p.log_position
+             FROM vellev.partitions p
+             JOIN vellev.shipping s ON s.tenant = p.tenant AND s.partition = p.partition
+                                   AND s.incarnation = p.incarnation
+             WHERE s.stalled IS NULL
+               AND p.log_position > COALESCE(s.shipped, s.base - 1)
+               AND ($1::text IS NULL OR (p.tenant, p.partition) > ($1, $2))
+             ORDER BY p.tenant, p.partition
+             LIMIT $3",
+        )
+        .bind(after.map(|after| after.tenant.as_str()))
+        .bind(after.map_or(0, |after| i64::from(after.partition.0)))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(UnshippedRow::unshipped).collect()
     }
 
     async fn partitions(

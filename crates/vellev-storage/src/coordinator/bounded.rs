@@ -10,7 +10,7 @@ use super::{
     Acquired, Adoption, Cleaned, ClusterId, Commit, Committed, Coordinator, CoordinatorError,
     Forgotten, Generation, Identity, Incarnation, KeyHash, Lease, LogPosition, ManifestRef,
     PartitionKey, Point, PurgeClaim, Purges, Removed, RestorePoint, Restored, Result, ShipBase,
-    Shipping, TenantKey, Versions,
+    Shipping, TenantKey, Unshipped, Versions,
 };
 
 /// A coordinator whose every call is given up once it has gone unanswered
@@ -130,6 +130,25 @@ impl Coordinator for Bounded {
     ) -> Result<Shipping> {
         self.bounded(self.inner.stall_shipping(key, incarnation, base, reason))
             .await
+    }
+
+    async fn commits_after(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        after: LogPosition,
+        limit: usize,
+    ) -> Result<Vec<RestorePoint>> {
+        self.bounded(self.inner.commits_after(key, incarnation, after, limit))
+            .await
+    }
+
+    async fn unshipped(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<Unshipped>> {
+        self.bounded(self.inner.unshipped(after, limit)).await
     }
 
     async fn partitions(

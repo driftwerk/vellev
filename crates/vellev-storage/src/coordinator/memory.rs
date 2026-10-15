@@ -17,7 +17,7 @@ use super::{
     Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation,
     KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges,
     Removed, RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts, Shipping, TenantKey,
-    Versions, RESTORES_KEPT_FOR,
+    Unshipped, Versions, RESTORES_KEPT_FOR,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -628,6 +628,51 @@ impl Coordinator for MemoryCoordinator {
             run.stalled.get_or_insert_with(|| reason.to_string());
             Ok(row.shipping())
         })
+    }
+
+    async fn commits_after(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        after: LogPosition,
+        limit: usize,
+    ) -> Result<Vec<RestorePoint>> {
+        self.with_row(key, |row, _| {
+            same_incarnation(key, incarnation, row.incarnation)?;
+            Ok(row
+                .history
+                .iter()
+                .filter(|commit| commit.position > after)
+                .take(limit)
+                .cloned()
+                .collect())
+        })
+    }
+
+    async fn unshipped(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<Unshipped>> {
+        let rows = self.rows.lock().expect("coordinator lock");
+        let mut behind: Vec<Unshipped> = rows
+            .iter()
+            .filter(|(key, _)| after.is_none_or(|after| *key > after))
+            .filter_map(|(key, row)| {
+                let run = row.ship_run.as_ref().filter(|run| run.stalled.is_none())?;
+                let shipped = run.shipped.map_or(run.base.0.saturating_sub(1), |at| at.0);
+                (row.log_position.0 > shipped).then(|| Unshipped {
+                    key: key.clone(),
+                    incarnation: row.incarnation,
+                    base: run.base,
+                    shipped: run.shipped,
+                    committed: row.log_position,
+                })
+            })
+            .collect();
+        behind.sort_unstable_by(|one, other| one.key.cmp(&other.key));
+        behind.truncate(limit);
+        Ok(behind)
     }
 
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>> {

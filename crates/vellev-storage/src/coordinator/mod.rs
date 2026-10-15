@@ -140,6 +140,18 @@ pub struct Shipping {
     pub stalled: Option<String>,
 }
 
+/// A partition with commits its run of shipping has yet to ship: the
+/// run's incarnation and base, what it has shipped, and the position
+/// committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unshipped {
+    pub key: PartitionKey,
+    pub incarnation: Incarnation,
+    pub base: LogPosition,
+    pub shipped: Option<LogPosition>,
+    pub committed: LogPosition,
+}
+
 /// Why a shipping hold or base was refused as stale: what it named no
 /// longer stands, and the caller reads again and asks anew.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,6 +675,31 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
         base: LogPosition,
         reason: &str,
     ) -> Result<Shipping>;
+
+    /// Up to `limit` commits of the partition's incarnation `incarnation`
+    /// at positions above `after`, oldest first, each with its head and the
+    /// time it was committed, by the database's clock, to the microsecond:
+    /// what a shipper ships, read from the rows the commit made, never
+    /// from a listing. Positions may skip, as a restore commits after the
+    /// greater of the current position and the one it restores; none is
+    /// missing that is still kept. Refused for another incarnation than
+    /// the partition's current one, and for a partition not registered.
+    async fn commits_after(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        after: LogPosition,
+        limit: usize,
+    ) -> Result<Vec<RestorePoint>>;
+
+    /// Up to `limit` partitions after `after`, in key order, whose run of
+    /// shipping has commits it has yet to ship: a base is recorded, the run
+    /// has not stalled, and the committed position is above what it has
+    /// shipped (at or above its base, if it has shipped nothing). A stalled
+    /// run waits for an operator, not a shipper. Paged by key, as
+    /// [`Self::partitions`] is, so that a sweep takes partitions in turn.
+    async fn unshipped(&self, after: Option<&PartitionKey>, limit: usize)
+        -> Result<Vec<Unshipped>>;
 
     /// Up to `limit` registered partitions after `after`, in key order,
     /// tenants comparing byte by byte.
