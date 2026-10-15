@@ -3,10 +3,14 @@
 //! decoded, and the checkpoint's manifest its caller decoded.
 //!
 //! A link's `before` names the commit before it in its incarnation: the
-//! previous row of `vellev.commits`, by position and frame sum. Positions
-//! may skip (a restore commits at the position after the greater of the
-//! current one and the one it restores), so a chain is walked by
-//! `before`, never by counting positions.
+//! previous row of `vellev.commits`, by position and frame sum. A
+//! checkpoint's may skip positions (a restore commits at the position
+//! after the greater of the current one and the one it restores, and an
+//! adopted tenant's first commit after nothing), so a chain is walked by
+//! `before`, never by counting positions. A log's never does: a log is
+//! committed at the position after the head it was made on, and loading
+//! one anywhere else is refused, so a log whose `before` is not the
+//! position just before it is refused here too.
 //!
 //! To restore the point `target`:
 //!
@@ -73,6 +77,12 @@ pub enum Broken {
     /// The link at `position` names a commit before it whose frame sum is
     /// not the one that link has.
     OtherSum { position: LogPosition },
+    /// The log at `position` names a commit before it other than the one
+    /// just before: a log is committed at the position after the head it
+    /// was made on, and is loaded only so. Only a checkpoint may skip.
+    LogSkips { position: LogPosition },
+    /// The checkpoint's link lists other files than its manifest names.
+    OtherFiles { checkpoint: LogPosition },
     /// The walk passed below `start` from the link at `position`.
     Passed {
         position: LogPosition,
@@ -150,6 +160,30 @@ pub fn checkpoint_for(
     }
 }
 
+/// Whether `listed`, a checkpoint link's files, are exactly the files
+/// `manifest` names, each once.
+fn same_files(listed: &[Needed], manifest: &Manifest) -> bool {
+    let mut listed: Vec<&str> = listed.iter().map(|file| file.key.as_str()).collect();
+    let mut named: Vec<&str> = manifest
+        .segments
+        .iter()
+        .flat_map(|segment| {
+            [
+                Some(&segment.key),
+                segment.index.as_ref(),
+                segment.vectors.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+        })
+        .collect();
+    listed.sort_unstable();
+    named.sort_unstable();
+    let once = listed.windows(2).all(|pair| pair[0] != pair[1]);
+    once && listed == named
+}
+
 /// The links from `target` down to `start` by `before`, oldest first, or,
 /// with no start, down to the first commit: a log at position 1 with
 /// nothing before it. Every step goes to an earlier position, so the walk
@@ -181,6 +215,9 @@ fn walk(
         if let Some(start) = start.filter(|start| before.position < *start) {
             return Err(Broken::Passed { position, start });
         }
+        if header.head == Head::Log && before.position.next() != Some(position) {
+            return Err(Broken::LogSkips { position });
+        }
         let earlier = visit(links, &timeline, before.position, Some(position))?;
         if earlier.sum != before.sum {
             return Err(Broken::OtherSum { position });
@@ -194,7 +231,15 @@ fn walk(
 
 /// What restoring `target` from `links`, the links of one timeline by
 /// position, needs; `checkpoint` is the manifest of the link
-/// [`checkpoint_for`] gives, decoded, or none if it gives none.
+/// [`checkpoint_for`] gives, or none if it gives none. That manifest is
+/// taken to be the checkpoint's own, by its position alone: the caller
+/// decodes it from that link's frame, only once the frame's SHA-256 is
+/// the one the link's header says.
+///
+/// The checkpoint's link must list exactly the files its manifest names:
+/// each segment, and its index and vectors files where it has them. What
+/// the link lists is what is shipped before it and kept for it, so a file
+/// it left out would be found missing only when a restore loads.
 pub fn needed(
     links: &BTreeMap<LogPosition, Header>,
     target: LogPosition,
@@ -217,6 +262,9 @@ pub fn needed(
         }
     };
     let at = found.position;
+    if !same_files(&found.files, manifest) {
+        return Err(Broken::OtherFiles { checkpoint: at });
+    }
     let replayed = u64::try_from(manifest.replay.len()).unwrap_or(u64::MAX);
     let start = match replayed {
         0 => at,
@@ -226,6 +274,10 @@ pub fn needed(
         _ => LogPosition(manifest.replay_after.0 + 1),
     };
     let walked = walk(links, target, Some(start))?;
+    // Every link between the target and the checkpoint is a log, the
+    // checkpoint being the newest manifest at or below the target, and a
+    // log never skips: so the walk cannot pass over the checkpoint, and
+    // this holds whatever is changed above it.
     let Some(checkpoint_at) = walked.iter().position(|position| *position == at) else {
         return Err(Broken::MissedCheckpoint { checkpoint: at });
     };
@@ -341,10 +393,25 @@ mod tests {
             prev: None,
             next_collection_id: 0,
             collections: Vec::new(),
-            segments: Vec::new(),
+            segments: vec![segment(position, true, true)],
             replay: replay.iter().map(|at| key(Head::Log, *at)).collect(),
             replay_after: LogPosition(replay.first().map_or(0, |first| first - 1)),
             answered: Vec::new(),
+        }
+    }
+
+    /// The segment of the checkpoint at `position`, with its index and
+    /// vectors files if asked for, keyed as [`files`] keys them.
+    fn segment(position: u64, index: bool, vectors: bool) -> crate::format::SegmentMeta {
+        let file = |kind: &str| {
+            format!("tenant-a/0/{kind}/{position:020}-00000000000000000002-{WRITER}.{kind}")
+        };
+        crate::format::SegmentMeta {
+            key: file("segment"),
+            rows: 1,
+            tombstones: 0,
+            index: index.then(|| file("index")),
+            vectors: vectors.then(|| file("vectors")),
         }
     }
 
@@ -406,8 +473,16 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_is_walked_by_before_and_may_skip_positions() {
-        // A log at 5 made on the commit at 2.
+    fn only_a_checkpoint_may_be_made_on_a_commit_more_than_one_before_it() {
+        // A restore checkpoint at 7 made on the commit at 3, as a restore
+        // to a later position commits, and an adopted tenant's first
+        // commit does after nothing.
+        let mut links = logs(3);
+        links.extend([checkpoint(7, Some(3)), log(8, Some(7))]);
+        let got = needed(&chain(links), LogPosition(8), Some(&manifest(7, &[]))).unwrap();
+        assert_eq!(got, restorable(Some(7), &[7, 8]));
+        // A log at 5 made on the commit at 2: no log is committed so, and
+        // none could be loaded so, the log at 3 missing.
         let links = chain([
             log(1, None),
             log(2, Some(1)),
@@ -415,15 +490,20 @@ mod tests {
             log(6, Some(5)),
         ]);
         assert_eq!(
-            needed(&links, LogPosition(6), None).unwrap(),
-            restorable(None, &[1, 2, 5, 6])
+            needed(&links, LogPosition(6), None),
+            Err(Broken::LogSkips {
+                position: LogPosition(5)
+            })
         );
-        // A restore checkpoint at 7 made on the commit at 3, as a restore
-        // to a later position commits.
+        // Nor above a checkpoint.
         let mut links = logs(3);
-        links.extend([checkpoint(7, Some(3)), log(8, Some(7))]);
-        let got = needed(&chain(links), LogPosition(8), Some(&manifest(7, &[]))).unwrap();
-        assert_eq!(got, restorable(Some(7), &[7, 8]));
+        links.extend([checkpoint(7, Some(3)), log(9, Some(7))]);
+        assert_eq!(
+            needed(&chain(links), LogPosition(9), Some(&manifest(7, &[]))),
+            Err(Broken::LogSkips {
+                position: LogPosition(9)
+            })
+        );
     }
 
     #[test]
@@ -578,12 +658,13 @@ mod tests {
                 start: LogPosition(3)
             })
         );
-        // The log at 6 made on 4, past the checkpoint at 5.
+        // The log at 6 made on 4, past the checkpoint at 5: a log, which
+        // may not skip, so the walk can never pass over the checkpoint.
         let links = with(replaying(), log(6, Some(4)));
         assert_eq!(
             needed(&links, LogPosition(7), Some(&manifest(5, &[3, 4]))),
-            Err(Broken::MissedCheckpoint {
-                checkpoint: LogPosition(5)
+            Err(Broken::LogSkips {
+                position: LogPosition(6)
             })
         );
         // Nor, replaying nothing, pass below the checkpoint itself.
@@ -696,5 +777,45 @@ mod tests {
                 says: LogPosition(2)
             })
         );
+    }
+
+    #[test]
+    fn a_checkpoints_link_must_list_the_files_its_manifest_names_and_no_others() {
+        let links = chain(replaying());
+        let named = |segments| Manifest {
+            segments,
+            ..manifest(5, &[3, 4])
+        };
+        let other_files = Err(Broken::OtherFiles {
+            checkpoint: LogPosition(5),
+        });
+        // Its vectors file not listed, though the manifest names it.
+        let mut lacking = links.clone();
+        lacking.get_mut(&LogPosition(5)).unwrap().files.pop();
+        let full = named(vec![segment(5, true, true)]);
+        assert_eq!(needed(&lacking, LogPosition(7), Some(&full)), other_files);
+        // Listed, though the manifest names no vectors file.
+        let without = named(vec![segment(5, true, false)]);
+        assert_eq!(needed(&links, LogPosition(7), Some(&without)), other_files);
+        // Listed twice.
+        let mut twice = links.clone();
+        let files = &mut twice.get_mut(&LogPosition(5)).unwrap().files;
+        files.push(files[0].clone());
+        assert_eq!(needed(&twice, LogPosition(7), Some(&full)), other_files);
+        // Another segment the manifest names, not listed.
+        let more = named(vec![segment(5, true, true), segment(4, false, false)]);
+        assert_eq!(needed(&links, LogPosition(7), Some(&more)), other_files);
+        // In another order, all there: the same files.
+        let mut reordered = links.clone();
+        reordered.get_mut(&LogPosition(5)).unwrap().files.reverse();
+        assert_eq!(
+            needed(&reordered, LogPosition(7), Some(&full)).map(|got| got.checkpoint),
+            Ok(Some(LogPosition(5)))
+        );
+        // A segment with no index or vectors file, listed alone.
+        let mut bare = links.clone();
+        bare.get_mut(&LogPosition(5)).unwrap().files.truncate(1);
+        let bare_manifest = named(vec![segment(5, false, false)]);
+        assert!(needed(&bare, LogPosition(7), Some(&bare_manifest)).is_ok());
     }
 }
