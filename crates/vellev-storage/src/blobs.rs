@@ -932,6 +932,7 @@ pub struct ObjectBlobs {
     /// files are then read in place.
     root: Option<PathBuf>,
     transfers: Transfers,
+    aborts: Aborts,
 }
 
 impl ObjectBlobs {
@@ -940,6 +941,7 @@ impl ObjectBlobs {
             store,
             root: None,
             transfers: Transfers::default(),
+            aborts: Aborts::process(),
         }
     }
 
@@ -958,6 +960,12 @@ impl ObjectBlobs {
         Self { transfers, ..self }
     }
 
+    /// Count the aborts of uploads dropped unfinished in `aborts`,
+    /// instead of in the process's own.
+    pub fn aborting(self, aborts: Aborts) -> Self {
+        Self { aborts, ..self }
+    }
+
     /// Upload `bytes` under `key` in parts, each its own request, and abort
     /// the upload if any of it fails or it is dropped unfinished.
     async fn put_in_parts(&self, key: &str, path: &ObjectPath, bytes: Bytes) -> Result<()> {
@@ -965,6 +973,7 @@ impl ObjectBlobs {
         let mut upload = Unfinished {
             upload: Some(bounded(key, within, self.store.put_multipart(path)).await?),
             within,
+            aborts: self.aborts.clone(),
         };
         let part = self.transfers.part_bytes.max(1);
         let uploaded = async {
@@ -1141,11 +1150,82 @@ impl Reading {
     }
 }
 
+/// The aborts of uploads dropped unfinished that are on their way: each is
+/// sent on a task of its own, which nothing waits for, and a process that
+/// exits at once may never send it, leaving the upload's parts in the
+/// store, where no listing shows them. A process that stops waits for
+/// them, for as long as it gives them (see [`Aborts::finished`]).
+///
+/// Each is on its way until it is answered or given up, at the bound of a
+/// request to the store, so waiting for longer than that bound waits for
+/// all there are.
+#[derive(Debug, Clone, Default)]
+pub struct Aborts(Arc<OnTheirWay>);
+
+#[derive(Debug, Default)]
+struct OnTheirWay {
+    pending: std::sync::atomic::AtomicUsize,
+    done: tokio::sync::Notify,
+}
+
+impl Aborts {
+    /// The aborts every store of the process counts in, unless it is given
+    /// others.
+    pub fn process() -> Aborts {
+        static PROCESS: std::sync::OnceLock<Aborts> = std::sync::OnceLock::new();
+        PROCESS.get_or_init(Aborts::default).clone()
+    }
+
+    /// How many are on their way.
+    pub fn pending(&self) -> usize {
+        self.0.pending.load(Ordering::SeqCst)
+    }
+
+    /// Wait until none is on its way, or `within` has passed: how many
+    /// still are.
+    pub async fn finished(&self, within: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            // Asked for before the count is read, so that the last one to
+            // end between the two is not missed.
+            let done = self.0.done.notified();
+            tokio::pin!(done);
+            done.as_mut().enable();
+            let pending = self.pending();
+            if pending == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, done).await.is_err() {
+                return self.pending();
+            }
+        }
+    }
+
+    /// One more on its way, until what this gives is dropped.
+    fn begun(&self) -> Aborting {
+        self.0.pending.fetch_add(1, Ordering::SeqCst);
+        Aborting(self.clone())
+    }
+}
+
+/// An abort on its way, counted in its [`Aborts`] until this is dropped:
+/// once it is answered or given up, or the task that sends it goes.
+struct Aborting(Aborts);
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        let OnTheirWay { pending, done } = &*self.0 .0;
+        pending.fetch_sub(1, Ordering::SeqCst);
+        done.notify_waiters();
+    }
+}
+
 /// An upload in parts not yet complete, aborted if it is dropped so.
 #[derive(Debug)]
 struct Unfinished {
     upload: Option<Box<dyn MultipartUpload>>,
     within: Duration,
+    aborts: Aborts,
 }
 
 impl Unfinished {
@@ -1175,7 +1255,9 @@ impl Drop for Unfinished {
             return;
         };
         let within = self.within;
+        let aborting = self.aborts.begun();
         runtime.spawn(async move {
+            let _aborting = aborting;
             if let Err(error) = bounded("an upload", within, upload.abort()).await {
                 tracing::warn!(%error, "an upload dropped unfinished could not be aborted");
             }
@@ -1305,6 +1387,7 @@ impl Blobs for ObjectBlobs {
         let mut upload = Unfinished {
             upload: None,
             within,
+            aborts: self.aborts.clone(),
         };
         // What has come and not gone up, no more than a part of it, and
         // how many parts have.
