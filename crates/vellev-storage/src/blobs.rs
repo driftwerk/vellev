@@ -874,6 +874,12 @@ impl ObjectBlobs {
         Self { transfers, ..self }
     }
 
+    /// Count the aborts of uploads dropped unfinished in `aborts`,
+    /// instead of in the process's own.
+    pub fn aborting(self, _aborts: Aborts) -> Self {
+        self
+    }
+
     /// Upload `bytes` under `key` in parts, each its own request, and abort
     /// the upload if any of it fails or it is dropped unfinished.
     async fn put_in_parts(&self, key: &str, path: &ObjectPath, bytes: Bytes) -> Result<()> {
@@ -1054,6 +1060,33 @@ impl Reading {
                 format!("{} bytes came where {wanted} were asked for", self.at()),
             )),
         }
+    }
+}
+
+/// The aborts of uploads dropped unfinished that are on their way: each is
+/// sent on a task of its own, which nothing waits for, and a process that
+/// exits at once may never send it, leaving the upload's parts in the
+/// store, where no listing shows them. A process that stops waits for
+/// them, for as long as it gives them (see [`Aborts::finished`]).
+#[derive(Debug, Clone, Default)]
+pub struct Aborts;
+
+impl Aborts {
+    /// The aborts every store of the process counts in, unless it is given
+    /// others.
+    pub fn process() -> Aborts {
+        Aborts
+    }
+
+    /// How many are on their way.
+    pub fn pending(&self) -> usize {
+        0
+    }
+
+    /// Wait until none is on its way, or `within` has passed: how many
+    /// still are.
+    pub async fn finished(&self, _within: Duration) -> usize {
+        0
     }
 }
 
