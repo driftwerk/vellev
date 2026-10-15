@@ -502,6 +502,11 @@ struct BackupBlobs {
     rewritten: Mutex<Vec<String>>,
     /// Every file that landed, in the order it did.
     landings: Mutex<Vec<String>>,
+    /// How many creates more the store answers `AlreadyThere` with nothing
+    /// there and nothing landing: a 409 for another create of the key that
+    /// was under way and failed since, as `put_new`'s callers are told to
+    /// expect.
+    falsely_there: AtomicUsize,
 }
 
 impl BackupBlobs {
@@ -520,6 +525,7 @@ impl BackupBlobs {
             first: Mutex::default(),
             rewritten: Mutex::default(),
             landings: Mutex::default(),
+            falsely_there: AtomicUsize::new(0),
         }
     }
 
@@ -592,10 +598,19 @@ impl Blobs for BackupBlobs {
     }
 
     /// Faults as for a put: refused, nothing lands; landed, its answer
-    /// lost; or had and made later, refused then if the key is taken.
+    /// lost; or had and made later, refused then if the key is taken. And
+    /// one of its own: said to be there, with nothing there.
     async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
         tokio::task::yield_now().await;
         self.reached()?;
+        let falsely = self
+            .falsely_there
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |more| {
+                more.checked_sub(1)
+            });
+        if falsely.is_ok() {
+            return Ok(Created::AlreadyThere);
+        }
         let fault = self.faults.lock().unwrap().pop_front();
         match fault {
             Some(PutFault::Refuse) => Err(lost()),
@@ -1248,6 +1263,9 @@ enum Action {
     BackupDown(usize),
     /// The creates the backup store has and has yet to make are made.
     DeliverDelayedBackup,
+    /// The backup store answers so many creates `AlreadyThere`, with
+    /// nothing there.
+    BackupFalselyThere(usize),
     /// Shipping of the partition begins, as bootstrap begins it: the hold
     /// is taken, and then a base recorded at the newest checkpoint whose
     /// row at its base is there, through the coordinator's own calls.
@@ -1905,41 +1923,28 @@ impl World {
     /// Begin shipping, as bootstrap begins it (DW-668, bootstrap note A),
     /// through the coordinator's own calls: take the hold, capped at the
     /// newest checkpoint recorded, and then record a base at the newest
-    /// checkpoint whose row at its base is there, its base where its
-    /// restore starts. Refusals are what the coordinator says they are, and
-    /// leave shipping where they left it.
+    /// checkpoint whose row at its base is there and whose manifest can be
+    /// read from the primary store, its base where its restore starts.
+    /// Refusals are what the coordinator says they are, and leave shipping
+    /// where they left it.
+    ///
+    /// A stand-in for bootstrap: it does not ask the lease holder for a
+    /// flush (bootstrap note, amendment L), so a base appears only once a
+    /// checkpoint has been made by the history itself, and no history may
+    /// count on one appearing at once.
     async fn begin_shipping(&mut self) {
-        let key = self.cluster.key.clone();
-        let committed = self.cluster.committed().await;
-        let incarnation = committed.incarnation;
-        let mut checkpoints: Vec<(LogPosition, ManifestRef)> = (self.coordinator.heads)
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|head| head.key.0.ends_with(".manifest"))
-            .filter(|head| head.position <= committed.log_position)
-            .map(|head| (head.position, head.key.clone()))
-            .collect();
-        checkpoints.sort_by_key(|(position, _)| *position);
-        let cap = checkpoints.last().map_or(LogPosition(0), |(at, _)| *at);
-        let held = self
-            .coordinator
-            .hold_for_shipping(&key, incarnation, cap)
-            .await;
-        if held.is_err() {
+        let Some((checkpoints, _)) = self.take_hold().await else {
             return;
-        }
+        };
+        let key = self.cluster.key.clone();
+        let incarnation = self.cluster.committed().await.incarnation;
         for (at, checkpoint) in checkpoints.into_iter().rev() {
-            let frame = self
-                .blobs
-                .shadow
-                .lock()
-                .unwrap()
-                .get(&checkpoint.0)
-                .cloned();
-            let Some(Ok(Stored::Manifest(manifest))) =
-                frame.map(|frame| decode_head(&checkpoint.0, &frame))
-            else {
+            // Read as bootstrap reads it, from the primary store: one a
+            // clean has deleted, or that cannot be read now, is passed by.
+            let Ok(frame) = self.blobs.get(&checkpoint.0).await else {
+                continue;
+            };
+            let Ok(Stored::Manifest(manifest)) = decode_head(&checkpoint.0, &frame) else {
                 continue;
             };
             let position = match manifest.replay.is_empty() {
@@ -1956,6 +1961,36 @@ impl World {
                 return;
             }
         }
+    }
+
+    /// Take shipping's hold as bootstrap takes it, capped at the newest
+    /// checkpoint recorded at or below the committed position: the
+    /// checkpoints so recorded, oldest first, and the hold as taken, or
+    /// none if it was refused.
+    async fn take_hold(
+        &self,
+    ) -> Option<(
+        Vec<(LogPosition, ManifestRef)>,
+        vellev_storage::coordinator::Shipping,
+    )> {
+        let key = self.cluster.key.clone();
+        let committed = self.cluster.committed().await;
+        let mut checkpoints: Vec<(LogPosition, ManifestRef)> = (self.coordinator.heads)
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|head| head.key.0.ends_with(".manifest"))
+            .filter(|head| head.position <= committed.log_position)
+            .map(|head| (head.position, head.key.clone()))
+            .collect();
+        checkpoints.sort_by_key(|(position, _)| *position);
+        let cap = checkpoints.last().map_or(LogPosition(0), |(at, _)| *at);
+        let held = self
+            .coordinator
+            .hold_for_shipping(&key, committed.incarnation, cap)
+            .await
+            .ok()?;
+        Some((checkpoints, held))
     }
 
     /// The lease expires and a new node takes it; every earlier writer is
@@ -2961,6 +2996,11 @@ impl World {
                 self.backup.down.fetch_add(requests, Ordering::SeqCst);
             }
             Action::DeliverDelayedBackup => self.backup.deliver_delayed().await,
+            Action::BackupFalselyThere(creates) => {
+                self.backup
+                    .falsely_there
+                    .fetch_add(creates, Ordering::SeqCst);
+            }
             Action::BeginShipping => self.begin_shipping().await,
         }
         Ok(())
@@ -5533,6 +5573,108 @@ fn shipping_begins_held_from_the_lowest_row_and_based_where_the_newest_checkpoin
         assert!(base.checkpoint.0.ends_with(".manifest"), "{base:?}");
         assert_eq!(shipping.cap, Some(base.checkpoint_at));
         assert_eq!(world.shipping_from, Some(base));
+    });
+}
+
+#[test]
+fn a_create_answered_already_there_lands_nothing_and_the_next_is_made() {
+    paused().block_on(async {
+        let store = backup();
+        store.falsely_there.fetch_add(1, Ordering::SeqCst);
+        // A 409 whose create failed: said to be there, and nothing is.
+        let said = store.put_new("link", Bytes::from("A")).await.unwrap();
+        assert_eq!(said, Created::AlreadyThere);
+        assert!(matches!(
+            store.get("link").await,
+            Err(StorageError::Missing { .. })
+        ));
+        assert!(store.landings.lock().unwrap().is_empty());
+        // Only the one: the next create is made.
+        let made = store.put_new("link", Bytes::from("A")).await.unwrap();
+        assert_eq!(made, Created::Written);
+        assert_eq!(store.get("link").await.unwrap(), "A");
+        // Puts are never answered so.
+        store.falsely_there.fetch_add(1, Ordering::SeqCst);
+        store.put("file", Bytes::from("F")).await.unwrap();
+        assert_eq!(store.get("file").await.unwrap(), "F");
+        assert_eq!(*store.landings.lock().unwrap(), ["link", "file"]);
+        // The world answers so as its action says.
+        let mut world = World::new(None).await;
+        world.step(Action::BackupFalselyThere(1)).await.unwrap();
+        let said = world.backup.put_new("a", Bytes::from("A")).await.unwrap();
+        assert_eq!(said, Created::AlreadyThere);
+        assert!(world.backup.get("a").await.is_err());
+    });
+}
+
+/// The newest checkpoint committed to `world`'s partition, by its row.
+async fn newest_checkpoint(world: &World) -> (LogPosition, ManifestRef) {
+    let key = world.cluster.key.clone();
+    let now = world.cluster.committed().await.incarnation;
+    let rows = world
+        .coordinator
+        .commits_after(&key, now, LogPosition(0), 1_000)
+        .await
+        .unwrap();
+    let row = rows
+        .into_iter()
+        .filter(|row| row.head.0.ends_with(".manifest"))
+        .last()
+        .expect("a checkpoint");
+    (row.position, row.head)
+}
+
+#[test]
+fn shipping_held_before_any_checkpoint_begins_at_the_newest_of_those_made_since() {
+    paused().block_on(async {
+        let mut world = after(vec![written(), Action::BeginShipping]).await;
+        let key = world.cluster.key.clone();
+        assert_eq!(world.coordinator.shipping(&key).await.unwrap().base, None);
+        for action in [flushed(), written(), flushed(), Action::BeginShipping] {
+            world.step(action).await.unwrap();
+            world.verify().await.unwrap();
+        }
+        let (newest, checkpoint) = newest_checkpoint(&world).await;
+        let base = world.coordinator.shipping(&key).await.unwrap().base;
+        let base = base.expect("a base");
+        assert_eq!((base.checkpoint_at, base.checkpoint), (newest, checkpoint));
+        assert!(newest > LogPosition(2), "two checkpoints: {newest:?}");
+    });
+}
+
+#[test]
+fn shipping_is_held_capped_at_the_newest_of_several_checkpoints() {
+    paused().block_on(async {
+        let world = after(vec![written(), flushed(), written(), flushed()]).await;
+        let (newest, _) = newest_checkpoint(&world).await;
+        // The hold as bootstrap takes it, read before a base raises its cap.
+        let (_, held) = world.take_hold().await.expect("held");
+        assert_eq!(held.cap, Some(newest));
+    });
+}
+
+#[test]
+fn shipping_begins_on_a_checkpoint_it_can_read_from_the_primary_store() {
+    paused().block_on(async {
+        // Held before any checkpoint, so that none is capped out.
+        let mut world = after(vec![
+            written(),
+            Action::BeginShipping,
+            flushed(),
+            written(),
+            flushed(),
+        ])
+        .await;
+        let (newest, checkpoint) = newest_checkpoint(&world).await;
+        // The newest checkpoint's manifest gone from the primary, as by a
+        // clean: shipping begins on the one before it.
+        world.blobs.clean.delete(&checkpoint.0).await.unwrap();
+        world.step(Action::BeginShipping).await.unwrap();
+        let key = world.cluster.key.clone();
+        let base = world.coordinator.shipping(&key).await.unwrap().base;
+        let base = base.expect("a base");
+        assert!(base.checkpoint_at < newest, "{base:?}");
+        assert_ne!(base.checkpoint, checkpoint);
     });
 }
 
