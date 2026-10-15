@@ -11,10 +11,12 @@ use uuid::Uuid;
 use vellev_core::{NodeId, Partition, RequestId, TenantId};
 
 use super::{
-    checked_hold, checked_ttl, checked_window, Acquired, Adoption, ClusterId, Commit, Committed,
+    base_decision, checked_hold, checked_note, checked_ship_base, checked_ttl, checked_window,
+    hold_decision, same_incarnation, Acquired, Adoption, Cleaned, ClusterId, Commit, Committed,
     Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation, KeyHash, Lease,
     Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges, Removed, Restore,
-    RestorePoint, Restored, Result, TenantKey, Versions, RESTORES_KEPT_FOR,
+    RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts, Shipping, TenantKey, Versions,
+    RESTORES_KEPT_FOR,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -28,7 +30,20 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (8, include_str!("../../migrations/0008_purges.sql")),
     (9, include_str!("../../migrations/0009_restores.sql")),
     (10, include_str!("../../migrations/0010_lineage.sql")),
+    (11, include_str!("../../migrations/0011_cleaned.sql")),
+    (12, include_str!("../../migrations/0012_shipping.sql")),
 ];
+
+/// The lock shipping's hold on a partition takes, and `forget_history`
+/// is to take, on (tenant, partition): a transaction-scoped advisory lock,
+/// which no commit takes, so that no commit ever waits on it. A hash
+/// collision only orders two unrelated partitions' maintenance.
+const SHIP_LOCK: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1 || '/' || $2::text, 0))";
+
+/// How many times a shipping write that changed nothing, though what it
+/// then reads says it should have, is made again: each time, something
+/// it was conditioned on moved in between.
+const SHIP_TRIES: usize = 3;
 
 /// Serialises migrations across nodes starting together. Transaction-scoped,
 /// so it is released with the transaction and never pins an RDS Proxy session.
@@ -236,6 +251,88 @@ impl PostgresCoordinator {
         }
         transaction.commit().await?;
         Ok(done)
+    }
+
+    /// The partition's cleaned record, with its generation; none for a
+    /// partition not registered.
+    async fn cleaned_row(&self, key: &PartitionKey) -> Result<Option<CleanedRow>> {
+        Ok(sqlx::query_as(
+            "SELECT generation, cleaned_below, cleaned_position
+             FROM vellev.partitions WHERE tenant = $1 AND partition = $2",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// The partition's shipping, and what its rows say for a hold or base
+    /// at `base` with its checkpoint at `checkpoint_at`; none for a
+    /// partition not registered.
+    async fn ship_row(
+        &self,
+        key: &PartitionKey,
+        base: LogPosition,
+        checkpoint_at: LogPosition,
+    ) -> Result<Option<ShipRow>> {
+        Ok(sqlx::query_as(
+            "SELECT p.incarnation, p.log_position, p.cleaned_position,
+                    p.ship_hold_from, p.ship_cap, p.ship_base,
+                    p.ship_base_checkpoint, p.ship_base_checkpoint_position,
+                    s.base AS run_base, s.shipped, s.stalled,
+                    EXISTS (SELECT 1 FROM vellev.commits c
+                            WHERE c.tenant = p.tenant AND c.partition = p.partition
+                              AND c.incarnation = p.incarnation AND c.position = $3)
+                        AS row_at_base,
+                    (SELECT c.head FROM vellev.commits c
+                     WHERE c.tenant = p.tenant AND c.partition = p.partition
+                       AND c.incarnation = p.incarnation AND c.position = $4)
+                        AS head_at_checkpoint
+             FROM vellev.partitions p
+             LEFT JOIN vellev.shipping s ON s.tenant = p.tenant AND s.partition = p.partition
+             WHERE p.tenant = $1 AND p.partition = $2",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(bigint(base.0)?)
+        .bind(bigint(checkpoint_at.0)?)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// The partition's shipping rows, refused for a partition not
+    /// registered.
+    async fn ship_facts(
+        &self,
+        key: &PartitionKey,
+        base: LogPosition,
+        checkpoint_at: LogPosition,
+    ) -> Result<ShipRow> {
+        self.ship_row(key, base, checkpoint_at)
+            .await?
+            .ok_or_else(|| CoordinatorError::UnknownPartition(key.clone()))
+    }
+
+    /// The partition's shipping after a shipper's write on the run from
+    /// `base` that changed nothing: refused for another incarnation, or
+    /// a run of another base or none; else what stands.
+    async fn shipper_refusal(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+    ) -> Result<Shipping> {
+        let row = self.ship_facts(key, LogPosition(0), LogPosition(0)).await?;
+        same_incarnation(key, incarnation, row.current()?)?;
+        let recorded = row.run_base.map(stored_position).transpose()?;
+        if recorded != Some(base) {
+            return Err(CoordinatorError::OtherBase {
+                key: key.clone(),
+                asked: base,
+                recorded,
+            });
+        }
+        row.shipping()
     }
 
     /// Why a fenced statement on `lease` changed no row. `Ok` means the
@@ -550,6 +647,104 @@ impl Snapshot {
             .clone()
             .map(NodeId::from)
             .zip(self.lease_expires_at)
+    }
+}
+
+/// What a clean of a partition last recorded it deletes below, as its row
+/// keeps it, with the row's generation.
+#[derive(FromRow)]
+struct CleanedRow {
+    #[sqlx(try_from = "i64")]
+    generation: Generation,
+    cleaned_below: Option<String>,
+    cleaned_position: Option<i64>,
+}
+
+impl CleanedRow {
+    fn cleaned(&self) -> Result<Option<Cleaned>> {
+        match (&self.cleaned_below, self.cleaned_position) {
+            (Some(base), Some(position)) => Ok(Some(Cleaned {
+                base: ManifestRef(base.clone()),
+                position: LogPosition(u64::try_from(position).map_err(|error| {
+                    invariant(format!("a cleaned position {position}: {error}"))
+                })?),
+            })),
+            (None, None) => Ok(None),
+            _ => Err(invariant(
+                "a partition's cleaned record is half there".into(),
+            )),
+        }
+    }
+}
+
+/// A position as a row keeps it.
+fn stored_position(value: i64) -> Result<LogPosition> {
+    LogPosition::try_from(value)
+        .map_err(|error| invariant(format!("a stored position {value}: {error}")))
+}
+
+/// A partition's shipping, as its row and its run's row keep it, and what
+/// they say for a hold or base asked for.
+#[derive(FromRow)]
+struct ShipRow {
+    incarnation: i64,
+    log_position: i64,
+    cleaned_position: Option<i64>,
+    ship_hold_from: Option<i64>,
+    ship_cap: Option<i64>,
+    ship_base: Option<i64>,
+    ship_base_checkpoint: Option<String>,
+    ship_base_checkpoint_position: Option<i64>,
+    run_base: Option<i64>,
+    shipped: Option<i64>,
+    stalled: Option<String>,
+    row_at_base: bool,
+    head_at_checkpoint: Option<String>,
+}
+
+impl ShipRow {
+    fn current(&self) -> Result<Incarnation> {
+        Incarnation::try_from(self.incarnation)
+            .map_err(|error| invariant(format!("a stored incarnation: {error}")))
+    }
+
+    fn shipping(&self) -> Result<Shipping> {
+        let position = |value: Option<i64>| value.map(stored_position).transpose();
+        let base = match (
+            self.ship_base,
+            &self.ship_base_checkpoint,
+            self.ship_base_checkpoint_position,
+        ) {
+            (Some(base), Some(checkpoint), Some(at)) => Some(ShipBase {
+                position: stored_position(base)?,
+                checkpoint: ManifestRef(checkpoint.clone()),
+                checkpoint_at: stored_position(at)?,
+            }),
+            (None, None, None) => None,
+            _ => {
+                return Err(invariant(
+                    "a partition's shipping base is half there".into(),
+                ))
+            }
+        };
+        Ok(Shipping {
+            incarnation: self.current()?,
+            hold_from: position(self.ship_hold_from)?,
+            cap: position(self.ship_cap)?,
+            base,
+            shipped: position(self.shipped)?,
+            stalled: self.stalled.clone(),
+        })
+    }
+
+    fn facts(&self) -> Result<ShipFacts> {
+        Ok(ShipFacts {
+            shipping: self.shipping()?,
+            committed: stored_position(self.log_position)?,
+            cleaned: self.cleaned_position.map(stored_position).transpose()?,
+            row_at_base: self.row_at_base,
+            head_at_checkpoint: self.head_at_checkpoint.clone().map(ManifestRef),
+        })
     }
 }
 
@@ -879,6 +1074,223 @@ impl Coordinator for PostgresCoordinator {
 
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>> {
         Ok(self.row(key).await?.as_ref().map(Snapshot::committed))
+    }
+
+    async fn cleaned(&self, key: &PartitionKey) -> Result<Option<Cleaned>> {
+        self.cleaned_row(key)
+            .await?
+            .ok_or_else(|| CoordinatorError::UnknownPartition(key.clone()))?
+            .cleaned()
+    }
+
+    async fn clean_below(
+        &self,
+        lease: &Lease,
+        base: &ManifestRef,
+        position: LogPosition,
+    ) -> Result<Cleaned> {
+        let raised: Option<CleanedRow> = sqlx::query_as(
+            "UPDATE vellev.partitions
+             SET cleaned_below = $4, cleaned_position = $5
+             WHERE tenant = $1 AND partition = $2 AND generation = $3
+               AND (cleaned_position IS NULL OR cleaned_position < $5)
+             RETURNING generation, cleaned_below, cleaned_position",
+        )
+        .bind(lease.key.tenant.as_str())
+        .bind(i64::from(lease.key.partition.0))
+        .bind(bigint(lease.generation.0)?)
+        .bind(base.0.as_str())
+        .bind(bigint(position.0)?)
+        .fetch_optional(&self.pool)
+        .await?;
+        let row = match raised {
+            Some(row) => row,
+            // Fenced, or the record is as high already: which, the row says.
+            None => match self.cleaned_row(&lease.key).await? {
+                None => return Err(CoordinatorError::UnknownPartition(lease.key.clone())),
+                Some(row) if row.generation != lease.generation => {
+                    return Err(lease.fenced_by(row.generation))
+                }
+                Some(row) => row,
+            },
+        };
+        row.cleaned()?
+            .ok_or_else(|| invariant("a cleaned record neither raised nor there".into()))
+    }
+
+    async fn shipping(&self, key: &PartitionKey) -> Result<Shipping> {
+        self.ship_facts(key, LogPosition(0), LogPosition(0))
+            .await?
+            .shipping()
+    }
+
+    async fn hold_for_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        cap: LogPosition,
+    ) -> Result<Shipping> {
+        for _ in 0..SHIP_TRIES {
+            let mut tx = self.pool.begin().await?;
+            // Lock in one statement and act in the next, whose snapshot is
+            // taken once the lock is held: the lowest row is read after any
+            // delete made under the lock.
+            sqlx::query(SHIP_LOCK)
+                .bind(key.tenant.as_str())
+                .bind(i64::from(key.partition.0))
+                .execute(&mut *tx)
+                .await?;
+            let taken = sqlx::query(
+                "UPDATE vellev.partitions p
+                 SET ship_hold_from = COALESCE(
+                         (SELECT min(c.position) FROM vellev.commits c
+                          WHERE c.tenant = p.tenant AND c.partition = p.partition
+                            AND c.incarnation = p.incarnation),
+                         p.log_position + 1),
+                     ship_cap = $4
+                 WHERE p.tenant = $1 AND p.partition = $2 AND p.incarnation = $3
+                   AND p.ship_hold_from IS NULL
+                   AND (p.cleaned_position IS NULL OR p.cleaned_position <= $4)
+                   AND $4 <= p.log_position",
+            )
+            .bind(key.tenant.as_str())
+            .bind(i64::from(key.partition.0))
+            .bind(bigint(incarnation.0)?)
+            .bind(bigint(cap.0)?)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            let row = self.ship_facts(key, LogPosition(0), LogPosition(0)).await?;
+            if taken == 1 {
+                return row.shipping();
+            }
+            if let Ship::Stand = hold_decision(key, incarnation, cap, &row.facts()?)? {
+                return row.shipping();
+            }
+        }
+        Err(invariant(
+            "a shipping hold neither taken nor refused".into(),
+        ))
+    }
+
+    async fn record_base(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: &ShipBase,
+    ) -> Result<Shipping> {
+        checked_ship_base(base)?;
+        for _ in 0..SHIP_TRIES {
+            let mut tx = self.pool.begin().await?;
+            // The partition's row first, then the run's own: every
+            // transaction that writes both takes them in that order.
+            let based = sqlx::query(
+                "UPDATE vellev.partitions p
+                 SET ship_base = $4, ship_base_checkpoint = $5,
+                     ship_base_checkpoint_position = $6, ship_cap = $6
+                 WHERE p.tenant = $1 AND p.partition = $2 AND p.incarnation = $3
+                   AND (p.ship_base IS NULL OR p.ship_base < $4)
+                   AND p.ship_hold_from <= $4 AND p.ship_cap <= $6
+                   AND (p.cleaned_position IS NULL OR p.cleaned_position <= $6)
+                   AND EXISTS (SELECT 1 FROM vellev.commits c
+                               WHERE c.tenant = p.tenant AND c.partition = p.partition
+                                 AND c.incarnation = p.incarnation AND c.position = $4)
+                   AND EXISTS (SELECT 1 FROM vellev.commits c
+                               WHERE c.tenant = p.tenant AND c.partition = p.partition
+                                 AND c.incarnation = p.incarnation AND c.position = $6
+                                 AND c.head = $5)",
+            )
+            .bind(key.tenant.as_str())
+            .bind(i64::from(key.partition.0))
+            .bind(bigint(incarnation.0)?)
+            .bind(bigint(base.position.0)?)
+            .bind(base.checkpoint.0.as_str())
+            .bind(bigint(base.checkpoint_at.0)?)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if based == 1 {
+                sqlx::query(
+                    "INSERT INTO vellev.shipping (tenant, partition, incarnation, base)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (tenant, partition) DO UPDATE
+                     SET incarnation = EXCLUDED.incarnation, base = EXCLUDED.base,
+                         shipped = NULL, stalled = NULL",
+                )
+                .bind(key.tenant.as_str())
+                .bind(i64::from(key.partition.0))
+                .bind(bigint(incarnation.0)?)
+                .bind(bigint(base.position.0)?)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return self.shipping(key).await;
+            }
+            drop(tx);
+            let row = self
+                .ship_facts(key, base.position, base.checkpoint_at)
+                .await?;
+            if let Ship::Stand = base_decision(key, incarnation, base, &row.facts()?)? {
+                return row.shipping();
+            }
+        }
+        Err(invariant(
+            "a shipping base neither recorded nor refused".into(),
+        ))
+    }
+
+    async fn note_shipped(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        position: LogPosition,
+    ) -> Result<Shipping> {
+        checked_note(base, position)?;
+        let noted = sqlx::query(
+            "UPDATE vellev.shipping SET shipped = $5
+             WHERE tenant = $1 AND partition = $2 AND incarnation = $3 AND base = $4
+               AND (shipped IS NULL OR shipped < $5)",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(bigint(incarnation.0)?)
+        .bind(bigint(base.0)?)
+        .bind(bigint(position.0)?)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        match noted {
+            1 => self.shipping(key).await,
+            _ => self.shipper_refusal(key, incarnation, base).await,
+        }
+    }
+
+    async fn stall_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        reason: &str,
+    ) -> Result<Shipping> {
+        let stalled = sqlx::query(
+            "UPDATE vellev.shipping SET stalled = $5
+             WHERE tenant = $1 AND partition = $2 AND incarnation = $3 AND base = $4
+               AND stalled IS NULL",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(bigint(incarnation.0)?)
+        .bind(bigint(base.0)?)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        match stalled {
+            1 => self.shipping(key).await,
+            _ => self.shipper_refusal(key, incarnation, base).await,
+        }
     }
 
     async fn partitions(

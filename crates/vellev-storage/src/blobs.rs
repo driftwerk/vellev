@@ -115,6 +115,44 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     async fn forget_local(&self, _prefix: &str) -> Result<()> {
         Ok(())
     }
+    /// Give the file under `to`, which the caller has seen to hold just
+    /// what the file under `from` holds, the copy on local disk `from` has,
+    /// without copying it. Never fails: a store that cannot says so, and
+    /// the caller reads `to` as any file.
+    ///
+    /// By default nothing is linked: a store with a copy of `from` on
+    /// local disk, which may have been read in place, has not given it to
+    /// `to`; one without, whose files are read whole into memory, has
+    /// nothing to give.
+    ///
+    /// The default goes by [`Self::local`]. A store over another that
+    /// keeps copies read in place must forward `local`, or forward this
+    /// too: one that forwards neither answers [`Linked::Unmapped`] for a
+    /// file its inner store reads in place, and a caller may then take
+    /// what was read of `from` for `to`'s, whose copy on local disk it is
+    /// not. Such a store answers `local` with none, so nothing read
+    /// through it is read in place: what is held of `from` is in memory,
+    /// and is the same file's. Forwarding `local` alone is safe, and
+    /// links nothing.
+    async fn link_local(&self, from: &str, _to: &str) -> Result<Linked> {
+        Ok(match self.local(from).await {
+            Ok(None) => Linked::Unmapped,
+            Ok(Some(_)) | Err(_) => Linked::Unlinked,
+        })
+    }
+}
+
+/// What came of [`Blobs::link_local`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Linked {
+    /// The copy on local disk is the new key's too, lying here.
+    Linked(PathBuf),
+    /// The store keeps no copy it reads in place: nothing to link, and
+    /// nothing of a file read from it is held by a name.
+    Unmapped,
+    /// Not linked: whatever was read of `from` in place is not to be
+    /// taken for `to`'s.
+    Unlinked,
 }
 
 /// What came of [`Blobs::put_new`].
@@ -264,6 +302,52 @@ impl Layout<'_> {
         }
         name.get(..20)?.parse().ok().map(LogPosition)
     }
+
+    /// What a key of this partition says of its file, if it is laid out
+    /// exactly as [`Self::named`] lays one out: the kind, position,
+    /// generation and writer, `-merged` only on a segment, index or vectors
+    /// file, and its kind again as its extension. Nothing else passes, so
+    /// every key read is plain: each part of it is one of those.
+    pub(crate) fn named_by<'k>(&self, key: &'k str) -> Option<Named<'k>> {
+        let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
+        let mergeable = matches!(kind, "segment" | "index" | "vectors");
+        if !mergeable && !matches!(kind, "log" | "manifest") {
+            return None;
+        }
+        let stem = name.strip_suffix(kind)?.strip_suffix('.')?;
+        let (stem, merged) = match stem.strip_suffix("-merged") {
+            Some(stem) if mergeable => (stem, true),
+            Some(_) => return None,
+            None => (stem, false),
+        };
+        let mut parts = stem.split('-');
+        let number = |part: &str| {
+            let digits = part.len() == 20 && part.bytes().all(|byte| byte.is_ascii_digit());
+            digits.then(|| part.parse::<u64>().ok()).flatten()
+        };
+        let position = LogPosition(number(parts.next()?)?);
+        let generation = Generation(number(parts.next()?)?);
+        let writer = parts.next()?;
+        let hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+        if writer.len() != 32 || !writer.bytes().all(hex) || parts.next().is_some() {
+            return None;
+        }
+        Some(Named {
+            kind,
+            position,
+            generation,
+            merged,
+        })
+    }
+}
+
+/// What a key laid out by [`Layout`] says of its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Named<'k> {
+    pub kind: &'k str,
+    pub position: LogPosition,
+    pub generation: Generation,
+    pub merged: bool,
 }
 
 /// Whether `key` is a plain path: no empty, `.` or `..` parts and no
@@ -1539,6 +1623,22 @@ impl Drop for Partial {
     }
 }
 
+/// A link into the cache (see [`CachedBlobs::link_local`]), given up
+/// once this is dropped unanswered: by a failure, a time-out or a caller
+/// that stops waiting.
+struct Linking {
+    given_up: Arc<std::sync::atomic::AtomicBool>,
+    answered: bool,
+}
+
+impl Drop for Linking {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.given_up.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// The copy of the file under `key` to forget once the file is put, and
 /// forgotten on a task of its own if this is dropped before.
 struct Forgetting {
@@ -1737,12 +1837,154 @@ impl Blobs for CachedBlobs {
             source: error.into(),
         })
     }
+
+    /// A hard link of the copy of `from` under the name of `to`'s, made
+    /// under a name drawn at random and renamed into place, so that it is
+    /// there whole or not at all, on one thread of the disk's. Both names
+    /// are one file from then on: a delete of either removes that name
+    /// alone. The new name is taken as summed only if the old one was, as
+    /// it lay just before, and the new is the very file it was.
+    ///
+    /// Not linked if either key is not a plain one, or the copy of `from`
+    /// is not there, or the disk will not make the link, as across disks
+    /// or in time: the caller then reads `to` as any file. Nothing is
+    /// linked off Unix, where no file is read in place (see
+    /// `Partition::column`), and nothing is to be.
+    ///
+    /// A link the caller stops waiting for, by a failure or by going away,
+    /// may yet be made by the thread still at it, after a delete of `to`
+    /// has removed whatever copy there was: the copy would then lie under
+    /// a key the store no longer has. So the thread looks, before it
+    /// renames and once it has, whether the link was given up, and if so
+    /// removes what it made. What remains is a link given up after that
+    /// last look: it is in place before the caller hears, so a delete of
+    /// `to` that follows removes it, and a fetch of `to` replaces it with
+    /// the same bytes. Nothing but the thread removes the new name, and
+    /// only while it is still the very file linked: a copy of `to` another
+    /// fetch has put in its place, which may be read in place by now, is
+    /// left alone, but for a fetch that renames into place between the
+    /// thread's look and its removal, whose copy goes and is fetched again
+    /// the next time it is read.
+    async fn link_local(&self, from: &str, to: &str) -> Result<Linked> {
+        let (Some(old), Some(new)) = (self.path(from), self.path(to)) else {
+            return Ok(Linked::Unlinked);
+        };
+        if cfg!(not(unix)) {
+            return Ok(Linked::Unmapped);
+        }
+        let mut linking = Linking {
+            given_up: Arc::default(),
+            answered: false,
+        };
+        let given_up = linking.given_up.clone();
+        let linked = move || {
+            let given_up = || given_up.load(Ordering::SeqCst);
+            let gone = || std::io::Error::other("the link was given up");
+            let before = crate::column::seen(&old)?;
+            let summed = crate::column::summed_before(&before);
+            let parent = new
+                .parent()
+                .ok_or_else(|| std::io::Error::other("cache path has no parent"))?;
+            std::fs::create_dir_all(parent)?;
+            let partial = partial(&new);
+            std::fs::hard_link(&old, &partial)?;
+            if given_up() {
+                let _ = std::fs::remove_file(&partial);
+                return Err(gone());
+            }
+            crate::column::forget_summed(&new);
+            if let Err(error) = std::fs::rename(&partial, &new) {
+                let _ = std::fs::remove_file(&partial);
+                return Err(error);
+            }
+            if given_up() {
+                let linked = crate::column::seen(&new);
+                if linked.is_ok_and(|linked| linked.same_file(&before)) {
+                    crate::column::forget_summed(&new);
+                    let _ = std::fs::remove_file(&new);
+                }
+                return Err(gone());
+            }
+            let after = crate::column::seen(&new)?;
+            if summed && after.same_file(&before) {
+                crate::column::remember_summed(after);
+            }
+            Ok(new)
+        };
+        match self.disk.run(0, linked).await {
+            Ok(new) => {
+                linking.answered = true;
+                Ok(Linked::Linked(new))
+            }
+            Err(error) => {
+                tracing::warn!(from, to, %error, "a copy on local disk is not linked to a new key");
+                Ok(Linked::Unlinked)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    #[test]
+    fn every_key_a_partition_lays_out_is_read_back_exactly_and_nothing_else_is() {
+        let partition = PartitionKey {
+            tenant: vellev_core::TenantId::new("tenant-a").unwrap(),
+            partition: vellev_core::Partition(0),
+        };
+        let layout = Layout(&partition);
+        let author = Author {
+            generation: Generation(2),
+            writer: uuid::Uuid::from_u128(0xabc),
+        };
+        let at = LogPosition(7);
+        let named = |kind, merged| Named {
+            kind,
+            position: at,
+            generation: Generation(2),
+            merged,
+        };
+        let laid_out = [
+            (layout.log(at, &author), named("log", false)),
+            (layout.manifest(at, &author), named("manifest", false)),
+            (layout.segment(at, &author), named("segment", false)),
+            (layout.merged(at, &author), named("segment", true)),
+            (layout.index(at, &author), named("index", false)),
+            (layout.merged_index(at, &author), named("index", true)),
+            (layout.vectors(at, &author), named("vectors", false)),
+            (layout.merged_vectors(at, &author), named("vectors", true)),
+        ];
+        for (key, named) in &laid_out {
+            assert_eq!(layout.named_by(key), Some(*named), "{key}");
+        }
+
+        let log = layout.log(at, &author);
+        let writer = author.writer.simple().to_string();
+        let refused = [
+            "tenant-a/0/log/00000000000000000007-x/y".to_string(),
+            format!("{log}x"),
+            log.replace(".log", ".manifest"),
+            log.replace(".log", "-merged.log"),
+            layout
+                .manifest(at, &author)
+                .replace(".manifest", "-merged.manifest"),
+            log.replace("/00000000000000000007-", "/0000000000000000007-"),
+            log.replace("-00000000000000000002-", "-0000000000000000002-"),
+            log.replace(&writer, &writer.to_uppercase()),
+            log.replace(&writer, &writer[1..]),
+            log.replace(&writer, &format!("{writer}-x")),
+            log.replace(&writer, &format!("{}g", &writer[..31])),
+            log.replace("tenant-a/0/", "tenant-a/1/"),
+            log.replace("/log/", "/other/").replace(".log", ".other"),
+            log.replace("/00000000000000000007-", "/+0000000000000000007-"),
+        ];
+        for key in &refused {
+            assert_eq!(layout.named_by(key), None, "{key}");
+        }
+    }
 
     #[test]
     fn a_file_written_into_the_cache_goes_under_a_name_drawn_at_random() {
@@ -2485,5 +2727,115 @@ mod tests {
             Err(StorageError::Missing { .. })
         ));
         assert!(cached.local(key).await.unwrap().is_none());
+    }
+
+    /// A cache over a store in memory, in a directory of its own.
+    fn cache() -> (tempfile::TempDir, CachedBlobs) {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let cached = CachedBlobs::new(inner, dir.path());
+        (dir, cached)
+    }
+
+    fn vectors(n: u8) -> String {
+        format!("tenant-a/0/vectors/0000000000000000000{n}-x.vectors")
+    }
+
+    fn frame(n: u8) -> Bytes {
+        crate::format::encode(crate::format::Kind::Index, &n).unwrap()
+    }
+
+    /// A file's copy on local disk is given to another key that holds the
+    /// same, as the one file under both names: either name deleted leaves
+    /// the other, and nothing is left part written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_on_local_disk_is_linked_to_a_key_holding_the_same() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, cached) = cache();
+        let (from, to) = (vectors(1), vectors(2));
+        cached.put(&from, frame(1)).await.unwrap();
+        cached.inner.put(&to, frame(1)).await.unwrap();
+
+        let linked = cached.link_local(&from, &to).await.unwrap();
+
+        let (from_path, to_path) = (dir.path().join(&from), dir.path().join(&to));
+        assert_eq!(linked, Linked::Linked(to_path.clone()));
+        let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+        assert_eq!(inode(&from_path), inode(&to_path));
+        let near: Vec<_> = std::fs::read_dir(to_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(near.len(), 2, "{near:?}");
+
+        cached.delete(&from).await.unwrap();
+        assert_eq!(std::fs::read(&to_path).unwrap(), frame(1));
+        assert!(cached.local(&to).await.unwrap().is_some());
+        cached.put(&from, frame(1)).await.unwrap();
+        cached.delete(&to).await.unwrap();
+        assert!(cached.local(&from).await.unwrap().is_some());
+    }
+
+    /// No copy of the file on local disk, or no plain key, is no link: the
+    /// caller reads the new key as any file. (Off Unix nothing is read in
+    /// place, and nothing is linked.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_not_on_local_disk_is_not_linked() {
+        let (_dir, cached) = cache();
+        let (from, to) = (vectors(1), vectors(2));
+        cached.inner.put(&from, frame(1)).await.unwrap();
+        cached.inner.put(&to, frame(1)).await.unwrap();
+        assert_eq!(
+            cached.link_local(&from, &to).await.unwrap(),
+            Linked::Unlinked
+        );
+        assert!(cached.local(&to).await.unwrap().is_none());
+        let stray = "tenant-a/0/../vectors/x.vectors";
+        assert_eq!(
+            cached.link_local(stray, &to).await.unwrap(),
+            Linked::Unlinked
+        );
+    }
+
+    /// A store that reads nothing in place has nothing to link; one that
+    /// reads its own files in place cannot give one key another's.
+    #[tokio::test]
+    async fn a_store_without_a_cache_links_nothing() {
+        let (from, to) = (vectors(1), vectors(2));
+        let memory = ObjectBlobs::new(Arc::new(InMemory::new()));
+        assert_eq!(
+            memory.link_local(&from, &to).await.unwrap(),
+            Linked::Unmapped
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let files = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let on_disk = ObjectBlobs::on_disk(Arc::new(files), dir.path());
+        on_disk.put(&from, frame(1)).await.unwrap();
+        assert_eq!(
+            on_disk.link_local(&from, &to).await.unwrap(),
+            Linked::Unlinked
+        );
+    }
+
+    /// The copy linked is taken as summed under its new name only if it
+    /// was summed under the old, as it lay just before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_copy_is_taken_as_summed_only_if_the_old_one_was() {
+        let (dir, cached) = cache();
+        let (from, to) = (vectors(3), vectors(4));
+        for (summed, from, to) in [(false, vectors(5), vectors(6)), (true, from, to)] {
+            cached.put(&from, frame(1)).await.unwrap();
+            cached.inner.put(&to, frame(1)).await.unwrap();
+            let from_path = dir.path().join(&from);
+            if summed {
+                crate::column::remember_summed(crate::column::seen(&from_path).unwrap());
+            }
+            cached.link_local(&from, &to).await.unwrap();
+            let to_seen = crate::column::seen(&dir.path().join(&to)).unwrap();
+            assert_eq!(crate::column::summed_before(&to_seen), summed, "{summed}");
+        }
     }
 }

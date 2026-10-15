@@ -11,17 +11,17 @@ use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
 
 use crate::backups::Held;
-use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Listed, Local, Transfers};
+use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Linked, Listed, Local, Transfers};
 use crate::catalog::Catalog;
 use crate::column::{self, Column};
 use crate::coordinator::{
-    Clock, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation, Lease,
-    Lineage, LogPosition, ManifestRef, PartitionKey, Prior, Restore, SystemClock,
+    Cleaned, Clock, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation,
+    Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Prior, Restore, SystemClock,
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
-    decode, decode_head, encode, rekeyed_index, Answer, Answered, Head, Kind, LogSegment, Manifest,
-    Op, SegmentFile, SegmentIndex, SegmentMeta, SUMMED_AT_ONCE,
+    decode, decode_head, encode, rekeyed_index, Answer, Answered, Came, Coming, Framed, Head, Kind,
+    LogSegment, Manifest, Op, SegmentFile, SegmentIndex, SegmentMeta, SUMMED_AT_ONCE,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
@@ -36,6 +36,13 @@ const COMMIT_ATTEMPTS: u32 = 3;
 const COPIED_AT_ONCE: usize = 4_096;
 /// How many segments a restore from another store is copying at once.
 const SEGMENTS_COPIED_AT_ONCE: usize = 4;
+/// How many segments a restore from another store decodes at once, as it
+/// loads the state it puts back from its copies: few, for it holds them
+/// beside the live state, which it keeps until it commits.
+const RESTORED_DECODED_AT_ONCE: usize = 2;
+/// How many times in all a restore from another store tries a step on
+/// local disk that did not answer in time, as it loads the state.
+const RELOAD_TRIES: usize = 3;
 /// How many of the files a clean deletes are being deleted at any moment.
 const CLEANING_AT_ONCE: usize = 16;
 /// How long a clean goes on finding what to delete, and how long again
@@ -93,6 +100,18 @@ struct Tail {
     logs: Vec<(String, LogSegment)>,
 }
 
+/// What a load of a checkpoint takes as loaded already, and how it reads
+/// the rest.
+#[derive(Default)]
+struct Loading<'a> {
+    /// The segments loaded already, by key, each taken as it is: those of
+    /// the copy being loaded into if none are given.
+    held: Option<HashMap<String, Loaded>>,
+    /// The right a restore from another store loads under, if this is
+    /// one's load (see [`Partition::restore`]).
+    reloading: Option<&'a dyn Held>,
+}
+
 impl Partition {
     pub fn key(&self) -> &PartitionKey {
         &self.key
@@ -119,19 +138,19 @@ impl Partition {
     }
 
     async fn load(key: PartitionKey, blobs: Arc<dyn Blobs>, committed: &Committed) -> Result<Self> {
-        Self::load_reusing(key, blobs, committed, None).await
+        Self::load_reusing(key, blobs, committed, Loading::default()).await
     }
 
-    /// Load the partition as committed, taking the segments `donor` has
-    /// loaded already rather than reading them again.
+    /// Load the partition as committed, taking the segments `loading`
+    /// holds as loaded already rather than reading them again.
     async fn load_reusing(
         key: PartitionKey,
         blobs: Arc<dyn Blobs>,
         committed: &Committed,
-        donor: Option<&Partition>,
+        loading: Loading<'_>,
     ) -> Result<Self> {
         let partition = Self::empty(key, blobs, committed.incarnation);
-        partition.advance_reusing(committed, donor).await?;
+        partition.advance_reusing(committed, loading).await?;
         Ok(partition)
     }
 
@@ -243,6 +262,32 @@ impl Partition {
         }
     }
 
+    /// As [`Self::column`] with nothing held; for a restore from another
+    /// store loading under the right `reloading`, a step on local disk
+    /// that did not answer in time is tried again, while the right is
+    /// held, up to [`RELOAD_TRIES`] times in all. Nothing else is tried
+    /// again: not a store that did not answer, nor a file that is not
+    /// whole. Each try takes as long again as the disk is given, and
+    /// writes are refused all the while.
+    async fn column_reloaded(&self, key: &str, reloading: Option<&dyn Held>) -> Result<Column> {
+        let Some(right) = reloading else {
+            return self.column(key, None).await;
+        };
+        let mut tried = 1;
+        loop {
+            match self.column(key, None).await {
+                Err(slow) if tried < RELOAD_TRIES && disk_timed_out(&slow) => {
+                    tracing::warn!(key, error = %slow, tried, "vectors whose local disk did not answer in time are read again");
+                    if !right.still() {
+                        return Err(StorageError::Unheld(self.key.tenant.clone()));
+                    }
+                    tried += 1;
+                }
+                read => return read,
+            }
+        }
+    }
+
     /// The vectors under `key` read in place from the store's copy `local`,
     /// on the disk the copy lies on, once the whole file is seen to sum to
     /// what it says: in its turn among the large files read there, for as
@@ -303,15 +348,16 @@ impl Partition {
     /// lower position from the same generation. A reading that is not ahead
     /// and not stale means the history this copy holds was replaced.
     async fn advance(&self, committed: &Committed) -> Result<LogPosition> {
-        self.advance_reusing(committed, None).await
+        self.advance_reusing(committed, Loading::default()).await
     }
 
     /// As [`Self::advance`], taking the segments a checkpoint lists from
-    /// `donor` where it holds them, rather than only from this copy.
+    /// what `loading` holds, rather than from this copy, and reading the
+    /// rest as it says.
     async fn advance_reusing(
         &self,
         committed: &Committed,
-        donor: Option<&Partition>,
+        loading: Loading<'_>,
     ) -> Result<LogPosition> {
         let mut seen = self.seen.lock().await;
         let (position, head) = self.read(State::at);
@@ -348,8 +394,9 @@ impl Partition {
         *seen = committed.generation;
         match tail.checkpoint {
             Some((key, manifest)) => {
-                let held = donor.unwrap_or(self).held();
-                let mut state = self.restore(&key, manifest, held).await?;
+                let Loading { held, reloading } = loading;
+                let held = held.unwrap_or_else(|| self.held());
+                let mut state = self.restore(&key, manifest, held, reloading).await?;
                 tail.logs
                     .iter()
                     .try_for_each(|(key, log)| state.apply(key, log))?;
@@ -406,28 +453,36 @@ impl Partition {
         Ok(Some(Tail { checkpoint, logs }))
     }
 
+    /// The state as `manifest`, under `key`, says, taking each segment
+    /// `held` holds as it is. Loading for a restore from another store,
+    /// under the right `reloading`, it decodes few segments at once, and
+    /// tries a step on local disk again that did not answer in time (see
+    /// [`Self::column_reloaded`]).
     async fn restore(
         &self,
         key: &str,
         manifest: Manifest,
         held: HashMap<String, Loaded>,
+        reloading: Option<&dyn Held>,
     ) -> Result<State> {
+        use futures::{StreamExt, TryStreamExt};
         // Each segment is decoded and indexed on a thread of its own as it
         // arrives, rather than all of them in turn once every one has.
         let catalog = Arc::new(
             Catalog::restore(manifest.next_collection_id, manifest.collections.clone())
                 .map_err(|reason| StorageError::corrupt(key, reason))?,
         );
-        let segments = try_join_all(manifest.segments.iter().map(|meta| {
+        let segment = |meta: &SegmentMeta| {
             let held = held.get(&meta.key).cloned();
             let catalog = catalog.clone();
+            let meta = meta.clone();
             async move {
                 if let Some(loaded) = held {
                     return Ok::<_, StorageError>(loaded);
                 }
                 let bytes = self.fetch(&meta.key).await?;
                 let vectors = match &meta.vectors {
-                    Some(key) => Some(self.column(key, None).await?),
+                    Some(key) => Some(self.column_reloaded(key, reloading).await?),
                     None => None,
                 };
                 let stored = match &meta.index {
@@ -442,8 +497,16 @@ impl Partition {
                 })
                 .await?
             }
-        }))
-        .await?;
+        };
+        let segments = match reloading {
+            None => try_join_all(manifest.segments.iter().map(segment)).await?,
+            Some(_) => {
+                futures::stream::iter(manifest.segments.iter().map(segment))
+                    .buffered(RESTORED_DECODED_AT_ONCE)
+                    .try_collect()
+                    .await?
+            }
+        };
         let replay = try_join_all(manifest.replay.iter().map(|key| async move {
             let log: LogSegment = decode(key, Kind::Log, &self.fetch(key).await?)?;
             Ok::<_, StorageError>((key.clone(), log))
@@ -1312,11 +1375,15 @@ impl Writer {
             log_position: position,
             manifest: head.cloned(),
         };
+        let loading = Loading {
+            held: Some(self.partition.held()),
+            reloading: None,
+        };
         let target = Partition::load_reusing(
             self.lease.key.clone(),
             self.partition.blobs.clone(),
             &at,
-            Some(&self.partition),
+            loading,
         )
         .await?;
         let mut held = target.held();
@@ -1349,7 +1416,7 @@ impl Writer {
             target.read(|target| current.restored_manifest(restored, target, segment))
         });
         let frame = encode(Kind::Manifest, &manifest)?;
-        let state = target.restore(&key, manifest, held).await?;
+        let state = target.restore(&key, manifest, held, None).await?;
         let turn = self.turn().await?;
         // Were the partition anywhere else, what was made above would put
         // back over commits it never saw; nothing is committed, and the
@@ -1386,7 +1453,12 @@ impl Writer {
     /// a key drawn for this restore, and the logs and checkpoint of the
     /// source's head are read into memory and never put. The state is
     /// loaded from those copies alone, read back from the store, as a node
-    /// with nothing would load it.
+    /// with nothing would load it, two segments at a time; but for a
+    /// segment the live state holds, which is taken as it is for the copy
+    /// of a source's segment once that copy is proved to be the very file
+    /// the live state was loaded from (see [`Self::reused`]). A copy is
+    /// never trusted unread: each is read back whole, to be decoded or to
+    /// be proved.
     ///
     /// The copies are named at the position of the checkpoint the restore
     /// is to commit, past where the partition and the source are: never at
@@ -1446,6 +1518,7 @@ impl Writer {
         }
         let mut staged = self.staging();
         let mut put = HashSet::new();
+        let mut reused = HashMap::new();
         if let Some((checkpoint_key, manifest)) = checkpoint {
             sourced.insert(checkpoint_key.clone());
             sourced.extend(listed_by(&manifest).map(str::to_string));
@@ -1469,30 +1542,58 @@ impl Writer {
             }
             use futures::{StreamExt, TryStreamExt};
             let indexing = Mutex::new(());
+            // Writes are refused and the building lock held, so the live
+            // state holds just these until the restore is done.
+            let donors: HashMap<String, Donor> = self.partition.read(|state| {
+                let held = state.loaded_with_vectors();
+                held.map(|(key, vectors, loaded)| {
+                    let vectors = vectors.map(str::to_string);
+                    (key.to_string(), Donor { vectors, loaded })
+                })
+                .collect()
+            });
             let copied: Vec<Copied> = futures::stream::iter(copies)
-                .map(|(meta, names)| self.copied(&*source, meta, names, &indexing, held))
+                .map(|(meta, names)| {
+                    let donor = donors.get(&meta.key).cloned();
+                    self.copied(&*source, meta, names, donor, &indexing, held)
+                })
                 .buffered(SEGMENTS_COPIED_AT_ONCE)
                 .try_collect()
                 .await?;
+            drop(donors);
+            let segments = copied.len();
             let mut fresh = HashMap::new();
             let mut dropped = HashSet::new();
-            for Copied { files, unused } in copied {
-                put.extend(files.iter().map(|(_, to)| to.clone()));
-                fresh.extend(files);
-                dropped.extend(unused);
+            for copied in copied {
+                put.extend(copied.files.iter().map(|(_, to)| to.clone()));
+                fresh.extend(copied.files);
+                dropped.extend(copied.unused);
+                reused.extend(copied.reused);
             }
+            tracing::info!(
+                partition = ?self.lease.key,
+                segments,
+                taken_as_held = reused.len(),
+                decoded = segments - reused.len(),
+                "a restore from another store copied the source's segments"
+            );
             let loading = loading(&checkpoint_key, manifest, &fresh, &dropped)?;
             memory.insert(checkpoint_key, encode(Kind::Manifest, &loading)?);
         }
         // The state is loaded from the copies alone, read back from the
         // store and summed, as a node with nothing would read them: the
-        // one check that each came out whole.
+        // one check that each came out whole. A segment taken as the live
+        // state holds it had its copy read back and proved already.
         let overlay = Overlay {
             memory,
             put: put.clone(),
             primary: self.partition.blobs.clone(),
         };
-        let target = Partition::load_reusing(key, Arc::new(overlay), &at, None).await?;
+        let loading = Loading {
+            held: Some(reused),
+            reloading: Some(held),
+        };
+        let target = Partition::load_reusing(key, Arc::new(overlay), &at, loading).await?;
         Ok(RestoreFrom {
             writer: self,
             _building: building,
@@ -1525,23 +1626,28 @@ impl Writer {
     /// another segment, is passed over, as every load of the source passed
     /// it over; one the source cannot give fails the copy, as any file it
     /// cannot give does.
+    ///
+    /// The segment the live state holds under the key the source's had,
+    /// `donor`, is taken for the copy if the copy is proved to be that
+    /// very file (see [`Self::reused`]).
     async fn copied(
         &self,
         source: &dyn Blobs,
         meta: SegmentMeta,
         names: Names,
+        donor: Option<Donor>,
         indexing: &Mutex<()>,
         held: &dyn Held,
     ) -> Result<Copied> {
         let blobs = &self.partition.blobs;
         let mut files = Vec::new();
         let mut unused = None;
-        if let Some(vectors) = meta.vectors {
+        let mut sent = Vec::new();
+        if let Some(vectors) = meta.vectors.clone() {
             self.still(held)?;
-            blobs
-                .put_parts(&names.vectors, source.parts(&vectors))
-                .await?;
-            files.push((vectors, names.vectors));
+            let came = self.put_copy(source, &vectors, &names.vectors).await?;
+            sent.push((Kind::Vectors, names.vectors.clone(), came));
+            files.push((vectors, names.vectors.clone()));
         }
         if let Some(index) = meta.index {
             self.still(held)?;
@@ -1560,11 +1666,100 @@ impl Writer {
             }
         }
         self.still(held)?;
-        blobs
-            .put_parts(&names.segment, source.parts(&meta.key))
-            .await?;
+        let came = self.put_copy(source, &meta.key, &names.segment).await?;
+        sent.push((Kind::Segment, names.segment.clone(), came));
+        let linked = meta.vectors.clone().zip(Some(names.vectors));
+        let reused = match donor {
+            Some(donor) if donor.vectors == meta.vectors => {
+                let reused = self.reused(donor, &sent, linked, held).await?;
+                reused.map(|loaded| (names.segment.clone(), loaded))
+            }
+            _ => None,
+        };
         files.push((meta.key, names.segment));
-        Ok(Copied { files, unused })
+        Ok(Copied {
+            files,
+            unused,
+            reused,
+        })
+    }
+
+    /// Put the file under `from` in `source` into the partition's store
+    /// under `to`, a part at a time; what it came to as the source sent it.
+    async fn put_copy(&self, source: &dyn Blobs, from: &str, to: &str) -> Result<Came> {
+        use futures::{StreamExt, TryStreamExt};
+        let coming = std::sync::Mutex::new(Coming::default());
+        let parts = source.parts(from).map_ok(|part| {
+            coming.lock().expect("coming").update(&part);
+            part
+        });
+        self.partition.blobs.put_parts(to, parts.boxed()).await?;
+        Ok(coming.into_inner().expect("coming").came())
+    }
+
+    /// The segment the live state holds, `donor`, if the copies a restore
+    /// made of the source's segment of the same key, and of its vectors of
+    /// the same key, are proved to be the very files the live state was
+    /// loaded from; none, for the copy to be decoded, if they are not.
+    ///
+    /// Each copy, `sent` with its kind and what the source sent of it, is
+    /// read back from the store a part at a time, kept nowhere, and must be
+    /// one whole frame of its kind and come to just what the source sent.
+    /// That proves the copy is what the source sent: its frame alone
+    /// proves only that it is whole, and what the source sent may itself
+    /// be damaged. The source's file is the live state's because the key
+    /// is the same and a key is written once (K1), and the live state's
+    /// was summed when it was loaded. A copy that cannot be read back is
+    /// not proved; it is decoded, which reads it again, and fails the
+    /// restore if it is not whole.
+    ///
+    /// The vectors the donor holds may be read in place from its copy on
+    /// local disk, under the key it had. Its column is taken only once the
+    /// store gives that copy to the new key too, `linked` (see
+    /// [`Blobs::link_local`]), or has no copy read in place at all: never
+    /// is a file read in place under a key the state does not name.
+    async fn reused(
+        &self,
+        donor: Donor,
+        sent: &[(Kind, String, Came)],
+        linked: Option<(String, String)>,
+        held: &dyn Held,
+    ) -> Result<Option<Loaded>> {
+        for (kind, key, came) in sent {
+            self.still(held)?;
+            match self.streamed_back(key, *kind).await {
+                Ok(back) if back == *came => {}
+                Ok(_) => {
+                    tracing::warn!(key, "a copy read back is not what the source sent");
+                    return Ok(None);
+                }
+                Err(error) => {
+                    tracing::warn!(key, %error, "a copy read back is not proved whole");
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some((from, to)) = linked {
+            self.still(held)?;
+            match self.partition.blobs.link_local(&from, &to).await? {
+                Linked::Linked(_) | Linked::Unmapped => {}
+                Linked::Unlinked => return Ok(None),
+            }
+        }
+        Ok(Some(donor.loaded))
+    }
+
+    /// What the file under `key` in the partition's store comes to, read
+    /// back a part at a time and kept nowhere, if it is one whole frame of
+    /// `kind`.
+    async fn streamed_back(&self, key: &str, kind: Kind) -> Result<Came> {
+        use futures::TryStreamExt;
+        let mut framed = Framed::default();
+        let mut parts = self.partition.blobs.parts(key);
+        while let Some(part) = parts.try_next().await? {
+            framed.update(&part);
+        }
+        framed.came(key, kind)
     }
 
     /// See that the partition is committed just where this writer has it,
@@ -1830,13 +2025,35 @@ impl Writer {
     /// bound near their defaults and no more; nor does any margin cover a
     /// clock wrong by more than it, or a flush or a merge that holds the
     /// building lock for longer. Deciding this by the coordinator's rows
-    /// instead of by time is DW-681, with the clean floor of DW-668.
+    /// instead of by time is the clean floor's, a change of its own.
     ///
     /// What is needed is decided by the committed chain alone: it is walked
     /// back to the latest checkpoint before the oldest recent file, and
     /// everything before that checkpoint which no checkpoint on the way
     /// lists goes. A restore's checkpoint lists segments far older than
     /// itself, which stay for as long as it is on the way.
+    ///
+    /// What a clean has deleted stays deleted, and nothing else is taken
+    /// for it (DW-681). Each clean deletes the checkpoint before the one it
+    /// deletes below, and a later one that keeps more, because a file under
+    /// an old position is young to it or because it is given more grace or
+    /// reckons by a clock behind, walks back to that checkpoint. Before its
+    /// first delete a clean therefore records, in the coordinator and as
+    /// the holder of its lease, the checkpoint it deletes below, and the
+    /// record is only ever raised; so every checkpoint a clean has deleted
+    /// lies below the one recorded. A walk that has passed the recorded
+    /// checkpoint and finds a checkpoint's predecessor missing ends there,
+    /// as a walk whose floor were that checkpoint would. Anywhere else a
+    /// predecessor missing is a file lost by something other than a clean,
+    /// and the clean fails for it and deletes nothing, as does one whose
+    /// predecessor cannot be read, or whose record cannot be. A record that
+    /// names no checkpoint of this chain is never passed, and is said so.
+    ///
+    /// Nothing younger than `grace` by this node's clock against the
+    /// store's date is deleted, whatever the chain says: a walk that ends
+    /// at what an earlier clean deleted has young files below it, which a
+    /// writer left behind or a put that landed late put there, or a restore
+    /// from a backup that fetches files back before it commits them.
     /// The files are listed first, and the head read after, with the
     /// writer held for just that reading so that no commit is in flight: a
     /// file this writer uploaded and had not yet published when the
@@ -1869,10 +2086,13 @@ impl Writer {
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
         let _building = self.building.lock().await;
         let unneeded = tokio::time::timeout(CLEANING_WITHIN, self.unneeded(grace));
-        let orphans = unneeded.await.map_err(|_| StorageError::Blob {
+        let Unneeded { orphans, below } = unneeded.await.map_err(|_| StorageError::Blob {
             key: Layout(&self.lease.key).prefix(),
             source: format!("what to clean up was not found within {CLEANING_WITHIN:?}").into(),
         })??;
+        if let (Some(below), false) = (below, orphans.is_empty()) {
+            self.recorded(below).await?;
+        }
         // A few at a time, each lot only once the coordinator has said
         // again that the partition is this writer's still and where it has
         // it: see `current`.
@@ -1916,20 +2136,76 @@ impl Writer {
         Ok(self.partition.read(State::at))
     }
 
+    /// See that the coordinator holds a record at or above the checkpoint
+    /// a clean is about to delete below, raising it if it is lower, before
+    /// anything is deleted: asked as the lots are, with the partition seen
+    /// to be this writer's still. A record it answers with that names
+    /// another checkpoint at or above this one is said so: the partition
+    /// then keeps to what a clean with no record does.
+    async fn recorded(&self, below: Below) -> Result<()> {
+        let Below {
+            base,
+            position,
+            recorded,
+            passed,
+        } = below;
+        let raised = match recorded {
+            Some(recorded) if recorded.position >= position => recorded,
+            _ => {
+                self.current().await?;
+                let within = self.commit_within();
+                let asked = self.coordinator.clean_below(&self.lease, &base, position);
+                tokio::time::timeout(within, asked).await.map_err(|_| {
+                    let reason =
+                        format!("the coordinator did not record a clean within {within:?}");
+                    CoordinatorError::backend(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        reason,
+                    ))
+                })??
+            }
+        };
+        // A record on this chain at or above the base is the base itself,
+        // or one the walk passed on its way down to it.
+        if raised.base != base && !passed {
+            tracing::warn!(
+                partition = %self.lease.key,
+                recorded = %raised.base.0,
+                base = %base.0,
+                "what a clean recorded it deletes below is no checkpoint on this chain; \
+                 a clean here takes no missing checkpoint for a clean's work until it is \
+                 passed"
+            );
+        }
+        Ok(())
+    }
+
+    /// What the coordinator records a clean of this partition deleted
+    /// below, if any: a clean that cannot be told fails.
+    async fn cleaned(&self) -> Result<Option<Cleaned>> {
+        let within = self.commit_within();
+        let asked = self.coordinator.cleaned(&self.lease.key);
+        Ok(tokio::time::timeout(within, asked).await.map_err(|_| {
+            let reason = format!("the coordinator did not say what was cleaned within {within:?}");
+            CoordinatorError::backend(std::io::Error::new(std::io::ErrorKind::TimedOut, reason))
+        })??)
+    }
+
     /// The files [`Self::clean`] with `grace` deletes, as many as it does
     /// at once: every file listed, set against the committed chain. Each
     /// request it makes is given up by the store, but a partition of a
     /// great many files, or of a long chain, takes many, so whoever asks
     /// gives the whole of it up after a while.
-    async fn unneeded(&self, grace: Duration) -> Result<Vec<String>> {
+    async fn unneeded(&self, grace: Duration) -> Result<Unneeded> {
         let layout = Layout(&self.lease.key);
         let listed = self.partition.blobs.list(&layout.prefix()).await?;
         let (position, head) = self.current().await?;
+        let recorded = self.cleaned().await?;
         let cutoff = chrono::Duration::from_std(grace)
             .ok()
             .and_then(|grace| self.clock.now().checked_sub_signed(grace));
         let Some(cutoff) = cutoff else {
-            return Ok(Vec::new());
+            return Ok(Unneeded::default());
         };
         let files: Vec<(&Listed, LogPosition)> = listed
             .iter()
@@ -1943,33 +2219,65 @@ impl Writer {
             .map(|at| LogPosition(at.0.saturating_sub(1)))
             .fold(position, std::cmp::min);
         let mut cursor = head;
-        let mut checkpoints = Vec::new();
+        let mut checkpoints: Vec<(String, Manifest)> = Vec::new();
+        // Whether the walk has passed the checkpoint a clean recorded it
+        // deleted below: past it, and only there, a checkpoint missing is a
+        // clean's work.
+        let mut passed = false;
         let base = loop {
             let Some(key) = cursor else { break None };
-            cursor = match decode_head(&key, &self.partition.fetch(&key).await?)? {
+            let frame = match self.partition.fetch(&key).await {
+                Err(StorageError::Missing { .. }) if passed => {
+                    tracing::debug!(
+                        partition = %self.lease.key,
+                        missing = key,
+                        "a clean's walk ends where an earlier clean deleted"
+                    );
+                    break checkpoints.pop();
+                }
+                fetched => fetched?,
+            };
+            cursor = match decode_head(&key, &frame)? {
                 Head::Log(log) => log.prev,
-                Head::Manifest(manifest) if manifest.position <= floor => break Some(manifest),
+                Head::Manifest(manifest) if manifest.position <= floor => {
+                    break Some((key, manifest))
+                }
                 Head::Manifest(manifest) => {
+                    passed |= recorded
+                        .as_ref()
+                        .is_some_and(|recorded| recorded.base.0 == key);
                     let prev = manifest.prev.clone();
-                    checkpoints.push(manifest);
+                    checkpoints.push((key, manifest));
                     prev
                 }
             };
         };
-        let Some(base) = base else {
-            return Ok(Vec::new());
+        let Some((base_key, base)) = base else {
+            return Ok(Unneeded::default());
         };
         let kept: HashSet<&str> = checkpoints
             .iter()
+            .map(|(_, manifest)| manifest)
             .chain([&base])
             .flat_map(listed_by)
             .collect();
-        Ok(files
+        let orphans = files
             .iter()
-            .filter(|(file, at)| *at < base.position && !kept.contains(file.key.as_str()))
+            .filter(|(file, at)| {
+                *at < base.position && file.modified < cutoff && !kept.contains(file.key.as_str())
+            })
             .map(|(file, _)| file.key.clone())
             .take(Self::CLEANED_AT_ONCE)
-            .collect())
+            .collect();
+        Ok(Unneeded {
+            orphans,
+            below: Some(Below {
+                base: ManifestRef(base_key),
+                position: base.position,
+                recorded,
+                passed,
+            }),
+        })
     }
 
     /// Whether something holds the writer now, as whatever commits does
@@ -2055,6 +2363,24 @@ impl Writer {
             }
         }
     }
+}
+
+/// What a clean is to delete, and the checkpoint it deletes below with
+/// what the coordinator recorded when it began.
+#[derive(Default)]
+struct Unneeded {
+    orphans: Vec<String>,
+    below: Option<Below>,
+}
+
+/// The checkpoint a clean deletes below, at its position; what the
+/// coordinator recorded a clean deleted below when this one began; and
+/// whether this one's walk passed that checkpoint.
+struct Below {
+    base: ManifestRef,
+    position: LogPosition,
+    recorded: Option<Cleaned>,
+    passed: bool,
 }
 
 /// The files a checkpoint lists: its segments' and the logs it replays.
@@ -2262,10 +2588,46 @@ pub struct RestoreFrom<'a> {
 }
 
 /// A segment a restore copied: each of its files by the key it had and
-/// the one it was given, and its index file if that was passed over.
+/// the one it was given, its index file if that was passed over, and the
+/// segment the live state holds taken for it, under its copy's key, if
+/// one is.
 struct Copied {
     files: Vec<(String, String)>,
     unused: Option<String>,
+    reused: Option<(String, Loaded)>,
+}
+
+/// A segment the live state holds, with the key of its vectors file: one
+/// a restore from another store may take for a segment it copies.
+#[derive(Clone)]
+struct Donor {
+    vectors: Option<String>,
+    loaded: Loaded,
+}
+
+/// Whether `error` is a step on local disk that did not answer in time,
+/// as the disk itself says, and nothing else: not a store that did not
+/// answer, nor a time-out passed on in another failure.
+fn disk_timed_out(error: &StorageError) -> bool {
+    let StorageError::Blob { source, .. } = error else {
+        return false;
+    };
+    let disk = source.downcast_ref::<std::io::Error>();
+    disk.is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+}
+
+/// The file under `key` in `blobs`, its parts gathered into one.
+async fn collected(blobs: &dyn Blobs, key: &str) -> Result<Bytes> {
+    use futures::TryStreamExt;
+    let mut parts: Vec<Bytes> = blobs.parts(key).try_collect().await?;
+    if parts.len() == 1 {
+        return Ok(parts.remove(0));
+    }
+    let mut whole = bytes::BytesMut::with_capacity(parts.iter().map(Bytes::len).sum());
+    for part in parts {
+        whole.extend_from_slice(&part);
+    }
+    Ok(whole.freeze())
 }
 
 impl RestoreFrom<'_> {
@@ -2322,7 +2684,7 @@ impl RestoreFrom<'_> {
             .read(|now| target.read(|target| now.restored_manifest(restored, target, segment)));
         kept_out(&manifest, &put, &source, rested_on.as_deref())?;
         let frame = encode(Kind::Manifest, &manifest)?;
-        let state = target.restore(&key, manifest, held).await?;
+        let state = target.restore(&key, manifest, held, None).await?;
         let turn = writer.turn().await?;
         // Nothing moves the partition while the building lock is held and
         // writes are refused, and a commit that follows anything else the
@@ -2445,12 +2807,16 @@ impl Blobs for Overlay {
     ) -> Result<()> {
         Err(loads_only(key))
     }
+    /// A file the restore put is read through [`Blobs::parts`], of which
+    /// a store that keeps copies on local disk keeps none: each is read
+    /// once, to be loaded, and copies of them all would take as much disk
+    /// as the tenant's files.
     async fn get(&self, key: &str) -> Result<Bytes> {
         if let Some(bytes) = self.memory.get(key) {
             return Ok(bytes.clone());
         }
         self.put_by_the_restore(key)?;
-        self.primary.get(key).await
+        collected(&*self.primary, key).await
     }
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
         Err(loads_only(prefix))
@@ -3301,5 +3667,452 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
+    }
+
+    /// The right a restore from a source is made under, never lost.
+    struct Always;
+
+    #[async_trait::async_trait]
+    impl crate::backups::Held for Always {
+        async fn held(&self) -> Result<bool> {
+            Ok(true)
+        }
+        fn still(&self) -> bool {
+            true
+        }
+    }
+
+    /// The files `writer`'s partition is loaded from, as committed, copied
+    /// into a store of their own by the keys they have: a backup of it.
+    async fn own_backup(
+        writer: &Writer,
+        coordinator: &MemoryCoordinator,
+    ) -> (Arc<dyn Blobs>, Committed) {
+        own_backup_in(writer, coordinator, memory()).await
+    }
+
+    /// As [`own_backup`], into `source`.
+    async fn own_backup_in(
+        writer: &Writer,
+        coordinator: &MemoryCoordinator,
+        source: Arc<dyn Blobs>,
+    ) -> (Arc<dyn Blobs>, Committed) {
+        let committed = coordinator
+            .committed(&writer.lease.key)
+            .await
+            .unwrap()
+            .unwrap();
+        let blobs = writer.partition.blobs.clone();
+        let files = Partition::files(writer.lease.key.clone(), blobs.clone(), &committed);
+        for key in files.await.unwrap() {
+            source
+                .put(&key, blobs.get(&key).await.unwrap())
+                .await
+                .unwrap();
+        }
+        (source, committed)
+    }
+
+    /// Restore `writer`'s partition from `source` at `committed`.
+    async fn restored_from(
+        writer: &Writer,
+        source: Arc<dyn Blobs>,
+        committed: &Committed,
+    ) -> Result<LogPosition> {
+        let restore = Restore {
+            request: vellev_core::RequestId::generate(),
+            asked: [0; 32],
+            from: committed.log_position,
+            from_at: chrono::Utc::now(),
+        };
+        let head = committed.manifest.as_ref();
+        let ready = writer
+            .restore_from(source, head, restore, None, &Always)
+            .await?;
+        ready.commit().await
+    }
+
+    /// The segments the partition holds, each file by where it lies in
+    /// memory.
+    fn segment_files(partition: &Partition) -> Vec<*const SegmentFile> {
+        partition.read(|state| {
+            let held = state.loaded_segments();
+            held.map(|(_, loaded)| Arc::as_ptr(&loaded.file)).collect()
+        })
+    }
+
+    /// A writer with two segments flushed, each with its vectors, and a
+    /// row written after them.
+    async fn flushed_twice(blobs: Arc<dyn Blobs>) -> (Writer, Arc<MemoryCoordinator>) {
+        let (writer, coordinator) = writer_on(blobs).await;
+        writer.commit(vec![create(), upsert(1)]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.commit(vec![upsert(2)]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.commit(vec![upsert(3)]).await.unwrap();
+        (writer, coordinator)
+    }
+
+    fn ns(partition: &Partition) -> Vec<bool> {
+        let id = |n: u8| ObjectId(uuid::Uuid::from_u128(u128::from(n)));
+        partition.read(|state| {
+            (1..=3)
+                .map(|n| state.get(&notes(), id(n)).is_some())
+                .collect()
+        })
+    }
+
+    /// A tenant put back from its own backup taken a moment ago takes each
+    /// segment the live state holds as it is, decoded once already: its
+    /// copy is streamed back and seen to be whole and to be what the
+    /// backup sent.
+    #[tokio::test]
+    async fn a_restore_from_its_own_backup_takes_the_segments_it_holds_as_they_are() {
+        let (writer, coordinator) = flushed_twice(memory()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let before = segment_files(&writer.partition);
+        assert_eq!(before.len(), 2);
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        for held in &before {
+            assert!(after.contains(held), "a segment was decoded again");
+        }
+        assert_eq!(ns(&writer.partition), [true, true, true]);
+    }
+
+    /// A store whose `parts` of a file of `kind` fail, the first time each
+    /// such file is asked for, or always.
+    #[derive(Debug)]
+    struct Unstreamed {
+        inner: Arc<dyn Blobs>,
+        kind: &'static str,
+        once: bool,
+        failed: std::sync::Mutex<HashSet<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Blobs for Unstreamed {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
+            self.inner.put(key, bytes).await
+        }
+        async fn put_parts(
+            &self,
+            key: &str,
+            parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+        ) -> Result<()> {
+            self.inner.put_parts(key, parts).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.inner.get(key).await
+        }
+        fn parts<'a>(&'a self, key: &'a str) -> futures::stream::BoxStream<'a, Result<Bytes>> {
+            use futures::StreamExt;
+            let first = self.failed.lock().unwrap().insert(key.to_string());
+            if key.contains(self.kind) && (first || !self.once) {
+                let lost = StorageError::Missing {
+                    key: key.to_string(),
+                };
+                return futures::stream::once(async { Err(lost) }).boxed();
+            }
+            self.inner.parts(key)
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    fn memory() -> Arc<dyn Blobs> {
+        Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))
+    }
+
+    /// A copy that cannot be streamed back is not taken for the segment the
+    /// live state holds: the segment is decoded from it, read as any file.
+    #[tokio::test]
+    async fn a_copy_that_cannot_be_streamed_back_is_decoded_and_not_taken_as_held() {
+        let inner = memory();
+        let (writer, coordinator) = flushed_twice(inner.clone()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let before = segment_files(&writer.partition);
+        // The writer's store, its restores' copies of segments failing to
+        // stream the first time each is asked for.
+        let unstreamed = Arc::new(Unstreamed {
+            inner,
+            kind: "-restored.segment",
+            once: true,
+            failed: Default::default(),
+        });
+        let (lease, at) = (writer.lease.clone(), committed.clone());
+        drop(writer);
+        let writer = Writer::open(unstreamed, coordinator.clone(), lease, &at)
+            .await
+            .unwrap();
+        let before_reopened = segment_files(&writer.partition);
+        assert_ne!(before, before_reopened);
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        for held in &before_reopened {
+            assert!(!after.contains(held), "a segment was taken unproved");
+        }
+        assert_eq!(ns(&writer.partition), [true, true, true]);
+    }
+
+    /// A store whose copies a restore puts of segments come out whole
+    /// frames, of no rows: not what was sent.
+    #[derive(Debug)]
+    struct Rewriting(Arc<dyn Blobs>);
+
+    #[async_trait::async_trait]
+    impl Blobs for Rewriting {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn put_parts(
+            &self,
+            key: &str,
+            parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+        ) -> Result<()> {
+            use futures::TryStreamExt;
+            if !key.ends_with("-restored.segment") {
+                return self.0.put_parts(key, parts).await;
+            }
+            let _sent: Vec<Bytes> = parts.try_collect().await?;
+            let empty = SegmentFile {
+                position: LogPosition(1),
+                rows: vec![],
+                tombstones: vec![],
+            };
+            self.0
+                .put(key, encode(Kind::Segment, &empty).unwrap())
+                .await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.0.get(key).await
+        }
+        fn parts<'a>(&'a self, key: &'a str) -> futures::stream::BoxStream<'a, Result<Bytes>> {
+            self.0.parts(key)
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// A copy that comes out a whole frame, but not the one the source
+    /// sent, is not taken for the segment the live state holds: it is
+    /// decoded, is not the segment the checkpoint lists, and nothing is
+    /// committed.
+    #[tokio::test]
+    async fn a_copy_whole_but_not_what_was_sent_is_not_taken_as_the_segment_held() {
+        let inner = memory();
+        let (writer, coordinator) = flushed_twice(inner.clone()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let (lease, at) = (writer.lease.clone(), committed.clone());
+        drop(writer);
+        let rewriting = Arc::new(Rewriting(inner));
+        let writer = Writer::open(rewriting, coordinator.clone(), lease, &at)
+            .await
+            .unwrap();
+
+        let refused = restored_from(&writer, source, &committed).await;
+
+        assert!(refused.is_err(), "{refused:?}");
+        let now = coordinator
+            .committed(&writer.lease.key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(now, committed);
+    }
+
+    /// A backup whose file is damaged, copied whole, makes a copy that
+    /// streams back just as the backup sent it; it is not taken for the
+    /// segment the live state holds, whose good copy would hide it. It is
+    /// decoded, which fails, and nothing is committed.
+    #[tokio::test]
+    async fn a_copy_of_a_damaged_backup_file_is_not_taken_as_the_segment_held() {
+        let (writer, coordinator) = flushed_twice(memory()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let listed = source.list("").await.unwrap();
+        let segment = listed
+            .iter()
+            .find(|file| file.key.contains("/segment/"))
+            .unwrap();
+        let mut frame = source.get(&segment.key).await.unwrap().to_vec();
+        let last = frame.len() - 1;
+        frame[last] ^= 1;
+        source.put(&segment.key, Bytes::from(frame)).await.unwrap();
+
+        let refused = restored_from(&writer, source, &committed).await;
+
+        assert!(refused.is_err(), "{refused:?}");
+        let now = coordinator
+            .committed(&writer.lease.key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(now, committed);
+    }
+
+    /// A store that links nothing, over another.
+    #[derive(Debug)]
+    struct NoLink(Arc<dyn Blobs>);
+
+    #[async_trait::async_trait]
+    impl Blobs for NoLink {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn put_parts(
+            &self,
+            key: &str,
+            parts: futures::stream::BoxStream<'_, Result<Bytes>>,
+        ) -> Result<()> {
+            self.0.put_parts(key, parts).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.0.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.0.delete(key).await
+        }
+        async fn local(&self, key: &str) -> Result<Option<Local>> {
+            self.0.local(key).await
+        }
+        async fn fetch_local(&self, key: &str) -> Result<Option<Local>> {
+            self.0.fetch_local(key).await
+        }
+        fn parts<'a>(&'a self, key: &'a str) -> futures::stream::BoxStream<'a, Result<Bytes>> {
+            self.0.parts(key)
+        }
+        async fn forget_local(&self, prefix: &str) -> Result<()> {
+            self.0.forget_local(prefix).await
+        }
+        async fn link_local(&self, _from: &str, _to: &str) -> Result<Linked> {
+            Ok(Linked::Unlinked)
+        }
+    }
+
+    /// The vectors files the partition's segments name.
+    fn vectors_named(partition: &Partition) -> Vec<String> {
+        partition.read(|state| {
+            let held = state.loaded_with_vectors();
+            held.filter_map(|(_, vectors, _)| vectors.map(str::to_string))
+                .collect()
+        })
+    }
+
+    /// From the review of #73. A segment whose vectors the store does not
+    /// link to the new key is not taken as held, though its copies are
+    /// proved: it is decoded, and its vectors read anew under the new key,
+    /// which then has a copy of its own on local disk.
+    #[tokio::test]
+    async fn a_restore_whose_vectors_are_not_linked_decodes_and_reads_them_anew() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached: Arc<dyn Blobs> = Arc::new(crate::blobs::CachedBlobs::new(memory(), dir.path()));
+        let blobs: Arc<dyn Blobs> = Arc::new(NoLink(cached));
+        let (writer, coordinator) = flushed_twice(blobs.clone()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let before = segment_files(&writer.partition);
+        let vectors_before = vectors_named(&writer.partition);
+        assert!(!vectors_before.is_empty(), "the segments have vectors");
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        for held in &before {
+            assert!(
+                !after.contains(held),
+                "a segment was taken though its vectors were not linked"
+            );
+        }
+        assert_eq!(ns(&writer.partition), [true, true, true]);
+        let vectors_after = vectors_named(&writer.partition);
+        let new = vectors_after
+            .iter()
+            .filter(|key| !vectors_before.contains(key));
+        for key in new {
+            let local = blobs.local(key).await.unwrap();
+            assert!(local.is_some(), "{key} has no copy of its own");
+        }
+    }
+
+    /// A backup that gives each file in many small parts: what the source
+    /// sent is summed over all of them, and so each segment the live state
+    /// holds is still taken as it is.
+    #[tokio::test]
+    async fn a_restore_from_its_own_backup_sums_every_part_the_source_sends() {
+        let (writer, coordinator) = flushed_twice(memory()).await;
+        let small = Transfers {
+            part_bytes: 16,
+            ..Transfers::default()
+        };
+        let parted = ObjectBlobs::new(Arc::new(InMemory::new())).transferring(small);
+        let (source, committed) = own_backup_in(&writer, &coordinator, Arc::new(parted)).await;
+        let segments = source.list("").await.unwrap();
+        let segment = segments.iter().find(|file| file.key.contains("/segment/"));
+        let parts = source.parts(&segment.unwrap().key);
+        use futures::StreamExt;
+        assert!(parts.count().await > 2, "the backup sends a file in parts");
+        let before = segment_files(&writer.partition);
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        for held in &before {
+            assert!(after.contains(held), "a segment was decoded again");
+        }
+        assert_eq!(ns(&writer.partition), [true, true, true]);
+    }
+
+    /// A backup whose checkpoint names a segment the live state holds,
+    /// with its vectors under another key than the live state's: the
+    /// segment is not taken as held, though both files come out what the
+    /// backup sent. It is decoded from the copies.
+    #[tokio::test]
+    async fn a_segment_held_with_vectors_under_another_key_is_not_taken_as_held() {
+        let (writer, coordinator) = flushed_twice(memory()).await;
+        let (source, committed) = own_backup(&writer, &coordinator).await;
+        let listed = source.list("").await.unwrap();
+        let checkpoint = listed
+            .iter()
+            .find(|file| file.key.contains("/manifest/"))
+            .unwrap();
+        let frame = source.get(&checkpoint.key).await.unwrap();
+        let mut manifest: Manifest = decode(&checkpoint.key, Kind::Manifest, &frame).unwrap();
+        let first = &mut manifest.segments[0];
+        let vectors = first.vectors.clone().unwrap();
+        let elsewhere = vectors.replace(".vectors", "-elsewhere.vectors");
+        let bytes = source.get(&vectors).await.unwrap();
+        source.put(&elsewhere, bytes).await.unwrap();
+        first.vectors = Some(elsewhere);
+        let held = first.key.clone();
+        let frame = encode(Kind::Manifest, &manifest).unwrap();
+        source.put(&checkpoint.key, frame).await.unwrap();
+        let before = writer.partition.read(|state| {
+            let held_now = state.loaded_segments();
+            let mut held_now = held_now.filter(|(key, _)| *key == held);
+            Arc::as_ptr(&held_now.next().unwrap().1.file)
+        });
+
+        restored_from(&writer, source, &committed).await.unwrap();
+
+        let after = segment_files(&writer.partition);
+        assert!(
+            !after.contains(&before),
+            "a segment was taken though its vectors' key is not the live state's"
+        );
+        assert_eq!(ns(&writer.partition), [true, true, true]);
     }
 }
