@@ -41,17 +41,21 @@ enough that the segments it lists are still the ones the node holds, reuses
 almost everything. An old backup (one whose segments merges have since
 replaced), another cluster's, or an adoption reuses nothing.
 
-| On the shape above | Own recent backup | Old backup, another cluster's, or an adoption |
+| On the shape above | Own recent backup (one run, n = 1) | Old backup, another cluster's, or an adoption |
 |---|---|---|
-| Peak memory, against the tenant loaded | 20.5 GiB: **about 1.15×** | 37 GiB: **about 2×** |
+| Peak memory, as a multiple of the tenant loaded | 20.5 GiB: **about 1.15× peak** | 37 GiB: **about 2× peak** |
 | Memory needed free beyond the tenant loaded | about 0.15× (2.7 GiB) | about 1.1× (19 GiB) |
 | Local disk high-water | +0.4 GB (the re-keyed index files) | +7.2 GB (the vectors, and the index files) |
 | Time writes are refused | **about 3 minutes** (172 s) | 6 to 7 minutes (350 to 420 s) |
 | Read from the backup store | 9.9 GB, about 620 requests | the same |
-| Put to the tenant's store, then read back to check | 9.9 GB, then 9.5 GB | the same |
+| Put to the tenant's store, then read back to check | 9.9 GB, then 9.5 GB | 9.9 GB, then 9.8 GB (613 reads) |
 | The next backup | copies the whole tenant again: 9.9 GB, about 720 requests, about 3 minutes | the same |
 
-A backup partly overtaken by merges falls in between. One taken a day of
+The own-backup column rests on one completed run; the other runs of it on
+the shared machine were stopped by the measuring rig's guard against swap
+before the restore began, at the tenant's loaded footprint. The other
+column rests on two runs of the restore and three of the release before
+it, which agree. A backup partly overtaken by merges falls in between. One taken a day of
 steady writes before, with 14 of its 16 segments still the node's, peaked
 at 22 GiB, refused writes for about 3 minutes, and took +0.9 GB of local
 disk.
@@ -62,9 +66,11 @@ backup store's reads and the tenant store's writes.
 
 **The rule (the owner's choice (i), 2026-10-12):** a restore from an old
 backup, from another cluster's, or an adoption is allowed to take about 2×
-the tenant's memory. Restore only on a node with **at least 1.15× the
-tenant's loaded footprint free, beyond what it already uses, and the
-tenant's vectors once more free on local disk**. A restore from the
+the tenant's memory. Restore only on a node with **free memory of at least
+1.15× the tenant's loaded footprint, beyond what it already uses, and the
+tenant's vectors once more free on local disk**. That 1.15× is head-room
+to have free, the measured 1.1× with a margin; it is not the 1.15× peak
+multiple of a restore from the tenant's own backup above. A restore from the
 tenant's own recent backup needs far less, but whether a backup is still
 recent in that sense depends on the merges since, which an operator cannot
 easily see: plan for the larger figure. A node without that room should
