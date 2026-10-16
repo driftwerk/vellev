@@ -96,7 +96,11 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     /// whether anything is past a key is known without listing what is
     /// before it. A store that lists in key order, as S3 and one in memory
     /// do, gives the first of them; one on local disk gives files after
-    /// `after` in no order, walking the directory to find them.
+    /// `after` in no order, walking the directory to find them. S3 asks
+    /// for them from `after` in one request; a store that cannot, as S3
+    /// Express, one in memory and one on local disk, lists under `prefix`
+    /// and leaves out what is not after `after`: what it gives is the
+    /// same, in more than one request, or longer, for a large prefix.
     ///
     /// By default refused, with [`StorageError::NotListed`]: a store that
     /// listed everything to find what is past a key would take as long as

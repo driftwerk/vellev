@@ -11,9 +11,11 @@
 //! 2. on the first batch of a run this shipper ships (its start, a
 //!    re-base, or a handover to it), asks the backup store in one request
 //!    whether it holds a link past the committed position, and stalls the
-//!    run naming T8 if it does (bootstrap note C). The node keeps one
-//!    shipper for each partition it holds, so that this is once a run, and
-//!    a new one on a handover; the shipper never lists the store;
+//!    run naming T8 if it does (bootstrap note C). It is once a run for
+//!    each shipper: the node keeps one for each partition it holds, and
+//!    makes a new one on a handover or a restart, which checks again; a
+//!    check that fails for the store or the coordinator is made again on
+//!    the next batch. The shipper never lists the store;
 //! 3. takes the commits after what the run has shipped (or from its base)
 //!    in order, positions skipping where they do (a restore commits past
 //!    the current position);
@@ -73,7 +75,8 @@ const CREATE_TRIES: usize = 3;
 
 /// Why a run of shipping stopped: none passes by being asked again. Each
 /// is written as the run's stall, for an operator, but for the node's own
-/// verdicts ([`Stall::is_local`]: `NotCreated`, `NotListed`), which stop
+/// verdicts ([`Stall::is_local`]: `NotCreated`, `NotListed`,
+/// `NewerVersion`), which stop
 /// this node shipping the run and leave the run for another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stall {
@@ -89,7 +92,11 @@ pub enum Stall {
     /// store: a verdict of the node's own ([`Self::is_local`]).
     NotCreated { position: LogPosition, why: String },
     /// A committed head, or a file a checkpoint lists, is not in the
-    /// primary.
+    /// primary. The run's stall, not the node's: a cache of the primary
+    /// reads through to the store when it has no copy of its own, so this
+    /// is the store's answer, and a file lost to every node is seen as
+    /// such. (A node with a copy cached of a file a clean took ships it
+    /// where one without stalls; the clean floor of PR 6 ends that.)
     PrimaryMissing { key: String },
     /// A committed head's frame, or a link, does not hold together.
     Corrupt { key: String, why: String },
@@ -102,6 +109,14 @@ pub enum Stall {
     /// The link of what the run has shipped up to is not in the backup
     /// store.
     LinkMissing { position: LogPosition },
+    /// `key`, a head or a link, is of a format version past any this
+    /// release reads: a verdict of the node's own ([`Self::is_local`]),
+    /// as a newer node can read it.
+    NewerVersion {
+        key: String,
+        found: u16,
+        supported: u16,
+    },
     /// The backup store holds `key`, past the position committed: the
     /// coordinator may have been put back to an older state of its own
     /// (threat T8), and what it now commits would fork what was shipped.
@@ -121,7 +136,10 @@ impl Stall {
     /// stall (bootstrap note, section M): the batch says
     /// [`Batch::Stopped`], and the node stops shipping the run itself.
     pub fn is_local(&self) -> bool {
-        matches!(self, Stall::NotCreated { .. } | Stall::NotListed { .. })
+        matches!(
+            self,
+            Stall::NotCreated { .. } | Stall::NotListed { .. } | Stall::NewerVersion { .. }
+        )
     }
 }
 
@@ -167,6 +185,14 @@ impl fmt::Display for Stall {
             Stall::NotListed { why } => write!(
                 f,
                 "the backup store cannot say what is past the committed position: {why}"
+            ),
+            Stall::NewerVersion {
+                key,
+                found,
+                supported,
+            } => write!(
+                f,
+                "{key} is of version {found}; this release reads {supported} at most"
             ),
             Stall::LinkMissing { position } => write!(
                 f,
@@ -456,10 +482,7 @@ impl Shipper {
         };
         Ok(match link::decode(&at, &bytes) {
             Ok(link) => Ok(Made::of(&link.header)),
-            Err(error) => Err(Stall::Corrupt {
-                key: at,
-                why: why(error),
-            }),
+            Err(error) => Err(unreadable(at, error)),
         })
     }
 
@@ -602,12 +625,7 @@ impl Shipper {
         };
         let stored = match decode_head(key, &frame) {
             Ok(stored) => stored,
-            Err(error) => {
-                return Ok(Err(Stall::Corrupt {
-                    key: key.clone(),
-                    why: why(error),
-                }))
-            }
+            Err(error) => return Ok(Err(unreadable(key.clone(), error))),
         };
         let manifest = match &stored {
             Stored::Log(log) => {
@@ -710,10 +728,7 @@ impl Shipper {
                 let mut spilling = spilling.lock().expect("spilling never panics");
                 let framed = std::mem::take(&mut spilling.framed);
                 if let Err(error) = framed.came(&expected.key, Kind::Log) {
-                    spilling.stall = Some(Stall::Corrupt {
-                        key: expected.key.clone(),
-                        why: why(error),
-                    });
+                    spilling.stall = Some(unreadable(expected.key.clone(), error));
                     return Some(Err(given_up(&expected.key)));
                 }
                 if let Some(prefix) = spilling.prefix.take() {
@@ -783,12 +798,7 @@ impl Shipper {
             };
             let theirs = match link::decode(&at, &there) {
                 Ok(theirs) => theirs.header,
-                Err(error) => {
-                    return Ok(Err(Stall::Corrupt {
-                        key: at,
-                        why: why(error),
-                    }))
-                }
+                Err(error) => return Ok(Err(unreadable(at, error))),
             };
             let fields = header.differs(&theirs);
             let at_base = position == base.position;
@@ -905,6 +915,25 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// What makes a file corrupt, without the key a stall names already.
+/// Why the run stops over `key`, which could not be read as it should:
+/// a version past this release's is this node's own verdict, a newer
+/// node reading it; anything else is the file's, and the run's.
+fn unreadable(key: String, error: StorageError) -> Stall {
+    match error {
+        StorageError::UnsupportedVersion {
+            found, supported, ..
+        } => Stall::NewerVersion {
+            key,
+            found,
+            supported,
+        },
+        error => Stall::Corrupt {
+            key,
+            why: why(error),
+        },
+    }
+}
+
 fn why(error: StorageError) -> String {
     match error {
         StorageError::Corrupt { reason, .. } => reason,
@@ -939,10 +968,7 @@ impl Expected {
                     position: self.position,
                 })
             }
-            Err(error) => Some(Stall::Corrupt {
-                key: self.key.clone(),
-                why: why(error),
-            }),
+            Err(error) => Some(unreadable(self.key.clone(), error)),
         }
     }
 }

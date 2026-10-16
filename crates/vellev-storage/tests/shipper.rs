@@ -2015,3 +2015,123 @@ async fn a_node_stopped_by_its_own_store_notes_what_it_shipped_first() {
     let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
     assert_eq!((shipping.shipped, shipping.stalled), (Some(next), None));
 }
+
+/// `frame` made to say it is of a format version past any this release
+/// reads, its checksum made again so that only its version is new.
+fn of_a_newer_format(frame: &[u8]) -> Bytes {
+    let mut newer = frame.to_vec();
+    let version = u16::from_le_bytes([newer[5], newer[6]]) + 1;
+    newer[5..7].copy_from_slice(&version.to_le_bytes());
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&newer[4..15]);
+    crc.update(&newer[19..]);
+    newer[15..19].copy_from_slice(&crc.finalize().to_le_bytes());
+    Bytes::from(newer)
+}
+
+/// `link` made to say it is of a link version past any this release reads.
+fn of_a_newer_link(link: &[u8]) -> Bytes {
+    let mut newer = link.to_vec();
+    let version = u16::from_le_bytes([newer[4], newer[5]]) + 1;
+    newer[4..6].copy_from_slice(&version.to_le_bytes());
+    Bytes::from(newer)
+}
+
+#[tokio::test]
+async fn a_head_or_a_link_of_a_newer_version_stops_this_node_and_leaves_the_run_unstalled() {
+    for newer in ["head", "shipped link", "link there"] {
+        let (cluster, _writer) = written().await;
+        let base = begun(&cluster).await;
+        let backup = a_backup();
+        let shipper = shipper_of(&cluster, &backup);
+        let now = cluster.committed().await.incarnation;
+        let timeline = shipper.timeline(now);
+        let after = rows_after(&cluster, &base).await;
+        let key = match newer {
+            // A head written by a newer release, after a rollback.
+            "head" => {
+                let frame = cluster.blobs.get(&after[0].head.0).await.unwrap();
+                cluster
+                    .blobs
+                    .put(&after[0].head.0, of_a_newer_format(&frame))
+                    .await
+                    .unwrap();
+                after[0].head.0.clone()
+            }
+            // The link of what was shipped, rewritten as by a newer release.
+            "shipped link" => {
+                ship(&shipper, &cluster, 1).await;
+                let at = timeline.link(base.position);
+                let link = backup.get(&at).await.unwrap();
+                backup.put(&at, of_a_newer_link(&link)).await.unwrap();
+                at
+            }
+            // A link a newer release created where this one would.
+            _ => {
+                let there = link_at(&cluster, base.position).await;
+                let at = timeline.link(base.position);
+                let link = link::encode(&there.header, there.frame.as_deref()).unwrap();
+                backup.put(&at, of_a_newer_link(&link)).await.unwrap();
+                at
+            }
+        };
+        let shipper = shipper_of(&cluster, &backup);
+        match ship(&shipper, &cluster, 100).await {
+            Batch::Stopped {
+                why: Stall::NewerVersion { key: found, .. },
+                ..
+            } => assert_eq!(found, key, "{newer}"),
+            other => panic!("{newer}: {other:?}"),
+        }
+        let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+        assert_eq!(shipping.stalled, None, "{newer}");
+    }
+}
+
+#[tokio::test]
+async fn a_head_missing_from_the_primary_stalls_the_run_and_a_node_whose_cache_lost_it_reads_on() {
+    // Missing from the primary store itself: the run's stall, so that a
+    // file lost to every node is seen as such.
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let after = rows_after(&cluster, &base).await;
+    cluster.blobs.delete(&after[0].head.0).await.unwrap();
+    let shipper = shipper_of(&cluster, &a_backup());
+    let missing = Stall::PrimaryMissing {
+        key: after[0].head.0.clone(),
+    };
+    let stalled = Batch::Shipped {
+        through: Some(base.position),
+        stalled: Some(missing.clone()),
+    };
+    assert_eq!(ship(&shipper, &cluster, 100).await, stalled);
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!(shipping.stalled, Some(missing.to_string()));
+    // A node whose cache of the primary has lost its copy, from its own
+    // disk: it reads the file from the store, and ships.
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cached = Arc::new(CachedBlobs::new(cluster.blobs.clone(), dir.path()));
+    let after = rows_after(&cluster, &base).await;
+    cached.get(&after[0].head.0).await.unwrap();
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let primary: Arc<dyn Blobs> = cached;
+    let shipper = Shipper::new(
+        primary,
+        a_backup(),
+        cluster.coordinator.clone(),
+        cluster.key.clone(),
+        lineage(),
+        cluster_id(),
+    );
+    let committed = cluster.committed().await.log_position;
+    assert_eq!(
+        ship(&shipper, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(committed),
+            stalled: None
+        }
+    );
+}
