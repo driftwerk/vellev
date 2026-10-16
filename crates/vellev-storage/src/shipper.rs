@@ -24,8 +24,17 @@
 //!    naming the fields that differ;
 //! 5. notes the watermark at the last position it shipped.
 //!
-//! A frame too large to go inline stalls the run until spilling is built
-//! (S3). Every other failure of the stores or the coordinator ends the
+//! A frame too large to go inline, with its link's header, is spilled
+//! (amendment 1, A2): put first under `frames/{key}` beside the links, and
+//! only then linked, the link carrying no frame. A log is spilled as it
+//! comes from the primary, a part at a time and never held whole, in one
+//! pass that sums it, checks its CRC and reads its start for its position
+//! and `prev` (A3); the upload is given up, and the run stalls, unless all
+//! of them hold. A checkpoint, read whole for its files, is spilled from
+//! what is held of it. A link whose header alone is larger than the store
+//! creates stalls the run.
+//!
+//! Every other failure of the stores or the coordinator ends the
 //! batch, after noting what it shipped, and is the caller's: the node's
 //! scheduler (review 6.2 item 7) decides when to try again, when to
 //! alarm, and whether a failure that persists stalls the run. The core
@@ -34,6 +43,8 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
+use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
@@ -41,8 +52,9 @@ use crate::blobs::{Blobs, Created, Layout};
 use crate::coordinator::{
     ClusterId, Coordinator, Incarnation, Lineage, LogPosition, PartitionKey, RestorePoint, ShipBase,
 };
-use crate::format::{decode_head, Head as Stored, Manifest};
+use crate::format::{decode_head, Framed, Head as Stored, Kind, Manifest};
 use crate::link::{self, Before, Body, Head, Header, Needed, Sum, Timeline, Unlinkable};
+use crate::prefix::{Found, Prefix};
 use crate::{Result, StorageError};
 
 /// How many times a link the store said was there, and was not when read
@@ -77,9 +89,6 @@ pub enum Stall {
     /// The link of what the run has shipped up to is not in the backup
     /// store.
     LinkMissing { position: LogPosition },
-    /// The frame at `position` is too large to go inline, and spilling it
-    /// is not built yet (S3).
-    SpillNotBuilt { position: LogPosition },
 }
 
 impl fmt::Display for Stall {
@@ -118,11 +127,6 @@ impl fmt::Display for Stall {
             Stall::LinkMissing { position } => write!(
                 f,
                 "the link at position {}, shipped, is not in the backup store",
-                position.0
-            ),
-            Stall::SpillNotBuilt { position } => write!(
-                f,
-                "the frame at position {} is too large to go inline, and spill is not yet built",
                 position.0
             ),
         }
@@ -344,12 +348,110 @@ impl Shipper {
         if last.is_some_and(|last| row.at < last.at) {
             return Ok(Err(Stall::TimeWentBack { position }));
         }
-        let frame = match self.primary.get(key).await {
-            Ok(frame) => frame,
-            Err(StorageError::Missing { .. }) => {
-                return Ok(Err(Stall::PrimaryMissing { key: key.clone() }))
+        let made_on = last.map(|last| Before {
+            position: last.position,
+            sum: last.sum.clone(),
+        });
+        let header = |sum: Sum, size: u64, files: Vec<Needed>, body: Body| Header {
+            tenant: timeline.tenant.clone(),
+            lineage: timeline.lineage,
+            cluster: timeline.cluster,
+            incarnation: timeline.incarnation,
+            partition: timeline.partition,
+            position,
+            key: key.clone(),
+            head,
+            generation: named.generation,
+            committed_at: row.at,
+            sum,
+            size,
+            before: made_on.clone(),
+            files,
+            body,
+        };
+        // A log is read a part at a time, and spilled as it comes if it is
+        // too large to go inline (amendment 1, A2); a checkpoint, which is
+        // decoded for its files, and a log that goes inline, are read whole.
+        let frame = match head {
+            Head::Manifest => match self.primary.get(key).await {
+                Ok(frame) => frame,
+                Err(StorageError::Missing { .. }) => {
+                    return Ok(Err(Stall::PrimaryMissing { key: key.clone() }))
+                }
+                Err(error) => return Err(error),
+            },
+            Head::Log => {
+                let mut parts = self.primary.parts(key);
+                let mut come = Vec::new();
+                let mut framed = Framed::default();
+                // As much as says how long the frame is.
+                while framed.declared().is_none() {
+                    match parts.next().await {
+                        None => break,
+                        Some(Ok(part)) => {
+                            framed.update(&part);
+                            come.push(part);
+                        }
+                        Some(Err(StorageError::Missing { .. })) => {
+                            return Ok(Err(Stall::PrimaryMissing { key: key.clone() }))
+                        }
+                        Some(Err(error)) => return Err(error),
+                    }
+                }
+                let declared = framed.declared();
+                // Its sum unknown yet, but of the length it will have.
+                let unsummed = Sum("0".repeat(64));
+                let shape = declared.map(|size| {
+                    let unsummed = header(unsummed, size, Vec::new(), Body::Inline);
+                    link::shape(&unsummed, self.backup.creates_at_most())
+                });
+                match shape {
+                    Some(Err(unlinkable)) => return Ok(Err(not_linkable(position, unlinkable))),
+                    Some(Ok(Body::Spilled)) => {
+                        let expected = Expected {
+                            key: key.clone(),
+                            position,
+                            last: last.map(|last| (last.position, last.key.clone())),
+                        };
+                        let rest = stream::iter(come.into_iter().map(Ok)).chain(parts).boxed();
+                        let (sum, size) =
+                            match self.spill_streamed(timeline, expected, rest).await? {
+                                Ok(spilled) => spilled,
+                                Err(stall) => return Ok(Err(stall)),
+                            };
+                        let header = header(sum, size, Vec::new(), Body::Spilled);
+                        let made = Made::of(&header);
+                        return self
+                            .create(timeline, base, header, None)
+                            .await
+                            .map(|created| created.map(|()| made));
+                    }
+                    Some(Ok(Body::Inline)) | None => {}
+                }
+                // Whole, and no longer than it says it is.
+                let most = declared.unwrap_or(u64::MAX);
+                let mut length: u64 = come.iter().map(|part| part.len() as u64).sum();
+                while length <= most {
+                    match parts.next().await {
+                        None => break,
+                        Some(Ok(part)) => {
+                            length += part.len() as u64;
+                            come.push(part);
+                        }
+                        Some(Err(StorageError::Missing { .. })) => {
+                            return Ok(Err(Stall::PrimaryMissing { key: key.clone() }))
+                        }
+                        Some(Err(error)) => return Err(error),
+                    }
+                }
+                if length > most {
+                    return Ok(Err(Stall::Corrupt {
+                        key: key.clone(),
+                        why: "longer than its header says".into(),
+                    }));
+                }
+                Bytes::from(come.concat())
             }
-            Err(error) => return Err(error),
         };
         let stored = match decode_head(key, &frame) {
             Ok(stored) => stored,
@@ -362,12 +464,11 @@ impl Shipper {
         };
         let manifest = match &stored {
             Stored::Log(log) => {
-                // A log follows the commit just before it, and names it.
-                let follows = last.is_none_or(|last| {
-                    last.position.next() == Some(position)
-                        && log.prev.as_deref() == Some(last.key.as_str())
-                });
-                if log.position != position || !follows {
+                let found = Found {
+                    position: log.position,
+                    prev: log.prev.clone(),
+                };
+                if !follows(&found, position, last) {
                     return not_the_rows;
                 }
                 None
@@ -382,60 +483,139 @@ impl Shipper {
                 Err(stall) => return Ok(Err(stall)),
             }
         }
-        let header = Header {
-            tenant: timeline.tenant.clone(),
-            lineage: timeline.lineage,
-            cluster: timeline.cluster,
-            incarnation: timeline.incarnation,
-            partition: timeline.partition,
-            position,
-            key: key.clone(),
-            head,
-            generation: named.generation,
-            committed_at: row.at,
-            sum: Sum::of(&frame),
-            size: frame.len() as u64,
-            before: last.map(|last| Before {
-                position: last.position,
-                sum: last.sum.clone(),
-            }),
-            files,
-            body: Body::Inline,
+        let mut header = header(Sum::of(&frame), frame.len() as u64, files, Body::Inline);
+        header.body = match link::shape(&header, self.backup.creates_at_most()) {
+            Ok(body) => body,
+            Err(unlinkable) => return Ok(Err(not_linkable(position, unlinkable))),
         };
-        match link::shape(&header, self.backup.creates_at_most()) {
-            Ok(Body::Inline) => {}
-            Ok(Body::Spilled) => return Ok(Err(Stall::SpillNotBuilt { position })),
-            Err(Unlinkable::NoCreate) => {
-                return Ok(Err(Stall::NotCreated {
-                    position,
-                    why: "the backup store does not create a file only if none is there".into(),
-                }))
-            }
-            Err(Unlinkable::HeaderTooLarge { bytes, most }) => {
-                return Ok(Err(Stall::NotCreated {
-                    position,
-                    why: format!("its header is {bytes} bytes; the store creates {most} at most"),
-                }))
-            }
-        }
         let made = Made::of(&header);
-        self.create(timeline, base, header, &frame)
+        let inline = match header.body {
+            Body::Inline => Some(&frame[..]),
+            // Its frame first, from what is held of it, then its link.
+            Body::Spilled => {
+                let whole = stream::once(std::future::ready(Ok(frame.clone()))).boxed();
+                self.backup.put_parts(&timeline.frame(key), whole).await?;
+                None
+            }
+        };
+        self.create(timeline, base, header, inline)
             .await
             .map(|created| created.map(|()| made))
     }
 
-    /// Create the link of `header`, with `frame` inline, once: a link
+    /// Spill the log `expected` names, coming a part at a time in `parts`,
+    /// to its frame's place in the backup store, in one pass: summed by
+    /// SHA-256 as it goes, its CRC checked and its start read for its
+    /// position and `prev` (amendment 1, A2 and A3). The upload is given
+    /// up, and nothing put, unless all of them hold. Its sum and size, or
+    /// why the run stalls.
+    async fn spill_streamed(
+        &self,
+        timeline: &Timeline,
+        expected: Expected,
+        parts: BoxStream<'_, Result<Bytes>>,
+    ) -> Result<std::result::Result<(Sum, u64), Stall>> {
+        let key = expected.key.clone();
+        let spilling = Arc::new(Mutex::new(Spilling {
+            hasher: Sha256::new(),
+            size: 0,
+            framed: Framed::default(),
+            prefix: Some(Prefix::new(&key)),
+            missing: false,
+            stall: None,
+            checked: false,
+        }));
+        let given_up = |key: &str| StorageError::corrupt(key, "the spill was given up");
+        let tapped = {
+            let (spilling, expected) = (spilling.clone(), expected.clone());
+            parts.map(move |part| {
+                let mut spilling = spilling.lock().expect("spilling never panics");
+                let part = match part {
+                    Ok(part) => part,
+                    Err(error) => {
+                        spilling.missing |= matches!(error, StorageError::Missing { .. });
+                        return Err(error);
+                    }
+                };
+                spilling.hasher.update(&part);
+                spilling.size += part.len() as u64;
+                spilling.framed.update(&part);
+                if let Some(prefix) = spilling.prefix.as_mut() {
+                    match prefix.feed(&part) {
+                        Ok(None) => {}
+                        read => {
+                            if let Some(stall) = expected.stall(read) {
+                                spilling.stall = Some(stall);
+                                return Err(given_up(&expected.key));
+                            }
+                            // Found, and right: nothing more of it is read.
+                            spilling.prefix = None;
+                        }
+                    }
+                }
+                Ok(part)
+            })
+        };
+        // Once all of it has come: its CRC, and its start if not yet read.
+        let checked = {
+            let (spilling, expected) = (spilling.clone(), expected.clone());
+            stream::once(async move {
+                let mut spilling = spilling.lock().expect("spilling never panics");
+                let framed = std::mem::take(&mut spilling.framed);
+                if let Err(error) = framed.came(&expected.key, Kind::Log) {
+                    spilling.stall = Some(Stall::Corrupt {
+                        key: expected.key.clone(),
+                        why: why(error),
+                    });
+                    return Some(Err(given_up(&expected.key)));
+                }
+                if let Some(prefix) = spilling.prefix.take() {
+                    if let Some(stall) = expected.stall(prefix.finish().map(Some)) {
+                        spilling.stall = Some(stall);
+                        return Some(Err(given_up(&expected.key)));
+                    }
+                }
+                spilling.checked = true;
+                None
+            })
+            .filter_map(std::future::ready)
+        };
+        let put = self
+            .backup
+            .put_parts(&timeline.frame(&key), tapped.chain(checked).boxed())
+            .await;
+        let spilling = std::mem::replace(
+            &mut *spilling.lock().expect("spilling never panics"),
+            Spilling::spent(),
+        );
+        if spilling.missing {
+            return Ok(Err(Stall::PrimaryMissing { key }));
+        }
+        if let Some(stall) = spilling.stall {
+            return Ok(Err(stall));
+        }
+        put?;
+        if !spilling.checked {
+            return Err(StorageError::Blob {
+                key: timeline.frame(&key),
+                source: "the spill was put before all of its frame had come".into(),
+            });
+        }
+        Ok(Ok((Sum(hex(&spilling.hasher.finalize())), spilling.size)))
+    }
+
+    /// Create the link of `header`, with `frame` if it is inline, once: a link
     /// already there passes only if it is of the same commit.
     async fn create(
         &self,
         timeline: &Timeline,
         base: &ShipBase,
         header: Header,
-        frame: &[u8],
+        frame: Option<&[u8]>,
     ) -> Result<std::result::Result<(), Stall>> {
         let position = header.position;
         let at = timeline.link(position);
-        let encoded = link::encode(&header, Some(frame))?;
+        let encoded = link::encode(&header, frame)?;
         for _ in 0..CREATE_TRIES {
             match self.backup.put_new(&at, encoded.clone()).await {
                 Ok(Created::Written) => return Ok(Ok(())),
@@ -583,4 +763,91 @@ fn why(error: StorageError) -> String {
         StorageError::Corrupt { reason, .. } => reason,
         other => other.to_string(),
     }
+}
+
+/// What a log being spilled must say of itself: it is the head of the row
+/// at `position`, made on `last`, the commit shipped just before it, if
+/// the run has shipped one.
+#[derive(Debug, Clone)]
+struct Expected {
+    key: String,
+    position: LogPosition,
+    last: Option<(LogPosition, String)>,
+}
+
+impl Expected {
+    /// Why the run stalls, given what reading the log's start came to, if
+    /// it does: none while more of it is needed.
+    fn stall(&self, read: Result<Option<Found>>) -> Option<Stall> {
+        match read {
+            Ok(None) => None,
+            Ok(Some(found)) => {
+                let follows = match &self.last {
+                    None => true,
+                    Some((at, key)) => {
+                        at.next() == Some(self.position) && found.prev.as_deref() == Some(key)
+                    }
+                };
+                (found.position != self.position || !follows).then_some(Stall::NotTheRowsHead {
+                    position: self.position,
+                })
+            }
+            Err(error) => Some(Stall::Corrupt {
+                key: self.key.clone(),
+                why: why(error),
+            }),
+        }
+    }
+}
+
+/// A log's frame as it is spilled: what it has come to so far.
+struct Spilling {
+    hasher: Sha256,
+    size: u64,
+    framed: Framed,
+    /// Its start, until what it says is found and seen to be right.
+    prefix: Option<Prefix>,
+    /// The primary said it was not there.
+    missing: bool,
+    /// Why the run stalls, the upload given up for it.
+    stall: Option<Stall>,
+    /// All of it came, and every check held.
+    checked: bool,
+}
+
+impl Spilling {
+    fn spent() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            size: 0,
+            framed: Framed::default(),
+            prefix: None,
+            missing: false,
+            stall: None,
+            checked: false,
+        }
+    }
+}
+
+/// Whether a log that says `found` of itself is the head of the row at
+/// `position`, made on `last`, the commit shipped just before it: one
+/// position past it, naming it as `prev`.
+fn follows(found: &Found, position: LogPosition, last: Option<&Made>) -> bool {
+    let made_on = last.is_none_or(|last| {
+        last.position.next() == Some(position) && found.prev.as_deref() == Some(last.key.as_str())
+    });
+    found.position == position && made_on
+}
+
+/// The stall of a link the backup store cannot take.
+fn not_linkable(position: LogPosition, unlinkable: Unlinkable) -> Stall {
+    let why = match unlinkable {
+        Unlinkable::NoCreate => {
+            "the backup store does not create a file only if none is there".into()
+        }
+        Unlinkable::HeaderTooLarge { bytes, most } => {
+            format!("its header is {bytes} bytes; the store creates {most} at most")
+        }
+    };
+    Stall::NotCreated { position, why }
 }
