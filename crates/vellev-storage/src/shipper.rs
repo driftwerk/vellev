@@ -24,8 +24,17 @@
 //!    naming the fields that differ;
 //! 5. notes the watermark at the last position it shipped.
 //!
-//! A frame too large to go inline stalls the run until spilling is built
-//! (S3). Every other failure of the stores or the coordinator ends the
+//! A frame too large to go inline, with its link's header, is spilled
+//! (amendment 1, A2): put first under `frames/{key}` beside the links, and
+//! only then linked, the link carrying no frame. A log is spilled as it
+//! comes from the primary, a part at a time and never held whole, in one
+//! pass that sums it, checks its CRC and reads its start for its position
+//! and `prev` (A3); the upload is given up, and the run stalls, unless all
+//! of them hold. A checkpoint, read whole for its files, is spilled from
+//! what is held of it. A link whose header alone is larger than the store
+//! creates stalls the run.
+//!
+//! Every other failure of the stores or the coordinator ends the
 //! batch, after noting what it shipped, and is the caller's: the node's
 //! scheduler (review 6.2 item 7) decides when to try again, when to
 //! alarm, and whether a failure that persists stalls the run. The core
