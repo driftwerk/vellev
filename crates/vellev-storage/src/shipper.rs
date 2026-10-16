@@ -914,7 +914,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// What makes a file corrupt, without the key a stall names already.
 /// Why the run stops over `key`, which could not be read as it should:
 /// a version past this release's is this node's own verdict, a newer
 /// node reading it; anything else is the file's, and the run's.
@@ -934,6 +933,7 @@ fn unreadable(key: String, error: StorageError) -> Stall {
     }
 }
 
+/// What makes a file corrupt, without the key a stall names already.
 fn why(error: StorageError) -> String {
     match error {
         StorageError::Corrupt { reason, .. } => reason,
