@@ -209,8 +209,60 @@ impl Shipper {
     /// stores or the coordinator, after what was shipped is noted; the
     /// run is left to be shipped on by the next batch.
     pub async fn ship_batch(&self, incarnation: Incarnation, limit: usize) -> Result<Batch> {
-        let _ = (incarnation, limit);
-        todo!("rule-first: not yet built")
+        let shipping = self.coordinator.shipping(&self.key).await?;
+        if shipping.incarnation != incarnation {
+            return Ok(Batch::Idle(Idle::OtherIncarnation));
+        }
+        let Some(base) = shipping.base else {
+            return Ok(Batch::Idle(Idle::NotShipping));
+        };
+        if let Some(why) = shipping.stalled {
+            return Ok(Batch::Idle(Idle::Stalled(why)));
+        }
+        let timeline = self.timeline(incarnation);
+        let mut last = match shipping.shipped {
+            None => None,
+            Some(shipped) => match self.shipped(&timeline, shipped).await? {
+                Ok(made) => Some(made),
+                Err(stall) => return self.stall(incarnation, &base, None, stall).await,
+            },
+        };
+        let after = match &last {
+            Some(made) => made.position,
+            None => LogPosition(base.position.0.saturating_sub(1)),
+        };
+        let rows = self
+            .coordinator
+            .commits_after(&self.key, incarnation, after, limit)
+            .await?;
+        let mut through = None;
+        for row in &rows {
+            let made = match self.ship(&timeline, &base, last.as_ref(), row).await {
+                Ok(made) => made,
+                Err(error) => {
+                    if let Err(unnoted) = self.note(incarnation, &base, through).await {
+                        tracing::warn!(
+                            partition = %self.key,
+                            error = %unnoted,
+                            "what a failed batch shipped was not noted"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            match made {
+                Ok(made) => {
+                    through = Some(row.position);
+                    last = Some(made);
+                }
+                Err(stall) => return self.stall(incarnation, &base, through, stall).await,
+            }
+        }
+        self.note(incarnation, &base, through).await?;
+        Ok(Batch::Shipped {
+            through,
+            stalled: None,
+        })
     }
 
     /// Note the run shipped up to `through`, if anything.
