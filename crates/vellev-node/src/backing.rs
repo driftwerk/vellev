@@ -1537,10 +1537,7 @@ mod tests {
         for key in ["t/links/1", "t/links/2", "u/links/3"] {
             inner.put(key, Bytes::from("x")).await.unwrap();
         }
-        let within = Within {
-            inner: inner.clone(),
-            within: WITHIN,
-        };
+        let within = Within::new(inner.clone(), WITHIN);
         let deleting = Deleting {
             inner: inner.clone(),
             sent: Arc::new(AtomicBool::new(false)),
