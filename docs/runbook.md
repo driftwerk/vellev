@@ -9,19 +9,9 @@ reasons are in the DW-680 design (`dw-680-design.md`, sections 4, 8 and
 
 None of these is optional:
 
-1. **The restore head-room is measured (DW-680, gate M).** A restore from a
-   backup is a full reload of the tenant (below). Its cost has been measured
-   on the largest real tenant shape, and a node restoring that tenant has
-   at least this much room:
-
-   | What | Head-room |
-   |---|---|
-   | Wall time of the restore | _to come from M_ |
-   | Time writes are refused | _to come from M_ |
-   | Peak resident memory | _to come from M_ |
-   | Local disk high-water mark | _to come from M_ |
-   | Bytes read from the backup store | _to come from M_ |
-   | The next backup: time and bytes copied | _to come from M_ |
+1. **Every node that may restore a tenant has the head-room for it
+   (DW-680, gate M).** Its cost was measured on the largest tenant shape on
+   hand (below). Size each node by the rule under "Head-room for a restore".
 
 2. **Cleaning up goes by the commits Postgres holds (DW-681).** Until then
    whether a restore to a point in the window finds its files rests on a
@@ -32,6 +22,56 @@ None of these is optional:
    timeout as the README says.
 4. **Every node runs a release with DW-680's restore** before any restore
    from a backup is asked for (see "Rolling deploys and rollback").
+
+## Head-room for a restore
+
+Gate M measured a restore from a backup on the whole driftwerk Weaviate
+import in one tenant: 4.3 million objects with 384-dimension code vectors,
+8.6 million rows with the import's ledgers, and 9.9 GB of files (2.8 GB of
+segments, 6.7 GB of vectors, 0.3 GB of indexes). Loaded, that tenant takes
+17.8 GiB of memory on its node.
+
+**These figures are for that full shape, code vectors included: a stress
+bound, and the size that matters for Patchwork.** Driftwerk's cutover moves
+only its memories and artifacts to vellev; its code vectors stay on
+Weaviate, so its tenants are far smaller than this.
+
+A restore costs what it can reuse. The tenant's own backup, taken recently
+enough that the segments it lists are still the ones the node holds, reuses
+almost everything. An old backup (one whose segments merges have since
+replaced), another cluster's, or an adoption reuses nothing.
+
+| On the shape above | Own recent backup | Old backup, another cluster's, or an adoption |
+|---|---|---|
+| Peak memory, against the tenant loaded | 20.5 GiB: **about 1.15×** | 37 GiB: **about 2×** |
+| Memory needed free beyond the tenant loaded | about 0.15× (2.7 GiB) | about 1.1× (19 GiB) |
+| Local disk high-water | +0.4 GB (the re-keyed index files) | +7.2 GB (the vectors, and the index files) |
+| Time writes are refused | **about 3 minutes** (172 s) | 6 to 7 minutes (350 to 420 s) |
+| Read from the backup store | 9.9 GB, about 620 requests | the same |
+| Put to the tenant's store, then read back to check | 9.9 GB, then 9.5 GB | the same |
+| The next backup | copies the whole tenant again: 9.9 GB, about 720 requests, about 3 minutes | the same |
+
+A backup partly overtaken by merges falls in between. One taken a day of
+steady writes before, with 14 of its 16 segments still the node's, peaked
+at 22 GiB, refused writes for about 3 minutes, and took +0.9 GB of local
+disk.
+
+The times were measured against a local S3 on a USB disk on a shared
+machine. They scale with the tenant's size divided by the slower of the
+backup store's reads and the tenant store's writes.
+
+**The rule (the owner's choice (i), 2026-10-12):** a restore from an old
+backup, from another cluster's, or an adoption is allowed to take about 2×
+the tenant's memory. Restore only on a node with **at least 1.15× the
+tenant's loaded footprint free, beyond what it already uses, and the
+tenant's vectors once more free on local disk**. A restore from the
+tenant's own recent backup needs far less, but whether a backup is still
+recent in that sense depends on the merges since, which an operator cannot
+easily see: plan for the larger figure. A node without that room should
+not be asked. Move other tenants off it first, or use a larger node.
+
+To find a tenant's loaded footprint, read the node's process footprint
+before and after the tenant loads. `State::resident` reads low.
 
 ## Restoring from a backup
 
@@ -51,14 +91,19 @@ What follows for operators:
   cluster takes copies back any file it lists that went, and mends the
   backup; restore from it after that. An older backup whose lost file the
   tenant no longer lists stays broken for as long as it is kept.
-- **Every restore is a full reload.** Every flushed byte of the tenant comes
-  down from the backup store and goes up to the tenant's store. Then every
-  vectors file comes down again to the node's local disk. The tenant's rows
-  are held in memory twice while the restore loads, beside what the node
-  already holds. Local disk and the tenant's store hold the tenant twice
-  until the old files are cleaned, after the restore window and the grace.
-  The next backup copies the whole tenant again, and the backup store holds
-  it twice for as long as backups are kept.
+- **Every restore copies the whole tenant.** Every flushed byte comes down
+  from the backup store, goes up to the tenant's store under new names, and
+  is read back once to check that each copy is whole. The tenant's store
+  holds the tenant twice until the old files are cleaned, after the restore
+  window and the grace. The next backup copies the whole tenant again, and
+  the backup store holds it twice for as long as backups are kept.
+- **What it loads depends on the backup.** A segment the node already holds,
+  under the same name in the backup, whose copy is read back and found to
+  be exactly the file the backup sent, is taken as it is: not decoded
+  again, and its vectors given to the copy's new name on local disk as a
+  link. Any other segment is decoded from its copy, two at a time, beside
+  the tenant as the node holds it, and its vectors come down to local disk
+  again. See "Head-room for a restore" for what each costs.
 - **Writes are refused for the whole restore**; reads are served.
 - **A restore that fails leaves the tenant as it was.** Copies it made are
   deleted, or, if its commit was tried and its outcome is unknown, left to
