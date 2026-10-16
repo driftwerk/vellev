@@ -373,29 +373,6 @@ async fn at_its_base_a_run_takes_a_link_that_differs_only_in_the_commit_before_i
     );
 }
 
-#[tokio::test]
-async fn a_frame_too_large_to_go_inline_stalls_until_spilling_is_built() {
-    let (cluster, _writer) = written().await;
-    let base = begun(&cluster).await;
-    // A store that creates files of 1 KiB at most: the checkpoint's link,
-    // with its frame, is larger.
-    let backup = backup_of(1024);
-    let shipper = shipper_of(&cluster, &backup);
-    let stalled = Stall::SpillNotBuilt {
-        position: base.position,
-    };
-    assert_eq!(
-        ship(&shipper, &cluster, 100).await,
-        Batch::Shipped {
-            through: None,
-            stalled: Some(stalled)
-        }
-    );
-    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
-    assert_eq!(shipping.shipped, None);
-    assert!(shipping.stalled.unwrap().contains("spill"));
-}
-
 /// A store that creates nothing: every create refused before it is sent.
 #[derive(Debug)]
 struct Uncreating(Arc<dyn Blobs>);
@@ -974,6 +951,262 @@ async fn a_checkpoint_after_a_skip_is_made_on_the_row_before_it_not_the_position
     assert_eq!(before.sum, links[&after[0].position].header.sum);
 }
 
+/// A partition as [`written`] makes it, in a primary store that reads and
+/// writes files `part_bytes` at a time, with a log at 4 of 200 writes,
+/// too large to go inline in [`a_small_backup`].
+async fn written_large(part_bytes: usize) -> (Cluster, Writer) {
+    let transfers = Transfers {
+        part_bytes,
+        ..Transfers::default()
+    };
+    let cluster = Cluster {
+        blobs: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(transfers)),
+        ..Cluster::new().await
+    };
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+    writer.flush().await.unwrap();
+    let many = (0..200u8).map(|n| upsert("notes", n, n.into())).collect();
+    writer.commit(many).await.unwrap();
+    writer.commit(vec![upsert("notes", 201, 1)]).await.unwrap();
+    (cluster, writer)
+}
+
+/// A backup store that creates files of 1 KiB at most: a checkpoint's
+/// link, or a large log's, with its frame, is larger; a small log's is not.
+fn a_small_backup() -> Arc<dyn Blobs> {
+    backup_of(1024)
+}
+
+/// The log of 200 writes [`written_large`] makes, its row.
+async fn the_large_log(cluster: &Cluster, base: &ShipBase) -> RestorePoint {
+    let after = rows_after(cluster, base).await;
+    after[0].clone()
+}
+
+#[tokio::test]
+async fn a_frame_too_large_to_go_inline_is_spilled_first_and_then_linked() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    let backup = a_small_backup();
+    let shipper = shipper_of(&cluster, &backup);
+    let committed = cluster.committed().await;
+    let shipped = ship(&shipper, &cluster, 100).await;
+    let through = Some(committed.log_position);
+    assert_eq!(
+        shipped,
+        Batch::Shipped {
+            through,
+            stalled: None
+        }
+    );
+    let timeline = shipper.timeline(committed.incarnation);
+    let links = links(&backup, &timeline).await;
+    let large = the_large_log(&cluster, &base).await;
+    let small = LogPosition(large.position.0 + 1);
+    // The checkpoint, from memory, and the large log, a part at a time,
+    // spilled; the small log inline.
+    let bodies: Vec<_> = [base.position, large.position, small]
+        .iter()
+        .map(|at| links.get(at).map(|link| link.header.body))
+        .collect();
+    let bodies: Vec<_> = bodies.into_iter().flatten().collect();
+    assert_eq!(bodies, [Body::Spilled, Body::Spilled, Body::Inline]);
+    for at in [base.position, large.position] {
+        let link = &links[&at];
+        assert_eq!(link.frame, None);
+        let spilled = backup.get(&timeline.frame(&link.header.key)).await.unwrap();
+        assert_eq!(spilled, cluster.blobs.get(&link.header.key).await.unwrap());
+        assert_eq!(link::Sum::of(&spilled), link.header.sum);
+        assert_eq!(spilled.len() as u64, link.header.size);
+    }
+    assert!(links[&base.position].header.files.len() >= 2);
+    assert_eq!(
+        links[&large.position]
+            .header
+            .before
+            .as_ref()
+            .unwrap()
+            .position,
+        base.position
+    );
+    // Restoring the newest commit needs what is there, the checkpoint
+    // read from its spilled frame.
+    let headers: BTreeMap<_, _> = links
+        .iter()
+        .map(|(at, link)| (*at, link.header.clone()))
+        .collect();
+    let checkpoint = &links[&base.position].header;
+    let frame = backup.get(&timeline.frame(&checkpoint.key)).await.unwrap();
+    let Ok(Stored::Manifest(manifest)) = decode_head(&checkpoint.key, &frame) else {
+        panic!("a manifest")
+    };
+    let needed = chain::needed(&headers, committed.log_position, Some(&manifest)).unwrap();
+    assert_eq!(needed.checkpoint, Some(base.position));
+}
+
+#[tokio::test]
+async fn a_link_too_large_for_the_store_even_spilled_stalls_the_run() {
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let backup = backup_of(256);
+    let shipper = shipper_of(&cluster, &backup);
+    match ship(&shipper, &cluster, 100).await {
+        Batch::Shipped {
+            through: None,
+            stalled: Some(Stall::NotCreated { position, why }),
+        } => {
+            assert_eq!(position, base.position);
+            assert!(why.contains("header"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_spill_that_fails_makes_no_link_and_ends_the_batch() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    let inner = a_small_backup();
+    let failing: Arc<dyn Blobs> = Arc::new(Failing {
+        inner: inner.clone(),
+        failing: "/frames/",
+    });
+    let shipper = shipper_of(&cluster, &failing);
+    let now = cluster.committed().await.incarnation;
+    assert!(shipper.ship_batch(now, 100).await.is_err());
+    let timeline = shipper.timeline(now);
+    assert!(inner
+        .list(&format!("{}links/", timeline.prefix()))
+        .await
+        .unwrap()
+        .is_empty());
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!((shipping.shipped, shipping.stalled), (None, None));
+    assert!(base.position > LogPosition(0));
+}
+
+/// `frame` put under the large log's key in the primary of `cluster`.
+async fn the_large_log_made(cluster: &Cluster, base: &ShipBase, frame: Bytes) -> RestorePoint {
+    let large = the_large_log(cluster, base).await;
+    cluster.blobs.put(&large.head.0, frame).await.unwrap();
+    large
+}
+
+/// The large log of `cluster`, decoded.
+async fn the_large_log_decoded(cluster: &Cluster, base: &ShipBase) -> LogSegment {
+    let large = the_large_log(cluster, base).await;
+    let frame = cluster.blobs.get(&large.head.0).await.unwrap();
+    match decode_head(&large.head.0, &frame).unwrap() {
+        Stored::Log(log) => log,
+        Stored::Manifest(_) => panic!("a log"),
+    }
+}
+
+#[tokio::test]
+async fn a_spilled_log_whose_checksum_fails_stalls_the_run_and_is_neither_linked_nor_left() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    let large = the_large_log(&cluster, &base).await;
+    let mut frame = cluster.blobs.get(&large.head.0).await.unwrap().to_vec();
+    let last = frame.len() - 1;
+    frame[last] ^= 0xff;
+    the_large_log_made(&cluster, &base, frame.into()).await;
+    let backup = a_small_backup();
+    let shipper = shipper_of(&cluster, &backup);
+    match ship(&shipper, &cluster, 100).await {
+        Batch::Shipped {
+            through,
+            stalled: Some(Stall::Corrupt { key, .. }),
+        } => {
+            assert_eq!(through, Some(base.position));
+            assert_eq!(key, large.head.0);
+        }
+        other => panic!("{other:?}"),
+    }
+    let timeline = shipper.timeline(cluster.committed().await.incarnation);
+    assert!(backup.get(&timeline.link(large.position)).await.is_err());
+    assert!(backup.get(&timeline.frame(&large.head.0)).await.is_err());
+}
+
+#[tokio::test]
+async fn a_spilled_log_of_another_position_or_made_on_another_head_stalls_the_run() {
+    for broken in ["position", "prev"] {
+        let (cluster, _writer) = written_large(64).await;
+        let base = begun(&cluster).await;
+        let mut log = the_large_log_decoded(&cluster, &base).await;
+        match broken {
+            "position" => log.position = LogPosition(log.position.0 + 5),
+            _ => log.prev = Some(format!("{}-other", log.prev.unwrap())),
+        }
+        let frame = format::encode(Kind::Log, &log).unwrap();
+        let large = the_large_log_made(&cluster, &base, frame).await;
+        let backup = a_small_backup();
+        let shipper = shipper_of(&cluster, &backup);
+        let stalled = Stall::NotTheRowsHead {
+            position: large.position,
+        };
+        assert_eq!(
+            ship(&shipper, &cluster, 100).await,
+            Batch::Shipped {
+                through: Some(base.position),
+                stalled: Some(stalled)
+            },
+            "{broken}"
+        );
+        let timeline = shipper.timeline(cluster.committed().await.incarnation);
+        assert!(
+            backup.get(&timeline.link(large.position)).await.is_err(),
+            "{broken}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_commit_spilled_by_one_shipper_and_inline_by_another_is_one_commit() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    let large = the_large_log(&cluster, &base).await;
+    // Shipped spilled, into a small store, noting nothing.
+    let small = a_small_backup();
+    let (spilling, unnoting) = shipper_over_rows(&cluster, &small);
+    unnoting.unnoted.store(true, Ordering::SeqCst);
+    ship(&spilling, &cluster, 100).await;
+    // And again, as by a shipper that crashed before noting it: the same
+    // frames put again, and the same links found there.
+    let committed = cluster.committed().await.log_position;
+    assert_eq!(
+        ship(&spilling, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(committed),
+            stalled: None
+        }
+    );
+    let now = cluster.committed().await.incarnation;
+    let spilled = links(&small, &spilling.timeline(now))
+        .await
+        .remove(&large.position)
+        .unwrap();
+    assert_eq!(spilled.header.body, Body::Spilled);
+    // That link in a store a shipper would ship it inline to: the same
+    // commit, shipped.
+    let backup = a_backup();
+    put_link(&backup, &spilled.header, None).await;
+    let shipper = shipper_of(&cluster, &backup);
+    let committed = cluster.committed().await.log_position;
+    assert_eq!(
+        ship(&shipper, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(committed),
+            stalled: None
+        }
+    );
+}
+
 #[tokio::test]
 async fn above_its_base_a_link_that_differs_only_in_the_commit_before_it_is_a_fork() {
     let (cluster, _writer) = written().await;
@@ -1108,6 +1341,254 @@ async fn a_run_re_based_during_a_batch_is_neither_noted_nor_stalled_by_it() {
                 stalled: None
             },
             "{stalling}"
+        );
+    }
+}
+
+/// How much of a file has come from the primary and not yet gone into
+/// the backup store's upload: the most, ever.
+#[derive(Debug, Default)]
+struct InFlight {
+    yielded: AtomicUsize,
+    consumed: AtomicUsize,
+    most: AtomicUsize,
+}
+
+/// A primary store that hands a file over `chunk` bytes at a time, each
+/// only when it is asked for, noting how much is in flight before each.
+#[derive(Debug)]
+struct Chunked {
+    inner: Arc<dyn Blobs>,
+    chunk: usize,
+    flight: Arc<InFlight>,
+}
+
+#[async_trait]
+impl Blobs for Chunked {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        use futures::StreamExt;
+        let (chunk, flight) = (self.chunk, self.flight.clone());
+        futures::stream::once(self.inner.get(key))
+            .flat_map(move |file| {
+                let flight = flight.clone();
+                // A file of its own: what came of one before, read whole
+                // for a link inline, is not in flight with this one.
+                let came = flight.yielded.load(Ordering::SeqCst);
+                flight.consumed.store(came, Ordering::SeqCst);
+                let chunks: Vec<vellev_storage::Result<Bytes>> = match file {
+                    Ok(file) => (0..file.len())
+                        .step_by(chunk)
+                        .map(|at| Ok(file.slice(at..(at + chunk).min(file.len()))))
+                        .collect(),
+                    Err(error) => vec![Err(error)],
+                };
+                futures::stream::iter(chunks).map(move |part| {
+                    let (yielded, consumed) = (&flight.yielded, &flight.consumed);
+                    let now = yielded.load(Ordering::SeqCst) - consumed.load(Ordering::SeqCst);
+                    flight.most.fetch_max(now, Ordering::SeqCst);
+                    if let Ok(part) = &part {
+                        yielded.fetch_add(part.len(), Ordering::SeqCst);
+                    }
+                    part
+                })
+            })
+            .boxed()
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A backup store whose upload takes a part at a time, counting each as
+/// consumed as it takes it.
+#[derive(Debug)]
+struct Pulling {
+    inner: Arc<dyn Blobs>,
+    flight: Arc<InFlight>,
+}
+
+#[async_trait]
+impl Blobs for Pulling {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        self.inner.put_new(key, bytes).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        use futures::StreamExt;
+        let flight = self.flight.clone();
+        let taken = parts.map(move |part| {
+            if let Ok(part) = &part {
+                flight.consumed.fetch_add(part.len(), Ordering::SeqCst);
+            }
+            part
+        });
+        self.inner.put_parts(key, taken.boxed()).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_large_log_is_spilled_as_it_comes_never_held_whole() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    // The large log made larger: its writes twelve times over, 256 KiB or
+    // so, at its own position and on its own head.
+    let mut log = the_large_log_decoded(&cluster, &base).await;
+    let ops = log.ops.clone();
+    for _ in 0..11 {
+        log.ops.extend(ops.iter().cloned());
+    }
+    let frame = format::encode(Kind::Log, &log).unwrap();
+    assert!(frame.len() > 200 * 1024, "{}", frame.len());
+    let large = the_large_log_made(&cluster, &base, frame.clone()).await;
+    let flight = Arc::new(InFlight::default());
+    let primary: Arc<dyn Blobs> = Arc::new(Chunked {
+        inner: cluster.blobs.clone(),
+        chunk: 1024,
+        flight: flight.clone(),
+    });
+    let inner = backup_of(4096);
+    let backup: Arc<dyn Blobs> = Arc::new(Pulling {
+        inner: inner.clone(),
+        flight: flight.clone(),
+    });
+    let shipper = Shipper::new(
+        primary,
+        backup,
+        cluster.coordinator.clone(),
+        cluster.key.clone(),
+        lineage(),
+        cluster_id(),
+    );
+    let committed = cluster.committed().await;
+    let shipped = ship(&shipper, &cluster, 100).await;
+    let through = Some(committed.log_position);
+    assert_eq!(
+        shipped,
+        Batch::Shipped {
+            through,
+            stalled: None
+        }
+    );
+    // Spilled whole, and never more than a few parts of it in flight.
+    let timeline = shipper.timeline(committed.incarnation);
+    let link = links(&inner, &timeline)
+        .await
+        .remove(&large.position)
+        .unwrap();
+    assert_eq!(link.header.body, Body::Spilled);
+    assert_eq!(
+        inner.get(&timeline.frame(&large.head.0)).await.unwrap(),
+        frame
+    );
+    let most = flight.most.load(Ordering::SeqCst);
+    assert!(most <= 4 * 1024, "{most} bytes in flight");
+}
+
+/// A backup store whose uploads of keys holding `failing` land, and are
+/// answered as failed.
+#[derive(Debug)]
+struct LandsThenFails {
+    inner: Arc<dyn Blobs>,
+    failing: &'static str,
+}
+
+#[async_trait]
+impl Blobs for LandsThenFails {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        self.inner.put_new(key, bytes).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await?;
+        match key.contains(self.failing) {
+            true => Err(StorageError::Blob {
+                key: key.into(),
+                source: "its answer was lost".into(),
+            }),
+            false => Ok(()),
+        }
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_log_spill_refused_or_landed_and_failed_makes_no_link_and_ends_the_batch() {
+    for landed in [false, true] {
+        let (cluster, _writer) = written_large(64).await;
+        let base = begun(&cluster).await;
+        let large = the_large_log(&cluster, &base).await;
+        let inner = a_small_backup();
+        let failing = Box::leak(large.head.0.clone().into_boxed_str());
+        let backup: Arc<dyn Blobs> = match landed {
+            false => Arc::new(Failing {
+                inner: inner.clone(),
+                failing,
+            }),
+            true => Arc::new(LandsThenFails {
+                inner: inner.clone(),
+                failing,
+            }),
+        };
+        let shipper = shipper_of(&cluster, &backup);
+        let now = cluster.committed().await.incarnation;
+        assert!(shipper.ship_batch(now, 100).await.is_err(), "{landed}");
+        let timeline = shipper.timeline(now);
+        assert!(
+            inner.get(&timeline.link(large.position)).await.is_err(),
+            "{landed}"
+        );
+        let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+        assert_eq!(
+            (shipping.shipped, shipping.stalled),
+            (Some(base.position), None),
+            "{landed}"
         );
     }
 }
