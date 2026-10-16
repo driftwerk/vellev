@@ -1380,6 +1380,10 @@ impl Blobs for Chunked {
         futures::stream::once(self.inner.get(key))
             .flat_map(move |file| {
                 let flight = flight.clone();
+                // A file of its own: what came of one before, read whole
+                // for a link inline, is not in flight with this one.
+                let came = flight.yielded.load(Ordering::SeqCst);
+                flight.consumed.store(came, Ordering::SeqCst);
                 let chunks: Vec<vellev_storage::Result<Bytes>> = match file {
                     Ok(file) => (0..file.len())
                         .step_by(chunk)
