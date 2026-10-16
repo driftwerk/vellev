@@ -2471,8 +2471,8 @@ async fn a_base_below_the_hold_or_its_row_or_a_clean_is_refused(h: &dyn Harness)
         &c.record_base(&key, now, &ship_base(2, 3, "m3")).await,
         Stale::HoldAbove
     ));
-    // The row at the base is gone since the hold, as nothing keeps it
-    // until forget_history honours the hold.
+    // The row at the base kept by forget_history since the hold, which it
+    // honours: the base is recorded.
     let key = registered(h).await;
     let now = incarnation_of(h, &key).await;
     committed_heads(h, &key, &[(1, "l1"), (2, "m2"), (3, "l3")]).await;
@@ -2482,22 +2482,42 @@ async fn a_base_below_the_hold_or_its_row_or_a_clean_is_refused(h: &dyn Harness)
     h.pass(&key, 2 * HOUR).await;
     committed_heads(h, &key, &[(4, "l4")]).await;
     c.forget_history(&key, HOUR).await.unwrap();
-    assert!(stale(
-        &c.record_base(&key, now, &ship_base(2, 2, "m2")).await,
-        Stale::NoRowAtBase
-    ));
-    // So with the checkpoint's own row still there: the base's alone gone.
+    let kept = ship_base(2, 2, "m2");
+    assert_eq!(
+        c.record_base(&key, now, &kept).await.unwrap(),
+        based(now, 1, &kept)
+    );
+    // No row at the base: none was ever committed there, positions
+    // skipping as a restore's do, the checkpoint's own row there.
     let key = registered(h).await;
     let now = incarnation_of(h, &key).await;
-    committed_heads(h, &key, &[(1, "l1"), (2, "l2"), (3, "m3")]).await;
-    c.hold_for_shipping(&key, now, LogPosition(3))
+    committed_heads(h, &key, &[(1, "l1"), (2, "l2"), (5, "m5")]).await;
+    c.hold_for_shipping(&key, now, LogPosition(5))
+        .await
+        .unwrap();
+    assert!(stale(
+        &c.record_base(&key, now, &ship_base(3, 5, "m5")).await,
+        Stale::NoRowAtBase
+    ));
+    // No row at the base: forgotten as the floor of a run that had shipped
+    // past it allowed, before a base was raised to it.
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(h, &key, &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "m4")]).await;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    c.record_base(&key, now, &ship_base(1, 2, "m2"))
+        .await
+        .unwrap();
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(3))
         .await
         .unwrap();
     h.pass(&key, 2 * HOUR).await;
-    committed_heads(h, &key, &[(4, "l4")]).await;
+    committed_heads(h, &key, &[(5, "l5")]).await;
     c.forget_history(&key, HOUR).await.unwrap();
     assert!(stale(
-        &c.record_base(&key, now, &ship_base(2, 3, "m3")).await,
+        &c.record_base(&key, now, &ship_base(3, 4, "m4")).await,
         Stale::NoRowAtBase
     ));
     // A clean recorded above the checkpoint, as one may until clean_below
@@ -2941,6 +2961,149 @@ async fn unshipped_partitions_are_given_in_turn_by_key(h: &dyn Harness) {
     assert_eq!(c.unshipped(None, 10).await.unwrap(), runs[1..]);
 }
 
+// DW-668, PR 5: forget_history keeps what shipping needs. From the floor
+// of the current incarnation's run, the position after what it shipped,
+// else its base, else its hold, no commit row is forgotten, whatever the
+// restore window lets go; with no hold, it forgets as it always has.
+
+/// What `forget_history` with a window of an hour leaves of the commits 1
+/// to 5 (3 and 5 checkpoints) made two hours ago and 6 made since, once
+/// `ship` has done what it does to shipping before it runs; and how many
+/// it said it forgot.
+async fn left_after_forgetting(
+    h: &dyn Harness,
+    ship: impl for<'a> FnOnce(
+        &'a dyn Coordinator,
+        &'a PartitionKey,
+        Incarnation,
+    ) -> futures::future::BoxFuture<'a, ()>,
+) -> (Vec<u64>, u64) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(
+        h,
+        &key,
+        &[(1, "l1"), (2, "l2"), (3, "m3"), (4, "l4"), (5, "m5")],
+    )
+    .await;
+    ship(c, &key, now).await;
+    h.pass(&key, 2 * HOUR).await;
+    committed_heads(h, &key, &[(6, "l6")]).await;
+    let forgot = c.forget_history(&key, HOUR).await.unwrap();
+    (commits_of(h, &key, now, 0, 100).await.unwrap(), forgot)
+}
+
+async fn forget_history_keeps_every_row_from_the_floor_shipping_needs(h: &dyn Harness) {
+    use futures::FutureExt;
+    // No hold: as ever, the newest commit before the window, and those in it.
+    let none = left_after_forgetting(h, |_, _, _| async {}.boxed()).await;
+    assert_eq!(none, (vec![5, 6], 4), "no hold");
+    // Held, no base: from the hold, the lowest row there when it was taken.
+    let held = left_after_forgetting(h, |c, key, now| {
+        async move {
+            c.hold_for_shipping(key, now, LogPosition(3)).await.unwrap();
+        }
+        .boxed()
+    })
+    .await;
+    assert_eq!(held, (vec![1, 2, 3, 4, 5, 6], 0), "held, no base");
+    // Based at 3, nothing shipped: from the base.
+    let based = left_after_forgetting(h, |c, key, now| {
+        async move {
+            c.hold_for_shipping(key, now, LogPosition(3)).await.unwrap();
+            c.record_base(key, now, &ship_base(3, 3, "m3"))
+                .await
+                .unwrap();
+        }
+        .boxed()
+    })
+    .await;
+    assert_eq!(based, (vec![3, 4, 5, 6], 2), "based, nothing shipped");
+    // Based at 3, shipped to 3: from the commit after it.
+    let shipped = left_after_forgetting(h, |c, key, now| {
+        async move {
+            c.hold_for_shipping(key, now, LogPosition(3)).await.unwrap();
+            c.record_base(key, now, &ship_base(3, 3, "m3"))
+                .await
+                .unwrap();
+            c.note_shipped(key, now, LogPosition(3), LogPosition(3))
+                .await
+                .unwrap();
+        }
+        .boxed()
+    })
+    .await;
+    assert_eq!(shipped, (vec![4, 5, 6], 3), "based and shipped");
+    // Shipped past the newest commit before the window: as with no hold,
+    // the window keeps what shipping no longer needs.
+    let caught_up = left_after_forgetting(h, |c, key, now| {
+        async move {
+            c.hold_for_shipping(key, now, LogPosition(3)).await.unwrap();
+            c.record_base(key, now, &ship_base(3, 3, "m3"))
+                .await
+                .unwrap();
+            c.note_shipped(key, now, LogPosition(3), LogPosition(5))
+                .await
+                .unwrap();
+        }
+        .boxed()
+    })
+    .await;
+    assert_eq!(caught_up, (vec![5, 6], 4), "shipped to the window");
+    // A run reset by a raised base, nothing of it shipped: from its base,
+    // not from what the run before shipped.
+    let reset = left_after_forgetting(h, |c, key, now| {
+        async move {
+            c.hold_for_shipping(key, now, LogPosition(3)).await.unwrap();
+            c.record_base(key, now, &ship_base(3, 3, "m3"))
+                .await
+                .unwrap();
+            c.note_shipped(key, now, LogPosition(3), LogPosition(3))
+                .await
+                .unwrap();
+            c.record_base(key, now, &ship_base(5, 5, "m5"))
+                .await
+                .unwrap();
+        }
+        .boxed()
+    })
+    .await;
+    assert_eq!(reset, (vec![5, 6], 4), "a run reset by a raised base");
+}
+
+async fn what_forget_history_keeps_for_shipping_lets_the_floor_rise_with_what_is_shipped(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(h, &key, &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "l4")]).await;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    c.record_base(&key, now, &ship_base(1, 2, "m2"))
+        .await
+        .unwrap();
+    h.pass(&key, 2 * HOUR).await;
+    committed_heads(h, &key, &[(5, "l5")]).await;
+    assert_eq!(c.forget_history(&key, HOUR).await.unwrap(), 0);
+    assert_eq!(
+        commits_of(h, &key, now, 0, 10).await.unwrap(),
+        [1, 2, 3, 4, 5]
+    );
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(2))
+        .await
+        .unwrap();
+    assert_eq!(c.forget_history(&key, HOUR).await.unwrap(), 2);
+    assert_eq!(commits_of(h, &key, now, 0, 10).await.unwrap(), [3, 4, 5]);
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(5))
+        .await
+        .unwrap();
+    assert_eq!(c.forget_history(&key, HOUR).await.unwrap(), 1);
+    assert_eq!(commits_of(h, &key, now, 0, 10).await.unwrap(), [4, 5]);
+}
+
 async fn ping_succeeds(h: &dyn Harness) {
     h.coordinator().ping().await.unwrap();
 }
@@ -3041,6 +3204,8 @@ conformance! {
     the_commits_of_another_incarnation_are_refused,
     a_run_is_unshipped_while_commits_lie_above_what_it_shipped,
     unshipped_partitions_are_given_in_turn_by_key,
+    forget_history_keeps_every_row_from_the_floor_shipping_needs,
+    what_forget_history_keeps_for_shipping_lets_the_floor_rise_with_what_is_shipped,
 }
 
 /// The test database's connection options.
@@ -3730,6 +3895,202 @@ async fn ship_locked(
         .await
         .unwrap();
     locked
+}
+
+/// DW-668, #81 review B1: a base raised over a run that had shipped lowers
+/// the floor, from what the run shipped down to the new base; so it waits
+/// for a forget_history under way, and then, the rows it would base on
+/// gone, is refused. Raised without the lock, it saw the rows the delete
+/// had yet to commit, was recorded, and was left with none of them.
+#[tokio::test]
+async fn postgres_a_base_raised_while_history_is_forgotten_waits_and_is_refused_its_rows_gone() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(
+        &pg,
+        &key,
+        &[
+            (1, "l1"),
+            (2, "m2"),
+            (3, "l3"),
+            (4, "m4"),
+            (5, "l5"),
+            (6, "l6"),
+        ],
+    )
+    .await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let first = ship_base(1, 2, "m2");
+    pg.coordinator.record_base(&key, now, &first).await.unwrap();
+    pg.coordinator
+        .note_shipped(&key, now, LogPosition(1), LogPosition(5))
+        .await
+        .unwrap();
+    // forget_history under way, as it runs: the lock, then its delete of
+    // what its floor of 6 lets go.
+    let mut forgetting = ship_locked(&pg.pool, &key).await;
+    sqlx::query("DELETE FROM vellev.commits WHERE tenant = $1 AND partition = $2 AND position < 6")
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&mut *forgetting)
+        .await
+        .unwrap();
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let raising = tokio::spawn({
+        let key = key.clone();
+        async move { other.record_base(&key, now, &ship_base(3, 4, "m4")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !raising.is_finished(),
+        "the raise waits for the shipping lock"
+    );
+    forgetting.commit().await.unwrap();
+    let refused = raising.await.unwrap();
+    assert!(stale(&refused, Stale::NoRowAtBase), "{refused:?}");
+    let shipping = pg.coordinator.shipping(&key).await.unwrap();
+    assert_eq!(shipping.base, Some(first));
+    assert_eq!(shipping.shipped, Some(LogPosition(5)));
+}
+
+/// DW-668, #81 review: the floor is the current incarnation's alone. The
+/// rows of one removed go as they always have, a hold on the one made
+/// again keeping none of them.
+#[tokio::test]
+async fn postgres_a_hold_keeps_none_of_a_removed_incarnations_rows() {
+    let Some(pg) = Pg::connect().await else {
+        return;
+    };
+    let c = &pg.coordinator;
+    let key = registered(&pg).await;
+    let old = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "l2"), (3, "l3")]).await;
+    assert!(c.remove(&key).await.unwrap());
+    purge(c, &key.tenant).await;
+    c.register(&key).await.unwrap();
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "n1"), (2, "n2")]).await;
+    c.hold_for_shipping(&key, now, LogPosition(0))
+        .await
+        .unwrap();
+    let old_rows = || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vellev.commits
+             WHERE tenant = $1 AND partition = $2 AND incarnation = $3",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(i64::try_from(old.0).unwrap())
+        .fetch_one(&pg.pool)
+    };
+    assert_eq!(
+        old_rows().await.unwrap(),
+        3,
+        "the removed incarnation's rows are there"
+    );
+    c.forget_history(&key, HOUR).await.unwrap();
+    assert_eq!(old_rows().await.unwrap(), 0);
+    assert_eq!(commits_of(&pg, &key, now, 0, 10).await.unwrap(), [1, 2]);
+}
+
+/// DW-668, PR 5: forget_history waits for a hold being taken under the
+/// shipping lock, and then keeps every row from it: its delete is a
+/// statement after its own taking of the lock, which sees the hold.
+#[tokio::test]
+async fn postgres_forget_history_waits_for_a_hold_being_taken_and_keeps_what_it_holds() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "m2"), (3, "l3")]).await;
+    pg.pass(&key, 2 * HOUR).await;
+    committed_heads(&pg, &key, &[(4, "l4")]).await;
+    // The hold, as hold_for_shipping takes it: the lock, then its update.
+    let mut holding = ship_locked(&pg.pool, &key).await;
+    sqlx::query(
+        "UPDATE vellev.partitions SET ship_hold_from = 1, ship_cap = 2
+         WHERE tenant = $1 AND partition = $2",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .execute(&mut *holding)
+    .await
+    .unwrap();
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let forgetting = tokio::spawn({
+        let key = key.clone();
+        async move { other.forget_history(&key, HOUR).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !forgetting.is_finished(),
+        "forget_history waits for the lock"
+    );
+    holding.commit().await.unwrap();
+    assert_eq!(forgetting.await.unwrap().unwrap(), 0);
+    assert_eq!(
+        commits_of(&pg, &key, now, 0, 10).await.unwrap(),
+        [1, 2, 3, 4]
+    );
+}
+
+/// DW-668, PR 5: a hold and forget_history made at once, each from its own
+/// connection, in either order: every row from the hold is still there.
+#[tokio::test]
+async fn postgres_a_hold_and_forget_history_at_once_leave_every_row_from_the_hold() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        let key = registered(&pg).await;
+        let now = incarnation_of(&pg, &key).await;
+        committed_heads(&pg, &key, &[(1, "l1"), (2, "m2"), (3, "l3")]).await;
+        pg.pass(&key, 2 * HOUR).await;
+        committed_heads(&pg, &key, &[(4, "l4")]).await;
+        let (held, forgot) = tokio::join!(
+            pg.coordinator.hold_for_shipping(&key, now, LogPosition(2)),
+            other.forget_history(&key, HOUR),
+        );
+        let (from, _) = (held.unwrap().hold_from.unwrap().0, forgot.unwrap());
+        let left = commits_of(&pg, &key, now, 0, 10).await.unwrap();
+        let expected: Vec<u64> = (from..=4).collect();
+        assert_eq!(left, expected, "held from {from}");
+        // Either the hold came first, from 1, or the forgetting did, and
+        // the hold is from the lowest row it left.
+        assert!(from == 1 || from == 3, "held from {from}");
+    }
+}
+
+/// DW-668, PR 5: forget_removed takes no shipping lock: it deletes only rows
+/// of incarnations no longer registered, which no hold covers.
+#[tokio::test]
+async fn postgres_forget_removed_takes_no_shipping_lock() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    committed_heads(&pg, &key, &[(1, "l1")]).await;
+    let locked = ship_locked(&pg.pool, &key).await;
+    let forgetting = pg.coordinator.forget_removed(&key, None, 1_000);
+    tokio::time::timeout(Duration::from_secs(5), forgetting)
+        .await
+        .expect("forget_removed does not wait for the shipping lock")
+        .unwrap();
+    drop(locked);
 }
 
 /// DW-668, amendment I: a hold waits for whoever holds the shipping lock,
