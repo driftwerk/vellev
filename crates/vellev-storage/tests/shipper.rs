@@ -941,3 +941,33 @@ async fn a_link_said_to_be_there_and_not_there_when_read_is_created_again_a_few_
     let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
     assert_eq!((shipping.shipped, shipping.stalled), (None, None));
 }
+
+#[tokio::test]
+async fn a_checkpoint_after_a_skip_is_made_on_the_row_before_it_not_the_position_before() {
+    // A checkpoint whose position skips past the row before it, as a
+    // restore's does: here the log before it, gone from the rows.
+    let (cluster, writer) = written().await;
+    let base = begun(&cluster).await;
+    writer.flush().await.unwrap();
+    let after = rows_after(&cluster, &base).await;
+    let (skipped, checkpoint) = (&after[1], &after[2]);
+    assert!(checkpoint.head.0.contains("/manifest/"), "{checkpoint:?}");
+    let backup = a_backup();
+    let (shipper, rows) = shipper_over_rows(&cluster, &backup);
+    rows.rows.lock().unwrap().insert(skipped.position, None);
+    let shipped = ship(&shipper, &cluster, 100).await;
+    let through = Some(checkpoint.position);
+    assert_eq!(
+        shipped,
+        Batch::Shipped {
+            through,
+            stalled: None
+        }
+    );
+    let now = cluster.committed().await.incarnation;
+    let links = links(&backup, &shipper.timeline(now)).await;
+    assert!(!links.contains_key(&skipped.position));
+    let before = links[&checkpoint.position].header.before.clone().unwrap();
+    assert_eq!(before.position, after[0].position);
+    assert_eq!(before.sum, links[&after[0].position].header.sum);
+}

@@ -2178,6 +2178,27 @@ impl World {
             }
             links.insert(header.position, (header, link.frame));
         }
+        // Every link is made on the commit recorded just before it, as
+        // its link has it: positions skip at a restore, and `before` with
+        // them.
+        for (at, (header, _)) in &links {
+            let Some(before) = &header.before else {
+                continue;
+            };
+            let just_before = (heads.iter())
+                .map(|head| head.position)
+                .filter(|position| position < at)
+                .max();
+            let summed = links
+                .get(&before.position)
+                .is_some_and(|(earlier, _)| earlier.sum == before.sum);
+            check(Some(before.position) == just_before && summed, || {
+                format!(
+                    "the link at {at:?} is made on {:?}, and the commit just before it is {just_before:?}",
+                    before.position
+                )
+            })?;
+        }
         let (Some(watermark), Some(base)) = (shipping.shipped, shipping.base) else {
             return Ok(());
         };
