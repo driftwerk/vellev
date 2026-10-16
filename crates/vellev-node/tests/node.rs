@@ -8121,3 +8121,80 @@ async fn a_caller_of_a_restore_waits_for_three_others_tries_at_most() {
     assert_eq!(tries + running, 5, "{told:?}");
     assert!(tries <= 4 && running >= 1, "{tries} tries: {told:?}");
 }
+
+/// Every vectors file under `dir`, by its path there, with the file it is
+/// on its disk.
+#[cfg(unix)]
+fn vectors_files(dir: &std::path::Path) -> Vec<(String, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut found = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(at) = dirs.pop() {
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|x| x == "vectors") {
+                let name = path.strip_prefix(dir).unwrap().display().to_string();
+                found.push((name, std::fs::metadata(&path).unwrap().ino()));
+            }
+        }
+    }
+    found
+}
+
+/// DW-680: a node restoring a tenant from its own backup restores through
+/// the store its writers are given, the cache itself, with nothing between
+/// that does not pass on [`Blobs::link_local`]: each vectors file of a
+/// segment the live state holds is given to its copy's new key as a link
+/// of the copy on local disk, not fetched again.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_node_restoring_a_tenant_from_its_own_backup_links_its_vectors_on_local_disk() {
+    let cluster = Cluster::new();
+    let cache = tempfile::tempdir().unwrap();
+    let cached = Arc::new(CachedBlobs::new(cluster.store.clone(), cache.path()));
+    let node = Node::new(
+        cluster.coordinator.clone(),
+        cached,
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            backups: Some(backup_store()),
+            ..cluster.settings()
+        },
+    );
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let tenant_now = node.tenant(&acme).await.unwrap();
+    tenant_now
+        .write(vec![
+            schema(EmbeddingProvider::None),
+            note(1, "fox", Some(vec![1.0, 0.0])),
+            note(2, "hen", Some(vec![0.0, 1.0])),
+        ])
+        .await
+        .unwrap();
+    tenant_now.flush().await.unwrap();
+    drop(tenant_now);
+    let backup = node.back_up(&acme).await.unwrap();
+    let before = vectors_files(cache.path());
+    assert!(!before.is_empty(), "the tenant's vectors are on local disk");
+
+    node.restore_backup(&acme, backup.id, RequestId::generate())
+        .await
+        .unwrap();
+
+    let after = vectors_files(cache.path());
+    let restored: Vec<_> = after
+        .iter()
+        .filter(|(name, _)| name.contains("-restored."))
+        .collect();
+    assert_eq!(restored.len(), before.len(), "{after:?}");
+    for (name, inode) in restored {
+        assert!(
+            before.iter().any(|(_, old)| old == inode),
+            "{name} is a copy of its own, not a link"
+        );
+    }
+    assert_eq!(notes_held(&node).await, [true, true]);
+}
