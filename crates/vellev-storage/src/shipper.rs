@@ -8,21 +8,29 @@
 //!    nothing unless it is of that incarnation, has a base, and has not
 //!    stalled: so a stale shipper, of a run since re-based or of an
 //!    incarnation since removed, stops;
-//! 2. takes the commits after what the run has shipped (or from its base)
+//! 2. on the first batch of a run this shipper ships (its start, a
+//!    re-base, or a handover to it), asks the backup store in one request
+//!    whether it holds a link past the committed position, and stalls the
+//!    run naming T8 if it does (bootstrap note C). It is once a run for
+//!    each shipper: the node keeps one for each partition it holds, and
+//!    makes a new one on a handover or a restart, which checks again; a
+//!    check that fails for the store or the coordinator is made again on
+//!    the next batch. The shipper never lists the store;
+//! 3. takes the commits after what the run has shipped (or from its base)
 //!    in order, positions skipping where they do (a restore commits past
 //!    the current position);
-//! 3. ships each as a link: its frame read from the primary under the
+//! 4. ships each as a link: its frame read from the primary under the
 //!    row's head, checked by its CRC and decoded to the row's position
 //!    (and, for a log, made on the row before), its header made from the
 //!    row (its time, by the database's clock) and the key (its
 //!    generation); a checkpoint's files first, each copied to the backup
 //!    store and summed on the way, and only then its link (I3);
-//! 4. creates each link once (`put_new`): a link already there of the same
+//! 5. creates each link once (`put_new`): a link already there of the same
 //!    commit, every field but `body` equal, is shipped; at the run's own
 //!    base, one that differs only in `before`, its own `None`, is too
 //!    (bootstrap note C); anything else is a fork, and stalls the run
 //!    naming the fields that differ;
-//! 5. notes the watermark at the last position it shipped.
+//! 6. notes the watermark at the last position it shipped.
 //!
 //! A frame too large to go inline, with its link's header, is spilled
 //! (amendment 1, A2): put first under `frames/{key}` beside the links, and
@@ -57,12 +65,19 @@ use crate::link::{self, Before, Body, Head, Header, Needed, Sum, Timeline, Unlin
 use crate::prefix::{Found, Prefix};
 use crate::{Result, StorageError};
 
+/// How many times the backup store is asked what is past the committed
+/// position while links keep being made up to it as it is read.
+const PAST_TRIES: usize = 3;
+
 /// How many times a link the store said was there, and was not when read
 /// back, is created again: another create of it was under way and failed.
 const CREATE_TRIES: usize = 3;
 
-/// Why a run of shipping stopped. Each is written as the run's stall,
-/// for an operator: none passes by being asked again.
+/// Why a run of shipping stopped: none passes by being asked again. Each
+/// is written as the run's stall, for an operator, but for the node's own
+/// verdicts ([`Stall::is_local`]: `NotCreated`, `NotListed`,
+/// `NewerVersion`), which stop
+/// this node shipping the run and leave the run for another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stall {
     /// A link at `position` is of another commit than this one: the
@@ -73,10 +88,15 @@ pub enum Stall {
     },
     /// No commit row is at the run's base, where a run's first link is.
     BaseRowMissing { position: LogPosition },
-    /// The link at `position` cannot be created in the backup store.
+    /// The link at `position` cannot be created in this node's backup
+    /// store: a verdict of the node's own ([`Self::is_local`]).
     NotCreated { position: LogPosition, why: String },
     /// A committed head, or a file a checkpoint lists, is not in the
-    /// primary.
+    /// primary. The run's stall, not the node's: a cache of the primary
+    /// reads through to the store when it has no copy of its own, so this
+    /// is the store's answer, and a file lost to every node is seen as
+    /// such. (A node with a copy cached of a file a clean took ships it
+    /// where one without stalls; the clean floor of PR 6 ends that.)
     PrimaryMissing { key: String },
     /// A committed head's frame, or a link, does not hold together.
     Corrupt { key: String, why: String },
@@ -89,6 +109,38 @@ pub enum Stall {
     /// The link of what the run has shipped up to is not in the backup
     /// store.
     LinkMissing { position: LogPosition },
+    /// `key`, a head or a link, is of a format version past any this
+    /// release reads: a verdict of the node's own ([`Self::is_local`]),
+    /// as a newer node can read it.
+    NewerVersion {
+        key: String,
+        found: u16,
+        supported: u16,
+    },
+    /// The backup store holds `key`, past the position committed: the
+    /// coordinator may have been put back to an older state of its own
+    /// (threat T8), and what it now commits would fork what was shipped.
+    StoreAhead { key: String, committed: LogPosition },
+    /// This node's backup store cannot say in one request whether anything
+    /// is past the position committed: a verdict of the node's own
+    /// ([`Self::is_local`]).
+    NotListed { why: String },
+}
+
+impl Stall {
+    /// Whether this is a verdict of the node's own, on its own backup
+    /// store or how it is set up, and not on what the run holds: the
+    /// largest file its store creates, which follows its part size, or
+    /// whether its store lists from a key. Another node, set up otherwise,
+    /// may ship the run, so such a verdict is never written as the run's
+    /// stall (bootstrap note, section M): the batch says
+    /// [`Batch::Stopped`], and the node stops shipping the run itself.
+    pub fn is_local(&self) -> bool {
+        matches!(
+            self,
+            Stall::NotCreated { .. } | Stall::NotListed { .. } | Stall::NewerVersion { .. }
+        )
+    }
 }
 
 impl fmt::Display for Stall {
@@ -124,6 +176,24 @@ impl fmt::Display for Stall {
                 "the commit at position {} was made before the commit before it",
                 position.0
             ),
+            Stall::StoreAhead { key, committed } => write!(
+                f,
+                "T8: the backup store holds {key}, past the committed position {}: \
+                 the coordinator may have been restored to an older state of its own",
+                committed.0
+            ),
+            Stall::NotListed { why } => write!(
+                f,
+                "the backup store cannot say what is past the committed position: {why}"
+            ),
+            Stall::NewerVersion {
+                key,
+                found,
+                supported,
+            } => write!(
+                f,
+                "{key} is of version {found}; this release reads {supported} at most"
+            ),
             Stall::LinkMissing { position } => write!(
                 f,
                 "the link at position {}, shipped, is not in the backup store",
@@ -155,6 +225,15 @@ pub enum Batch {
         through: Option<LogPosition>,
         stalled: Option<Stall>,
     },
+    /// Shipped up to `through`, if anything, and found it cannot ship on,
+    /// for a reason of its own node's: its backup store or how it is set
+    /// up ([`Stall::is_local`]). The run is not stalled, as another node
+    /// may ship it: this node stops shipping it, raises an alarm and says
+    /// so in its status, until it is set up otherwise.
+    Stopped {
+        through: Option<LogPosition>,
+        why: Stall,
+    },
 }
 
 /// Ships one partition's history to the backup store.
@@ -166,6 +245,9 @@ pub struct Shipper {
     key: PartitionKey,
     lineage: Lineage,
     cluster: ClusterId,
+    /// The run whose backup store this shipper has found nothing past the
+    /// committed position in, by its incarnation and base.
+    checked: Arc<Mutex<Option<(Incarnation, LogPosition)>>>,
 }
 
 impl Shipper {
@@ -186,6 +268,7 @@ impl Shipper {
             key,
             lineage,
             cluster,
+            checked: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -219,6 +302,18 @@ impl Shipper {
         // What the run had shipped as this batch began: its stall is taken
         // only if it still has (`Coordinator::stall_shipping`).
         let seen = shipping.shipped;
+        // Once a run, on its first batch here: on a run's start, a re-base
+        // or a handover to this shipper (bootstrap note C).
+        let run = (incarnation, base.position);
+        if *self.checked.lock().expect("never poisoned") != Some(run) {
+            match self.past_committed(&timeline).await? {
+                Past::Nothing => *self.checked.lock().expect("never poisoned") = Some(run),
+                Past::OtherIncarnation => return Ok(Batch::Idle(Idle::OtherIncarnation)),
+                Past::Stall(stall) => {
+                    return self.stall(incarnation, &base, seen, None, stall).await
+                }
+            }
+        }
         let mut last = match shipping.shipped {
             None => None,
             Some(shipped) => match self.shipped(&timeline, shipped).await? {
@@ -264,6 +359,69 @@ impl Shipper {
         })
     }
 
+    /// Whether the backup store holds anything of `timeline` past the
+    /// position committed, in one request each time: the committed
+    /// position read, the store asked for the first link past it, and, if
+    /// it has one, the committed position read again. A link is made only
+    /// of a commit made before it, so one past what is committed after the
+    /// store was asked is past anything committed then: the store is ahead
+    /// of the coordinator (T8). One at or below it was made since the
+    /// first reading, and the store is asked again from there, a few times
+    /// at most while commits keep pace.
+    async fn past_committed(&self, timeline: &Timeline) -> Result<Past> {
+        let links = format!("{}links/", timeline.prefix());
+        let Some(mut committed) = self.committed(timeline.incarnation).await? else {
+            return Ok(Past::OtherIncarnation);
+        };
+        for _ in 0..PAST_TRIES {
+            let after = timeline.link(committed);
+            let listed = match self.backup.list_from(&links, &after, 1).await {
+                Ok(listed) => listed,
+                Err(StorageError::NotListed { reason, .. }) => {
+                    return Ok(Past::Stall(Stall::NotListed { why: reason }))
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(past) = listed.into_iter().next() else {
+                return Ok(Past::Nothing);
+            };
+            let Some(now) = self.committed(timeline.incarnation).await? else {
+                return Ok(Past::OtherIncarnation);
+            };
+            let position = past
+                .key
+                .strip_prefix(&links)
+                .and_then(|name| name.strip_suffix(".link"))
+                .filter(|digits| digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|digits| digits.parse().ok())
+                .map(LogPosition);
+            match position {
+                Some(position) if position <= now => committed = now,
+                _ => {
+                    return Ok(Past::Stall(Stall::StoreAhead {
+                        key: past.key,
+                        committed: now,
+                    }))
+                }
+            }
+        }
+        Err(StorageError::Blob {
+            key: links,
+            source: "links kept being made past the committed position as it was read; \
+                     checked again on the next batch"
+                .into(),
+        })
+    }
+
+    /// The position committed to the partition's incarnation
+    /// `incarnation`, or none if it is of another now.
+    async fn committed(&self, incarnation: Incarnation) -> Result<Option<LogPosition>> {
+        let committed = self.coordinator.committed(&self.key).await?;
+        Ok(committed
+            .filter(|committed| committed.incarnation == incarnation)
+            .map(|committed| committed.log_position))
+    }
+
     /// Note the run shipped up to `through`, if anything.
     async fn note(
         &self,
@@ -290,6 +448,15 @@ impl Shipper {
         through: Option<LogPosition>,
         stall: Stall,
     ) -> Result<Batch> {
+        if stall.is_local() {
+            // This node's verdict, not the run's: what it shipped noted,
+            // and the run left for a node that can ship it.
+            self.note(incarnation, base, through).await?;
+            return Ok(Batch::Stopped {
+                through,
+                why: stall,
+            });
+        }
         let why = stall.to_string();
         self.coordinator
             .stall_shipping(&self.key, incarnation, base.position, seen, through, &why)
@@ -315,10 +482,7 @@ impl Shipper {
         };
         Ok(match link::decode(&at, &bytes) {
             Ok(link) => Ok(Made::of(&link.header)),
-            Err(error) => Err(Stall::Corrupt {
-                key: at,
-                why: why(error),
-            }),
+            Err(error) => Err(unreadable(at, error)),
         })
     }
 
@@ -461,12 +625,7 @@ impl Shipper {
         };
         let stored = match decode_head(key, &frame) {
             Ok(stored) => stored,
-            Err(error) => {
-                return Ok(Err(Stall::Corrupt {
-                    key: key.clone(),
-                    why: why(error),
-                }))
-            }
+            Err(error) => return Ok(Err(unreadable(key.clone(), error))),
         };
         let manifest = match &stored {
             Stored::Log(log) => {
@@ -569,10 +728,7 @@ impl Shipper {
                 let mut spilling = spilling.lock().expect("spilling never panics");
                 let framed = std::mem::take(&mut spilling.framed);
                 if let Err(error) = framed.came(&expected.key, Kind::Log) {
-                    spilling.stall = Some(Stall::Corrupt {
-                        key: expected.key.clone(),
-                        why: why(error),
-                    });
+                    spilling.stall = Some(unreadable(expected.key.clone(), error));
                     return Some(Err(given_up(&expected.key)));
                 }
                 if let Some(prefix) = spilling.prefix.take() {
@@ -642,12 +798,7 @@ impl Shipper {
             };
             let theirs = match link::decode(&at, &there) {
                 Ok(theirs) => theirs.header,
-                Err(error) => {
-                    return Ok(Err(Stall::Corrupt {
-                        key: at,
-                        why: why(error),
-                    }))
-                }
+                Err(error) => return Ok(Err(unreadable(at, error))),
             };
             let fields = header.differs(&theirs);
             let at_base = position == base.position;
@@ -763,6 +914,25 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Why the run stops over `key`, which could not be read as it should:
+/// a version past this release's is this node's own verdict, a newer
+/// node reading it; anything else is the file's, and the run's.
+fn unreadable(key: String, error: StorageError) -> Stall {
+    match error {
+        StorageError::UnsupportedVersion {
+            found, supported, ..
+        } => Stall::NewerVersion {
+            key,
+            found,
+            supported,
+        },
+        error => Stall::Corrupt {
+            key,
+            why: why(error),
+        },
+    }
+}
+
 /// What makes a file corrupt, without the key a stall names already.
 fn why(error: StorageError) -> String {
     match error {
@@ -798,10 +968,7 @@ impl Expected {
                     position: self.position,
                 })
             }
-            Err(error) => Some(Stall::Corrupt {
-                key: self.key.clone(),
-                why: why(error),
-            }),
+            Err(error) => Some(unreadable(self.key.clone(), error)),
         }
     }
 }
@@ -856,4 +1023,12 @@ fn not_linkable(position: LogPosition, unlinkable: Unlinkable) -> Stall {
         }
     };
     Stall::NotCreated { position, why }
+}
+
+/// What the backup store holds past the committed position.
+enum Past {
+    Nothing,
+    /// The partition is of another incarnation now.
+    OtherIncarnation,
+    Stall(Stall),
 }

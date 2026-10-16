@@ -182,6 +182,7 @@ fn code(error: &StorageError) -> Code {
         E::Missing { .. }
         | E::Corrupt { .. }
         | E::NotCreated { .. }
+        | E::NotListed { .. }
         | E::UnusableRecords { .. }
         | E::UnsupportedVersion { .. }
         | E::Exhausted(_)

@@ -91,6 +91,26 @@ pub trait Blobs: fmt::Debug + Send + Sync {
             .await
             .map_err(|_| unanswered(prefix, each))?
     }
+    /// Up to `limit` files whose keys start with `prefix` and come after
+    /// `after`, byte by byte, never `after` itself, in one request: so that
+    /// whether anything is past a key is known without listing what is
+    /// before it. A store that lists in key order, as S3 and one in memory
+    /// do, gives the first of them; one on local disk gives files after
+    /// `after` in no order, walking the directory to find them. S3 asks
+    /// for them from `after` in one request; a store that cannot, as S3
+    /// Express, one in memory and one on local disk, lists under `prefix`
+    /// and leaves out what is not after `after`: what it gives is the
+    /// same, in more than one request, or longer, for a large prefix.
+    ///
+    /// By default refused, with [`StorageError::NotListed`]: a store that
+    /// listed everything to find what is past a key would take as long as
+    /// the listing, unseen.
+    async fn list_from(&self, prefix: &str, _after: &str, _limit: usize) -> Result<Vec<Listed>> {
+        Err(StorageError::NotListed {
+            prefix: prefix.to_string(),
+            reason: "this store does not list from a key in one request".into(),
+        })
+    }
     /// Remove a file; one that is not there is no error.
     async fn delete(&self, key: &str) -> Result<()>;
     /// The copy of the file on local disk, if the store has one there now.
@@ -1542,6 +1562,27 @@ impl Blobs for ObjectBlobs {
         Ok(listed)
     }
 
+    /// One request of the store's listing, from `after`: S3's
+    /// `start-after`, given up after `request_within` as any request is.
+    async fn list_from(&self, prefix: &str, after: &str, limit: usize) -> Result<Vec<Listed>> {
+        use futures::TryStreamExt;
+        let within = self.transfers.request_within;
+        let under = ObjectPath::from(prefix);
+        let offset = ObjectPath::from(after);
+        let mut listing = self.store.list_with_offset(Some(&under), &offset);
+        let mut listed = Vec::new();
+        while listed.len() < limit {
+            let Some(meta) = bounded(prefix, within, listing.try_next()).await? else {
+                break;
+            };
+            listed.push(Listed {
+                key: meta.location.to_string(),
+                modified: meta.last_modified,
+            });
+        }
+        Ok(listed)
+    }
+
     async fn list_within(&self, prefix: &str, each: Duration) -> Result<Vec<Listed>> {
         use futures::TryStreamExt;
         let under = object_store::path::Path::from(prefix);
@@ -1892,6 +1933,14 @@ impl Blobs for CachedBlobs {
 
     async fn list_within(&self, prefix: &str, each: Duration) -> Result<Vec<Listed>> {
         self.inner.list_within(prefix, each).await
+    }
+
+    /// As the store lists from a key. The cache creates no file only if
+    /// none is there (`put_new` is refused, by design: #66's review, N3),
+    /// so a backup store, which a shipper creates links in, is never
+    /// wrapped in a cache: this is for a listing alone.
+    async fn list_from(&self, prefix: &str, after: &str, limit: usize) -> Result<Vec<Listed>> {
+        self.inner.list_from(prefix, after, limit).await
     }
 
     /// The copy on local disk goes first, and the file only once it has:
@@ -2949,6 +2998,74 @@ mod tests {
             Err(StorageError::Missing { .. })
         ));
         assert!(cached.local(key).await.unwrap().is_none());
+    }
+
+    /// Files under `links/` and beside it, in `store`.
+    async fn listed_from(store: &dyn Blobs) {
+        for key in [
+            "t/links/1",
+            "t/links/2",
+            "t/links/3",
+            "t/linksx/9",
+            "u/links/4",
+        ] {
+            store.put(key, Bytes::from("x")).await.unwrap();
+        }
+    }
+
+    /// The keys `store` lists under `t/links/` after `after`, `limit` at most.
+    async fn keys_from(store: &dyn Blobs, after: &str, limit: usize) -> Vec<String> {
+        let listed = store.list_from("t/links/", after, limit).await.unwrap();
+        let mut keys: Vec<_> = listed.into_iter().map(|file| file.key).collect();
+        keys.sort();
+        keys
+    }
+
+    /// A listing from a key gives files under the prefix after the key,
+    /// never the key itself, and no more than asked for: in key order in
+    /// memory, as in S3; on local disk, after the key in some order.
+    #[tokio::test]
+    async fn a_listing_from_a_key_gives_only_files_under_the_prefix_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let stores: [(&str, Arc<dyn ObjectStore>); 2] = [
+            ("memory", Arc::new(InMemory::new())),
+            ("local", Arc::new(local)),
+        ];
+        for (name, store) in stores {
+            let store = ObjectBlobs::new(store);
+            listed_from(&store).await;
+            let all = keys_from(&store, "t/links/1", 10).await;
+            assert_eq!(all, ["t/links/2", "t/links/3"], "{name}");
+            assert!(
+                keys_from(&store, "t/links/3", 10).await.is_empty(),
+                "{name}"
+            );
+            let one = keys_from(&store, "t/links/0", 1).await;
+            assert_eq!(one.len(), 1, "{name}");
+            assert!(one[0].as_str() > "t/links/0", "{name}");
+            if name == "memory" {
+                assert_eq!(one, ["t/links/1"]);
+            }
+            assert!(keys_from(&store, "t/links/1", 0).await.is_empty(), "{name}");
+        }
+    }
+
+    /// A store that says nothing of listing from a key refuses to, and the
+    /// cache lists from a key as its store does.
+    #[tokio::test]
+    async fn a_listing_from_a_key_is_refused_by_a_store_that_does_not_say_it_can() {
+        let refused = Plain::default().list_from("t/links/", "t/links/1", 1).await;
+        assert!(
+            matches!(refused, Err(StorageError::NotListed { .. })),
+            "{refused:?}"
+        );
+        let (_dir, cached) = cache();
+        listed_from(&cached).await;
+        assert_eq!(
+            keys_from(&cached, "t/links/1", 10).await,
+            ["t/links/2", "t/links/3"]
+        );
     }
 
     /// A cache over a store in memory, in a directory of its own.
