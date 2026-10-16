@@ -243,7 +243,7 @@ async fn nothing_is_shipped_without_a_base_of_this_incarnation_or_once_stalled()
     );
     cluster
         .coordinator
-        .stall_shipping(&cluster.key, now, base.position, "for a test")
+        .stall_shipping(&cluster.key, now, base.position, None, None, "for a test")
         .await
         .unwrap();
     assert_eq!(
@@ -1591,4 +1591,37 @@ async fn a_log_spill_refused_or_landed_and_failed_makes_no_link_and_ends_the_bat
             "{landed}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_shipper_that_read_the_run_before_it_shipped_on_never_stalls_it() {
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let before = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    let backup = a_backup();
+    // The run ships its base, and notes it.
+    let live = shipper_of(&cluster, &backup);
+    ship(&live, &cluster, 1).await;
+    // A shipper that read the run before that: it finds the base's row
+    // gone, as `forget_history` may take it once the run has shipped on,
+    // and would stall the run for it.
+    let (stale, rows) = shipper_over_rows(&cluster, &backup);
+    *rows.shipping_once.lock().unwrap() = Some(before);
+    rows.rows.lock().unwrap().insert(base.position, None);
+    let now = cluster.committed().await.incarnation;
+    let refused = stale.ship_batch(now, 100).await;
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::Coordinator(
+                CoordinatorError::ShippedSince { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!(
+        (shipping.shipped, shipping.stalled),
+        (Some(base.position), None)
+    );
 }

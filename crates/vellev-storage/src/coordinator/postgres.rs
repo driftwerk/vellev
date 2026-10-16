@@ -1318,24 +1318,48 @@ impl Coordinator for PostgresCoordinator {
         key: &PartitionKey,
         incarnation: Incarnation,
         base: LogPosition,
+        seen: Option<LogPosition>,
+        through: Option<LogPosition>,
         reason: &str,
     ) -> Result<Shipping> {
+        if let Some(through) = through {
+            checked_note(base, through)?;
+        }
+        // One statement, conditioned on what the run has shipped being
+        // what the stall was decided on: one read first and written after
+        // could stop a run that shipped on in between.
         let stalled = sqlx::query(
-            "UPDATE vellev.shipping SET stalled = $5
+            "UPDATE vellev.shipping SET stalled = $5, shipped = GREATEST(shipped, $7)
              WHERE tenant = $1 AND partition = $2 AND incarnation = $3 AND base = $4
-               AND stalled IS NULL",
+               AND stalled IS NULL AND shipped IS NOT DISTINCT FROM $6",
         )
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
         .bind(bigint(incarnation.0)?)
         .bind(bigint(base.0)?)
         .bind(reason)
+        .bind(seen.map(|seen| bigint(seen.0)).transpose()?)
+        .bind(through.map(|through| bigint(through.0)).transpose()?)
         .execute(&self.pool)
         .await?
         .rows_affected();
-        match stalled {
-            1 => self.shipping(key).await,
-            _ => self.shipper_refusal(key, incarnation, base).await,
+        if stalled == 1 {
+            return self.shipping(key).await;
+        }
+        let shipping = self.shipper_refusal(key, incarnation, base).await?;
+        match shipping {
+            // Stalled already: the first reason stands.
+            Shipping {
+                stalled: Some(_), ..
+            } => Ok(shipping),
+            Shipping { shipped, .. } if shipped != seen => Err(CoordinatorError::ShippedSince {
+                key: key.clone(),
+                seen,
+                shipped,
+            }),
+            // Neither, read after the statement: it moved under it, and
+            // back; asking again may well succeed.
+            _ => Err(CoordinatorError::ShippingContended { key: key.clone() }),
         }
     }
 

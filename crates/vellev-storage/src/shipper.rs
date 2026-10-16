@@ -216,11 +216,14 @@ impl Shipper {
             return Ok(Batch::Idle(Idle::Stalled(why)));
         }
         let timeline = self.timeline(incarnation);
+        // What the run had shipped as this batch began: its stall is taken
+        // only if it still has (`Coordinator::stall_shipping`).
+        let seen = shipping.shipped;
         let mut last = match shipping.shipped {
             None => None,
             Some(shipped) => match self.shipped(&timeline, shipped).await? {
                 Ok(made) => Some(made),
-                Err(stall) => return self.stall(incarnation, &base, None, stall).await,
+                Err(stall) => return self.stall(incarnation, &base, seen, None, stall).await,
             },
         };
         let after = match &last {
@@ -251,7 +254,7 @@ impl Shipper {
                     through = Some(row.position);
                     last = Some(made);
                 }
-                Err(stall) => return self.stall(incarnation, &base, through, stall).await,
+                Err(stall) => return self.stall(incarnation, &base, seen, through, stall).await,
             }
         }
         self.note(incarnation, &base, through).await?;
@@ -276,17 +279,20 @@ impl Shipper {
         Ok(())
     }
 
-    /// Note the run shipped up to `through`, if anything, and stalled.
+    /// Note the run shipped up to `through`, if anything, and stalled, in
+    /// one step, if it has shipped no further than `seen` since the batch
+    /// began: a stale shipper's stall is refused, and the error is its.
     async fn stall(
         &self,
         incarnation: Incarnation,
         base: &ShipBase,
+        seen: Option<LogPosition>,
         through: Option<LogPosition>,
         stall: Stall,
     ) -> Result<Batch> {
-        self.note(incarnation, base, through).await?;
+        let why = stall.to_string();
         self.coordinator
-            .stall_shipping(&self.key, incarnation, base.position, &stall.to_string())
+            .stall_shipping(&self.key, incarnation, base.position, seen, through, &why)
             .await?;
         Ok(Batch::Shipped {
             through,

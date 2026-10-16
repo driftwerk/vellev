@@ -323,6 +323,9 @@ pub struct Unreliable {
     /// A base recorded, once, as the next commit rows are read: a run
     /// re-based while a batch of it is under way.
     pub re_base: Mutex<Option<vellev_storage::coordinator::ShipBase>>,
+    /// The record of shipping the next reading of it answers, once, in
+    /// place of the one there: as a shipper read it before the run moved.
+    pub shipping_once: Mutex<Option<vellev_storage::coordinator::Shipping>>,
 }
 
 impl Unreliable {
@@ -338,6 +341,7 @@ impl Unreliable {
             rows: Mutex::new(BTreeMap::new()),
             unnoted: AtomicBool::new(false),
             re_base: Mutex::new(None),
+            shipping_once: Mutex::new(None),
         }
     }
 }
@@ -412,6 +416,9 @@ impl Coordinator for Unreliable {
         &self,
         key: &PartitionKey,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if let Some(seen) = self.shipping_once.lock().unwrap().take() {
+            return Ok(seen);
+        }
         self.inner.shipping(key).await
     }
     async fn hold_for_shipping(
@@ -449,13 +456,15 @@ impl Coordinator for Unreliable {
         key: &PartitionKey,
         incarnation: vellev_storage::coordinator::Incarnation,
         base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        through: Option<vellev_storage::coordinator::LogPosition>,
         reason: &str,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         if self.unnoted.load(Ordering::SeqCst) {
             return self.inner.shipping(key).await;
         }
         self.inner
-            .stall_shipping(key, incarnation, base, reason)
+            .stall_shipping(key, incarnation, base, seen, through, reason)
             .await
     }
     async fn commits_after(

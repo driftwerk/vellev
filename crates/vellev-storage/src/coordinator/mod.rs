@@ -345,6 +345,15 @@ pub enum CoordinatorError {
         asked: LogPosition,
         recorded: Option<LogPosition>,
     },
+    /// A stall asked for by a run that saw it shipped up to `seen`, when
+    /// it has shipped up to `shipped` since: the run is under way past
+    /// what the stall was decided on, and is not stopped.
+    #[error("shipping of {key} has shipped to {shipped:?} since {seen:?} was seen; not stalled")]
+    ShippedSince {
+        key: PartitionKey,
+        seen: Option<LogPosition>,
+        shipped: Option<LogPosition>,
+    },
     /// A shipping write whose conditions kept moving under it, each time
     /// it was made: nothing was written, and asking again may succeed.
     #[error("shipping of {key} was changed under the write too often; nothing was written")]
@@ -668,15 +677,23 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
         position: LogPosition,
     ) -> Result<Shipping>;
 
-    /// Note that the run from `base` has stopped, and why. The first
-    /// reason stands; a later one is left, and the record returned.
-    /// Fenced as [`Self::note_shipped`] is, so that a stale run never
-    /// stops the one under way. No default.
+    /// Note that the run from `base` has stopped, and why, in one step
+    /// with noting it shipped up to `through`, if anything, as
+    /// [`Self::note_shipped`] does: taken only if what the run has shipped
+    /// is still `seen`, what the batch that stalls began from. So a stale
+    /// shipper of the same run, which decided on a record the run has
+    /// moved past, never stops the run under way: it is refused,
+    /// [`CoordinatorError::ShippedSince`], and nothing is written. The
+    /// first reason stands; a later one is left, and the record returned.
+    /// Fenced besides as [`Self::note_shipped`] is, by the incarnation and
+    /// the base. No default.
     async fn stall_shipping(
         &self,
         key: &PartitionKey,
         incarnation: Incarnation,
         base: LogPosition,
+        seen: Option<LogPosition>,
+        through: Option<LogPosition>,
         reason: &str,
     ) -> Result<Shipping>;
 

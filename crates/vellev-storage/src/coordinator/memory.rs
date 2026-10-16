@@ -621,11 +621,29 @@ impl Coordinator for MemoryCoordinator {
         key: &PartitionKey,
         incarnation: Incarnation,
         base: LogPosition,
+        seen: Option<LogPosition>,
+        through: Option<LogPosition>,
         reason: &str,
     ) -> Result<Shipping> {
+        if let Some(through) = through {
+            checked_note(base, through)?;
+        }
         self.with_row(key, |row, _| {
             let run = shipper_run(key, incarnation, base, row)?;
-            run.stalled.get_or_insert_with(|| reason.to_string());
+            if run.stalled.is_some() {
+                return Ok(row.shipping());
+            }
+            if run.shipped != seen {
+                return Err(CoordinatorError::ShippedSince {
+                    key: key.clone(),
+                    seen,
+                    shipped: run.shipped,
+                });
+            }
+            if let Some(through) = through.filter(|through| run.shipped < Some(*through)) {
+                run.shipped = Some(through);
+            }
+            run.stalled = Some(reason.to_string());
             Ok(row.shipping())
         })
     }

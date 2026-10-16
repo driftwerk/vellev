@@ -944,10 +944,12 @@ impl Coordinator for SimCoordinator {
         key: &PartitionKey,
         incarnation: vellev_storage::coordinator::Incarnation,
         base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        through: Option<vellev_storage::coordinator::LogPosition>,
         reason: &str,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         self.clean
-            .stall_shipping(key, incarnation, base, reason)
+            .stall_shipping(key, incarnation, base, seen, through, reason)
             .await
     }
     async fn commits_after(
