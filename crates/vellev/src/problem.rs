@@ -349,6 +349,18 @@ mod tests {
         );
     }
 
+    /// A restore whose right to read a backup ran out is told alike
+    /// however it is said: as the claim lost, or as the right the store's
+    /// work found unheld. Either way it may be asked again.
+    #[test]
+    fn a_right_run_out_is_unavailable_as_a_claim_lost_is() {
+        let acme = || TenantId::new("acme").unwrap();
+        let unavailable = (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable);
+        assert_eq!(told(NodeError::ClaimLost(acme())), unavailable);
+        let unheld = NodeError::Storage(StorageError::Unheld(acme()));
+        assert_eq!(told(unheld), unavailable);
+    }
+
     #[test]
     fn a_backup_lacking_a_file_is_a_conflict_that_says_which_and_a_corrupt_file_is_not_told() {
         let backup = uuid::Uuid::new_v4();

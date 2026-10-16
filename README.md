@@ -1336,7 +1336,9 @@ OBJECTS=1000000 cargo run --release -p vellev-storage --example vector_scale  # 
 Two releases run side by side during a rolling deploy and after a
 rollback. What a release may change to keep that working, for files,
 Postgres, the API and between nodes, is in
-[docs/compatibility.md](docs/compatibility.md).
+[docs/compatibility.md](docs/compatibility.md). What to do about restores,
+the clocks a cluster goes by, and what must hold before a production
+cutover is in [docs/runbook.md](docs/runbook.md).
 
 ## Licence
 

@@ -95,10 +95,11 @@
 //! by the next that lists the file. A file in the tenants' store is not
 //! put back: the tenant fails loudly when it is next opened, naming the
 //! file, and the file is still in the backup the lineage was taken up
-//! from. A restore from a backup looks, just before it commits, that every
-//! file the backup lists is there, by name alone, not by size or sum, and
-//! fetches again any that went; a delete that lands after the commit is
-//! not seen until the file is read.
+//! from. A lineage taken up again from that backup takes none of the
+//! purged tenant's keys: a restore from a backup copies every file under a
+//! key of its own (DW-680), so a delete of the purged tenant's, however
+//! late it lands, takes nothing the tenant taken up names. What stays
+//! open is in the backup store alone.
 //!
 //! [`DELETED_AT_ONCE`]: vellev_storage::backups::DELETED_AT_ONCE
 //! [`LANDED_AFTER`]: crate::LANDED_AFTER

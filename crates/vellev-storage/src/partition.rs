@@ -2127,12 +2127,15 @@ impl Writer {
     /// a restore since may have put back into use segments this one takes
     /// for litter. So it asks before it works out what to delete, and
     /// again before each lot it deletes. What is left is a lot already
-    /// asked for when the lease is lost, and only if, before those
-    /// requests are answered, another writer has taken the lease, opened
-    /// the partition and committed a restore to a state that lists one of
-    /// those very files: a lease is taken from a node only once it has run
-    /// out, by when the node has long stopped whatever was working on the
-    /// tenant, this included.
+    /// asked for when the lease is lost, which may land after another
+    /// writer has taken the lease. A restore from a backup by that writer
+    /// names none of those files, whatever it restores: its files are
+    /// copies under keys of its own ([`Self::restore_from`]). A restore to
+    /// a point in the window may name one, and is kept clear of it only by
+    /// the grace: a lease is taken from a node only once it has run out,
+    /// by when the node has long stopped whatever was working on the
+    /// tenant, this included, and what such a restore may go back to only
+    /// shrinks with time.
     async fn current(&self) -> Result<(LogPosition, Option<String>)> {
         let turn = self.turn().await?;
         turn.allow(self.commit_within());
