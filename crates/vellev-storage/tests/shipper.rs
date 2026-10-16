@@ -395,6 +395,14 @@ impl Blobs for Uncreating {
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
         self.0.list(prefix).await
     }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.0.list_from(prefix, after, limit).await
+    }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.0.delete(key).await
     }
@@ -518,6 +526,14 @@ impl Blobs for Failing {
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
         self.inner.list(prefix).await
+    }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list_from(prefix, after, limit).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.inner.delete(key).await
@@ -878,6 +894,14 @@ impl Blobs for FalselyThere {
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
         self.inner.list(prefix).await
+    }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list_from(prefix, after, limit).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.inner.delete(key).await
@@ -1623,5 +1647,270 @@ async fn a_shipper_that_read_the_run_before_it_shipped_on_never_stalls_it() {
     assert_eq!(
         (shipping.shipped, shipping.stalled),
         (Some(base.position), None)
+    );
+}
+
+/// A backup store that counts its listings from a key, and fails every
+/// whole listing: a shipper never lists.
+#[derive(Debug)]
+struct Counted {
+    inner: Arc<dyn Blobs>,
+    listed_from: AtomicUsize,
+}
+
+impl Counted {
+    fn over(inner: Arc<dyn Blobs>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            listed_from: AtomicUsize::new(0),
+        })
+    }
+
+    fn listed(&self) -> usize {
+        self.listed_from.swap(0, Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Blobs for Counted {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        self.inner.put_new(key, bytes).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        Err(StorageError::Blob {
+            key: prefix.into(),
+            source: "a shipper never lists".into(),
+        })
+    }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.listed_from.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_from(prefix, after, limit).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_shipper_checks_what_is_past_the_committed_position_once_a_run_and_never_lists() {
+    let (cluster, writer) = written().await;
+    begun(&cluster).await;
+    let counted = Counted::over(a_backup());
+    let backup: Arc<dyn Blobs> = counted.clone();
+    let shipper = shipper_of(&cluster, &backup);
+    // Its first batch of the run checks, and its next do not.
+    ship(&shipper, &cluster, 1).await;
+    assert_eq!(counted.listed(), 1);
+    let committed = cluster.committed().await.log_position;
+    let shipped = ship(&shipper, &cluster, 100).await;
+    assert_eq!(
+        shipped,
+        Batch::Shipped {
+            through: Some(committed),
+            stalled: None
+        }
+    );
+    assert_eq!(counted.listed(), 0);
+    // A run re-based on a newer checkpoint is checked again.
+    writer.flush().await.unwrap();
+    let now = cluster.committed().await.incarnation;
+    let (at, checkpoint) = newest_checkpoint(&cluster).await;
+    let raised = ShipBase {
+        position: at,
+        checkpoint,
+        checkpoint_at: at,
+    };
+    cluster
+        .coordinator
+        .record_base(&cluster.key, now, &raised)
+        .await
+        .unwrap();
+    ship(&shipper, &cluster, 100).await;
+    assert_eq!(counted.listed(), 1);
+    // And so is a run another shipper takes over, as on a handover.
+    let taken_over = shipper_of(&cluster, &backup);
+    ship(&taken_over, &cluster, 100).await;
+    assert_eq!(counted.listed(), 1);
+}
+
+#[tokio::test]
+async fn a_link_past_the_committed_position_stalls_a_run_on_its_first_batch_naming_t8() {
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let committed = cluster.committed().await;
+    // The link of a commit past what the coordinator says is committed,
+    // as after it was put back to an older state of its own.
+    let past = LogPosition(committed.log_position.0 + 1);
+    let backup = a_backup();
+    let shipper = shipper_of(&cluster, &backup);
+    let at = shipper.timeline(committed.incarnation).link(past);
+    backup
+        .put(&at, Bytes::from_static(b"a link"))
+        .await
+        .unwrap();
+    match ship(&shipper, &cluster, 100).await {
+        Batch::Shipped {
+            through: None,
+            stalled: Some(stall),
+        } => {
+            assert_eq!(
+                stall,
+                Stall::StoreAhead {
+                    key: at.clone(),
+                    committed: committed.log_position
+                }
+            );
+            assert!(stall.to_string().contains("T8"), "{stall}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert!(shipping.stalled.unwrap().contains("T8"));
+    assert!(backup
+        .get(&shipper.timeline(committed.incarnation).link(base.position))
+        .await
+        .is_err());
+
+    // Anything at all past it, a link by its name or not.
+    let (cluster, _writer) = written().await;
+    begun(&cluster).await;
+    let backup = a_backup();
+    let shipper = shipper_of(&cluster, &backup);
+    let now = cluster.committed().await;
+    let stray = format!("{}links/zz", shipper.timeline(now.incarnation).prefix());
+    backup.put(&stray, Bytes::from_static(b"?")).await.unwrap();
+    let stalled = Stall::StoreAhead {
+        key: stray,
+        committed: now.log_position,
+    };
+    assert_eq!(
+        ship(&shipper, &cluster, 100).await,
+        Batch::Shipped {
+            through: None,
+            stalled: Some(stalled)
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_link_at_the_committed_position_or_committed_since_it_was_read_is_not_past_it() {
+    // At the committed position: shipped already, and not past it.
+    let (cluster, _writer) = written().await;
+    begun(&cluster).await;
+    let committed = cluster.committed().await.log_position;
+    let there = link_at(&cluster, committed).await;
+    let backup = a_backup();
+    put_link(&backup, &there.header, there.frame.as_deref()).await;
+    let shipper = shipper_of(&cluster, &backup);
+    assert_eq!(
+        ship(&shipper, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(committed),
+            stalled: None
+        }
+    );
+    // Committed after the position was first read: read again before the
+    // link is taken for one past it.
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let committed = cluster.committed().await.log_position;
+    let there = link_at(&cluster, committed).await;
+    let backup = a_backup();
+    put_link(&backup, &there.header, there.frame.as_deref()).await;
+    let (shipper, rows) = shipper_over_rows(&cluster, &backup);
+    *rows.committed_once.lock().unwrap() = Some(base.position);
+    assert_eq!(
+        ship(&shipper, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(committed),
+            stalled: None
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_say_what_is_past_a_key_stalls_the_run() {
+    let (cluster, _writer) = written().await;
+    begun(&cluster).await;
+    #[derive(Debug)]
+    struct Unlisting(Arc<dyn Blobs>);
+    #[async_trait]
+    impl Blobs for Unlisting {
+        async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+            self.0.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+            self.0.delete(key).await
+        }
+    }
+    let backup: Arc<dyn Blobs> = Arc::new(Unlisting(a_backup()));
+    let shipper = shipper_of(&cluster, &backup);
+    match ship(&shipper, &cluster, 100).await {
+        Batch::Shipped {
+            through: None,
+            stalled: Some(Stall::NotListed { .. }),
+        } => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn after_a_handover_a_run_is_shipped_again_from_what_was_noted_its_links_found_the_same() {
+    // The old node ships the whole run, and notes none of it: its notes
+    // lost, as when it lost its hold.
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let backup = a_backup();
+    let (old, unnoting) = shipper_over_rows(&cluster, &backup);
+    unnoting.unnoted.store(true, Ordering::SeqCst);
+    let committed = cluster.committed().await;
+    ship(&old, &cluster, 100).await;
+    let shipped = links(&backup, &old.timeline(committed.incarnation)).await;
+    assert_eq!(shipped.keys().next_back(), Some(&committed.log_position));
+    // The new node's shipper: nothing past the committed position, so no
+    // stall; the base and every link after it shipped again, found there
+    // and the same.
+    let new = shipper_of(&cluster, &backup);
+    assert_eq!(
+        ship(&new, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(committed.log_position),
+            stalled: None
+        }
+    );
+    let again = links(&backup, &new.timeline(committed.incarnation)).await;
+    assert_eq!(again, shipped);
+    assert!(again.contains_key(&base.position));
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!(
+        (shipping.shipped, shipping.stalled),
+        (Some(committed.log_position), None)
     );
 }

@@ -8,6 +8,12 @@
 //!    nothing unless it is of that incarnation, has a base, and has not
 //!    stalled: so a stale shipper, of a run since re-based or of an
 //!    incarnation since removed, stops;
+//! 1a. on the first batch of a run this shipper ships (its start, a
+//!    re-base, or a handover to it), asks the backup store in one request
+//!    whether it holds a link past the committed position, and stalls the
+//!    run naming T8 if it does (bootstrap note C). The node keeps one
+//!    shipper for each partition it holds, so that this is once a run, and
+//!    a new one on a handover; the shipper never lists the store;
 //! 2. takes the commits after what the run has shipped (or from its base)
 //!    in order, positions skipping where they do (a restore commits past
 //!    the current position);
@@ -57,6 +63,10 @@ use crate::link::{self, Before, Body, Head, Header, Needed, Sum, Timeline, Unlin
 use crate::prefix::{Found, Prefix};
 use crate::{Result, StorageError};
 
+/// How many times the backup store is asked what is past the committed
+/// position while links keep being made up to it as it is read.
+const PAST_TRIES: usize = 3;
+
 /// How many times a link the store said was there, and was not when read
 /// back, is created again: another create of it was under way and failed.
 const CREATE_TRIES: usize = 3;
@@ -89,6 +99,13 @@ pub enum Stall {
     /// The link of what the run has shipped up to is not in the backup
     /// store.
     LinkMissing { position: LogPosition },
+    /// The backup store holds `key`, past the position committed: the
+    /// coordinator may have been put back to an older state of its own
+    /// (threat T8), and what it now commits would fork what was shipped.
+    StoreAhead { key: String, committed: LogPosition },
+    /// The backup store cannot say in one request whether anything is past
+    /// the position committed.
+    NotListed { why: String },
 }
 
 impl fmt::Display for Stall {
@@ -123,6 +140,16 @@ impl fmt::Display for Stall {
                 f,
                 "the commit at position {} was made before the commit before it",
                 position.0
+            ),
+            Stall::StoreAhead { key, committed } => write!(
+                f,
+                "T8: the backup store holds {key}, past the committed position {}: \
+                 the coordinator may have been restored to an older state of its own",
+                committed.0
+            ),
+            Stall::NotListed { why } => write!(
+                f,
+                "the backup store cannot say what is past the committed position: {why}"
             ),
             Stall::LinkMissing { position } => write!(
                 f,
@@ -166,6 +193,9 @@ pub struct Shipper {
     key: PartitionKey,
     lineage: Lineage,
     cluster: ClusterId,
+    /// The run whose backup store this shipper has found nothing past the
+    /// committed position in, by its incarnation and base.
+    checked: Arc<Mutex<Option<(Incarnation, LogPosition)>>>,
 }
 
 impl Shipper {
@@ -186,6 +216,7 @@ impl Shipper {
             key,
             lineage,
             cluster,
+            checked: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -219,6 +250,18 @@ impl Shipper {
         // What the run had shipped as this batch began: its stall is taken
         // only if it still has (`Coordinator::stall_shipping`).
         let seen = shipping.shipped;
+        // Once a run, on its first batch here: on a run's start, a re-base
+        // or a handover to this shipper (bootstrap note C).
+        let run = (incarnation, base.position);
+        if *self.checked.lock().expect("never poisoned") != Some(run) {
+            match self.past_committed(&timeline).await? {
+                Past::Nothing => *self.checked.lock().expect("never poisoned") = Some(run),
+                Past::OtherIncarnation => return Ok(Batch::Idle(Idle::OtherIncarnation)),
+                Past::Stall(stall) => {
+                    return self.stall(incarnation, &base, seen, None, stall).await
+                }
+            }
+        }
         let mut last = match shipping.shipped {
             None => None,
             Some(shipped) => match self.shipped(&timeline, shipped).await? {
@@ -262,6 +305,69 @@ impl Shipper {
             through,
             stalled: None,
         })
+    }
+
+    /// Whether the backup store holds anything of `timeline` past the
+    /// position committed, in one request each time: the committed
+    /// position read, the store asked for the first link past it, and, if
+    /// it has one, the committed position read again. A link is made only
+    /// of a commit made before it, so one past what is committed after the
+    /// store was asked is past anything committed then: the store is ahead
+    /// of the coordinator (T8). One at or below it was made since the
+    /// first reading, and the store is asked again from there, a few times
+    /// at most while commits keep pace.
+    async fn past_committed(&self, timeline: &Timeline) -> Result<Past> {
+        let links = format!("{}links/", timeline.prefix());
+        let Some(mut committed) = self.committed(timeline.incarnation).await? else {
+            return Ok(Past::OtherIncarnation);
+        };
+        for _ in 0..PAST_TRIES {
+            let after = timeline.link(committed);
+            let listed = match self.backup.list_from(&links, &after, 1).await {
+                Ok(listed) => listed,
+                Err(StorageError::NotListed { reason, .. }) => {
+                    return Ok(Past::Stall(Stall::NotListed { why: reason }))
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(past) = listed.into_iter().next() else {
+                return Ok(Past::Nothing);
+            };
+            let Some(now) = self.committed(timeline.incarnation).await? else {
+                return Ok(Past::OtherIncarnation);
+            };
+            let position = past
+                .key
+                .strip_prefix(&links)
+                .and_then(|name| name.strip_suffix(".link"))
+                .filter(|digits| digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|digits| digits.parse().ok())
+                .map(LogPosition);
+            match position {
+                Some(position) if position <= now => committed = now,
+                _ => {
+                    return Ok(Past::Stall(Stall::StoreAhead {
+                        key: past.key,
+                        committed: now,
+                    }))
+                }
+            }
+        }
+        Err(StorageError::Blob {
+            key: links,
+            source: "links kept being made past the committed position as it was read; \
+                     checked again on the next batch"
+                .into(),
+        })
+    }
+
+    /// The position committed to the partition's incarnation
+    /// `incarnation`, or none if it is of another now.
+    async fn committed(&self, incarnation: Incarnation) -> Result<Option<LogPosition>> {
+        let committed = self.coordinator.committed(&self.key).await?;
+        Ok(committed
+            .filter(|committed| committed.incarnation == incarnation)
+            .map(|committed| committed.log_position))
     }
 
     /// Note the run shipped up to `through`, if anything.
@@ -856,4 +962,12 @@ fn not_linkable(position: LogPosition, unlinkable: Unlinkable) -> Stall {
         }
     };
     Stall::NotCreated { position, why }
+}
+
+/// What the backup store holds past the committed position.
+enum Past {
+    Nothing,
+    /// The partition is of another incarnation now.
+    OtherIncarnation,
+    Stall(Stall),
 }

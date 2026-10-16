@@ -326,6 +326,9 @@ pub struct Unreliable {
     /// The record of shipping the next reading of it answers, once, in
     /// place of the one there: as a shipper read it before the run moved.
     pub shipping_once: Mutex<Option<vellev_storage::coordinator::Shipping>>,
+    /// The position the next reading of what is committed answers, once,
+    /// in place of the one committed: as read just before a commit.
+    pub committed_once: Mutex<Option<LogPosition>>,
 }
 
 impl Unreliable {
@@ -342,6 +345,7 @@ impl Unreliable {
             unnoted: AtomicBool::new(false),
             re_base: Mutex::new(None),
             shipping_once: Mutex::new(None),
+            committed_once: Mutex::new(None),
         }
     }
 }
@@ -396,7 +400,12 @@ impl Coordinator for Unreliable {
         Ok(committed)
     }
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
-        self.inner.committed(key).await
+        let committed = self.inner.committed(key).await?;
+        let once = self.committed_once.lock().unwrap().take();
+        Ok(committed.map(|committed| Committed {
+            log_position: once.unwrap_or(committed.log_position),
+            ..committed
+        }))
     }
     async fn cleaned(
         &self,
