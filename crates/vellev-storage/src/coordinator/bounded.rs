@@ -126,10 +126,15 @@ impl Coordinator for Bounded {
         key: &PartitionKey,
         incarnation: Incarnation,
         base: LogPosition,
+        seen: Option<LogPosition>,
+        through: Option<LogPosition>,
         reason: &str,
     ) -> Result<Shipping> {
-        self.bounded(self.inner.stall_shipping(key, incarnation, base, reason))
-            .await
+        self.bounded(
+            self.inner
+                .stall_shipping(key, incarnation, base, seen, through, reason),
+        )
+        .await
     }
 
     async fn commits_after(

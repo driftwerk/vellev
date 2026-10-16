@@ -2341,7 +2341,8 @@ async fn a_partition_never_shipped_has_nothing_and_one_not_registered_is_unknown
             .await
     ));
     assert!(is_unknown(
-        c.stall_shipping(&unknown, now, LogPosition(1), "why").await
+        c.stall_shipping(&unknown, now, LogPosition(1), None, None, "why")
+            .await
     ));
 }
 
@@ -2583,9 +2584,16 @@ async fn a_base_is_raised_only_and_a_new_run_starts_afresh(h: &dyn Harness) {
     // Higher: raised, the cap with it, and its run starts with nothing
     // shipped or stalled.
     committed_heads(h, &key, &[(6, "l6"), (7, "m7")]).await;
-    c.stall_shipping(&key, now, LogPosition(4), "the first run stopped")
-        .await
-        .unwrap();
+    c.stall_shipping(
+        &key,
+        now,
+        LogPosition(4),
+        Some(LogPosition(5)),
+        None,
+        "the first run stopped",
+    )
+    .await
+    .unwrap();
     let second = ship_base(6, 7, "m7");
     assert_eq!(
         c.record_base(&key, now, &second).await.unwrap(),
@@ -2600,10 +2608,12 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
     let note = |base: u64, position: u64| {
         c.note_shipped(&key, now, LogPosition(base), LogPosition(position))
     };
-    let stall =
-        |base: u64, reason: &'static str| c.stall_shipping(&key, now, LogPosition(base), reason);
+    let stall = |base: u64, seen: Option<u64>, reason: &'static str| {
+        let seen = seen.map(LogPosition);
+        c.stall_shipping(&key, now, LogPosition(base), seen, None, reason)
+    };
     assert!(other_base(&note(4, 5).await, None));
-    assert!(other_base(&stall(4, "no run").await, None));
+    assert!(other_base(&stall(4, None, "no run").await, None));
     committed_heads(
         h,
         &key,
@@ -2638,13 +2648,16 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
         "{below:?}"
     );
     assert!(other_base(&note(3, 7).await, Some(4)));
-    assert!(other_base(&stall(5, "another run's").await, Some(4)));
+    assert!(other_base(
+        &stall(5, Some(6), "another run's").await,
+        Some(4)
+    ));
     assert_eq!(
-        stall(4, "the first").await.unwrap(),
+        stall(4, Some(6), "the first").await.unwrap(),
         run(Some(6), Some("the first"))
     );
     assert_eq!(
-        stall(4, "a later").await.unwrap(),
+        stall(4, Some(6), "a later").await.unwrap(),
         run(Some(6), Some("the first")),
         "the first stands"
     );
@@ -2655,7 +2668,15 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
         now
     ));
     assert!(other_incarnation(
-        &c.stall_shipping(&key, stale_one, LogPosition(4), "x").await,
+        &c.stall_shipping(
+            &key,
+            stale_one,
+            LogPosition(4),
+            Some(LogPosition(6)),
+            None,
+            "x"
+        )
+        .await,
         now
     ));
     // After a re-base, a stale run neither raises nor stops the new one.
@@ -2663,8 +2684,115 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
     let second = ship_base(6, 7, "m7");
     c.record_base(&key, now, &second).await.unwrap();
     assert!(other_base(&note(4, 9).await, Some(6)));
-    assert!(other_base(&stall(4, "a stale run's").await, Some(6)));
+    assert!(other_base(
+        &stall(4, Some(6), "a stale run's").await,
+        Some(6)
+    ));
     assert_eq!(c.shipping(&key).await.unwrap(), based(now, 1, &second));
+}
+
+/// DW-668, S5: a stall is decided on what a batch read of the run, and a
+/// shipper of the same run that read it before the run moved on, a stale
+/// one, is refused: the run under way is never stopped by it. The stall
+/// notes what its own batch shipped in the same step, as `note_shipped`
+/// would, raising only.
+async fn a_stall_is_taken_only_from_a_run_that_saw_what_it_has_shipped_and_notes_it_too(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(
+        h,
+        &key,
+        &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "l4"), (5, "l5")],
+    )
+    .await;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let base = ship_base(1, 2, "m2");
+    c.record_base(&key, now, &base).await.unwrap();
+    let run = |shipped: Option<u64>, stalled: Option<&str>| Shipping {
+        shipped: shipped.map(LogPosition),
+        stalled: stalled.map(String::from),
+        ..based(now, 1, &base)
+    };
+    let stall = |seen: Option<u64>, through: Option<u64>, reason: &'static str| {
+        let (seen, through) = (seen.map(LogPosition), through.map(LogPosition));
+        c.stall_shipping(&key, now, LogPosition(1), seen, through, reason)
+    };
+    let shipped_since = |result: &Result<Shipping, CoordinatorError>, was: Option<u64>, is: u64| {
+        matches!(
+            result,
+            Err(CoordinatorError::ShippedSince { seen, shipped, .. })
+                if *seen == was.map(LogPosition) && *shipped == Some(LogPosition(is))
+        )
+    };
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(3))
+        .await
+        .unwrap();
+    // A shipper that read the run before it shipped to 3: refused, and
+    // nothing written, neither its stall nor what it shipped.
+    let stale = stall(None, Some(2), "a stale shipper's").await;
+    assert!(shipped_since(&stale, None, 3), "{stale:?}");
+    let stale = stall(Some(2), Some(4), "a stale shipper's").await;
+    assert!(shipped_since(&stale, Some(2), 3), "{stale:?}");
+    assert_eq!(c.shipping(&key).await.unwrap(), run(Some(3), None));
+    // One that read it as it stands: what it shipped noted, and stalled,
+    // in one step.
+    assert_eq!(
+        stall(Some(3), Some(5), "the run's own").await.unwrap(),
+        run(Some(5), Some("the run's own"))
+    );
+    // Stalled already: the first reason stands, whatever was seen.
+    assert_eq!(
+        stall(Some(5), None, "a later").await.unwrap(),
+        run(Some(5), Some("the run's own"))
+    );
+    assert_eq!(
+        stall(None, None, "a stale later").await.unwrap(),
+        run(Some(5), Some("the run's own"))
+    );
+}
+
+/// DW-668, S5: noting what a stall's batch shipped only raises, and one
+/// below the base is refused as a note is.
+async fn a_stall_raises_what_was_shipped_only(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(h, &key, &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "l4")]).await;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let base = ship_base(2, 2, "m2");
+    c.record_base(&key, now, &base).await.unwrap();
+    let below = c
+        .stall_shipping(&key, now, LogPosition(2), None, Some(LogPosition(1)), "x")
+        .await;
+    assert!(
+        matches!(below, Err(CoordinatorError::InvalidArgument(_))),
+        "{below:?}"
+    );
+    c.note_shipped(&key, now, LogPosition(2), LogPosition(4))
+        .await
+        .unwrap();
+    let lower = c
+        .stall_shipping(
+            &key,
+            now,
+            LogPosition(2),
+            Some(LogPosition(4)),
+            Some(LogPosition(3)),
+            "y",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (lower.shipped, lower.stalled.as_deref()),
+        (Some(LogPosition(4)), Some("y"))
+    );
 }
 
 async fn shipping_stays_through_leases_and_is_of_its_own_partition_alone(h: &dyn Harness) {
@@ -2741,7 +2869,8 @@ async fn a_partition_removed_loses_its_shipping_and_one_made_again_starts_with_n
         now
     ));
     assert!(other_incarnation(
-        &c.stall_shipping(&key, old, LogPosition(1), "x").await,
+        &c.stall_shipping(&key, old, LogPosition(1), None, None, "x")
+            .await,
         now
     ));
     assert_eq!(c.shipping(&key).await.unwrap(), not_shipped(now));
@@ -2918,9 +3047,16 @@ async fn a_run_is_unshipped_while_commits_lie_above_what_it_shipped(h: &dyn Harn
         [behind(&key, now, Some(2), 3)]
     );
     // Stalled: an operator's, not a shipper's.
-    c.stall_shipping(&key, now, LogPosition(1), "a fork")
-        .await
-        .unwrap();
+    c.stall_shipping(
+        &key,
+        now,
+        LogPosition(1),
+        Some(LogPosition(2)),
+        None,
+        "a fork",
+    )
+    .await
+    .unwrap();
     assert_eq!(c.unshipped(None, 10).await.unwrap(), Vec::new());
     // A base that is its own checkpoint and the head, nothing committed
     // past it nor shipped: the base itself is still to ship.
@@ -3197,6 +3333,8 @@ conformance! {
     a_base_below_the_hold_or_its_row_or_a_clean_is_refused,
     a_base_is_raised_only_and_a_new_run_starts_afresh,
     a_runs_writes_are_fenced_by_its_base_and_only_raise,
+    a_stall_is_taken_only_from_a_run_that_saw_what_it_has_shipped_and_notes_it_too,
+    a_stall_raises_what_was_shipped_only,
     shipping_stays_through_leases_and_is_of_its_own_partition_alone,
     a_partition_removed_loses_its_shipping_and_one_made_again_starts_with_none,
     the_commits_after_a_position_are_read_from_their_rows_in_order,
@@ -3961,6 +4099,77 @@ async fn postgres_a_base_raised_while_history_is_forgotten_waits_and_is_refused_
     assert_eq!(shipping.shipped, Some(LogPosition(5)));
 }
 
+/// DW-668, S5: the stale stall's race, on two connections. A stale
+/// shipper decided its stall on the run before it shipped on; the run's
+/// note is made, not yet committed, when the stall is asked for. The
+/// stall is one statement whose condition is what the run has shipped, so
+/// it waits for the note's row and is then refused as shipped since: a
+/// stall read first and written after would stop the run under way.
+#[tokio::test]
+async fn postgres_a_stale_stall_waiting_on_a_note_is_refused_once_it_lands() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "m2"), (3, "l3")]).await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let base = ship_base(1, 2, "m2");
+    pg.coordinator.record_base(&key, now, &base).await.unwrap();
+    // The run under way's note, made and not yet committed.
+    let mut noting = pg.pool.begin().await.unwrap();
+    sqlx::query("UPDATE vellev.shipping SET shipped = 3 WHERE tenant = $1 AND partition = $2")
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&mut *noting)
+        .await
+        .unwrap();
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let stalling = tokio::spawn({
+        let key = key.clone();
+        async move {
+            other
+                .stall_shipping(
+                    &key,
+                    now,
+                    LogPosition(1),
+                    None,
+                    Some(LogPosition(2)),
+                    "stale",
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !stalling.is_finished(),
+        "the stall waits for the note's row"
+    );
+    noting.commit().await.unwrap();
+    let refused = stalling.await.unwrap();
+    assert!(
+        matches!(
+            refused,
+            Err(CoordinatorError::ShippedSince {
+                seen: None,
+                shipped: Some(LogPosition(3)),
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    let shipping = pg.coordinator.shipping(&key).await.unwrap();
+    assert_eq!(
+        (shipping.shipped, shipping.stalled),
+        (Some(LogPosition(3)), None)
+    );
+}
+
 /// DW-668, #81 review: the floor is the current incarnation's alone. The
 /// rows of one removed go as they always have, a hold on the one made
 /// again keeping none of them.
@@ -4439,6 +4648,9 @@ async fn answers_to_shipping(h: &dyn Harness) -> Vec<String> {
         Err(CoordinatorError::OtherBase { recorded, .. }) => format!("other base, {recorded:?}"),
         Err(CoordinatorError::StaleShipping { why, .. }) => format!("stale, {why:?}"),
         Err(CoordinatorError::InvalidArgument(_)) => "invalid".into(),
+        Err(CoordinatorError::ShippedSince { seen, shipped, .. }) => {
+            format!("shipped since, {seen:?} to {shipped:?}")
+        }
         Err(other) => format!("{other:?}"),
     };
     let mut answers = vec![said(c.shipping(&key).await)];
@@ -4466,10 +4678,30 @@ async fn answers_to_shipping(h: &dyn Harness) -> Vec<String> {
         ));
     }
     answers.push(said(
-        c.stall_shipping(&key, now, LogPosition(3), "first").await,
+        c.stall_shipping(&key, now, LogPosition(3), None, None, "stale")
+            .await,
     ));
     answers.push(said(
-        c.stall_shipping(&key, now, LogPosition(3), "second").await,
+        c.stall_shipping(
+            &key,
+            now,
+            LogPosition(3),
+            Some(LogPosition(4)),
+            None,
+            "first",
+        )
+        .await,
+    ));
+    answers.push(said(
+        c.stall_shipping(
+            &key,
+            now,
+            LogPosition(3),
+            Some(LogPosition(4)),
+            None,
+            "second",
+        )
+        .await,
     ));
     c.remove(&key).await.unwrap();
     answers.push(said(c.shipping(&key).await));
@@ -4495,7 +4727,7 @@ async fn postgres_and_memory_answer_shipping_alike() {
     };
     let memory = answers_to_shipping(&Memory::new()).await;
     assert_eq!(answers_to_shipping(&pg).await, memory);
-    assert_eq!(memory.len(), 20, "{memory:?}");
+    assert_eq!(memory.len(), 21, "{memory:?}");
 }
 
 /// DW-668: a coordinator bounded as a node bounds it answers shipping as
