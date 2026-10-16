@@ -71,8 +71,10 @@ const PAST_TRIES: usize = 3;
 /// back, is created again: another create of it was under way and failed.
 const CREATE_TRIES: usize = 3;
 
-/// Why a run of shipping stopped. Each is written as the run's stall,
-/// for an operator: none passes by being asked again.
+/// Why a run of shipping stopped: none passes by being asked again. Each
+/// is written as the run's stall, for an operator, but for the node's own
+/// verdicts ([`Stall::is_local`]: `NotCreated`, `NotListed`), which stop
+/// this node shipping the run and leave the run for another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stall {
     /// A link at `position` is of another commit than this one: the
@@ -83,7 +85,8 @@ pub enum Stall {
     },
     /// No commit row is at the run's base, where a run's first link is.
     BaseRowMissing { position: LogPosition },
-    /// The link at `position` cannot be created in the backup store.
+    /// The link at `position` cannot be created in this node's backup
+    /// store: a verdict of the node's own ([`Self::is_local`]).
     NotCreated { position: LogPosition, why: String },
     /// A committed head, or a file a checkpoint lists, is not in the
     /// primary.
@@ -103,9 +106,23 @@ pub enum Stall {
     /// coordinator may have been put back to an older state of its own
     /// (threat T8), and what it now commits would fork what was shipped.
     StoreAhead { key: String, committed: LogPosition },
-    /// The backup store cannot say in one request whether anything is past
-    /// the position committed.
+    /// This node's backup store cannot say in one request whether anything
+    /// is past the position committed: a verdict of the node's own
+    /// ([`Self::is_local`]).
     NotListed { why: String },
+}
+
+impl Stall {
+    /// Whether this is a verdict of the node's own, on its own backup
+    /// store or how it is set up, and not on what the run holds: the
+    /// largest file its store creates, which follows its part size, or
+    /// whether its store lists from a key. Another node, set up otherwise,
+    /// may ship the run, so such a verdict is never written as the run's
+    /// stall (bootstrap note, section M): the batch says
+    /// [`Batch::Stopped`], and the node stops shipping the run itself.
+    pub fn is_local(&self) -> bool {
+        matches!(self, Stall::NotCreated { .. } | Stall::NotListed { .. })
+    }
 }
 
 impl fmt::Display for Stall {
@@ -181,6 +198,15 @@ pub enum Batch {
     Shipped {
         through: Option<LogPosition>,
         stalled: Option<Stall>,
+    },
+    /// Shipped up to `through`, if anything, and found it cannot ship on,
+    /// for a reason of its own node's: its backup store or how it is set
+    /// up ([`Stall::is_local`]). The run is not stalled, as another node
+    /// may ship it: this node stops shipping it, raises an alarm and says
+    /// so in its status, until it is set up otherwise.
+    Stopped {
+        through: Option<LogPosition>,
+        why: Stall,
     },
 }
 
@@ -396,6 +422,15 @@ impl Shipper {
         through: Option<LogPosition>,
         stall: Stall,
     ) -> Result<Batch> {
+        if stall.is_local() {
+            // This node's verdict, not the run's: what it shipped noted,
+            // and the run left for a node that can ship it.
+            self.note(incarnation, base, through).await?;
+            return Ok(Batch::Stopped {
+                through,
+                why: stall,
+            });
+        }
         let why = stall.to_string();
         self.coordinator
             .stall_shipping(&self.key, incarnation, base.position, seen, through, &why)

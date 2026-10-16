@@ -409,20 +409,23 @@ impl Blobs for Uncreating {
 }
 
 #[tokio::test]
-async fn a_store_that_creates_nothing_stalls_the_run() {
+async fn a_store_that_creates_nothing_stops_this_node_and_leaves_the_run_unstalled() {
     let (cluster, _writer) = written().await;
     let base = begun(&cluster).await;
     let backup: Arc<dyn Blobs> = Arc::new(Uncreating(a_backup()));
     let shipper = shipper_of(&cluster, &backup);
     match ship(&shipper, &cluster, 100).await {
-        Batch::Shipped {
+        Batch::Stopped {
             through: None,
-            stalled: Some(Stall::NotCreated { position, .. }),
+            why: Stall::NotCreated { position, .. },
         } => {
             assert_eq!(position, base.position)
         }
         other => panic!("{other:?}"),
     }
+    // This node's verdict, not the run's: the run is not stalled.
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!(shipping.stalled, None);
 }
 
 #[tokio::test]
@@ -1074,21 +1077,25 @@ async fn a_frame_too_large_to_go_inline_is_spilled_first_and_then_linked() {
 }
 
 #[tokio::test]
-async fn a_link_too_large_for_the_store_even_spilled_stalls_the_run() {
+async fn a_link_too_large_for_the_store_even_spilled_stops_this_node_and_leaves_the_run_unstalled()
+{
     let (cluster, _writer) = written().await;
     let base = begun(&cluster).await;
     let backup = backup_of(256);
     let shipper = shipper_of(&cluster, &backup);
     match ship(&shipper, &cluster, 100).await {
-        Batch::Shipped {
+        Batch::Stopped {
             through: None,
-            stalled: Some(Stall::NotCreated { position, why }),
+            why: Stall::NotCreated { position, why },
         } => {
             assert_eq!(position, base.position);
             assert!(why.contains("header"), "{why}");
         }
         other => panic!("{other:?}"),
     }
+    // This node's verdict, not the run's: the run is not stalled.
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!(shipping.stalled, None);
 }
 
 #[tokio::test]
@@ -1475,6 +1482,14 @@ impl Blobs for Pulling {
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
         self.inner.list(prefix).await
     }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list_from(prefix, after, limit).await
+    }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.inner.delete(key).await
     }
@@ -1576,6 +1591,14 @@ impl Blobs for LandsThenFails {
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
         self.inner.list(prefix).await
+    }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list_from(prefix, after, limit).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.inner.delete(key).await
@@ -1850,7 +1873,7 @@ async fn a_link_at_the_committed_position_or_committed_since_it_was_read_is_not_
 }
 
 #[tokio::test]
-async fn a_store_that_cannot_say_what_is_past_a_key_stalls_the_run() {
+async fn a_store_that_cannot_say_what_is_past_a_key_stops_this_node_and_leaves_the_run_unstalled() {
     let (cluster, _writer) = written().await;
     begun(&cluster).await;
     #[derive(Debug)]
@@ -1873,12 +1896,15 @@ async fn a_store_that_cannot_say_what_is_past_a_key_stalls_the_run() {
     let backup: Arc<dyn Blobs> = Arc::new(Unlisting(a_backup()));
     let shipper = shipper_of(&cluster, &backup);
     match ship(&shipper, &cluster, 100).await {
-        Batch::Shipped {
+        Batch::Stopped {
             through: None,
-            stalled: Some(Stall::NotListed { .. }),
+            why: Stall::NotListed { .. },
         } => {}
         other => panic!("{other:?}"),
     }
+    // This node's verdict, not the run's: the run is not stalled.
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!(shipping.stalled, None);
 }
 
 #[tokio::test]
@@ -1913,4 +1939,79 @@ async fn after_a_handover_a_run_is_shipped_again_from_what_was_noted_its_links_f
         (shipping.shipped, shipping.stalled),
         (Some(committed.log_position), None)
     );
+}
+
+/// A backup store that refuses, before sending anything, to create the
+/// link at one position, as a store too small for it does.
+#[derive(Debug)]
+struct RefusingAt {
+    inner: Arc<dyn Blobs>,
+    at: String,
+}
+
+#[async_trait]
+impl Blobs for RefusingAt {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        if key.ends_with(&self.at) {
+            return Err(StorageError::NotCreated {
+                key: key.into(),
+                reason: "too large for this store".into(),
+            });
+        }
+        self.inner.put_new(key, bytes).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list_from(prefix, after, limit).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_node_stopped_by_its_own_store_notes_what_it_shipped_first() {
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let next = LogPosition(base.position.0 + 1);
+    let refused = LogPosition(base.position.0 + 2);
+    let backup: Arc<dyn Blobs> = Arc::new(RefusingAt {
+        inner: a_backup(),
+        at: format!("{:020}.link", refused.0),
+    });
+    let shipper = shipper_of(&cluster, &backup);
+    match ship(&shipper, &cluster, 100).await {
+        Batch::Stopped {
+            through,
+            why: Stall::NotCreated { position, .. },
+        } => {
+            assert_eq!((through, position), (Some(next), refused));
+        }
+        other => panic!("{other:?}"),
+    }
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!((shipping.shipped, shipping.stalled), (Some(next), None));
 }

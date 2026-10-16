@@ -1931,6 +1931,10 @@ impl Blobs for CachedBlobs {
         self.inner.list_within(prefix, each).await
     }
 
+    /// As the store lists from a key. The cache creates no file only if
+    /// none is there (`put_new` is refused, by design: #66's review, N3),
+    /// so a backup store, which a shipper creates links in, is never
+    /// wrapped in a cache: this is for a listing alone.
     async fn list_from(&self, prefix: &str, after: &str, limit: usize) -> Result<Vec<Listed>> {
         self.inner.list_from(prefix, after, limit).await
     }
