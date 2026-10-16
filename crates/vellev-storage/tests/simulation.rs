@@ -74,8 +74,8 @@ use vellev_storage::{Batch, Embedded, Live, Merging, Outcome, Transfers};
 const COLLECTION: &str = "sim";
 
 /// The lineage and the cluster the partition's history is shipped as.
-const LINEAGE: Lineage = Lineage(uuid::Uuid::from_u128(0x668_1));
-const CLUSTER: ClusterId = ClusterId(uuid::Uuid::from_u128(0x668_2));
+const LINEAGE: Lineage = Lineage(uuid::Uuid::from_u128(0x6681));
+const CLUSTER: ClusterId = ClusterId(uuid::Uuid::from_u128(0x6682));
 
 /// The id of the `n`th row written: spread over the id space, so that
 /// id order is not write order.
