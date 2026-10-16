@@ -4128,6 +4128,59 @@ proptest! {
     }
 }
 
+/// A spill is in the backup store before the link that names it, whatever
+/// fails between the two writes: a log's, streamed, and a checkpoint's,
+/// put from memory after its files. Each history makes the second write
+/// fail, so a link made first would be left naming nothing (amendment 1,
+/// A2).
+#[test]
+fn a_spill_is_there_before_its_link_whatever_fails_between_them() {
+    let fail_second = || {
+        vec![
+            Action::FailBackupPut(PutFault::Pass),
+            Action::FailBackupPut(PutFault::Refuse),
+        ]
+    };
+    // A large log, spilled a part at a time, after its base is shipped.
+    let log = [
+        vec![
+            Action::BackupCreatesAtMost(SPILL_ABOVE),
+            written(),
+            flushed(),
+            Action::BeginShipping,
+            Action::Ship(5),
+            Action::Write {
+                who: Who::Current,
+                rows: 60,
+                delete: None,
+            },
+        ],
+        fail_second(),
+        vec![Action::Ship(5), Action::Ship(5)],
+    ]
+    .concat();
+    let made = run(log, None).unwrap();
+    assert!(made.spilled_logs >= 1 && made.ship_failed >= 1, "{made:?}");
+    // A checkpoint in a store too small for it inline, spilled after its
+    // two files.
+    let checkpoint = [
+        vec![
+            Action::BackupCreatesAtMost(1200),
+            written(),
+            Action::BeginShipping,
+            flushed(),
+            Action::BeginShipping,
+            Action::FailBackupPut(PutFault::Pass),
+            Action::FailBackupPut(PutFault::Pass),
+        ],
+        fail_second(),
+        vec![Action::Ship(5), Action::Ship(5)],
+    ]
+    .concat();
+    let made = run(checkpoint, None).unwrap();
+    assert!(made.spilled >= 1 && made.ship_failed >= 1, "{made:?}");
+}
+
 /// The first violation reported with `canary` over a fixed set of
 /// shipping histories, which some history must meet.
 fn caught_shipping(canary: Canary) -> String {
