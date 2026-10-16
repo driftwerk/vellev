@@ -628,6 +628,13 @@ mod tests {
             framed.update(&frame[at..]);
             assert_eq!(framed.declared(), Some(frame.len() as u64), "{at}");
         }
+        // A byte at a time, as a store may hand the parts.
+        let mut framed = Framed::default();
+        for (at, byte) in frame.iter().enumerate() {
+            framed.update(std::slice::from_ref(byte));
+            let declared = (at + 1 >= HEADER).then_some(frame.len() as u64);
+            assert_eq!(framed.declared(), declared, "{at}");
+        }
     }
 
     /// A file that is not one whole frame of the kind it is named for is

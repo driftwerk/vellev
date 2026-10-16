@@ -1344,3 +1344,247 @@ async fn a_run_re_based_during_a_batch_is_neither_noted_nor_stalled_by_it() {
         );
     }
 }
+
+/// How much of a file has come from the primary and not yet gone into
+/// the backup store's upload: the most, ever.
+#[derive(Debug, Default)]
+struct InFlight {
+    yielded: AtomicUsize,
+    consumed: AtomicUsize,
+    most: AtomicUsize,
+}
+
+/// A primary store that hands a file over `chunk` bytes at a time, each
+/// only when it is asked for, noting how much is in flight before each.
+#[derive(Debug)]
+struct Chunked {
+    inner: Arc<dyn Blobs>,
+    chunk: usize,
+    flight: Arc<InFlight>,
+}
+
+#[async_trait]
+impl Blobs for Chunked {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        use futures::StreamExt;
+        let (chunk, flight) = (self.chunk, self.flight.clone());
+        futures::stream::once(self.inner.get(key))
+            .flat_map(move |file| {
+                let flight = flight.clone();
+                let chunks: Vec<vellev_storage::Result<Bytes>> = match file {
+                    Ok(file) => (0..file.len())
+                        .step_by(chunk)
+                        .map(|at| Ok(file.slice(at..(at + chunk).min(file.len()))))
+                        .collect(),
+                    Err(error) => vec![Err(error)],
+                };
+                futures::stream::iter(chunks).map(move |part| {
+                    let (yielded, consumed) = (&flight.yielded, &flight.consumed);
+                    let now = yielded.load(Ordering::SeqCst) - consumed.load(Ordering::SeqCst);
+                    flight.most.fetch_max(now, Ordering::SeqCst);
+                    if let Ok(part) = &part {
+                        yielded.fetch_add(part.len(), Ordering::SeqCst);
+                    }
+                    part
+                })
+            })
+            .boxed()
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A backup store whose upload takes a part at a time, counting each as
+/// consumed as it takes it.
+#[derive(Debug)]
+struct Pulling {
+    inner: Arc<dyn Blobs>,
+    flight: Arc<InFlight>,
+}
+
+#[async_trait]
+impl Blobs for Pulling {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        self.inner.put_new(key, bytes).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        use futures::StreamExt;
+        let flight = self.flight.clone();
+        let taken = parts.map(move |part| {
+            if let Ok(part) = &part {
+                flight.consumed.fetch_add(part.len(), Ordering::SeqCst);
+            }
+            part
+        });
+        self.inner.put_parts(key, taken.boxed()).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_large_log_is_spilled_as_it_comes_never_held_whole() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    // The large log made larger: its writes twelve times over, 256 KiB or
+    // so, at its own position and on its own head.
+    let mut log = the_large_log_decoded(&cluster, &base).await;
+    let ops = log.ops.clone();
+    for _ in 0..11 {
+        log.ops.extend(ops.iter().cloned());
+    }
+    let frame = format::encode(Kind::Log, &log).unwrap();
+    assert!(frame.len() > 200 * 1024, "{}", frame.len());
+    let large = the_large_log_made(&cluster, &base, frame.clone()).await;
+    let flight = Arc::new(InFlight::default());
+    let primary: Arc<dyn Blobs> = Arc::new(Chunked {
+        inner: cluster.blobs.clone(),
+        chunk: 1024,
+        flight: flight.clone(),
+    });
+    let inner = backup_of(4096);
+    let backup: Arc<dyn Blobs> = Arc::new(Pulling {
+        inner: inner.clone(),
+        flight: flight.clone(),
+    });
+    let shipper = Shipper::new(
+        primary,
+        backup,
+        cluster.coordinator.clone(),
+        cluster.key.clone(),
+        lineage(),
+        cluster_id(),
+    );
+    let committed = cluster.committed().await;
+    let shipped = ship(&shipper, &cluster, 100).await;
+    let through = Some(committed.log_position);
+    assert_eq!(
+        shipped,
+        Batch::Shipped {
+            through,
+            stalled: None
+        }
+    );
+    // Spilled whole, and never more than a few parts of it in flight.
+    let timeline = shipper.timeline(committed.incarnation);
+    let link = links(&inner, &timeline)
+        .await
+        .remove(&large.position)
+        .unwrap();
+    assert_eq!(link.header.body, Body::Spilled);
+    assert_eq!(
+        inner.get(&timeline.frame(&large.head.0)).await.unwrap(),
+        frame
+    );
+    let most = flight.most.load(Ordering::SeqCst);
+    assert!(most <= 4 * 1024, "{most} bytes in flight");
+}
+
+/// A backup store whose uploads of keys holding `failing` land, and are
+/// answered as failed.
+#[derive(Debug)]
+struct LandsThenFails {
+    inner: Arc<dyn Blobs>,
+    failing: &'static str,
+}
+
+#[async_trait]
+impl Blobs for LandsThenFails {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn put_new(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<Created> {
+        self.inner.put_new(key, bytes).await
+    }
+    fn creates_at_most(&self) -> Option<usize> {
+        self.inner.creates_at_most()
+    }
+    async fn put_parts(
+        &self,
+        key: &str,
+        parts: futures::stream::BoxStream<'_, vellev_storage::Result<Bytes>>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_parts(key, parts).await?;
+        match key.contains(self.failing) {
+            true => Err(StorageError::Blob {
+                key: key.into(),
+                source: "its answer was lost".into(),
+            }),
+            false => Ok(()),
+        }
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_log_spill_refused_or_landed_and_failed_makes_no_link_and_ends_the_batch() {
+    for landed in [false, true] {
+        let (cluster, _writer) = written_large(64).await;
+        let base = begun(&cluster).await;
+        let large = the_large_log(&cluster, &base).await;
+        let inner = a_small_backup();
+        let failing = Box::leak(large.head.0.clone().into_boxed_str());
+        let backup: Arc<dyn Blobs> = match landed {
+            false => Arc::new(Failing {
+                inner: inner.clone(),
+                failing,
+            }),
+            true => Arc::new(LandsThenFails {
+                inner: inner.clone(),
+                failing,
+            }),
+        };
+        let shipper = shipper_of(&cluster, &backup);
+        let now = cluster.committed().await.incarnation;
+        assert!(shipper.ship_batch(now, 100).await.is_err(), "{landed}");
+        let timeline = shipper.timeline(now);
+        assert!(
+            inner.get(&timeline.link(large.position)).await.is_err(),
+            "{landed}"
+        );
+        let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+        assert_eq!(
+            (shipping.shipped, shipping.stalled),
+            (Some(base.position), None),
+            "{landed}"
+        );
+    }
+}
