@@ -19,6 +19,7 @@ mod mutation;
 mod partition;
 pub mod prefix;
 mod search;
+pub mod shipper;
 mod state;
 
 pub use answers::KEPT_FOR as ANSWERS_KEPT_FOR;
