@@ -346,10 +346,7 @@ impl Inner {
     /// long as one may take, as those to the backup store are: so that a
     /// purge waits for none past its claim.
     fn store(&self) -> Within {
-        Within {
-            inner: self.blobs.clone(),
-            within: self.settings.request_bounds.store,
-        }
+        Within::new(self.blobs.clone(), self.settings.request_bounds.store)
     }
 
     /// The keys of every file kept under `tenant`'s name in the store.

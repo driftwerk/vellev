@@ -1367,7 +1367,9 @@ async fn a_restore_from_a_source_given_up_at_any_point_leaves_no_copies_unneeded
             true => {
                 assert_eq!(read, rows_before, "{at} ({what})");
                 let asked = stopping.asked.lock().unwrap();
-                let tried = asked.iter().any(|asked| asked.contains("/manifest/"));
+                let put =
+                    |asked: &String| asked.starts_with("put ") && asked.contains("/manifest/");
+                let tried = asked.iter().any(put);
                 assert!(tried || litter.is_empty(), "{at} ({what}): {litter:?}");
             }
             false => assert_eq!(read, frozen.rows, "{at} ({what})"),
@@ -1996,4 +1998,80 @@ async fn a_link_lists_every_checkpoint_file_a_flush_a_merge_and_a_restore_name()
         }
     }
     assert_eq!(marks, BTreeSet::from(["flushed", "merged", "restored"]));
+}
+
+/// A source whose every read fails once it is told to.
+#[derive(Debug)]
+struct Cut {
+    inner: Arc<dyn Blobs>,
+    cut: AtomicBool,
+}
+
+impl Cut {
+    fn gone(&self, key: &str) -> StorageError {
+        StorageError::Missing {
+            key: key.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl Blobs for Cut {
+    async fn put(&self, key: &str, _bytes: Bytes) -> vellev_storage::Result<()> {
+        Err(only_read(key))
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        if self.cut.load(Ordering::SeqCst) {
+            return Err(self.gone(key));
+        }
+        self.inner.get(key).await
+    }
+    fn parts<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> futures::stream::BoxStream<'a, vellev_storage::Result<Bytes>> {
+        use futures::StreamExt;
+        if self.cut.load(Ordering::SeqCst) {
+            let gone = self.gone(key);
+            return futures::stream::once(async move { Err(gone) }).boxed();
+        }
+        self.inner.parts(key)
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        Err(only_read(prefix))
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        Err(only_read(key))
+    }
+}
+
+/// The commit of a restore from a source reads nothing of the source:
+/// with every read of the source failing once the restore is ready, it is
+/// committed, and the partition reads what the source held.
+#[tokio::test]
+async fn a_restore_from_a_source_commits_without_reading_the_source() {
+    let source = Cluster::new().await;
+    of_several_segments(&source).await;
+    let frozen = frozen(&source).await;
+    let cut = Arc::new(Cut {
+        inner: frozen.as_source(),
+        cut: AtomicBool::new(false),
+    });
+    let target = Cluster::new().await;
+    let writer = lived_in(&target).await;
+    let ready = writer
+        .restore_from(
+            cut.clone(),
+            frozen.head.as_ref(),
+            restore(&target, frozen.at),
+            None,
+            &Holding(true),
+        )
+        .await
+        .unwrap();
+
+    cut.cut.store(true, Ordering::SeqCst);
+    ready.commit().await.unwrap();
+
+    assert_eq!(target.open().await.partition().read(ns), frozen.rows);
 }

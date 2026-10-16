@@ -1889,6 +1889,12 @@ impl Blobs for CachedBlobs {
         }
     }
 
+    /// From the store, as it gives the file, and never from the copy on
+    /// local disk, which [`Self::get`] reads first: a store over this one
+    /// that reads a file whole as its parts put together, as a node's
+    /// bounded stores do, passes the copy by. None reads through a cache
+    /// today: a node's backup store keeps no copies, and the tenants'
+    /// store is read through a bounded one only to list and delete.
     fn parts<'a>(&'a self, key: &'a str) -> futures::stream::BoxStream<'a, Result<Bytes>> {
         self.inner.parts(key)
     }
