@@ -327,7 +327,7 @@ async fn a_link_already_there_of_the_same_commit_is_shipped_and_one_of_another_s
 }
 
 #[tokio::test]
-async fn at_its_base_a_run_takes_a_link_that_differs_only_in_the_commit_before_it() {
+async fn at_its_base_a_run_takes_a_link_that_differs_only_in_the_commit_before_it_and_no_more() {
     let (cluster, _writer) = written().await;
     let base = begun(&cluster).await;
     let mine = link_at(&cluster, base.position).await;
@@ -350,7 +350,8 @@ async fn at_its_base_a_run_takes_a_link_that_differs_only_in_the_commit_before_i
         }
     );
 
-    // One that differs in more, at the base: another run's.
+    // One that differs in more, at the base: another commit, a fork, its
+    // fields named.
     let (cluster, _writer) = written().await;
     let base = begun(&cluster).await;
     let mine = link_at(&cluster, base.position).await;
@@ -359,8 +360,9 @@ async fn at_its_base_a_run_takes_a_link_that_differs_only_in_the_commit_before_i
     let backup = a_backup();
     put_link(&backup, &another, mine.frame.as_deref()).await;
     let shipper = shipper_of(&cluster, &backup);
-    let stalled = Stall::BaseLinkOfAnotherRun {
+    let stalled = Stall::Fork {
         position: base.position,
+        fields: vec!["committed_at"],
     };
     assert_eq!(
         ship(&shipper, &cluster, 100).await,
@@ -970,4 +972,142 @@ async fn a_checkpoint_after_a_skip_is_made_on_the_row_before_it_not_the_position
     let before = links[&checkpoint.position].header.before.clone().unwrap();
     assert_eq!(before.position, after[0].position);
     assert_eq!(before.sum, links[&after[0].position].header.sum);
+}
+
+#[tokio::test]
+async fn above_its_base_a_link_that_differs_only_in_the_commit_before_it_is_a_fork() {
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let next = LogPosition(base.position.0 + 1);
+    let mine = link_at(&cluster, next).await;
+    let mut other = mine.header.clone();
+    other.before = None;
+    let backup = a_backup();
+    put_link(&backup, &other, mine.frame.as_deref()).await;
+    let shipper = shipper_of(&cluster, &backup);
+    let fork = Stall::Fork {
+        position: next,
+        fields: vec!["before"],
+    };
+    assert_eq!(
+        ship(&shipper, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(base.position),
+            stalled: Some(fork)
+        }
+    );
+}
+
+/// A primary store that fails every read of a key holding `failing` as a
+/// store that cannot be reached for it does: not as one without the file.
+#[derive(Debug)]
+struct Unreadable {
+    inner: Arc<dyn Blobs>,
+    failing: &'static str,
+}
+
+#[async_trait]
+impl Blobs for Unreadable {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        if key.contains(self.failing) {
+            return Err(StorageError::Blob {
+                key: key.into(),
+                source: "the store could not be reached".into(),
+            });
+        }
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_primary_that_cannot_be_read_ends_the_batch_and_stalls_nothing() {
+    for failing in ["/log/", "/manifest/", "/segment/"] {
+        let (cluster, _writer) = written().await;
+        begun(&cluster).await;
+        let backup = a_backup();
+        let primary: Arc<dyn Blobs> = Arc::new(Unreadable {
+            inner: cluster.blobs.clone(),
+            failing,
+        });
+        let shipper = Shipper::new(
+            primary,
+            backup.clone(),
+            cluster.coordinator.clone(),
+            cluster.key.clone(),
+            lineage(),
+            cluster_id(),
+        );
+        let now = cluster.committed().await.incarnation;
+        let failed = shipper.ship_batch(now, 100).await;
+        assert!(
+            matches!(failed, Err(StorageError::Blob { .. })),
+            "{failing}: {failed:?}"
+        );
+        let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+        assert_eq!(shipping.stalled, None, "{failing}");
+    }
+}
+
+#[tokio::test]
+async fn a_run_re_based_during_a_batch_is_neither_noted_nor_stalled_by_it() {
+    for stalling in [false, true] {
+        let (cluster, writer) = written().await;
+        let base = begun(&cluster).await;
+        writer.flush().await.unwrap();
+        let now = cluster.committed().await.incarnation;
+        let (at, checkpoint) = newest_checkpoint(&cluster).await;
+        let raised = ShipBase {
+            position: at,
+            checkpoint,
+            checkpoint_at: at,
+        };
+        let backup = a_backup();
+        let (batch, rows) = shipper_over_rows(&cluster, &backup);
+        // The run is re-based as the batch reads its rows.
+        *rows.re_base.lock().unwrap() = Some(raised.clone());
+        if stalling {
+            // And the batch would stall: a row it reads names no head.
+            let after = rows_after(&cluster, &base).await;
+            let mut row = after[1].clone();
+            row.head = after[0].head.clone();
+            rows.rows.lock().unwrap().insert(row.position, Some(row));
+        }
+        let refused = batch.ship_batch(now, 100).await;
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::Coordinator(
+                    CoordinatorError::OtherBase { .. }
+                ))
+            ),
+            "{stalling}: {refused:?}"
+        );
+        let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+        assert_eq!(shipping.base, Some(raised.clone()), "{stalling}");
+        assert_eq!(
+            (shipping.shipped, shipping.stalled),
+            (None, None),
+            "{stalling}"
+        );
+        // What the batch left in the store, the new run takes as its own.
+        let shipper = shipper_of(&cluster, &backup);
+        let committed = cluster.committed().await.log_position;
+        assert_eq!(
+            ship(&shipper, &cluster, 100).await,
+            Batch::Shipped {
+                through: Some(committed),
+                stalled: None
+            },
+            "{stalling}"
+        );
+    }
 }

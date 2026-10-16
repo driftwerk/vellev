@@ -1649,6 +1649,8 @@ struct World {
     backup: Arc<BackupBlobs>,
     /// Every stall a batch of shipping met.
     stalls: Vec<Stall>,
+    /// Every base a run of shipping was recorded at.
+    bases: BTreeSet<LogPosition>,
     shipping_from: Option<ShipBase>,
     step: usize,
     made: Made,
@@ -1980,6 +1982,7 @@ impl World {
             backup: Arc::new(BackupBlobs::broken(Transfers::default().part_bytes, canary)),
             shipping_from: None,
             stalls: Vec::new(),
+            bases: BTreeSet::new(),
             step: 0,
             made: Made::default(),
         };
@@ -2024,6 +2027,8 @@ impl World {
                 checkpoint_at: at,
             };
             if let Ok(shipping) = self.coordinator.record_base(&key, incarnation, &base).await {
+                self.bases
+                    .extend(shipping.base.as_ref().map(|base| base.position));
                 self.shipping_from = shipping.base;
                 return;
             }
@@ -2104,9 +2109,20 @@ impl World {
     /// - a run stalls only where the primary has lost what it was to ship,
     ///   as a clean may make it until the clean floor (PR 6) is built.
     async fn shipped_as_committed(&mut self) -> Violation {
-        let stalled: Vec<_> = (self.stalls.iter())
-            .filter(|stall| !matches!(stall, Stall::PrimaryMissing { .. }))
-            .collect();
+        let mut stalled = Vec::new();
+        for stall in &self.stalls {
+            // Only where the primary truly has lost what was to be shipped.
+            let lost = match stall {
+                Stall::PrimaryMissing { key } => matches!(
+                    self.blobs.clean.get(key).await,
+                    Err(StorageError::Missing { .. })
+                ),
+                _ => false,
+            };
+            if !lost {
+                stalled.push(stall);
+            }
+        }
         check(stalled.is_empty(), || {
             format!("the run stalled with nothing broken: {stalled:?}")
         })?;
@@ -2183,6 +2199,10 @@ impl World {
         // them.
         for (at, (header, _)) in &links {
             let Some(before) = &header.before else {
+                // Made on nothing: only a run's base is.
+                check(self.bases.contains(at), || {
+                    format!("the link at {at:?} is made on nothing, and no run's base is there")
+                })?;
                 continue;
             };
             let just_before = (heads.iter())

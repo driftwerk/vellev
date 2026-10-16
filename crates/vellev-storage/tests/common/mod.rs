@@ -320,6 +320,9 @@ pub struct Unreliable {
     /// Shipping noted nowhere: what a run shipped, or why it stalled, is
     /// answered as the record stands, and not recorded.
     pub unnoted: AtomicBool,
+    /// A base recorded, once, as the next commit rows are read: a run
+    /// re-based while a batch of it is under way.
+    pub re_base: Mutex<Option<vellev_storage::coordinator::ShipBase>>,
 }
 
 impl Unreliable {
@@ -334,6 +337,7 @@ impl Unreliable {
             slowly: Mutex::new(Duration::ZERO),
             rows: Mutex::new(BTreeMap::new()),
             unnoted: AtomicBool::new(false),
+            re_base: Mutex::new(None),
         }
     }
 }
@@ -461,6 +465,10 @@ impl Coordinator for Unreliable {
         after: vellev_storage::coordinator::LogPosition,
         limit: usize,
     ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        let re_base = self.re_base.lock().unwrap().take();
+        if let Some(base) = re_base {
+            self.inner.record_base(key, incarnation, &base).await?;
+        }
         let rows = self
             .inner
             .commits_after(key, incarnation, after, limit)

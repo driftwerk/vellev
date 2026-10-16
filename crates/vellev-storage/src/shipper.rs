@@ -20,7 +20,8 @@
 //! 4. creates each link once (`put_new`): a link already there of the same
 //!    commit, every field but `body` equal, is shipped; at the run's own
 //!    base, one that differs only in `before`, its own `None`, is too
-//!    (bootstrap note C); anything else stalls the run;
+//!    (bootstrap note C); anything else is a fork, and stalls the run
+//!    naming the fields that differ;
 //! 5. notes the watermark at the last position it shipped.
 //!
 //! A frame too large to go inline stalls the run until spilling is built
@@ -58,9 +59,6 @@ pub enum Stall {
         position: LogPosition,
         fields: Vec<&'static str>,
     },
-    /// The link at the run's base is of another run: it differs in more
-    /// than `before`.
-    BaseLinkOfAnotherRun { position: LogPosition },
     /// No commit row is at the run's base, where a run's first link is.
     BaseRowMissing { position: LogPosition },
     /// The link at `position` cannot be created in the backup store.
@@ -92,12 +90,6 @@ impl fmt::Display for Stall {
                 "fork: the link at position {} is of another commit, differing in {}",
                 position.0,
                 fields.join(", ")
-            ),
-            Stall::BaseLinkOfAnotherRun { position } => write!(
-                f,
-                "base link of another run: the link at the run's base, position {}, \
-                 is not this run's",
-                position.0
             ),
             Stall::BaseRowMissing { position } => write!(
                 f,
@@ -473,13 +465,14 @@ impl Shipper {
             };
             let fields = header.differs(&theirs);
             let at_base = position == base.position;
+            // Every field but `before` comes from the commit itself, so any
+            // other difference, at the base or not, is another commit.
             return Ok(match (fields.as_slice(), at_base) {
                 ([], _) => Ok(()),
                 // An older run's link of the same commit, which knew the
                 // commit before it (bootstrap note C).
                 (["before"], true) if header.before.is_none() => Ok(()),
-                (_, true) => Err(Stall::BaseLinkOfAnotherRun { position }),
-                (_, false) => Err(Stall::Fork { position, fields }),
+                _ => Err(Stall::Fork { position, fields }),
             });
         }
         Err(StorageError::Blob {
