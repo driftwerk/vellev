@@ -373,29 +373,6 @@ async fn at_its_base_a_run_takes_a_link_that_differs_only_in_the_commit_before_i
     );
 }
 
-#[tokio::test]
-async fn a_frame_too_large_to_go_inline_stalls_until_spilling_is_built() {
-    let (cluster, _writer) = written().await;
-    let base = begun(&cluster).await;
-    // A store that creates files of 1 KiB at most: the checkpoint's link,
-    // with its frame, is larger.
-    let backup = backup_of(1024);
-    let shipper = shipper_of(&cluster, &backup);
-    let stalled = Stall::SpillNotBuilt {
-        position: base.position,
-    };
-    assert_eq!(
-        ship(&shipper, &cluster, 100).await,
-        Batch::Shipped {
-            through: None,
-            stalled: Some(stalled)
-        }
-    );
-    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
-    assert_eq!(shipping.shipped, None);
-    assert!(shipping.stalled.unwrap().contains("spill"));
-}
-
 /// A store that creates nothing: every create refused before it is sent.
 #[derive(Debug)]
 struct Uncreating(Arc<dyn Blobs>);
@@ -972,6 +949,262 @@ async fn a_checkpoint_after_a_skip_is_made_on_the_row_before_it_not_the_position
     let before = links[&checkpoint.position].header.before.clone().unwrap();
     assert_eq!(before.position, after[0].position);
     assert_eq!(before.sum, links[&after[0].position].header.sum);
+}
+
+/// A partition as [`written`] makes it, in a primary store that reads and
+/// writes files `part_bytes` at a time, with a log at 4 of 200 writes,
+/// too large to go inline in [`a_small_backup`].
+async fn written_large(part_bytes: usize) -> (Cluster, Writer) {
+    let transfers = Transfers {
+        part_bytes,
+        ..Transfers::default()
+    };
+    let cluster = Cluster {
+        blobs: Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())).transferring(transfers)),
+        ..Cluster::new().await
+    };
+    let writer = cluster.writer().await;
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+    writer.flush().await.unwrap();
+    let many = (0..200u8).map(|n| upsert("notes", n, n.into())).collect();
+    writer.commit(many).await.unwrap();
+    writer.commit(vec![upsert("notes", 201, 1)]).await.unwrap();
+    (cluster, writer)
+}
+
+/// A backup store that creates files of 1 KiB at most: a checkpoint's
+/// link, or a large log's, with its frame, is larger; a small log's is not.
+fn a_small_backup() -> Arc<dyn Blobs> {
+    backup_of(1024)
+}
+
+/// The log of 200 writes [`written_large`] makes, its row.
+async fn the_large_log(cluster: &Cluster, base: &ShipBase) -> RestorePoint {
+    let after = rows_after(cluster, base).await;
+    after[0].clone()
+}
+
+#[tokio::test]
+async fn a_frame_too_large_to_go_inline_is_spilled_first_and_then_linked() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    let backup = a_small_backup();
+    let shipper = shipper_of(&cluster, &backup);
+    let committed = cluster.committed().await;
+    let shipped = ship(&shipper, &cluster, 100).await;
+    let through = Some(committed.log_position);
+    assert_eq!(
+        shipped,
+        Batch::Shipped {
+            through,
+            stalled: None
+        }
+    );
+    let timeline = shipper.timeline(committed.incarnation);
+    let links = links(&backup, &timeline).await;
+    let large = the_large_log(&cluster, &base).await;
+    let small = LogPosition(large.position.0 + 1);
+    // The checkpoint, from memory, and the large log, a part at a time,
+    // spilled; the small log inline.
+    let bodies: Vec<_> = [base.position, large.position, small]
+        .iter()
+        .map(|at| links.get(at).map(|link| link.header.body))
+        .collect();
+    let bodies: Vec<_> = bodies.into_iter().flatten().collect();
+    assert_eq!(bodies, [Body::Spilled, Body::Spilled, Body::Inline]);
+    for at in [base.position, large.position] {
+        let link = &links[&at];
+        assert_eq!(link.frame, None);
+        let spilled = backup.get(&timeline.frame(&link.header.key)).await.unwrap();
+        assert_eq!(spilled, cluster.blobs.get(&link.header.key).await.unwrap());
+        assert_eq!(link::Sum::of(&spilled), link.header.sum);
+        assert_eq!(spilled.len() as u64, link.header.size);
+    }
+    assert!(links[&base.position].header.files.len() >= 2);
+    assert_eq!(
+        links[&large.position]
+            .header
+            .before
+            .as_ref()
+            .unwrap()
+            .position,
+        base.position
+    );
+    // Restoring the newest commit needs what is there, the checkpoint
+    // read from its spilled frame.
+    let headers: BTreeMap<_, _> = links
+        .iter()
+        .map(|(at, link)| (*at, link.header.clone()))
+        .collect();
+    let checkpoint = &links[&base.position].header;
+    let frame = backup.get(&timeline.frame(&checkpoint.key)).await.unwrap();
+    let Ok(Stored::Manifest(manifest)) = decode_head(&checkpoint.key, &frame) else {
+        panic!("a manifest")
+    };
+    let needed = chain::needed(&headers, committed.log_position, Some(&manifest)).unwrap();
+    assert_eq!(needed.checkpoint, Some(base.position));
+}
+
+#[tokio::test]
+async fn a_link_too_large_for_the_store_even_spilled_stalls_the_run() {
+    let (cluster, _writer) = written().await;
+    let base = begun(&cluster).await;
+    let backup = backup_of(256);
+    let shipper = shipper_of(&cluster, &backup);
+    match ship(&shipper, &cluster, 100).await {
+        Batch::Shipped {
+            through: None,
+            stalled: Some(Stall::NotCreated { position, why }),
+        } => {
+            assert_eq!(position, base.position);
+            assert!(why.contains("header"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_spill_that_fails_makes_no_link_and_ends_the_batch() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    let inner = a_small_backup();
+    let failing: Arc<dyn Blobs> = Arc::new(Failing {
+        inner: inner.clone(),
+        failing: "/frames/",
+    });
+    let shipper = shipper_of(&cluster, &failing);
+    let now = cluster.committed().await.incarnation;
+    assert!(shipper.ship_batch(now, 100).await.is_err());
+    let timeline = shipper.timeline(now);
+    assert!(inner
+        .list(&format!("{}links/", timeline.prefix()))
+        .await
+        .unwrap()
+        .is_empty());
+    let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!((shipping.shipped, shipping.stalled), (None, None));
+    assert!(base.position > LogPosition(0));
+}
+
+/// `frame` put under the large log's key in the primary of `cluster`.
+async fn the_large_log_made(cluster: &Cluster, base: &ShipBase, frame: Bytes) -> RestorePoint {
+    let large = the_large_log(cluster, base).await;
+    cluster.blobs.put(&large.head.0, frame).await.unwrap();
+    large
+}
+
+/// The large log of `cluster`, decoded.
+async fn the_large_log_decoded(cluster: &Cluster, base: &ShipBase) -> LogSegment {
+    let large = the_large_log(cluster, base).await;
+    let frame = cluster.blobs.get(&large.head.0).await.unwrap();
+    match decode_head(&large.head.0, &frame).unwrap() {
+        Stored::Log(log) => log,
+        Stored::Manifest(_) => panic!("a log"),
+    }
+}
+
+#[tokio::test]
+async fn a_spilled_log_whose_checksum_fails_stalls_the_run_and_is_neither_linked_nor_left() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    let large = the_large_log(&cluster, &base).await;
+    let mut frame = cluster.blobs.get(&large.head.0).await.unwrap().to_vec();
+    let last = frame.len() - 1;
+    frame[last] ^= 0xff;
+    the_large_log_made(&cluster, &base, frame.into()).await;
+    let backup = a_small_backup();
+    let shipper = shipper_of(&cluster, &backup);
+    match ship(&shipper, &cluster, 100).await {
+        Batch::Shipped {
+            through,
+            stalled: Some(Stall::Corrupt { key, .. }),
+        } => {
+            assert_eq!(through, Some(base.position));
+            assert_eq!(key, large.head.0);
+        }
+        other => panic!("{other:?}"),
+    }
+    let timeline = shipper.timeline(cluster.committed().await.incarnation);
+    assert!(backup.get(&timeline.link(large.position)).await.is_err());
+    assert!(backup.get(&timeline.frame(&large.head.0)).await.is_err());
+}
+
+#[tokio::test]
+async fn a_spilled_log_of_another_position_or_made_on_another_head_stalls_the_run() {
+    for broken in ["position", "prev"] {
+        let (cluster, _writer) = written_large(64).await;
+        let base = begun(&cluster).await;
+        let mut log = the_large_log_decoded(&cluster, &base).await;
+        match broken {
+            "position" => log.position = LogPosition(log.position.0 + 5),
+            _ => log.prev = Some(format!("{}-other", log.prev.unwrap())),
+        }
+        let frame = format::encode(Kind::Log, &log).unwrap();
+        let large = the_large_log_made(&cluster, &base, frame).await;
+        let backup = a_small_backup();
+        let shipper = shipper_of(&cluster, &backup);
+        let stalled = Stall::NotTheRowsHead {
+            position: large.position,
+        };
+        assert_eq!(
+            ship(&shipper, &cluster, 100).await,
+            Batch::Shipped {
+                through: Some(base.position),
+                stalled: Some(stalled)
+            },
+            "{broken}"
+        );
+        let timeline = shipper.timeline(cluster.committed().await.incarnation);
+        assert!(
+            backup.get(&timeline.link(large.position)).await.is_err(),
+            "{broken}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_commit_spilled_by_one_shipper_and_inline_by_another_is_one_commit() {
+    let (cluster, _writer) = written_large(64).await;
+    let base = begun(&cluster).await;
+    let large = the_large_log(&cluster, &base).await;
+    // Shipped spilled, into a small store, noting nothing.
+    let small = a_small_backup();
+    let (spilling, unnoting) = shipper_over_rows(&cluster, &small);
+    unnoting.unnoted.store(true, Ordering::SeqCst);
+    ship(&spilling, &cluster, 100).await;
+    // And again, as by a shipper that crashed before noting it: the same
+    // frames put again, and the same links found there.
+    let committed = cluster.committed().await.log_position;
+    assert_eq!(
+        ship(&spilling, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(committed),
+            stalled: None
+        }
+    );
+    let now = cluster.committed().await.incarnation;
+    let spilled = links(&small, &spilling.timeline(now))
+        .await
+        .remove(&large.position)
+        .unwrap();
+    assert_eq!(spilled.header.body, Body::Spilled);
+    // That link in a store a shipper would ship it inline to: the same
+    // commit, shipped.
+    let backup = a_backup();
+    put_link(&backup, &spilled.header, None).await;
+    let shipper = shipper_of(&cluster, &backup);
+    let committed = cluster.committed().await.log_position;
+    assert_eq!(
+        ship(&shipper, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(committed),
+            stalled: None
+        }
+    );
 }
 
 #[tokio::test]
