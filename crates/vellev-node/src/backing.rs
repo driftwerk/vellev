@@ -872,6 +872,15 @@ impl Blobs for Within {
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
         self.inner.list_within(prefix, self.within).await
     }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.bounded(prefix, self.inner.list_from(prefix, after, limit))
+            .await
+    }
     async fn list_within(
         &self,
         prefix: &str,
@@ -929,6 +938,14 @@ impl Blobs for Deleting {
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
         self.inner.list(prefix).await
+    }
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list_from(prefix, after, limit).await
     }
     async fn list_within(
         &self,
@@ -1507,6 +1524,32 @@ mod tests {
     fn in_memory() -> Arc<dyn Blobs> {
         let store = object_store::memory::InMemory::new();
         Arc::new(vellev_storage::blobs::ObjectBlobs::new(Arc::new(store)))
+    }
+
+    /// The backup store's wrappers list from a key as their store does,
+    /// so a shipper's check of what is past the committed position reaches
+    /// the store (DW-668, S5).
+    #[tokio::test]
+    async fn the_backup_stores_wrappers_list_from_a_key_as_their_store_does() {
+        let store = object_store::memory::InMemory::new();
+        let inner: Arc<dyn Blobs> =
+            Arc::new(vellev_storage::blobs::ObjectBlobs::new(Arc::new(store)));
+        for key in ["t/links/1", "t/links/2", "u/links/3"] {
+            inner.put(key, Bytes::from("x")).await.unwrap();
+        }
+        let within = Within {
+            inner: inner.clone(),
+            within: WITHIN,
+        };
+        let deleting = Deleting {
+            inner: inner.clone(),
+            sent: Arc::new(AtomicBool::new(false)),
+        };
+        for (name, wrapper) in [("within", &within as &dyn Blobs), ("deleting", &deleting)] {
+            let listed = wrapper.list_from("t/links/", "t/links/1", 5).await.unwrap();
+            let keys: Vec<_> = listed.into_iter().map(|file| file.key).collect();
+            assert_eq!(keys, ["t/links/2"], "{name}");
+        }
     }
 
     #[tokio::test]
