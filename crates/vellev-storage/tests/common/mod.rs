@@ -314,6 +314,12 @@ pub struct Unreliable {
     pub unanswered: AtomicBool,
     /// How long each commit takes to be answered.
     pub slowly: Mutex<Duration>,
+    /// Commit rows as `commits_after` gives them, by position: one not
+    /// given (`None`), or another in its place.
+    pub rows: Mutex<BTreeMap<LogPosition, Option<RestorePoint>>>,
+    /// Shipping noted nowhere: what a run shipped, or why it stalled, is
+    /// answered as the record stands, and not recorded.
+    pub unnoted: AtomicBool,
 }
 
 impl Unreliable {
@@ -326,6 +332,8 @@ impl Unreliable {
             hang_after_commit: AtomicBool::new(false),
             unanswered: AtomicBool::new(false),
             slowly: Mutex::new(Duration::ZERO),
+            rows: Mutex::new(BTreeMap::new()),
+            unnoted: AtomicBool::new(false),
         }
     }
 }
@@ -425,6 +433,9 @@ impl Coordinator for Unreliable {
         base: vellev_storage::coordinator::LogPosition,
         position: vellev_storage::coordinator::LogPosition,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if self.unnoted.load(Ordering::SeqCst) {
+            return self.inner.shipping(key).await;
+        }
         self.inner
             .note_shipped(key, incarnation, base, position)
             .await
@@ -436,6 +447,9 @@ impl Coordinator for Unreliable {
         base: vellev_storage::coordinator::LogPosition,
         reason: &str,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if self.unnoted.load(Ordering::SeqCst) {
+            return self.inner.shipping(key).await;
+        }
         self.inner
             .stall_shipping(key, incarnation, base, reason)
             .await
@@ -447,9 +461,18 @@ impl Coordinator for Unreliable {
         after: vellev_storage::coordinator::LogPosition,
         limit: usize,
     ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
-        self.inner
+        let rows = self
+            .inner
             .commits_after(key, incarnation, after, limit)
-            .await
+            .await?;
+        let given = self.rows.lock().unwrap();
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match given.get(&row.position) {
+                Some(instead) => instead.clone(),
+                None => Some(row),
+            })
+            .collect())
     }
     async fn unshipped(
         &self,

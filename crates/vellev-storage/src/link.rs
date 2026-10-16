@@ -230,6 +230,11 @@ impl Timeline {
         format!("{}links/{:020}.link", self.prefix(), position.0)
     }
 
+    /// Where the checkpoint file under `key` in the primary is copied to.
+    pub fn file(&self, key: &str) -> String {
+        format!("{}files/{key}", self.prefix())
+    }
+
     /// Where the frame of the head under `key` in the primary is spilled.
     pub fn frame(&self, key: &str) -> String {
         format!("{}frames/{key}", self.prefix())
