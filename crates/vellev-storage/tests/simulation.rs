@@ -73,6 +73,11 @@ use vellev_storage::{Batch, Embedded, Live, Merging, Outcome, Transfers};
 
 const COLLECTION: &str = "sim";
 
+/// The most bytes the backup store of a shipping history creates a file
+/// of: so that some frames go inline and some spill, a large write's log
+/// among them, and every link's header fits.
+const SPILL_ABOVE: usize = 4096;
+
 /// The lineage and the cluster the partition's history is shipped as.
 const LINEAGE: Lineage = Lineage(uuid::Uuid::from_u128(0x6681));
 const CLUSTER: ClusterId = ClusterId(uuid::Uuid::from_u128(0x6682));
@@ -165,6 +170,10 @@ enum Canary {
     /// The coordinator gives each commit row a time a microsecond later
     /// than the commit was made at.
     ShiftsCommitTimes,
+    /// The backup store answers a spilled frame's put as done, and lands
+    /// it only later, with the requests it has yet to make: after the
+    /// link that names it (DW-668, S3).
+    SpillAfterLink,
 }
 
 #[derive(Debug, Default)]
@@ -606,7 +615,12 @@ impl Blobs for BackupBlobs {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         tokio::task::yield_now().await;
         self.reached()?;
-        if self.canary == Some(Canary::LandsFilesLate) && key.contains("/files/") {
+        let late = match self.canary {
+            Some(Canary::LandsFilesLate) => key.contains("/files/"),
+            Some(Canary::SpillAfterLink) => key.contains("/frames/"),
+            _ => false,
+        };
+        if late {
             (self.delayed.lock().unwrap()).push((key.to_string(), bytes, false));
             return Ok(());
         }
@@ -1316,6 +1330,10 @@ enum Action {
     /// A batch of up to so many commits is shipped to the backup store
     /// (DW-668, S2).
     Ship(usize),
+    /// The backup store is one that creates files of so many bytes at
+    /// most, in place of the one there: taken before anything is shipped,
+    /// so that frames spill (DW-668, S3).
+    BackupCreatesAtMost(usize),
     /// Shipping of the partition begins, as bootstrap begins it: the hold
     /// is taken, and then a base recorded at the newest checkpoint whose
     /// row at its base is there, through the coordinator's own calls.
@@ -1651,6 +1669,8 @@ struct World {
     stalls: Vec<Stall>,
     /// Every base a run of shipping was recorded at.
     bases: BTreeSet<LogPosition>,
+    /// Every link seen in the backup store, by incarnation and position.
+    linked: BTreeSet<(Incarnation, LogPosition)>,
     shipping_from: Option<ShipBase>,
     step: usize,
     made: Made,
@@ -1787,6 +1807,11 @@ struct Made {
     /// and steps at which a watermark was checked against the links there.
     shipped_checkpoints: usize,
     watermarks: usize,
+    /// Links seen in the backup store, inline and spilled.
+    inlined: usize,
+    spilled: usize,
+    /// Of the links spilled, those of logs, streamed as they came.
+    spilled_logs: usize,
 }
 
 impl Made {
@@ -1822,6 +1847,9 @@ impl Made {
             stalled: self.stalled + other.stalled,
             shipped_checkpoints: self.shipped_checkpoints + other.shipped_checkpoints,
             watermarks: self.watermarks + other.watermarks,
+            inlined: self.inlined + other.inlined,
+            spilled: self.spilled + other.spilled,
+            spilled_logs: self.spilled_logs + other.spilled_logs,
         }
     }
 }
@@ -1983,6 +2011,7 @@ impl World {
             shipping_from: None,
             stalls: Vec::new(),
             bases: BTreeSet::new(),
+            linked: BTreeSet::new(),
             step: 0,
             made: Made::default(),
         };
@@ -2160,8 +2189,36 @@ impl World {
                     header.position, header.key, header.committed_at
                 )
             })?;
+            // A spilled frame is there before its link, as summed (I3).
+            let carried = match header.body {
+                link::Body::Inline => link.frame,
+                link::Body::Spilled => {
+                    let spilled = store.get(&timeline.frame(&header.key)).await.ok();
+                    let summed = spilled.as_ref().is_some_and(|spilled| {
+                        spilled.len() as u64 == header.size && Sum::of(spilled) == header.sum
+                    });
+                    check(summed, || {
+                        format!(
+                            "I3: the spilled link at {:?} is there without its frame as summed",
+                            header.position
+                        )
+                    })?;
+                    spilled
+                }
+            };
+            if self.linked.insert((shipping.incarnation, header.position)) {
+                match header.body {
+                    link::Body::Inline => self.made.inlined += 1,
+                    link::Body::Spilled => {
+                        self.made.spilled += 1;
+                        if header.head == Shipped::Log {
+                            self.made.spilled_logs += 1;
+                        }
+                    }
+                }
+            }
             let frame = self.blobs.shadow.lock().unwrap().get(&header.key).cloned();
-            check(frame.is_some() && link.frame == frame, || {
+            check(frame.is_some() && carried == frame, || {
                 format!(
                     "I1: the link at {:?} carries other bytes than {}",
                     header.position, header.key
@@ -2192,7 +2249,7 @@ impl World {
             if !header.files.is_empty() {
                 self.made.shipped_checkpoints += 1;
             }
-            links.insert(header.position, (header, link.frame));
+            links.insert(header.position, (header, carried));
         }
         // Every link is made on the commit recorded just before it, as
         // its link has it: positions skip at a restore, and `before` with
@@ -3273,6 +3330,10 @@ impl World {
             }
             Action::DeliverDelayedBackup => self.backup.deliver_delayed().await,
             Action::Ship(limit) => self.ship(limit).await,
+            Action::BackupCreatesAtMost(bytes) => {
+                let canary = self.backup.canary;
+                self.backup = Arc::new(BackupBlobs::broken(bytes, canary));
+            }
             Action::BackupFalselyThere(creates) => {
                 self.backup
                     .falsely_there
@@ -4017,6 +4078,12 @@ fn shipping_action() -> impl Strategy<Value = Action> {
     ];
     prop_oneof![
         12 => (1..6usize).prop_map(Action::Ship),
+        // Writes large enough that their logs spill.
+        2 => (40..80u64).prop_map(|rows| Action::Write {
+            who: Who::Current,
+            rows,
+            delete: None,
+        }),
         1 => Just(Action::BeginShipping),
         1 => put_fault.prop_map(Action::FailBackupPut),
         1 => (1..3usize).prop_map(Action::BackupDown),
@@ -4033,7 +4100,11 @@ fn shipping_action() -> impl Strategy<Value = Action> {
 fn shipping_histories() -> impl Strategy<Value = (Clocks, Vec<Action>)> {
     let part = prop_oneof![3 => action(), 2 => shipping_action()];
     let actions = prop::collection::vec(part, 1..60).prop_map(|actions| {
-        let mut history = vec![written(), Action::BeginShipping];
+        let mut history = vec![
+            Action::BackupCreatesAtMost(SPILL_ABOVE),
+            written(),
+            Action::BeginShipping,
+        ];
         history.extend(actions);
         history
     });
@@ -4071,6 +4142,9 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
         "{made:?}"
     );
     assert!(made.ship_failed > 30, "{made:?}");
+    // Frames go inline and spill both.
+    assert!(made.inlined > 150 && made.spilled > 40, "{made:?}");
+    assert!(made.spilled_logs > 10, "{made:?}");
 
     let dropped = caught_shipping(Canary::DropsLinks);
     assert!(
@@ -4083,6 +4157,8 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
     assert!(ahead.contains("I4:"), "{ahead}");
     let shifted = caught_shipping(Canary::ShiftsCommitTimes);
     assert!(shifted.contains("I1:"), "{shifted}");
+    let spilled = caught_shipping(Canary::SpillAfterLink);
+    assert!(spilled.contains("I3: the spilled link"), "{spilled}");
 }
 
 /// The first violation the simulation reports over a fixed set of histories
