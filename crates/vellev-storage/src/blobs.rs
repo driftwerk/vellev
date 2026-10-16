@@ -293,6 +293,23 @@ impl Layout<'_> {
         )
     }
 
+    /// The key a writer names a checkpoint file by: `kind` at `position`, of
+    /// `author`, apart from any other by `nonce`, which it draws, and then
+    /// `marker`: none for a flush, `-merged` for a merge, `-restored` for a
+    /// restore from another store's files (DW-680). Every checkpoint file a
+    /// writer has written since DW-658 is named so; [`Self::named_by`] reads
+    /// these names back, and those of files written before, with no nonce.
+    pub(crate) fn nonced(
+        &self,
+        kind: &str,
+        position: LogPosition,
+        author: &Author,
+        nonce: u64,
+        marker: &str,
+    ) -> String {
+        self.named(kind, position, author, &format!("-{nonce:016x}{marker}"))
+    }
+
     /// The position a file under this partition was written at, or `None`
     /// for a key not laid out this way.
     pub(crate) fn position(&self, key: &str) -> Option<LogPosition> {
@@ -304,10 +321,14 @@ impl Layout<'_> {
     }
 
     /// What a key of this partition says of its file, if it is laid out
-    /// exactly as [`Self::named`] lays one out: the kind, position,
-    /// generation and writer, `-merged` only on a segment, index or vectors
-    /// file, and its kind again as its extension. Nothing else passes, so
-    /// every key read is plain: each part of it is one of those.
+    /// exactly as [`Self::named`] and [`Self::nonced`] lay one out: the
+    /// kind, the position, the generation, the writer; on a segment, index
+    /// or vectors file only, the nonce a writer drew since DW-658, sixteen
+    /// lowercase hex digits, and a marker, `-merged` or `-restored`; and the
+    /// kind again as its extension. `-restored` comes only with a nonce,
+    /// as no writer named a restored file before DW-658; `-merged` comes
+    /// with or without one. A log or a manifest is named with neither. Nothing else passes, so every key read is plain: each part
+    /// of it is one of those.
     pub(crate) fn named_by<'k>(&self, key: &'k str) -> Option<Named<'k>> {
         let (kind, name) = key.strip_prefix(&self.prefix())?.split_once('/')?;
         let mergeable = matches!(kind, "segment" | "index" | "vectors");
@@ -315,21 +336,37 @@ impl Layout<'_> {
             return None;
         }
         let stem = name.strip_suffix(kind)?.strip_suffix('.')?;
-        let (stem, merged) = match stem.strip_suffix("-merged") {
-            Some(stem) if mergeable => (stem, true),
-            Some(_) => return None,
-            None => (stem, false),
-        };
+        let (stem, merged, restored) =
+            match (stem.strip_suffix("-merged"), stem.strip_suffix("-restored")) {
+                (Some(stem), _) if mergeable => (stem, true, false),
+                (_, Some(stem)) if mergeable => (stem, false, true),
+                (None, None) => (stem, false, false),
+                _ => return None,
+            };
         let mut parts = stem.split('-');
         let number = |part: &str| {
             let digits = part.len() == 20 && part.bytes().all(|byte| byte.is_ascii_digit());
             digits.then(|| part.parse::<u64>().ok()).flatten()
         };
+        let hex = |part: &str, len: usize| {
+            let lower = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+            part.len() == len && part.bytes().all(lower)
+        };
         let position = LogPosition(number(parts.next()?)?);
         let generation = Generation(number(parts.next()?)?);
-        let writer = parts.next()?;
-        let hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
-        if writer.len() != 32 || !writer.bytes().all(hex) || parts.next().is_some() {
+        if !hex(parts.next()?, 32) {
+            return None;
+        }
+        let nonce = match parts.next() {
+            None => None,
+            Some(drawn) if mergeable && hex(drawn, 16) => {
+                Some(u64::from_str_radix(drawn, 16).ok()?)
+            }
+            Some(_) => return None,
+        };
+        // `restore_from` (DW-680) came after the nonce (DW-658): a file
+        // marked restored without one was never written.
+        if parts.next().is_some() || (restored && nonce.is_none()) {
             return None;
         }
         Some(Named {
@@ -337,6 +374,8 @@ impl Layout<'_> {
             position,
             generation,
             merged,
+            restored,
+            nonce,
         })
     }
 }
@@ -348,6 +387,10 @@ pub(crate) struct Named<'k> {
     pub position: LogPosition,
     pub generation: Generation,
     pub merged: bool,
+    pub restored: bool,
+    /// What the writer drew to name it apart, if it is a checkpoint file
+    /// named since DW-658.
+    pub nonce: Option<u64>,
 }
 
 /// Whether `key` is a plain path: no empty, `.` or `..` parts and no
@@ -2029,6 +2072,8 @@ mod tests {
             position: at,
             generation: Generation(2),
             merged,
+            restored: false,
+            nonce: None,
         };
         let laid_out = [
             (layout.log(at, &author), named("log", false)),
@@ -2063,6 +2108,74 @@ mod tests {
             log.replace("tenant-a/0/", "tenant-a/1/"),
             log.replace("/log/", "/other/").replace(".log", ".other"),
             log.replace("/00000000000000000007-", "/+0000000000000000007-"),
+        ];
+        for key in &refused {
+            assert_eq!(layout.named_by(key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn every_name_a_writer_gives_a_checkpoint_file_is_read_back_and_nothing_else_is() {
+        let partition = PartitionKey {
+            tenant: vellev_core::TenantId::new("tenant-a").unwrap(),
+            partition: vellev_core::Partition(0),
+        };
+        let layout = Layout(&partition);
+        let author = Author {
+            generation: Generation(2),
+            writer: uuid::Uuid::from_u128(0xabc),
+        };
+        let at = LogPosition(7);
+        let nonce = 0x0123_4567_89ab_cdef;
+        // As a flush, a merge and a restore from another store's files name
+        // them (Writer::named), each kind of checkpoint file.
+        for kind in ["segment", "index", "vectors"] {
+            for marker in ["", "-merged", "-restored"] {
+                let key = layout.nonced(kind, at, &author, nonce, marker);
+                let named = Named {
+                    kind,
+                    position: at,
+                    generation: Generation(2),
+                    merged: marker == "-merged",
+                    restored: marker == "-restored",
+                    nonce: Some(nonce),
+                };
+                assert_eq!(layout.named_by(&key), Some(named), "{key}");
+            }
+            // A nonce of any value, its sixteen digits as drawn.
+            let key = layout.nonced(kind, at, &author, 0, "");
+            assert_eq!(
+                layout.named_by(&key).and_then(|named| named.nonce),
+                Some(0),
+                "{key}"
+            );
+            // Merged with no nonce, as before DW-658, read as ever.
+            let key = layout.named(kind, at, &author, "-merged");
+            let named = layout.named_by(&key).unwrap();
+            assert!(named.merged && named.nonce.is_none(), "{key}");
+            // Restored with no nonce: no writer ever named one so, as
+            // `restore_from` (DW-680) came after the nonce (DW-658).
+            let key = layout.named(kind, at, &author, "-restored");
+            assert_eq!(layout.named_by(&key), None, "{key}");
+        }
+        let segment = layout.nonced("segment", at, &author, nonce, "");
+        let drawn = format!("-{nonce:016x}");
+        let refused = [
+            // A nonce of other than sixteen lowercase hex digits.
+            segment.replace(&drawn, &drawn[..16]),
+            segment.replace(&drawn, &format!("{drawn}0")),
+            segment.replace(&drawn, &drawn.to_uppercase()),
+            segment.replace(&drawn, "-0123456789abcdeg"),
+            // Two of them, or one after the marker.
+            segment.replace(&drawn, &format!("{drawn}{drawn}")),
+            layout.named("segment", at, &author, &format!("-merged{drawn}")),
+            // Two markers.
+            layout.nonced("segment", at, &author, nonce, "-merged-restored"),
+            // A head, never named with either.
+            layout.nonced("log", at, &author, nonce, ""),
+            layout.nonced("manifest", at, &author, nonce, ""),
+            layout.named("log", at, &author, "-restored"),
+            layout.named("manifest", at, &author, "-restored"),
         ];
         for key in &refused {
             assert_eq!(layout.named_by(key), None, "{key}");

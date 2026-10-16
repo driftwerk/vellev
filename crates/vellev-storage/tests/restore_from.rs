@@ -1915,3 +1915,85 @@ async fn a_restore_tries_a_slow_local_disk_three_times_in_all_while_its_right_ho
         }
     }
 }
+
+/// Every checkpoint file a real flush, merge and restore from another
+/// store's files named, as its manifest lists it: each manifest, in a
+/// link of continuous backup (DW-668) listing its files, is read back,
+/// whatever the writer drew to name them apart and whatever marks them.
+#[tokio::test]
+async fn a_link_lists_every_checkpoint_file_a_flush_a_merge_and_a_restore_name() {
+    use vellev_storage::coordinator::{ClusterId, Generation, Lineage};
+    use vellev_storage::link::{self, Body, Head, Header, Needed, Sum, Timeline};
+
+    // A flush, a second, and a merge of the two; then that put back, by
+    // a restore from its files, into a partition of its own.
+    let merged = a_merge(Cluster::new().await).await;
+    let source = frozen(&merged).await;
+    let into = Cluster::new().await;
+    let writer = lived_in(&into).await;
+    restored_from(&into, &writer, &source).await.unwrap();
+
+    let mut marks = BTreeSet::new();
+    for cluster in [&merged, &into] {
+        let listed = cluster.blobs.list("").await.unwrap();
+        let manifests = listed
+            .into_iter()
+            .filter(|file| file.key.contains("/manifest/"));
+        for file in manifests {
+            let frame = cluster.blobs.get(&file.key).await.unwrap();
+            let manifest = read_manifest(&*cluster.blobs, &file.key).await;
+            let files: Vec<Needed> = manifest
+                .segments
+                .iter()
+                .flat_map(|segment| {
+                    [
+                        Some(&segment.key),
+                        segment.index.as_ref(),
+                        segment.vectors.as_ref(),
+                    ]
+                })
+                .flatten()
+                .map(|key| Needed {
+                    key: key.clone(),
+                    size: 1,
+                    sum: Sum::of(key.as_bytes()),
+                })
+                .collect();
+            for needed in &files {
+                let stem = needed.key.rsplit('/').next().unwrap();
+                marks.insert(match () {
+                    _ if stem.contains("-merged.") => "merged",
+                    _ if stem.contains("-restored.") => "restored",
+                    _ => "flushed",
+                });
+            }
+            let generation: u64 = file.key.rsplit('/').next().unwrap()[21..41]
+                .parse()
+                .unwrap();
+            let header = Header {
+                tenant: cluster.key.tenant.clone(),
+                lineage: Lineage(uuid::Uuid::from_u128(1)),
+                cluster: ClusterId(uuid::Uuid::from_u128(2)),
+                incarnation: cluster.committed().await.incarnation,
+                partition: cluster.key.partition,
+                position: manifest.position,
+                key: file.key.clone(),
+                head: Head::Manifest,
+                generation: Generation(generation),
+                committed_at: cluster.clock.now(),
+                sum: Sum::of(&frame),
+                size: frame.len() as u64,
+                before: None,
+                files,
+                body: Body::Spilled,
+            };
+            let at = Timeline::of(&header).link(header.position);
+            let read = link::decode(&at, &link::encode(&header, None).unwrap());
+            match read {
+                Ok(link) => assert_eq!(link.header, header, "{}", file.key),
+                Err(error) => panic!("{}: {error}", file.key),
+            }
+        }
+    }
+    assert_eq!(marks, BTreeSet::from(["flushed", "merged", "restored"]));
+}

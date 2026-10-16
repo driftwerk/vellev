@@ -1839,10 +1839,14 @@ impl Writer {
     /// the latest checkpoint: a flush's or a merge's at the position of the
     /// partition it was built from, a restore's at the position it commits.
     fn named(&self, position: LogPosition, marker: &str) -> Names {
-        let nonce = uuid::Uuid::new_v4().as_u64_pair().0;
-        let suffix = format!("-{nonce:016x}{marker}");
+        self.named_drawing(position, marker, uuid::Uuid::new_v4().as_u64_pair().0)
+    }
+
+    /// As [`Self::named`], with `nonce` as drawn: so that what a writer
+    /// names its files is pinned to [`Layout::nonced`], whatever it draws.
+    fn named_drawing(&self, position: LogPosition, marker: &str, nonce: u64) -> Names {
         let layout = Layout(&self.lease.key);
-        let named = |kind| layout.named(kind, position, &self.author, &suffix);
+        let named = |kind| layout.nonced(kind, position, &self.author, nonce, marker);
         Names {
             segment: named("segment"),
             index: named("index"),
@@ -3039,6 +3043,30 @@ mod tests {
         };
         let writer = Writer::open(blobs, coordinator.clone(), lease, &committed).await;
         (writer.unwrap().merging_with(MERGING), coordinator)
+    }
+
+    #[tokio::test]
+    async fn a_writer_names_its_checkpoint_files_as_the_layout_does_its_nonce_in_sixteen_digits() {
+        let writer = writer().await;
+        let layout = Layout(&writer.lease.key);
+        let at = LogPosition(7);
+        // A nonce whose leading digits are zeros, kept as drawn.
+        let nonce = 0xab;
+        for marker in ["", "-merged", "-restored"] {
+            let names = writer.named_drawing(at, marker, nonce);
+            for (kind, name) in [
+                ("segment", &names.segment),
+                ("index", &names.index),
+                ("vectors", &names.vectors),
+            ] {
+                let laid_out = layout.nonced(kind, at, writer.author(), nonce, marker);
+                assert_eq!(*name, laid_out);
+                let ending = format!("-00000000000000ab{marker}.{kind}");
+                assert!(name.ends_with(&ending), "{name}");
+                let named = layout.named_by(name).unwrap();
+                assert_eq!(named.nonce, Some(nonce), "{name}");
+            }
+        }
     }
 
     #[test]
