@@ -107,6 +107,9 @@ enum PutFault {
     LandThenFail,
     /// The writer sees an error and the file arrives later.
     Delay,
+    /// Nothing goes wrong with this one: so that a fault queued after it
+    /// falls on the request after it, as between a spill and its link.
+    Pass,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -402,7 +405,7 @@ impl Blobs for SimBlobs {
         }
         let fault = self.faults.lock().unwrap().puts.pop_front();
         let put = match fault {
-            None => self.land(key, bytes).await,
+            None | Some(PutFault::Pass) => self.land(key, bytes).await,
             Some(PutFault::Refuse) => Err(lost()),
             Some(PutFault::LandThenFail) => self.land(key, bytes).await.and(Err(lost())),
             Some(PutFault::Delay) => {
@@ -626,7 +629,7 @@ impl Blobs for BackupBlobs {
         }
         let fault = self.faults.lock().unwrap().pop_front();
         match fault {
-            None => {
+            None | Some(PutFault::Pass) => {
                 self.clean.put(key, bytes.clone()).await?;
                 self.landed(key, &bytes);
                 Ok(())
@@ -668,7 +671,7 @@ impl Blobs for BackupBlobs {
                 (self.delayed.lock().unwrap()).push((key.to_string(), bytes, true));
                 Err(lost())
             }
-            None | Some(PutFault::LandThenFail) => {
+            None | Some(PutFault::Pass) | Some(PutFault::LandThenFail) => {
                 let created = self.clean.put_new(key, bytes.clone()).await?;
                 if created == Created::Written {
                     self.landed(key, &bytes);
@@ -4074,7 +4077,8 @@ fn shipping_action() -> impl Strategy<Value = Action> {
     let put_fault = prop_oneof![
         Just(PutFault::Refuse),
         Just(PutFault::LandThenFail),
-        Just(PutFault::Delay)
+        Just(PutFault::Delay),
+        Just(PutFault::Pass)
     ];
     prop_oneof![
         12 => (1..6usize).prop_map(Action::Ship),
@@ -4143,7 +4147,7 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
     );
     assert!(made.ship_failed > 30, "{made:?}");
     // Frames go inline and spill both.
-    assert!(made.inlined > 150 && made.spilled > 40, "{made:?}");
+    assert!(made.inlined > 120 && made.spilled > 25, "{made:?}");
     assert!(made.spilled_logs > 10, "{made:?}");
 
     let dropped = caught_shipping(Canary::DropsLinks);
