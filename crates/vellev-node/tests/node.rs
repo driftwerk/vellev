@@ -8200,3 +8200,62 @@ async fn a_node_restoring_a_tenant_from_its_own_backup_links_its_vectors_on_loca
     }
     assert_eq!(notes_held(&node).await, [true, true]);
 }
+
+/// DW-680, T3: the node's own upkeep of the tenant cleans it, and its
+/// deletes are sent and not answered; the node's hold on the tenant is
+/// lost, which stops the upkeep where it is. The tenant is restored from
+/// its own backup, and only then do the deletes land. A node with nothing
+/// of its own opens the tenant and holds every note the backup held.
+#[tokio::test(start_paused = true)]
+async fn deletes_sent_by_upkeep_stopped_by_a_lost_hold_land_after_a_restore_from_the_backup() {
+    let cluster = Cluster::new();
+    let store = backup_store();
+    let blobs = Troubled::over(cluster.store.clone());
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over(&cluster, coordinator.clone(), blobs.clone(), store.clone());
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let tenant = node.tenant(&acme).await.unwrap();
+    tenant
+        .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    tenant.flush().await.unwrap();
+    tenant.write(vec![note(2, "hen", None)]).await.unwrap();
+    let backup = node.back_up(&acme).await.unwrap();
+    for (n, title) in [(3, "owl"), (4, "elk"), (5, "bee")] {
+        tenant.write(vec![note(n, title, None)]).await.unwrap();
+        tenant.flush().await.unwrap();
+    }
+
+    // The upkeep comes round once a minute, merges and cleans, and hangs
+    // on the deletes it sends.
+    blobs.deletes_hang.store(true, Ordering::SeqCst);
+    let sent = tokio::time::timeout(Duration::from_secs(5 * 60), blobs.delete_sent.notified());
+    sent.await.expect("the upkeep sends its deletes");
+    let segment = listed_of_kind(&backup, "segment");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let hung = blobs.hung.lock().unwrap().clone();
+    assert!(hung.contains(&segment), "{hung:?}");
+
+    // The hold is lost: its renewals fail until it runs out, which stops
+    // the upkeep where it is, its deletes sent.
+    coordinator.failing.store(true, Ordering::SeqCst);
+    tokio::time::sleep(LEASE * 2).await;
+    coordinator.failing.store(false, Ordering::SeqCst);
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+    let opened = node.tenant(&acme).await.unwrap();
+    assert!(!Arc::ptr_eq(&tenant, &opened), "the hold was lost");
+    drop((tenant, opened));
+    blobs.deletes_hang.store(false, Ordering::SeqCst);
+
+    restored_under_no_key_the_backup_lists(&cluster, &blobs, &node, &backup).await;
+    for key in &hung {
+        cluster.store.delete(key).await.unwrap();
+    }
+    node.shutdown().await;
+    cluster.clock.advance(LEASE + Duration::from_secs(1));
+    let fresh = backing_up_to(&cluster, store);
+    assert_eq!(notes_held(&fresh).await, [true, true]);
+    fresh.back_up(&acme).await.unwrap();
+}

@@ -485,6 +485,17 @@ after its answer was lost, sent to it or on to it, is made again, going
 back past whatever was written in between. Upgrade every node before
 asking for a restore, and ask for none while a deploy that adds this runs.
 
+A restore from a backup copies the backup's files into the tenant's store
+under names of its own and commits a head naming only those (DW-680). No
+file format changes: a node of the release before opens, cleans and backs
+up such a tenant as any other, its file names keeping the position first,
+and passes over an index file that says another segment, as it always
+has. A node of the release before that restores from a backup does it the
+old way, by the names the files had, and a delete given up before the
+restore and landing after it can take a file its head names. That is one
+more reason to upgrade every node before asking for a restore; see
+[runbook.md](runbook.md).
+
 A commit names the position and the head it was built on, and is recorded
 only if those are what is committed still, in the statement that checks
 its lease: two writers under one lease cannot both commit, nor one that
@@ -514,3 +525,7 @@ release before does not know are lost when it rewrites a file, which is
 why only fields that may be lost are added without a new format. After
 the setting is raised and the cluster's format has risen, the release
 before refuses to start, and rolling back means restoring from before.
+
+Rolling back past DW-680 reads every tenant this release restored, and
+brings back the hazard above for restores the older release makes, for as
+long as it runs.

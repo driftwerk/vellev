@@ -1,5 +1,25 @@
 //! Immutable files in object storage. A key is written once and never
 //! changes, which is what makes caching them on local disk safe.
+//!
+//! Nothing brought in from outside a tenant's store, from a backup or from
+//! shipped history, is ever written or named there under the key it had:
+//! it is copied under keys of its own, which nobody could have known
+//! before, and the head that takes it up names only those
+//! ([`Writer::restore_from`]). A delete asked for of a key, however late
+//! it lands, so never takes a file a head brought in that way names. That
+//! is the whole of the rule, and the code enforces it (DW-680).
+//!
+//! A head made inside the store does name older keys: every checkpoint
+//! carries forward the files of the one before, and a restore to a point
+//! in the window names the files of that point. The first is safe by the
+//! cleaner's own rule ([`Writer::clean`]). The second is safe only by a
+//! margin of time, the grace, which nothing enforces: the clocks the
+//! cleaner and the coordinator go by must not disagree by more than it.
+//! Capping what a clean deletes by the commits the coordinator still has
+//! is DW-681.
+//!
+//! [`Writer::restore_from`]: crate::Writer::restore_from
+//! [`Writer::clean`]: crate::Writer::clean
 
 use std::collections::HashMap;
 use std::fmt;

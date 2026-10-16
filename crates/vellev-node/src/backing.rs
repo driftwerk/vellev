@@ -1,6 +1,16 @@
 //! Tenants backed up to a second store, daily and when asked, and put back
 //! from it: into their own cluster, or into one that has lost them.
 //!
+//! Nothing of a backup comes into a tenant's store under the key it had:
+//! a restore copies every file it needs from the backup under keys of its
+//! own and commits a head that names only those (DW-680; see
+//! `vellev_storage::blobs`). So a delete sent before the restore, by a
+//! clean, a purge or a node since deposed, and landing after it, takes
+//! nothing the restored tenant names, and no file is taken from the
+//! tenant's store in place of the backup's: a backup that lacks one is
+//! refused, even where the tenant's store still has the file, until the
+//! next backup copies it back.
+//!
 //! One node at a time backs a tenant up or restores it from a backup, by a
 //! claim in the coordinator, so that pruning never deletes a file another
 //! backup is copying or a restore is reading. A claim is taken by an id the
@@ -349,9 +359,9 @@ impl Node {
         // Read through the backup store, each part of a file given up as
         // the store client gives one up: see `Within`.
         let source: Arc<dyn Blobs> = Arc::new(backups.source(backup)?);
-        let told = |error: StorageError| match error {
-            StorageError::Unheld(tenant) => NodeError::ClaimLost(tenant),
-            error => opened.told(error),
+        let told = |error: StorageError| match claimed(error) {
+            NodeError::Storage(error) => opened.told(error),
+            lost => lost,
         };
         let preparing =
             opened
@@ -1698,5 +1708,22 @@ mod tests {
         deleting.put_parts("file", coming(file())).await.unwrap();
         assert_eq!(*inner.kept.lock().unwrap(), file());
         assert!(!deleting.sent.load(Ordering::SeqCst));
+    }
+
+    /// A right that ran out under a store's work is told as the claim
+    /// lost, whatever work it was; anything else as it was.
+    #[test]
+    fn a_right_run_out_under_a_stores_work_is_told_as_the_claim_lost() {
+        let acme = TenantId::new("acme").unwrap();
+        let lost = claimed(StorageError::Unheld(acme.clone()));
+        assert!(
+            matches!(&lost, NodeError::ClaimLost(tenant) if *tenant == acme),
+            "{lost}"
+        );
+        let other = claimed(StorageError::Closed);
+        assert!(
+            matches!(other, NodeError::Storage(StorageError::Closed)),
+            "{other}"
+        );
     }
 }
