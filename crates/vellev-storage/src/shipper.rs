@@ -8,27 +8,27 @@
 //!    nothing unless it is of that incarnation, has a base, and has not
 //!    stalled: so a stale shipper, of a run since re-based or of an
 //!    incarnation since removed, stops;
-//! 1a. on the first batch of a run this shipper ships (its start, a
+//! 2. on the first batch of a run this shipper ships (its start, a
 //!    re-base, or a handover to it), asks the backup store in one request
 //!    whether it holds a link past the committed position, and stalls the
 //!    run naming T8 if it does (bootstrap note C). The node keeps one
 //!    shipper for each partition it holds, so that this is once a run, and
 //!    a new one on a handover; the shipper never lists the store;
-//! 2. takes the commits after what the run has shipped (or from its base)
+//! 3. takes the commits after what the run has shipped (or from its base)
 //!    in order, positions skipping where they do (a restore commits past
 //!    the current position);
-//! 3. ships each as a link: its frame read from the primary under the
+//! 4. ships each as a link: its frame read from the primary under the
 //!    row's head, checked by its CRC and decoded to the row's position
 //!    (and, for a log, made on the row before), its header made from the
 //!    row (its time, by the database's clock) and the key (its
 //!    generation); a checkpoint's files first, each copied to the backup
 //!    store and summed on the way, and only then its link (I3);
-//! 4. creates each link once (`put_new`): a link already there of the same
+//! 5. creates each link once (`put_new`): a link already there of the same
 //!    commit, every field but `body` equal, is shipped; at the run's own
 //!    base, one that differs only in `before`, its own `None`, is too
 //!    (bootstrap note C); anything else is a fork, and stalls the run
 //!    naming the fields that differ;
-//! 5. notes the watermark at the last position it shipped.
+//! 6. notes the watermark at the last position it shipped.
 //!
 //! A frame too large to go inline, with its link's header, is spilled
 //! (amendment 1, A2): put first under `frames/{key}` beside the links, and
