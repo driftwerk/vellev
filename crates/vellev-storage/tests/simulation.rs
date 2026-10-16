@@ -173,6 +173,9 @@ enum Canary {
     /// The coordinator gives each commit row a time a microsecond later
     /// than the commit was made at.
     ShiftsCommitTimes,
+    /// The coordinator hides the shipping cap from a clean, and says a
+    /// clean recorded above it when it did not (DW-668 PR 6).
+    CapIgnored,
     /// The backup store answers a spilled frame's put as done, and lands
     /// it only later, with the requests it has yet to make: after the
     /// link that names it (DW-668, S3).
@@ -810,6 +813,15 @@ impl Coordinator for StaleView {
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         self.inner.record_base(key, incarnation, base).await
     }
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.raise_ship_cap(key, incarnation, base, cap).await
+    }
     async fn note_shipped(
         &self,
         key: &PartitionKey,
@@ -1233,7 +1245,14 @@ impl Coordinator for SimCoordinator {
             self.records.lock().unwrap().push((asked, false));
             return Err(reset());
         }
-        let made = self.clean.clean_below(lease, base, position).await;
+        let made = match self.clean.clean_below(lease, base, position).await {
+            Err(CoordinatorError::CleanAboveCap { .. })
+                if self.canary == Some(Canary::CapIgnored) =>
+            {
+                Ok(asked.clone())
+            }
+            made => made,
+        };
         self.records.lock().unwrap().push((asked, made.is_ok()));
         if let Ok(made) = &made {
             *self.record.lock().unwrap() = Some(made.position.0);
@@ -1247,7 +1266,14 @@ impl Coordinator for SimCoordinator {
         &self,
         key: &PartitionKey,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
-        self.clean.shipping(key).await
+        let shipping = self.clean.shipping(key).await?;
+        Ok(match self.canary {
+            Some(Canary::CapIgnored) => vellev_storage::coordinator::Shipping {
+                cap: None,
+                ..shipping
+            },
+            _ => shipping,
+        })
     }
     async fn hold_for_shipping(
         &self,
@@ -1264,6 +1290,15 @@ impl Coordinator for SimCoordinator {
         base: &vellev_storage::coordinator::ShipBase,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         self.clean.record_base(key, incarnation, base).await
+    }
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.clean.raise_ship_cap(key, incarnation, base, cap).await
     }
     async fn note_shipped(
         &self,
@@ -2518,6 +2553,50 @@ impl World {
         }
     }
 
+    /// Every checkpoint the run has yet to ship, by the commit rows above
+    /// its watermark (or from its base), is in the primary with every file
+    /// it lists: a clean is held below them by the cap (DW-668 PR 6).
+    async fn unshipped_kept(&self, shipping: &vellev_storage::coordinator::Shipping) -> Violation {
+        let Some(base) = &shipping.base else {
+            return Ok(());
+        };
+        let after = shipping
+            .shipped
+            .unwrap_or(LogPosition(base.position.0.saturating_sub(1)));
+        let key = &self.cluster.key;
+        let rows = self
+            .coordinator
+            .clean
+            .commits_after(key, shipping.incarnation, after, 10_000)
+            .await
+            .unwrap_or_default();
+        for row in rows.iter().filter(|row| row.head.0.ends_with(".manifest")) {
+            let head = &row.head.0;
+            let frame = self.blobs.shadow.lock().unwrap().get(head).cloned();
+            let Some(Ok(Stored::Manifest(manifest))) = frame.map(|frame| decode_head(head, &frame))
+            else {
+                continue;
+            };
+            let mut needed = vec![head.clone()];
+            for segment in &manifest.segments {
+                needed.push(segment.key.clone());
+                needed.extend(segment.index.clone());
+                needed.extend(segment.vectors.clone());
+            }
+            needed.extend(manifest.replay.iter().cloned());
+            for file in needed {
+                let gone = matches!(
+                    self.blobs.clean.get(&file).await,
+                    Err(StorageError::Missing { .. })
+                );
+                check(!gone, || {
+                    format!("PR 6: {file}, of the checkpoint at {:?} yet to be shipped, is gone from the primary", row.position)
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// What the backup store holds of the partition's run of shipping, as
     /// committed (DW-668):
     ///
@@ -2530,20 +2609,9 @@ impl World {
     /// - a run stalls only where the primary has lost what it was to ship,
     ///   as a clean may make it until the clean floor (PR 6) is built.
     async fn shipped_as_committed(&mut self) -> Violation {
-        let mut stalled = Vec::new();
-        for stall in &self.stalls {
-            // Only where the primary truly has lost what was to be shipped.
-            let lost = match stall {
-                Stall::PrimaryMissing { key } => matches!(
-                    self.blobs.clean.get(key).await,
-                    Err(StorageError::Missing { .. })
-                ),
-                _ => false,
-            };
-            if !lost {
-                stalled.push(stall);
-            }
-        }
+        // No run stalls with nothing broken: not even for a file gone from
+        // the primary, which a clean held to the cap never takes (PR 6).
+        let stalled = &self.stalls;
         check(stalled.is_empty(), || {
             format!("the run stalled with nothing broken: {stalled:?}")
         })?;
@@ -2551,13 +2619,14 @@ impl World {
         let Ok(shipping) = self.coordinator.clean.shipping(&key).await else {
             return Ok(());
         };
-        // What an operator sees: the run's own record stalled only where
-        // its own shipper would stall it.
+        // What an operator sees: the run's own record never stalled with
+        // nothing broken, for a file gone from the primary least of all,
+        // which a clean held to the cap never takes (PR 6).
         let recorded = shipping.stalled.as_deref();
-        check(
-            recorded.is_none_or(|why| why.contains("is committed and not in the primary store")),
-            || format!("the run's record is stalled with nothing broken: {recorded:?}"),
-        )?;
+        check(recorded.is_none(), || {
+            format!("the run's record is stalled with nothing broken: {recorded:?}")
+        })?;
+        self.unshipped_kept(&shipping).await?;
         let timeline = Timeline {
             tenant: key.tenant.clone(),
             lineage: LINEAGE,
@@ -4697,6 +4766,16 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
     assert!(late.contains("I3:"), "{late}");
     let ahead = caught_shipping(Canary::NotesShippedAhead);
     assert!(ahead.contains("I4:"), "{ahead}");
+    let capped = caught_shipping(Canary::CapIgnored);
+    // Caught as a file of a checkpoint yet to ship gone from the primary,
+    // or as a clean that then fails on a checkpoint the one before deleted
+    // under a record the coordinator only said it made.
+    assert!(
+        capped.contains("PR 6:")
+            || capped.contains("PrimaryMissing")
+            || capped.contains("a clean failed with nothing in its way"),
+        "{capped}"
+    );
     let shifted = caught_shipping(Canary::ShiftsCommitTimes);
     assert!(shifted.contains("I1:"), "{shifted}");
     // A stale run unfenced stalls the run under way, as the fork it meets

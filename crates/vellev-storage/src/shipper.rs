@@ -30,7 +30,9 @@
 //!    base, one that differs only in `before`, its own `None`, is too
 //!    (bootstrap note C); anything else is a fork, and stalls the run
 //!    naming the fields that differ;
-//! 6. notes the watermark at the last position it shipped.
+//! 6. notes the watermark at the last position it shipped, and raises the
+//!    cap the partition's cleans are held to, to it (DW-668 PR 6), so
+//!    that what is shipped is cleaned.
 //!
 //! A frame too large to go inline, with its link's header, is spilled
 //! (amendment 1, A2): put first under `frames/{key}` beside the links, and
@@ -314,6 +316,16 @@ impl Shipper {
                 }
             }
         }
+        // A cap left behind what was shipped, by a batch that noted and
+        // then failed before raising it, is raised first.
+        if let Some(shipped) = shipping
+            .shipped
+            .filter(|shipped| shipping.cap < Some(*shipped))
+        {
+            self.coordinator
+                .raise_ship_cap(&self.key, incarnation, base.position, shipped)
+                .await?;
+        }
         let mut last = match shipping.shipped {
             None => None,
             Some(shipped) => match self.shipped(&timeline, shipped).await? {
@@ -432,6 +444,10 @@ impl Shipper {
         if let Some(position) = through {
             self.coordinator
                 .note_shipped(&self.key, incarnation, base.position, position)
+                .await?;
+            // The cap follows (PR 6), so that what is shipped is cleaned.
+            self.coordinator
+                .raise_ship_cap(&self.key, incarnation, base.position, position)
                 .await?;
         }
         Ok(())
