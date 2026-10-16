@@ -830,7 +830,21 @@ impl Coordinator for MemoryCoordinator {
     async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64> {
         self.with_row(key, |row, now| {
             let start = window_start(now, window)?;
-            let forgotten = row.history.len() - row.reachable(start).len();
+            let unreachable = row.history.len() - row.reachable(start).len();
+            // Nothing from the floor shipping needs: after what its run
+            // shipped, else from its base, else from its hold.
+            let floor = row
+                .ship_run
+                .as_ref()
+                .and_then(|run| run.shipped)
+                .map(|shipped| LogPosition(shipped.0 + 1))
+                .or(row.ship_base.as_ref().map(|base| base.position))
+                .or(row.ship_hold_from);
+            let below = floor.map_or(row.history.len(), |floor| {
+                row.history
+                    .partition_point(|commit| commit.position < floor)
+            });
+            let forgotten = unreachable.min(below);
             row.history.drain(..forgotten);
             let kept_since = window_start(now, RESTORES_KEPT_FOR)?;
             row.restores.retain(|(at, _)| *at >= kept_since);

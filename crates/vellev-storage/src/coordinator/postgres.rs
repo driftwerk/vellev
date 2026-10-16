@@ -1219,8 +1219,18 @@ impl Coordinator for PostgresCoordinator {
         checked_ship_base(base)?;
         for _ in 0..SHIP_TRIES {
             let mut tx = self.pool.begin().await?;
-            // The partition's row first, then the run's own: every
+            // The shipping lock first, in a statement of its own, as the
+            // hold and forget_history take it: a base raised over a run
+            // that has shipped lowers the floor forget_history keeps from,
+            // so it must be ordered against a delete under way, and see
+            // in its own statement, taken after the lock, what that delete
+            // left. Then the partition's row, then the run's own: every
             // transaction that writes both takes them in that order.
+            sqlx::query(SHIP_LOCK)
+                .bind(key.tenant.as_str())
+                .bind(i64::from(key.partition.0))
+                .execute(&mut *tx)
+                .await?;
             let based = sqlx::query(
                 "UPDATE vellev.partitions p
                  SET ship_base = $4, ship_base_checkpoint = $5,
@@ -1672,19 +1682,45 @@ impl Coordinator for PostgresCoordinator {
         Ok(found.next().transpose()?.zip(found.next().transpose()?))
     }
 
+    /// Nothing at or above the floor shipping needs is forgotten: after
+    /// what the run shipped, else from its base, else from its hold. The
+    /// floor is read by the delete, a statement of its own after the
+    /// shipping lock is taken, so it sees any hold, and any base, recorded
+    /// before it, both being recorded under the same lock; and one being
+    /// recorded waits for it, and then sees what it left. A base raised
+    /// over a run that has shipped lowers the floor, which is why it takes
+    /// the lock. The watermark is raised without it, and only rises, so a
+    /// read that misses one keeps more.
     async fn forget_history(&self, key: &PartitionKey, window: Duration) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(SHIP_LOCK)
+            .bind(key.tenant.as_str())
+            .bind(i64::from(key.partition.0))
+            .execute(&mut *tx)
+            .await?;
         let done = sqlx::query(&format!(
-            "{REACHABLE}
+            "{REACHABLE}, floor AS (
+                 SELECT p.incarnation,
+                        COALESCE(s.shipped + 1, p.ship_base, p.ship_hold_from) AS position
+                 FROM vellev.partitions p
+                 LEFT JOIN vellev.shipping s
+                   ON s.tenant = p.tenant AND s.partition = p.partition
+                  AND s.incarnation = p.incarnation
+                 WHERE p.tenant = $1 AND p.partition = $2
+             )
              DELETE FROM vellev.commits c
              WHERE c.tenant = $1 AND c.partition = $2
                AND NOT EXISTS (SELECT 1 FROM boundary b
-                               WHERE b.incarnation = c.incarnation AND c.position >= b.position)"
+                               WHERE b.incarnation = c.incarnation AND c.position >= b.position)
+               AND NOT EXISTS (SELECT 1 FROM floor f
+                               WHERE f.incarnation = c.incarnation AND c.position >= f.position)"
         ))
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
         .bind(window.as_secs_f64())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         sqlx::query(
             "DELETE FROM vellev.restores
              WHERE tenant = $1 AND partition = $2 AND made_at < now() - make_interval(secs => $3)",
