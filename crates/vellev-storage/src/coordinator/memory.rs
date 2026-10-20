@@ -13,11 +13,11 @@ use vellev_core::{NodeId, RequestId, TenantId};
 
 use super::{
     base_decision, checked_hold, checked_note, checked_ship_base, checked_ttl, checked_window,
-    hold_decision, same_incarnation, window_start, Acquired, Adoption, Cleaned, ClusterId, Commit,
-    Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation,
-    KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges,
-    Removed, RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts, Shipping, TenantKey,
-    Unshipped, Versions, RESTORES_KEPT_FOR,
+    hold_decision, past_shipped, same_incarnation, window_start, Acquired, Adoption, Cleaned,
+    ClusterId, Commit, Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity,
+    Incarnation, KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point,
+    PurgeClaim, Purges, Removed, RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts,
+    Shipping, TenantKey, Unshipped, Versions, RESTORES_KEPT_FOR,
 };
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -546,8 +546,14 @@ impl Coordinator for MemoryCoordinator {
                 base: base.clone(),
                 position,
             };
-            match &row.cleaned {
-                Some(cleaned) if cleaned.position >= position => Ok(cleaned.clone()),
+            match (&row.cleaned, row.ship_cap) {
+                (Some(cleaned), _) if cleaned.position >= position => Ok(cleaned.clone()),
+                // Held below the cap, on the record to be written (H).
+                (_, Some(cap)) if position > cap => Err(CoordinatorError::CleanAboveCap {
+                    key: lease.key.clone(),
+                    asked: position,
+                    cap,
+                }),
                 _ => {
                     row.cleaned = Some(raised.clone());
                     Ok(raised)
@@ -595,6 +601,27 @@ impl Coordinator for MemoryCoordinator {
                     stalled: None,
                 });
             }
+            Ok(row.shipping())
+        })
+    }
+
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        cap: LogPosition,
+    ) -> Result<Shipping> {
+        self.with_row(key, |row, _| {
+            let run = shipper_run(key, incarnation, base, row)?;
+            let shipped = run.shipped;
+            if row.ship_cap.is_some_and(|stands| stands >= cap) {
+                return Ok(row.shipping());
+            }
+            if shipped.is_none_or(|shipped| cap > shipped) {
+                return Err(past_shipped(key, cap, shipped));
+            }
+            row.ship_cap = Some(cap);
             Ok(row.shipping())
         })
     }

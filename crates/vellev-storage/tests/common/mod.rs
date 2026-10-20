@@ -317,8 +317,9 @@ pub struct Unreliable {
     /// Commit rows as `commits_after` gives them, by position: one not
     /// given (`None`), or another in its place.
     pub rows: Mutex<BTreeMap<LogPosition, Option<RestorePoint>>>,
-    /// Shipping noted nowhere: what a run shipped, or why it stalled, is
-    /// answered as the record stands, and not recorded.
+    /// Shipping noted nowhere: what a run shipped, why it stalled, or the
+    /// cap raised to it, is answered as the record stands, and not
+    /// recorded.
     pub unnoted: AtomicBool,
     /// A base recorded, once, as the next commit rows are read: a run
     /// re-based while a batch of it is under way.
@@ -329,6 +330,12 @@ pub struct Unreliable {
     /// The position the next reading of what is committed answers, once,
     /// in place of the one committed: as read just before a commit.
     pub committed_once: Mutex<Option<LogPosition>>,
+    /// A hold for shipping taken, once, capped here, as the next clean
+    /// asks to record: taken between the clean's reading of the cap and
+    /// its record.
+    pub hold_on_clean: Mutex<Option<LogPosition>>,
+    /// Every reading of shipping fails, as a coordinator not reached does.
+    pub fail_shipping: AtomicBool,
 }
 
 impl Unreliable {
@@ -346,6 +353,8 @@ impl Unreliable {
             re_base: Mutex::new(None),
             shipping_once: Mutex::new(None),
             committed_once: Mutex::new(None),
+            hold_on_clean: Mutex::new(None),
+            fail_shipping: AtomicBool::new(false),
         }
     }
 }
@@ -419,6 +428,11 @@ impl Coordinator for Unreliable {
         base: &vellev_storage::coordinator::ManifestRef,
         position: vellev_storage::coordinator::LogPosition,
     ) -> Result<vellev_storage::coordinator::Cleaned, CoordinatorError> {
+        let hold = self.hold_on_clean.lock().unwrap().take();
+        if let Some(cap) = hold {
+            let now = self.inner.committed(&lease.key).await?.unwrap().incarnation;
+            self.inner.hold_for_shipping(&lease.key, now, cap).await?;
+        }
         self.inner.clean_below(lease, base, position).await
     }
     async fn shipping(
@@ -427,6 +441,9 @@ impl Coordinator for Unreliable {
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         if let Some(seen) = self.shipping_once.lock().unwrap().take() {
             return Ok(seen);
+        }
+        if self.fail_shipping.load(Ordering::SeqCst) {
+            return Err(lost());
         }
         self.inner.shipping(key).await
     }
@@ -445,6 +462,18 @@ impl Coordinator for Unreliable {
         base: &vellev_storage::coordinator::ShipBase,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         self.inner.record_base(key, incarnation, base).await
+    }
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if self.unnoted.load(Ordering::SeqCst) {
+            return self.inner.shipping(key).await;
+        }
+        self.inner.raise_ship_cap(key, incarnation, base, cap).await
     }
     async fn note_shipped(
         &self,

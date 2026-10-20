@@ -1484,6 +1484,15 @@ impl Coordinator for Unrenewing {
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         self.inner.record_base(key, incarnation, base).await
     }
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.raise_ship_cap(key, incarnation, base, cap).await
+    }
     async fn note_shipped(
         &self,
         key: &PartitionKey,

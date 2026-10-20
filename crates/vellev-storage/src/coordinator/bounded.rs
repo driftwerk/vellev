@@ -111,6 +111,16 @@ impl Coordinator for Bounded {
         self.bounded(self.inner.record_base(key, incarnation, base))
             .await
     }
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        cap: LogPosition,
+    ) -> Result<Shipping> {
+        self.bounded(self.inner.raise_ship_cap(key, incarnation, base, cap))
+            .await
+    }
     async fn note_shipped(
         &self,
         key: &PartitionKey,
