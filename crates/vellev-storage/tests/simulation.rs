@@ -173,8 +173,8 @@ enum Canary {
     /// The coordinator gives each commit row a time a microsecond later
     /// than the commit was made at.
     ShiftsCommitTimes,
-    /// The coordinator hides the shipping cap from a clean, and says a
-    /// clean recorded above it when it did not (DW-668 PR 6).
+    /// The coordinator hides the shipping cap from a clean, and holds a
+    /// clean above it as recorded (DW-668 PR 6).
     CapIgnored,
     /// The backup store answers a spilled frame's put as done, and lands
     /// it only later, with the requests it has yet to make: after the
@@ -1102,9 +1102,25 @@ struct SimCoordinator {
     /// of what it holds, if anything: one put back from earlier, or one of
     /// no checkpoint of this chain.
     answering: Mutex<Option<Option<Cleaned>>>,
+    /// With [`Canary::CapIgnored`], the clean the coordinator holds as
+    /// recorded above the shipping cap, which the wrapped one refused.
+    above_cap: Mutex<Option<Cleaned>>,
 }
 
 impl SimCoordinator {
+    /// The record of what cleans deleted below, as held: the wrapped
+    /// coordinator's, or, with the canary, a clean held above the cap
+    /// when that is higher.
+    async fn held(&self, key: &PartitionKey) -> Result<Option<Cleaned>, CoordinatorError> {
+        let made = self.clean.cleaned(key).await?;
+        let above = self.above_cap.lock().unwrap().clone();
+        Ok(match (made, above) {
+            (Some(made), Some(above)) if above.position > made.position => Some(above),
+            (None, Some(above)) => Some(above),
+            (made, _) => made,
+        })
+    }
+
     /// The base a note or a stall of shipping is taken for: the one it
     /// names, or, with the canary, the run under way's.
     async fn unfenced(&self, key: &PartitionKey, base: LogPosition) -> LogPosition {
@@ -1221,7 +1237,7 @@ impl Coordinator for SimCoordinator {
         if let Some(answering) = answering {
             return Ok(answering);
         }
-        self.clean.cleaned(key).await
+        self.held(key).await
     }
     async fn clean_below(
         &self,
@@ -1246,10 +1262,19 @@ impl Coordinator for SimCoordinator {
             return Err(reset());
         }
         let made = match self.clean.clean_below(lease, base, position).await {
+            // The cap ignored: the clean is held as recorded, as later
+            // reads and cleans see it, as if H were not there.
             Err(CoordinatorError::CleanAboveCap { .. })
                 if self.canary == Some(Canary::CapIgnored) =>
             {
-                Ok(asked.clone())
+                let mut above = self.above_cap.lock().unwrap();
+                match &*above {
+                    Some(held) if held.position >= position => Ok(held.clone()),
+                    _ => {
+                        *above = Some(asked.clone());
+                        Ok(asked.clone())
+                    }
+                }
             }
             made => made,
         };
@@ -2328,6 +2353,7 @@ impl World {
             record: record.clone(),
             records: Mutex::default(),
             answering: Mutex::default(),
+            above_cap: Mutex::default(),
         });
         let blobs = Arc::new(SimBlobs {
             clean: cluster.blobs.clone(),
@@ -4767,13 +4793,9 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
     let ahead = caught_shipping(Canary::NotesShippedAhead);
     assert!(ahead.contains("I4:"), "{ahead}");
     let capped = caught_shipping(Canary::CapIgnored);
-    // Caught as a file of a checkpoint yet to ship gone from the primary,
-    // or as a clean that then fails on a checkpoint the one before deleted
-    // under a record the coordinator only said it made.
+    // Caught as a file of a checkpoint yet to ship gone from the primary.
     assert!(
-        capped.contains("PR 6:")
-            || capped.contains("PrimaryMissing")
-            || capped.contains("a clean failed with nothing in its way"),
+        capped.contains("PR 6:") || capped.contains("PrimaryMissing"),
         "{capped}"
     );
     let shifted = caught_shipping(Canary::ShiftsCommitTimes);
@@ -5819,11 +5841,7 @@ impl World {
 
     /// What the coordinator holds of what cleans deleted below.
     async fn cleaned_record(&self) -> Option<Cleaned> {
-        self.coordinator
-            .clean
-            .cleaned(&self.cluster.key)
-            .await
-            .unwrap()
+        self.coordinator.held(&self.cluster.key).await.unwrap()
     }
 
     /// A clean by the newest writer with `grace`, which is to fail and
