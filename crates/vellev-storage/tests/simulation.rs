@@ -4794,10 +4794,9 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
     assert!(ahead.contains("I4:"), "{ahead}");
     let capped = caught_shipping(Canary::CapIgnored);
     // Caught as a file of a checkpoint yet to ship gone from the primary.
-    assert!(
-        capped.contains("PR 6:") || capped.contains("PrimaryMissing"),
-        "{capped}"
-    );
+    // Only the invariant itself: a shipper stalling on PrimaryMissing is
+    // the damage shown later, and would pass with the invariant untested.
+    assert!(capped.contains("PR 6:"), "{capped}");
     let shifted = caught_shipping(Canary::ShiftsCommitTimes);
     assert!(shifted.contains("I1:"), "{shifted}");
     // A stale run unfenced stalls the run under way, as the fork it meets
