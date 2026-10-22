@@ -586,6 +586,33 @@ async fn rows_without_vectors_and_replaced_rows_flush_nothing() {
     assert_eq!(acme.read(State::unflushed_vectors), 1);
 }
 
+/// A tenant held back from a flush for its vectors is flushed once it may
+/// be, written to or not: rows a quiet tenant keeps in memory are scored
+/// exactly by every search until then.
+#[tokio::test]
+async fn a_tenant_held_back_from_a_flush_for_its_vectors_is_flushed_when_it_may_be() {
+    let cluster = Cluster::new();
+    let node = vector_flushing(&cluster, 10, Duration::from_millis(300));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    let batch = |from: u64| -> Vec<Mutation> {
+        (from..from + 11)
+            .map(|n| note(n, "fox", Some(vec![1.0, n as f32])))
+            .collect()
+    };
+    acme.write(batch(0)).await.unwrap();
+    assert!(until(|| acme.read(State::unflushed_vectors) == 0).await);
+    acme.write(batch(100)).await.unwrap();
+    assert_eq!(acme.read(State::unflushed_vectors), 11, "held back");
+    assert!(
+        until(|| acme.read(State::unflushed_vectors) == 0).await,
+        "flushed once it may be, with nothing more written"
+    );
+}
+
 /// A tenant is flushed for its vectors at most once every so often, so
 /// that a burst of writes with vectors, an artifact reindex say, flushes
 /// once and not at every few thousand rows.
