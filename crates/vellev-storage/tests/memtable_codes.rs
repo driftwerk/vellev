@@ -466,7 +466,6 @@ async fn the_codes_are_counted_as_resident_and_let_go_at_a_flush() {
 /// The apply that brings a collection to `CODE_FROM` versions codes no
 /// row: it computes the centre alone. Rows after it are coded one by one.
 #[tokio::test]
-#[ignore = "F2b: the memtable is coded (burst plan F2b, PR 3)"]
 async fn reaching_the_threshold_computes_a_centre_and_codes_no_row() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
