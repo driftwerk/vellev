@@ -9,6 +9,9 @@ pub struct Work {
     /// The memtable has no vector index, so this is every allowed live row
     /// of it.
     pub exact_memtable: u64,
+    /// Rows of the memtable a search ranked by their one-bit codes before
+    /// scoring the nearest of them exactly, once the memtable is coded.
+    pub coded_memtable: u64,
     /// Rows of segments scored exactly against the query's vector: those
     /// a small layer offers whole, those its index shortlisted, and those
     /// it has no estimate for.

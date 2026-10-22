@@ -36,7 +36,7 @@ pub use mutation::{
 };
 pub use partition::{Embedded, Follower, Partition, RestoreFrom, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
-pub use state::{Live, Merging, State};
+pub use state::{Live, MemtableCoding, Merging, State};
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;
 pub use work::Work;

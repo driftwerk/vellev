@@ -67,6 +67,19 @@ pub(crate) struct Merge {
     pub keys: Vec<String>,
 }
 
+/// How one collection's rows written since the last checkpoint are coded
+/// for search (burst plan F2b).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemtableCoding {
+    /// How many versions of the collection's rows with a vector have been
+    /// applied since the checkpoint, dead or not: what decides coding.
+    pub applied: usize,
+    /// How many of the memtable's rows have a code.
+    pub coded: usize,
+    /// The centre the codes are taken about, in the rotated space.
+    pub centre: Vec<f32>,
+}
+
 /// What is indexed about one collection's rows in a layer: their filterable
 /// values, their searchable text and, once there are too many to score one
 /// by one, their vectors.
@@ -646,6 +659,12 @@ impl State {
 
     /// How many rows have been written since the last checkpoint, counting
     /// those since replaced: what a flush would move out of memory.
+    /// How the memtable's rows of `collection` are coded for search, if
+    /// they are: see [`MemtableCoding`].
+    pub fn memtable_coding(&self, _collection: &CollectionName) -> Option<MemtableCoding> {
+        None
+    }
+
     pub fn unflushed(&self) -> usize {
         self.memtable.rows.len()
     }
