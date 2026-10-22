@@ -11,7 +11,10 @@
 //! ```
 //!
 //! Every 69th object, up to 200, is held out as a query: its vector, and
-//! the first six words of its content as the text. The rest are written
+//! the first six words of its content as the text. Or, with
+//! `VELLEV_RECALL_QUERIES` naming a JSON Lines file of `{"text", "vector"}`
+//! (queries embedded with the model's query prefix, as a hub embeds them),
+//! those are the queries and every object is written. The rest are written
 //! in three layouts: one segment; segments of uneven size, one too small
 //! to shortlist, and a memtable; and one segment with a memtable. Each
 //! object is given a bucket from 0 to 99 by its id, so that a filter can
@@ -33,6 +36,29 @@ use vellev_storage::{Hybrid, Work, DEFAULT_OVERSAMPLE, HYBRID_DEFAULT_RESCORE};
 const MEMORIES: &str = "memories";
 const CAPS: [usize; 7] = [128, 256, 512, 1_024, 2_048, 4_096, 8_192];
 const LIMITS: [usize; 3] = [10, 50, 100];
+
+struct Asked {
+    text: String,
+    vector: Vec<f32>,
+}
+
+/// The queries `VELLEV_RECALL_QUERIES` names, if it is set.
+fn queries() -> Option<Vec<Asked>> {
+    let path = std::env::var("VELLEV_RECALL_QUERIES").ok()?;
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    Some(
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                Asked {
+                    text: value["text"].as_str().unwrap().to_string(),
+                    vector: serde_json::from_value(value["vector"].clone()).unwrap(),
+                }
+            })
+            .collect(),
+    )
+}
 
 struct Memory {
     id: uuid::Uuid,
@@ -146,13 +172,29 @@ async fn the_default_rescore_cap_keeps_recall_on_real_embeddings() {
         panic!("set VELLEV_RECALL_FIXTURE to a JSON Lines file of embeddings");
     };
     let (mut queries, mut rows) = (Vec::new(), Vec::new());
-    for (n, memory) in all.iter().enumerate() {
-        match n % 69 == 0 && queries.len() < 200 {
-            true => queries.push(memory),
-            false => rows.push(memory),
+    match self::queries() {
+        Some(asked) => {
+            queries = asked;
+            rows = all.iter().collect();
+        }
+        None => {
+            for (n, memory) in all.iter().enumerate() {
+                match n % 69 == 0 && queries.len() < 200 {
+                    true => queries.push(Asked {
+                        text: memory
+                            .content
+                            .split_whitespace()
+                            .take(6)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        vector: memory.vector.clone(),
+                    }),
+                    false => rows.push(memory),
+                }
+            }
         }
     }
-    let layouts: [(&str, &[f64], bool); 3] = [
+    let layouts: [(&str, &[f64], bool); 4] = [
         ("one segment", &[1.0], false),
         (
             "uneven segments and a memtable",
@@ -160,6 +202,9 @@ async fn the_default_rescore_cap_keeps_recall_on_real_embeddings() {
             true,
         ),
         ("a segment and a memtable", &[0.85, 0.15], true),
+        // Rows written since a checkpoint, coded once there are enough of
+        // them (burst plan F2b), or scored whole before that.
+        ("the memtable alone", &[1.0], true),
     ];
     let filters = [
         ("all", None),
@@ -193,15 +238,10 @@ async fn the_default_rescore_cap_keeps_recall_on_real_embeddings() {
                     // Per cap: summed overlap, same top results, rows scored.
                     let mut tally = vec![(0.0, 0usize, 0u64); CAPS.len()];
                     for query in &queries {
-                        let text: String = query
-                            .content
-                            .split_whitespace()
-                            .take(6)
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                        let text = &query.text;
                         let base = Hybrid {
                             filter: filter.as_ref(),
-                            ..Hybrid::matching(&text, Some(&query.vector), limit)
+                            ..Hybrid::matching(text, Some(&query.vector), limit)
                         };
                         let exact = ids(
                             state,
