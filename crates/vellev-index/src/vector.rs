@@ -510,20 +510,20 @@ impl BinaryIndex {
     }
 
     /// An index of no rows yet, its codes to be taken about the mean of
-    /// `first` (in the rotated space, as every code is): for rows coded one
-    /// at a time with [`Self::push`] as they come, such as those in memory
-    /// since a checkpoint (burst plan F2b). The mean is summed in `f64`,
-    /// one value after another in the order given, and rounded to `f32`
-    /// once, so that it comes out the same to the bit on every machine.
+    /// `first`: for rows coded one at a time with [`Self::push`] as they
+    /// come, such as those in memory since a checkpoint (burst plan F2b).
+    /// The vectors, normalised as codes are, are summed in `f64` one value
+    /// after another in the order given and rounded to `f32` once, so that
+    /// the mean comes out the same to the bit on every machine; and that
+    /// mean is rotated once into the space codes are taken in. The cost is
+    /// a sum over `first` and one rotation, whatever its length.
     /// `None` when `first` has nothing to measure.
     pub fn about_mean(metric: Distance, first: &[&[f32]]) -> Option<Self> {
         let dimensions = first.first()?.len();
-        let rotation = Rotation::new(dimensions, ROTATION_SEED);
-        let mut sums = vec![0.0f64; rotation.width];
+        let mut sums = vec![0.0f64; dimensions];
         let mut counted = 0usize;
         for vector in first.iter().filter(|vector| measurable(metric, vector)) {
-            let rotated = rotation.apply(&normalised(metric, vector));
-            for (sum, value) in sums.iter_mut().zip(&rotated) {
+            for (sum, value) in sums.iter_mut().zip(normalised(metric, vector).iter()) {
                 *sum += f64::from(*value);
             }
             counted += 1;
@@ -531,10 +531,14 @@ impl BinaryIndex {
         if counted == 0 {
             return None;
         }
-        let centre = sums
+        let mean: Vec<f32> = sums
             .iter()
             .map(|sum| (sum / counted as f64) as f32)
             .collect();
+        // The rotation is linear: the mean rotated once stands for the
+        // rotated vectors' mean, at a sum's cost rather than a rotation for
+        // every vector.
+        let centre = Rotation::new(dimensions, ROTATION_SEED).apply(&mean);
         Some(Self::empty(metric, dimensions, centre))
     }
 
@@ -562,8 +566,7 @@ impl BinaryIndex {
     /// coded: the rows a memtable's centre is taken from (burst plan F2b),
     /// so that reaching the threshold codes none of them.
     pub fn push_exact(&mut self, row: u32) {
-        let _ = row;
-        unimplemented!("burst plan F2b, review addendum")
+        self.unmeasured.push(row);
     }
 
     /// How many rows have a code.
