@@ -216,21 +216,27 @@ async fn t9_a_writer_and_its_copies_code_and_answer_alike_with_changes_beside_a_
     });
     assert_eq!(stored.recv().await, Some("stored"));
     paused.armed.store(false, Ordering::SeqCst);
+    // Beside the flush: flushed rows replaced and deleted, then more than
+    // CODE_FROM new rows, some of them replaced and deleted beside it too,
+    // so that the flush keeps more than CODE_FROM versions, dead ones
+    // among the first of them, and recodes them.
     let mut beside: Vec<Mutation> = (0..100)
         .map(|n| row(NOTES, n, vector(n as usize + 7)))
         .collect();
     beside.extend((100..150).map(|n| gone(NOTES, n)));
-    beside.extend((600..1_500).map(|n| row(NOTES, n, vector(n as usize))));
+    beside.extend((600..1_800).map(|n| row(NOTES, n, vector(n as usize))));
+    beside.extend((600..700).map(|n| row(NOTES, n, vector(n as usize + 11))));
+    beside.extend((700..750).map(|n| gone(NOTES, n)));
     commit(&writer, beside).await;
     paused.release.notify_one();
     flushing.await.unwrap().unwrap();
     // After the flush: rows kept from beside it replaced and deleted, and
     // many more written.
-    let mut after: Vec<Mutation> = (650..700)
+    let mut after: Vec<Mutation> = (750..800)
         .map(|n| row(NOTES, n, vector(n as usize + 3)))
         .collect();
-    after.extend((700..720).map(|n| gone(NOTES, n)));
-    after.extend((1_500..7_000).map(|n| row(NOTES, n, vector(n as usize))));
+    after.extend((800..820).map(|n| gone(NOTES, n)));
+    after.extend((1_800..7_000).map(|n| row(NOTES, n, vector(n as usize))));
     commit(&writer, after).await;
     let committed = cluster.committed().await;
     following.catch_up(&committed).await.unwrap();
