@@ -21,7 +21,7 @@ pub const DEFAULT_CANDIDATES: usize = 100;
 /// The most rows a hybrid search that names no `oversample` asks each
 /// segment that shortlists to score exactly, whatever its limit, unless
 /// its fusion pool is larger: see [`default_oversample`].
-pub const HYBRID_DEFAULT_RESCORE: usize = 1_024;
+pub const HYBRID_DEFAULT_RESCORE: usize = 2_048;
 
 /// The oversample of a hybrid search for `limit` results that names none:
 /// [`DEFAULT_OVERSAMPLE`], lowered for a large `limit` so that `limit`

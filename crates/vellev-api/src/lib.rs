@@ -859,7 +859,7 @@ pub struct Hybrid {
     /// at least `candidates`, in each segment that shortlists; smaller
     /// segments and unflushed rows are scored whole. Left out, the node's
     /// default, lowered for a large `limit` so that each such segment
-    /// scores no more than 1,024 rows (or `candidates`, if larger).
+    /// scores no more than 2,048 rows (or `candidates`, if larger).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oversample: Option<u32>,
     #[serde(default)]

@@ -350,16 +350,12 @@ and say what the caller then answers for.
 - **A hybrid search scores far fewer rows exactly.** Its vector search
   scored `candidates × oversample` rows exactly (12,800 by default, nearly
   every row of a mid-sized collection); it now scores `limit × oversample`,
-  and at least `candidates`: 1,020 for ten results by default (the
-  default oversample at limit 10 is 102, lowered by the 1,024 cap from the
-  128 that gave 1,280). The budget
+  and at least `candidates`: 1,280 for ten results by default. The budget
   is per segment that shortlists; a segment too small to shortlist, and
   unflushed rows, are scored whole, as before. A search that names no
-  `oversample` has each such segment score no more than 1,024 rows
+  `oversample` has each such segment score no more than 2,048 rows
   whatever its `limit` (or `candidates`, if larger), the default being
-  lowered for large limits (the cap was set from a recall sweep on real
-  bge-base memories: fused results match an exact search everywhere at
-  1,024, and first fall below 0.99 overlap at 256); one that names an `oversample` scores as many
+  lowered for large limits; one that names an `oversample` scores as many
   as it asks for. **A caller that named an `oversample` for hybrid now
   scores `limit/candidates` times fewer rows than it did** (10/100 with
   the defaults): multiply it by that to keep the old recall. Results can
