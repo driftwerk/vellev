@@ -430,6 +430,17 @@ impl BinaryIndex {
     /// Index `vectors`, which must be in ascending row order and all of one
     /// length, for search under `metric`. Returns `None` when there is
     /// nothing to index.
+    /// As [`Self::build`], with codes taken about `centre` (in the rotated
+    /// space) rather than about the vectors' own median.
+    pub fn build_about(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        centre: Vec<f32>,
+    ) -> Option<Self> {
+        let _ = (metric, vectors, centre);
+        unimplemented!("burst plan F2b, PR 2")
+    }
+
     pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
@@ -485,6 +496,35 @@ impl BinaryIndex {
                 .map(|hamming| ranked_cosine(hamming, bits))
                 .collect(),
         })
+    }
+
+    /// An index of no rows yet, its codes to be taken about the mean of
+    /// `first` (in the rotated space, as every code is): for rows coded one
+    /// at a time with [`Self::push`] as they come, such as those in memory
+    /// since a checkpoint (burst plan F2b). The mean is summed in `f64`,
+    /// one value after another in the order given, and rounded to `f32`
+    /// once, so that it comes out the same to the bit on every machine.
+    /// `None` when `first` has nothing to measure.
+    pub fn about_mean(metric: Distance, first: &[&[f32]]) -> Option<Self> {
+        let _ = (metric, first);
+        unimplemented!("burst plan F2b, PR 2")
+    }
+
+    /// Code `vector` as row `row`, which must come after every row coded
+    /// so far.
+    pub fn push(&mut self, row: u32, vector: &[f32]) {
+        let _ = (row, vector);
+        unimplemented!("burst plan F2b, PR 2")
+    }
+
+    /// The centre codes are taken about, in the rotated space.
+    pub fn centre(&self) -> &[f32] {
+        &self.centre
+    }
+
+    /// About how many bytes the index takes in memory.
+    pub fn resident(&self) -> usize {
+        unimplemented!("burst plan F2b, PR 2")
     }
 
     fn hamming(&self, position: usize, query: &[u64]) -> usize {
@@ -1241,5 +1281,86 @@ mod tests {
             Vec::<u32>::new()
         );
         assert!(BinaryIndex::build(Distance::Cosine, &[]).is_none());
+    }
+
+    /// The mean a growing index is centred on, worked out plainly: each
+    /// vector rotated as the index rotates it, summed in `f64` one after
+    /// another, divided, and rounded to `f32` once.
+    fn scalar_mean(metric: Distance, vectors: &[Vec<f32>]) -> Vec<f32> {
+        let rotation = Rotation::new(vectors[0].len(), ROTATION_SEED);
+        let rotated: Vec<Vec<f32>> = vectors
+            .iter()
+            .filter(|vector| measurable(metric, vector))
+            .map(|vector| rotation.apply(&normalised(metric, vector)))
+            .collect();
+        (0..rotation.width)
+            .map(|at| {
+                let mut sum = 0.0f64;
+                for vector in &rotated {
+                    sum += f64::from(vector[at]);
+                }
+                (sum / rotated.len() as f64) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_growing_index_is_centred_on_the_scalar_mean_to_the_bit() {
+        let mut random = Random(23);
+        for (metric, dimensions) in [
+            (Distance::Cosine, 768),
+            (Distance::L2, 100),
+            (Distance::Dot, 64),
+        ] {
+            let vectors = grouped(&mut random, 1_024, dimensions, 0.4);
+            let first: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let index = BinaryIndex::about_mean(metric, &first).unwrap();
+            let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(index.centre()),
+                bits(&scalar_mean(metric, &vectors)),
+                "{metric:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_coded_one_at_a_time_rank_as_rows_coded_together_about_the_same_centre() {
+        let mut random = Random(29);
+        for metric in [Distance::Cosine, Distance::L2, Distance::Dot] {
+            let vectors = grouped(&mut random, 3_000, 128, 0.4);
+            let first: Vec<&[f32]> = vectors[..1_024].iter().map(Vec::as_slice).collect();
+            let mut growing = BinaryIndex::about_mean(metric, &first).unwrap();
+            for (row, vector) in vectors.iter().enumerate() {
+                growing.push(row as u32 * 3, vector);
+            }
+            let rows: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, vector)| (row as u32 * 3, vector.as_slice()))
+                .collect();
+            let together =
+                BinaryIndex::build_about(metric, &rows, growing.centre().to_vec()).unwrap();
+            assert_eq!(growing.len(), together.len());
+            for query in grouped(&mut random, 20, 128, 0.4) {
+                let ranked =
+                    |index: &BinaryIndex| index.estimates(&query, 200, None, &[], &in_row_order);
+                assert_eq!(ranked(&growing), ranked(&together), "{metric:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_growing_index_counts_its_codes_as_resident() {
+        let mut random = Random(31);
+        let vectors = grouped(&mut random, 2_000, 768, 0.4);
+        let first: Vec<&[f32]> = vectors[..1_024].iter().map(Vec::as_slice).collect();
+        let mut index = BinaryIndex::about_mean(Distance::Cosine, &first).unwrap();
+        let empty = index.resident();
+        for (row, vector) in vectors.iter().enumerate() {
+            index.push(row as u32, vector);
+        }
+        // A bit a rotated dimension and two factors, for each row.
+        assert!(index.resident() - empty >= 2_000 * (1_024 / 8 + 8));
     }
 }
