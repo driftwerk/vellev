@@ -35,6 +35,12 @@ use crate::turns::{Turn, Turns};
 /// The most candidates per result a search may ask to have scored exactly.
 const MAX_OVERSAMPLE: u32 = 1_024;
 
+/// The most rows a hybrid search that names no `oversample` scores
+/// exactly against its vector, whatever its limit (or its fusion pool, if
+/// that is larger). The default oversample is lowered to keep to it for
+/// large limits.
+pub const HYBRID_DEFAULT_RESCORE: usize = 2_048;
+
 /// What a caller may ask of the node.
 #[derive(Debug, Clone)]
 pub struct Limits {
@@ -261,6 +267,22 @@ impl App {
             let most = self.allowed().candidates;
             Self::within(Bounded::Candidates, "candidates", asked, most)
         })
+    }
+
+    /// The oversample of a hybrid search for `limit` results: as asked,
+    /// within the most allowed; or, unasked, the default, lowered so that
+    /// it scores no more than [`HYBRID_DEFAULT_RESCORE`] rows exactly
+    /// however many results are asked for. A caller who asks scores as
+    /// many as it asks for.
+    pub(crate) fn hybrid_oversample(
+        &self,
+        asked: Option<u32>,
+        limit: usize,
+    ) -> Result<usize, ApiError> {
+        match asked {
+            Some(_) => self.oversample(asked),
+            None => Ok(DEFAULT_OVERSAMPLE.min((HYBRID_DEFAULT_RESCORE / limit.max(1)).max(1))),
+        }
     }
 
     pub(crate) fn oversample(&self, asked: Option<u32>) -> Result<usize, ApiError> {

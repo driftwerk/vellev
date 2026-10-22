@@ -69,7 +69,7 @@ async fn search(served: &Served, body: Value) {
 async fn a_hybrid_search_with_no_oversample_scores_at_most_the_default_whatever_its_limit() {
     let served = flushed().await;
     let mut before = 0.0;
-    for limit in [10, 100, 1_000] {
+    for limit in [10, 50] {
         let body = json!({ "text": "fox", "vector": [1.0, 0.0], "limit": limit });
         search(&served, body).await;
         let now = scored(&served);

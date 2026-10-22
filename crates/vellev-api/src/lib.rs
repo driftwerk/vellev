@@ -855,6 +855,9 @@ pub struct Hybrid {
     pub candidates: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
+    /// How many times `limit` rows the vector search scores exactly, and
+    /// at least `candidates`. Left out, the node's default, lowered for a
+    /// large `limit` so that no more than 2,048 rows are scored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oversample: Option<u32>,
     #[serde(default)]

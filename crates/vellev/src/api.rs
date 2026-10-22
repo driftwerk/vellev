@@ -1123,7 +1123,7 @@ pub async fn hybrid(
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
     let candidates = app.candidates(asked.candidates)?;
-    let oversample = app.oversample(asked.oversample)?;
+    let oversample = app.hybrid_oversample(asked.oversample, limit)?;
     let alpha = asked.alpha.unwrap_or(DEFAULT_ALPHA);
     let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
     let weighs_meaning = alpha > 0.0 && alpha <= 1.0;

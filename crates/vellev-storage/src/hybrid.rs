@@ -32,8 +32,12 @@ pub struct Hybrid<'a> {
     /// As [`Keywords::properties`].
     pub properties: &'a [(&'a str, f32)],
     pub limit: usize,
+    /// How many results each search offers for fusing.
     pub candidates: usize,
     pub filter: Option<&'a Filter>,
+    /// How many times `limit` the vector search scores exactly, and at
+    /// least `candidates`: it scales the results asked for, not the pool
+    /// fused from.
     pub oversample: usize,
 }
 
@@ -127,7 +131,12 @@ impl State {
         let alpha = query.vector.map_or(0.0, |_| query.alpha);
         let candidates = query.candidates.max(query.limit);
         let nearest = match query.vector {
-            Some(vector) if alpha > 0.0 => self.search_counted(
+            // The vector leg offers `candidates` for fusing, but scores
+            // exactly only as many rows as the results asked for call for:
+            // `limit × oversample`, or the pool itself if that is larger.
+            // Scaling the pool instead scored a 12,800-row budget for ten
+            // results, nearly every row of a mid-sized collection.
+            Some(vector) if alpha > 0.0 => self.search_within(
                 collection,
                 &Query {
                     vector,
@@ -135,6 +144,10 @@ impl State {
                     filter: query.filter,
                     oversample: query.oversample,
                 },
+                query
+                    .limit
+                    .saturating_mul(query.oversample.max(1))
+                    .max(candidates),
                 work,
             )?,
             _ => Vec::new(),
