@@ -446,6 +446,10 @@ mod tests {
         calls: Arc<AtomicUsize>,
         gate: Arc<Semaphore>,
         answer: Arc<Mutex<Option<Option<TenantId>>>>,
+        /// How long each next lookup takes once let go, in turn.
+        delays: Arc<Mutex<std::collections::VecDeque<Duration>>>,
+        /// Whether the next lookup panics.
+        panics: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Stand {
@@ -455,7 +459,14 @@ mod tests {
                 calls: Arc::default(),
                 gate: Arc::new(Semaphore::new(0)),
                 answer: Arc::new(Mutex::new(Some(tenant))),
+                delays: Arc::default(),
+                panics: Arc::default(),
             }
+        }
+
+        /// The next lookup taking `delay` once let go.
+        fn slowed(&self, delay: Duration) {
+            self.delays.lock().unwrap().push_back(delay);
         }
 
         fn open(self) -> Self {
@@ -496,8 +507,17 @@ mod tests {
             let stand = self.clone();
             Box::pin(async move {
                 stand.calls.fetch_add(1, Ordering::SeqCst);
-                let _go = stand.gate.acquire().await.unwrap();
+                // What the coordinator holds when the lookup reaches it;
+                // the answer comes back after.
                 let answer = stand.answer.lock().unwrap().clone();
+                let delay = stand.delays.lock().unwrap().pop_front();
+                let _go = stand.gate.acquire().await.unwrap();
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                if stand.panics.swap(false, Ordering::SeqCst) {
+                    panic!("the stand-in panics");
+                }
                 answer.ok_or_else(|| {
                     vellev_storage::coordinator::CoordinatorError::Backend("down".into())
                 })
@@ -645,10 +665,129 @@ mod tests {
         stand.release();
         assert_eq!(
             before.await.unwrap().unwrap(),
-            None,
-            "both see the answer given as they end"
+            Some(acme()),
+            "the earlier lookup answers as the coordinator held when it asked"
         );
         assert_eq!(after.await.unwrap().unwrap(), None);
         assert_eq!(stand.calls(), 2, "the later ask looked the key up itself");
+    }
+
+    /// A lookup that panics is an error to whoever asked, and leaves the
+    /// key to be looked up again: never a key no ask can get past.
+    #[tokio::test]
+    async fn a_lookup_that_panics_fails_its_askers_and_poisons_nothing() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        stand.panics.store(true, Ordering::SeqCst);
+        let asked = asking(&keys, &stand, &secret, 4);
+        for answer in asked {
+            let answer = answer.await.expect("an answer, not a panic");
+            assert!(answer.is_err(), "{answer:?}");
+        }
+        let again = tokio::time::timeout(Duration::from_secs(5), keys.tenant(&stand, &secret))
+            .await
+            .expect("answered");
+        assert_eq!(again.unwrap(), Some(acme()), "looked up again");
+        assert_eq!(stand.calls(), 2);
+    }
+
+    /// A key no one asks for meanwhile is looked up again once
+    /// [`REMEMBERED_FOR`] has passed, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_is_answered_from_memory_for_as_long_as_it_is_remembered_and_no_longer() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        stand.answering(Some(None));
+        tokio::time::advance(REMEMBERED_FOR + Duration::from_millis(1)).await;
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), None);
+        assert_eq!(stand.calls(), 2);
+    }
+
+    /// A lookup begun before a tenant's keys were forgotten remembers
+    /// nothing, however it ends: the coordinator answered it as things were.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_begun_before_keys_are_forgotten_remembers_nothing() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        stand.slowed(Duration::from_secs(5));
+        let before = asking(&keys, &stand, &secret, 1).remove(0);
+        stand.called(1).await;
+        keys.forget(&acme());
+        stand.answering(Some(None));
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), None);
+        assert_eq!(
+            before.await.unwrap().unwrap(),
+            Some(acme()),
+            "its own answer"
+        );
+        assert_eq!(
+            keys.tenant(&stand, &secret).await.unwrap(),
+            None,
+            "the later lookup is what is remembered"
+        );
+        assert_eq!(stand.calls(), 2);
+    }
+
+    /// However many ask for a key due to be looked up again, it is looked
+    /// up again once.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_due_is_looked_up_again_once_however_many_ask() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        tokio::time::advance(REMEMBERED_FOR - REFRESHED_BEFORE + Duration::from_millis(1)).await;
+        stand.slowed(Duration::from_secs(1));
+        for answer in asking(&keys, &stand, &secret, 64) {
+            assert_eq!(answer.await.unwrap().unwrap(), Some(acme()));
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(stand.calls(), 2, "one lookup again for all 64");
+    }
+
+    /// A key revoked through another node is answered as revoked here
+    /// within [`REMEMBERED_FOR`] of the revoke, however slow a lookup of it
+    /// begun before then: an answer is as old as the lookup that asked.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_revoked_elsewhere_is_refused_here_within_the_bound_however_slow_the_lookup() {
+        let stand = Stand::new(Some(acme())).open();
+        let (here, there, secret) = (Arc::new(Keys::default()), Keys::default(), secret());
+        assert_eq!(here.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        tokio::time::advance(REMEMBERED_FOR - REFRESHED_BEFORE + Duration::from_millis(1)).await;
+        // A lookup again, begun now and five seconds in coming back.
+        stand.slowed(Duration::from_secs(5));
+        assert_eq!(here.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        stand.called(2).await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        // Revoked through the other node: the coordinator holds no key.
+        stand.answering(Some(None));
+        there.forget(&acme());
+        let revoked = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let until = revoked + REMEMBERED_FOR + Duration::from_millis(100);
+        tokio::time::advance(until - tokio::time::Instant::now()).await;
+        assert_eq!(
+            here.tenant(&stand, &secret).await.unwrap(),
+            None,
+            "refused within ten seconds of the revoke"
+        );
     }
 }
