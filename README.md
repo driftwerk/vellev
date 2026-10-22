@@ -1363,6 +1363,33 @@ port never serves metrics. Unset, no metrics are served.
 - `vellev_reads_in_flight` and `vellev_reads_waiting`: reads holding a
   turn, and waiting for one, now.
 
+### Recall on real embeddings
+
+The default rescore budget is held to a recall gate on real embeddings,
+`crates/vellev-storage/tests/recall_fixture.rs`. It is ignored in the
+per-commit run; the nightly workflow runs it on a public fixture:
+
+- **The fixture:** 118,609 rows of SQuAD 2.0 (paragraphs and their
+  sentences) and 500 of its questions, embedded with BAAI/bge-base-en-v1.5,
+  the questions with the model's query prefix. It is published as the assets
+  of the release `fixture-recall-squad2-bge-base-v1`, not committed;
+  `scripts/recall-fixture/SHA256SUMS` holds the checksums CI checks it by.
+- **Its licence:** SQuAD 2.0, by Rajpurkar, Jia and Liang, drawn from
+  English Wikipedia, is licensed CC BY-SA 4.0, and so is the fixture, an
+  adaptation of it: see `scripts/recall-fixture/ATTRIBUTION.md`. It is a
+  test input, not part of vellev or covered by vellev's licence.
+- **To run it:** fetch and unpack the assets, then
+
+  ```sh
+  VELLEV_RECALL_FIXTURE=memories.jsonl VELLEV_RECALL_QUERIES=queries.vectors.jsonl \
+    cargo test --release -p vellev-storage --test recall_fixture -- --ignored --nocapture
+  ```
+
+- **To rebuild it:** `scripts/recall-fixture/prepare.py` turns SQuAD's JSON
+  into `rows.jsonl` and `queries.jsonl`, and
+  `cargo run --release -p vellev-embed --example recall_fixture -- DIR` embeds
+  them.
+
 ## Upgrades
 
 Two releases run side by side during a rolling deploy and after a
