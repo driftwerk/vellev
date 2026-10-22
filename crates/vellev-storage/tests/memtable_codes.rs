@@ -763,3 +763,44 @@ async fn adopting_a_flush_keeps_readers_waiting_a_few_milliseconds_however_much_
         );
     }
 }
+
+/// Committing a batch of rows to a coded collection keeps readers waiting
+/// no longer for their codes: they are made before the partition is
+/// locked. Timed in an optimised build only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(debug_assertions, ignore = "timed: run with --release")]
+async fn a_batch_to_a_coded_collection_is_coded_before_the_lock() {
+    let _timed = timed().await;
+    let mut waits = Vec::new();
+    for attempt in 0..3u64 {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await;
+        let mut schema = schema(NOTES);
+        schema.embedding.dimensions = 768;
+        writer
+            .commit(vec![Mutation::CreateCollection(Box::new(schema))])
+            .await
+            .unwrap();
+        let mut random = Random(47 + attempt);
+        commit(
+            &writer,
+            (0..CODE_FROM as u32 + 100)
+                .map(|n| row(NOTES, n, random.vector(768)))
+                .collect(),
+        )
+        .await;
+        let batch: Vec<Mutation> = (5_000..7_000)
+            .map(|n| row(NOTES, n, random.vector(768)))
+            .collect();
+        waits.push(longest_wait(&writer, batch).await);
+    }
+    waits.sort();
+    eprintln!("a batch of 2,000 coded rows: readers waited at most {waits:?}");
+    let median = waits[waits.len() / 2];
+    // About 2.5 ms of indexing and storing; coding the batch under the
+    // lock as well came to more than 9 ms.
+    assert!(
+        median <= Duration::from_millis(5),
+        "readers waited up to {median:?} (median of {waits:?})"
+    );
+}

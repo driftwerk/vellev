@@ -9,7 +9,7 @@ use vellev_core::{
 use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
-use vellev_index::vector::{BinaryIndex, Ties, VectorIndex};
+use vellev_index::vector::{BinaryIndex, Coded, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
@@ -470,6 +470,27 @@ struct Memtable {
     /// have been applied since the checkpoint, dead or not: what decides
     /// when its rows are coded (see [`CODE_FROM`]). It only rises.
     applied: HashMap<CollectionId, usize>,
+    /// Moved on whenever a collection's memtable is coded afresh or let
+    /// go, so that codes prepared before are known for another centre's.
+    coding: u64,
+}
+
+/// Codes worked out for a log's rows before it is applied: see
+/// [`State::prepared`]. Keyed by the row's place among the log's ops.
+#[derive(Debug, Default)]
+pub(crate) struct Prepared {
+    coding: u64,
+    codes: HashMap<usize, Option<Coded>>,
+}
+
+/// The memtable a flush keeps, made before the state is locked to adopt
+/// the flush: see [`State::kept`].
+#[derive(Debug)]
+pub(crate) struct Kept {
+    held: usize,
+    rows: usize,
+    indexes: Indexes,
+    applied: HashMap<CollectionId, usize>,
 }
 
 /// From how many versions of a collection's rows with a vector applied
@@ -714,8 +735,6 @@ impl State {
         self.live.len()
     }
 
-    /// How many rows have been written since the last checkpoint, counting
-    /// those since replaced: what a flush would move out of memory.
     /// How the memtable's rows of `collection` are coded for search, if
     /// they are: see [`MemtableCoding`].
     pub fn memtable_coding(&self, collection: &CollectionName) -> Option<MemtableCoding> {
@@ -734,7 +753,7 @@ impl State {
     /// has a vector: on its own once the collection's rows are coded, or
     /// with every row before it as this version is the
     /// [`CODE_FROM`]th applied since the checkpoint.
-    fn code(&mut self, collection: CollectionId, row: usize) {
+    fn code(&mut self, collection: CollectionId, row: usize, prepared: Option<Option<Coded>>) {
         let Some(schema) = self.catalog.schema(collection) else {
             return;
         };
@@ -753,13 +772,19 @@ impl State {
         let Some(index) = indexes.get_mut(&collection) else {
             return;
         };
-        match &mut index.vectors {
-            Some(Vectors::Binary(codes)) => codes.push(row as u32, vector),
-            _ if *applied == CODE_FROM => index.vectors = coded(rows, collection, metric),
+        match (&mut index.vectors, prepared) {
+            (Some(Vectors::Binary(codes)), Some(coded)) => codes.push_coded(row as u32, coded),
+            (Some(Vectors::Binary(codes)), None) => codes.push(row as u32, vector),
+            _ if *applied == CODE_FROM => {
+                index.vectors = coded(rows, collection, metric);
+                self.memtable.coding += 1;
+            }
             _ => {}
-        }
+        };
     }
 
+    /// How many rows have been written since the last checkpoint, counting
+    /// those since replaced: what a flush would move out of memory.
     pub fn unflushed(&self) -> usize {
         self.memtable.rows.len()
     }
@@ -1123,6 +1148,47 @@ impl State {
     /// directly on top of this state. Either the whole commit is applied or,
     /// on error, none of it.
     pub(crate) fn apply(&mut self, key: &str, log: &LogSegment) -> Result<()> {
+        self.apply_prepared(key, log, Prepared::default())
+    }
+
+    /// The codes of `log`'s rows with a vector whose collection's memtable
+    /// is coded now, worked out without changing the state: so that they
+    /// can be made before the state is locked to apply the log, and the
+    /// apply only stores them. A row whose collection is coded only during
+    /// the log, at its threshold, is coded as it is applied.
+    pub(crate) fn prepared(&self, log: &LogSegment) -> Prepared {
+        let codes = log
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(at, op)| match op {
+                Op::Upsert { collection, object } => {
+                    let vector = object.vector.as_deref()?;
+                    match &self.memtable.indexes.get(collection)?.vectors {
+                        Some(Vectors::Binary(codes)) => Some((at, codes.code(vector))),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        Prepared {
+            coding: self.memtable.coding,
+            codes,
+        }
+    }
+
+    /// As [`Self::apply`], storing the codes `prepared` holds for the rows
+    /// it holds them for, if it was prepared from the state as it is.
+    pub(crate) fn apply_prepared(
+        &mut self,
+        key: &str,
+        log: &LogSegment,
+        mut prepared: Prepared,
+    ) -> Result<()> {
+        if prepared.coding != self.memtable.coding {
+            prepared.codes.clear();
+        }
         let corrupt = |reason: String| StorageError::corrupt(key, reason);
         if self.position.next() != Some(log.position) || log.prev.as_deref() != self.head() {
             return Err(corrupt(format!(
@@ -1137,7 +1203,7 @@ impl State {
                 catalog.apply(op).map_err(corrupt)?;
                 Ok::<_, StorageError>(catalog)
             })?;
-        for op in &log.ops {
+        for (op_at, op) in log.ops.iter().enumerate() {
             match op {
                 Op::CreateCollection { .. } | Op::AddProperty { .. } => {}
                 Op::DropCollection { collection } => {
@@ -1153,6 +1219,7 @@ impl State {
                     // this only frees the memory.
                     self.memtable.indexes.remove(collection);
                     self.memtable.applied.remove(collection);
+                    self.memtable.coding += 1;
                     self.corpora.remove(collection);
                 }
                 Op::Upsert { collection, object } => {
@@ -1164,9 +1231,9 @@ impl State {
                     let row = self.memtable.rows.len();
                     self.live.insert(key, Location::Memtable(row));
                     // A memtable is flushed long before it holds as many
-                    // rows as a segment may number. It has no vector index:
-                    // its rows change, and are few enough to score one by
-                    // one.
+                    // rows as a segment may number. Its rows with a vector
+                    // are coded once a collection has CODE_FROM of them
+                    // (see `code`), the first of them scored one by one.
                     //
                     // A collection dropped later in the same commit is
                     // already gone from the catalog; its rows go unindexed.
@@ -1187,7 +1254,7 @@ impl State {
                     self.memtable.bytes += row_bytes(&row);
                     self.memtable.rows.push(row);
                     self.memtable.dead.push(false);
-                    self.code(*collection, at);
+                    self.code(*collection, at, prepared.codes.remove(&op_at));
                 }
                 Op::Delete { collection, id } => {
                     let key = (*collection, *id);
@@ -1542,6 +1609,7 @@ impl State {
         position: LogPosition,
         snapshot: Snapshot,
         segment: Option<Fit>,
+        kept: Option<Kept>,
     ) -> Discarded {
         if let Some(Fit {
             meta,
@@ -1581,7 +1649,7 @@ impl State {
         self.memtable
             .tombstones
             .retain(|tombstone| !flushed.contains(tombstone));
-        let discarded = self.drop_flushed_rows(snapshot.held);
+        let discarded = self.drop_flushed_rows(snapshot.held, kept);
         self.since.drain(..snapshot.logs);
         self.position = position;
         self.head = Some(manifest_key.to_string());
@@ -1589,10 +1657,57 @@ impl State {
         discarded
     }
 
+    /// The memtable as a flush that holds its first `held` rows leaves it:
+    /// the rows after them indexed and, past [`CODE_FROM`] versions of a
+    /// collection, coded, numbered as they will be. Made under the state's
+    /// read lock, which readers share, so that adopting the flush under
+    /// the write lock only swaps it in, however many rows were written
+    /// beside the flush.
+    pub(crate) fn kept(&self, snapshot: &Snapshot) -> Kept {
+        let held = snapshot.held;
+        let rows = &self.memtable.rows;
+        let kept = rows.get(held..).unwrap_or_default();
+        let mut indexes = Indexes::default();
+        let mut applied: HashMap<CollectionId, usize> = HashMap::new();
+        for (row, Row { collection, object }) in kept.iter().enumerate() {
+            if let Some(schema) = self.catalog.schema(*collection) {
+                indexes
+                    .entry(*collection)
+                    .or_default()
+                    .insert(schema, row as u32, object);
+            }
+            if object.vector.is_some() {
+                *applied.entry(*collection).or_default() += 1;
+            }
+        }
+        for (collection, versions) in &applied {
+            if *versions < CODE_FROM {
+                continue;
+            }
+            let (Some(schema), Some(index)) = (
+                self.catalog.schema(*collection),
+                indexes.get_mut(collection),
+            ) else {
+                continue;
+            };
+            index.vectors = coded(kept, *collection, schema.distance);
+        }
+        Kept {
+            held,
+            rows: rows.len(),
+            indexes,
+            applied,
+        }
+    }
+
     /// Take out the memtable's first `held` rows, every one of them dead,
     /// renumbering and indexing afresh those after them. Returns what was
     /// taken out, to be freed without holding the state.
-    fn drop_flushed_rows(&mut self, held: usize) -> Discarded {
+    fn drop_flushed_rows(&mut self, held: usize, kept: Option<Kept>) -> Discarded {
+        // Made beforehand of just these rows, it is swapped in; else the
+        // rows kept are indexed and coded here.
+        let kept = kept.filter(|kept| kept.held == held && kept.rows == self.memtable.rows.len());
+        self.memtable.coding += 1;
         let Memtable {
             rows,
             dead,
@@ -1609,6 +1724,21 @@ impl State {
         *bytes = rows.iter().map(row_bytes).sum();
         dead.drain(..held);
         *deaths -= held;
+        if let Some(Kept {
+            indexes: made,
+            applied: counted,
+            ..
+        }) = kept
+        {
+            *indexes = made;
+            *applied = counted;
+            for location in self.live.values_mut() {
+                if let Location::Memtable(row) = location {
+                    *row -= held;
+                }
+            }
+            return discarded;
+        }
         for (row, Row { collection, object }) in rows.iter().enumerate() {
             if let Some(schema) = self.catalog.schema(*collection) {
                 indexes
@@ -1815,8 +1945,13 @@ mod tests {
                 self.fit(file, &catalog)
             });
             let position = self.state.position().next().unwrap();
-            self.state
-                .flushed(&format!("manifest-{}", position.0), position, snapshot, fit);
+            self.state.flushed(
+                &format!("manifest-{}", position.0),
+                position,
+                snapshot,
+                fit,
+                None,
+            );
         }
 
         /// Merge a run of segments if there is one to merge.

@@ -859,8 +859,11 @@ pub struct Hybrid {
     /// at least `candidates`: in each segment that shortlists by one-bit
     /// codes, that many each; across the segments with a clustered index
     /// (those of more than 200,000 rows), that many between them, less the
-    /// nearest few each scores of its own. Smaller segments and unflushed
-    /// rows are scored whole. Left out, the node's default, lowered for a
+    /// nearest few each scores of its own. Smaller segments are scored
+    /// whole, and so are unflushed rows until a collection has more of them
+    /// than that and the first 1,024 with a vector; past that they are
+    /// shortlisted as a segment's are, the first 1,024 scored exactly
+    /// besides. Left out, the node's default, lowered for a
     /// large `limit` so that the budget is no more than 2,048 rows (or
     /// `candidates`, if larger).
     #[serde(default, skip_serializing_if = "Option::is_none")]

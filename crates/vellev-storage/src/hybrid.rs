@@ -52,8 +52,11 @@ pub struct Hybrid<'a> {
     /// pool fused from. Each segment that shortlists by one-bit codes
     /// scores up to that many of its own; the segments with a clustered
     /// index share it, less the nearest few each scores of its own (see
-    /// `nearest_across` in `search.rs`); a segment too small to shortlist,
-    /// and the memtable, are scored whole.
+    /// `nearest_across` in `search.rs`); a segment too small to shortlist
+    /// is scored whole. So is the memtable until it holds more allowed
+    /// rows than a segment scores whole and is coded; then it shortlists
+    /// as a one-bit segment does, besides its first [`crate::CODE_FROM`]
+    /// rows, which are scored exactly.
     pub oversample: usize,
 }
 
