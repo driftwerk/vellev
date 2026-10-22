@@ -240,14 +240,18 @@ impl State {
                 work.filtered += index.rows.rows().len();
                 work.allowed += allowed.len();
             }
-            let wanted = |row: u32| {
-                !layer.dead[row as usize] && allowed.as_ref().is_none_or(|rows| rows.contains(row))
+            // The first row the filter allows at or past `row`: under a
+            // narrow filter, where the walk goes next instead of to each
+            // posting in between.
+            let allowed_from = |row: u32| match &allowed {
+                Some(rows) => rows.range(row..).next(),
+                None => Some(row),
             };
             top(
                 schema.bm25,
                 &index.text,
                 &clauses,
-                wanted,
+                allowed_from,
                 &mut best,
                 layer,
                 work,
@@ -320,7 +324,7 @@ fn top<'a>(
     parameters: Bm25,
     index: &'a TextIndex,
     clauses: &[Clause<'_>],
-    wanted: impl Fn(u32) -> bool,
+    allowed_from: impl Fn(u32) -> Option<u32>,
     best: &mut Best<'a>,
     layer: &Layer<'a>,
     work: &mut Work,
@@ -403,7 +407,21 @@ fn top<'a>(
             .take_while(|walk| walk.cursor.row() == Some(row))
             .count();
         work.postings += at as u64;
-        if wanted(row) {
+        let next = allowed_from(row);
+        if next != Some(row) {
+            // Not allowed: every walk short of the next allowed row goes
+            // there at once, past the postings of rows the filter keeps
+            // out, which no score can count.
+            let Some(next) = next else {
+                break;
+            };
+            walks
+                .iter_mut()
+                .filter(|walk| walk.cursor.row() < Some(next))
+                .for_each(|walk| walk.cursor.seek(next));
+            continue;
+        }
+        if !layer.dead[row as usize] {
             work.keyword_rows += 1;
             walks[..at].sort_by_key(|walk| walk.clause);
             let score = walks[..at]
