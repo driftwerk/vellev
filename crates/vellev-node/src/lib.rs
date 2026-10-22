@@ -350,6 +350,13 @@ pub enum NodeError {
     Stopped,
     #[error("the node is looking up too many keys at once")]
     Busy,
+    /// Looking a key up failed; each ask waiting on the lookup is told.
+    #[error("looking the key up failed: {0}")]
+    KeyLookup(Arc<StorageError>),
+    /// Looking a key up panicked; each ask waiting on the lookup is told,
+    /// and the key is looked up again on the next ask.
+    #[error("looking the key up failed in the node")]
+    KeyLookupPanicked,
     #[error("tenant {tenant} is asking too much of this node; try again in {wait:?}")]
     Limited { tenant: TenantId, wait: Duration },
     #[error("this node's hold on tenant {0} was lost; ask again")]
@@ -1255,10 +1262,7 @@ impl Node {
 
     /// The tenant the key `secret` reaches, if it is one.
     pub async fn key_tenant(&self, secret: &str) -> Result<Option<TenantId>> {
-        self.0
-            .keys
-            .tenant(self.0.coordinator.as_ref(), secret)
-            .await
+        self.0.keys.tenant(&self.0.coordinator, secret).await
     }
 
     /// Creating a tenant that exists changes nothing.

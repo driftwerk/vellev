@@ -8,22 +8,28 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time::Instant;
 
+use futures::future::{BoxFuture, FutureExt, Shared};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use vellev_core::TenantId;
-use vellev_storage::coordinator::{Coordinator, KeyHash, TenantKey};
+use vellev_storage::coordinator::{self, Coordinator, KeyHash, TenantKey};
+use vellev_storage::StorageError;
 
 use crate::{NodeError, Result};
 
 /// How long a node takes a key it has looked up, found or not, to be as it
 /// was.
 pub const REMEMBERED_FOR: Duration = Duration::from_secs(10);
+
+/// How long before a key in use is due to be looked up again that a node
+/// looks it up, answering from what it remembers meanwhile.
+pub const REFRESHED_BEFORE: Duration = Duration::from_secs(2);
 
 /// The most keys a node remembers as found, and as not found. Each is kept
 /// apart, so that a flood of made-up keys never pushes out real ones.
@@ -37,6 +43,26 @@ const LOOKUPS: usize = 16;
 
 /// What starts every key, so that one is recognisable wherever it leaks.
 const PREFIX: &str = "vlv_";
+
+/// Where a node looks up the tenant a key's hash reaches: the coordinator,
+/// or in a test, a stand-in for it. The lookup is a future of its own,
+/// owning what it needs, so that it can be run apart from whoever asked.
+pub(crate) trait KeyLookup: Send + Sync + 'static {
+    fn key_tenant(
+        &self,
+        hash: KeyHash,
+    ) -> BoxFuture<'static, coordinator::Result<Option<TenantId>>>;
+}
+
+impl KeyLookup for Arc<dyn Coordinator> {
+    fn key_tenant(
+        &self,
+        hash: KeyHash,
+    ) -> BoxFuture<'static, coordinator::Result<Option<TenantId>>> {
+        let coordinator = self.clone();
+        Box::pin(async move { Coordinator::key_tenant(coordinator.as_ref(), &hash).await })
+    }
+}
 
 /// A key just issued, with its secret.
 #[derive(Clone, PartialEq, Eq)]
@@ -54,11 +80,77 @@ impl std::fmt::Debug for Issued {
     }
 }
 
+/// What a node remembers of keys, and the lookups it has under way. A key
+/// is looked up once however many ask for it at once: the first to find
+/// it neither remembered nor being looked up starts a lookup on a task of
+/// its own, which goes on whoever stops waiting for it, and every other
+/// ask joins it. A key in use is looked up again a little before it is
+/// due ([`REFRESHED_BEFORE`]), its asks answered from what is remembered
+/// meanwhile; that never keeps an answer past [`REMEMBERED_FOR`] from the
+/// lookup that gave it.
+#[derive(Debug, Clone)]
+pub(crate) struct Keys(Arc<Kept>);
+
 #[derive(Debug)]
-pub(crate) struct Keys {
+struct Kept {
     remembered: Mutex<Remembered>,
-    lookups: Semaphore,
+    lookups: Arc<Semaphore>,
     counted: Counted,
+}
+
+/// Takes a lookup out of those under way when dropped, if it is still the
+/// one under way for its key.
+struct Unpending {
+    kept: Arc<Kept>,
+    hash: KeyHash,
+    id: u64,
+}
+
+impl Drop for Unpending {
+    fn drop(&mut self) {
+        // Not to panic in a drop that may run while unwinding: a poisoned
+        // lock is taken as it is.
+        let mut remembered = match self.kept.remembered.lock() {
+            Ok(remembered) => remembered,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if remembered
+            .pending
+            .get(&self.hash)
+            .is_some_and(|pending| pending.id == self.id)
+        {
+            remembered.pending.remove(&self.hash);
+        }
+    }
+}
+
+/// How a lookup ended, as each of those waiting on it is told.
+type Looked = std::result::Result<Option<TenantId>, Failed>;
+
+#[derive(Debug, Clone)]
+enum Failed {
+    /// The coordinator did not answer: every asker is told, and nothing is
+    /// remembered, so the next ask looks again.
+    Lookup(Arc<StorageError>),
+    /// The node stopped before the lookup was done.
+    Stopped,
+    /// The lookup panicked: a fault of the node's, told to every asker as
+    /// one, and the key left to be looked up again.
+    Panicked,
+}
+
+/// A lookup under way, and which it is, so that the lookup takes out of
+/// those under way only itself.
+#[derive(Clone)]
+struct Pending {
+    id: u64,
+    answer: Shared<BoxFuture<'static, Looked>>,
+}
+
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending").field("id", &self.id).finish()
+    }
 }
 
 /// How the keys presented to a node have been answered, counted from
@@ -68,26 +160,31 @@ pub(crate) struct Keys {
 struct Counted {
     remembered: AtomicU64,
     looked_up: AtomicU64,
+    shared: AtomicU64,
     busy: AtomicU64,
 }
 
-/// How many keys a node has answered from what it remembered, looked up
-/// with the coordinator, and turned away as busy, since it started. A key
-/// not of the issued form is none of these: it is refused unlooked at.
+/// How many asks for keys a node has answered from what it remembered,
+/// by looking the key up with the coordinator, by joining a lookup already
+/// under way, and how many it turned away as busy, since it started; and
+/// lookups of keys in use made before they were due are among those
+/// looked up. A key not of the issued form is none of these: it is
+/// refused unlooked at.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeyLookups {
     pub remembered: u64,
     pub looked_up: u64,
+    pub shared: u64,
     pub busy: u64,
 }
 
 impl Default for Keys {
     fn default() -> Self {
-        Self {
+        Self(Arc::new(Kept {
             remembered: Mutex::default(),
-            lookups: Semaphore::new(LOOKUPS),
+            lookups: Arc::new(Semaphore::new(LOOKUPS)),
             counted: Counted::default(),
-        }
+        }))
     }
 }
 
@@ -98,25 +195,42 @@ struct Remembered {
     /// Moved on whenever keys are forgotten, so that a lookup made before
     /// is not remembered after.
     generation: u64,
+    /// The lookups under way, one at most for a key.
+    pending: HashMap<KeyHash, Pending>,
+    /// The id of the next lookup.
+    next: u64,
 }
 
 impl Remembered {
-    fn get(&self, hash: &KeyHash) -> Option<Option<TenantId>> {
+    /// What is remembered of the key, if it is still fresh, and when it
+    /// was looked up.
+    fn get(&self, hash: &KeyHash) -> Option<(Option<TenantId>, Instant)> {
         let fresh = |at: &Instant| at.elapsed() < REMEMBERED_FOR;
-        if let Some((tenant, _)) = self.found.get(hash).filter(|(_, at)| fresh(at)) {
-            return Some(Some(tenant.clone()));
+        if let Some((tenant, at)) = self.found.get(hash).filter(|(_, at)| fresh(at)) {
+            return Some((Some(tenant.clone()), *at));
         }
-        self.unknown.get(hash).filter(|at| fresh(at)).map(|_| None)
+        self.unknown
+            .get(hash)
+            .filter(|at| fresh(at))
+            .map(|at| (None, *at))
     }
 
-    fn insert(&mut self, hash: KeyHash, tenant: Option<TenantId>) {
-        let now = Instant::now();
+    /// Remember what the lookup begun `at` found for `hash`: from then,
+    /// not from when its answer came back, so that a slow lookup never
+    /// keeps an answer past [`REMEMBERED_FOR`] from when the coordinator
+    /// gave it.
+    fn insert(&mut self, hash: KeyHash, tenant: Option<TenantId>, at: Instant) {
+        let now = at;
+        // A key looked up again may have changed either way: what was
+        // remembered of it before goes.
         match tenant {
             Some(tenant) => {
+                self.unknown.remove(&hash);
                 bounded(&mut self.found, MOST_FOUND, |(_, at)| *at);
                 self.found.insert(hash, (tenant, now));
             }
             None => {
+                self.found.remove(&hash);
                 bounded(&mut self.unknown, MOST_UNKNOWN, |at| *at);
                 self.unknown.insert(hash, now);
             }
@@ -165,56 +279,129 @@ impl Keys {
     }
 
     /// The tenant `secret` reaches, if it is a key.
-    pub async fn tenant(
-        &self,
-        coordinator: &dyn Coordinator,
-        secret: &str,
-    ) -> Result<Option<TenantId>> {
+    pub async fn tenant(&self, lookup: &impl KeyLookup, secret: &str) -> Result<Option<TenantId>> {
         if !well_formed(secret) {
             return Ok(None);
         }
         let hash = hashed(secret);
-        let generation = {
-            let remembered = self.remembered();
-            if let Some(tenant) = remembered.get(&hash) {
-                self.counted.remembered.fetch_add(1, Ordering::Relaxed);
+        let counted = &self.0.counted;
+        let answer = {
+            let mut remembered = self.remembered();
+            if let Some((tenant, at)) = remembered.get(&hash) {
+                counted.remembered.fetch_add(1, Ordering::Relaxed);
+                let due = at.elapsed() >= REMEMBERED_FOR.saturating_sub(REFRESHED_BEFORE);
+                if due && !remembered.pending.contains_key(&hash) {
+                    // Looked up again now, if a lookup is free, and answered
+                    // from what is remembered meanwhile. With none free, the
+                    // next ask tries again.
+                    let _ = self.look_up(&mut remembered, lookup, hash);
+                }
                 return Ok(tenant);
             }
-            remembered.generation
+            match remembered.pending.get(&hash) {
+                Some(pending) => {
+                    counted.shared.fetch_add(1, Ordering::Relaxed);
+                    pending.answer.clone()
+                }
+                None => match self.look_up(&mut remembered, lookup, hash) {
+                    Some(answer) => answer,
+                    None => {
+                        counted.busy.fetch_add(1, Ordering::Relaxed);
+                        return Err(NodeError::Busy);
+                    }
+                },
+            }
         };
-        let Ok(_looking) = self.lookups.try_acquire() else {
-            self.counted.busy.fetch_add(1, Ordering::Relaxed);
-            return Err(NodeError::Busy);
-        };
-        self.counted.looked_up.fetch_add(1, Ordering::Relaxed);
-        let tenant = coordinator.key_tenant(&hash).await?;
-        let mut remembered = self.remembered();
-        if remembered.generation == generation {
-            remembered.insert(hash, tenant.clone());
+        answer.await.map_err(|failed| match failed {
+            Failed::Lookup(error) => NodeError::KeyLookup(error),
+            Failed::Stopped => NodeError::Stopped,
+            Failed::Panicked => NodeError::KeyLookupPanicked,
+        })
+    }
+
+    /// Start looking `hash` up, on a task of its own, and note it as under
+    /// way: or `None`, if as many lookups are under way as may be. The
+    /// lookup remembers what it finds unless keys were forgotten since it
+    /// began, and takes itself out of those under way as it ends, both
+    /// before anyone waiting on it is answered.
+    fn look_up(
+        &self,
+        remembered: &mut Remembered,
+        lookup: &impl KeyLookup,
+        hash: KeyHash,
+    ) -> Option<Shared<BoxFuture<'static, Looked>>> {
+        let permit = self.0.lookups.clone().try_acquire_owned().ok()?;
+        self.0.counted.looked_up.fetch_add(1, Ordering::Relaxed);
+        let (kept, generation, id) = (self.0.clone(), remembered.generation, remembered.next);
+        remembered.next += 1;
+        let asked = lookup.key_tenant(hash);
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            // Out of those under way however the lookup ends, a panic or
+            // a node stopping among the ways.
+            let _unpending = Unpending {
+                kept: kept.clone(),
+                hash,
+                id,
+            };
+            let looked = asked
+                .await
+                .map_err(|error| Failed::Lookup(Arc::new(error.into())));
+            if let Ok(tenant) = &looked {
+                let mut remembered = kept.remembered.lock().expect("keys lock");
+                if remembered.generation == generation {
+                    remembered.insert(hash, tenant.clone(), started);
+                }
+            }
+            looked
+        });
+        let answer = async move {
+            match task.await {
+                Ok(looked) => looked,
+                Err(ended) if ended.is_panic() => {
+                    tracing::error!("looking a key up panicked");
+                    Err(Failed::Panicked)
+                }
+                Err(_) => Err(Failed::Stopped),
+            }
         }
-        Ok(tenant)
+        .boxed()
+        .shared();
+        remembered.pending.insert(
+            hash,
+            Pending {
+                id,
+                answer: answer.clone(),
+            },
+        );
+        Some(answer)
     }
 
     /// How the keys presented so far have been answered.
     pub fn lookups(&self) -> KeyLookups {
         let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
+        let counted = &self.0.counted;
         KeyLookups {
-            remembered: read(&self.counted.remembered),
-            looked_up: read(&self.counted.looked_up),
-            busy: read(&self.counted.busy),
+            remembered: read(&counted.remembered),
+            looked_up: read(&counted.looked_up),
+            shared: read(&counted.shared),
+            busy: read(&counted.busy),
         }
     }
 
     /// Forget what was looked up for `tenant`, whose keys have changed, and
-    /// whatever is being looked up now.
+    /// whatever is being looked up now: a lookup under way remembers
+    /// nothing, and no ask from now on joins it.
     pub fn forget(&self, tenant: &TenantId) {
         let mut remembered = self.remembered();
         remembered.generation += 1;
         remembered.found.retain(|_, (reaches, _)| reaches != tenant);
+        remembered.pending.clear();
     }
 
     fn remembered(&self) -> std::sync::MutexGuard<'_, Remembered> {
-        self.remembered.lock().expect("keys lock")
+        self.0.remembered.lock().expect("keys lock")
     }
 }
 
@@ -223,9 +410,16 @@ mod tests {
     use vellev_core::Partition;
     use vellev_storage::coordinator::{MemoryCoordinator, PartitionKey};
 
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
     use super::*;
 
-    async fn tenant(coordinator: &MemoryCoordinator, name: &str) -> TenantId {
+    fn memory() -> Arc<dyn Coordinator> {
+        Arc::new(MemoryCoordinator::default())
+    }
+
+    async fn tenant(coordinator: &Arc<dyn Coordinator>, name: &str) -> TenantId {
         let tenant = TenantId::new(name).unwrap();
         let key = PartitionKey {
             tenant: tenant.clone(),
@@ -237,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_a_key_of_the_issued_form_is_looked_up() {
-        let (coordinator, keys) = (MemoryCoordinator::default(), Keys::default());
+        let (coordinator, keys) = (memory(), Keys::default());
         assert_eq!(keys.tenant(&coordinator, "dev-key").await.unwrap(), None);
         assert!(keys.remembered().unknown.is_empty(), "not even remembered");
         let random = || Uuid::new_v4().simple().to_string();
@@ -255,10 +449,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_flood_of_made_up_keys_never_forgets_a_real_one() {
-        let coordinator = MemoryCoordinator::default();
+        let coordinator = memory();
         let acme = tenant(&coordinator, "acme").await;
         let keys = Keys::default();
-        let issued = keys.issue(&coordinator, &acme).await.unwrap().unwrap();
+        let issued = keys
+            .issue(coordinator.as_ref(), &acme)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             keys.tenant(&coordinator, &issued.secret).await.unwrap(),
             Some(acme.clone())
@@ -273,6 +471,359 @@ mod tests {
         }
         let remembered = keys.remembered();
         assert!(remembered.unknown.len() <= MOST_UNKNOWN);
-        assert_eq!(remembered.get(&hashed(&issued.secret)), Some(Some(acme)));
+        let (found, _) = remembered.get(&hashed(&issued.secret)).unwrap();
+        assert_eq!(found, Some(acme));
+    }
+
+    /// A stand-in for the coordinator: it counts its lookups, holds each
+    /// until let go, and answers as it is told to then.
+    #[derive(Clone)]
+    struct Stand {
+        calls: Arc<AtomicUsize>,
+        gate: Arc<Semaphore>,
+        answer: Arc<Mutex<Option<Option<TenantId>>>>,
+        /// How long each next lookup takes once let go, in turn.
+        delays: Arc<Mutex<std::collections::VecDeque<Duration>>>,
+        /// Whether the next lookup panics.
+        panics: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Stand {
+        /// Answering `tenant`, or failing while the answer is `None`.
+        fn new(tenant: Option<TenantId>) -> Self {
+            Self {
+                calls: Arc::default(),
+                gate: Arc::new(Semaphore::new(0)),
+                answer: Arc::new(Mutex::new(Some(tenant))),
+                delays: Arc::default(),
+                panics: Arc::default(),
+            }
+        }
+
+        /// The next lookup taking `delay` once let go.
+        fn slowed(&self, delay: Duration) {
+            self.delays.lock().unwrap().push_back(delay);
+        }
+
+        fn open(self) -> Self {
+            self.gate.add_permits(Semaphore::MAX_PERMITS / 2);
+            self
+        }
+
+        fn release(&self) {
+            self.gate.add_permits(Semaphore::MAX_PERMITS / 2);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn answering(&self, answer: Option<Option<TenantId>>) {
+            *self.answer.lock().unwrap() = answer;
+        }
+
+        /// Once the stand-in has been asked `times` times; failing the test,
+        /// rather than hanging it, if that is not soon.
+        async fn called(&self, times: usize) {
+            for _ in 0..1_000 {
+                if self.calls() >= times {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            panic!("asked {} times, not {times}", self.calls());
+        }
+    }
+
+    impl KeyLookup for Stand {
+        fn key_tenant(
+            &self,
+            _: KeyHash,
+        ) -> BoxFuture<'static, coordinator::Result<Option<TenantId>>> {
+            let stand = self.clone();
+            Box::pin(async move {
+                stand.calls.fetch_add(1, Ordering::SeqCst);
+                // What the coordinator holds when the lookup reaches it;
+                // the answer comes back after.
+                let answer = stand.answer.lock().unwrap().clone();
+                let delay = stand.delays.lock().unwrap().pop_front();
+                let _go = stand.gate.acquire().await.unwrap();
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                if stand.panics.swap(false, Ordering::SeqCst) {
+                    panic!("the stand-in panics");
+                }
+                answer.ok_or_else(|| {
+                    vellev_storage::coordinator::CoordinatorError::Backend("down".into())
+                })
+            })
+        }
+    }
+
+    fn secret() -> String {
+        format!(
+            "{PREFIX}{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        )
+    }
+
+    fn acme() -> TenantId {
+        TenantId::new("acme").unwrap()
+    }
+
+    /// `askers` asks for `secret` at once, each on a task of its own.
+    fn asking(
+        keys: &Arc<Keys>,
+        stand: &Stand,
+        secret: &str,
+        askers: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<Option<TenantId>>>> {
+        (0..askers)
+            .map(|_| {
+                let (keys, stand, secret) = (keys.clone(), stand.clone(), secret.to_string());
+                tokio::spawn(async move { keys.tenant(&stand, &secret).await })
+            })
+            .collect()
+    }
+
+    /// T3: however many ask for a key not remembered at once, it is looked
+    /// up once, and none of them is turned away as busy.
+    #[tokio::test]
+    async fn one_lookup_answers_every_concurrent_ask_for_a_key() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())),
+            secret(),
+        );
+        let asked = asking(&keys, &stand, &secret, 64);
+        stand.called(1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stand.release();
+        for answer in asked {
+            assert_eq!(answer.await.unwrap().unwrap(), Some(acme()));
+        }
+        assert_eq!(stand.calls(), 1, "one lookup for all 64");
+        let looked = keys.lookups();
+        assert_eq!((looked.looked_up, looked.busy), (1, 0));
+    }
+
+    /// T11: a lookup goes on when whoever began it stops waiting, and those
+    /// who joined it are answered by it.
+    #[tokio::test]
+    async fn a_lookup_goes_on_when_whoever_began_it_stops_waiting() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())),
+            secret(),
+        );
+        let first = asking(&keys, &stand, &secret, 1).remove(0);
+        stand.called(1).await;
+        let joined = asking(&keys, &stand, &secret, 1).remove(0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        first.abort();
+        stand.release();
+        let answer = tokio::time::timeout(Duration::from_secs(5), joined)
+            .await
+            .expect("answered, not left waiting");
+        assert_eq!(answer.unwrap().unwrap(), Some(acme()));
+        assert_eq!(stand.calls(), 1);
+    }
+
+    /// A failed lookup is told to everyone who asked, once, and is not
+    /// remembered: the next ask looks the key up again.
+    #[tokio::test]
+    async fn a_failed_lookup_is_told_to_each_asker_and_not_remembered() {
+        let (keys, stand, secret) = (Arc::new(Keys::default()), Stand::new(None), secret());
+        stand.answering(None);
+        let asked = asking(&keys, &stand, &secret, 8);
+        stand.called(1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stand.release();
+        for answer in asked {
+            assert!(
+                answer.await.unwrap().is_err(),
+                "the failure, to every asker"
+            );
+        }
+        assert_eq!(stand.calls(), 1);
+        stand.answering(Some(Some(acme())));
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        assert_eq!(stand.calls(), 2, "the failure was not remembered");
+    }
+
+    /// A key nearly due to be looked up again is looked up while what was
+    /// remembered of it still answers: no ask waits on the coordinator for
+    /// a key in use, and a revoked key is found out no later than it was.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_nearly_due_is_looked_up_again_while_it_still_answers() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        tokio::time::advance(REMEMBERED_FOR - REFRESHED_BEFORE + Duration::from_millis(1)).await;
+        stand.answering(Some(None));
+        assert_eq!(
+            keys.tenant(&stand, &secret).await.unwrap(),
+            Some(acme()),
+            "answered from what is remembered"
+        );
+        stand.called(2).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            keys.tenant(&stand, &secret).await.unwrap(),
+            None,
+            "the fresh answer"
+        );
+        assert_eq!(stand.calls(), 2);
+    }
+
+    /// An ask made after a tenant's keys are forgotten does not join a
+    /// lookup begun before: it looks the key up afresh.
+    #[tokio::test]
+    async fn an_ask_after_keys_are_forgotten_joins_no_lookup_begun_before() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())),
+            secret(),
+        );
+        let before = asking(&keys, &stand, &secret, 1).remove(0);
+        stand.called(1).await;
+        keys.forget(&acme());
+        stand.answering(Some(None));
+        let after = asking(&keys, &stand, &secret, 1).remove(0);
+        stand.called(2).await;
+        stand.release();
+        assert_eq!(
+            before.await.unwrap().unwrap(),
+            Some(acme()),
+            "the earlier lookup answers as the coordinator held when it asked"
+        );
+        assert_eq!(after.await.unwrap().unwrap(), None);
+        assert_eq!(stand.calls(), 2, "the later ask looked the key up itself");
+    }
+
+    /// A lookup that panics is an error to whoever asked, and leaves the
+    /// key to be looked up again: never a key no ask can get past.
+    #[tokio::test]
+    async fn a_lookup_that_panics_fails_its_askers_and_poisons_nothing() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        stand.panics.store(true, Ordering::SeqCst);
+        let asked = asking(&keys, &stand, &secret, 4);
+        for answer in asked {
+            let answer = answer.await.expect("an answer, not a panic");
+            assert!(answer.is_err(), "{answer:?}");
+        }
+        let again = tokio::time::timeout(Duration::from_secs(5), keys.tenant(&stand, &secret))
+            .await
+            .expect("answered");
+        assert_eq!(again.unwrap(), Some(acme()), "looked up again");
+        assert_eq!(stand.calls(), 2);
+    }
+
+    /// A key no one asks for meanwhile is looked up again once
+    /// [`REMEMBERED_FOR`] has passed, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_is_answered_from_memory_for_as_long_as_it_is_remembered_and_no_longer() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        stand.answering(Some(None));
+        tokio::time::advance(REMEMBERED_FOR + Duration::from_millis(1)).await;
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), None);
+        assert_eq!(stand.calls(), 2);
+    }
+
+    /// A lookup begun before a tenant's keys were forgotten remembers
+    /// nothing, however it ends: the coordinator answered it as things were.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_begun_before_keys_are_forgotten_remembers_nothing() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        stand.slowed(Duration::from_secs(5));
+        let before = asking(&keys, &stand, &secret, 1).remove(0);
+        stand.called(1).await;
+        keys.forget(&acme());
+        stand.answering(Some(None));
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), None);
+        assert_eq!(
+            before.await.unwrap().unwrap(),
+            Some(acme()),
+            "its own answer"
+        );
+        assert_eq!(
+            keys.tenant(&stand, &secret).await.unwrap(),
+            None,
+            "the later lookup is what is remembered"
+        );
+        assert_eq!(stand.calls(), 2);
+    }
+
+    /// However many ask for a key due to be looked up again, it is looked
+    /// up again once.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_due_is_looked_up_again_once_however_many_ask() {
+        let (keys, stand, secret) = (
+            Arc::new(Keys::default()),
+            Stand::new(Some(acme())).open(),
+            secret(),
+        );
+        assert_eq!(keys.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        tokio::time::advance(REMEMBERED_FOR - REFRESHED_BEFORE + Duration::from_millis(1)).await;
+        stand.slowed(Duration::from_secs(1));
+        for answer in asking(&keys, &stand, &secret, 64) {
+            assert_eq!(answer.await.unwrap().unwrap(), Some(acme()));
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(stand.calls(), 2, "one lookup again for all 64");
+    }
+
+    /// A key revoked through another node is answered as revoked here
+    /// within [`REMEMBERED_FOR`] of the revoke, however slow a lookup of it
+    /// begun before then: an answer is as old as the lookup that asked.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_revoked_elsewhere_is_refused_here_within_the_bound_however_slow_the_lookup() {
+        let stand = Stand::new(Some(acme())).open();
+        let (here, there, secret) = (Arc::new(Keys::default()), Keys::default(), secret());
+        assert_eq!(here.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        tokio::time::advance(REMEMBERED_FOR - REFRESHED_BEFORE + Duration::from_millis(1)).await;
+        // A lookup again, begun now and five seconds in coming back.
+        stand.slowed(Duration::from_secs(5));
+        assert_eq!(here.tenant(&stand, &secret).await.unwrap(), Some(acme()));
+        stand.called(2).await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        // Revoked through the other node: the coordinator holds no key.
+        stand.answering(Some(None));
+        there.forget(&acme());
+        let revoked = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let until = revoked + REMEMBERED_FOR + Duration::from_millis(100);
+        tokio::time::advance(until - tokio::time::Instant::now()).await;
+        assert_eq!(
+            here.tenant(&stand, &secret).await.unwrap(),
+            None,
+            "refused within ten seconds of the revoke"
+        );
     }
 }

@@ -223,8 +223,14 @@ fn limit(error: &StorageError) -> Option<Limit> {
 
 impl From<StorageError> for ApiError {
     fn from(error: StorageError) -> Self {
-        match (code(&error), error.root()) {
-            (_, StorageError::Embedding { lasting, .. }) => Self::unembedded(&error, *lasting),
+        Self::from(&error)
+    }
+}
+
+impl From<&StorageError> for ApiError {
+    fn from(error: &StorageError) -> Self {
+        match (code(error), error.root()) {
+            (_, StorageError::Embedding { lasting, .. }) => Self::unembedded(error, *lasting),
             (Code::Internal, _) => {
                 tracing::error!(%error, "request failed");
                 Self::new(Code::Internal, "the node failed to serve the request")
@@ -288,6 +294,10 @@ impl From<NodeError> for ApiError {
                 ..Self::new(Code::Limited, error.to_string())
             },
             NodeError::Storage(error) => error.into(),
+            NodeError::KeyLookup(error) => error.as_ref().into(),
+            NodeError::KeyLookupPanicked => {
+                Self::new(Code::Internal, "the node failed to serve the request")
+            }
         }
     }
 }
