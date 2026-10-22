@@ -272,3 +272,35 @@ async fn the_memtable_counts_its_live_rows_with_a_vector() {
         .unwrap();
     assert_eq!(vectors(), 1);
 }
+
+/// Rows with a vector written while a flush is under way stay in memory
+/// after it, and are counted there.
+#[tokio::test]
+async fn rows_written_beside_a_flush_are_counted_after_it() {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
+    let writer = Arc::new(cluster.writer().await);
+    writer
+        .commit(vec![
+            create(NOTES),
+            note(1, "fox", 0, Some([1.0, 0.0])),
+            note(2, "hen", 0, Some([0.0, 1.0])),
+        ])
+        .await
+        .unwrap();
+    paused.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    assert_eq!(stored.recv().await, Some("stored"));
+    paused.armed.store(false, Ordering::SeqCst);
+    writer
+        .commit(vec![note(3, "owl", 0, Some([1.0, 1.0]))])
+        .await
+        .unwrap();
+    paused.release.notify_one();
+    flushing.await.unwrap().unwrap();
+    assert_eq!(writer.partition().read(State::unflushed), 1);
+    assert_eq!(writer.partition().read(State::unflushed_vectors), 1);
+}
