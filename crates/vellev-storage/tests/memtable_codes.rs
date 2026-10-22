@@ -86,7 +86,6 @@ fn hybrid_work(state: &State, collection: &str, query: &Hybrid<'_>) -> Work {
 }
 
 #[tokio::test]
-#[ignore = "F2b: the memtable is coded (burst plan F2b, PR 3)"]
 async fn t1_a_coded_memtable_is_scored_exactly_no_more_than_its_budget() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
@@ -126,7 +125,6 @@ async fn t1_a_coded_memtable_is_scored_exactly_no_more_than_its_budget() {
 }
 
 #[tokio::test]
-#[ignore = "F2b: the memtable is coded (burst plan F2b, PR 3)"]
 async fn t4_a_collection_is_coded_by_its_own_versions_and_stays_coded() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
@@ -192,7 +190,6 @@ fn answers(state: &State, queries: &[Vec<f32>]) -> Vec<Vec<(ObjectId, u32)>> {
 }
 
 #[tokio::test]
-#[ignore = "F2b: the memtable is coded (burst plan F2b, PR 3)"]
 async fn t9_a_writer_and_its_copies_code_and_answer_alike_with_changes_beside_a_flush() {
     let mut cluster = Cluster::new().await;
     let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
@@ -399,7 +396,6 @@ async fn t2_recall_holds_when_the_memtable_drifts_far_from_its_centre() {
 }
 
 #[tokio::test]
-#[ignore = "F2b: the memtable is coded (burst plan F2b, PR 3)"]
 async fn the_codes_are_counted_as_resident_and_let_go_at_a_flush() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;

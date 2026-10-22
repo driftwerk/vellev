@@ -212,6 +212,10 @@ fn candidates(
             estimated: None,
         };
     };
+    // The memtable's live allowed rows, every one ranked by its code.
+    if layer.vectors.is_none() {
+        work.coded_memtable += live().count() as u64;
+    }
     let ties = |a, b| layer.id(a).cmp(&layer.id(b));
     let unmeasured = vectors.unmeasured(only.as_ref(), layer.dead);
     match vectors {

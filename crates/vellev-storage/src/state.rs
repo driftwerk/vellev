@@ -3,7 +3,9 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
-use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value, Version};
+use vellev_core::{
+    Collection, CollectionName, Distance, Object, ObjectId, RequestId, Value, Version,
+};
 use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
@@ -464,6 +466,41 @@ struct Memtable {
     indexes: Indexes,
     /// About how many bytes `rows` take, with what indexes them.
     bytes: usize,
+    /// For each collection, how many versions of its rows with a vector
+    /// have been applied since the checkpoint, dead or not: what decides
+    /// when its rows are coded (see [`CODE_FROM`]). It only rises.
+    applied: HashMap<CollectionId, usize>,
+}
+
+/// From how many versions of a collection's rows with a vector applied
+/// since the checkpoint the memtable's rows of it are coded one bit a
+/// dimension, for a search to shortlist as it does a segment's (burst plan
+/// F2b). The codes are taken about the mean of those first versions, dead
+/// or not, in log order: what any copy replaying the log from the same
+/// checkpoint arrives at too. Once coded, the memtable stays coded until
+/// it is flushed, however many of its rows die.
+pub const CODE_FROM: usize = 1_024;
+
+/// The memtable's rows of `collection` with a vector, every one coded about
+/// the mean of the first [`CODE_FROM`] of them in row order, which is log
+/// order since the checkpoint.
+fn coded(rows: &[Row], collection: CollectionId, metric: Distance) -> Option<Vectors> {
+    let vectored: Vec<(u32, &[f32])> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.collection == collection)
+        .filter_map(|(at, row)| Some((at as u32, row.object.vector.as_deref()?)))
+        .collect();
+    let first: Vec<&[f32]> = vectored
+        .iter()
+        .take(CODE_FROM)
+        .map(|(_, vector)| *vector)
+        .collect();
+    let mut codes = BinaryIndex::about_mean(metric, &first)?;
+    for (row, vector) in &vectored {
+        codes.push(*row, vector);
+    }
+    Some(Vectors::Binary(codes))
 }
 
 /// A partition in memory as of one position: flushed segments, the rows
@@ -648,7 +685,16 @@ impl State {
     /// is counted as it is made.
     pub fn resident(&self) -> usize {
         let segments: usize = self.segments.iter().map(|segment| segment.resident).sum();
-        segments + self.memtable.bytes
+        let codes: usize = self
+            .memtable
+            .indexes
+            .values()
+            .map(|index| match &index.vectors {
+                Some(Vectors::Binary(codes)) => codes.resident(),
+                _ => 0,
+            })
+            .sum();
+        segments + self.memtable.bytes + codes
     }
 
     /// How many rows are live. What a writer does in memory as it commits
@@ -661,8 +707,46 @@ impl State {
     /// those since replaced: what a flush would move out of memory.
     /// How the memtable's rows of `collection` are coded for search, if
     /// they are: see [`MemtableCoding`].
-    pub fn memtable_coding(&self, _collection: &CollectionName) -> Option<MemtableCoding> {
-        None
+    pub fn memtable_coding(&self, collection: &CollectionName) -> Option<MemtableCoding> {
+        let (id, _) = self.catalog.known(collection).ok()?;
+        match &self.memtable.indexes.get(&id)?.vectors {
+            Some(Vectors::Binary(codes)) => Some(MemtableCoding {
+                applied: self.memtable.applied.get(&id).copied().unwrap_or(0),
+                coded: codes.len(),
+                centre: codes.centre().to_vec(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Code the memtable's row `row` of `collection`, just applied, if it
+    /// has a vector: on its own once the collection's rows are coded, or
+    /// with every row before it as this version is the
+    /// [`CODE_FROM`]th applied since the checkpoint.
+    fn code(&mut self, collection: CollectionId, row: usize) {
+        let Some(schema) = self.catalog.schema(collection) else {
+            return;
+        };
+        let metric = schema.distance;
+        let Memtable {
+            rows,
+            indexes,
+            applied,
+            ..
+        } = &mut self.memtable;
+        let Some(vector) = rows[row].object.vector.as_deref() else {
+            return;
+        };
+        let applied = applied.entry(collection).or_default();
+        *applied += 1;
+        let Some(index) = indexes.get_mut(&collection) else {
+            return;
+        };
+        match &mut index.vectors {
+            Some(Vectors::Binary(codes)) => codes.push(row as u32, vector),
+            _ if *applied == CODE_FROM => index.vectors = coded(rows, collection, metric),
+            _ => {}
+        }
     }
 
     pub fn unflushed(&self) -> usize {
@@ -1057,6 +1141,7 @@ impl State {
                     // Nothing can ask for a dropped collection's rows;
                     // this only frees the memory.
                     self.memtable.indexes.remove(collection);
+                    self.memtable.applied.remove(collection);
                     self.corpora.remove(collection);
                 }
                 Op::Upsert { collection, object } => {
@@ -1083,6 +1168,7 @@ impl State {
                         .entry(*collection)
                         .or_default()
                         .count(index, row as u32, true);
+                    let at = row;
                     let row = Row {
                         collection: *collection,
                         object: object.clone(),
@@ -1090,6 +1176,7 @@ impl State {
                     self.memtable.bytes += row_bytes(&row);
                     self.memtable.rows.push(row);
                     self.memtable.dead.push(false);
+                    self.code(*collection, at);
                 }
                 Op::Delete { collection, id } => {
                     let key = (*collection, *id);
@@ -1501,6 +1588,7 @@ impl State {
             deaths,
             indexes,
             bytes,
+            applied,
             ..
         } = &mut self.memtable;
         let discarded = Discarded {
@@ -1517,6 +1605,25 @@ impl State {
                     .or_default()
                     .insert(schema, row as u32, object);
             }
+        }
+        // The rows kept are the versions applied since the new checkpoint,
+        // dead ones among them: coded again as a copy replaying the log
+        // from that checkpoint codes them.
+        applied.clear();
+        for row in rows.iter().filter(|row| row.object.vector.is_some()) {
+            *applied.entry(row.collection).or_default() += 1;
+        }
+        for (collection, versions) in applied.iter() {
+            if *versions < CODE_FROM {
+                continue;
+            }
+            let (Some(schema), Some(index)) = (
+                self.catalog.schema(*collection),
+                indexes.get_mut(collection),
+            ) else {
+                continue;
+            };
+            index.vectors = coded(rows, *collection, schema.distance);
         }
         for location in self.live.values_mut() {
             if let Location::Memtable(row) = location {
