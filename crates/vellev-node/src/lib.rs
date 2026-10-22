@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -42,7 +42,7 @@ use limits::Asked;
 use limits::Limits;
 
 pub use claim_clock::{BootClock, ClaimClock};
-pub use keys::{Issued, REMEMBERED_FOR as KEYS_REMEMBERED_FOR};
+pub use keys::{Issued, KeyLookups, REMEMBERED_FOR as KEYS_REMEMBERED_FOR};
 pub use purging::{LOOKED_FOR_EVERY as PURGES_LOOKED_FOR_EVERY, LOOKED_OVER_EVERY, REMEMBERED};
 pub use reading::{Freshness, Reader};
 
@@ -1013,6 +1013,10 @@ impl Tenant {
 
 type Opening = Arc<OnceCell<Arc<Tenant>>>;
 
+/// How many tries of a restore by others one caller waits for before it is
+/// told a restore is running, rather than making a try of its own.
+const RESTORE_WAITS: usize = 3;
+
 /// How long a tenant or copy is kept after it was last used, whatever the
 /// memory budget.
 const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
@@ -1047,6 +1051,9 @@ struct Inner {
     /// When object storage last answered a readiness check.
     store_answered: Mutex<Option<Instant>>,
     keys: Keys,
+    /// How many writers and copies for reads this node has opened.
+    writers_opened: AtomicU64,
+    copies_opened: AtomicU64,
     limits: Arc<Limits>,
     /// The tenants purged lately whose cached files this node has dropped.
     dropped: Mutex<std::collections::HashSet<TenantId>>,
@@ -1057,6 +1064,14 @@ struct Inner {
 
 #[derive(Debug, Clone)]
 pub struct Node(Arc<Inner>);
+
+/// How many tenants a node has opened since it started. Each is a load of
+/// the tenant's committed state, which reads that wait on it wait for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Opens {
+    pub writers: u64,
+    pub copies: u64,
+}
 
 impl Node {
     /// A node that runs as `settings` say, taken as they are: nothing here
@@ -1076,6 +1091,8 @@ impl Node {
             open: Mutex::default(),
             store_answered: Mutex::default(),
             keys: Keys::default(),
+            writers_opened: AtomicU64::new(0),
+            copies_opened: AtomicU64::new(0),
             dropped: Mutex::default(),
             cluster_format: AtomicU16::new(0),
             limits: Arc::new(Limits::new(
@@ -1221,6 +1238,21 @@ impl Node {
         Ok(revoked)
     }
 
+    /// How the keys presented to this node have been answered since it
+    /// started.
+    pub fn key_lookups(&self) -> KeyLookups {
+        self.0.keys.lookups()
+    }
+
+    /// How many tenants this node has opened since it started: as their
+    /// writer, and as copies to read from.
+    pub fn opens(&self) -> Opens {
+        Opens {
+            writers: self.0.writers_opened.load(Ordering::Relaxed),
+            copies: self.0.copies_opened.load(Ordering::Relaxed),
+        }
+    }
+
     /// The tenant the key `secret` reaches, if it is one.
     pub async fn key_tenant(&self, secret: &str) -> Result<Option<TenantId>> {
         self.0
@@ -1289,7 +1321,11 @@ impl Node {
     /// Restore `tenant` as `work` does with the tenant as it is opened, as
     /// [`Tenant::restoring`] does, asking again of the tenant opened afresh
     /// whenever a try of the same request that ran meanwhile ended without
-    /// being recorded, as one whose writer closed under it.
+    /// being recorded, as one whose writer closed under it. Whoever asks
+    /// makes the restore's work once at most: only a caller that waited for
+    /// another's try asks again, and one that has waited for
+    /// [`RESTORE_WAITS`] of them is told a restore is running instead, to
+    /// ask again later.
     async fn restoring<F>(
         &self,
         tenant: &TenantId,
@@ -1299,13 +1335,14 @@ impl Node {
     where
         F: Future<Output = Result<Restored>> + Send + 'static,
     {
-        loop {
+        for _ in 0..=RESTORE_WAITS {
             let opened = self.tenant(tenant).await?;
             let made = work(self.clone(), opened.clone());
             if let Some(restored) = opened.restoring(&self.0.coordinator, asking, made).await? {
                 return Ok(restored);
             }
         }
+        Err(NodeError::Restoring(tenant.clone()))
     }
 
     /// The earliest and the latest state `tenant` may be restored to, with
@@ -1643,6 +1680,7 @@ impl Inner {
             !hold.is_lost() && Instant::now() < *deadline.lock().expect("deadline lock");
         let writer = match opened {
             Ok(writer) if !self.opened().stopped && still_held => {
+                self.writers_opened.fetch_add(1, Ordering::Relaxed);
                 let documents = Arc::new(Documents(self.embedders.clone()));
                 Arc::new(
                     writer

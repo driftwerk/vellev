@@ -19,6 +19,7 @@ publish = false
 
 [workspace.dependencies]
 base64 = "0.22"
+prometheus-client = "0.24"
 vellev-api = { path = "crates/vellev-api", version = "0.2.0" }
 vellev-client = { path = "crates/vellev-client", version = "0.2.0" }
 vellev-core = { path = "crates/vellev-core", version = "0.2.0" }

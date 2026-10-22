@@ -152,6 +152,18 @@ pub struct Unshipped {
     pub committed: LogPosition,
 }
 
+/// The refusal of a cap raised past what its run has shipped.
+pub(crate) fn past_shipped(
+    key: &PartitionKey,
+    cap: LogPosition,
+    shipped: Option<LogPosition>,
+) -> CoordinatorError {
+    CoordinatorError::InvalidArgument(format!(
+        "the shipping cap of {key} raised to {}, past what its run has shipped, {shipped:?}",
+        cap.0
+    ))
+}
+
 /// Why a shipping hold or base was refused as stale: what it named no
 /// longer stands, and the caller reads again and asks anew.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +356,25 @@ pub enum CoordinatorError {
         key: PartitionKey,
         asked: LogPosition,
         recorded: Option<LogPosition>,
+    },
+    /// A stall asked for by a run that saw it shipped up to `seen`, when
+    /// it has shipped up to `shipped` since: the run is under way past
+    /// what the stall was decided on, and is not stopped.
+    #[error("shipping of {key} has shipped to {shipped:?} since {seen:?} was seen; not stalled")]
+    ShippedSince {
+        key: PartitionKey,
+        seen: Option<LogPosition>,
+        shipped: Option<LogPosition>,
+    },
+    /// A clean asked to record it deletes below `asked`, above the cap a
+    /// run of shipping holds the partition's cleans to: what is at or
+    /// above the cap is yet to be shipped (DW-668, bootstrap note H).
+    /// Nothing is recorded, and the clean deletes nothing.
+    #[error("a clean of {key} below {asked:?} is above the shipping cap {cap:?}")]
+    CleanAboveCap {
+        key: PartitionKey,
+        asked: LogPosition,
+        cap: LogPosition,
     },
     /// A shipping write whose conditions kept moving under it, each time
     /// it was made: nothing was written, and asking again may succeed.
@@ -605,6 +636,11 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
     /// would do with none. The record goes with the partition's row when
     /// it is removed. Every coordinator has its own: there is no default,
     /// so that one that does not record can never seem to.
+    ///
+    /// While the partition is held for shipping, a record above the cap
+    /// is refused, [`CoordinatorError::CleanAboveCap`], and nothing is
+    /// recorded: checked on the record being written, not the one there
+    /// (bootstrap note H). A record left as it stands is not one written.
     async fn clean_below(
         &self,
         lease: &Lease,
@@ -655,6 +691,23 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
         base: &ShipBase,
     ) -> Result<Shipping>;
 
+    /// Raise the cap the partition's cleans are held to, to `cap`, as the
+    /// run from `base` ships on (bootstrap note, the hold's lifecycle 3):
+    /// so that a clean frees what is shipped. Only ever raised, and never
+    /// past what the run has shipped: `cap` is at most its watermark, and
+    /// a clean deletes below the newest checkpoint at or below it. A cap
+    /// at or above `cap` already is left, and returned. Fenced as
+    /// [`Self::note_shipped`] is, by the incarnation and the base, here on
+    /// the partition's row. Refused, [`CoordinatorError::InvalidArgument`],
+    /// for a cap past what the run has shipped. No default.
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        cap: LogPosition,
+    ) -> Result<Shipping>;
+
     /// Note that every commit of the run from `base` up to `position` has
     /// been shipped. Only ever raised: a note at or below what stands is
     /// left, and returned. Fenced by the incarnation and the base on the
@@ -668,15 +721,23 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
         position: LogPosition,
     ) -> Result<Shipping>;
 
-    /// Note that the run from `base` has stopped, and why. The first
-    /// reason stands; a later one is left, and the record returned.
-    /// Fenced as [`Self::note_shipped`] is, so that a stale run never
-    /// stops the one under way. No default.
+    /// Note that the run from `base` has stopped, and why, in one step
+    /// with noting it shipped up to `through`, if anything, as
+    /// [`Self::note_shipped`] does: taken only if what the run has shipped
+    /// is still `seen`, what the batch that stalls began from. So a stale
+    /// shipper of the same run, which decided on a record the run has
+    /// moved past, never stops the run under way: it is refused,
+    /// [`CoordinatorError::ShippedSince`], and nothing is written. The
+    /// first reason stands; a later one is left, and the record returned.
+    /// Fenced besides as [`Self::note_shipped`] is, by the incarnation and
+    /// the base. No default.
     async fn stall_shipping(
         &self,
         key: &PartitionKey,
         incarnation: Incarnation,
         base: LogPosition,
+        seen: Option<LogPosition>,
+        through: Option<LogPosition>,
         reason: &str,
     ) -> Result<Shipping>;
 

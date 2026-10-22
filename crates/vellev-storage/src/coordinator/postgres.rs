@@ -12,11 +12,11 @@ use vellev_core::{NodeId, Partition, RequestId, TenantId};
 
 use super::{
     base_decision, checked_hold, checked_note, checked_ship_base, checked_ttl, checked_window,
-    hold_decision, same_incarnation, Acquired, Adoption, Cleaned, ClusterId, Commit, Committed,
-    Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation, KeyHash, Lease,
-    Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges, Removed, Restore,
-    RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts, Shipping, TenantKey, Unshipped,
-    Versions, RESTORES_KEPT_FOR,
+    hold_decision, past_shipped, same_incarnation, Acquired, Adoption, Cleaned, ClusterId, Commit,
+    Committed, Coordinator, CoordinatorError, Forgotten, Generation, Identity, Incarnation,
+    KeyHash, Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Point, PurgeClaim, Purges,
+    Removed, Restore, RestorePoint, Restored, Result, Ship, ShipBase, ShipFacts, Shipping,
+    TenantKey, Unshipped, Versions, RESTORES_KEPT_FOR,
 };
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -257,7 +257,7 @@ impl PostgresCoordinator {
     /// partition not registered.
     async fn cleaned_row(&self, key: &PartitionKey) -> Result<Option<CleanedRow>> {
         Ok(sqlx::query_as(
-            "SELECT generation, cleaned_below, cleaned_position
+            "SELECT generation, cleaned_below, cleaned_position, ship_cap
              FROM vellev.partitions WHERE tenant = $1 AND partition = $2",
         )
         .bind(key.tenant.as_str())
@@ -658,6 +658,7 @@ struct CleanedRow {
     generation: Generation,
     cleaned_below: Option<String>,
     cleaned_position: Option<i64>,
+    ship_cap: Option<i64>,
 }
 
 impl CleanedRow {
@@ -1130,7 +1131,8 @@ impl Coordinator for PostgresCoordinator {
              SET cleaned_below = $4, cleaned_position = $5
              WHERE tenant = $1 AND partition = $2 AND generation = $3
                AND (cleaned_position IS NULL OR cleaned_position < $5)
-             RETURNING generation, cleaned_below, cleaned_position",
+               AND (ship_cap IS NULL OR $5 <= ship_cap)
+             RETURNING generation, cleaned_below, cleaned_position, ship_cap",
         )
         .bind(lease.key.tenant.as_str())
         .bind(i64::from(lease.key.partition.0))
@@ -1141,13 +1143,29 @@ impl Coordinator for PostgresCoordinator {
         .await?;
         let row = match raised {
             Some(row) => row,
-            // Fenced, or the record is as high already: which, the row says.
+            // Fenced, the record as high already, or held to the cap (H):
+            // which, the row says.
             None => match self.cleaned_row(&lease.key).await? {
                 None => return Err(CoordinatorError::UnknownPartition(lease.key.clone())),
                 Some(row) if row.generation != lease.generation => {
                     return Err(lease.fenced_by(row.generation))
                 }
-                Some(row) => row,
+                Some(row) if row.cleaned_position >= Some(bigint(position.0)?) => row,
+                Some(CleanedRow {
+                    ship_cap: Some(cap),
+                    ..
+                }) if cap < bigint(position.0)? => {
+                    return Err(CoordinatorError::CleanAboveCap {
+                        key: lease.key.clone(),
+                        asked: position,
+                        cap: stored_position(cap)?,
+                    })
+                }
+                Some(_) => {
+                    return Err(CoordinatorError::ShippingContended {
+                        key: lease.key.clone(),
+                    })
+                }
             },
         };
         row.cleaned()?
@@ -1286,6 +1304,46 @@ impl Coordinator for PostgresCoordinator {
         Err(CoordinatorError::ShippingContended { key: key.clone() })
     }
 
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        cap: LogPosition,
+    ) -> Result<Shipping> {
+        // On the partition's row, which the hold and the base write, so
+        // that a raise waits for either and is then fenced on what it
+        // wrote; never past what the run has shipped, read in the same
+        // statement.
+        let raised = sqlx::query(
+            "UPDATE vellev.partitions p SET ship_cap = $5
+             WHERE p.tenant = $1 AND p.partition = $2 AND p.incarnation = $3
+               AND p.ship_base = $4 AND p.ship_cap < $5
+               AND $5 <= (SELECT s.shipped FROM vellev.shipping s
+                          WHERE s.tenant = p.tenant AND s.partition = p.partition
+                            AND s.incarnation = $3 AND s.base = $4)",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(bigint(incarnation.0)?)
+        .bind(bigint(base.0)?)
+        .bind(bigint(cap.0)?)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if raised == 1 {
+            return self.shipping(key).await;
+        }
+        let shipping = self.shipper_refusal(key, incarnation, base).await?;
+        match (shipping.cap, shipping.shipped) {
+            (Some(stands), _) if stands >= cap => Ok(shipping),
+            (_, shipped) if shipped.is_none_or(|shipped| cap > shipped) => {
+                Err(past_shipped(key, cap, shipped))
+            }
+            _ => Err(CoordinatorError::ShippingContended { key: key.clone() }),
+        }
+    }
+
     async fn note_shipped(
         &self,
         key: &PartitionKey,
@@ -1318,24 +1376,48 @@ impl Coordinator for PostgresCoordinator {
         key: &PartitionKey,
         incarnation: Incarnation,
         base: LogPosition,
+        seen: Option<LogPosition>,
+        through: Option<LogPosition>,
         reason: &str,
     ) -> Result<Shipping> {
+        if let Some(through) = through {
+            checked_note(base, through)?;
+        }
+        // One statement, conditioned on what the run has shipped being
+        // what the stall was decided on: one read first and written after
+        // could stop a run that shipped on in between.
         let stalled = sqlx::query(
-            "UPDATE vellev.shipping SET stalled = $5
+            "UPDATE vellev.shipping SET stalled = $5, shipped = GREATEST(shipped, $7)
              WHERE tenant = $1 AND partition = $2 AND incarnation = $3 AND base = $4
-               AND stalled IS NULL",
+               AND stalled IS NULL AND shipped IS NOT DISTINCT FROM $6",
         )
         .bind(key.tenant.as_str())
         .bind(i64::from(key.partition.0))
         .bind(bigint(incarnation.0)?)
         .bind(bigint(base.0)?)
         .bind(reason)
+        .bind(seen.map(|seen| bigint(seen.0)).transpose()?)
+        .bind(through.map(|through| bigint(through.0)).transpose()?)
         .execute(&self.pool)
         .await?
         .rows_affected();
-        match stalled {
-            1 => self.shipping(key).await,
-            _ => self.shipper_refusal(key, incarnation, base).await,
+        if stalled == 1 {
+            return self.shipping(key).await;
+        }
+        let shipping = self.shipper_refusal(key, incarnation, base).await?;
+        match shipping {
+            // Stalled already: the first reason stands.
+            Shipping {
+                stalled: Some(_), ..
+            } => Ok(shipping),
+            Shipping { shipped, .. } if shipped != seen => Err(CoordinatorError::ShippedSince {
+                key: key.clone(),
+                seen,
+                shipped,
+            }),
+            // Neither, read after the statement: it moved under it, and
+            // back; asking again may well succeed.
+            _ => Err(CoordinatorError::ShippingContended { key: key.clone() }),
         }
     }
 

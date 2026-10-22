@@ -547,6 +547,17 @@ impl Framed {
         self.body.update(part);
     }
 
+    /// The length of the whole frame, as its header says it is, once the
+    /// header has come: what it is to come to, before it has. Only a
+    /// header: [`Self::came`] says whether the frame is that length.
+    pub fn declared(&self) -> Option<u64> {
+        if self.header.len() < HEADER {
+            return None;
+        }
+        let length = u64::from_le_bytes(self.header[7..15].try_into().expect("eight bytes"));
+        Some(length.saturating_add(HEADER as u64))
+    }
+
     /// What the file came to, if it is one whole frame of `expected`, of
     /// a format this release reads; a failure saying how it is not
     /// otherwise.
@@ -601,6 +612,28 @@ mod tests {
         for each in [1, 3, HEADER - 1, HEADER, HEADER + 1, frame.len()] {
             let framed = framed_by(&frame, each);
             assert_eq!(framed.came("k", Kind::Index).unwrap(), whole, "{each}");
+        }
+    }
+
+    /// A frame's length is known as soon as its header has come, and not
+    /// before, however it is split.
+    #[test]
+    fn a_frame_going_by_says_how_long_it_is_once_its_header_has_come() {
+        let frame = encode(Kind::Log, &(7u64, "seven".repeat(40))).unwrap();
+        for at in 0..=frame.len() {
+            let mut framed = Framed::default();
+            framed.update(&frame[..at]);
+            let declared = (at >= HEADER).then_some(frame.len() as u64);
+            assert_eq!(framed.declared(), declared, "{at}");
+            framed.update(&frame[at..]);
+            assert_eq!(framed.declared(), Some(frame.len() as u64), "{at}");
+        }
+        // A byte at a time, as a store may hand the parts.
+        let mut framed = Framed::default();
+        for (at, byte) in frame.iter().enumerate() {
+            framed.update(std::slice::from_ref(byte));
+            let declared = (at + 1 >= HEADER).then_some(frame.len() as u64);
+            assert_eq!(framed.declared(), declared, "{at}");
         }
     }
 

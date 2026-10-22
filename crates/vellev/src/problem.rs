@@ -182,6 +182,7 @@ fn code(error: &StorageError) -> Code {
         E::Missing { .. }
         | E::Corrupt { .. }
         | E::NotCreated { .. }
+        | E::NotListed { .. }
         | E::UnusableRecords { .. }
         | E::UnsupportedVersion { .. }
         | E::Exhausted(_)
@@ -359,6 +360,18 @@ mod tests {
             told(coordinator(fenced)),
             (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable)
         );
+    }
+
+    /// A restore whose right to read a backup ran out is told alike
+    /// however it is said: as the claim lost, or as the right the store's
+    /// work found unheld. Either way it may be asked again.
+    #[test]
+    fn a_right_run_out_is_unavailable_as_a_claim_lost_is() {
+        let acme = || TenantId::new("acme").unwrap();
+        let unavailable = (StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable);
+        assert_eq!(told(NodeError::ClaimLost(acme())), unavailable);
+        let unheld = NodeError::Storage(StorageError::Unheld(acme()));
+        assert_eq!(told(unheld), unavailable);
     }
 
     #[test]

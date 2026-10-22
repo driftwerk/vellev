@@ -2053,6 +2053,16 @@ impl Writer {
     /// predecessor cannot be read, or whose record cannot be. A record that
     /// names no checkpoint of this chain is never passed, and is said so.
     ///
+    /// While the partition's history is shipped to a backup store, nothing
+    /// at or above the cap the run holds cleans to is deleted (DW-668 PR
+    /// 6): the clean's base is the newest checkpoint at or below it, and
+    /// every checkpoint above it, each on the chain, is walked and keeps
+    /// what it lists, old keys a restore put back included. The cap trails
+    /// what the run has shipped, so a run that lags, or has stalled, pins
+    /// every file from the cap up and the partition's storage grows until
+    /// it ships on: the node's lag and stall alarm is for that, and must
+    /// be in place before shipping is switched on.
+    ///
     /// Nothing younger than `grace` by this node's clock against the
     /// store's date is deleted, whatever the chain says: a walk that ends
     /// at what an earlier clean deleted has young files below it, which a
@@ -2127,12 +2137,15 @@ impl Writer {
     /// a restore since may have put back into use segments this one takes
     /// for litter. So it asks before it works out what to delete, and
     /// again before each lot it deletes. What is left is a lot already
-    /// asked for when the lease is lost, and only if, before those
-    /// requests are answered, another writer has taken the lease, opened
-    /// the partition and committed a restore to a state that lists one of
-    /// those very files: a lease is taken from a node only once it has run
-    /// out, by when the node has long stopped whatever was working on the
-    /// tenant, this included.
+    /// asked for when the lease is lost, which may land after another
+    /// writer has taken the lease. A restore from a backup by that writer
+    /// names none of those files, whatever it restores: its files are
+    /// copies under keys of its own ([`Self::restore_from`]). A restore to
+    /// a point in the window may name one, and is kept clear of it only by
+    /// the grace: a lease is taken from a node only once it has run out,
+    /// by when the node has long stopped whatever was working on the
+    /// tenant, this included, and what such a restore may go back to only
+    /// shrinks with time.
     async fn current(&self) -> Result<(LogPosition, Option<String>)> {
         let turn = self.turn().await?;
         turn.allow(self.commit_within());
@@ -2195,6 +2208,19 @@ impl Writer {
         })??)
     }
 
+    /// The cap a run of shipping holds this partition's cleans to, if it is
+    /// held for shipping (DW-668 PR 6): a clean that cannot be told fails,
+    /// and deletes nothing, as one that cannot read what was cleaned does.
+    async fn ship_cap(&self) -> Result<Option<LogPosition>> {
+        let within = self.commit_within();
+        let asked = self.coordinator.shipping(&self.lease.key);
+        let shipping = tokio::time::timeout(within, asked).await.map_err(|_| {
+            let reason = format!("the coordinator did not say how it is shipped within {within:?}");
+            CoordinatorError::backend(std::io::Error::new(std::io::ErrorKind::TimedOut, reason))
+        })??;
+        Ok(shipping.cap)
+    }
+
     /// The files [`Self::clean`] with `grace` deletes, as many as it does
     /// at once: every file listed, set against the committed chain. Each
     /// request it makes is given up by the store, but a partition of a
@@ -2205,6 +2231,7 @@ impl Writer {
         let listed = self.partition.blobs.list(&layout.prefix()).await?;
         let (position, head) = self.current().await?;
         let recorded = self.cleaned().await?;
+        let cap = self.ship_cap().await?;
         let cutoff = chrono::Duration::from_std(grace)
             .ok()
             .and_then(|grace| self.clock.now().checked_sub_signed(grace));
@@ -2219,8 +2246,12 @@ impl Writer {
             .iter()
             .filter(|(file, _)| file.modified >= cutoff)
             .map(|(_, at)| *at);
+        // Held below what a run of shipping has yet to ship (DW-668 PR 6):
+        // every checkpoint above the cap, and so every file one lists, is
+        // walked and kept.
         let floor = young
             .map(|at| LogPosition(at.0.saturating_sub(1)))
+            .chain(cap)
             .fold(position, std::cmp::min);
         let mut cursor = head;
         let mut checkpoints: Vec<(String, Manifest)> = Vec::new();

@@ -314,6 +314,28 @@ pub struct Unreliable {
     pub unanswered: AtomicBool,
     /// How long each commit takes to be answered.
     pub slowly: Mutex<Duration>,
+    /// Commit rows as `commits_after` gives them, by position: one not
+    /// given (`None`), or another in its place.
+    pub rows: Mutex<BTreeMap<LogPosition, Option<RestorePoint>>>,
+    /// Shipping noted nowhere: what a run shipped, why it stalled, or the
+    /// cap raised to it, is answered as the record stands, and not
+    /// recorded.
+    pub unnoted: AtomicBool,
+    /// A base recorded, once, as the next commit rows are read: a run
+    /// re-based while a batch of it is under way.
+    pub re_base: Mutex<Option<vellev_storage::coordinator::ShipBase>>,
+    /// The record of shipping the next reading of it answers, once, in
+    /// place of the one there: as a shipper read it before the run moved.
+    pub shipping_once: Mutex<Option<vellev_storage::coordinator::Shipping>>,
+    /// The position the next reading of what is committed answers, once,
+    /// in place of the one committed: as read just before a commit.
+    pub committed_once: Mutex<Option<LogPosition>>,
+    /// A hold for shipping taken, once, capped here, as the next clean
+    /// asks to record: taken between the clean's reading of the cap and
+    /// its record.
+    pub hold_on_clean: Mutex<Option<LogPosition>>,
+    /// Every reading of shipping fails, as a coordinator not reached does.
+    pub fail_shipping: AtomicBool,
 }
 
 impl Unreliable {
@@ -326,6 +348,13 @@ impl Unreliable {
             hang_after_commit: AtomicBool::new(false),
             unanswered: AtomicBool::new(false),
             slowly: Mutex::new(Duration::ZERO),
+            rows: Mutex::new(BTreeMap::new()),
+            unnoted: AtomicBool::new(false),
+            re_base: Mutex::new(None),
+            shipping_once: Mutex::new(None),
+            committed_once: Mutex::new(None),
+            hold_on_clean: Mutex::new(None),
+            fail_shipping: AtomicBool::new(false),
         }
     }
 }
@@ -380,7 +409,12 @@ impl Coordinator for Unreliable {
         Ok(committed)
     }
     async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
-        self.inner.committed(key).await
+        let committed = self.inner.committed(key).await?;
+        let once = self.committed_once.lock().unwrap().take();
+        Ok(committed.map(|committed| Committed {
+            log_position: once.unwrap_or(committed.log_position),
+            ..committed
+        }))
     }
     async fn cleaned(
         &self,
@@ -394,12 +428,23 @@ impl Coordinator for Unreliable {
         base: &vellev_storage::coordinator::ManifestRef,
         position: vellev_storage::coordinator::LogPosition,
     ) -> Result<vellev_storage::coordinator::Cleaned, CoordinatorError> {
+        let hold = self.hold_on_clean.lock().unwrap().take();
+        if let Some(cap) = hold {
+            let now = self.inner.committed(&lease.key).await?.unwrap().incarnation;
+            self.inner.hold_for_shipping(&lease.key, now, cap).await?;
+        }
         self.inner.clean_below(lease, base, position).await
     }
     async fn shipping(
         &self,
         key: &PartitionKey,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if let Some(seen) = self.shipping_once.lock().unwrap().take() {
+            return Ok(seen);
+        }
+        if self.fail_shipping.load(Ordering::SeqCst) {
+            return Err(lost());
+        }
         self.inner.shipping(key).await
     }
     async fn hold_for_shipping(
@@ -418,6 +463,18 @@ impl Coordinator for Unreliable {
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         self.inner.record_base(key, incarnation, base).await
     }
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if self.unnoted.load(Ordering::SeqCst) {
+            return self.inner.shipping(key).await;
+        }
+        self.inner.raise_ship_cap(key, incarnation, base, cap).await
+    }
     async fn note_shipped(
         &self,
         key: &PartitionKey,
@@ -425,6 +482,9 @@ impl Coordinator for Unreliable {
         base: vellev_storage::coordinator::LogPosition,
         position: vellev_storage::coordinator::LogPosition,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if self.unnoted.load(Ordering::SeqCst) {
+            return self.inner.shipping(key).await;
+        }
         self.inner
             .note_shipped(key, incarnation, base, position)
             .await
@@ -434,10 +494,15 @@ impl Coordinator for Unreliable {
         key: &PartitionKey,
         incarnation: vellev_storage::coordinator::Incarnation,
         base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        through: Option<vellev_storage::coordinator::LogPosition>,
         reason: &str,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if self.unnoted.load(Ordering::SeqCst) {
+            return self.inner.shipping(key).await;
+        }
         self.inner
-            .stall_shipping(key, incarnation, base, reason)
+            .stall_shipping(key, incarnation, base, seen, through, reason)
             .await
     }
     async fn commits_after(
@@ -447,9 +512,22 @@ impl Coordinator for Unreliable {
         after: vellev_storage::coordinator::LogPosition,
         limit: usize,
     ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
-        self.inner
+        let re_base = self.re_base.lock().unwrap().take();
+        if let Some(base) = re_base {
+            self.inner.record_base(key, incarnation, &base).await?;
+        }
+        let rows = self
+            .inner
             .commits_after(key, incarnation, after, limit)
-            .await
+            .await?;
+        let given = self.rows.lock().unwrap();
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match given.get(&row.position) {
+                Some(instead) => instead.clone(),
+                None => Some(row),
+            })
+            .collect())
     }
     async fn unshipped(
         &self,

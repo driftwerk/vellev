@@ -65,10 +65,22 @@ use vellev_storage::format::{decode_head, Head as Stored};
 use common::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use vellev_storage::blobs::Created;
-use vellev_storage::coordinator::ShipBase;
+use vellev_storage::chain;
+use vellev_storage::coordinator::{ClusterId, Lineage, ShipBase};
+use vellev_storage::link::{self, Head as Shipped, Header, Sum, Timeline};
+use vellev_storage::shipper::{self, Shipper, Stall};
 use vellev_storage::{Batch, Embedded, Live, Merging, Outcome, Transfers};
 
 const COLLECTION: &str = "sim";
+
+/// The most bytes the backup store of a shipping history creates a file
+/// of: so that some frames go inline and some spill, a large write's log
+/// among them, and every link's header fits.
+const SPILL_ABOVE: usize = 4096;
+
+/// The lineage and the cluster the partition's history is shipped as.
+const LINEAGE: Lineage = Lineage(uuid::Uuid::from_u128(0x6681));
+const CLUSTER: ClusterId = ClusterId(uuid::Uuid::from_u128(0x6682));
 
 /// The id of the `n`th row written: spread over the id space, so that
 /// id order is not write order.
@@ -95,6 +107,9 @@ enum PutFault {
     LandThenFail,
     /// The writer sees an error and the file arrives later.
     Delay,
+    /// Nothing goes wrong with this one: so that a fault queued after it
+    /// falls on the request after it, as between a spill and its link.
+    Pass,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,6 +161,29 @@ enum Canary {
     /// whose delete was given up and is yet to land, and must be shown to
     /// be, so that what it notes cannot be made less unseen.
     NotesDeletesOnlyMade,
+    /// The backup store answers a link's create as made and keeps nothing
+    /// (DW-668).
+    DropsLinks,
+    /// The backup store answers a checkpoint file's put as done, and lands
+    /// it only later, with the requests it has yet to make.
+    LandsFilesLate,
+    /// The coordinator notes a run shipped one position further than it
+    /// was told.
+    NotesShippedAhead,
+    /// The coordinator gives each commit row a time a microsecond later
+    /// than the commit was made at.
+    ShiftsCommitTimes,
+    /// The coordinator hides the shipping cap from a clean, and holds a
+    /// clean above it as recorded (DW-668 PR 6).
+    CapIgnored,
+    /// The backup store answers a spilled frame's put as done, and lands
+    /// it only later, with the requests it has yet to make: after the
+    /// link that names it (DW-668, S3).
+    SpillAfterLink,
+    /// The coordinator takes a run's note or stall whatever base it names
+    /// and whatever it saw the run shipped to, as the run under way's: a
+    /// stale run is not fenced (DW-668, S5).
+    StaleRunWrites,
 }
 
 #[derive(Debug, Default)]
@@ -374,7 +412,7 @@ impl Blobs for SimBlobs {
         }
         let fault = self.faults.lock().unwrap().puts.pop_front();
         let put = match fault {
-            None => self.land(key, bytes).await,
+            None | Some(PutFault::Pass) => self.land(key, bytes).await,
             Some(PutFault::Refuse) => Err(lost()),
             Some(PutFault::LandThenFail) => self.land(key, bytes).await.and(Err(lost())),
             Some(PutFault::Delay) => {
@@ -507,6 +545,7 @@ struct BackupBlobs {
     /// was under way and failed since, as `put_new`'s callers are told to
     /// expect.
     falsely_there: AtomicUsize,
+    canary: Option<Canary>,
 }
 
 impl BackupBlobs {
@@ -526,6 +565,15 @@ impl BackupBlobs {
             rewritten: Mutex::default(),
             landings: Mutex::default(),
             falsely_there: AtomicUsize::new(0),
+            canary: None,
+        }
+    }
+
+    /// As [`Self::new`], broken as `canary` says, if it is a backup store's.
+    fn broken(part_bytes: usize, canary: Option<Canary>) -> Self {
+        Self {
+            canary,
+            ..Self::new(part_bytes)
         }
     }
 
@@ -577,9 +625,18 @@ impl Blobs for BackupBlobs {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
         tokio::task::yield_now().await;
         self.reached()?;
+        let late = match self.canary {
+            Some(Canary::LandsFilesLate) => key.contains("/files/"),
+            Some(Canary::SpillAfterLink) => key.contains("/frames/"),
+            _ => false,
+        };
+        if late {
+            (self.delayed.lock().unwrap()).push((key.to_string(), bytes, false));
+            return Ok(());
+        }
         let fault = self.faults.lock().unwrap().pop_front();
         match fault {
-            None => {
+            None | Some(PutFault::Pass) => {
                 self.clean.put(key, bytes.clone()).await?;
                 self.landed(key, &bytes);
                 Ok(())
@@ -611,6 +668,9 @@ impl Blobs for BackupBlobs {
         if falsely.is_ok() {
             return Ok(Created::AlreadyThere);
         }
+        if self.canary == Some(Canary::DropsLinks) && key.contains("/links/") {
+            return Ok(Created::Written);
+        }
         let fault = self.faults.lock().unwrap().pop_front();
         match fault {
             Some(PutFault::Refuse) => Err(lost()),
@@ -618,7 +678,7 @@ impl Blobs for BackupBlobs {
                 (self.delayed.lock().unwrap()).push((key.to_string(), bytes, true));
                 Err(lost())
             }
-            None | Some(PutFault::LandThenFail) => {
+            None | Some(PutFault::Pass) | Some(PutFault::LandThenFail) => {
                 let created = self.clean.put_new(key, bytes.clone()).await?;
                 if created == Created::Written {
                     self.landed(key, &bytes);
@@ -646,6 +706,17 @@ impl Blobs for BackupBlobs {
         self.put(key, Bytes::from(parts.concat())).await
     }
 
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> vellev_storage::Result<Vec<Listed>> {
+        tokio::task::yield_now().await;
+        self.reached()?;
+        self.clean.list_from(prefix, after, limit).await
+    }
+
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         tokio::task::yield_now().await;
         self.reached()?;
@@ -665,6 +736,330 @@ impl Blobs for BackupBlobs {
         tokio::task::yield_now().await;
         self.reached()?;
         self.clean.delete(key).await
+    }
+}
+
+/// The coordinator as a node that lost its hold last saw shipping: its
+/// record as it was when the node lost it, while every write, and every
+/// other reading, goes to the coordinator itself, so that the fences on
+/// the run's record decide what a stale run may do (DW-668, S5).
+#[derive(Debug)]
+struct StaleView {
+    inner: Arc<SimCoordinator>,
+    seen: vellev_storage::coordinator::Shipping,
+}
+
+#[async_trait]
+impl Coordinator for StaleView {
+    async fn register(&self, key: &PartitionKey) -> Result<(), CoordinatorError> {
+        self.inner.register(key).await
+    }
+    async fn remove(&self, key: &PartitionKey) -> Result<bool, CoordinatorError> {
+        self.inner.remove(key).await
+    }
+    async fn acquire(
+        &self,
+        key: &PartitionKey,
+        holder: &NodeId,
+        ttl: Duration,
+    ) -> Result<Acquired, CoordinatorError> {
+        self.inner.acquire(key, holder, ttl).await
+    }
+    async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease, CoordinatorError> {
+        self.inner.renew(lease, ttl).await
+    }
+    async fn release(&self, lease: &Lease) -> Result<(), CoordinatorError> {
+        self.inner.release(lease).await
+    }
+    async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed, CoordinatorError> {
+        self.inner.commit(lease, commit).await
+    }
+    async fn committed(&self, key: &PartitionKey) -> Result<Option<Committed>, CoordinatorError> {
+        self.inner.committed(key).await
+    }
+    async fn cleaned(
+        &self,
+        key: &PartitionKey,
+    ) -> Result<Option<vellev_storage::coordinator::Cleaned>, CoordinatorError> {
+        self.inner.cleaned(key).await
+    }
+    async fn clean_below(
+        &self,
+        lease: &Lease,
+        base: &vellev_storage::coordinator::ManifestRef,
+        position: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Cleaned, CoordinatorError> {
+        self.inner.clean_below(lease, base, position).await
+    }
+    async fn shipping(
+        &self,
+        _key: &PartitionKey,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        Ok(self.seen.clone())
+    }
+    async fn hold_for_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.hold_for_shipping(key, incarnation, cap).await
+    }
+    async fn record_base(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: &vellev_storage::coordinator::ShipBase,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.record_base(key, incarnation, base).await
+    }
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner.raise_ship_cap(key, incarnation, base, cap).await
+    }
+    async fn note_shipped(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        position: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner
+            .note_shipped(key, incarnation, base, position)
+            .await
+    }
+    async fn stall_shipping(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        through: Option<vellev_storage::coordinator::LogPosition>,
+        reason: &str,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.inner
+            .stall_shipping(key, incarnation, base, seen, through, reason)
+            .await
+    }
+    async fn commits_after(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        after: vellev_storage::coordinator::LogPosition,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        self.inner
+            .commits_after(key, incarnation, after, limit)
+            .await
+    }
+    async fn unshipped(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::Unshipped>, CoordinatorError> {
+        self.inner.unshipped(after, limit).await
+    }
+    async fn partitions(
+        &self,
+        after: Option<&PartitionKey>,
+        limit: usize,
+    ) -> Result<Vec<PartitionKey>, CoordinatorError> {
+        self.inner.partitions(after, limit).await
+    }
+    async fn ping(&self) -> Result<(), CoordinatorError> {
+        self.inner.ping().await
+    }
+    async fn announce(&self, node: &NodeId, versions: Versions) -> Result<u16, CoordinatorError> {
+        self.inner.announce(node, versions).await
+    }
+    async fn depart(&self, node: &NodeId) -> Result<(), CoordinatorError> {
+        self.inner.depart(node).await
+    }
+    async fn oldest(&self) -> Result<Option<Versions>, CoordinatorError> {
+        self.inner.oldest().await
+    }
+    async fn format(&self) -> Result<u16, CoordinatorError> {
+        self.inner.format().await
+    }
+    async fn raise_format(&self, format: u16) -> Result<u16, CoordinatorError> {
+        self.inner.raise_format(format).await
+    }
+    async fn issue_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+        hash: &KeyHash,
+    ) -> Result<Option<TenantKey>, CoordinatorError> {
+        self.inner.issue_key(tenant, id, hash).await
+    }
+    async fn keys(&self, tenant: &TenantId) -> Result<Vec<TenantKey>, CoordinatorError> {
+        self.inner.keys(tenant).await
+    }
+    async fn revoke_key(
+        &self,
+        tenant: &TenantId,
+        id: uuid::Uuid,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.revoke_key(tenant, id).await
+    }
+    async fn key_tenant(&self, hash: &KeyHash) -> Result<Option<TenantId>, CoordinatorError> {
+        self.inner.key_tenant(hash).await
+    }
+    async fn restore_point(
+        &self,
+        key: &PartitionKey,
+        point: Point,
+        window: Duration,
+    ) -> Result<Option<RestorePoint>, CoordinatorError> {
+        self.inner.restore_point(key, point, window).await
+    }
+    async fn restore_points(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<Option<(RestorePoint, RestorePoint)>, CoordinatorError> {
+        self.inner.restore_points(key, window).await
+    }
+    async fn forget_history(
+        &self,
+        key: &PartitionKey,
+        window: Duration,
+    ) -> Result<u64, CoordinatorError> {
+        self.inner.forget_history(key, window).await
+    }
+    async fn restored(
+        &self,
+        key: &PartitionKey,
+        request: RequestId,
+    ) -> Result<Option<Restored>, CoordinatorError> {
+        self.inner.restored(key, request).await
+    }
+    async fn forget_removed(
+        &self,
+        key: &PartitionKey,
+        after: Option<Forgotten>,
+        limit: usize,
+    ) -> Result<Option<Forgotten>, CoordinatorError> {
+        self.inner.forget_removed(key, after, limit).await
+    }
+    async fn forget_restores(&self) -> Result<u64, CoordinatorError> {
+        self.inner.forget_restores().await
+    }
+    async fn restore_window(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Duration>, CoordinatorError> {
+        self.inner.restore_window(tenant).await
+    }
+    async fn purges(
+        &self,
+        due: Duration,
+        lately: Duration,
+    ) -> Result<vellev_storage::coordinator::Purges, CoordinatorError> {
+        self.inner.purges(due, lately).await
+    }
+    async fn identity(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<vellev_storage::coordinator::Identity>, CoordinatorError> {
+        self.inner.identity(tenant).await
+    }
+    async fn cluster(&self) -> Result<vellev_storage::coordinator::ClusterId, CoordinatorError> {
+        self.inner.cluster().await
+    }
+    async fn adopt_on_commit(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+        adoption: &vellev_storage::coordinator::Adoption,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.adopt_on_commit(key, generation, adoption).await
+    }
+    async fn adopt_no_more(
+        &self,
+        key: &PartitionKey,
+        generation: vellev_storage::coordinator::Generation,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.adopt_no_more(key, generation).await
+    }
+    async fn claim_purge(
+        &self,
+        tenant: &TenantId,
+        due: Duration,
+        hold: Duration,
+    ) -> Result<Option<vellev_storage::coordinator::PurgeClaim>, CoordinatorError> {
+        self.inner.claim_purge(tenant, due, hold).await
+    }
+    async fn renew_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        hold: Duration,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.renew_purge(tenant, claim, hold).await
+    }
+    async fn release_purge(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.release_purge(tenant, claim).await
+    }
+    async fn look_overs(
+        &self,
+        lately: Duration,
+        every: Duration,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::Removed>, CoordinatorError> {
+        self.inner.look_overs(lately, every, limit).await
+    }
+    async fn purged(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        forget_after: Duration,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.purged(tenant, claim, forget_after).await
+    }
+    async fn reopen_purge(&self, tenant: &TenantId) -> Result<bool, CoordinatorError> {
+        self.inner.reopen_purge(tenant).await
+    }
+    async fn claim_backup(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        due: Option<Duration>,
+        hold: Duration,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.claim_backup(tenant, claim, due, hold).await
+    }
+    async fn renew_backup(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        hold: Duration,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.renew_backup(tenant, claim, hold).await
+    }
+    async fn release_backup(
+        &self,
+        tenant: &TenantId,
+        claim: uuid::Uuid,
+        made: bool,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.release_backup(tenant, claim, made).await
+    }
+    async fn set_restore_window(
+        &self,
+        tenant: &TenantId,
+        window: Option<Duration>,
+    ) -> Result<bool, CoordinatorError> {
+        self.inner.set_restore_window(tenant, window).await
     }
 }
 
@@ -707,9 +1102,36 @@ struct SimCoordinator {
     /// of what it holds, if anything: one put back from earlier, or one of
     /// no checkpoint of this chain.
     answering: Mutex<Option<Option<Cleaned>>>,
+    /// With [`Canary::CapIgnored`], the clean the coordinator holds as
+    /// recorded above the shipping cap, which the wrapped one refused.
+    above_cap: Mutex<Option<Cleaned>>,
 }
 
 impl SimCoordinator {
+    /// The record of what cleans deleted below, as held: the wrapped
+    /// coordinator's, or, with the canary, a clean held above the cap
+    /// when that is higher.
+    async fn held(&self, key: &PartitionKey) -> Result<Option<Cleaned>, CoordinatorError> {
+        let made = self.clean.cleaned(key).await?;
+        let above = self.above_cap.lock().unwrap().clone();
+        Ok(match (made, above) {
+            (Some(made), Some(above)) if above.position > made.position => Some(above),
+            (None, Some(above)) => Some(above),
+            (made, _) => made,
+        })
+    }
+
+    /// The base a note or a stall of shipping is taken for: the one it
+    /// names, or, with the canary, the run under way's.
+    async fn unfenced(&self, key: &PartitionKey, base: LogPosition) -> LogPosition {
+        if self.canary != Some(Canary::StaleRunWrites) {
+            return base;
+        }
+        let shipping = self.clean.shipping(key).await.ok();
+        let under_way = shipping.and_then(|shipping| shipping.base);
+        under_way.map_or(base, |under_way| under_way.position)
+    }
+
     /// How many of the heads recorded are logs, as every write's is and no
     /// checkpoint's.
     fn logs(&self) -> usize {
@@ -815,7 +1237,7 @@ impl Coordinator for SimCoordinator {
         if let Some(answering) = answering {
             return Ok(answering);
         }
-        self.clean.cleaned(key).await
+        self.held(key).await
     }
     async fn clean_below(
         &self,
@@ -839,7 +1261,23 @@ impl Coordinator for SimCoordinator {
             self.records.lock().unwrap().push((asked, false));
             return Err(reset());
         }
-        let made = self.clean.clean_below(lease, base, position).await;
+        let made = match self.clean.clean_below(lease, base, position).await {
+            // The cap ignored: the clean is held as recorded, as later
+            // reads and cleans see it, as if H were not there.
+            Err(CoordinatorError::CleanAboveCap { .. })
+                if self.canary == Some(Canary::CapIgnored) =>
+            {
+                let mut above = self.above_cap.lock().unwrap();
+                match &*above {
+                    Some(held) if held.position >= position => Ok(held.clone()),
+                    _ => {
+                        *above = Some(asked.clone());
+                        Ok(asked.clone())
+                    }
+                }
+            }
+            made => made,
+        };
         self.records.lock().unwrap().push((asked, made.is_ok()));
         if let Ok(made) = &made {
             *self.record.lock().unwrap() = Some(made.position.0);
@@ -853,7 +1291,14 @@ impl Coordinator for SimCoordinator {
         &self,
         key: &PartitionKey,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
-        self.clean.shipping(key).await
+        let shipping = self.clean.shipping(key).await?;
+        Ok(match self.canary {
+            Some(Canary::CapIgnored) => vellev_storage::coordinator::Shipping {
+                cap: None,
+                ..shipping
+            },
+            _ => shipping,
+        })
     }
     async fn hold_for_shipping(
         &self,
@@ -871,6 +1316,15 @@ impl Coordinator for SimCoordinator {
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
         self.clean.record_base(key, incarnation, base).await
     }
+    async fn raise_ship_cap(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        cap: vellev_storage::coordinator::LogPosition,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        self.clean.raise_ship_cap(key, incarnation, base, cap).await
+    }
     async fn note_shipped(
         &self,
         key: &PartitionKey,
@@ -878,6 +1332,11 @@ impl Coordinator for SimCoordinator {
         base: vellev_storage::coordinator::LogPosition,
         position: vellev_storage::coordinator::LogPosition,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        let position = match self.canary {
+            Some(Canary::NotesShippedAhead) => LogPosition(position.0 + 1),
+            _ => position,
+        };
+        let base = self.unfenced(key, base).await;
         self.clean
             .note_shipped(key, incarnation, base, position)
             .await
@@ -887,10 +1346,21 @@ impl Coordinator for SimCoordinator {
         key: &PartitionKey,
         incarnation: vellev_storage::coordinator::Incarnation,
         base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        through: Option<vellev_storage::coordinator::LogPosition>,
         reason: &str,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        let base = self.unfenced(key, base).await;
+        // Unfenced, a stale run's stall is taken whatever it saw, too.
+        let seen = match self.canary {
+            Some(Canary::StaleRunWrites) => {
+                let shipping = self.clean.shipping(key).await?;
+                shipping.shipped
+            }
+            _ => seen,
+        };
         self.clean
-            .stall_shipping(key, incarnation, base, reason)
+            .stall_shipping(key, incarnation, base, seen, through, reason)
             .await
     }
     async fn commits_after(
@@ -900,9 +1370,16 @@ impl Coordinator for SimCoordinator {
         after: vellev_storage::coordinator::LogPosition,
         limit: usize,
     ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
-        self.clean
+        let mut rows = self
+            .clean
             .commits_after(key, incarnation, after, limit)
-            .await
+            .await?;
+        if self.canary == Some(Canary::ShiftsCommitTimes) {
+            for row in &mut rows {
+                row.at += chrono::Duration::microseconds(1);
+            }
+        }
+        Ok(rows)
     }
     async fn unshipped(
         &self,
@@ -1266,6 +1743,16 @@ enum Action {
     /// The backup store answers so many creates `AlreadyThere`, with
     /// nothing there.
     BackupFalselyThere(usize),
+    /// A batch of up to so many commits is shipped to the backup store
+    /// (DW-668, S2).
+    Ship(usize),
+    /// A batch of up to so many is shipped by the node the partition was
+    /// last taken over from, as it last saw the run (DW-668, S5).
+    ShipStale(usize),
+    /// The backup store is one that creates files of so many bytes at
+    /// most, in place of the one there: taken before anything is shipped,
+    /// so that frames spill (DW-668, S3).
+    BackupCreatesAtMost(usize),
     /// Shipping of the partition begins, as bootstrap begins it: the hold
     /// is taken, and then a base recorded at the newest checkpoint whose
     /// row at its base is there, through the coordinator's own calls.
@@ -1597,6 +2084,16 @@ struct World {
     /// The store continuous backup ships to, and the base shipping began
     /// from, if it has.
     backup: Arc<BackupBlobs>,
+    /// Every stall a batch of shipping met.
+    stalls: Vec<Stall>,
+    /// Every base a run of shipping was recorded at.
+    bases: BTreeSet<LogPosition>,
+    /// The shipper of the node holding the partition, and of the one it
+    /// was last taken over from.
+    node_shipper: Option<Shipper>,
+    stale_shipper: Option<Shipper>,
+    /// Every link seen in the backup store, by incarnation and position.
+    linked: BTreeSet<(Incarnation, LogPosition)>,
     shipping_from: Option<ShipBase>,
     step: usize,
     made: Made,
@@ -1724,6 +2221,23 @@ struct Made {
     /// a delete given up was yet to land.
     sourced: usize,
     sourced_under: usize,
+    /// Batches that shipped something, batches that failed and runs
+    /// stalled (DW-668).
+    shipped: usize,
+    ship_failed: usize,
+    stalled: usize,
+    /// Checkpoint links checked with their files, counted at every step,
+    /// and steps at which a watermark was checked against the links there.
+    shipped_checkpoints: usize,
+    watermarks: usize,
+    /// Links seen in the backup store, inline and spilled.
+    inlined: usize,
+    spilled: usize,
+    /// Of the links spilled, those of logs, streamed as they came.
+    spilled_logs: usize,
+    /// Batches a stale shipper shipped something in, and those that failed.
+    stale_shipped: usize,
+    stale_failed: usize,
 }
 
 impl Made {
@@ -1754,6 +2268,16 @@ impl Made {
             edge_ahead: self.edge_ahead + other.edge_ahead,
             sourced: self.sourced + other.sourced,
             sourced_under: self.sourced_under + other.sourced_under,
+            shipped: self.shipped + other.shipped,
+            ship_failed: self.ship_failed + other.ship_failed,
+            stalled: self.stalled + other.stalled,
+            shipped_checkpoints: self.shipped_checkpoints + other.shipped_checkpoints,
+            watermarks: self.watermarks + other.watermarks,
+            inlined: self.inlined + other.inlined,
+            spilled: self.spilled + other.spilled,
+            spilled_logs: self.spilled_logs + other.spilled_logs,
+            stale_shipped: self.stale_shipped + other.stale_shipped,
+            stale_failed: self.stale_failed + other.stale_failed,
         }
     }
 }
@@ -1829,6 +2353,7 @@ impl World {
             record: record.clone(),
             records: Mutex::default(),
             answering: Mutex::default(),
+            above_cap: Mutex::default(),
         });
         let blobs = Arc::new(SimBlobs {
             clean: cluster.blobs.clone(),
@@ -1911,8 +2436,13 @@ impl World {
             snapshots: Vec::new(),
             sourced: BTreeSet::new(),
             from_source: None,
-            backup: Arc::new(BackupBlobs::new(Transfers::default().part_bytes)),
+            backup: Arc::new(BackupBlobs::broken(Transfers::default().part_bytes, canary)),
             shipping_from: None,
+            stalls: Vec::new(),
+            bases: BTreeSet::new(),
+            node_shipper: None,
+            stale_shipper: None,
+            linked: BTreeSet::new(),
             step: 0,
             made: Made::default(),
         };
@@ -1957,6 +2487,8 @@ impl World {
                 checkpoint_at: at,
             };
             if let Ok(shipping) = self.coordinator.record_base(&key, incarnation, &base).await {
+                self.bases
+                    .extend(shipping.base.as_ref().map(|base| base.position));
                 self.shipping_from = shipping.base;
                 return;
             }
@@ -1993,9 +2525,308 @@ impl World {
         Some((checkpoints, held))
     }
 
+    /// The shipper of the partition, from the primary store to the backup
+    /// store, as a node would make it for each batch.
+    /// The shipper of the node holding the partition, kept from batch to
+    /// batch as a node keeps it, and made anew when another node takes the
+    /// partition over or the backup store is replaced.
+    fn shipper(&mut self) -> Shipper {
+        let (blobs, backup) = (self.blobs.clone(), self.backup.clone());
+        let (coordinator, key) = (self.coordinator.clone(), self.cluster.key.clone());
+        let made = || Shipper::new(blobs, backup, coordinator, key, LINEAGE, CLUSTER);
+        self.node_shipper.get_or_insert_with(made).clone()
+    }
+
+    /// A batch of up to `limit` commits shipped by the node the partition
+    /// was taken over from, as it last saw the run: what its fences let it
+    /// do is all it does. Whatever it meets is its own, not the run's.
+    async fn ship_stale(&mut self, limit: usize) {
+        let Some(stale) = self.stale_shipper.clone() else {
+            return;
+        };
+        let incarnation = self.cluster.committed().await.incarnation;
+        match stale.ship_batch(incarnation, limit).await {
+            Ok(shipper::Batch::Shipped {
+                through: Some(_), ..
+            }) => self.made.stale_shipped += 1,
+            Ok(_) => {}
+            Err(_) => self.made.stale_failed += 1,
+        }
+    }
+
+    /// Ship a batch of up to `limit` commits. A batch that fails is the
+    /// node's scheduler's to try again, and the next one does.
+    async fn ship(&mut self, limit: usize) {
+        let incarnation = self.cluster.committed().await.incarnation;
+        match self.shipper().ship_batch(incarnation, limit).await {
+            Ok(shipper::Batch::Idle(_)) => {}
+            Ok(shipper::Batch::Shipped { through, stalled }) => {
+                if through.is_some() {
+                    self.made.shipped += 1;
+                }
+                if let Some(stall) = stalled {
+                    self.made.stalled += 1;
+                    self.stalls.push(stall);
+                }
+            }
+            // This node's own store refusing: never, in a world whose
+            // store takes every link it is given.
+            Ok(shipper::Batch::Stopped { why, .. }) => {
+                self.made.stalled += 1;
+                self.stalls.push(why);
+            }
+            Err(_) => self.made.ship_failed += 1,
+        }
+    }
+
+    /// Every checkpoint the run has yet to ship, by the commit rows above
+    /// its watermark (or from its base), is in the primary with every file
+    /// it lists: a clean is held below them by the cap (DW-668 PR 6).
+    async fn unshipped_kept(&self, shipping: &vellev_storage::coordinator::Shipping) -> Violation {
+        let Some(base) = &shipping.base else {
+            return Ok(());
+        };
+        let after = shipping
+            .shipped
+            .unwrap_or(LogPosition(base.position.0.saturating_sub(1)));
+        let key = &self.cluster.key;
+        let rows = self
+            .coordinator
+            .clean
+            .commits_after(key, shipping.incarnation, after, 10_000)
+            .await
+            .unwrap_or_default();
+        for row in rows.iter().filter(|row| row.head.0.ends_with(".manifest")) {
+            let head = &row.head.0;
+            let frame = self.blobs.shadow.lock().unwrap().get(head).cloned();
+            let Some(Ok(Stored::Manifest(manifest))) = frame.map(|frame| decode_head(head, &frame))
+            else {
+                continue;
+            };
+            let mut needed = vec![head.clone()];
+            for segment in &manifest.segments {
+                needed.push(segment.key.clone());
+                needed.extend(segment.index.clone());
+                needed.extend(segment.vectors.clone());
+            }
+            needed.extend(manifest.replay.iter().cloned());
+            for file in needed {
+                let gone = matches!(
+                    self.blobs.clean.get(&file).await,
+                    Err(StorageError::Missing { .. })
+                );
+                check(!gone, || {
+                    format!("PR 6: {file}, of the checkpoint at {:?} yet to be shipped, is gone from the primary", row.position)
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What the backup store holds of the partition's run of shipping, as
+    /// committed (DW-668):
+    ///
+    /// - I1: every link is of a commit the coordinator recorded, at its
+    ///   position, at its time, its frame the head's bytes;
+    /// - every log's link is made on the commit just before it;
+    /// - I3: every checkpoint's link has its files there, with their sums;
+    /// - I4: the run's watermark is never ahead of the links there:
+    ///   restoring it needs nothing the store lacks;
+    /// - a run stalls only where the primary has lost what it was to ship,
+    ///   as a clean may make it until the clean floor (PR 6) is built.
+    async fn shipped_as_committed(&mut self) -> Violation {
+        // No run stalls with nothing broken: not even for a file gone from
+        // the primary, which a clean held to the cap never takes (PR 6).
+        let stalled = &self.stalls;
+        check(stalled.is_empty(), || {
+            format!("the run stalled with nothing broken: {stalled:?}")
+        })?;
+        let key = self.cluster.key.clone();
+        let Ok(shipping) = self.coordinator.clean.shipping(&key).await else {
+            return Ok(());
+        };
+        // What an operator sees: the run's own record never stalled with
+        // nothing broken, for a file gone from the primary least of all,
+        // which a clean held to the cap never takes (PR 6).
+        let recorded = shipping.stalled.as_deref();
+        check(recorded.is_none(), || {
+            format!("the run's record is stalled with nothing broken: {recorded:?}")
+        })?;
+        self.unshipped_kept(&shipping).await?;
+        let timeline = Timeline {
+            tenant: key.tenant.clone(),
+            lineage: LINEAGE,
+            cluster: CLUSTER,
+            incarnation: shipping.incarnation,
+            partition: key.partition,
+        };
+        let store = &self.backup.clean;
+        let listed = store
+            .list(&format!("{}links/", timeline.prefix()))
+            .await
+            .unwrap();
+        let heads = self.coordinator.heads.lock().unwrap().clone();
+        let mut links: BTreeMap<LogPosition, (Header, Option<Bytes>)> = BTreeMap::new();
+        for file in listed {
+            let bytes = store.get(&file.key).await.unwrap();
+            let link = link::decode(&file.key, &bytes)
+                .map_err(|error| format!("a link does not hold together: {error}"))?;
+            let header = link.header;
+            let recorded = heads.iter().any(|head| {
+                head.position == header.position
+                    && head.key.0 == header.key
+                    && head.at == header.committed_at
+            });
+            check(recorded, || {
+                format!(
+                    "I1: the link at {:?} is of no commit recorded: {} at {}",
+                    header.position, header.key, header.committed_at
+                )
+            })?;
+            // A spilled frame is there before its link, as summed (I3).
+            let carried = match header.body {
+                link::Body::Inline => link.frame,
+                link::Body::Spilled => {
+                    let spilled = store.get(&timeline.frame(&header.key)).await.ok();
+                    let summed = spilled.as_ref().is_some_and(|spilled| {
+                        spilled.len() as u64 == header.size && Sum::of(spilled) == header.sum
+                    });
+                    check(summed, || {
+                        format!(
+                            "I3: the spilled link at {:?} is there without its frame as summed",
+                            header.position
+                        )
+                    })?;
+                    spilled
+                }
+            };
+            if self.linked.insert((shipping.incarnation, header.position)) {
+                match header.body {
+                    link::Body::Inline => self.made.inlined += 1,
+                    link::Body::Spilled => {
+                        self.made.spilled += 1;
+                        if header.head == Shipped::Log {
+                            self.made.spilled_logs += 1;
+                        }
+                    }
+                }
+            }
+            let frame = self.blobs.shadow.lock().unwrap().get(&header.key).cloned();
+            check(frame.is_some() && carried == frame, || {
+                format!(
+                    "I1: the link at {:?} carries other bytes than {}",
+                    header.position, header.key
+                )
+            })?;
+            if header.head == Shipped::Log {
+                let made_on = header.before.as_ref().map(|before| before.position);
+                let just_before = header.position.0.checked_sub(1).map(LogPosition);
+                check(made_on.is_none() || made_on == just_before, || {
+                    format!(
+                        "the log's link at {:?} is made on {made_on:?}",
+                        header.position
+                    )
+                })?;
+            }
+            for needed in &header.files {
+                let copy = store.get(&timeline.file(&needed.key)).await.ok();
+                let summed = copy.as_ref().is_some_and(|copy| {
+                    copy.len() as u64 == needed.size && Sum::of(copy) == needed.sum
+                });
+                check(summed, || {
+                    format!(
+                        "I3: the checkpoint's link at {:?} is there without {} as summed",
+                        header.position, needed.key
+                    )
+                })?;
+            }
+            if !header.files.is_empty() {
+                self.made.shipped_checkpoints += 1;
+            }
+            links.insert(header.position, (header, carried));
+        }
+        // Every link is made on the commit recorded just before it, as
+        // its link has it: positions skip at a restore, and `before` with
+        // them.
+        for (at, (header, _)) in &links {
+            let Some(before) = &header.before else {
+                // Made on nothing: only a run's base is.
+                check(self.bases.contains(at), || {
+                    format!("the link at {at:?} is made on nothing, and no run's base is there")
+                })?;
+                continue;
+            };
+            let just_before = (heads.iter())
+                .map(|head| head.position)
+                .filter(|position| position < at)
+                .max();
+            let summed = links
+                .get(&before.position)
+                .is_some_and(|(earlier, _)| earlier.sum == before.sum);
+            check(Some(before.position) == just_before && summed, || {
+                format!(
+                    "the link at {at:?} is made on {:?}, and the commit just before it is {just_before:?}",
+                    before.position
+                )
+            })?;
+        }
+        let (Some(watermark), Some(base)) = (shipping.shipped, shipping.base) else {
+            return Ok(());
+        };
+        self.made.watermarks += 1;
+        // Every commit from the base up to the watermark is linked.
+        let unlinked: Vec<_> = (heads.iter())
+            .map(|head| head.position)
+            .filter(|at| (base.position..=watermark).contains(at) && !links.contains_key(at))
+            .collect();
+        check(unlinked.is_empty(), || {
+            format!(
+                "I4: the run is noted shipped to {watermark:?}, and {unlinked:?} are not linked"
+            )
+        })?;
+        // Below its checkpoint, a base's logs are only the checkpoint's to
+        // replay: no restore goes to one.
+        if watermark < base.checkpoint_at {
+            return Ok(());
+        }
+        let headers: BTreeMap<_, _> = (links.iter())
+            .map(|(at, (header, _))| (*at, header.clone()))
+            .collect();
+        let restorable = chain::checkpoint_for(&headers, watermark).and_then(|checkpoint| {
+            let manifest = checkpoint.and_then(|checkpoint| {
+                let frame = links[&checkpoint.position].1.as_ref()?;
+                match decode_head(&checkpoint.key, frame) {
+                    Ok(Stored::Manifest(manifest)) => Some(manifest),
+                    _ => None,
+                }
+            });
+            chain::needed(&headers, watermark, manifest.as_ref())
+        });
+        check(restorable.is_ok(), || {
+            format!("I4: the run is noted shipped to {watermark:?}, and the links there do not restore it: {restorable:?}")
+        })
+    }
+
     /// The lease expires and a new node takes it; every earlier writer is
     /// now a zombie, whether or not the new one manages to open.
     async fn take_over(&mut self) {
+        // The node taken over from goes on shipping as it last saw the run,
+        // until it finds it has lost its hold; the new one ships afresh.
+        if let Ok(seen) = self.coordinator.clean.shipping(&self.cluster.key).await {
+            let view = StaleView {
+                inner: self.coordinator.clone(),
+                seen,
+            };
+            self.stale_shipper = Some(Shipper::new(
+                self.blobs.clone(),
+                self.backup.clone(),
+                Arc::new(view),
+                self.cluster.key.clone(),
+                LINEAGE,
+                CLUSTER,
+            ));
+        }
+        self.node_shipper = None;
         // Waiting out the lease moves the coordinator's clock, and the
         // others go with it, each as far from it as before.
         let before = self.cluster.clock.now();
@@ -2976,7 +3807,20 @@ impl World {
                 let forgot = self.coordinator.forget_history(key, REACH).await;
                 let forgot = forgot.map_err(|error| format!("nothing was forgotten: {error}"))?;
                 self.listed().await?;
-                let passed = self.in_reach() - self.forgotten;
+                // Shipping keeps its rows from its floor up (#81): only
+                // those out of reach below it are forgotten.
+                let shipping = self.coordinator.clean.shipping(key).await;
+                let floor = shipping.ok().and_then(|shipping| {
+                    let shipped = shipping.shipped.map(|at| LogPosition(at.0 + 1));
+                    let base = shipping.base.map(|base| base.position);
+                    shipped.or(base).or(shipping.hold_from)
+                });
+                let kept_from = floor.map_or(usize::MAX, |floor| {
+                    self.heads
+                        .partition_point(|recorded| recorded.head.position < floor)
+                });
+                let forgettable = self.in_reach().min(kept_from).max(self.forgotten);
+                let passed = forgettable - self.forgotten;
                 self.forgotten += passed;
                 self.made.forgets += 1;
                 self.made.forgotten += forgot as usize;
@@ -2996,6 +3840,13 @@ impl World {
                 self.backup.down.fetch_add(requests, Ordering::SeqCst);
             }
             Action::DeliverDelayedBackup => self.backup.deliver_delayed().await,
+            Action::Ship(limit) => self.ship(limit).await,
+            Action::ShipStale(limit) => self.ship_stale(limit).await,
+            Action::BackupCreatesAtMost(bytes) => {
+                let canary = self.backup.canary;
+                self.backup = Arc::new(BackupBlobs::broken(bytes, canary));
+                self.node_shipper = None;
+            }
             Action::BackupFalselyThere(creates) => {
                 self.backup
                     .falsely_there
@@ -3534,6 +4385,7 @@ impl World {
         check(rewritten.is_empty(), || {
             format!("backup files were written again with other bytes: {rewritten:?}")
         })?;
+        self.shipped_as_committed().await?;
         let unfenced = self.coordinator.unfenced.lock().unwrap().clone();
         check(unfenced.is_empty(), || {
             format!("a superseded lease committed: {unfenced:?}")
@@ -3636,6 +4488,7 @@ async fn simulate(
     }
     world.faults.lock().unwrap().failing_gets = 0;
     world.blobs.deliver_delayed().await;
+    world.backup.deliver_delayed().await;
     let (held, took) = world.blobs.deliver_held_deletes().await;
     world.made.held += held;
     world.made.late += took;
@@ -3728,19 +4581,254 @@ proptest! {
     }
 }
 
+/// What shipping does (DW-668, S2), and what goes wrong with the backup
+/// store meanwhile.
+fn shipping_action() -> impl Strategy<Value = Action> {
+    let put_fault = prop_oneof![
+        Just(PutFault::Refuse),
+        Just(PutFault::LandThenFail),
+        Just(PutFault::Delay),
+        Just(PutFault::Pass)
+    ];
+    prop_oneof![
+        12 => (1..6usize).prop_map(Action::Ship),
+        6 => (1..6usize).prop_map(Action::ShipStale),
+        // Handovers, for stale shippers to ship around.
+        2 => Just(Action::Takeover),
+        // Writes large enough that their logs spill.
+        2 => (40..80u64).prop_map(|rows| Action::Write {
+            who: Who::Current,
+            rows,
+            delete: None,
+        }),
+        1 => Just(Action::BeginShipping),
+        1 => put_fault.prop_map(Action::FailBackupPut),
+        1 => (1..3usize).prop_map(Action::BackupDown),
+        1 => Just(Action::DeliverDelayedBackup),
+        1 => (1..3usize).prop_map(Action::BackupFalselyThere),
+    ]
+}
+
+/// A history of the partition with its commits shipped as they go: a
+/// write, shipping begun before any checkpoint, and then what the
+/// partition's histories do, with batches of shipping and faults of the
+/// backup store between. Apart from [`histories`], whose fixed seeds the
+/// canaries before shipping keep.
+fn shipping_histories() -> impl Strategy<Value = (Clocks, Vec<Action>)> {
+    let part = prop_oneof![3 => action(), 2 => shipping_action()];
+    let actions = prop::collection::vec(part, 1..60).prop_map(|actions| {
+        let mut history = vec![
+            Action::BackupCreatesAtMost(SPILL_ABOVE),
+            written(),
+            Action::BeginShipping,
+        ];
+        history.extend(actions);
+        history
+    });
+    let clocks =
+        (-3..=3i64, -AHEAD..=0).prop_map(|(coordinator, node)| Clocks { coordinator, node });
+    (clocks, actions)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn no_history_of_shipping_ships_what_was_not_committed_or_notes_more_than_is_there(
+        history in shipping_histories()
+    ) {
+        run_on(history, None).map_err(TestCaseError::fail)?;
+    }
+}
+
+/// A handover re-ships the base (bootstrap note F): the old node's
+/// create of the base's link was answered as failed and landed later, so
+/// nothing of the run was noted; the node that takes the partition over
+/// finds the link there, at the committed position or below it and so no
+/// sign of T8, and ships the base again as the same commit, and the run
+/// on from it.
+#[test]
+fn a_base_landed_after_its_node_gave_up_on_it_is_shipped_again_after_a_handover() {
+    paused().block_on(async {
+        let mut world = after(vec![written(), Action::BeginShipping, flushed(), written()]).await;
+        world.step(Action::BeginShipping).await.unwrap();
+        let key = world.cluster.key.clone();
+        let base = world
+            .coordinator
+            .shipping(&key)
+            .await
+            .unwrap()
+            .base
+            .expect("a base");
+        // Its files put, and then its link's create held and failed.
+        let frame = world.blobs.clean.get(&base.checkpoint.0).await.unwrap();
+        let Ok(Stored::Manifest(manifest)) = decode_head(&base.checkpoint.0, &frame) else {
+            panic!("a manifest")
+        };
+        let files: usize = (manifest.segments.iter())
+            .map(|segment| 1 + segment.index.iter().count() + segment.vectors.iter().count())
+            .sum();
+        for _ in 0..files {
+            world
+                .step(Action::FailBackupPut(PutFault::Pass))
+                .await
+                .unwrap();
+        }
+        for action in [
+            Action::FailBackupPut(PutFault::Delay),
+            Action::Ship(5),
+            Action::DeliverDelayedBackup,
+        ] {
+            world.step(action).await.unwrap();
+            world.verify().await.unwrap();
+        }
+        let shipping = world.coordinator.shipping(&key).await.unwrap();
+        assert_eq!(shipping.shipped, None);
+        assert_eq!(world.made.ship_failed, 1);
+        // Taken over; the new node ships the run from its base.
+        for action in [Action::Takeover, Action::Ship(5)] {
+            world.step(action).await.unwrap();
+            world.verify().await.unwrap();
+        }
+        let committed = world.cluster.committed().await.log_position;
+        let shipping = world.coordinator.shipping(&key).await.unwrap();
+        assert_eq!(
+            (shipping.shipped, shipping.stalled.clone()),
+            (Some(committed), None)
+        );
+        assert!(world.stalls.is_empty(), "{:?}", world.stalls);
+        // And the old node, shipping on as it last saw the run, changes
+        // nothing.
+        world.step(Action::ShipStale(5)).await.unwrap();
+        world.verify().await.unwrap();
+        let after = world.coordinator.shipping(&key).await.unwrap();
+        assert_eq!(after, shipping);
+    });
+}
+
+/// A spill is in the backup store before the link that names it, whatever
+/// fails between the two writes: a log's, streamed, and a checkpoint's,
+/// put from memory after its files. Each history makes the second write
+/// fail, so a link made first would be left naming nothing (amendment 1,
+/// A2).
+#[test]
+fn a_spill_is_there_before_its_link_whatever_fails_between_them() {
+    let fail_second = || {
+        vec![
+            Action::FailBackupPut(PutFault::Pass),
+            Action::FailBackupPut(PutFault::Refuse),
+        ]
+    };
+    // A large log, spilled a part at a time, after its base is shipped.
+    let log = [
+        vec![
+            Action::BackupCreatesAtMost(SPILL_ABOVE),
+            written(),
+            flushed(),
+            Action::BeginShipping,
+            Action::Ship(5),
+            Action::Write {
+                who: Who::Current,
+                rows: 60,
+                delete: None,
+            },
+        ],
+        fail_second(),
+        vec![Action::Ship(5), Action::Ship(5)],
+    ]
+    .concat();
+    let made = run(log, None).unwrap();
+    assert!(made.spilled_logs >= 1 && made.ship_failed >= 1, "{made:?}");
+    // A checkpoint in a store too small for it inline, spilled after its
+    // two files.
+    let checkpoint = [
+        vec![
+            Action::BackupCreatesAtMost(1200),
+            written(),
+            Action::BeginShipping,
+            flushed(),
+            Action::BeginShipping,
+            Action::FailBackupPut(PutFault::Pass),
+            Action::FailBackupPut(PutFault::Pass),
+        ],
+        fail_second(),
+        vec![Action::Ship(5), Action::Ship(5)],
+    ]
+    .concat();
+    let made = run(checkpoint, None).unwrap();
+    assert!(made.spilled >= 1 && made.ship_failed >= 1, "{made:?}");
+}
+
+/// The first violation reported with `canary` over a fixed set of
+/// shipping histories, which some history must meet.
+fn caught_shipping(canary: Canary) -> String {
+    let (violation, _) = first_violation_in(shipping_histories(), 200, Some(canary));
+    violation.unwrap_or_else(|| panic!("no history of shipping caught the canary {canary:?}"))
+}
+
+#[test]
+fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
+    let (violation, made) = first_violation_in(shipping_histories(), 200, None);
+    assert_eq!(violation, None);
+    // Shipping is done in earnest: commits and checkpoints shipped, the
+    // watermark checked, and batches failed by the store and tried again.
+    assert!(
+        made.shipped > 50 && made.shipped_checkpoints > 300 && made.watermarks > 300,
+        "{made:?}"
+    );
+    assert!(made.ship_failed > 30, "{made:?}");
+    // Frames go inline and spill both.
+    assert!(made.inlined > 120 && made.spilled > 25, "{made:?}");
+    assert!(made.spilled_logs > 10, "{made:?}");
+    // And nodes taken over from ship on as they last saw the run.
+    assert!(made.stale_shipped > 10 && made.stale_failed > 5, "{made:?}");
+
+    let dropped = caught_shipping(Canary::DropsLinks);
+    assert!(
+        dropped.contains("I4:") || dropped.contains("LinkMissing"),
+        "{dropped}"
+    );
+    let late = caught_shipping(Canary::LandsFilesLate);
+    assert!(late.contains("I3:"), "{late}");
+    let ahead = caught_shipping(Canary::NotesShippedAhead);
+    assert!(ahead.contains("I4:"), "{ahead}");
+    let capped = caught_shipping(Canary::CapIgnored);
+    // Caught as a file of a checkpoint yet to ship gone from the primary.
+    // Only the invariant itself: a shipper stalling on PrimaryMissing is
+    // the damage shown later, and would pass with the invariant untested.
+    assert!(capped.contains("PR 6:"), "{capped}");
+    let shifted = caught_shipping(Canary::ShiftsCommitTimes);
+    assert!(shifted.contains("I1:"), "{shifted}");
+    // A stale run unfenced stalls the run under way, as the fork it meets
+    // at the new run's base is taken for the new run's.
+    let stale = caught_shipping(Canary::StaleRunWrites);
+    assert!(stale.contains("the run's record is stalled"), "{stale}");
+    let spilled = caught_shipping(Canary::SpillAfterLink);
+    assert!(spilled.contains("I3: the spilled link"), "{spilled}");
+}
+
 /// The first violation the simulation reports over a fixed set of histories
 /// when one of its dependencies is broken in the given way, and how much
 /// the histories without one made between them.
 fn first_violation(canary: Option<Canary>) -> (Option<String>, Made) {
+    first_violation_in(histories(), 300, canary)
+}
+
+/// As [`first_violation`], over `cases` histories of `histories`.
+fn first_violation_in(
+    histories: impl Strategy<Value = (Clocks, Vec<Action>)>,
+    cases: u32,
+    canary: Option<Canary>,
+) -> (Option<String>, Made) {
     let config = Config {
-        cases: 300,
+        cases,
         failure_persistence: None,
         max_shrink_iters: 0,
         ..Config::default()
     };
     let rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
     let found = Mutex::new((None, Made::default()));
-    let _ = TestRunner::new_with_rng(config, rng).run(&histories(), |history| {
+    let _ = TestRunner::new_with_rng(config, rng).run(&histories, |history| {
         let outcome = run_on(history, canary);
         let mut found = found.lock().unwrap();
         match outcome {
@@ -4752,11 +5840,7 @@ impl World {
 
     /// What the coordinator holds of what cleans deleted below.
     async fn cleaned_record(&self) -> Option<Cleaned> {
-        self.coordinator
-            .clean
-            .cleaned(&self.cluster.key)
-            .await
-            .unwrap()
+        self.coordinator.held(&self.cluster.key).await.unwrap()
     }
 
     /// A clean by the newest writer with `grace`, which is to fail and

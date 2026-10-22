@@ -98,6 +98,12 @@ impl Turns {
         self.most
     }
 
+    /// How many turns are taken, and how many reads wait for one.
+    pub fn counts(&self) -> (usize, usize) {
+        let taken = self.taken.lock().expect("turns lock");
+        (taken.all(), taken.waiting.values().sum())
+    }
+
     /// How many turns a tenant may have while another tenant waits for
     /// one.
     pub fn share(&self) -> usize {

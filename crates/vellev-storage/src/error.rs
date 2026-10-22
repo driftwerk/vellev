@@ -26,6 +26,10 @@ pub enum StorageError {
     /// than it creates: nothing was put, and asking again is refused again.
     #[error("{key} was not created, and nothing was put: {reason}")]
     NotCreated { key: String, reason: String },
+    /// A listing from a key refused by a store that cannot list from a
+    /// key in one request: asking again is refused again.
+    #[error("{prefix} was not listed from a key: {reason}")]
+    NotListed { prefix: String, reason: String },
     /// A fact about the backup, for whoever asked to restore from it: it
     /// lists a file that is no longer in the backup store, and cannot be
     /// restored from by a cluster that does not have the file itself.

@@ -353,6 +353,12 @@ and say what the caller then answers for.
   (500), `VELLEV_CACHE_LOADS` (2), `VELLEV_STORE_TIMEOUT_SECS`,
   `VELLEV_STORE_MIN_BYTES_PER_SEC`, `VELLEV_UPLOAD_PART_MIB` and
   `VELLEV_DATABASE_TIMEOUT_SECS`; see the README.
+- **Metrics for Prometheus**, on a listener of their own: set
+  `VELLEV_METRICS_LISTEN`. Requests are timed whole and by stage, and
+  searches report the rows they scored and how much their filter allowed;
+  see the README. `vellev-storage`'s `State` gains `search_counted`,
+  `keyword_counted` and `hybrid_counted`, which add what a search did to a
+  `Work`; the uncounted forms are unchanged.
 - **Vectors are never held in memory by a node with a cache directory.**
   A tenant whose vectors the cache cannot take, or whose disk does not
   answer, does not open, and is `unavailable` until it does.

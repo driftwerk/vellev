@@ -6,7 +6,7 @@ use vellev_index::vector::{nearest, Scorer, VectorIndex};
 
 use crate::format::CollectionId;
 use crate::state::{Layer, State, Vectors, SHORTLIST_ABOVE};
-use crate::Result;
+use crate::{Result, Work};
 
 /// How many times `limit` rows are scored exactly: those the clustered
 /// layers estimate nearest, taken together, with at least `limit` of each,
@@ -69,6 +69,16 @@ impl State {
     /// ids are found first. Rows it estimates differently are found, or
     /// missed, as any other near neighbour is, whatever their distance.
     pub fn search(&self, collection: &CollectionName, query: &Query<'_>) -> Result<Vec<Hit<'_>>> {
+        self.search_counted(collection, query, &mut Work::default())
+    }
+
+    /// As [`Self::search`], adding what it did to `work`.
+    pub fn search_counted(
+        &self,
+        collection: &CollectionName,
+        query: &Query<'_>,
+        work: &mut Work,
+    ) -> Result<Vec<Hit<'_>>> {
         let (id, schema) = self.catalog().known(collection)?;
         schema.embedding.check(query.vector)?;
         let predicate = query
@@ -82,7 +92,7 @@ impl State {
         let mut estimated = Vec::new();
         let mut floors = 0;
         for (at, layer) in layers.iter().enumerate() {
-            let offered = candidates(layer, id, predicate.as_ref(), query.vector, budget);
+            let offered = candidates(layer, id, predicate.as_ref(), query.vector, budget, work);
             exact.extend(offered.exact.into_iter().map(|row| (at, row)));
             // Each layer's own nearest few are always scored: one whose
             // estimates err more than others' would otherwise crowd them
@@ -99,19 +109,39 @@ impl State {
                 );
             }
         }
+        work.estimated += (floors + estimated.len()) as u64;
         nearest_across(&layers, &mut estimated, budget.saturating_sub(floors));
         let estimated = estimated.into_iter().map(|(_, found)| found);
         let mut hits: Vec<Hit<'_>> = exact
             .into_iter()
             .chain(estimated)
-            .filter_map(|(at, row)| hit(&layers[at], row, &scorer))
+            .filter_map(|(at, row)| {
+                let found = hit(&layers[at], row, &scorer)?;
+                match layers[at].vectors {
+                    Some(_) => work.exact_segments += 1,
+                    None => work.exact_memtable += 1,
+                }
+                Some(found)
+            })
             .collect();
-        hits.sort_unstable_by(|a, b| {
+        // Nearest first, ties in object id order: a total order, so that
+        // picking the first `limit` and then ordering only them gives what
+        // ordering every hit would, without ordering the rest.
+        let order = |a: &Hit<'_>, b: &Hit<'_>| {
             a.distance
                 .total_cmp(&b.distance)
                 .then(a.object.id.cmp(&b.object.id))
-        });
-        hits.truncate(query.limit);
+        };
+        if hits.len() > query.limit {
+            match query.limit {
+                0 => hits.clear(),
+                limit => {
+                    hits.select_nth_unstable_by(limit - 1, order);
+                    hits.truncate(limit);
+                }
+            }
+        }
+        hits.sort_unstable_by(order);
         Ok(hits)
     }
 }
@@ -146,12 +176,17 @@ fn candidates(
     predicate: Option<&Predicate>,
     vector: &[f32],
     count: usize,
+    work: &mut Work,
 ) -> Candidates {
     let Some(index) = layer.indexes.get(&collection) else {
         return Candidates::default();
     };
     let only = predicate.map(|predicate| predicate.select(&index.rows));
     let allowed = only.as_ref().unwrap_or(index.rows.rows());
+    if only.is_some() {
+        work.filtered += index.rows.rows().len();
+        work.allowed += allowed.len();
+    }
     let live = || allowed.iter().filter(|row| !layer.dead[*row as usize]);
     let shortlist = index
         .vectors

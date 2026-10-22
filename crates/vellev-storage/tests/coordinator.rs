@@ -2341,7 +2341,8 @@ async fn a_partition_never_shipped_has_nothing_and_one_not_registered_is_unknown
             .await
     ));
     assert!(is_unknown(
-        c.stall_shipping(&unknown, now, LogPosition(1), "why").await
+        c.stall_shipping(&unknown, now, LogPosition(1), None, None, "why")
+            .await
     ));
 }
 
@@ -2520,24 +2521,26 @@ async fn a_base_below_the_hold_or_its_row_or_a_clean_is_refused(h: &dyn Harness)
         &c.record_base(&key, now, &ship_base(3, 4, "m4")).await,
         Stale::NoRowAtBase
     ));
-    // A clean recorded above the checkpoint, as one may until clean_below
-    // honours the cap.
+    // A clean recorded above a checkpoint: held to the cap now (PR 6, H),
+    // so only under a cap at or above it; a base at the checkpoint below
+    // is then refused, for the cap above it first.
     let key = registered(h).await;
     let now = incarnation_of(h, &key).await;
     let (lease_held, _) = lease(h, &key, &node("a")).await;
     for (position, head) in [(1, "l1"), (2, "m2"), (3, "l3"), (4, "m4")] {
         c.commit(&lease_held, commit(position, head)).await.unwrap();
     }
-    c.hold_for_shipping(&key, now, LogPosition(2))
+    c.hold_for_shipping(&key, now, LogPosition(4))
         .await
         .unwrap();
     c.clean_below(&lease_held, &ManifestRef("m4".into()), LogPosition(4))
         .await
         .unwrap();
-    assert!(stale(
-        &c.record_base(&key, now, &ship_base(1, 2, "m2")).await,
-        Stale::CleanedAbove
-    ));
+    let refused = c.record_base(&key, now, &ship_base(1, 2, "m2")).await;
+    assert!(
+        stale(&refused, Stale::CapAbove) || stale(&refused, Stale::CleanedAbove),
+        "{refused:?}"
+    );
     let base = ship_base(3, 4, "m4");
     assert_eq!(
         c.record_base(&key, now, &base).await.unwrap(),
@@ -2583,9 +2586,16 @@ async fn a_base_is_raised_only_and_a_new_run_starts_afresh(h: &dyn Harness) {
     // Higher: raised, the cap with it, and its run starts with nothing
     // shipped or stalled.
     committed_heads(h, &key, &[(6, "l6"), (7, "m7")]).await;
-    c.stall_shipping(&key, now, LogPosition(4), "the first run stopped")
-        .await
-        .unwrap();
+    c.stall_shipping(
+        &key,
+        now,
+        LogPosition(4),
+        Some(LogPosition(5)),
+        None,
+        "the first run stopped",
+    )
+    .await
+    .unwrap();
     let second = ship_base(6, 7, "m7");
     assert_eq!(
         c.record_base(&key, now, &second).await.unwrap(),
@@ -2600,10 +2610,12 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
     let note = |base: u64, position: u64| {
         c.note_shipped(&key, now, LogPosition(base), LogPosition(position))
     };
-    let stall =
-        |base: u64, reason: &'static str| c.stall_shipping(&key, now, LogPosition(base), reason);
+    let stall = |base: u64, seen: Option<u64>, reason: &'static str| {
+        let seen = seen.map(LogPosition);
+        c.stall_shipping(&key, now, LogPosition(base), seen, None, reason)
+    };
     assert!(other_base(&note(4, 5).await, None));
-    assert!(other_base(&stall(4, "no run").await, None));
+    assert!(other_base(&stall(4, None, "no run").await, None));
     committed_heads(
         h,
         &key,
@@ -2638,13 +2650,16 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
         "{below:?}"
     );
     assert!(other_base(&note(3, 7).await, Some(4)));
-    assert!(other_base(&stall(5, "another run's").await, Some(4)));
+    assert!(other_base(
+        &stall(5, Some(6), "another run's").await,
+        Some(4)
+    ));
     assert_eq!(
-        stall(4, "the first").await.unwrap(),
+        stall(4, Some(6), "the first").await.unwrap(),
         run(Some(6), Some("the first"))
     );
     assert_eq!(
-        stall(4, "a later").await.unwrap(),
+        stall(4, Some(6), "a later").await.unwrap(),
         run(Some(6), Some("the first")),
         "the first stands"
     );
@@ -2655,7 +2670,15 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
         now
     ));
     assert!(other_incarnation(
-        &c.stall_shipping(&key, stale_one, LogPosition(4), "x").await,
+        &c.stall_shipping(
+            &key,
+            stale_one,
+            LogPosition(4),
+            Some(LogPosition(6)),
+            None,
+            "x"
+        )
+        .await,
         now
     ));
     // After a re-base, a stale run neither raises nor stops the new one.
@@ -2663,8 +2686,224 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
     let second = ship_base(6, 7, "m7");
     c.record_base(&key, now, &second).await.unwrap();
     assert!(other_base(&note(4, 9).await, Some(6)));
-    assert!(other_base(&stall(4, "a stale run's").await, Some(6)));
+    assert!(other_base(
+        &stall(4, Some(6), "a stale run's").await,
+        Some(6)
+    ));
     assert_eq!(c.shipping(&key).await.unwrap(), based(now, 1, &second));
+}
+
+/// DW-668, S5: a stall is decided on what a batch read of the run, and a
+/// shipper of the same run that read it before the run moved on, a stale
+/// one, is refused: the run under way is never stopped by it. The stall
+/// notes what its own batch shipped in the same step, as `note_shipped`
+/// would, raising only.
+async fn a_stall_is_taken_only_from_a_run_that_saw_what_it_has_shipped_and_notes_it_too(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(
+        h,
+        &key,
+        &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "l4"), (5, "l5")],
+    )
+    .await;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let base = ship_base(1, 2, "m2");
+    c.record_base(&key, now, &base).await.unwrap();
+    let run = |shipped: Option<u64>, stalled: Option<&str>| Shipping {
+        shipped: shipped.map(LogPosition),
+        stalled: stalled.map(String::from),
+        ..based(now, 1, &base)
+    };
+    let stall = |seen: Option<u64>, through: Option<u64>, reason: &'static str| {
+        let (seen, through) = (seen.map(LogPosition), through.map(LogPosition));
+        c.stall_shipping(&key, now, LogPosition(1), seen, through, reason)
+    };
+    let shipped_since = |result: &Result<Shipping, CoordinatorError>, was: Option<u64>, is: u64| {
+        matches!(
+            result,
+            Err(CoordinatorError::ShippedSince { seen, shipped, .. })
+                if *seen == was.map(LogPosition) && *shipped == Some(LogPosition(is))
+        )
+    };
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(3))
+        .await
+        .unwrap();
+    // A shipper that read the run before it shipped to 3: refused, and
+    // nothing written, neither its stall nor what it shipped.
+    let stale = stall(None, Some(2), "a stale shipper's").await;
+    assert!(shipped_since(&stale, None, 3), "{stale:?}");
+    let stale = stall(Some(2), Some(4), "a stale shipper's").await;
+    assert!(shipped_since(&stale, Some(2), 3), "{stale:?}");
+    assert_eq!(c.shipping(&key).await.unwrap(), run(Some(3), None));
+    // One that read it as it stands: what it shipped noted, and stalled,
+    // in one step.
+    assert_eq!(
+        stall(Some(3), Some(5), "the run's own").await.unwrap(),
+        run(Some(5), Some("the run's own"))
+    );
+    // Stalled already: the first reason stands, whatever was seen.
+    assert_eq!(
+        stall(Some(5), None, "a later").await.unwrap(),
+        run(Some(5), Some("the run's own"))
+    );
+    assert_eq!(
+        stall(None, None, "a stale later").await.unwrap(),
+        run(Some(5), Some("the run's own"))
+    );
+}
+
+/// DW-668, S5: noting what a stall's batch shipped only raises, and one
+/// below the base is refused as a note is.
+async fn a_stall_raises_what_was_shipped_only(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(h, &key, &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "l4")]).await;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let base = ship_base(2, 2, "m2");
+    c.record_base(&key, now, &base).await.unwrap();
+    let below = c
+        .stall_shipping(&key, now, LogPosition(2), None, Some(LogPosition(1)), "x")
+        .await;
+    assert!(
+        matches!(below, Err(CoordinatorError::InvalidArgument(_))),
+        "{below:?}"
+    );
+    c.note_shipped(&key, now, LogPosition(2), LogPosition(4))
+        .await
+        .unwrap();
+    let lower = c
+        .stall_shipping(
+            &key,
+            now,
+            LogPosition(2),
+            Some(LogPosition(4)),
+            Some(LogPosition(3)),
+            "y",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (lower.shipped, lower.stalled.as_deref()),
+        (Some(LogPosition(4)), Some("y"))
+    );
+}
+
+fn above_cap(result: &Result<Cleaned, CoordinatorError>, asked: u64, cap: u64) -> bool {
+    matches!(
+        result,
+        Err(CoordinatorError::CleanAboveCap { asked: a, cap: c, .. })
+            if *a == LogPosition(asked) && *c == LogPosition(cap)
+    )
+}
+
+/// DW-668 PR 6 (bootstrap note H): while a partition is held for
+/// shipping, a clean records nothing above the cap, checked on the record
+/// it would write: one below the cap stands, and a record left as it is
+/// is no record written.
+async fn a_clean_is_held_to_the_shipping_cap_on_the_record_it_writes(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(
+        h,
+        &key,
+        &[
+            (1, "l1"),
+            (2, "m2"),
+            (3, "l3"),
+            (4, "m4"),
+            (5, "l5"),
+            (6, "m6"),
+        ],
+    )
+    .await;
+    let (held, _) = lease(h, &key, &node("a")).await;
+    // No hold: no cap.
+    assert_eq!(record(c, &held, 2).await.unwrap(), cleaned_at(2));
+    c.hold_for_shipping(&key, now, LogPosition(4))
+        .await
+        .unwrap();
+    // An old record below the cap, a new one above it: refused, the old
+    // one standing.
+    assert!(above_cap(&record(c, &held, 6).await, 6, 4), "above");
+    assert_eq!(c.cleaned(&key).await.unwrap(), Some(cleaned_at(2)));
+    // At the cap: recorded.
+    assert_eq!(record(c, &held, 4).await.unwrap(), cleaned_at(4));
+    // Lower than the record: left as it is, and said, under the cap or not.
+    assert_eq!(record(c, &held, 3).await.unwrap(), cleaned_at(4));
+    // The cap raised by a base: up to it, recorded.
+    c.record_base(&key, now, &ship_base(5, 6, "m6"))
+        .await
+        .unwrap();
+    assert_eq!(record(c, &held, 6).await.unwrap(), cleaned_at(6));
+}
+
+/// DW-668 PR 6 (the hold's lifecycle, 3): the cap follows what the run
+/// ships, raised only, never past its watermark, and only by its own run.
+async fn a_cap_is_raised_only_and_never_past_what_its_run_shipped(h: &dyn Harness) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    let raise =
+        |base: u64, cap: u64| c.raise_ship_cap(&key, now, LogPosition(base), LogPosition(cap));
+    committed_heads(
+        h,
+        &key,
+        &[
+            (1, "l1"),
+            (2, "m2"),
+            (3, "l3"),
+            (4, "m4"),
+            (5, "l5"),
+            (6, "m6"),
+            (7, "l7"),
+        ],
+    )
+    .await;
+    // No run: another base, none.
+    assert!(other_base(&raise(2, 2).await, None));
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let base = ship_base(2, 2, "m2");
+    c.record_base(&key, now, &base).await.unwrap();
+    // Past what was shipped, nothing yet: refused.
+    let past = raise(2, 3).await;
+    assert!(
+        matches!(past, Err(CoordinatorError::InvalidArgument(_))),
+        "{past:?}"
+    );
+    c.note_shipped(&key, now, LogPosition(2), LogPosition(5))
+        .await
+        .unwrap();
+    let past = raise(2, 6).await;
+    assert!(
+        matches!(past, Err(CoordinatorError::InvalidArgument(_))),
+        "{past:?}"
+    );
+    // Up to it: raised; lower: left, and said.
+    assert_eq!(raise(2, 5).await.unwrap().cap, Some(LogPosition(5)));
+    assert_eq!(raise(2, 4).await.unwrap().cap, Some(LogPosition(5)));
+    assert_eq!(c.shipping(&key).await.unwrap().cap, Some(LogPosition(5)));
+    // Another run's, or another incarnation's: refused.
+    assert!(other_base(&raise(3, 5).await, Some(2)));
+    let stale = c
+        .raise_ship_cap(&key, Incarnation(now.0 + 1), LogPosition(2), LogPosition(5))
+        .await;
+    assert!(other_incarnation(&stale, now), "{stale:?}");
+    // A clean is held to it.
+    let (held, _) = lease(h, &key, &node("a")).await;
+    assert!(above_cap(&record(c, &held, 6).await, 6, 5));
+    assert_eq!(record(c, &held, 4).await.unwrap(), cleaned_at(4));
 }
 
 async fn shipping_stays_through_leases_and_is_of_its_own_partition_alone(h: &dyn Harness) {
@@ -2741,7 +2980,8 @@ async fn a_partition_removed_loses_its_shipping_and_one_made_again_starts_with_n
         now
     ));
     assert!(other_incarnation(
-        &c.stall_shipping(&key, old, LogPosition(1), "x").await,
+        &c.stall_shipping(&key, old, LogPosition(1), None, None, "x")
+            .await,
         now
     ));
     assert_eq!(c.shipping(&key).await.unwrap(), not_shipped(now));
@@ -2918,9 +3158,16 @@ async fn a_run_is_unshipped_while_commits_lie_above_what_it_shipped(h: &dyn Harn
         [behind(&key, now, Some(2), 3)]
     );
     // Stalled: an operator's, not a shipper's.
-    c.stall_shipping(&key, now, LogPosition(1), "a fork")
-        .await
-        .unwrap();
+    c.stall_shipping(
+        &key,
+        now,
+        LogPosition(1),
+        Some(LogPosition(2)),
+        None,
+        "a fork",
+    )
+    .await
+    .unwrap();
     assert_eq!(c.unshipped(None, 10).await.unwrap(), Vec::new());
     // A base that is its own checkpoint and the head, nothing committed
     // past it nor shipped: the base itself is still to ship.
@@ -3197,6 +3444,10 @@ conformance! {
     a_base_below_the_hold_or_its_row_or_a_clean_is_refused,
     a_base_is_raised_only_and_a_new_run_starts_afresh,
     a_runs_writes_are_fenced_by_its_base_and_only_raise,
+    a_clean_is_held_to_the_shipping_cap_on_the_record_it_writes,
+    a_cap_is_raised_only_and_never_past_what_its_run_shipped,
+    a_stall_is_taken_only_from_a_run_that_saw_what_it_has_shipped_and_notes_it_too,
+    a_stall_raises_what_was_shipped_only,
     shipping_stays_through_leases_and_is_of_its_own_partition_alone,
     a_partition_removed_loses_its_shipping_and_one_made_again_starts_with_none,
     the_commits_after_a_position_are_read_from_their_rows_in_order,
@@ -3961,6 +4212,341 @@ async fn postgres_a_base_raised_while_history_is_forgotten_waits_and_is_refused_
     assert_eq!(shipping.shipped, Some(LogPosition(5)));
 }
 
+/// DW-668, S5: the stale stall's race, on two connections. A stale
+/// shipper decided its stall on the run before it shipped on; the run's
+/// note is made, not yet committed, when the stall is asked for. The
+/// stall is one statement whose condition is what the run has shipped, so
+/// it waits for the note's row and is then refused as shipped since: a
+/// stall read first and written after would stop the run under way.
+#[tokio::test]
+async fn postgres_a_stale_stall_waiting_on_a_note_is_refused_once_it_lands() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(&pg, &key, &[(1, "l1"), (2, "m2"), (3, "l3")]).await;
+    pg.coordinator
+        .hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    let base = ship_base(1, 2, "m2");
+    pg.coordinator.record_base(&key, now, &base).await.unwrap();
+    // The run under way's note, made and not yet committed.
+    let mut noting = pg.pool.begin().await.unwrap();
+    sqlx::query("UPDATE vellev.shipping SET shipped = 3 WHERE tenant = $1 AND partition = $2")
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&mut *noting)
+        .await
+        .unwrap();
+    let other = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let stalling = tokio::spawn({
+        let key = key.clone();
+        async move {
+            other
+                .stall_shipping(
+                    &key,
+                    now,
+                    LogPosition(1),
+                    None,
+                    Some(LogPosition(2)),
+                    "stale",
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !stalling.is_finished(),
+        "the stall waits for the note's row"
+    );
+    noting.commit().await.unwrap();
+    let refused = stalling.await.unwrap();
+    assert!(
+        matches!(
+            refused,
+            Err(CoordinatorError::ShippedSince {
+                seen: None,
+                shipped: Some(LogPosition(3)),
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    let shipping = pg.coordinator.shipping(&key).await.unwrap();
+    assert_eq!(
+        (shipping.shipped, shipping.stalled),
+        (Some(LogPosition(3)), None)
+    );
+}
+
+/// A clean's record asked for on its own connection, its transaction
+/// left open: the partition's row held until it commits.
+async fn cleaned_uncommitted(
+    pool: &sqlx::PgPool,
+    key: &PartitionKey,
+    position: u64,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut cleaning = pool.begin().await.unwrap();
+    let (base, position) = base(position);
+    sqlx::query(
+        "UPDATE vellev.partitions SET cleaned_below = $3, cleaned_position = $4
+         WHERE tenant = $1 AND partition = $2",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .bind(base.0.as_str())
+    .bind(i64::try_from(position.0).unwrap())
+    .execute(&mut *cleaning)
+    .await
+    .unwrap();
+    cleaning
+}
+
+/// `asked`, which must be answered without waiting for another's lock:
+/// a refusal on the cap read, not a wait for the row. A wait fails the
+/// test, rather than hanging it while the lock's holder waits on this.
+async fn at_once<T>(asked: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), asked)
+        .await
+        .expect("answered at once, not after waiting for the partition's row")
+}
+
+/// DW-668 PR 6, the interleavings 3a deferred: the cap against a clean's
+/// record, on two connections, in each order. The second waits for the
+/// partition's row, and is then refused on what the first wrote.
+#[tokio::test]
+async fn postgres_a_cap_and_a_clean_record_meet_on_the_partitions_row_in_either_order() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let other = || async {
+        PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+            .await
+            .unwrap()
+    };
+    for order in [
+        "hold, then clean",
+        "clean, then hold",
+        "base, then clean",
+        "clean, then base",
+    ] {
+        let key = registered(&pg).await;
+        let now = incarnation_of(&pg, &key).await;
+        committed_heads(
+            &pg,
+            &key,
+            &[
+                (1, "l1"),
+                (2, "m2"),
+                (3, "l3"),
+                (4, "m4"),
+                (5, "l5"),
+                (6, "m6"),
+            ],
+        )
+        .await;
+        let (held, _) = lease(&pg, &key, &node("cleaner")).await;
+        let second = other().await;
+        match order {
+            "hold, then clean" => {
+                // The hold made, capped at 2, and not yet committed.
+                let mut holding = pg.pool.begin().await.unwrap();
+                sqlx::query("UPDATE vellev.partitions SET ship_hold_from = 1, ship_cap = 2 WHERE tenant = $1 AND partition = $2")
+                    .bind(key.tenant.as_str())
+                    .bind(i64::from(key.partition.0))
+                    .execute(&mut *holding)
+                    .await
+                    .unwrap();
+                let cleaning = tokio::spawn({
+                    let held = held.clone();
+                    async move { record(&second, &held, 4).await }
+                });
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    !cleaning.is_finished(),
+                    "{order}: the clean waits for the row"
+                );
+                holding.commit().await.unwrap();
+                let refused = cleaning.await.unwrap();
+                assert!(above_cap(&refused, 4, 2), "{order}: {refused:?}");
+                assert_eq!(pg.coordinator.cleaned(&key).await.unwrap(), None, "{order}");
+            }
+            "clean, then hold" => {
+                let cleaning = cleaned_uncommitted(&pg.pool, &key, 4).await;
+                let holding = tokio::spawn({
+                    let key = key.clone();
+                    async move { second.hold_for_shipping(&key, now, LogPosition(2)).await }
+                });
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    !holding.is_finished(),
+                    "{order}: the hold waits for the row"
+                );
+                cleaning.commit().await.unwrap();
+                let refused = holding.await.unwrap();
+                assert!(stale(&refused, Stale::CleanedAbove), "{order}: {refused:?}");
+            }
+            "base, then clean" => {
+                pg.coordinator
+                    .hold_for_shipping(&key, now, LogPosition(2))
+                    .await
+                    .unwrap();
+                // The base made at 4, raising the cap to it, and not yet
+                // committed: a clean at 6 waits, and is refused at 4.
+                let mut basing = pg.pool.begin().await.unwrap();
+                sqlx::query("UPDATE vellev.partitions SET ship_base = 3, ship_base_checkpoint = 'm4', ship_base_checkpoint_position = 4, ship_cap = 4 WHERE tenant = $1 AND partition = $2")
+                    .bind(key.tenant.as_str())
+                    .bind(i64::from(key.partition.0))
+                    .execute(&mut *basing)
+                    .await
+                    .unwrap();
+                // A cap only rises, so a clean above the cap it reads is
+                // refused on it at once, without waiting: never taken.
+                let refused = at_once(record(&second, &held, 6)).await;
+                assert!(above_cap(&refused, 6, 2), "{order}: {refused:?}");
+                basing.commit().await.unwrap();
+                let refused = record(&second, &held, 6).await;
+                assert!(above_cap(&refused, 6, 4), "{order}: {refused:?}");
+            }
+            _ => {
+                pg.coordinator
+                    .hold_for_shipping(&key, now, LogPosition(2))
+                    .await
+                    .unwrap();
+                // A record above the base's checkpoint, made as a clean
+                // with no cap to hold it would make it (H keeps one from
+                // being asked for now), and not yet committed: the base
+                // waits, and is refused on its own direct check.
+                let cleaning = cleaned_uncommitted(&pg.pool, &key, 6).await;
+                let basing = tokio::spawn({
+                    let key = key.clone();
+                    async move { second.record_base(&key, now, &ship_base(3, 4, "m4")).await }
+                });
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(!basing.is_finished(), "{order}: the base waits for the row");
+                cleaning.commit().await.unwrap();
+                let refused = basing.await.unwrap();
+                assert!(stale(&refused, Stale::CleanedAbove), "{order}: {refused:?}");
+            }
+        }
+    }
+}
+
+/// DW-668 PR 6: a raise of the cap by a run re-based meanwhile, on two
+/// connections. The re-base holds the partition's row; the raise waits for
+/// it, and is then refused on the base it names, which is no longer the
+/// run's: it never sets the new run's cap from the old run's watermark.
+#[tokio::test]
+async fn postgres_a_raise_by_a_run_re_based_meanwhile_waits_and_is_refused() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(
+        &pg,
+        &key,
+        &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "m4"), (5, "l5")],
+    )
+    .await;
+    let c = &pg.coordinator;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    c.record_base(&key, now, &ship_base(2, 2, "m2"))
+        .await
+        .unwrap();
+    c.note_shipped(&key, now, LogPosition(2), LogPosition(5))
+        .await
+        .unwrap();
+    // A re-base at 3, its checkpoint and cap at 4, made and not committed:
+    // the partition's row first, then the run's, as record_base writes.
+    let mut basing = pg.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE vellev.partitions SET ship_base = 3, ship_base_checkpoint = 'm4',
+             ship_base_checkpoint_position = 4, ship_cap = 4
+         WHERE tenant = $1 AND partition = $2",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .execute(&mut *basing)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE vellev.shipping SET base = 3, shipped = NULL WHERE tenant = $1 AND partition = $2",
+    )
+    .bind(key.tenant.as_str())
+    .bind(i64::from(key.partition.0))
+    .execute(&mut *basing)
+    .await
+    .unwrap();
+    let second = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let raising = tokio::spawn({
+        let key = key.clone();
+        async move {
+            second
+                .raise_ship_cap(&key, now, LogPosition(2), LogPosition(5))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!raising.is_finished(), "the raise waits for the row");
+    basing.commit().await.unwrap();
+    let refused = raising.await.unwrap();
+    assert!(other_base(&refused, Some(3)), "{refused:?}");
+    assert_eq!(c.shipping(&key).await.unwrap().cap, Some(LogPosition(4)));
+}
+
+/// DW-668 PR 6: a raise of the cap and a clean's record on two
+/// connections. A raise only loosens: a clean above the cap it reads is
+/// refused on it at once, and taken once the raise has committed.
+#[tokio::test]
+async fn postgres_a_clean_above_a_cap_being_raised_is_taken_once_the_raise_commits() {
+    let Some(pg) = Pg::connect_beside(HARNESS).await else {
+        return;
+    };
+    let key = registered(&pg).await;
+    let now = incarnation_of(&pg, &key).await;
+    committed_heads(
+        &pg,
+        &key,
+        &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "m4"), (5, "l5")],
+    )
+    .await;
+    let c = &pg.coordinator;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    c.record_base(&key, now, &ship_base(2, 2, "m2"))
+        .await
+        .unwrap();
+    c.note_shipped(&key, now, LogPosition(2), LogPosition(5))
+        .await
+        .unwrap();
+    let (held, _) = lease(&pg, &key, &node("cleaner")).await;
+    // The raise to 5 made, and not yet committed.
+    let mut raising = pg.pool.begin().await.unwrap();
+    sqlx::query("UPDATE vellev.partitions SET ship_cap = 5 WHERE tenant = $1 AND partition = $2")
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .execute(&mut *raising)
+        .await
+        .unwrap();
+    let second = PostgresCoordinator::with_pool(pool(pg.options(), HARNESS).await)
+        .await
+        .unwrap();
+    let refused = at_once(record(&second, &held, 4)).await;
+    assert!(above_cap(&refused, 4, 2), "{refused:?}");
+    raising.commit().await.unwrap();
+    assert_eq!(record(&second, &held, 4).await.unwrap(), cleaned_at(4));
+}
+
 /// DW-668, #81 review: the floor is the current incarnation's alone. The
 /// rows of one removed go as they always have, a hold on the one made
 /// again keeping none of them.
@@ -4439,6 +5025,9 @@ async fn answers_to_shipping(h: &dyn Harness) -> Vec<String> {
         Err(CoordinatorError::OtherBase { recorded, .. }) => format!("other base, {recorded:?}"),
         Err(CoordinatorError::StaleShipping { why, .. }) => format!("stale, {why:?}"),
         Err(CoordinatorError::InvalidArgument(_)) => "invalid".into(),
+        Err(CoordinatorError::ShippedSince { seen, shipped, .. }) => {
+            format!("shipped since, {seen:?} to {shipped:?}")
+        }
         Err(other) => format!("{other:?}"),
     };
     let mut answers = vec![said(c.shipping(&key).await)];
@@ -4466,10 +5055,30 @@ async fn answers_to_shipping(h: &dyn Harness) -> Vec<String> {
         ));
     }
     answers.push(said(
-        c.stall_shipping(&key, now, LogPosition(3), "first").await,
+        c.stall_shipping(&key, now, LogPosition(3), None, None, "stale")
+            .await,
     ));
     answers.push(said(
-        c.stall_shipping(&key, now, LogPosition(3), "second").await,
+        c.stall_shipping(
+            &key,
+            now,
+            LogPosition(3),
+            Some(LogPosition(4)),
+            None,
+            "first",
+        )
+        .await,
+    ));
+    answers.push(said(
+        c.stall_shipping(
+            &key,
+            now,
+            LogPosition(3),
+            Some(LogPosition(4)),
+            None,
+            "second",
+        )
+        .await,
     ));
     c.remove(&key).await.unwrap();
     answers.push(said(c.shipping(&key).await));
@@ -4495,7 +5104,7 @@ async fn postgres_and_memory_answer_shipping_alike() {
     };
     let memory = answers_to_shipping(&Memory::new()).await;
     assert_eq!(answers_to_shipping(&pg).await, memory);
-    assert_eq!(memory.len(), 20, "{memory:?}");
+    assert_eq!(memory.len(), 21, "{memory:?}");
 }
 
 /// DW-668: a coordinator bounded as a node bounds it answers shipping as
