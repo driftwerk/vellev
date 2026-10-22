@@ -1220,10 +1220,7 @@ impl Node {
 
     /// The tenant the key `secret` reaches, if it is one.
     pub async fn key_tenant(&self, secret: &str) -> Result<Option<TenantId>> {
-        self.0
-            .keys
-            .tenant(self.0.coordinator.as_ref(), secret)
-            .await
+        self.0.keys.tenant(&self.0.coordinator, secret).await
     }
 
     /// Creating a tenant that exists changes nothing.
