@@ -49,9 +49,11 @@ pub struct Hybrid<'a> {
     pub filter: Option<&'a Filter>,
     /// How many times `limit` rows the vector search scores exactly, and
     /// at least `candidates`: it scales the results asked for, not the
-    /// pool fused from. The budget is per layer: each segment that
-    /// shortlists scores up to that many, while a segment too small to
-    /// shortlist, and the memtable, are scored whole.
+    /// pool fused from. Each segment that shortlists by one-bit codes
+    /// scores up to that many of its own; the segments with a clustered
+    /// index share it, less the nearest few each scores of its own (see
+    /// `nearest_across` in `search.rs`); a segment too small to shortlist,
+    /// and the memtable, are scored whole.
     pub oversample: usize,
 }
 
