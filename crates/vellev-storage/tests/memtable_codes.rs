@@ -556,6 +556,7 @@ async fn reaching_the_threshold_keeps_readers_waiting_a_millisecond_at_most() {
         waits.push(longest_wait(&writer, last.to_vec()).await);
     }
     waits.sort();
+    eprintln!("readers waited at most {waits:?} as the threshold was reached");
     let median = waits[waits.len() / 2];
     assert!(
         median <= Duration::from_millis(1),

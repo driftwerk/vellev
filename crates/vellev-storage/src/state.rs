@@ -479,11 +479,19 @@ struct Memtable {
 /// or not, in log order: what any copy replaying the log from the same
 /// checkpoint arrives at too. Once coded, the memtable stays coded until
 /// it is flushed, however many of its rows die.
+///
+/// Those first versions are never coded, and are scored exactly beside the
+/// shortlist: reaching the threshold sums them and codes nothing, so that
+/// the apply that does it holds the lock readers wait on for well under a
+/// millisecond.
 pub const CODE_FROM: usize = 1_024;
 
-/// The memtable's rows of `collection` with a vector, every one coded about
-/// the mean of the first [`CODE_FROM`] of them in row order, which is log
-/// order since the checkpoint.
+/// The memtable's rows of `collection` with a vector, centred on the mean
+/// of the first [`CODE_FROM`] of them in row order, which is log order
+/// since the checkpoint: those first rows taken to be scored exactly and
+/// never coded, every row after them coded. At the threshold that is a sum
+/// and no code; at a flush, a code for each row kept past the first
+/// [`CODE_FROM`], as applying them would have made.
 fn coded(rows: &[Row], collection: CollectionId, metric: Distance) -> Option<Vectors> {
     let vectored: Vec<(u32, &[f32])> = rows
         .iter()
@@ -497,8 +505,11 @@ fn coded(rows: &[Row], collection: CollectionId, metric: Distance) -> Option<Vec
         .map(|(_, vector)| *vector)
         .collect();
     let mut codes = BinaryIndex::about_mean(metric, &first)?;
-    for (row, vector) in &vectored {
-        codes.push(*row, vector);
+    for (at, (row, vector)) in vectored.iter().enumerate() {
+        match at < CODE_FROM {
+            true => codes.push_exact(*row),
+            false => codes.push(*row, vector),
+        }
     }
     Some(Vectors::Binary(codes))
 }
@@ -712,7 +723,7 @@ impl State {
         match &self.memtable.indexes.get(&id)?.vectors {
             Some(Vectors::Binary(codes)) => Some(MemtableCoding {
                 applied: self.memtable.applied.get(&id).copied().unwrap_or(0),
-                coded: codes.len(),
+                coded: codes.coded(),
                 centre: codes.centre().to_vec(),
             }),
             _ => None,
