@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -42,7 +42,7 @@ use limits::Asked;
 use limits::Limits;
 
 pub use claim_clock::{BootClock, ClaimClock};
-pub use keys::{Issued, REMEMBERED_FOR as KEYS_REMEMBERED_FOR};
+pub use keys::{Issued, KeyLookups, REMEMBERED_FOR as KEYS_REMEMBERED_FOR};
 pub use purging::{LOOKED_FOR_EVERY as PURGES_LOOKED_FOR_EVERY, LOOKED_OVER_EVERY, REMEMBERED};
 pub use reading::{Freshness, Reader};
 
@@ -1021,6 +1021,9 @@ struct Inner {
     /// When object storage last answered a readiness check.
     store_answered: Mutex<Option<Instant>>,
     keys: Keys,
+    /// How many writers and copies for reads this node has opened.
+    writers_opened: AtomicU64,
+    copies_opened: AtomicU64,
     limits: Arc<Limits>,
     /// The tenants purged lately whose cached files this node has dropped.
     dropped: Mutex<std::collections::HashSet<TenantId>>,
@@ -1031,6 +1034,14 @@ struct Inner {
 
 #[derive(Debug, Clone)]
 pub struct Node(Arc<Inner>);
+
+/// How many tenants a node has opened since it started. Each is a load of
+/// the tenant's committed state, which reads that wait on it wait for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Opens {
+    pub writers: u64,
+    pub copies: u64,
+}
 
 impl Node {
     /// A node that runs as `settings` say, taken as they are: nothing here
@@ -1050,6 +1061,8 @@ impl Node {
             open: Mutex::default(),
             store_answered: Mutex::default(),
             keys: Keys::default(),
+            writers_opened: AtomicU64::new(0),
+            copies_opened: AtomicU64::new(0),
             dropped: Mutex::default(),
             cluster_format: AtomicU16::new(0),
             limits: Arc::new(Limits::new(
@@ -1188,6 +1201,21 @@ impl Node {
         let revoked = self.0.coordinator.revoke_key(tenant, id).await?;
         self.0.keys.forget(tenant);
         Ok(revoked)
+    }
+
+    /// How the keys presented to this node have been answered since it
+    /// started.
+    pub fn key_lookups(&self) -> KeyLookups {
+        self.0.keys.lookups()
+    }
+
+    /// How many tenants this node has opened since it started: as their
+    /// writer, and as copies to read from.
+    pub fn opens(&self) -> Opens {
+        Opens {
+            writers: self.0.writers_opened.load(Ordering::Relaxed),
+            copies: self.0.copies_opened.load(Ordering::Relaxed),
+        }
     }
 
     /// The tenant the key `secret` reaches, if it is one.
@@ -1603,6 +1631,7 @@ impl Inner {
             !hold.is_lost() && Instant::now() < *deadline.lock().expect("deadline lock");
         let writer = match opened {
             Ok(writer) if !self.opened().stopped && still_held => {
+                self.writers_opened.fetch_add(1, Ordering::Relaxed);
                 let documents = Arc::new(Documents(self.embedders.clone()));
                 Arc::new(
                     writer

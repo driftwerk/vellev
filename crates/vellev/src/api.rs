@@ -21,12 +21,13 @@ use vellev_core::{
 };
 use vellev_node::{Freshness, Reader};
 use vellev_storage::coordinator::{Incarnation, LogPosition, Point, MAX_RESTORE_WINDOW};
-use vellev_storage::{Batch as Writes, Hybrid as HybridQuery, Keywords};
+use vellev_storage::{Batch as Writes, Hybrid as HybridQuery, Keywords, Work};
 use vellev_storage::{
     Condition, Fused, Hit, Mutation, Query as VectorQuery, Receipt, Scored, State, DEFAULT_ALPHA,
 };
 
 use crate::identity::Viewer;
+use crate::metrics::{self, Stage};
 use crate::problem::ApiError;
 use crate::server::App;
 
@@ -49,7 +50,7 @@ async fn json<T: DeserializeOwned>(
     request: axum::extract::Request,
     app: &App,
 ) -> Result<Json<T>, ApiError> {
-    Json::<T>::from_request(request, app)
+    metrics::timed(Stage::Body, Json::<T>::from_request(request, app))
         .await
         .map_err(|rejection| ApiError::unreadable(rejection, app.allowed().body_bytes))
 }
@@ -383,7 +384,7 @@ async fn read<T: Send + 'static>(
     app: &App,
     tenant: &TenantId,
     reader: Reader,
-    f: impl FnOnce(&State) -> Result<T, ApiError> + Send + 'static,
+    f: impl FnOnce(&State, &mut Work) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
     let turn = match app.reading(tenant).await {
         Ok(turn) => turn,
@@ -392,7 +393,15 @@ async fn read<T: Send + 'static>(
             return Err(turned_away);
         }
     };
-    turn.run(move || reader.read(f)).await?
+    let (read, work) = turn
+        .run(move || {
+            let mut work = Work::default();
+            let read = reader.read(|state| f(state, &mut work));
+            (read, work)
+        })
+        .await?;
+    metrics::read_ended(&work);
+    read
 }
 
 fn weights(properties: &[Weighted]) -> Vec<(&str, f32)> {
@@ -742,7 +751,7 @@ pub async fn collections(
     Named(tenant): Named<TenantId>,
     Fresh(fresh): Fresh,
 ) -> Answer<Collections> {
-    let tenant = app.node()?.reader(&tenant, fresh).await?;
+    let tenant = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
     let collections = tenant.read(|state| state.collections().cloned().collect());
     Ok(Json(Collections::new(collections)))
 }
@@ -769,7 +778,7 @@ pub async fn collection(
     Named((tenant, collection)): Named<(TenantId, CollectionName)>,
     Fresh(fresh): Fresh,
 ) -> Answer<Collection> {
-    let tenant = app.node()?.reader(&tenant, fresh).await?;
+    let tenant = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
     Ok(Json(tenant.read(|state| schema(state, &collection))?))
 }
 
@@ -862,7 +871,7 @@ pub async fn object(
     Fresh(fresh): Fresh,
     viewer: Viewer,
 ) -> Answer<Stored> {
-    let tenant = app.node()?.reader(&tenant, fresh).await?;
+    let tenant = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
     tenant
         .read(|state| {
             let schema = schema(state, &collection)?;
@@ -1026,11 +1035,10 @@ pub async fn nearest(
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
     let oversample = app.oversample(asked.oversample)?;
-    let reader = app.node()?.reader(&tenant, fresh).await?;
+    let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
     let vector = match (asked.vector, &asked.text) {
         (Some(vector), None) => vector,
-        (None, Some(text)) => reader
-            .query_vector(&collection, text)
+        (None, Some(text)) => metrics::timed(Stage::Embed, reader.query_vector(&collection, text))
             .await?
             .ok_or_else(|| {
                 ApiError::invalid(format!(
@@ -1039,7 +1047,7 @@ pub async fn nearest(
             })?,
         _ => return Err(ApiError::invalid("send either a vector or a text")),
     };
-    let results = read(&app, &tenant, reader, move |state| {
+    let results = read(&app, &tenant, reader, move |state, work| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = VectorQuery {
             vector: &vector,
@@ -1047,7 +1055,7 @@ pub async fn nearest(
             filter: filter.as_ref(),
             oversample,
         };
-        let hits = state.search(&collection, &query)?;
+        let hits = state.search_counted(&collection, &query, work)?;
         Ok(hits
             .into_iter()
             .map(|found| hit(found, asked.vectors))
@@ -1075,8 +1083,8 @@ pub async fn keyword(
     Body(asked): Body<Keyword>,
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
-    let reader = app.node()?.reader(&tenant, fresh).await?;
-    let results = read(&app, &tenant, reader, move |state| {
+    let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
+    let results = read(&app, &tenant, reader, move |state, work| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = Keywords {
             text: &asked.text,
@@ -1084,7 +1092,7 @@ pub async fn keyword(
             limit,
             filter: filter.as_ref(),
         };
-        let found = state.keyword(&collection, &query)?;
+        let found = state.keyword_counted(&collection, &query, work)?;
         Ok(found
             .into_iter()
             .map(|found| scored(found, asked.vectors))
@@ -1117,14 +1125,16 @@ pub async fn hybrid(
     let candidates = app.candidates(asked.candidates)?;
     let oversample = app.oversample(asked.oversample)?;
     let alpha = asked.alpha.unwrap_or(DEFAULT_ALPHA);
-    let reader = app.node()?.reader(&tenant, fresh).await?;
+    let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
     let weighs_meaning = alpha > 0.0 && alpha <= 1.0;
     // Why the words alone decide, if the text could not be embedded: as
     // the search would have been refused had it not fallen back.
     let (vector, degraded_by) = match asked.vector {
         Some(vector) => (Some(vector), None),
         None if !weighs_meaning => (None, None),
-        None => match reader.query_vector(&collection, &asked.text).await {
+        None => match metrics::timed(Stage::Embed, reader.query_vector(&collection, &asked.text))
+            .await
+        {
             Ok(vector) => (vector, None),
             Err(vellev_node::NodeError::Embed(error)) => {
                 // A fault that stands was said where it was met, once for
@@ -1144,7 +1154,7 @@ pub async fn hybrid(
             Err(error) => return Err(error.into()),
         },
     };
-    let results = read(&app, &tenant, reader, move |state| {
+    let results = read(&app, &tenant, reader, move |state, work| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = HybridQuery {
             text: &asked.text,
@@ -1157,7 +1167,7 @@ pub async fn hybrid(
             filter: filter.as_ref(),
             oversample,
         };
-        let found = state.hybrid(&collection, &query)?;
+        let found = state.hybrid_counted(&collection, &query, work)?;
         Ok(found
             .into_iter()
             .map(|found| fused(found, asked.vectors))
@@ -1188,8 +1198,8 @@ pub async fn list(
     Body(page): Body<Page>,
 ) -> Answer<Objects> {
     let limit = app.limit(page.limit)?;
-    let reader = app.node()?.reader(&tenant, fresh).await?;
-    read(&app, &tenant, reader, move |state| {
+    let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
+    read(&app, &tenant, reader, move |state, _work| {
         let filter = viewer.narrowed(&schema(state, &collection)?, page.filter);
         let found = state.list(&collection, filter.as_ref(), page.after, limit + 1)?;
         let next = (found.len() > limit).then(|| found[limit - 1].id());
@@ -1220,8 +1230,8 @@ pub async fn count(
     viewer: Viewer,
     Body(counting): Body<Counting>,
 ) -> Answer<Counted> {
-    let reader = app.node()?.reader(&tenant, fresh).await?;
-    read(&app, &tenant, reader, move |state| {
+    let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
+    read(&app, &tenant, reader, move |state, _work| {
         let filter = viewer.narrowed(&schema(state, &collection)?, counting.filter);
         let count = match &filter {
             Some(filter) => state.select(&collection, filter)?.len(),

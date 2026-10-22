@@ -4,6 +4,7 @@ mod api;
 pub mod config;
 pub mod identity;
 pub mod import;
+pub mod metrics;
 mod problem;
 pub mod server;
 mod turns;

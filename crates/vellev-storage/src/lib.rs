@@ -21,6 +21,7 @@ pub mod prefix;
 mod search;
 pub mod shipper;
 mod state;
+mod work;
 
 pub use answers::KEPT_FOR as ANSWERS_KEPT_FOR;
 pub use blobs::{Disk, Local, Transfers};
@@ -36,3 +37,4 @@ pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::{Live, Merging, State};
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;
+pub use work::Work;

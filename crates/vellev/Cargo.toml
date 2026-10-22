@@ -23,6 +23,7 @@ eyre.workspace = true
 http-body-util.workspace = true
 jsonwebtoken.workspace = true
 object_store.workspace = true
+prometheus-client.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

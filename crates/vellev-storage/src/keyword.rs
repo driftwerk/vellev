@@ -8,7 +8,7 @@ use vellev_index::filter::Filter;
 use vellev_index::text::{self, Cursor, Posting, TextIndex};
 
 use crate::state::{Layer, LayerIndex, State};
-use crate::{Result, StorageError};
+use crate::{Result, StorageError, Work};
 
 /// The most a match in one property may count against one in another.
 pub const MAX_WEIGHT: f32 = 1_000.0;
@@ -156,6 +156,16 @@ impl State {
         collection: &CollectionName,
         query: &Keywords<'_>,
     ) -> Result<Vec<Scored<'_>>> {
+        self.keyword_counted(collection, query, &mut Work::default())
+    }
+
+    /// As [`Self::keyword`], adding what it did to `work`.
+    pub fn keyword_counted(
+        &self,
+        collection: &CollectionName,
+        query: &Keywords<'_>,
+        work: &mut Work,
+    ) -> Result<Vec<Scored<'_>>> {
         let (id, schema) = self.catalog().known(collection)?;
         let properties = searched(schema, query.properties)?;
         let predicate = query
@@ -176,6 +186,8 @@ impl State {
             *repeats.entry(token).or_insert(0u32) += 1;
             repeats
         });
+        // Postings read to count the live rows holding a term.
+        let mut counted = 0;
         let clauses: Vec<Clause<'_>> = properties
             .iter()
             .flat_map(|property| repeats.iter().map(move |repeat| (property, repeat)))
@@ -192,19 +204,27 @@ impl State {
                     .filter_map(|(layer, index)| {
                         let cursor = clause.cursor(&index.text)?;
                         Some(match layer.deaths {
-                            0 => cursor.len(),
-                            _ => cursor
-                                .filter(|posting| !layer.dead[posting.row as usize])
-                                .count(),
+                            0 => (cursor.len(), 0),
+                            _ => {
+                                let read = cursor.len();
+                                let live = cursor
+                                    .filter(|posting| !layer.dead[posting.row as usize])
+                                    .count();
+                                (live, read)
+                            }
                         })
                     })
-                    .sum();
+                    .fold(0, |holding, (live, read)| {
+                        counted += read as u64;
+                        holding + live
+                    });
                 (holding > 0).then(|| Clause {
                     weight: clause.weight * text::idf(corpus.objects, holding as u64),
                     ..clause
                 })
             })
             .collect();
+        work.postings += counted;
         if clauses.is_empty() {
             return Ok(Vec::new());
         }
@@ -216,10 +236,22 @@ impl State {
             let allowed = predicate
                 .as_ref()
                 .map(|predicate| predicate.select(&index.rows));
+            if let Some(allowed) = &allowed {
+                work.filtered += index.rows.rows().len();
+                work.allowed += allowed.len();
+            }
             let wanted = |row: u32| {
                 !layer.dead[row as usize] && allowed.as_ref().is_none_or(|rows| rows.contains(row))
             };
-            top(schema.bm25, &index.text, &clauses, wanted, &mut best, layer);
+            top(
+                schema.bm25,
+                &index.text,
+                &clauses,
+                wanted,
+                &mut best,
+                layer,
+                work,
+            );
         }
         Ok(best
             .heap
@@ -291,6 +323,7 @@ fn top<'a>(
     wanted: impl Fn(u32) -> bool,
     best: &mut Best<'a>,
     layer: &Layer<'a>,
+    work: &mut Work,
 ) {
     let mut walks: Vec<Walk<'a>> = clauses
         .iter()
@@ -369,7 +402,9 @@ fn top<'a>(
             .iter()
             .take_while(|walk| walk.cursor.row() == Some(row))
             .count();
+        work.postings += at as u64;
         if wanted(row) {
+            work.keyword_rows += 1;
             walks[..at].sort_by_key(|walk| walk.clause);
             let score = walks[..at]
                 .iter()

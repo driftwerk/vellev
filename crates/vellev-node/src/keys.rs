@@ -7,6 +7,7 @@
 //! to one made again under the same id.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -57,6 +58,27 @@ impl std::fmt::Debug for Issued {
 pub(crate) struct Keys {
     remembered: Mutex<Remembered>,
     lookups: Semaphore,
+    counted: Counted,
+}
+
+/// How the keys presented to a node have been answered, counted from
+/// its start: from what it remembered, by asking the coordinator, or
+/// turned away for want of a lookup.
+#[derive(Debug, Default)]
+struct Counted {
+    remembered: AtomicU64,
+    looked_up: AtomicU64,
+    busy: AtomicU64,
+}
+
+/// How many keys a node has answered from what it remembered, looked up
+/// with the coordinator, and turned away as busy, since it started. A key
+/// not of the issued form is none of these: it is refused unlooked at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyLookups {
+    pub remembered: u64,
+    pub looked_up: u64,
+    pub busy: u64,
 }
 
 impl Default for Keys {
@@ -64,6 +86,7 @@ impl Default for Keys {
         Self {
             remembered: Mutex::default(),
             lookups: Semaphore::new(LOOKUPS),
+            counted: Counted::default(),
         }
     }
 }
@@ -154,17 +177,32 @@ impl Keys {
         let generation = {
             let remembered = self.remembered();
             if let Some(tenant) = remembered.get(&hash) {
+                self.counted.remembered.fetch_add(1, Ordering::Relaxed);
                 return Ok(tenant);
             }
             remembered.generation
         };
-        let _looking = self.lookups.try_acquire().map_err(|_| NodeError::Busy)?;
+        let Ok(_looking) = self.lookups.try_acquire() else {
+            self.counted.busy.fetch_add(1, Ordering::Relaxed);
+            return Err(NodeError::Busy);
+        };
+        self.counted.looked_up.fetch_add(1, Ordering::Relaxed);
         let tenant = coordinator.key_tenant(&hash).await?;
         let mut remembered = self.remembered();
         if remembered.generation == generation {
             remembered.insert(hash, tenant.clone());
         }
         Ok(tenant)
+    }
+
+    /// How the keys presented so far have been answered.
+    pub fn lookups(&self) -> KeyLookups {
+        let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
+        KeyLookups {
+            remembered: read(&self.counted.remembered),
+            looked_up: read(&self.counted.looked_up),
+            busy: read(&self.counted.busy),
+        }
     }
 
     /// Forget what was looked up for `tenant`, whose keys have changed, and
