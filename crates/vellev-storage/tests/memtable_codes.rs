@@ -7,7 +7,10 @@
 //! it does a segment's. The rules:
 //!
 //! - T1: a coded memtable of many rows is scored exactly no more than a
-//!   segment is: the default budget.
+//!   segment is, the default budget, besides the first `CODE_FROM` rows,
+//!   which are never coded and always scored exactly: so that reaching
+//!   the threshold computes a centre and codes nothing, holding the
+//!   partition's lock, which readers wait on, for well under a millisecond.
 //! - T4: coding is per collection, by its own applied versions, and once
 //!   coded a memtable stays coded however many of its rows die.
 //! - T9: a writer, a copy that followed it, and a copy opened afresh code
@@ -110,15 +113,18 @@ async fn t1_a_coded_memtable_is_scored_exactly_no_more_than_its_budget() {
                 ..Hybrid::matching("fox", Some(&all[7]), limit)
             };
             let budget = (limit * default_oversample(limit)).max(DEFAULT_CANDIDATES) as u64;
+            let bound = budget + CODE_FROM as u64;
             let work = hybrid_work(state, NOTES, &query);
             assert!(
-                work.exact_memtable <= budget,
-                "limit {limit}: {} memtable rows scored exactly, the budget is {budget}",
+                work.exact_memtable <= bound,
+                "limit {limit}: {} memtable rows scored exactly; the budget, {budget}, and the \
+                 first {CODE_FROM} rows, never coded, come to {bound}",
                 work.exact_memtable
             );
             assert_eq!(
-                work.coded_memtable, 20_000,
-                "every live row ranked by its code"
+                work.coded_memtable,
+                20_000 - CODE_FROM as u64,
+                "every live row after the first CODE_FROM ranked by its code"
             );
         }
     });
@@ -149,7 +155,8 @@ async fn t4_a_collection_is_coded_by_its_own_versions_and_stays_coded() {
         let coding = state.memtable_coding(&name(NOTES)).expect("notes is coded");
         assert_eq!(
             (coding.applied, coding.coded),
-            (CODE_FROM + 76, CODE_FROM + 76)
+            (CODE_FROM + 76, 76),
+            "the first CODE_FROM versions are scored exactly, uncoded"
         );
         assert_eq!(coding.centre.len() % 64, 0, "a centre in the rotated space");
         assert_eq!(
@@ -162,7 +169,7 @@ async fn t4_a_collection_is_coded_by_its_own_versions_and_stays_coded() {
     commit(&writer, (0..700).map(|n| gone(NOTES, n)).collect()).await;
     writer.partition().read(|state| {
         let coding = state.memtable_coding(&name(NOTES)).expect("still coded");
-        assert_eq!(coding.coded, CODE_FROM + 76, "dead rows keep their codes");
+        assert_eq!(coding.coded, 76, "dead rows keep their codes");
     });
 }
 
@@ -408,12 +415,63 @@ async fn t2_recall_holds_when_the_memtable_drifts_far_from_its_centre() {
     });
 }
 
+/// `count` rows with a vector, spread over `collections` collections in
+/// turn, all alike but for the collection they are in.
+async fn spread(writer: &Writer, collections: &[&str], count: u32) {
+    let mut random = Random(19);
+    let groups = centres(&mut random, 10);
+    writer
+        .commit(collections.iter().map(|c| wide(c)).collect())
+        .await
+        .unwrap();
+    commit(
+        writer,
+        (0..count)
+            .map(|n| {
+                let collection = collections[n as usize % collections.len()];
+                row(collection, n, about(&mut random, &groups, n as usize, 0.3))
+            })
+            .collect(),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn the_codes_are_counted_as_resident_and_let_go_at_a_flush() {
+    // The same rows, in one collection that is coded and in three that are
+    // not: what the first holds more is its codes.
+    let rows = CODE_FROM as u32 + 2_000;
+    let coded = Cluster::new().await;
+    let coded = coded.writer().await;
+    spread(&coded, &[NOTES], rows).await;
+    let plain = Cluster::new().await;
+    let plain = plain.writer().await;
+    spread(&plain, &[NOTES, OTHER, "third"], rows).await;
+    let resident = |writer: &Writer| writer.partition().read(State::resident);
+    let codes = 2_000 * DIMENSIONS / 8;
+    let more = resident(&coded) as i64 - resident(&plain) as i64;
+    assert!(
+        more >= codes as i64,
+        "{more} bytes more with 2,000 codes of {codes} bytes in all"
+    );
+    coded.flush().await.unwrap();
+    plain.flush().await.unwrap();
+    let more = resident(&coded) as i64 - resident(&plain) as i64;
+    assert!(
+        more < codes as i64 / 4,
+        "the codes let go at the flush: {more} bytes more"
+    );
+}
+
+/// The apply that brings a collection to `CODE_FROM` versions codes no
+/// row: it computes the centre alone. Rows after it are coded one by one.
+#[tokio::test]
+#[ignore = "F2b: the memtable is coded (burst plan F2b, PR 3)"]
+async fn reaching_the_threshold_computes_a_centre_and_codes_no_row() {
     let cluster = Cluster::new().await;
     let writer = cluster.writer().await;
     writer.commit(vec![wide(NOTES)]).await.unwrap();
-    let mut random = Random(19);
+    let mut random = Random(23);
     let groups = centres(&mut random, 10);
     let mut vector = |n: usize| about(&mut random, &groups, n, 0.3);
     commit(
@@ -423,23 +481,85 @@ async fn the_codes_are_counted_as_resident_and_let_go_at_a_flush() {
             .collect(),
     )
     .await;
-    let before = writer.partition().read(State::resident);
+    let coding = |writer: &Writer| {
+        writer
+            .partition()
+            .read(|state| state.memtable_coding(&name(NOTES)))
+    };
+    assert_eq!(coding(&writer), None);
     writer
-        .commit(vec![row(NOTES, CODE_FROM as u32, vector(0))])
+        .commit(vec![row(NOTES, CODE_FROM as u32, vector(1))])
         .await
         .unwrap();
-    let coded = writer.partition().read(State::resident);
-    // One bit a dimension for every row coded, at the least.
-    let codes = CODE_FROM * DIMENSIONS / 8;
-    assert!(
-        coded - before >= codes,
-        "{} bytes more for {CODE_FROM} codes of {codes} bytes",
-        coded - before
+    let reached = coding(&writer).expect("a centre at the threshold");
+    assert_eq!(
+        (reached.applied, reached.coded),
+        (CODE_FROM, 0),
+        "no row coded"
     );
-    writer.flush().await.unwrap();
-    let flushed = writer.partition().read(State::resident);
+    writer
+        .commit(vec![row(NOTES, CODE_FROM as u32 + 1, vector(2))])
+        .await
+        .unwrap();
+    assert_eq!(
+        coding(&writer).unwrap().coded,
+        1,
+        "the next row is coded as it comes"
+    );
+}
+
+/// How long readers waited, at the most, for the partition while
+/// `commit` ran.
+async fn longest_wait(writer: &Writer, commit: Vec<Mutation>) -> std::time::Duration {
+    let partition = writer.partition().clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reading = std::thread::spawn({
+        let stop = stop.clone();
+        move || {
+            let mut longest = std::time::Duration::ZERO;
+            while !stop.load(Ordering::SeqCst) {
+                let began = std::time::Instant::now();
+                partition.read(|_| ());
+                longest = longest.max(began.elapsed());
+            }
+            longest
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    writer.commit(commit).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    stop.store(true, Ordering::SeqCst);
+    reading.join().unwrap()
+}
+
+/// No apply holds the partition's lock, which readers wait on, for more
+/// than about a millisecond when it brings a collection to `CODE_FROM`
+/// versions of 768 dimensions. Timed in an optimised build only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(debug_assertions, ignore = "timed: run with --release")]
+async fn reaching_the_threshold_keeps_readers_waiting_a_millisecond_at_most() {
+    let mut waits = Vec::new();
+    for attempt in 0..5u64 {
+        let cluster = Cluster::new().await;
+        let writer = cluster.writer().await;
+        let mut schema = schema(NOTES);
+        schema.embedding.dimensions = 768;
+        writer
+            .commit(vec![Mutation::CreateCollection(Box::new(schema))])
+            .await
+            .unwrap();
+        let mut random = Random(29 + attempt);
+        let rows: Vec<Mutation> = (0..CODE_FROM as u32)
+            .map(|n| row(NOTES, n, random.vector(768)))
+            .collect();
+        let (before, last) = rows.split_at(CODE_FROM - 1);
+        commit(&writer, before.to_vec()).await;
+        waits.push(longest_wait(&writer, last.to_vec()).await);
+    }
+    waits.sort();
+    let median = waits[waits.len() / 2];
     assert!(
-        coded - flushed >= codes,
-        "the codes let go: {coded} before the flush, {flushed} after"
+        median <= Duration::from_millis(1),
+        "readers waited up to {median:?} (median of {waits:?})"
     );
 }
