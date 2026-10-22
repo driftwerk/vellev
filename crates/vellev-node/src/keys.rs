@@ -13,8 +13,6 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use std::panic::AssertUnwindSafe;
-
 use futures::future::{BoxFuture, FutureExt, Shared};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -347,13 +345,9 @@ impl Keys {
                 hash,
                 id,
             };
-            let looked = match AssertUnwindSafe(asked).catch_unwind().await {
-                Ok(looked) => looked.map_err(|error| Failed::Lookup(Arc::new(error.into()))),
-                Err(_) => {
-                    tracing::error!("looking a key up panicked");
-                    Err(Failed::Panicked)
-                }
-            };
+            let looked = asked
+                .await
+                .map_err(|error| Failed::Lookup(Arc::new(error.into())));
             if let Ok(tenant) = &looked {
                 let mut remembered = kept.remembered.lock().expect("keys lock");
                 if remembered.generation == generation {
@@ -365,7 +359,10 @@ impl Keys {
         let answer = async move {
             match task.await {
                 Ok(looked) => looked,
-                Err(ended) if ended.is_panic() => Err(Failed::Panicked),
+                Err(ended) if ended.is_panic() => {
+                    tracing::error!("looking a key up panicked");
+                    Err(Failed::Panicked)
+                }
                 Err(_) => Err(Failed::Stopped),
             }
         }
