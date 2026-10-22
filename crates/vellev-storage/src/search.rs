@@ -124,12 +124,24 @@ impl State {
                 Some(found)
             })
             .collect();
-        hits.sort_unstable_by(|a, b| {
+        // Nearest first, ties in object id order: a total order, so that
+        // picking the first `limit` and then ordering only them gives what
+        // ordering every hit would, without ordering the rest.
+        let order = |a: &Hit<'_>, b: &Hit<'_>| {
             a.distance
                 .total_cmp(&b.distance)
                 .then(a.object.id.cmp(&b.object.id))
-        });
-        hits.truncate(query.limit);
+        };
+        if hits.len() > query.limit {
+            match query.limit {
+                0 => hits.clear(),
+                limit => {
+                    hits.select_nth_unstable_by(limit - 1, order);
+                    hits.truncate(limit);
+                }
+            }
+        }
+        hits.sort_unstable_by(order);
         Ok(hits)
     }
 }
