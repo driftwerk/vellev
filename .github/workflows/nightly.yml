@@ -61,7 +61,7 @@ jobs:
           gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" \
             --pattern '*.zst' --pattern ATTRIBUTION.md
           sha256sum --check --strict "$GITHUB_WORKSPACE/scripts/recall-fixture/SHA256SUMS"
-          zstd --decompress --rm *.zst
+          zstd --decompress --rm -- *.zst
       - name: Recall gate
         run: cargo test --release --locked -p vellev-storage --test recall_fixture -- --ignored --nocapture
         env:
