@@ -1641,3 +1641,59 @@ async fn a_conditional_delete_goes_as_a_change_a_node_of_0_1_refuses_rather_than
     assert_eq!(*deletes.lock().unwrap(), 1);
     assert_eq!(posts.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_node_that_does_not_serve_the_tenant_is_not_asked_again_and_a_read_goes_elsewhere() {
+    let misdirected = || (421, failure("not_served_here"));
+    let elsewhere = Stub::answering(move |_, _| misdirected()).await;
+    let serving = Stub::answering(|_, _| (200, json!({ "collections": [] }))).await;
+
+    // A write is refused at the first node, once, and nothing was done.
+    let client = Client::connect(&[&elsewhere.url, &serving.url], KEY, tries(4)).unwrap();
+    let notes = client.tenant(&tenant("acme")).collection(&notes_named());
+    let failed = tokio::time::timeout(
+        Duration::from_secs(30),
+        notes.put(oid(1), &content("fox", 1, None)),
+    )
+    .await
+    .expect("failed at once, with no wait")
+    .unwrap_err();
+    assert_eq!(failed.code(), Some(Code::NotServedHere), "{failed}");
+    assert!(!failed.is_unknown_outcome());
+    assert_eq!((elsewhere.asked("acme"), serving.asked("acme")), (1, 0));
+
+    // A read is asked of the next node at once, which serves it.
+    let acme = client.tenant(&tenant("acme"));
+    tokio::time::timeout(Duration::from_secs(30), acme.collections())
+        .await
+        .expect("no wait before another node is asked")
+        .unwrap();
+    assert_eq!((elsewhere.asked("acme"), serving.asked("acme")), (2, 1));
+}
+
+#[tokio::test]
+async fn a_read_no_address_serves_fails_after_one_request_to_each() {
+    let misdirected = || (421, failure("not_served_here"));
+    let only = Stub::answering(move |_, _| misdirected()).await;
+    let client = Client::connect(&[&only.url], KEY, tries(4)).unwrap();
+    let failed = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.tenant(&tenant("acme")).collections(),
+    )
+    .await
+    .expect("failed at once, with no wait")
+    .unwrap_err();
+    assert_eq!(failed.code(), Some(Code::NotServedHere), "{failed}");
+    assert_eq!(only.asked("acme"), 1, "one address, one request");
+
+    let first = Stub::answering(move |_, _| misdirected()).await;
+    let second = Stub::answering(move |_, _| misdirected()).await;
+    let client = Client::connect(&[&first.url, &second.url], KEY, tries(4)).unwrap();
+    let failed = client
+        .tenant(&tenant("acme"))
+        .collections()
+        .await
+        .unwrap_err();
+    assert_eq!(failed.code(), Some(Code::NotServedHere), "{failed}");
+    assert_eq!((first.asked("acme"), second.asked("acme")), (1, 1));
+}

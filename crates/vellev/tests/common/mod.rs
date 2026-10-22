@@ -10,9 +10,9 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use vellev::identity::IdentityKeys;
 use vellev::server::{App, Limits};
-use vellev_core::NodeId;
+use vellev_core::{NodeId, TenantId};
 use vellev_embed::Embedders;
-use vellev_node::{Node, Settings};
+use vellev_node::{Node, Served as Tenants, Settings};
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
 use vellev_storage::coordinator::{Clock, MemoryCoordinator};
 
@@ -169,6 +169,25 @@ impl Cluster {
         let served = self
             .unstarted_with(urls, None, &[], |settings| Settings {
                 queries_per_second: Some(queries),
+                ..settings
+            })
+            .await;
+        served.app.start(served.node.clone());
+        served
+    }
+
+    /// A node that serves these tenants and no other, backing them up to
+    /// `backups` if anywhere when it is asked to.
+    pub async fn serve_serving(&self, tenants: &[&str], backups: Option<Arc<dyn Blobs>>) -> Served {
+        let listed = tenants
+            .iter()
+            .map(|name| TenantId::new(*name).unwrap())
+            .collect();
+        let served = self
+            .unstarted_with(&[], None, &[], |settings| Settings {
+                served: Tenants::Only(listed),
+                backups,
+                backups_scheduled: false,
                 ..settings
             })
             .await;

@@ -439,6 +439,24 @@ the least recently used are let go. `VELLEV_TENANT_QUERIES_PER_SECOND` and
 each node, not of the cluster; a tenant asking more is answered 429 with
 `Retry-After`, and the client waits as long and asks the same node again.
 
+`VELLEV_TENANTS` lists the tenants a node serves, comma separated; `*`, the
+default, serves every one. A node never holds, follows for reads or backs
+up a tenant it does not serve, so a large tenant can be kept to nodes of
+its own and off the others' memory. Every request for any other tenant,
+read or write, its keys, backups and restores, making it and dropping it,
+is refused with `not_served_here` (421) and sent on to no node: send each
+tenant's requests to nodes that serve it. The scheduled backups of a
+tenant are taken by the nodes that serve it. A client given a
+`not_served_here` asks that address no more for the request, and gives up
+once every address has said it: a misrouted read fails after one request
+to each address, never retried. The one thing any node does for a tenant
+it does not serve is purge it: once a tenant is dropped, whichever node
+takes the purge's claim lists and deletes its files and backups and drops
+its own cache of it. That is safe, because a purge only deletes: it opens
+no state, takes no lease, follows nothing and loads nothing of the tenant
+into memory, and it runs under the purge's claim either way. Lists hold only once every
+node runs a release that has them (see `docs/compatibility.md`).
+
 A collection with an `access_rule` is read with a tenant's key only on
 behalf of a person: the caller sends an identity token in
 `x-vellev-identity`, a JWT signed with Ed25519 under a key id, for the

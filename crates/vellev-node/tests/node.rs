@@ -18,8 +18,8 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{
-    ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Settings, LOOKED_OVER_EVERY,
-    REMEMBERED,
+    ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Served, Settings,
+    LOOKED_OVER_EVERY, REMEMBERED,
 };
 use vellev_storage::backups::{Backup, Backups, DELETED_AT_ONCE};
 use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs};
@@ -8267,4 +8267,304 @@ async fn deletes_sent_by_upkeep_stopped_by_a_lost_hold_land_after_a_restore_from
     let fresh = backing_up_to(&cluster, store);
     assert_eq!(notes_held(&fresh).await, [true, true]);
     fresh.back_up(&acme).await.unwrap();
+}
+
+/// Settings for a node of `cluster` that serves these tenants and no other.
+fn serving(cluster: &Cluster, tenants: &[&str]) -> Settings {
+    Settings {
+        served: Served::Only(tenants.iter().map(|name| tenant(name)).collect()),
+        ..cluster.settings()
+    }
+}
+
+/// The cluster's store as one node reaches it, keeping every key that node
+/// read.
+#[derive(Debug)]
+struct ReadsKept {
+    inner: Arc<Store>,
+    got: std::sync::Mutex<Vec<String>>,
+}
+
+impl ReadsKept {
+    fn new(inner: Arc<Store>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            got: std::sync::Mutex::default(),
+        })
+    }
+
+    /// How many of the keys this node read are under `prefix`.
+    fn got_under(&self, prefix: &str) -> usize {
+        let got = self.got.lock().unwrap();
+        got.iter().filter(|key| key.starts_with(prefix)).count()
+    }
+}
+
+#[async_trait]
+impl Blobs for ReadsKept {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.got.lock().unwrap().push(key.to_string());
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.got.lock().unwrap().push(prefix.to_string());
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn forget_local(&self, prefix: &str) -> vellev_storage::Result<()> {
+        self.inner.forget_local(prefix).await
+    }
+}
+
+/// The node that serves `code`, holding it with one note written, and a
+/// node that serves `memories` only, limited to one query a second for
+/// each tenant and reaching the store through `watched`.
+async fn code_held_elsewhere(cluster: &Cluster, watched: Arc<ReadsKept>) -> (Node, Node) {
+    let code = cluster.node_from(serving(cluster, &["code"]));
+    code.create_tenant(&tenant("code")).await.unwrap();
+    let opened = code.tenant(&tenant("code")).await.unwrap();
+    opened
+        .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    opened.flush().await.unwrap();
+    let memories = Node::new(
+        cluster.coordinator.clone(),
+        watched,
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            queries_per_second: Some(1.0),
+            ..serving(cluster, &["memories"])
+        },
+    );
+    (code, memories)
+}
+
+fn not_served<T: std::fmt::Debug>(answer: Result<T, NodeError>, name: &str) -> bool {
+    matches!(&answer, Err(NodeError::NotServedHere { tenant: refused }) if *refused == tenant(name))
+}
+
+#[tokio::test]
+async fn a_node_never_opens_a_tenant_it_does_not_serve_nor_takes_its_lease() {
+    let cluster = Cluster::new();
+    let memories = cluster.node_from(serving(&cluster, &["memories"]));
+    memories.create_tenant(&tenant("code")).await.unwrap();
+    let generation = || async {
+        let committed = cluster.coordinator.committed(&key("code")).await.unwrap();
+        committed.unwrap().generation
+    };
+    let before = generation().await;
+
+    let refused = memories.tenant(&tenant("code")).await;
+    assert!(not_served(refused, "code"));
+    assert!(!memories.serves(&tenant("code")));
+    assert!(memories.serves(&tenant("memories")));
+    assert_eq!(generation().await, before, "no lease taken");
+    assert!(cluster.store.list("code/").await.unwrap().is_empty());
+    assert_eq!(memories.resident(), 0, "nothing held");
+
+    // The node that serves it takes it at once: nobody holds it.
+    let code = cluster.node_from(serving(&cluster, &["code"]));
+    let opened = code.tenant(&tenant("code")).await.unwrap();
+    opened
+        .write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    // And while it does, the other is refused as before, not told who.
+    assert!(not_served(memories.tenant(&tenant("code")).await, "code"));
+    assert!(not_served(
+        memories
+            .restore(
+                &tenant("code"),
+                Point::At(Utc::now()),
+                RequestId::generate()
+            )
+            .await,
+        "code"
+    ));
+}
+
+#[tokio::test]
+async fn a_read_of_a_tenant_the_node_does_not_serve_opens_no_copy_and_is_not_counted() {
+    let cluster = Cluster::new();
+    let watched = ReadsKept::new(cluster.store.clone());
+    let (code, memories) = code_held_elsewhere(&cluster, watched.clone()).await;
+    for fresh in [Freshness::Eventual, Freshness::Strong, Freshness::Eventual] {
+        let refused = memories.reader(&tenant("code"), fresh).await;
+        assert!(not_served(refused, "code"), "not turned away as too many");
+    }
+    assert_eq!(memories.copies(), 0, "no copy followed");
+    assert_eq!(watched.got_under("code/"), 0, "nothing of it fetched");
+    assert_eq!(memories.resident(), 0, "nothing held");
+
+    // A tenant it serves is read, and counted, as ever.
+    memories.create_tenant(&tenant("memories")).await.unwrap();
+    let opened = memories.tenant(&tenant("memories")).await.unwrap();
+    opened
+        .write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    memories
+        .reader(&tenant("memories"), Freshness::Eventual)
+        .await
+        .unwrap();
+    let limited = memories
+        .reader(&tenant("memories"), Freshness::Eventual)
+        .await;
+    assert!(matches!(limited, Err(NodeError::Limited { .. })));
+    // And the tenant it does not serve is read where it is served.
+    let read = code.reader(&tenant("code"), Freshness::Strong).await;
+    assert_eq!(read.unwrap().read(count), 1);
+}
+
+#[tokio::test]
+async fn a_node_serving_one_tenant_refuses_every_other_each_way() {
+    let cluster = Cluster::new();
+    let memories = cluster.node_from(serving(&cluster, &["memories"]));
+    memories.create_tenant(&tenant("memories")).await.unwrap();
+    let opened = memories.tenant(&tenant("memories")).await.unwrap();
+    opened
+        .write(vec![schema(EmbeddingProvider::None), note(1, "owl", None)])
+        .await
+        .unwrap();
+    opened.flush().await.unwrap();
+    drop(opened);
+    memories.shutdown().await;
+
+    let watched = ReadsKept::new(cluster.store.clone());
+    let code = Node::new(
+        cluster.coordinator.clone(),
+        watched.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        serving(&cluster, &["code"]),
+    );
+    let generation = cluster
+        .coordinator
+        .committed(&key("memories"))
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+    for fresh in [Freshness::Eventual, Freshness::Strong] {
+        let refused = code.reader(&tenant("memories"), fresh).await;
+        assert!(not_served(refused, "memories"));
+    }
+    assert!(not_served(
+        code.tenant(&tenant("memories")).await,
+        "memories"
+    ));
+    assert_eq!(code.copies(), 0);
+    assert_eq!(watched.got_under("memories/"), 0, "nothing of it fetched");
+    let committed = cluster.coordinator.committed(&key("memories")).await;
+    assert_eq!(
+        committed.unwrap().unwrap().generation,
+        generation,
+        "no lease taken"
+    );
+
+    // The node that serves it takes it up again at once.
+    let again = cluster.node_from(serving(&cluster, &["memories"]));
+    assert_eq!(
+        again.tenant(&tenant("memories")).await.unwrap().read(count),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_node_takes_up_no_backup_of_a_tenant_it_does_not_serve() {
+    let (store, kept) = backed_up_elsewhere().await;
+    let cluster = Cluster::new();
+    let memories = cluster.node_from(Settings {
+        backups: Some(store.clone()),
+        ..serving(&cluster, &["memories"])
+    });
+    let refused = memories
+        .adopt_backup(&tenant("acme"), kept.id, true, RequestId::generate())
+        .await;
+    assert!(
+        not_served(refused, "acme"),
+        "refused before anything is done"
+    );
+    let identity = cluster.coordinator.identity(&tenant("acme")).await.unwrap();
+    assert!(identity.is_none(), "the tenant was not made");
+    assert!(cluster.store.list("acme/").await.unwrap().is_empty());
+
+    // A node that serves it takes it up.
+    let acme = cluster.node_from(Settings {
+        backups: Some(store),
+        ..serving(&cluster, &["acme"])
+    });
+    acme.adopt_backup(&tenant("acme"), kept.id, true, RequestId::generate())
+        .await
+        .unwrap();
+    assert_eq!(acme.tenant(&tenant("acme")).await.unwrap().read(count), 1);
+}
+
+#[tokio::test]
+async fn a_node_backs_up_only_the_tenants_it_serves() {
+    let cluster = Cluster::new();
+    let backups: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+    let node_of = |tenants: &[&str]| {
+        cluster.node_from(Settings {
+            backups: Some(backups.clone()),
+            ..serving(&cluster, tenants)
+        })
+    };
+    let (memories, code) = (node_of(&["memories"]), node_of(&["code"]));
+    for (node, name) in [(&memories, "memories"), (&code, "code")] {
+        node.create_tenant(&tenant(name)).await.unwrap();
+        let opened = node.tenant(&tenant(name)).await.unwrap();
+        opened
+            .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+            .await
+            .unwrap();
+    }
+    let every = cluster.node_from(Settings {
+        backups: Some(backups.clone()),
+        ..cluster.settings()
+    });
+    let counts = || async {
+        let mut counts = Vec::new();
+        for name in ["memories", "code"] {
+            counts.push(every.backups(&tenant(name)).await.unwrap().len());
+        }
+        counts
+    };
+
+    memories.back_up_due().await.unwrap();
+    assert_eq!(counts().await, [1, 0], "code is not memories' to back up");
+    assert!(not_served(memories.back_up(&tenant("code")).await, "code"));
+    assert_eq!(counts().await, [1, 0]);
+    code.back_up_due().await.unwrap();
+    assert_eq!(counts().await, [1, 1]);
+
+    // A node serving every tenant backs every one up, as ever.
+    cluster.clock.advance(Duration::from_secs(25 * 60 * 60));
+    every.back_up_due().await.unwrap();
+    assert_eq!(counts().await, [2, 2]);
+}
+
+#[tokio::test]
+async fn a_node_serves_every_tenant_unless_told_otherwise() {
+    let cluster = Cluster::new();
+    assert_eq!(cluster.settings().served, Served::Every);
+    let node = cluster.node();
+    for name in ["code", "memories"] {
+        assert!(node.serves(&tenant(name)));
+        node.create_tenant(&tenant(name)).await.unwrap();
+        let opened = node.tenant(&tenant(name)).await.unwrap();
+        opened
+            .write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+            .await
+            .unwrap();
+        let reading = cluster.reading_node();
+        let read = reading.reader(&tenant(name), Freshness::Strong).await;
+        assert_eq!(read.unwrap().read(count), 1);
+        assert_eq!(reading.copies(), 1);
+    }
 }

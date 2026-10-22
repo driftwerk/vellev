@@ -507,6 +507,13 @@ this release's writers are held to what they follow. A node opens one
 writer for each lease it takes, so two under one lease is not something a
 node does; the check is what makes that not matter.
 
+A node may serve only the tenants `VELLEV_TENANTS` lists. A node of a
+release before has no such setting and serves every tenant: it opens,
+follows and backs up any tenant it is asked for, whatever the others are
+told. So a tenant is kept to the nodes that list it only once every node
+runs this release. Set each node's list in the same deploy that brings it
+to this release, and leave it at `*` until then.
+
 A delete by filter may carry a `limit`. A node of a release before refuses
 the field, as it does any it does not know, so page deletes only once
 every node is upgraded; without the field a delete of more than 8,192

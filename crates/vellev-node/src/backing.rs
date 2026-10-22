@@ -177,6 +177,7 @@ fn claim_problem(hold: Duration, bounds: RequestBounds) -> Option<String> {
 impl Node {
     /// Back `tenant` up now, whenever it was last backed up.
     pub async fn back_up(&self, tenant: &TenantId) -> Result<Backup> {
+        self.0.served(tenant)?;
         let backups = self.0.backups()?;
         if self.0.coordinator.identity(tenant).await?.is_none() {
             return Err(NodeError::UnknownTenant(tenant.clone()));
@@ -257,6 +258,8 @@ impl Node {
         with_keys: bool,
         request: RequestId,
     ) -> Result<Restored> {
+        // Before the tenant is made, which comes before it is opened.
+        self.0.served(tenant)?;
         let backups = self.0.backups()?;
         let asking = Asking::of(
             request,
@@ -390,8 +393,8 @@ impl Node {
         Ok(restored)
     }
 
-    /// Back up each tenant whose last backup is as old as the node backs
-    /// tenants up, that no node is backing up already.
+    /// Back up each tenant this node serves whose last backup is as old as
+    /// the node backs tenants up, that no node is backing up already.
     pub async fn back_up_due(&self) -> Result<()> {
         self.0.back_up_due().await
     }
@@ -553,6 +556,10 @@ impl Inner {
             for key in &page {
                 if self.opened().stopped {
                     return Ok(());
+                }
+                // Each tenant is backed up by a node that serves it.
+                if !self.settings.served.serves(&key.tenant) {
+                    continue;
                 }
                 // A partition that never committed holds nothing to back
                 // up, and is passed over without taking its tenant's lock.

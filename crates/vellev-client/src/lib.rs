@@ -218,7 +218,7 @@ impl Error {
             Self::Api { code, .. } => match code {
                 Code::Unavailable => Fate::NoEffect,
                 Code::Uncertain => Fate::Unknown,
-                Code::ModelUnavailable => Fate::NotByThisNode,
+                Code::ModelUnavailable | Code::NotServedHere => Fate::NotByThisNode,
                 Code::Invalid
                 | Code::Unauthorized
                 | Code::Forbidden
@@ -570,6 +570,13 @@ impl Client {
                     let tried = match (&failure, failure.fate(), kind) {
                         (_, Fate::Final, _) | (_, Fate::NotByThisNode, Kind::Write(_)) => None,
                         (Error::Limited { wait, .. }, ..) => Some(Tried::TurnedAway(*wait)),
+                        (
+                            Error::Api {
+                                code: Code::NotServedHere,
+                                ..
+                            },
+                            ..,
+                        ) => Some(Tried::NotServedHere),
                         (_, Fate::NotByThisNode, _) => Some(Tried::NotByThisAddress),
                         (
                             Error::Api {
