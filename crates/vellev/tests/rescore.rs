@@ -14,9 +14,16 @@ const HYBRID: &str = "/v1/tenants/{tenant}/collections/{collection}/hybrid";
 const DEFAULT_RESCORE: f64 = 2_048.0;
 const ROWS: u64 = 6_000;
 
-/// `acme`'s notes: `ROWS` of them, flushed to a segment, which shortlists.
+/// `acme`'s notes: `ROWS` of them, flushed to one segment, which
+/// shortlists. The node is kept from flushing for its vectors, which would
+/// split them across segments, each with a budget of its own.
 async fn flushed() -> Served {
-    let served = Served::new().await;
+    let served = Cluster::new()
+        .serve_adjusted(|settings| vellev_node::Settings {
+            memtable_vectors: usize::MAX,
+            ..settings
+        })
+        .await;
     served.with_notes(supplied()).await;
     for start in (0..ROWS).step_by(200) {
         let changes: Vec<Value> = (start..start + 200)

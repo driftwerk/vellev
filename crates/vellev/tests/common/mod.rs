@@ -118,6 +118,13 @@ impl Cluster {
         served
     }
 
+    /// A node run as `adjusted` makes of the usual settings.
+    pub async fn serve_adjusted(&self, adjusted: impl FnOnce(Settings) -> Settings) -> Served {
+        let served = self.unstarted_with(&[], None, &[], adjusted).await;
+        served.app.start(served.node.clone());
+        served
+    }
+
     /// A node that tells other nodes it can be reached at `address`
     /// rather than where it listens.
     pub async fn serve_advertising(&self, address: &str) -> Served {
