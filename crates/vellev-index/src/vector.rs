@@ -437,43 +437,25 @@ impl BinaryIndex {
         vectors: &[(u32, &[f32])],
         centre: Vec<f32>,
     ) -> Option<Self> {
-        let _ = (metric, vectors, centre);
-        unimplemented!("burst plan F2b, PR 2")
-    }
-
-    pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
-        let rotation = Rotation::new(dimensions, ROTATION_SEED);
-        let prepared = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
+        let mut index = Self::empty(metric, dimensions, centre);
         let (measured, unmeasured): (Vec<&(u32, &[f32])>, _) = vectors
             .iter()
             .partition(|(_, vector)| measurable(metric, vector));
-        let sampled: Vec<(usize, Vec<f32>)> = Random(ROTATION_SEED)
-            .sample(measured.len(), CENTRE_SAMPLE)
-            .into_par_iter()
-            .map(|at| (at, prepared(measured[at].1)))
-            .collect();
-        let centre = median(
-            rotation.width,
-            sampled.iter().map(|(_, vector)| vector.as_slice()),
-        );
-        let words = rotation.width / 64;
+        let words = index.words;
         let mut codes = vec![0u64; measured.len() * words];
+        let (rotation, centre) = (&index.rotation, &index.centre);
         let factors = codes
             .par_chunks_mut(words)
             .zip(measured.par_iter())
-            .enumerate()
-            .map(|(at, (code, (_, vector)))| {
-                let vector = match sampled.binary_search_by_key(&at, |(sampled, _)| *sampled) {
-                    Ok(found) => Cow::Borrowed(sampled[found].1.as_slice()),
-                    Err(_) => Cow::Owned(prepared(vector)),
-                };
+            .map(|(code, (_, vector))| {
+                let vector = rotation.apply(&normalised(metric, vector));
                 code.iter_mut()
-                    .zip(encode(&centre, &vector))
+                    .zip(encode(centre, &vector))
                     .for_each(|(slot, word)| *slot = word);
-                let (squared, along) = residual(&centre, &vector);
+                let (squared, along) = residual(centre, &vector);
                 let term = match metric {
                     Distance::L2 => squared,
                     Distance::Dot | Distance::Cosine => -along,
@@ -481,21 +463,50 @@ impl BinaryIndex {
                 (term, squared.sqrt())
             })
             .collect();
+        index.rows = measured.iter().map(|(row, _)| *row).collect();
+        index.codes = codes;
+        index.factors = factors;
+        index.unmeasured = unmeasured.iter().map(|(row, _)| *row).collect();
+        Some(index)
+    }
+
+    /// An index of `dimensions`, of no rows yet, its codes taken about
+    /// `centre`.
+    fn empty(metric: Distance, dimensions: usize, centre: Vec<f32>) -> Self {
+        let rotation = Rotation::new(dimensions, ROTATION_SEED);
+        debug_assert_eq!(centre.len(), rotation.width);
         let bits = rotation.width;
-        Some(Self {
+        Self {
             metric,
             dimensions,
+            words: rotation.width / 64,
             rotation,
             centre,
-            words,
-            rows: measured.iter().map(|(row, _)| *row).collect(),
-            codes,
-            factors,
-            unmeasured: unmeasured.iter().map(|(row, _)| *row).collect(),
+            rows: Vec::new(),
+            codes: Vec::new(),
+            factors: Vec::new(),
+            unmeasured: Vec::new(),
             cosines: (0..=bits)
                 .map(|hamming| ranked_cosine(hamming, bits))
                 .collect(),
-        })
+        }
+    }
+
+    pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
+        let dimensions = vectors.first()?.1.len();
+        let rotation = Rotation::new(dimensions, ROTATION_SEED);
+        let measured: Vec<&[f32]> = vectors
+            .iter()
+            .map(|(_, vector)| *vector)
+            .filter(|vector| measurable(metric, vector))
+            .collect();
+        let sampled: Vec<Vec<f32>> = Random(ROTATION_SEED)
+            .sample(measured.len(), CENTRE_SAMPLE)
+            .into_par_iter()
+            .map(|at| rotation.apply(&normalised(metric, measured[at])))
+            .collect();
+        let centre = median(rotation.width, sampled.iter().map(Vec::as_slice));
+        Self::build_about(metric, vectors, centre)
     }
 
     /// An index of no rows yet, its codes to be taken about the mean of
@@ -506,15 +517,44 @@ impl BinaryIndex {
     /// once, so that it comes out the same to the bit on every machine.
     /// `None` when `first` has nothing to measure.
     pub fn about_mean(metric: Distance, first: &[&[f32]]) -> Option<Self> {
-        let _ = (metric, first);
-        unimplemented!("burst plan F2b, PR 2")
+        let dimensions = first.first()?.len();
+        let rotation = Rotation::new(dimensions, ROTATION_SEED);
+        let mut sums = vec![0.0f64; rotation.width];
+        let mut counted = 0usize;
+        for vector in first.iter().filter(|vector| measurable(metric, vector)) {
+            let rotated = rotation.apply(&normalised(metric, vector));
+            for (sum, value) in sums.iter_mut().zip(&rotated) {
+                *sum += f64::from(*value);
+            }
+            counted += 1;
+        }
+        if counted == 0 {
+            return None;
+        }
+        let centre = sums
+            .iter()
+            .map(|sum| (sum / counted as f64) as f32)
+            .collect();
+        Some(Self::empty(metric, dimensions, centre))
     }
 
     /// Code `vector` as row `row`, which must come after every row coded
     /// so far.
     pub fn push(&mut self, row: u32, vector: &[f32]) {
-        let _ = (row, vector);
-        unimplemented!("burst plan F2b, PR 2")
+        debug_assert_eq!(vector.len(), self.dimensions);
+        if !measurable(self.metric, vector) {
+            self.unmeasured.push(row);
+            return;
+        }
+        let rotated = self.rotation.apply(&normalised(self.metric, vector));
+        let (squared, along) = residual(&self.centre, &rotated);
+        let term = match self.metric {
+            Distance::L2 => squared,
+            Distance::Dot | Distance::Cosine => -along,
+        };
+        self.codes.extend(encode(&self.centre, &rotated));
+        self.factors.push((term, squared.sqrt()));
+        self.rows.push(row);
     }
 
     /// The centre codes are taken about, in the rotated space.
@@ -524,7 +564,13 @@ impl BinaryIndex {
 
     /// About how many bytes the index takes in memory.
     pub fn resident(&self) -> usize {
-        unimplemented!("burst plan F2b, PR 2")
+        use std::mem::size_of;
+        self.centre.len() * size_of::<f32>()
+            + self.rows.capacity() * size_of::<u32>()
+            + self.codes.capacity() * size_of::<u64>()
+            + self.factors.capacity() * size_of::<(f32, f32)>()
+            + self.unmeasured.capacity() * size_of::<u32>()
+            + self.cosines.len() * size_of::<f32>()
     }
 
     fn hamming(&self, position: usize, query: &[u64]) -> usize {
