@@ -2283,4 +2283,75 @@ mod tests {
         assert_eq!(built.walk("b", None, 4), [oid(5)]);
         assert_eq!(built.state.count(&b), 1);
     }
+
+    /// Codes prepared for a log before a flush that codes the memtable
+    /// afresh, about another centre, are not stored when the log is applied
+    /// after it: the row is coded about the centre it is stored beside.
+    #[test]
+    fn codes_prepared_before_the_memtable_is_coded_afresh_are_not_stored() {
+        let index = |built: &Built| -> BinaryIndex {
+            match &built.state.memtable.indexes[&CollectionId(0)].vectors {
+                Some(Vectors::Binary(codes)) => codes.clone(),
+                _ => panic!("coded"),
+            }
+        };
+        let mut built = Built::new(&["notes"]);
+        built.commit((0..1_100).map(|n| upsert(0, n, n as i64)).collect());
+        let mut snapshot = built.state.snapshot().unwrap();
+        while built.state.copy_rows(&mut snapshot, 7) {}
+        // Beside the flush, more than CODE_FROM rows of other directions.
+        let beside: Vec<Op> = (5_000..6_100).map(|n| upsert(0, n, -(n as i64))).collect();
+        let late = vec![upsert(0, 9_999, 77)];
+        built.commit(beside.clone());
+        let position = built.state.position().next().unwrap();
+        let log = LogSegment {
+            position,
+            prev: built.state.head().map(str::to_string),
+            ops: late.clone(),
+            answered: Vec::new(),
+        };
+        let prepared = built.state.prepared(&log);
+        let before = index(&built).centre().to_vec();
+        let file = SegmentFile {
+            position: snapshot.position,
+            rows: snapshot.rows.clone(),
+            tombstones: snapshot.tombstones.clone(),
+        };
+        let catalog = snapshot.catalog.clone();
+        let fit = built.fit(file, &catalog);
+        let at = built.state.position().next().unwrap();
+        built
+            .state
+            .flushed(&format!("manifest-{}", at.0), at, snapshot, Some(fit), None);
+        assert_ne!(index(&built).centre(), before.as_slice(), "coded afresh");
+        let position = built.state.position().next().unwrap();
+        let log = LogSegment {
+            prev: built.state.head().map(str::to_string),
+            position,
+            ..log
+        };
+        built
+            .state
+            .apply_prepared(&format!("log-{}", position.0), &log, prepared)
+            .unwrap();
+        // The rows the flush kept, and the late one, coded with nothing
+        // prepared.
+        let mut plain = Built::new(&["notes"]);
+        plain.commit(beside.into_iter().chain(late).collect());
+        let query = [0.3f32, -0.9];
+        let ranked = |codes: &BinaryIndex| {
+            codes
+                .estimates(
+                    &query,
+                    10_000,
+                    None,
+                    &[],
+                    &vellev_index::vector::in_row_order,
+                )
+                .into_iter()
+                .map(|(estimate, _)| estimate.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranked(&index(&built)), ranked(&index(&plain)));
+    }
 }
