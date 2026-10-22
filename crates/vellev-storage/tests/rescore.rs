@@ -107,7 +107,6 @@ fn hybrid_work(state: &State, query: &Hybrid<'_>) -> Work {
 }
 
 #[tokio::test]
-#[ignore = "F1: the hybrid rescore budget (burst plan PR4)"]
 async fn t1_a_default_hybrid_search_scores_at_most_its_default_budget() {
     let all = vectors(12_000, 3);
     let (_cluster, writer) = laid_out(&all, &[12_000], false).await;
