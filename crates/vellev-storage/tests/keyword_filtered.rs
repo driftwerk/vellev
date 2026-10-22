@@ -117,6 +117,9 @@ async fn t6b_a_narrow_filter_reads_postings_for_the_rows_it_allows() {
     });
 }
 
+/// Which rows, by number, a filter allows.
+type Allowed = Box<dyn Fn(u128) -> bool>;
+
 #[tokio::test]
 async fn t8_a_filtered_search_finds_what_scoring_every_row_and_keeping_the_allowed_finds() {
     let (_cluster, writer) = notes(true).await;
@@ -124,7 +127,7 @@ async fn t8_a_filtered_search_finds_what_scoring_every_row_and_keeping_the_allow
         // Runs of allowed rows, and rows allowed one in two: a walk that
         // lands past the next allowed row skips one only when they are
         // scattered.
-        let mut filters: Vec<(String, Filter, Box<dyn Fn(u128) -> bool>)> = [1, 10, 50, 100]
+        let mut filters: Vec<(String, Filter, Allowed)> = [1, 10, 50, 100]
             .into_iter()
             .map(|cut| {
                 let allowed: Box<dyn Fn(u128) -> bool> = Box::new(move |n| n % 100 < cut);
