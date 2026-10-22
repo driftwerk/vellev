@@ -57,6 +57,10 @@ pub(crate) enum Tried {
     TurnedAway(Duration),
     /// The address cannot do it as it is set up; another may.
     NotByThisAddress,
+    /// The address does not serve the tenant, and never will in this
+    /// request: it is not asked again, and once no address is left that
+    /// may serve it, the request is given up.
+    NotServedHere,
     /// The address answered with less than another might.
     Less,
 }
@@ -85,6 +89,8 @@ pub(crate) struct Schedule {
     backoff: Duration,
     /// The addresses that have said they cannot do the request.
     unable: Vec<bool>,
+    /// The addresses that said they do not serve the tenant.
+    refused: Vec<bool>,
     /// The addresses asked since the last wait.
     asked: Vec<bool>,
     /// The addresses asked at all.
@@ -107,6 +113,7 @@ impl Schedule {
             tries_left: tries,
             backoff,
             unable: vec![false; addresses],
+            refused: vec![false; addresses],
             sent: asked.clone(),
             asked,
             told_to_wait: Duration::ZERO,
@@ -132,6 +139,14 @@ impl Schedule {
                 self.unable[self.address] = true;
                 self.unable.contains(&false)
             }
+            Tried::NotServedHere => {
+                self.unable[self.address] = true;
+                self.refused[self.address] = true;
+                if !self.refused.contains(&false) {
+                    return Next::GiveUp;
+                }
+                self.unable.contains(&false)
+            }
             Tried::MayPass | Tried::Busy(_) | Tried::TurnedAway(_) | Tried::Less => false,
         };
         if !free {
@@ -146,7 +161,7 @@ impl Schedule {
                 self.told_to_wait = self.told_to_wait.max(wait.min(LONGEST_TURNED_AWAY));
                 (self.following(), Duration::ZERO)
             }
-            Tried::MayPass | Tried::NotByThisAddress | Tried::Less => {
+            Tried::MayPass | Tried::NotByThisAddress | Tried::NotServedHere | Tried::Less => {
                 (self.following(), Duration::ZERO)
             }
         };
@@ -170,10 +185,13 @@ impl Schedule {
     /// said they cannot while any has not.
     fn following(&self) -> usize {
         let count = self.unable.len();
-        let mut round = (1..=count).map(|step| (self.address + step) % count);
+        let round = || (1..=count).map(|step| (self.address + step) % count);
         let passed_over = self.unable.contains(&false);
-        round
-            .find(|&address| !(passed_over && self.unable[address]))
+        // An address that does not serve the tenant is never asked again;
+        // `after` gives up before every address has said so.
+        round()
+            .find(|&address| !self.refused[address] && !(passed_over && self.unable[address]))
+            .or_else(|| round().find(|&address| !self.refused[address]))
             .unwrap_or(self.address)
     }
 }
@@ -267,6 +285,28 @@ mod tests {
             asked(&[then_able], 0, 4),
             (vec![(0, NONE), (0, MS(100))], true),
             "another node may be behind the one address next time"
+        );
+    }
+
+    #[test]
+    fn an_address_that_does_not_serve_the_tenant_is_asked_once_and_none_left_gives_up() {
+        const REFUSED: &[Option<Tried>] = &[Some(Tried::NotServedHere)];
+        assert_eq!(asked(&[REFUSED], 0, 4), (vec![(0, NONE)], false));
+        assert_eq!(
+            asked(&[REFUSED, REFUSED], 1, 4),
+            (vec![(1, NONE), (0, NONE)], false)
+        );
+        assert_eq!(
+            asked(&[REFUSED, DONE], 0, 1),
+            (vec![(0, NONE), (1, NONE)], true)
+        );
+        // A refusing address is passed over even once others failed.
+        assert_eq!(
+            asked(&[REFUSED, AWAY], 0, 3),
+            (
+                vec![(0, NONE), (1, NONE), (1, MS(100)), (1, MS(200))],
+                false
+            )
         );
     }
 

@@ -570,6 +570,13 @@ impl Client {
                     let tried = match (&failure, failure.fate(), kind) {
                         (_, Fate::Final, _) | (_, Fate::NotByThisNode, Kind::Write(_)) => None,
                         (Error::Limited { wait, .. }, ..) => Some(Tried::TurnedAway(*wait)),
+                        (
+                            Error::Api {
+                                code: Code::NotServedHere,
+                                ..
+                            },
+                            ..,
+                        ) => Some(Tried::NotServedHere),
                         (_, Fate::NotByThisNode, _) => Some(Tried::NotByThisAddress),
                         (
                             Error::Api {
