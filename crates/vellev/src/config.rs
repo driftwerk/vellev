@@ -153,6 +153,14 @@ pub struct Config {
     /// flushed.
     #[arg(long, env = "VELLEV_FLUSH_ROWS", default_value_t = 50_000)]
     pub flush_rows: usize,
+    /// A tenant with more live rows with a vector than this written since
+    /// its last checkpoint is flushed, at most once every
+    /// `VELLEV_MEMTABLE_FLUSH_EVERY_SECS`: rows not yet flushed have no
+    /// vector index, and a search scores each of them exactly.
+    #[arg(long, env = "VELLEV_MEMTABLE_VECTORS", default_value_t = vellev_storage::SHORTLIST_ABOVE)]
+    pub memtable_vectors: usize,
+    #[arg(long, env = "VELLEV_MEMTABLE_FLUSH_EVERY_SECS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub memtable_flush_every_secs: u64,
     /// How far back a tenant may be restored unless it is set otherwise for
     /// it, in seconds. What a restore that far back needs is kept.
     #[arg(long, env = "VELLEV_RESTORE_WINDOW_SECS", default_value_t = 14 * 24 * 60 * 60)]
@@ -600,6 +608,8 @@ impl Config {
         let settings = Settings {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
+            memtable_vectors: self.memtable_vectors,
+            memtable_flush_every: Duration::from_secs(self.memtable_flush_every_secs),
             restore_window: Duration::from_secs(self.restore_window_secs),
             backups,
             backup_every: Duration::from_secs(self.backup_every_secs),

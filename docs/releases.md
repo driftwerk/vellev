@@ -361,6 +361,14 @@ and say what the caller then answers for.
   the defaults): multiply it by that to keep the old recall. Results can
   differ where the vector search's index would have needed more rows to
   find the nearest: name a larger `oversample` to have them.
+- **A tenant is flushed once more than 4,000 live rows with a vector are
+  in memory** (`VELLEV_MEMTABLE_VECTORS`), at most once every 30 seconds
+  (`VELLEV_MEMTABLE_FLUSH_EVERY_SECS`), as well as at `VELLEV_FLUSH_ROWS`.
+  Rows not yet flushed have no vector index and every search scores each
+  of them exactly; a collection of a few thousand to fifty thousand
+  vectors otherwise kept them all in memory. More flushes mean more
+  segments, merges and checkpoint files to back up: see the burst plan's
+  F2a measurements. A stopgap until rows in memory are indexed.
 - **Metrics for Prometheus**, on a listener of their own: set
   `VELLEV_METRICS_LISTEN`. Requests are timed whole and by stage, and
   searches report the rows they scored and how much their filter allowed;

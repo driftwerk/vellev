@@ -461,6 +461,11 @@ pub struct Tenant {
     commits: GroupCommitter,
     embedders: Arc<Embedders>,
     flush_rows: usize,
+    /// See [`Settings::memtable_vectors`].
+    memtable_vectors: usize,
+    memtable_flush_every: Duration,
+    /// When the tenant was last flushed for the vectors in its memtable.
+    flushed_for_vectors: Mutex<Option<Instant>>,
     flushes: mpsc::Sender<()>,
     /// Lost once the writer can no longer write or the node lets the tenant
     /// go, so that the node opens the tenant afresh for the next caller.
@@ -758,10 +763,28 @@ impl Tenant {
             });
             self.limits.owe(&self.id, Asked::Write, deleted.sum());
         }
-        if self.read(State::unflushed) >= self.flush_rows {
+        if self.flush_due() {
             let _ = self.flushes.try_send(());
         }
         Ok(receipt)
+    }
+
+    /// Whether the tenant should be flushed: for as many rows as
+    /// [`Settings::flush_rows`] written since its last checkpoint, or for
+    /// more live rows with a vector than [`Settings::memtable_vectors`],
+    /// if it has not been flushed for its vectors within
+    /// [`Settings::memtable_flush_every`].
+    fn flush_due(&self) -> bool {
+        self.read(State::unflushed) >= self.flush_rows || self.vectors_due()
+    }
+
+    fn vectors_due(&self) -> bool {
+        self.read(State::unflushed_vectors) > self.memtable_vectors
+            && self
+                .flushed_for_vectors
+                .lock()
+                .expect("vector flush lock")
+                .is_none_or(|at| at.elapsed() >= self.memtable_flush_every)
     }
 
     /// Move what has been written since the last checkpoint out of memory.
@@ -1605,6 +1628,8 @@ impl Inner {
             group,
             queue,
             flush_rows,
+            memtable_vectors,
+            memtable_flush_every,
             ..
         } = &self.settings;
         let (lease, committed) = match self.coordinator.acquire(&key(tenant), node, *lease).await {
@@ -1676,6 +1701,9 @@ impl Inner {
             writer,
             embedders: self.embedders.clone(),
             flush_rows: *flush_rows,
+            memtable_vectors: *memtable_vectors,
+            memtable_flush_every: *memtable_flush_every,
+            flushed_for_vectors: Mutex::default(),
             flushes,
             hold,
             deadline,
@@ -1716,7 +1744,13 @@ impl Inner {
                 if !tenant.held() {
                     return;
                 }
-                if flush && tenant.read(State::unflushed) >= tenant.flush_rows {
+                if flush && tenant.flush_due() {
+                    if tenant.vectors_due() {
+                        *tenant
+                            .flushed_for_vectors
+                            .lock()
+                            .expect("vector flush lock") = Some(Instant::now());
+                    }
                     if let Err(error) = tenant.flush().await {
                         tracing::warn!(tenant = %tenant.id, %error, "flush failed");
                         continue;
