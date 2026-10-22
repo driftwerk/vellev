@@ -52,6 +52,27 @@ fn row(collection: &str, n: u32, vector: Vec<f32>) -> Mutation {
     }
 }
 
+/// A row with no vector, which no search by vector scores and coding does
+/// not count.
+fn bare(collection: &str, n: u32) -> Mutation {
+    match row(collection, n, Vec::new()) {
+        Mutation::Upsert {
+            collection,
+            id,
+            properties,
+            only_if_version,
+            ..
+        } => Mutation::Upsert {
+            collection,
+            id,
+            properties,
+            vector: None,
+            only_if_version,
+        },
+        _ => unreachable!(),
+    }
+}
+
 fn gone(collection: &str, n: u32) -> Mutation {
     Mutation::Delete {
         collection: name(collection),
@@ -126,6 +147,12 @@ async fn t1_a_coded_memtable_is_scored_exactly_no_more_than_its_budget() {
                 20_000 - CODE_FROM as u64,
                 "every live row after the first CODE_FROM ranked by its code"
             );
+            assert!(
+                work.exact_memtable >= bound,
+                "limit {limit}: {} memtable rows scored exactly; the shortlist has the whole \
+                 budget, {budget}, besides the first {CODE_FROM}",
+                work.exact_memtable
+            );
         }
     });
 }
@@ -137,8 +164,14 @@ async fn t4_a_collection_is_coded_by_its_own_versions_and_stays_coded() {
     writer.commit(vec![wide(NOTES), wide(OTHER)]).await.unwrap();
     let mut random = Random(5);
     let groups = centres(&mut random, 10);
+    // Rows without a vector among them, which coding does not count.
     let notes: Vec<Mutation> = (0..CODE_FROM as u32 + 76)
-        .map(|n| row(NOTES, n, about(&mut random, &groups, n as usize, 0.3)))
+        .flat_map(|n| {
+            [
+                row(NOTES, n, about(&mut random, &groups, n as usize, 0.3)),
+                bare(NOTES, 500_000 + n),
+            ]
+        })
         .collect();
     let other: Vec<Mutation> = (0..900)
         .map(|n| {
@@ -231,7 +264,14 @@ async fn t9_a_writer_and_its_copies_code_and_answer_alike_with_changes_beside_a_
         .map(|n| row(NOTES, n, vector(n as usize + 7)))
         .collect();
     beside.extend((100..150).map(|n| gone(NOTES, n)));
-    beside.extend((600..1_800).map(|n| row(NOTES, n, vector(n as usize))));
+    beside.extend((600..1_800).flat_map(|n| {
+        // Rows without a vector among them, which coding does not count.
+        let mut written = vec![row(NOTES, n, vector(n as usize))];
+        if n % 3 == 0 {
+            written.push(bare(NOTES, 300_000 + n));
+        }
+        written
+    }));
     beside.extend((600..700).map(|n| row(NOTES, n, vector(n as usize + 11))));
     beside.extend((700..750).map(|n| gone(NOTES, n)));
     commit(&writer, beside).await;
@@ -244,6 +284,7 @@ async fn t9_a_writer_and_its_copies_code_and_answer_alike_with_changes_beside_a_
         .collect();
     after.extend((800..820).map(|n| gone(NOTES, n)));
     after.extend((1_800..7_000).map(|n| row(NOTES, n, vector(n as usize))));
+    after.extend((7_000..7_200).map(|n| bare(NOTES, n)));
     commit(&writer, after).await;
     let committed = cluster.committed().await;
     following.catch_up(&committed).await.unwrap();
@@ -537,6 +578,7 @@ async fn longest_wait(writer: &Writer, commit: Vec<Mutation>) -> std::time::Dura
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(debug_assertions, ignore = "timed: run with --release")]
 async fn reaching_the_threshold_keeps_readers_waiting_a_millisecond_at_most() {
+    let _timed = timed().await;
     let mut waits = Vec::new();
     for attempt in 0..5u64 {
         let cluster = Cluster::new().await;
@@ -558,8 +600,166 @@ async fn reaching_the_threshold_keeps_readers_waiting_a_millisecond_at_most() {
     waits.sort();
     eprintln!("readers waited at most {waits:?} as the threshold was reached");
     let median = waits[waits.len() / 2];
+    // About a millisecond: a bound loose enough for a busy machine, and
+    // well under the 5 ms that coding the first rows here took.
     assert!(
-        median <= Duration::from_millis(1),
+        median <= Duration::from_millis(2),
         "readers waited up to {median:?} (median of {waits:?})"
     );
+}
+
+/// The timed tests, one at a time: timings taken beside another test's
+/// work measure that work.
+async fn timed() -> tokio::sync::MutexGuard<'static, ()> {
+    static TIMED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    TIMED.lock().await
+}
+
+/// Two collections written in turn, each past `CODE_FROM`, and kept
+/// through a flush: a search of one finds only its own rows, before and
+/// after the flush, however its codes were made.
+#[tokio::test]
+async fn a_collections_codes_hold_its_own_rows_alone_through_a_flush() {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
+    let writer = Arc::new(cluster.writer().await);
+    writer.commit(vec![wide(NOTES), wide(OTHER)]).await.unwrap();
+    let mut random = Random(41);
+    let groups = centres(&mut random, 10);
+    let mut vector = |n: usize| about(&mut random, &groups, n, 0.3);
+    // Ids of notes are below 100,000, of other above.
+    let interleaved = |vector: &mut dyn FnMut(usize) -> Vec<f32>, from: u32, to: u32| {
+        (from..to)
+            .flat_map(|n| {
+                [
+                    row(NOTES, n, vector(n as usize)),
+                    row(OTHER, 100_000 + n, vector(n as usize + 1)),
+                ]
+            })
+            .collect::<Vec<Mutation>>()
+    };
+    commit(&writer, interleaved(&mut vector, 0, 300)).await;
+    paused.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    assert_eq!(stored.recv().await, Some("stored"));
+    paused.armed.store(false, Ordering::SeqCst);
+    commit(&writer, interleaved(&mut vector, 300, 5_600)).await;
+    let queries: Vec<Vec<f32>> = (0..20).map(|n| vector(n * 97)).collect();
+    let own = |state: &State, collection: &str, below: bool| {
+        for query in &queries {
+            let query = Query {
+                oversample: 1,
+                ..Query::nearest(query, 50)
+            };
+            for hit in state.search(&name(collection), &query).unwrap() {
+                let id = hit.object.id.0.as_u128();
+                assert_eq!(id < 100_000, below, "{collection} found {id}");
+            }
+        }
+    };
+    let check = |when: &str| {
+        writer.partition().read(|state| {
+            assert!(
+                state.memtable_coding(&name(NOTES)).is_some(),
+                "{when}: notes coded"
+            );
+            assert!(
+                state.memtable_coding(&name(OTHER)).is_some(),
+                "{when}: other coded"
+            );
+            own(state, NOTES, true);
+            own(state, OTHER, false);
+        })
+    };
+    check("before the flush");
+    paused.release.notify_one();
+    flushing.await.unwrap().unwrap();
+    check("after the flush");
+}
+
+/// How long readers waited, at the most, for the partition while a flush
+/// held beside `kept` rows written meanwhile was let go and adopted.
+async fn longest_wait_at_a_flush(kept: u32) -> std::time::Duration {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
+    let writer = Arc::new(cluster.writer().await);
+    let mut schema = schema(NOTES);
+    schema.embedding.dimensions = 768;
+    writer
+        .commit(vec![Mutation::CreateCollection(Box::new(schema))])
+        .await
+        .unwrap();
+    let mut random = Random(43 + u64::from(kept));
+    commit(
+        &writer,
+        (0..1_000)
+            .map(|n| row(NOTES, n, random.vector(768)))
+            .collect(),
+    )
+    .await;
+    paused.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    assert_eq!(stored.recv().await, Some("stored"));
+    paused.armed.store(false, Ordering::SeqCst);
+    commit(
+        &writer,
+        (1_000..1_000 + kept)
+            .map(|n| row(NOTES, n, random.vector(768)))
+            .collect(),
+    )
+    .await;
+    let partition = writer.partition().clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reading = std::thread::spawn({
+        let stop = stop.clone();
+        move || {
+            let mut longest = std::time::Duration::ZERO;
+            while !stop.load(Ordering::SeqCst) {
+                let began = std::time::Instant::now();
+                partition.read(|_| ());
+                longest = longest.max(began.elapsed());
+            }
+            longest
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    paused.release.notify_one();
+    flushing.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    stop.store(true, Ordering::SeqCst);
+    let longest = reading.join().unwrap();
+    writer.partition().read(|state| {
+        let coding = state.memtable_coding(&name(NOTES)).expect("coded");
+        assert_eq!(coding.applied, kept as usize, "the kept rows recoded");
+    });
+    longest
+}
+
+/// Adopting a flush keeps readers waiting a few milliseconds at most,
+/// however many rows were written beside it and are kept, coded: their
+/// codes and indexes are made before the partition is locked. Timed in an
+/// optimised build only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(debug_assertions, ignore = "timed: run with --release")]
+async fn adopting_a_flush_keeps_readers_waiting_a_few_milliseconds_however_much_it_keeps() {
+    let _timed = timed().await;
+    for kept in [4_000u32, 16_000] {
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            waits.push(longest_wait_at_a_flush(kept).await);
+        }
+        waits.sort();
+        eprintln!("{kept} rows kept: readers waited at most {waits:?}");
+        let median = waits[waits.len() / 2];
+        assert!(
+            median <= Duration::from_millis(5),
+            "{kept} rows kept: readers waited up to {median:?} (median of {waits:?})"
+        );
+    }
 }

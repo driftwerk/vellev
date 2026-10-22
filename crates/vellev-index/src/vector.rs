@@ -426,6 +426,13 @@ pub struct BinaryIndex {
     cosines: Vec<f32>,
 }
 
+/// One row's code and factors, as [`BinaryIndex::code`] works them out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Coded {
+    words: Vec<u64>,
+    factors: (f32, f32),
+}
+
 impl BinaryIndex {
     /// Index `vectors`, which must be in ascending row order and all of one
     /// length, for search under `metric`. Returns `None` when there is
@@ -545,10 +552,18 @@ impl BinaryIndex {
     /// Code `vector` as row `row`, which must come after every row coded
     /// so far.
     pub fn push(&mut self, row: u32, vector: &[f32]) {
+        let coded = self.code(vector);
+        self.push_coded(row, coded);
+    }
+
+    /// What [`Self::push`] stores for `vector`: its code and factors about
+    /// this index's centre, or `None` for a vector too long to measure,
+    /// which is scored exactly. Worked out apart from the index, so that it
+    /// can be done before whatever holds the index is locked to change it.
+    pub fn code(&self, vector: &[f32]) -> Option<Coded> {
         debug_assert_eq!(vector.len(), self.dimensions);
         if !measurable(self.metric, vector) {
-            self.unmeasured.push(row);
-            return;
+            return None;
         }
         let rotated = self.rotation.apply(&normalised(self.metric, vector));
         let (squared, along) = residual(&self.centre, &rotated);
@@ -556,9 +571,24 @@ impl BinaryIndex {
             Distance::L2 => squared,
             Distance::Dot | Distance::Cosine => -along,
         };
-        self.codes.extend(encode(&self.centre, &rotated));
-        self.factors.push((term, squared.sqrt()));
-        self.rows.push(row);
+        Some(Coded {
+            words: encode(&self.centre, &rotated).collect(),
+            factors: (term, squared.sqrt()),
+        })
+    }
+
+    /// Store row `row`, which must come after every row taken so far, as
+    /// [`Self::code`] coded it about this index's centre.
+    pub fn push_coded(&mut self, row: u32, coded: Option<Coded>) {
+        match coded {
+            None => self.unmeasured.push(row),
+            Some(Coded { words, factors }) => {
+                debug_assert_eq!(words.len(), self.words);
+                self.codes.extend(words);
+                self.factors.push(factors);
+                self.rows.push(row);
+            }
+        }
     }
 
     /// Take row `row`, which must come after every row taken so far, to be
