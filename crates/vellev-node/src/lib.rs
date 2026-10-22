@@ -763,7 +763,9 @@ impl Tenant {
             });
             self.limits.owe(&self.id, Asked::Write, deleted.sum());
         }
-        if self.flush_due() {
+        // A tenant held back from a flush for its vectors wakes its
+        // maintenance too, which waits then only as long as it must.
+        if self.flush_due() || self.vectors_wait().is_some() {
             let _ = self.flushes.try_send(());
         }
         Ok(receipt)
@@ -776,6 +778,18 @@ impl Tenant {
     /// [`Settings::memtable_flush_every`].
     fn flush_due(&self) -> bool {
         self.read(State::unflushed) >= self.flush_rows || self.vectors_due()
+    }
+
+    /// How long until the tenant may be flushed for its vectors, if it has
+    /// more than [`Settings::memtable_vectors`] of them in memory.
+    fn vectors_wait(&self) -> Option<Duration> {
+        if self.read(State::unflushed_vectors) <= self.memtable_vectors {
+            return None;
+        }
+        let last = *self.flushed_for_vectors.lock().expect("vector flush lock");
+        Some(last.map_or(Duration::ZERO, |at| {
+            self.memtable_flush_every.saturating_sub(at.elapsed())
+        }))
     }
 
     fn vectors_due(&self) -> bool {
@@ -1733,7 +1747,15 @@ impl Inner {
         let tenant = Arc::downgrade(tenant);
         let maintaining = tokio::spawn(async move {
             loop {
-                let flush = match tokio::time::timeout(every, wanted.recv()).await {
+                // A tenant held back from a flush for its vectors is
+                // looked at again as soon as it may be flushed, rather than
+                // at the next write: a quiet tenant would keep them in
+                // memory, scored exactly by every search, until then.
+                let wait = match tenant.upgrade().and_then(|tenant| tenant.vectors_wait()) {
+                    Some(wait) => wait.min(every),
+                    None => every,
+                };
+                let flush = match tokio::time::timeout(wait, wanted.recv()).await {
                     Ok(Some(())) => true,
                     Ok(None) => return,
                     Err(_) => false,
@@ -1741,6 +1763,7 @@ impl Inner {
                 let Some(tenant) = tenant.upgrade() else {
                     return;
                 };
+                let flush = flush || tenant.vectors_due();
                 if !tenant.held() {
                     return;
                 }
