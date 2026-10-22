@@ -316,8 +316,15 @@ async fn t5_a_memtable_with_few_live_rows_is_scored_whole_however_many_died() {
     writer.partition().read(|state| {
         for (q, limit) in [(0usize, 10usize), (1, 50), (2, 300)] {
             let query = about(&mut Random(100 + q as u64), &groups, q, 0.3);
+            // An oversample of one: were the memtable shortlisted, only as
+            // many rows as asked for would be scored, and the nearest
+            // missed; scored whole, every one is.
+            let asked = Query {
+                oversample: 1,
+                ..Query::nearest(&query, limit)
+            };
             let found: Vec<(ObjectId, f32)> = state
-                .search(&name(NOTES), &Query::nearest(&query, limit))
+                .search(&name(NOTES), &asked)
                 .unwrap()
                 .into_iter()
                 .map(|hit| (hit.object.id, hit.distance))
