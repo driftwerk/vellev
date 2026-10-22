@@ -11,7 +11,7 @@ use vellev_core::TenantId;
 
 const HYBRID: &str = "/v1/tenants/{tenant}/collections/{collection}/hybrid";
 /// The most rows a hybrid search with no `oversample` scores exactly.
-const DEFAULT_RESCORE: f64 = 1_024.0;
+const DEFAULT_RESCORE: f64 = 2_048.0;
 const ROWS: u64 = 6_000;
 
 /// `acme`'s notes: `ROWS` of them, flushed to a segment, which shortlists.
