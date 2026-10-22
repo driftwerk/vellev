@@ -350,7 +350,9 @@ and say what the caller then answers for.
 - **A hybrid search scores far fewer rows exactly.** Its vector search
   scored `candidates × oversample` rows exactly (12,800 by default, nearly
   every row of a mid-sized collection); it now scores `limit × oversample`,
-  and at least `candidates`: 1,020 for ten results by default. The budget
+  and at least `candidates`: 1,020 for ten results by default (the
+  default oversample at limit 10 is 102, lowered by the 1,024 cap from the
+  128 that gave 1,280). The budget
   is per segment that shortlists; a segment too small to shortlist, and
   unflushed rows, are scored whole, as before. A search that names no
   `oversample` has each such segment score no more than 1,024 rows
