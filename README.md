@@ -1356,8 +1356,12 @@ port never serves metrics. Unset, no metrics are served.
 - `vellev_filter_selectivity{route}`: the share of the rows a filtered
   search searched that its filter allowed.
 - `vellev_key_lookups_total{outcome}`: tenant keys answered from what the
-  node remembered, looked up with the coordinator, or turned away as
-  `busy`.
+  node remembered, looked up with the coordinator, joined to a lookup
+  already under way (`shared`), or turned away as `busy`. A key is looked
+  up once however many ask for it at once, and a key in use is looked up
+  again two seconds before it is due, answered from what is remembered
+  meanwhile; nothing is answered from memory longer than ten seconds
+  after the lookup that gave it.
 - `vellev_tenant_opens_total{kind}`: tenants opened as their `writer` or as
   a `copy` to read from.
 - `vellev_reads_in_flight` and `vellev_reads_waiting`: reads holding a

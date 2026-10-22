@@ -245,13 +245,14 @@ impl Collector for Counted {
         let counter = ConstCounter::new(0u64);
         let mut family = encoder.encode_descriptor(
             "key_lookups",
-            "Tenant keys presented, by how they were answered: from what the node remembered, by asking the coordinator, or turned away as busy",
+            "Tenant keys presented, by how they were answered: from what the node remembered, by asking the coordinator, by joining a lookup under way, or turned away as busy",
             None,
             counter.metric_type(),
         )?;
         for (outcome, count) in [
             ("remembered", keys.remembered),
             ("looked_up", keys.looked_up),
+            ("shared", keys.shared),
             ("busy", keys.busy),
         ] {
             ConstCounter::new(count).encode(family.encode_family(&[("outcome", outcome)])?)?;
