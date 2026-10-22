@@ -77,6 +77,12 @@ and say what the caller then answers for.
   says where the fault lies: `build`, `setup` or `provider`. A client of
   0.1 reads the code as `unknown` and gives up at the first node, where it
   used to try again.
+- **A new code, `not_served_here` (421)**, for a request for a tenant
+  the node is not set to serve (`VELLEV_TENANTS`, every tenant by
+  default): a read or a write of its data, its keys, backups and
+  restores, making and dropping it. Nothing was done, and nothing was
+  sent on to another node. A client of 0.1 reads the code as `unknown`
+  and gives up at the first node.
 - **A failure may say more**, in fields that are absent when there is
   nothing to say: `limit: {name, max}` when a request asks for more than
   the node allows, `missing` when something it names does not exist
@@ -554,6 +560,10 @@ New:
 
 - `Client::limits()`: `Ok(None)` from a node of 0.1, which has no such
   route.
+- **How `not_served_here` is met**: as `model_unavailable` is. A read is
+  asked of every other address; a write fails at the first node to say
+  it, sent once, with `Error::code()` `Some(Code::NotServedHere)`. Send
+  writes for a tenant to the nodes that serve it.
 - `Error::limit()`, `Error::limit_max(Bounded)`, `Error::missing()`,
   `Error::reason()`, `Error::is_model_unavailable()`.
 - `Error::Api` has `wait`: how long the node said to leave it before
@@ -604,7 +614,8 @@ Breaking:
   as `x-vellev-after` to read past the restore.
 - `RestoreTo` gains `Adopt(Adopt)`, with `Adopt { backup, with_keys }`:
   a `match` on `RestoreTo` needs the arm. `Code` gains `Empty` (11) and
-  `Purging` (12), which 0.1 read as `Unknown`. `Backup` gains `lineage`
+  `Purging` (12), which 0.1 read as `Unknown`, and `NotServedHere` (13,
+  status 421), which 0.1 reads as `Unknown`. `Backup` gains `lineage`
   and `cluster`, each `Option<Uuid>`, `None` from a node of 0.1.
 - `Change::DeleteWhere` gains `limit: Option<u32>`, so writing the variant
   out needs the field. `Change::delete_where(collection, filter)` and

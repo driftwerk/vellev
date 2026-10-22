@@ -7910,10 +7910,7 @@ async fn a_node_never_opens_a_tenant_it_does_not_serve_nor_takes_its_lease() {
     assert!(memories.serves(&tenant("memories")));
     assert_eq!(generation().await, before, "no lease taken");
     assert!(cluster.store.list("code/").await.unwrap().is_empty());
-    assert!(
-        !format!("{memories:?}").contains("\"code\""),
-        "nothing kept"
-    );
+    assert_eq!(memories.resident(), 0, "nothing held");
 
     // The node that serves it takes it at once: nobody holds it.
     let code = cluster.node_from(serving(&cluster, &["code"]));
@@ -7947,10 +7944,7 @@ async fn a_read_of_a_tenant_the_node_does_not_serve_opens_no_copy_and_is_not_cou
     }
     assert_eq!(memories.copies(), 0, "no copy followed");
     assert_eq!(watched.got_under("code/"), 0, "nothing of it fetched");
-    assert!(
-        !format!("{memories:?}").contains("\"code\""),
-        "nothing kept"
-    );
+    assert_eq!(memories.resident(), 0, "nothing held");
 
     // A tenant it serves is read, and counted, as ever.
     memories.create_tenant(&tenant("memories")).await.unwrap();

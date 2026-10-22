@@ -169,8 +169,11 @@ impl Node {
     ///
     /// The read counts as one query against what the tenant may ask a
     /// second, and the reader keeps whether anything costly was done to
-    /// answer it: see [`Self::unread`].
+    /// answer it: see [`Self::unread`]. A read of a tenant the node does
+    /// not serve is refused first, counted against nothing and with no
+    /// copy opened.
     pub async fn reader(&self, tenant: &TenantId, fresh: Freshness) -> Result<Reader> {
+        self.0.served(tenant)?;
         self.0.admit(tenant, Asked::Query, 1)?;
         // Whether the coordinator was asked, here or below.
         let mut asked = false;

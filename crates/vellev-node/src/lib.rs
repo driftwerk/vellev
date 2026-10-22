@@ -1355,8 +1355,11 @@ impl Node {
 
     /// The tenant, opened if this is the first call for it or its writer
     /// was lost. Callers arriving together share one opening, which runs
-    /// to its end even if they all stop waiting for it.
+    /// to its end even if they all stop waiting for it. A tenant the node
+    /// does not serve is refused before anything is kept for it or its
+    /// lease is asked for.
     pub async fn tenant(&self, tenant: &TenantId) -> Result<Arc<Tenant>> {
+        self.0.served(tenant)?;
         let opening = {
             let mut open = self.0.opened();
             if open.stopped {

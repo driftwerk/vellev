@@ -218,7 +218,7 @@ impl Error {
             Self::Api { code, .. } => match code {
                 Code::Unavailable => Fate::NoEffect,
                 Code::Uncertain => Fate::Unknown,
-                Code::ModelUnavailable => Fate::NotByThisNode,
+                Code::ModelUnavailable | Code::NotServedHere => Fate::NotByThisNode,
                 Code::Invalid
                 | Code::Unauthorized
                 | Code::Forbidden

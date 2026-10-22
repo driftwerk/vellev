@@ -172,7 +172,7 @@ impl Code {
             Code::ModelUnavailable => 501,
             // Misdirected Request: the request reached a node that will
             // not answer for its tenant, and nothing was done.
-            Code::NotServedHere => 500, // STUB
+            Code::NotServedHere => 421,
             Code::Internal | Code::Unknown => 500,
         }
     }

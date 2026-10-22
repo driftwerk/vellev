@@ -259,7 +259,7 @@ impl From<NodeError> for ApiError {
                 Self::invalid(error.to_string())
             }
             NodeError::Empty(_) => Self::new(Code::Empty, error.to_string()),
-            NodeError::NotServedHere { .. } => Self::unavailable(error.to_string()), // STUB
+            NodeError::NotServedHere { .. } => Self::new(Code::NotServedHere, error.to_string()),
             NodeError::BackingUp(_)
             | NodeError::Restoring(_)
             | NodeError::NotLost(_)

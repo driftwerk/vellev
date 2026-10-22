@@ -66,7 +66,7 @@ async fn a_node_refuses_reads_and_writes_of_a_tenant_another_holds_and_sends_non
         assert!(not_served(&read), "{path}: {read:?}");
     }
     assert_eq!(memories.node.copies(), 0, "no copy of acme followed");
-    assert!(!format!("{:?}", memories.node).contains("\"acme\""));
+    assert_eq!(memories.node.resident(), 0, "nor anything of it held");
 
     // A caller without a key learns nothing of where tenants are served.
     let (status, _) = memories.call_as(None, Method::GET, &object(1), None).await;

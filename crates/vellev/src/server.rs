@@ -460,6 +460,39 @@ fn hop_by_hop(name: &HeaderName) -> bool {
         || name.as_str() == "proxy-connection"
 }
 
+/// Refuse a request for a tenant this node does not serve, whatever the
+/// route: a read or a write of its data, its keys, backups and restores,
+/// making it and dropping it. The node checks again wherever a tenant is
+/// opened, read or backed up; this answers for the routes that only reach
+/// the coordinator or the backup store, and comes before any request is
+/// sent on, so that none for the tenant is. A caller's key is checked
+/// first: one without a valid key learns nothing of where tenants are
+/// served.
+async fn served(
+    Shared(app): Shared<App>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Ok(node) = app.node() else {
+        return Ok(next.run(request).await);
+    };
+    // The tenant as the router read it, which is what the handler is given.
+    let (mut parts, body) = request.into_parts();
+    let named = RawPathParams::from_request_parts(&mut parts, &app)
+        .await
+        .ok()
+        .and_then(|params| {
+            params
+                .iter()
+                .find(|(name, _)| *name == "tenant")
+                .and_then(|(_, tenant)| TenantId::new(tenant).ok())
+        });
+    match named {
+        Some(tenant) if !node.serves(&tenant) => Err(NodeError::NotServedHere { tenant }.into()),
+        _ => Ok(next.run(Request::from_parts(parts, body)).await),
+    }
+}
+
 /// Send a request for a tenant that another node holds on to that node,
 /// and answer with its answer. A request that has been sent on once goes
 /// no further: the node it reached answers for itself.
@@ -621,6 +654,7 @@ pub fn router(app: App) -> Router {
         .merge(
             keyed
                 .route_layer(from_fn_with_state(app.clone(), forwarded))
+                .route_layer(from_fn_with_state(app.clone(), served))
                 .route_layer(from_fn_with_state(app.clone(), authorized)),
         )
         .route("/health/live", get(live))
