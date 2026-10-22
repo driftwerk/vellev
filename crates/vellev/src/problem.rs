@@ -259,6 +259,7 @@ impl From<NodeError> for ApiError {
                 Self::invalid(error.to_string())
             }
             NodeError::Empty(_) => Self::new(Code::Empty, error.to_string()),
+            NodeError::NotServedHere { .. } => Self::unavailable(error.to_string()), // STUB
             NodeError::BackingUp(_)
             | NodeError::Restoring(_)
             | NodeError::NotLost(_)
@@ -318,6 +319,17 @@ mod tests {
             status, problem, ..
         } = error.into();
         (status, problem.code)
+    }
+
+    #[test]
+    fn a_tenant_the_node_does_not_serve_is_misdirected() {
+        let refused = NodeError::NotServedHere {
+            tenant: TenantId::new("code").unwrap(),
+        };
+        assert_eq!(
+            told(refused),
+            (StatusCode::MISDIRECTED_REQUEST, Code::NotServedHere)
+        );
     }
 
     #[test]

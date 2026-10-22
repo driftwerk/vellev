@@ -143,6 +143,11 @@ pub enum Code {
     /// brings its own vector needs no model.
     ModelUnavailable = 10,
     Internal = 8,
+    /// The node asked does not serve the tenant, as it is set up: another
+    /// node does. The request had no effect, and was not sent on; send it
+    /// to a node that serves the tenant. A client of 0.1 reads it as
+    /// `Unknown`.
+    NotServedHere = 13,
     /// A code this client does not know, from a newer node.
     #[serde(other)]
     Unknown = 9,
@@ -165,6 +170,9 @@ impl Code {
             // as it is set up, which HTTP clients and proxies do not send
             // again of their own accord as they do 500, 502, 503 and 504.
             Code::ModelUnavailable => 501,
+            // Misdirected Request: the request reached a node that will
+            // not answer for its tenant, and nothing was done.
+            Code::NotServedHere => 500, // STUB
             Code::Internal | Code::Unknown => 500,
         }
     }
@@ -1986,6 +1994,42 @@ mod tests {
     }
 
     #[test]
+    fn a_tenant_not_served_here_is_spelt_and_numbered_for_good_and_read_by_older_clients() {
+        assert_eq!(Code::NotServedHere as u16, 13);
+        let spelt = serde_json::to_value(Code::NotServedHere).unwrap();
+        assert_eq!(spelt, json!("not_served_here"));
+        assert_eq!(
+            serde_json::from_value::<Code>(spelt.clone()).unwrap(),
+            Code::NotServedHere
+        );
+        // A client of 0.1 has the codes there were then, and reads every
+        // other as `unknown`: its `Code`, as it was.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Older {
+            Invalid,
+            Unauthorized,
+            Forbidden,
+            NotFound,
+            Conflict,
+            Limited,
+            Unavailable,
+            Uncertain,
+            Internal,
+            #[serde(other)]
+            Unknown,
+        }
+        assert_eq!(
+            serde_json::from_value::<Older>(spelt).unwrap(),
+            Older::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<Older>(json!("unavailable")).unwrap(),
+            Older::Unavailable
+        );
+    }
+
+    #[test]
     fn every_code_has_its_status_and_a_model_that_cannot_be_used_is_not_one_retried_blindly() {
         let statuses = [
             (Code::Invalid, 400),
@@ -1999,6 +2043,7 @@ mod tests {
             (Code::Unavailable, 503),
             (Code::Uncertain, 503),
             (Code::ModelUnavailable, 501),
+            (Code::NotServedHere, 421),
             (Code::Internal, 500),
             (Code::Unknown, 500),
         ];
@@ -2020,6 +2065,7 @@ mod tests {
             Code::ModelUnavailable,
             Code::Empty,
             Code::Purging,
+            Code::NotServedHere,
         ];
         for (number, code) in numbered.into_iter().enumerate() {
             assert_eq!(code as usize, number, "{code:?}");

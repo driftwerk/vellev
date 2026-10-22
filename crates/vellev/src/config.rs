@@ -10,9 +10,9 @@ use eyre::{bail, eyre, Result, WrapErr};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use vellev_core::NodeId;
+use vellev_core::{NodeId, TenantId};
 use vellev_embed::Embedders;
-use vellev_node::{Node, RequestBounds, Settings};
+use vellev_node::{Node, RequestBounds, Served, Settings};
 
 use crate::server::Limits;
 use object_store::aws::AmazonS3ConfigKey;
@@ -250,6 +250,18 @@ pub struct Config {
     /// do not count, being the operating system's to page out.
     #[arg(long, env = "VELLEV_MEMORY_MB")]
     pub memory_mb: Option<usize>,
+    /// The tenants this node serves, by id, comma separated; `*`, the
+    /// default, for every one. A request for any other is refused with
+    /// `not_served_here` (421), read or write, and is sent on to no other
+    /// node: the node never holds, follows or backs up a tenant it does
+    /// not serve.
+    #[arg(
+        long,
+        env = "VELLEV_TENANTS",
+        value_delimiter = ',',
+        default_value = "*"
+    )]
+    pub tenants: Vec<String>,
     /// The newest file format nodes may write, so that the release before
     /// can still read everything if this one is rolled back. Raise it once
     /// every node runs the release that reads it and rollback is no longer
@@ -516,6 +528,7 @@ impl Config {
             .filter(|url| !url.is_empty())
             .chain(keyed.into_keys())
             .collect();
+        self.served()?;
         if self.purge_after_secs < 2 * self.lease_secs {
             bail!("VELLEV_PURGE_AFTER_SECS must be at least two leases, so a holder lets go first");
         }
@@ -594,6 +607,30 @@ impl Config {
         ))
     }
 
+    /// The tenants this node serves, as `VELLEV_TENANTS` lists them:
+    /// refused if the list is empty, names a tenant that cannot be, or
+    /// has `*` beside anything else.
+    fn served(&self) -> Result<Served> {
+        let listed: Vec<&str> = self.tenants.iter().map(|name| name.trim()).collect();
+        if listed == ["*"] {
+            return Ok(Served::Every);
+        }
+        if listed.contains(&"*") {
+            bail!("VELLEV_TENANTS is `*` for every tenant, or a list of tenants, not both");
+        }
+        let mut served = std::collections::BTreeSet::new();
+        for name in listed {
+            let tenant = TenantId::new(name).map_err(|wrong| {
+                eyre!("VELLEV_TENANTS names {name:?}, which is no tenant: {wrong}")
+            })?;
+            served.insert(tenant);
+        }
+        if served.is_empty() {
+            bail!("VELLEV_TENANTS lists no tenant; `*` serves every one");
+        }
+        Ok(Served::Only(served))
+    }
+
     /// How `node` is to run, backing tenants up to `backups` if anywhere:
     /// refused if a node could not run so.
     fn settings(&self, node: NodeId, backups: Option<Arc<dyn Blobs>>) -> Result<Settings> {
@@ -620,6 +657,7 @@ impl Config {
             memory: self
                 .memory_mb
                 .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
+            served: self.served()?,
             ..Settings::new(node)
         };
         if let Some(problem) = settings.request_bounds.grace_problem(settings.grace) {
@@ -688,6 +726,27 @@ mod tests {
             "memory://",
         ];
         Parsed::parse_from(required.iter().chain(extra)).config
+    }
+
+    #[test]
+    fn a_node_serves_every_tenant_unless_given_a_list_of_them() {
+        let served = |extra: &[&str]| config(extra).served();
+        assert_eq!(served(&[]).unwrap(), Served::Every);
+        assert_eq!(served(&["--tenants", "*"]).unwrap(), Served::Every);
+        let listed = served(&["--tenants", "memories, artifacts,memories"]).unwrap();
+        let tenants = ["artifacts", "memories"].map(|name| TenantId::new(name).unwrap());
+        assert_eq!(listed, Served::Only(tenants.into()));
+        assert!(config(&["--tenants", "code"]).checked().is_ok());
+        for (wrong, said) in [
+            ("*,code", "not both"),
+            ("", "\"\""),
+            ("code,", "\"\""),
+            ("Code", "\"Code\""),
+        ] {
+            let refused = format!("{:#}", config(&["--tenants", wrong]).checked().unwrap_err());
+            assert!(refused.contains("VELLEV_TENANTS"), "{wrong}: {refused}");
+            assert!(refused.contains(said), "{wrong}: {refused}");
+        }
     }
 
     #[test]

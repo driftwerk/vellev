@@ -1,7 +1,7 @@
 //! One node's part in the database: the tenants it writes for, each opened
 //! when first asked for and written to through one shared queue.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -219,6 +219,31 @@ pub struct Settings {
     /// How files go to and come from object storage, and when a request is
     /// given up.
     pub transfers: Transfers,
+    /// The tenants this node serves. A request for any other is refused
+    /// as [`NodeError::NotServedHere`], read or write, and is sent on to
+    /// no other node: the node never holds, follows or backs up a tenant
+    /// it does not serve. Every tenant, unless told otherwise.
+    pub served: Served,
+}
+
+/// The tenants a node serves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Served {
+    /// Every tenant, as a node did before it could be told otherwise.
+    #[default]
+    Every,
+    /// These tenants and no other.
+    Only(BTreeSet<TenantId>),
+}
+
+impl Served {
+    /// Whether `tenant` is one of these.
+    pub fn serves(&self, tenant: &TenantId) -> bool {
+        match self {
+            Served::Every => true,
+            Served::Only(listed) => listed.contains(tenant),
+        }
+    }
 }
 
 impl Settings {
@@ -251,6 +276,7 @@ impl Settings {
             purges_looked_for_every: PURGES_LOOKED_FOR_EVERY,
             purge_after: Duration::from_secs(10 * 60),
             transfers: Transfers::default(),
+            served: Served::Every,
         }
     }
 
@@ -366,6 +392,10 @@ pub enum NodeError {
     ClaimLost(TenantId),
     #[error("tenant {0} has no backup {1}")]
     UnknownBackup(TenantId, uuid::Uuid),
+    /// The node is not one that serves the tenant: see
+    /// [`Settings::served`]. Nothing was done, and nothing is sent on.
+    #[error("tenant {tenant} is not served by this node; ask a node that serves it")]
+    NotServedHere { tenant: TenantId },
     #[error("the cluster writes file format {cluster}, and this release reads only up to {reads}")]
     Outdated { cluster: u16, reads: u16 },
     #[error(transparent)]
@@ -1140,6 +1170,11 @@ impl Node {
         self.0.held_now().iter().map(|held| held.size).sum()
     }
 
+    /// Whether this node serves `tenant`: see [`Settings::served`].
+    pub fn serves(&self, tenant: &TenantId) -> bool {
+        self.0.settings.served.serves(tenant)
+    }
+
     pub fn sweeping(&self) {
         let every = self.0.sweep_every();
         let inner = Arc::downgrade(&self.0);
@@ -1539,6 +1574,17 @@ impl Inner {
             }
         }
         going
+    }
+
+    /// Refuse `tenant` if this node does not serve it, before anything is
+    /// done or counted for it.
+    fn served(&self, tenant: &TenantId) -> Result<()> {
+        match self.settings.served.serves(tenant) {
+            true => Ok(()),
+            false => Err(NodeError::NotServedHere {
+                tenant: tenant.clone(),
+            }),
+        }
     }
 
     /// Take `cost` of what `tenant` may ask for now.
