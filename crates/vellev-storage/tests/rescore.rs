@@ -197,7 +197,7 @@ fn overlap(found: &[ObjectId], exact: &[ObjectId]) -> (f64, bool) {
 
 /// T2 over one layout: for queries near stored rows, under no filter, a
 /// tenth and a hundredth, the default budget's fused top ten, and top
-/// fifty where the node's 2,048-row cap lowers the oversample, against an
+/// fifty where the node's 1,024-row cap lowers the oversample, against an
 /// exact vector leg's.
 fn holds_recall(state: &State, all: &[Vec<f32>], layout: &str) {
     for limit in [10, 50] {
