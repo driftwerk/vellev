@@ -215,3 +215,47 @@ async fn metrics_are_served_on_their_own_listener_and_never_on_the_apis() {
     assert!(text.ends_with("# EOF\n"), "{text}");
     served.stop().await;
 }
+
+#[tokio::test]
+async fn a_refused_request_is_counted_by_its_status_class() {
+    let (served, key) = embedded().await;
+    let path = format!("{NOTES}/hybrid");
+    let body = json!({ "text": "fox", "limit": 1, "alpha": 5.0 });
+    let (status, answer) = served
+        .call_as(Some(&key), Method::POST, &path, Some(body))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    let text = served.app.metrics().encoded();
+    let class = |status: &str| {
+        let labels = [("route", HYBRID), ("method", "POST"), ("status", status)];
+        sample(&text, "vellev_request_seconds_count", &labels)
+    };
+    assert_eq!(class("4xx"), Some(1.0), "{text}");
+    assert_eq!(class("2xx"), None);
+    served.stop().await;
+}
+
+#[tokio::test]
+async fn the_stages_of_a_request_do_not_overlap() {
+    let (served, key) = embedded().await;
+    hybrid(&served, &key, json!({ "text": "fox", "limit": 10 })).await;
+    let text = served.app.metrics().encoded();
+    let stages: f64 = Stage::ALL
+        .iter()
+        .map(|stage| {
+            sample(
+                &text,
+                "vellev_stage_seconds_sum",
+                &[("route", HYBRID), ("stage", stage.name())],
+            )
+            .unwrap_or(0.0)
+        })
+        .sum();
+    let whole = [("route", HYBRID), ("method", "POST"), ("status", "2xx")];
+    let whole = sample(&text, "vellev_request_seconds_sum", &whole).unwrap();
+    assert!(
+        stages <= whole,
+        "the stages, {stages}s, are parts of the request, {whole}s\n{text}"
+    );
+    served.stop().await;
+}
