@@ -856,10 +856,13 @@ pub struct Hybrid {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
     /// How many times `limit` rows the vector search scores exactly, and
-    /// at least `candidates`, in each segment that shortlists; smaller
-    /// segments and unflushed rows are scored whole. Left out, the node's
-    /// default, lowered for a large `limit` so that each such segment
-    /// scores no more than 2,048 rows (or `candidates`, if larger).
+    /// at least `candidates`: in each segment that shortlists by one-bit
+    /// codes, that many each; across the segments with a clustered index
+    /// (those of more than 200,000 rows), that many between them, less the
+    /// nearest few each scores of its own. Smaller segments and unflushed
+    /// rows are scored whole. Left out, the node's default, lowered for a
+    /// large `limit` so that the budget is no more than 2,048 rows (or
+    /// `candidates`, if larger).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oversample: Option<u32>,
     #[serde(default)]
