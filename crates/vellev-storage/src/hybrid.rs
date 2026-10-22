@@ -18,6 +18,18 @@ pub const DEFAULT_ALPHA: f32 = 0.75;
 /// no more.
 pub const DEFAULT_CANDIDATES: usize = 100;
 
+/// The most rows a hybrid search that names no `oversample` asks each
+/// segment that shortlists to score exactly, whatever its limit, unless
+/// its fusion pool is larger: see [`default_oversample`].
+pub const HYBRID_DEFAULT_RESCORE: usize = 2_048;
+
+/// The oversample of a hybrid search for `limit` results that names none:
+/// [`DEFAULT_OVERSAMPLE`], lowered for a large `limit` so that `limit`
+/// times it is at most [`HYBRID_DEFAULT_RESCORE`], and never below 1.
+pub fn default_oversample(limit: usize) -> usize {
+    DEFAULT_OVERSAMPLE.min((HYBRID_DEFAULT_RESCORE / limit.max(1)).max(1))
+}
+
 #[derive(Debug, Clone)]
 pub struct Hybrid<'a> {
     pub text: &'a str,
@@ -35,9 +47,11 @@ pub struct Hybrid<'a> {
     /// How many results each search offers for fusing.
     pub candidates: usize,
     pub filter: Option<&'a Filter>,
-    /// How many times `limit` the vector search scores exactly, and at
-    /// least `candidates`: it scales the results asked for, not the pool
-    /// fused from.
+    /// How many times `limit` rows the vector search scores exactly, and
+    /// at least `candidates`: it scales the results asked for, not the
+    /// pool fused from. The budget is per layer: each segment that
+    /// shortlists scores up to that many, while a segment too small to
+    /// shortlist, and the memtable, are scored whole.
     pub oversample: usize,
 }
 

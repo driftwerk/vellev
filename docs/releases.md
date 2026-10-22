@@ -350,12 +350,17 @@ and say what the caller then answers for.
 - **A hybrid search scores far fewer rows exactly.** Its vector search
   scored `candidates × oversample` rows exactly (12,800 by default, nearly
   every row of a mid-sized collection); it now scores `limit × oversample`,
-  and at least `candidates`: 1,280 for ten results by default. A search
-  that names no `oversample` scores no more than 2,048 rows whatever its
-  `limit`, the default being lowered for large limits; one that names an
-  `oversample` scores as many as it asks for. Results can differ where
-  the vector search's index would have needed more rows to find the
-  nearest: name a larger `oversample` to have them.
+  and at least `candidates`: 1,280 for ten results by default. The budget
+  is per segment that shortlists; a segment too small to shortlist, and
+  unflushed rows, are scored whole, as before. A search that names no
+  `oversample` has each such segment score no more than 2,048 rows
+  whatever its `limit` (or `candidates`, if larger), the default being
+  lowered for large limits; one that names an `oversample` scores as many
+  as it asks for. **A caller that named an `oversample` for hybrid now
+  scores `limit/candidates` times fewer rows than it did** (10/100 with
+  the defaults): multiply it by that to keep the old recall. Results can
+  differ where the vector search's index would have needed more rows to
+  find the nearest: name a larger `oversample` to have them.
 - **Metrics for Prometheus**, on a listener of their own: set
   `VELLEV_METRICS_LISTEN`. Requests are timed whole and by stage, and
   searches report the rows they scored and how much their filter allowed;
