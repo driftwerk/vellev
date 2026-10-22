@@ -246,3 +246,29 @@ async fn the_keyword_leg_counts_each_posting_it_reads_exactly() {
         );
     });
 }
+
+/// What the memtable holds that a vector search scores exactly: its live
+/// rows with a vector, no more, counted through replacements, deletes and
+/// a flush.
+#[tokio::test]
+async fn the_memtable_counts_its_live_rows_with_a_vector() {
+    let (_cluster, writer) = notes().await;
+    let vectors = || writer.partition().read(State::unflushed_vectors);
+    assert_eq!(vectors(), 3, "note 4 has no vector");
+    writer
+        .commit(vec![note(1, "fox again", 0, Some([1.0, 1.0]))])
+        .await
+        .unwrap();
+    assert_eq!(vectors(), 3, "a replaced row is counted once");
+    writer.commit(vec![note(2, "fox", 1, None)]).await.unwrap();
+    assert_eq!(vectors(), 2, "a row replaced by one without a vector");
+    writer.commit(vec![delete(NOTES, 3)]).await.unwrap();
+    assert_eq!(vectors(), 1, "a deleted row");
+    writer.flush().await.unwrap();
+    assert_eq!(vectors(), 0, "flushed");
+    writer
+        .commit(vec![note(5, "hen", 0, Some([0.0, 1.0]))])
+        .await
+        .unwrap();
+    assert_eq!(vectors(), 1);
+}

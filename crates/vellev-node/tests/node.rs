@@ -509,6 +509,114 @@ async fn a_tenant_is_flushed_once_enough_has_been_written() {
     assert_eq!(acme.read(State::unflushed), 0);
 }
 
+/// A node flushing a tenant at `vectors` live rows with a vector in
+/// memory, at most once every `every`, and never for its row count.
+fn vector_flushing(cluster: &Cluster, vectors: usize, every: Duration) -> Node {
+    cluster.node_from(Settings {
+        memtable_vectors: vectors,
+        memtable_flush_every: every,
+        ..cluster.settings()
+    })
+}
+
+async fn until(what: impl Fn() -> bool) -> bool {
+    for _ in 0..200 {
+        if what() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// T4: a search never scores more of the memtable's rows exactly than a
+/// segment scores whole: once more rows with a vector are in memory than
+/// that, the tenant is flushed.
+#[tokio::test]
+async fn a_tenant_with_more_vectors_in_memory_than_are_scored_whole_is_flushed() {
+    let cluster = Cluster::new();
+    let node = vector_flushing(&cluster, 10, Duration::from_secs(3_600));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    for n in 0..10 {
+        acme.write(vec![note(n, "fox", Some(vec![1.0, n as f32]))])
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        acme.read(State::unflushed_vectors),
+        10,
+        "not more than ten yet"
+    );
+    acme.write(vec![note(10, "fox", Some(vec![1.0, 10.0]))])
+        .await
+        .unwrap();
+    assert!(
+        until(|| acme.read(State::unflushed_vectors) == 0).await,
+        "flushed at eleven"
+    );
+    assert_eq!(acme.read(count), 11);
+}
+
+/// Rows without a vector, and rows since replaced, are not what a vector
+/// search scores, and flush nothing.
+#[tokio::test]
+async fn rows_without_vectors_and_replaced_rows_flush_nothing() {
+    let cluster = Cluster::new();
+    let node = vector_flushing(&cluster, 10, Duration::from_secs(3_600));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    for n in 0..30 {
+        acme.write(vec![note(n, "fox", None)]).await.unwrap();
+    }
+    for n in 0..30 {
+        acme.write(vec![note(100, "hen", Some(vec![1.0, n as f32]))])
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(acme.read(State::unflushed), 60, "nothing flushed");
+    assert_eq!(acme.read(State::unflushed_vectors), 1);
+}
+
+/// A tenant is flushed for its vectors at most once every so often, so
+/// that a burst of writes with vectors, an artifact reindex say, flushes
+/// once and not at every few thousand rows.
+#[tokio::test]
+async fn a_tenant_is_flushed_for_its_vectors_at_most_once_every_so_often() {
+    let cluster = Cluster::new();
+    let node = vector_flushing(&cluster, 10, Duration::from_secs(3_600));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    let batch = |from: u64| -> Vec<Mutation> {
+        (from..from + 11)
+            .map(|n| note(n, "fox", Some(vec![1.0, n as f32])))
+            .collect()
+    };
+    acme.write(batch(0)).await.unwrap();
+    assert!(
+        until(|| acme.read(State::unflushed_vectors) == 0).await,
+        "the first is flushed"
+    );
+    acme.write(batch(100)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        acme.read(State::unflushed_vectors),
+        11,
+        "the second waits its turn"
+    );
+}
+
 #[tokio::test]
 async fn small_segments_are_merged_after_a_flush_and_the_old_files_cleaned_up() {
     let cluster = Cluster::new();

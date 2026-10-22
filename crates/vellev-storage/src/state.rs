@@ -23,7 +23,7 @@ type RowKey = (CollectionId, ObjectId);
 /// Up to this many of a collection's rows a layer scores every one exactly
 /// on a vector search; only beyond it is a vector index built, and with it
 /// any approximation used. Scoring this many takes well under a millisecond.
-pub(crate) const SHORTLIST_ABOVE: usize = 4_000;
+pub const SHORTLIST_ABOVE: usize = 4_000;
 /// A collection with more vectors than this in one segment gets a clustered
 /// index, which takes a while to build and is kept in a file of its own, in
 /// place of a scan of every code.
@@ -451,6 +451,9 @@ struct Memtable {
     indexes: Indexes,
     /// About how many bytes `rows` take, with what indexes them.
     bytes: usize,
+    /// How many of `rows` are live and have a vector: those a search with
+    /// a vector scores exactly, the memtable having no vector index.
+    vectors: usize,
 }
 
 /// A partition in memory as of one position: flushed segments, the rows
@@ -648,6 +651,12 @@ impl State {
     /// those since replaced: what a flush would move out of memory.
     pub fn unflushed(&self) -> usize {
         self.memtable.rows.len()
+    }
+
+    /// How many live rows written since the last checkpoint have a vector:
+    /// what a search with a vector scores exactly in the memtable.
+    pub fn unflushed_vectors(&self) -> usize {
+        self.memtable.vectors
     }
 
     pub fn head(&self) -> Option<&str> {
@@ -879,6 +888,12 @@ impl State {
     }
 
     fn mark_dead(&mut self, location: Location) {
+        if let Location::Memtable(row) = location {
+            let vectored = self.memtable.rows[row].object.vector.is_some();
+            if vectored && !self.memtable.dead[row] {
+                self.memtable.vectors -= 1;
+            }
+        }
         let (rows, dead, deaths, indexes, row) = match location {
             Location::Memtable(row) => {
                 let Memtable {
@@ -1069,6 +1084,7 @@ impl State {
                         object: object.clone(),
                     };
                     self.memtable.bytes += row_bytes(&row);
+                    self.memtable.vectors += usize::from(row.object.vector.is_some());
                     self.memtable.rows.push(row);
                     self.memtable.dead.push(false);
                 }
@@ -1482,6 +1498,7 @@ impl State {
             deaths,
             indexes,
             bytes,
+            vectors,
             ..
         } = &mut self.memtable;
         let discarded = Discarded {
@@ -1491,6 +1508,11 @@ impl State {
         *bytes = rows.iter().map(row_bytes).sum();
         dead.drain(..held);
         *deaths -= held;
+        *vectors = rows
+            .iter()
+            .zip(dead.iter())
+            .filter(|(row, dead)| !**dead && row.object.vector.is_some())
+            .count();
         for (row, Row { collection, object }) in rows.iter().enumerate() {
             if let Some(schema) = self.catalog.schema(*collection) {
                 indexes

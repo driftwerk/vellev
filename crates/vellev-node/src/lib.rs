@@ -135,6 +135,13 @@ pub struct Settings {
     /// A tenant with this many rows written since its last checkpoint is
     /// flushed.
     pub flush_rows: usize,
+    /// A tenant with more live rows with a vector than this written since
+    /// its last checkpoint is flushed too, at most once every
+    /// [`Self::memtable_flush_every`]: rows in memory have no vector
+    /// index, so a search scores each of them exactly. A stopgap until the
+    /// memtable is indexed (burst plan F2b).
+    pub memtable_vectors: usize,
+    pub memtable_flush_every: Duration,
     /// How far back a tenant may be restored, unless it says otherwise; at
     /// most [`MAX_RESTORE_WINDOW`]. What a restore that far back needs is
     /// kept, every log among it. A tenant open here is looked after every
@@ -229,6 +236,8 @@ impl Settings {
             group: 64,
             queue: 1_024,
             flush_rows: 50_000,
+            memtable_vectors: vellev_storage::SHORTLIST_ABOVE,
+            memtable_flush_every: Duration::from_secs(30),
             restore_window: Duration::from_secs(14 * 24 * 60 * 60),
             grace: Duration::from_secs(60 * 60),
             follow_every: Duration::from_secs(1),
