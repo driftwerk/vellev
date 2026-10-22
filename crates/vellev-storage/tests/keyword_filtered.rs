@@ -18,10 +18,10 @@ const ROWS: u32 = 10_000;
 fn row(n: u32) -> Mutation {
     // Every row holds "fox"; one in three "hen"; one in seven "den", twice.
     let mut title = String::from("fox");
-    if n % 3 == 0 {
+    if n.is_multiple_of(3) {
         title.push_str(" hen");
     }
-    if n % 7 == 0 {
+    if n.is_multiple_of(7) {
         title.push_str(" den den");
     }
     Mutation::Upsert {
