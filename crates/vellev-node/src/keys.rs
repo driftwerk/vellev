@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use std::panic::AssertUnwindSafe;
+
 use futures::future::{BoxFuture, FutureExt, Shared};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -98,6 +100,32 @@ struct Kept {
     counted: Counted,
 }
 
+/// Takes a lookup out of those under way when dropped, if it is still the
+/// one under way for its key.
+struct Unpending {
+    kept: Arc<Kept>,
+    hash: KeyHash,
+    id: u64,
+}
+
+impl Drop for Unpending {
+    fn drop(&mut self) {
+        // Not to panic in a drop that may run while unwinding: a poisoned
+        // lock is taken as it is.
+        let mut remembered = match self.kept.remembered.lock() {
+            Ok(remembered) => remembered,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if remembered
+            .pending
+            .get(&self.hash)
+            .is_some_and(|pending| pending.id == self.id)
+        {
+            remembered.pending.remove(&self.hash);
+        }
+    }
+}
+
 /// How a lookup ended, as each of those waiting on it is told.
 type Looked = std::result::Result<Option<TenantId>, Failed>;
 
@@ -108,6 +136,9 @@ enum Failed {
     Lookup(Arc<StorageError>),
     /// The node stopped before the lookup was done.
     Stopped,
+    /// The lookup panicked: a fault of the node's, told to every asker as
+    /// one, and the key left to be looked up again.
+    Panicked,
 }
 
 /// A lookup under way, and which it is, so that the lookup takes out of
@@ -186,8 +217,12 @@ impl Remembered {
             .map(|at| (None, *at))
     }
 
-    fn insert(&mut self, hash: KeyHash, tenant: Option<TenantId>) {
-        let now = Instant::now();
+    /// Remember what the lookup begun `at` found for `hash`: from then,
+    /// not from when its answer came back, so that a slow lookup never
+    /// keeps an answer past [`REMEMBERED_FOR`] from when the coordinator
+    /// gave it.
+    fn insert(&mut self, hash: KeyHash, tenant: Option<TenantId>, at: Instant) {
+        let now = at;
         // A key looked up again may have changed either way: what was
         // remembered of it before goes.
         match tenant {
@@ -282,6 +317,7 @@ impl Keys {
         answer.await.map_err(|failed| match failed {
             Failed::Lookup(error) => NodeError::KeyLookup(error),
             Failed::Stopped => NodeError::Stopped,
+            Failed::Panicked => NodeError::KeyLookupPanicked,
         })
     }
 
@@ -301,33 +337,36 @@ impl Keys {
         let (kept, generation, id) = (self.0.clone(), remembered.generation, remembered.next);
         remembered.next += 1;
         let asked = lookup.key_tenant(hash);
+        let started = Instant::now();
         let task = tokio::spawn(async move {
             let _permit = permit;
-            let looked = asked
-                .await
-                .map_err(|error| Failed::Lookup(Arc::new(error.into())));
-            let mut remembered = kept.remembered.lock().expect("keys lock");
-            if let Ok(tenant) = &looked {
-                if remembered.generation == generation {
-                    remembered.insert(hash, tenant.clone());
+            // Out of those under way however the lookup ends, a panic or
+            // a node stopping among the ways.
+            let _unpending = Unpending {
+                kept: kept.clone(),
+                hash,
+                id,
+            };
+            let looked = match AssertUnwindSafe(asked).catch_unwind().await {
+                Ok(looked) => looked.map_err(|error| Failed::Lookup(Arc::new(error.into()))),
+                Err(_) => {
+                    tracing::error!("looking a key up panicked");
+                    Err(Failed::Panicked)
                 }
-            }
-            if remembered
-                .pending
-                .get(&hash)
-                .is_some_and(|pending| pending.id == id)
-            {
-                remembered.pending.remove(&hash);
+            };
+            if let Ok(tenant) = &looked {
+                let mut remembered = kept.remembered.lock().expect("keys lock");
+                if remembered.generation == generation {
+                    remembered.insert(hash, tenant.clone(), started);
+                }
             }
             looked
         });
         let answer = async move {
             match task.await {
                 Ok(looked) => looked,
-                Err(ended) => match ended.try_into_panic() {
-                    Ok(panic) => std::panic::resume_unwind(panic),
-                    Err(_) => Err(Failed::Stopped),
-                },
+                Err(ended) if ended.is_panic() => Err(Failed::Panicked),
+                Err(_) => Err(Failed::Stopped),
             }
         }
         .boxed()

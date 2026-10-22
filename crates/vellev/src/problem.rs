@@ -294,6 +294,9 @@ impl From<NodeError> for ApiError {
             },
             NodeError::Storage(error) => error.into(),
             NodeError::KeyLookup(error) => error.as_ref().into(),
+            NodeError::KeyLookupPanicked => {
+                Self::new(Code::Internal, "the node failed to serve the request")
+            }
         }
     }
 }
