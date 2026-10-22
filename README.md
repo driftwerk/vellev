@@ -1331,6 +1331,38 @@ cargo run --release -p vellev-index --example clustered_bench -- 200000 768   # 
 OBJECTS=1000000 cargo run --release -p vellev-storage --example vector_scale  # commit, flush, merge, search
 ```
 
+## Metrics
+
+Set `VELLEV_METRICS_LISTEN` (for example `0.0.0.0:9464`) and a node serves
+`GET /metrics` there for Prometheus, unauthenticated: put it on an address
+only the scraper reaches. It must not be `VELLEV_LISTEN`'s, and the API's
+port never serves metrics. Unset, no metrics are served.
+
+- `vellev_request_seconds{route,method,status}`: each request to a keyed
+  route, whole.
+- `vellev_stage_seconds{route,stage}`: the stages a request passes
+  through. `auth` finds a tenant key's tenant (an admin key has no
+  lookup); `body` receives and parses a JSON body; `reader` finds what a
+  read is answered from, opening a tenant if it must; `embed` embeds a
+  query's text; `turn` waits for one of the node's read turns; `queue`
+  waits, with a turn, for a thread; `read` is the search, page or count
+  itself; `serialise` runs from the read's end to the response being
+  made.
+- `vellev_search_work{route,kind}`: what each read did, so that a costly
+  search can be told from a starved one: rows scored exactly in the
+  memtable (`exact_memtable`) and in segments (`exact_segments`), rows a
+  clustered index estimated (`estimated`), and the keyword leg's
+  `postings` read and `keyword_rows` scored.
+- `vellev_filter_selectivity{route}`: the share of the rows a filtered
+  search searched that its filter allowed.
+- `vellev_key_lookups_total{outcome}`: tenant keys answered from what the
+  node remembered, looked up with the coordinator, or turned away as
+  `busy`.
+- `vellev_tenant_opens_total{kind}`: tenants opened as their `writer` or as
+  a `copy` to read from.
+- `vellev_reads_in_flight` and `vellev_reads_waiting`: reads holding a
+  turn, and waiting for one, now.
+
 ## Upgrades
 
 Two releases run side by side during a rolling deploy and after a

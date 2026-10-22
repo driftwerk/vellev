@@ -26,6 +26,11 @@ struct Cli {
 struct Serve {
     #[arg(long, env = "VELLEV_LISTEN", default_value = "0.0.0.0:8080")]
     listen: SocketAddr,
+    /// Where to serve `GET /metrics` for Prometheus, unauthenticated: so
+    /// on an address only the scraper reaches. Unset, the node serves no
+    /// metrics; they are never served on the API's address.
+    #[arg(long, env = "VELLEV_METRICS_LISTEN")]
+    metrics_listen: Option<SocketAddr>,
     #[command(flatten)]
     config: Config,
 }
@@ -305,7 +310,11 @@ fn class_vector(given: &str) -> Result<(String, String)> {
 async fn main() -> Result<ExitCode> {
     match Cli::parse().command {
         Command::Serve(serve) => {
-            let Serve { listen, config } = *serve;
+            let Serve {
+                listen,
+                metrics_listen,
+                config,
+            } = *serve;
             tracing_subscriber::fmt().json().init();
             let (limits, store) = config.checked()?;
             let trusted = vellev::identity::IdentityKeys::parse(&config.identity_keys)?;
@@ -313,6 +322,22 @@ async fn main() -> Result<ExitCode> {
             let listener = TcpListener::bind(listen).await?;
             tracing::info!(%listen, version = env!("CARGO_PKG_VERSION"), "vellev listening");
             let port = listener.local_addr()?.port();
+            if metrics_listen == Some(listen) {
+                eyre::bail!("VELLEV_METRICS_LISTEN must not be VELLEV_LISTEN's address");
+            }
+            let measuring = match metrics_listen {
+                Some(address) => {
+                    let listener = TcpListener::bind(address).await?;
+                    tracing::info!(%address, "serving metrics");
+                    let router = vellev::metrics::router(app.clone());
+                    Some(tokio::spawn(async move {
+                        if let Err(error) = axum::serve(listener, router).await {
+                            tracing::error!(%error, "serving metrics failed");
+                        }
+                    }))
+                }
+                None => None,
+            };
             let starting = tokio::spawn(start(config.clone(), store, app.clone(), port));
 
             let told = Arc::new(Notify::new());
@@ -333,6 +358,9 @@ async fn main() -> Result<ExitCode> {
                 }
             }
             starting.abort();
+            if let Some(measuring) = measuring {
+                measuring.abort();
+            }
             if let Some(node) = app.started() {
                 node.shutdown().await;
             }

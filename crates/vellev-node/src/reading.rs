@@ -321,6 +321,7 @@ impl Inner {
             .await?
             .ok_or_else(|| NodeError::UnknownTenant(tenant.clone()))?;
         let follower = Follower::open(key(tenant), self.blobs.clone(), &committed).await?;
+        self.copies_opened.fetch_add(1, Ordering::Relaxed);
         let followed = Arc::new(Followed {
             follower,
             embedders: self.embedders.clone(),

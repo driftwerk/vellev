@@ -9,7 +9,7 @@ use vellev_index::fusion::Fusion;
 use crate::keyword::{searched, Keywords};
 use crate::search::{Query, DEFAULT_OVERSAMPLE};
 use crate::state::State;
-use crate::{Result, StorageError};
+use crate::{Result, StorageError, Work};
 
 /// How much of a fused score is the vector search's to give.
 pub const DEFAULT_ALPHA: f32 = 0.75;
@@ -103,6 +103,16 @@ impl State {
         collection: &CollectionName,
         query: &Hybrid<'_>,
     ) -> Result<Vec<Fused<'_>>> {
+        self.hybrid_counted(collection, query, &mut Work::default())
+    }
+
+    /// As [`Self::hybrid`], adding what both its legs did to `work`.
+    pub fn hybrid_counted(
+        &self,
+        collection: &CollectionName,
+        query: &Hybrid<'_>,
+        work: &mut Work,
+    ) -> Result<Vec<Fused<'_>>> {
         if !(0.0..=1.0).contains(&query.alpha) {
             return Err(StorageError::InvalidQuery(format!(
                 "alpha must be from 0 to 1, not {}",
@@ -117,7 +127,7 @@ impl State {
         let alpha = query.vector.map_or(0.0, |_| query.alpha);
         let candidates = query.candidates.max(query.limit);
         let nearest = match query.vector {
-            Some(vector) if alpha > 0.0 => self.search(
+            Some(vector) if alpha > 0.0 => self.search_counted(
                 collection,
                 &Query {
                     vector,
@@ -125,6 +135,7 @@ impl State {
                     filter: query.filter,
                     oversample: query.oversample,
                 },
+                work,
             )?,
             _ => Vec::new(),
         };
@@ -135,7 +146,7 @@ impl State {
                 limit: candidates,
                 filter: query.filter,
             };
-            self.keyword(collection, &keywords)?
+            self.keyword_counted(collection, &keywords, work)?
         } else {
             Vec::new()
         };

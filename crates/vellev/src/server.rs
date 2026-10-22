@@ -28,6 +28,7 @@ use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE, DELETED_AT_MOST};
 
 use crate::api;
 use crate::identity::{Caller, IdentityKeys};
+use crate::metrics::{self, Metrics, Stage};
 use crate::problem::ApiError;
 use crate::turns::{Turn, Turns};
 
@@ -69,14 +70,24 @@ impl Reading {
         self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, ApiError> {
+        let queued = std::time::Instant::now();
         let read = tokio::task::spawn_blocking(move || {
             let _turn = self;
-            work()
+            let began = std::time::Instant::now();
+            let done = work();
+            (
+                done,
+                began.saturating_duration_since(queued),
+                began.elapsed(),
+            )
         });
-        read.await.map_err(|error| {
+        let (done, waited, ran) = read.await.map_err(|error| {
             tracing::error!(%error, "a read did not finish");
             ApiError::new(Code::Internal, "the node failed to serve the request")
-        })
+        })?;
+        metrics::record(Stage::Queue, waited);
+        metrics::record(Stage::Read, ran);
+        Ok(done)
     }
 }
 
@@ -97,6 +108,8 @@ pub struct App {
     limits: Limits,
     /// A turn for each read being answered: see [`Self::reading`].
     reading: Arc<Turns>,
+    /// What the node measures of the requests it answers.
+    metrics: Arc<Metrics>,
     /// For sending a request on to the node that holds its tenant.
     http: reqwest::Client,
 }
@@ -135,7 +148,8 @@ impl App {
     #[doc(hidden)]
     pub async fn reading(&self, tenant: &TenantId) -> Result<Reading, ApiError> {
         let turn = self.reading.take(tenant);
-        match tokio::time::timeout(self.limits.reads_wait, turn).await {
+        let waited = tokio::time::timeout(self.limits.reads_wait, turn);
+        match metrics::timed(Stage::Turn, waited).await {
             Ok(turn) => Ok(Reading { _turn: turn }),
             Err(_) => {
                 let busy = "the node is answering as many reads as it does at once; ask again";
@@ -145,12 +159,15 @@ impl App {
     }
 
     pub fn new(keys: Arc<[String]>, limits: Limits) -> Self {
+        let node = Arc::<OnceLock<Arc<Node>>>::default();
+        let reading = Turns::new(limits.reads);
         Self {
-            node: Arc::default(),
+            metrics: Arc::new(Metrics::new(node.clone(), reading.clone())),
+            node,
             stopping: Arc::default(),
             keys,
             identity_keys: Arc::default(),
-            reading: Turns::new(limits.reads),
+            reading,
             limits,
             http: reqwest::Client::builder()
                 .connect_timeout(FORWARD_CONNECT_TIMEOUT)
@@ -190,6 +207,11 @@ impl App {
     /// Report not ready from now on: the node is about to stop.
     pub fn stopping(&self) {
         self.stopping.store(true, Ordering::Relaxed);
+    }
+
+    /// What the node measures of the requests it answers.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
     }
 
     /// The node being served from, once there is one.
@@ -376,9 +398,7 @@ async fn authorized(
         request.extensions_mut().insert(Caller::Admin);
         return Ok(next.run(request).await);
     }
-    let reaches = app
-        .node()?
-        .key_tenant(presented)
+    let reaches = metrics::timed(Stage::Auth, app.node()?.key_tenant(presented))
         .await?
         .ok_or_else(unauthorized)?;
     let route = request
@@ -621,7 +641,8 @@ pub fn router(app: App) -> Router {
         .merge(
             keyed
                 .route_layer(from_fn_with_state(app.clone(), forwarded))
-                .route_layer(from_fn_with_state(app.clone(), authorized)),
+                .route_layer(from_fn_with_state(app.clone(), authorized))
+                .route_layer(from_fn_with_state(app.clone(), metrics::timing)),
         )
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
