@@ -121,20 +121,40 @@ async fn t6b_a_narrow_filter_reads_postings_for_the_rows_it_allows() {
 async fn t8_a_filtered_search_finds_what_scoring_every_row_and_keeping_the_allowed_finds() {
     let (_cluster, writer) = notes(true).await;
     writer.partition().read(|state| {
+        // Runs of allowed rows, and rows allowed one in two: a walk that
+        // lands past the next allowed row skips one only when they are
+        // scattered.
+        let mut filters: Vec<(String, Filter, Box<dyn Fn(u128) -> bool>)> = [1, 10, 50, 100]
+            .into_iter()
+            .map(|cut| {
+                let allowed: Box<dyn Fn(u128) -> bool> = Box::new(move |n| n % 100 < cut);
+                (format!("n < {cut}"), n_below(cut as i64), allowed)
+            })
+            .collect();
+        let odd = Filter::Or(
+            (1..100)
+                .step_by(2)
+                .map(|n| Filter::Eq {
+                    property: "n".into(),
+                    value: json!(n),
+                })
+                .collect(),
+        );
+        filters.push(("n odd".into(), odd, Box::new(|n| n % 2 == 1)));
         for text in ["fox", "fox hen", "den hen", "den"] {
-            for cut in [1, 10, 50, 100] {
-                let filter = n_below(cut);
-                let allowed = |id: &ObjectId| (id.0.as_u128() % 100) < cut as u128;
+            for (named, filter, allows) in &filters {
+                let allowed = |id: &ObjectId| allows(id.0.as_u128());
+                let cut = named;
                 let (everything, _) = searched(state, text, None, ROWS as usize);
                 for limit in [1, 10, 200] {
-                    let (found, _) = searched(state, text, Some(&filter), limit);
+                    let (found, _) = searched(state, text, Some(filter), limit);
                     let wanted: Vec<(ObjectId, f32)> = everything
                         .iter()
                         .filter(|(id, _)| allowed(id))
                         .take(limit)
                         .cloned()
                         .collect();
-                    assert_eq!(found, wanted, "{text}, n < {cut}, limit {limit}");
+                    assert_eq!(found, wanted, "{text}, {cut}, limit {limit}");
                 }
             }
         }
