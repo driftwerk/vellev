@@ -190,7 +190,7 @@ impl Schedule {
         // An address that does not serve the tenant is never asked again;
         // `after` gives up before every address has said so.
         round()
-            .find(|&address| !self.refused[address] && !(passed_over && self.unable[address]))
+            .find(|&address| !(self.refused[address] || passed_over && self.unable[address]))
             .or_else(|| round().find(|&address| !self.refused[address]))
             .unwrap_or(self.address)
     }
