@@ -696,9 +696,15 @@ logged, written to a segment or backed up. It must be one the collection
 embeds, and can be neither filterable nor searchable. A schema with every
 property stored is written as before, byte for byte. A patch or append
 that changes what such a collection embeds must bring its vector, and a
-whole object written to one is always embedded afresh. A node of the
-release before reads `"stored": false` as nothing and stores the text of
-what it writes: do not run one as a writer of such a collection.
+whole object written to one is always embedded afresh.
+
+Such a property is new in file format 2. This release reads formats 1 and
+2 and writes format 1 unless `VELLEV_MAX_FORMAT=2` is set, and refuses a
+schema with an unstored property until the cluster writes format 2:
+upgrade every node, then raise `VELLEV_MAX_FORMAT` on all of them, after
+which the release before no longer starts (see `docs/compatibility.md`,
+"Format 2"). Every file a writer puts is now stamped with the format it
+writes, not the newest it reads.
 
 Not changed, and why: `EmbeddingProvider`, `HttpApi`, `DataType` and
 `Distance` stay exhaustive. They are stored, so a new variant of any is a

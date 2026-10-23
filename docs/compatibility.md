@@ -78,6 +78,7 @@ The formats so far:
 | Format | Release | What it added |
 | --- | --- | --- |
 | 1 | first | logs (with the requests each answered), manifests (naming the checkpoint before, the logs committed while a flush or a merge built to replay over its segments from the position those segments hold, and the requests answered in the last fifteen minutes), segments, vectors files, clustered index files |
+| 2 | 0.2.0 | a property embedded but not stored (`"stored": false`), in the schemas logs and manifests carry. A node of format 1 would read such a property as stored and write the text of what it is given. Nothing else differs: a file of format 2 without one is as format 1 writes it but for its stamp |
 
 A release may, without a new format:
 
@@ -120,10 +121,13 @@ Then:
    newest it may write, which happens only once every node registered
    reads it. A node that goes quiet stays registered (for a day, unless it
    stops cleanly and takes itself off), so its silence never lets the
-   format rise past it. Every writer (`format::encode`, and the vectors
-   file's own frame) must then take its version from the cluster's format
-   rather than from `FORMAT_VERSION`; today, with one format, they stamp
-   `FORMAT_VERSION`.
+   format rise past it. Every writer stamps every file it puts (logs,
+   manifests, segments, index files and vectors files) with the format it
+   writes (`Writer::writes`), which a node shares with each writer it
+   opens: the cluster's format, as far as `VELLEV_MAX_FORMAT` lets it.
+   `format::encode` alone stamps `FORMAT_VERSION`, and nothing puts what
+   it frames in the store. A file that only a newer format than the
+   writer's can hold is refused rather than stamped older.
 3. A node may write no newer than `VELLEV_MAX_FORMAT`, whose default is
    `DEFAULT_MAX_FORMAT`. A release that adds format N keeps that default
    at N - 1, so the cluster's format does not rise and a rollback finds
@@ -132,7 +136,9 @@ Then:
    become ready while the cluster writes a format newer than it reads, so
    rolling back past a raise fails at once and plainly.
 4. The API refuses whatever would be stored in the new format (a new
-   field or variant in a schema, say) until the cluster writes it.
+   field or variant in a schema, say) until the cluster writes it. For
+   format 2, a writer's draft refuses a schema with an unstored property,
+   as an invalid request saying so, while it writes format 1.
 5. Its tests carry fixtures of every format it reads, under
    `crates/vellev-storage/tests/fixtures/format-N`, and a test reads them.
    The fixtures of a released format are never written again: they stand
@@ -521,6 +527,24 @@ objects is refused by this release and made by the one before. So is a
 request with two deletes by filter and no limits, or with limits that come
 to more than 8,192 between them: the release before made it, and this one
 refuses it as invalid.
+
+### Format 2 (0.2.0): unstored properties
+
+0.2.0 reads formats 1 and 2 and writes format 1 by default
+(`DEFAULT_MAX_FORMAT` is 1), so a rollback to the release before reads
+everything it wrote. A collection with an unstored property is refused
+until the cluster writes format 2. To allow one:
+
+1. Run 0.2.0 on every node, and no node of a release before.
+2. Set `VELLEV_MAX_FORMAT=2` on every node and restart them. The cluster's
+   format rises to 2 once every node registered reads it, and nodes write
+   format 2 from then on, as soon as each sees the rise.
+3. After that, the release before refuses to start, and rolling back
+   means restoring from before the rise.
+
+A restore or adoption into a cluster that writes format 1 of a state that
+holds an unstored property fails, plainly, rather than write it as
+format 1.
 
 ## What rollback covers
 
