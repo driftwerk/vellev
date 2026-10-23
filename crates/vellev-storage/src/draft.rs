@@ -10,7 +10,7 @@ use vellev_core::{
 use vellev_index::filter::Predicate;
 
 use crate::catalog::Catalog;
-use crate::format::{CollectionId, Op};
+use crate::format::{CollectionId, Op, UNSTORED_FORMAT};
 use crate::mutation::{Condition, Mutation, Outcome, DELETED_AT_MOST};
 use crate::state::{Live, State};
 use crate::{Capped, Over, Result, StorageError};
@@ -23,6 +23,8 @@ type RowKey = (CollectionId, ObjectId);
 pub(crate) struct Draft<'a> {
     state: &'a State,
     pending: Pending,
+    /// The file format the commit will be written in.
+    format: u16,
 }
 
 /// What has been resolved so far: the catalog as it will be, the rows that
@@ -33,6 +35,8 @@ struct Pending {
     rows: HashMap<RowKey, Option<Object>>,
     ops: Vec<Op>,
     ends: Vec<usize>,
+    texts: HashMap<usize, String>,
+    row_texts: HashMap<RowKey, Option<String>>,
 }
 
 /// An object a commit writes without the vector its collection embeds for
@@ -61,17 +65,33 @@ struct Batch<'a> {
     catalog: Catalog,
     rows: HashMap<RowKey, Option<Object>>,
     ops: Vec<Op>,
+    /// The text to embed for each op, by its place in `ops`, that writes
+    /// an object of a collection not storing all it embeds, and wants a
+    /// vector: the op's object no longer holds all of it.
+    texts: HashMap<usize, String>,
+    /// The text to embed for each object of such a collection as its last
+    /// write in the commit, a whole one, left it, or none if that brought
+    /// its vector or had no text: what a change to nothing embedded that
+    /// follows it in the commit is embedded from.
+    row_texts: HashMap<RowKey, Option<String>>,
 }
 
 impl<'a> Draft<'a> {
-    pub fn new(state: &'a State) -> Self {
+    /// A draft of a commit to be written in `format`.
+    pub fn new(state: &'a State, format: u16) -> Self {
         let pending = Pending {
             catalog: state.catalog().clone(),
             rows: HashMap::new(),
             ops: vec![],
             ends: vec![],
+            texts: HashMap::new(),
+            row_texts: HashMap::new(),
         };
-        Self { state, pending }
+        Self {
+            state,
+            pending,
+            format,
+        }
     }
 
     /// Resolve one caller's batch. Either all of it joins the draft, or, on
@@ -105,17 +125,28 @@ impl<'a> Draft<'a> {
             catalog: self.pending.catalog.clone(),
             rows: HashMap::new(),
             ops: vec![],
+            texts: HashMap::new(),
+            row_texts: HashMap::new(),
         };
         let outcomes = mutations
             .into_iter()
             .map(|m| batch.resolve(m))
             .collect::<Result<Vec<_>>>()?;
         let Batch {
-            catalog, rows, ops, ..
+            catalog,
+            rows,
+            ops,
+            texts,
+            row_texts,
+            ..
         } = batch;
+        let before = self.pending.ops.len();
         self.pending.catalog = catalog;
         self.pending.rows.extend(rows);
         self.pending.ops.extend(ops);
+        let texts = texts.into_iter().map(|(op, text)| (before + op, text));
+        self.pending.texts.extend(texts);
+        self.pending.row_texts.extend(row_texts);
         Ok(outcomes)
     }
 
@@ -125,7 +156,11 @@ impl<'a> Draft<'a> {
     /// a later batch that only changed something else is not to blame.
     pub fn finish(self) -> (Vec<Op>, Vec<Wanted>) {
         let Pending {
-            catalog, ops, ends, ..
+            catalog,
+            ops,
+            ends,
+            texts,
+            ..
         } = self.pending;
         let mut wanting: HashMap<RowKey, Wanted> = HashMap::new();
         for (op, written) in ops.iter().enumerate() {
@@ -133,9 +168,15 @@ impl<'a> Draft<'a> {
             match written {
                 Op::Upsert { collection, object } => {
                     let key = (*collection, object.id);
+                    // An object of a collection not storing all it embeds
+                    // is embedded only from the text its write was given.
+                    let text = |schema: &Collection| match schema.has_unstored() {
+                        true => texts.get(&op).cloned(),
+                        false => wanting_text(schema, object),
+                    };
                     let needed = catalog
                         .schema(*collection)
-                        .and_then(|schema| Some((schema, wanting_text(schema, object)?)));
+                        .and_then(|schema| Some((schema, text(schema)?)));
                     match needed {
                         Some((schema, text)) => {
                             let since = wanting
@@ -176,6 +217,31 @@ fn invalid(reason: String) -> StorageError {
     StorageError::InvalidMutation(reason)
 }
 
+/// Refuse a change, without a vector, to any of `changed` that the
+/// collection embeds, where it does not store all it embeds: the text to
+/// embed again is not all there. Whether it is refused depends on the
+/// change and the schema alone, not on the object or the commit.
+fn unseen<'a>(schema: &Collection, mut changed: impl Iterator<Item = &'a String>) -> Result<()> {
+    if !schema.has_unstored() {
+        return Ok(());
+    }
+    let embedded = &schema.embedding.properties;
+    let Some(property) = changed.find(|name| embedded.contains(name)) else {
+        return Ok(());
+    };
+    let unstored: Vec<&str> = schema
+        .properties
+        .iter()
+        .filter(|p| !p.stored)
+        .map(|p| p.name.as_str())
+        .collect();
+    Err(invalid(format!(
+        "{} embeds {property:?} with {unstored:?}, which it does not store, so a change to \
+         {property:?} must bring its vector, or write the whole object",
+        schema.name
+    )))
+}
+
 /// A request that would delete more by filter than one may, or may.
 fn too_many_deleted(message: String) -> StorageError {
     StorageError::TooMany {
@@ -200,6 +266,16 @@ impl Batch<'_> {
             }),
             None => self.draft.state.row(key.0, key.1),
         }
+    }
+
+    /// The text the last whole write of the object in this commit left it
+    /// to be embedded from, if any.
+    fn row_text(&self, key: RowKey) -> Option<String> {
+        self.row_texts
+            .get(&key)
+            .or_else(|| self.draft.pending.row_texts.get(&key))
+            .cloned()
+            .flatten()
     }
 
     fn collection(&self, name: &CollectionName) -> Result<(CollectionId, Collection)> {
@@ -256,25 +332,60 @@ impl Batch<'_> {
     /// `supplied` no vector, the vector follows the text: the one stored
     /// for the same text if there is one, in this commit or before it, and
     /// otherwise none, to be made before the commit is logged.
+    ///
+    /// A collection that does not store all it embeds keeps none of that
+    /// text: not in its rows, this commit's included, nor in what the
+    /// commit logs. So no row's text can be compared with another's:
+    /// - A `whole` object, which the caller wrote in full, is always
+    ///   embedded afresh, from the text it was given, and is never taken
+    ///   for unchanged: two whole writes that differ only in that text
+    ///   read the same.
+    /// - One made from the object as it is and a change to it, which is
+    ///   refused before here if it changes what is embedded, has the
+    ///   object's vector; or, if the object has none yet, as a whole write
+    ///   earlier in the commit left it, is embedded from that write's text.
     fn write(
         &mut self,
         collection: CollectionId,
         schema: &Collection,
         mut next: Object,
         supplied: bool,
+        whole: bool,
     ) -> Outcome {
         let key = (collection, next.id);
         let embedding = &schema.embedding;
+        let unstored = schema.has_unstored();
+        let mut text = None;
         if !supplied && embedding.provider != EmbeddingProvider::None {
-            let text = next.embedded_text(embedding);
-            next.vector = [self.row(key), self.draft.state.row(collection, next.id)]
-                .into_iter()
-                .flatten()
-                .filter(|stored| stored.object.embedded_text(embedding) == text)
-                .find_map(|stored| stored.vector.map(<[f32]>::to_vec));
+            let embedded = next.embedded_text(embedding);
+            match (unstored, whole) {
+                (true, true) => {
+                    next.vector = None;
+                    text = Some(embedded).filter(|text| !text.trim().is_empty());
+                }
+                (true, false) if next.vector.is_none() => text = self.row_text(key),
+                (true, false) => {}
+                (false, _) => {
+                    next.vector = [self.row(key), self.draft.state.row(collection, next.id)]
+                        .into_iter()
+                        .flatten()
+                        .filter(|stored| stored.object.embedded_text(embedding) == embedded)
+                        .find_map(|stored| stored.vector.map(<[f32]>::to_vec));
+                }
+            }
         }
-        if self.row(key).is_some_and(|stored| stored.is(&next)) {
+        if unstored {
+            next = schema.stripped(next);
+            if whole {
+                self.row_texts.insert(key, text.clone());
+            }
+        }
+        let afresh = unstored && whole && !supplied;
+        if !afresh && self.row(key).is_some_and(|stored| stored.is(&next)) {
             return Outcome::Unchanged;
+        }
+        if let Some(text) = text {
+            self.texts.insert(self.ops.len(), text);
         }
         self.rows.insert(key, Some(next.clone()));
         self.ops.push(Op::Upsert {
@@ -287,6 +398,15 @@ impl Batch<'_> {
     fn resolve(&mut self, mutation: Mutation) -> Result<Outcome> {
         match mutation {
             Mutation::CreateCollection(schema) => {
+                let format = self.draft.format;
+                if schema.has_unstored() && format < UNSTORED_FORMAT {
+                    return Err(invalid(format!(
+                        "{} has a property it does not store, which only format 2 \
+                         can hold, and the cluster writes format {format}: every node must \
+                         read format 2 and be let write it (VELLEV_MAX_FORMAT=2) first",
+                        schema.name
+                    )));
+                }
                 let op = self.catalog.create_collection(schema)?;
                 Ok(op.map_or(Outcome::Unchanged, |op| {
                     self.ops.push(op);
@@ -319,7 +439,7 @@ impl Batch<'_> {
                 self.at_version(&collection, (cid, id), only_if_version)?;
                 let supplied = vector.is_some();
                 let object = Object::from_json(&schema, id, &properties, vector)?;
-                Ok(self.write(cid, &schema, object, supplied))
+                Ok(self.write(cid, &schema, object, supplied, true))
             }
             Mutation::Insert {
                 collection,
@@ -333,7 +453,7 @@ impl Batch<'_> {
                 }
                 let supplied = vector.is_some();
                 let object = Object::from_json(&schema, id, &properties, vector)?;
-                Ok(self.write(cid, &schema, object, supplied))
+                Ok(self.write(cid, &schema, object, supplied, true))
             }
             Mutation::Patch {
                 collection,
@@ -358,8 +478,11 @@ impl Batch<'_> {
                 }
                 self.at_version(&collection, (cid, id), only_if_version)?;
                 let supplied = vector.is_some();
+                if !supplied {
+                    unseen(&schema, properties.keys())?;
+                }
                 let patched = stored.patched(&schema, &properties, vector)?;
-                Ok(self.write(cid, &schema, patched, supplied))
+                Ok(self.write(cid, &schema, patched, supplied, false))
             }
             Mutation::Increment {
                 collection,
@@ -372,7 +495,7 @@ impl Batch<'_> {
                 let value = incremented(&schema, &object, &property, by)?;
                 if by != 0.0 {
                     object.properties.insert(property, value.clone());
-                    self.write(cid, &schema, object, false);
+                    self.write(cid, &schema, object, false, false);
                 }
                 Ok(Outcome::Value(value))
             }
@@ -384,6 +507,7 @@ impl Batch<'_> {
                 unique,
             } => {
                 let (cid, schema) = self.collection(&collection)?;
+                unseen(&schema, std::iter::once(&property))?;
                 let mut object = self.stored(&collection, (cid, id))?;
                 let Some(appended) = appended(&schema, &object, &property, values, unique)? else {
                     return Ok(Outcome::Unchanged);
@@ -391,7 +515,7 @@ impl Batch<'_> {
                 object
                     .properties
                     .insert(property, Value::TextArray(appended));
-                Ok(self.write(cid, &schema, object, false))
+                Ok(self.write(cid, &schema, object, false, false))
             }
             Mutation::Delete {
                 collection,
@@ -445,6 +569,7 @@ impl Batch<'_> {
 
     fn delete(&mut self, collection: CollectionId, id: ObjectId) {
         self.rows.insert((collection, id), None);
+        self.row_texts.insert((collection, id), None);
         self.ops.push(Op::Delete { collection, id });
     }
 

@@ -2020,7 +2020,8 @@ async fn a_node_stopped_by_its_own_store_notes_what_it_shipped_first() {
 /// reads, its checksum made again so that only its version is new.
 fn of_a_newer_format(frame: &[u8]) -> Bytes {
     let mut newer = frame.to_vec();
-    let version = u16::from_le_bytes([newer[5], newer[6]]) + 1;
+    // Past the newest this release reads, whatever format it was written in.
+    let version = vellev_storage::format::FORMAT_VERSION + 1;
     newer[5..7].copy_from_slice(&version.to_le_bytes());
     let mut crc = crc32fast::Hasher::new();
     crc.update(&newer[4..15]);
