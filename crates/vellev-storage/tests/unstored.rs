@@ -313,3 +313,84 @@ async fn the_text_not_kept_is_memory_not_held() {
     assert!(kept.0 >= unkept.0 + bodies, "{kept:?} {unkept:?}");
     assert!(kept.1 >= unkept.1 + bodies, "{kept:?} {unkept:?}");
 }
+
+/// A change to nothing embedded, after a whole write of the same object in
+/// its commit, leaves the object with the vector that write's text makes:
+/// however the two are grouped, and whatever the object was before.
+#[tokio::test]
+async fn a_change_after_a_whole_write_in_its_commit_keeps_the_text_that_write_brings() {
+    let whole = format!("T\n{SECRET}");
+    for before in [true, false] {
+        for grouped in [false, true] {
+            let cluster = Cluster::new().await;
+            let (writer, lengths) = writer(&cluster, false).await;
+            if before {
+                let old = page(1, json!({ "title": "T", "body": "old words" }));
+                writer.commit(vec![old]).await.unwrap();
+            }
+            let upsert = page(1, json!({ "title": "T", "body": SECRET }));
+            let changes = [patch(1, json!({ "n": 2 }), None), {
+                Mutation::Increment {
+                    collection: name(PAGES),
+                    id: id(1),
+                    property: "n".into(),
+                    by: 1.0,
+                }
+            }];
+            match grouped {
+                false => {
+                    let batch = [vec![upsert], changes.to_vec()].concat();
+                    writer.commit(batch).await.unwrap();
+                }
+                true => {
+                    let batches = vec![vec![upsert], changes.to_vec()];
+                    for result in writer.commit_group(batches).await.unwrap() {
+                        result.unwrap();
+                    }
+                }
+            }
+            let (properties, vector) = writer.partition().read(|state| read(state, 1));
+            assert_eq!(
+                properties["n"],
+                json!(3),
+                "before: {before}, grouped: {grouped}"
+            );
+            assert_eq!(
+                vector,
+                Some(vector_of(&whole)),
+                "before: {before}, grouped: {grouped}"
+            );
+            assert!(lengths.asked().contains(&whole));
+        }
+    }
+}
+
+/// Of two whole writes of an object in one commit, which read the same
+/// once their text is gone, the last one's text is what is embedded.
+#[tokio::test]
+async fn the_last_whole_write_in_a_commit_is_the_text_embedded() {
+    for grouped in [false, true] {
+        let cluster = Cluster::new().await;
+        let (writer, _) = writer(&cluster, false).await;
+        let first = page(1, json!({ "title": "T", "body": "first words" }));
+        let last = page(1, json!({ "title": "T", "body": SECRET }));
+        match grouped {
+            false => drop(writer.commit(vec![first, last]).await.unwrap()),
+            true => {
+                for result in writer
+                    .commit_group(vec![vec![first], vec![last]])
+                    .await
+                    .unwrap()
+                {
+                    result.unwrap();
+                }
+            }
+        }
+        let vector = writer.partition().read(|state| read(state, 1).1);
+        assert_eq!(
+            vector,
+            Some(vector_of(&format!("T\n{SECRET}"))),
+            "grouped: {grouped}"
+        );
+    }
+}
