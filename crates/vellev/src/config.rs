@@ -153,6 +153,16 @@ pub struct Config {
     /// flushed.
     #[arg(long, env = "VELLEV_FLUSH_ROWS", default_value_t = 50_000)]
     pub flush_rows: usize,
+    /// The most rows a tenant holds unflushed while its flushes fail; a
+    /// write past them is refused with 429 and a Retry-After until one goes
+    /// through. Four times `VELLEV_FLUSH_ROWS` unless set.
+    #[arg(long, env = "VELLEV_BACKLOG_ROWS")]
+    pub backlog_rows: Option<usize>,
+    /// How long after a failed flush the next is tried, at the least, in
+    /// milliseconds: twice as long after each that fails in a row, up to
+    /// 64 times this.
+    #[arg(long, env = "VELLEV_FLUSH_BACKOFF_MS", default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
+    pub flush_backoff_ms: u64,
     /// The most tenants the node keeps a list of, the most lately served
     /// first, in its cache directory, to open copies of as it starts again
     /// before anyone reads them; 0, or no cache directory, to keep none.
@@ -642,6 +652,8 @@ impl Config {
         let settings = Settings {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
+            backlog_rows: self.backlog_rows,
+            flush_backoff: Duration::from_millis(self.flush_backoff_ms),
             warm: self
                 .cache_dir
                 .as_ref()

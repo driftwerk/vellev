@@ -1734,7 +1734,8 @@ impl Blobs for Silenced {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn a_flush_whose_vectors_on_local_disk_never_answer_keeps_those_it_holds() {
+async fn a_flush_whose_vectors_on_local_disk_never_answer_fails_within_its_bound_and_keeps_its_rows(
+) {
     let dir = tempfile::tempdir().unwrap();
     let mut cluster = Cluster::new().await;
     // The copies lie on a disk of the cache's own, which waits a little
@@ -1752,7 +1753,14 @@ async fn a_flush_whose_vectors_on_local_disk_never_answer_keeps_those_it_holds()
         .unwrap();
     let started = std::time::Instant::now();
     let flushed = tokio::time::timeout(Duration::from_secs(60), writer.flush()).await;
-    flushed.expect("given up within its bound").unwrap();
+    // Not kept in memory instead, unseen (track 2, V1): the flush fails,
+    // and the rows stay where they were, to be flushed once the disk
+    // answers.
+    let failed = flushed.expect("given up within its bound").unwrap_err();
+    assert!(
+        matches!(&failed, StorageError::Blob { key, .. } if key.ends_with(".vectors")),
+        "{failed}"
+    );
     let took = started.elapsed();
     assert!(
         took < Duration::from_secs(2),

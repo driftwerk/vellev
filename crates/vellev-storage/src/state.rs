@@ -924,6 +924,22 @@ impl State {
         self.memtable.rows.len()
     }
 
+    /// About how many bytes what is held in memory until the next flush
+    /// takes: the rows written since the last checkpoint, with whatever
+    /// codes they are searched by. Counted in [`Self::resident`] too.
+    pub fn unflushed_bytes(&self) -> usize {
+        let codes: usize = self
+            .memtable
+            .indexes
+            .values()
+            .map(|index| match &index.vectors {
+                Some(Vectors::Binary(codes)) => codes.resident(),
+                _ => 0,
+            })
+            .sum();
+        self.memtable.bytes + codes
+    }
+
     pub fn head(&self) -> Option<&str> {
         self.head.as_deref()
     }

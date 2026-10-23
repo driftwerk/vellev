@@ -18,7 +18,7 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{
-    ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Served, Settings,
+    ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Served, Settings, Tenant,
     LOOKED_OVER_EVERY, REMEMBERED,
 };
 use vellev_storage::backups::{Backup, Backups, DELETED_AT_ONCE};
@@ -57,6 +57,9 @@ struct Store {
     slow: std::sync::Mutex<Option<Duration>>,
     /// The prefixes whose cached copies were dropped.
     forgotten: std::sync::Mutex<Vec<String>>,
+    /// How many vectors files were asked to be written, right or wrong:
+    /// one for each flush that got as far as writing its segment.
+    vectors_written: AtomicUsize,
 }
 
 impl Store {
@@ -68,6 +71,9 @@ impl Store {
 
     /// A write of `key` goes wrong, if it is to, as it is to.
     async fn written(&self, key: &str) -> vellev_storage::Result<()> {
+        if key.ends_with(".vectors") {
+            self.vectors_written.fetch_add(1, Ordering::SeqCst);
+        }
         let fault = {
             let mut faulty = self.faulty.lock().unwrap();
             let fault = faulty
@@ -161,6 +167,7 @@ impl Cluster {
                 failing_once: AtomicBool::new(false),
                 slow: std::sync::Mutex::new(None),
                 forgotten: std::sync::Mutex::default(),
+                vectors_written: AtomicUsize::new(0),
             }),
         }
     }
@@ -8567,4 +8574,104 @@ async fn a_node_serves_every_tenant_unless_told_otherwise() {
         assert_eq!(read.unwrap().read(count), 1);
         assert_eq!(reading.copies(), 1);
     }
+}
+
+/// A tenant flushed every `flush_rows` rows, whose failed flushes are
+/// tried again no sooner than `backoff`, doubling.
+fn backlogging(cluster: &Cluster, flush_rows: usize, backoff: Duration) -> Node {
+    cluster.node_from(Settings {
+        flush_rows,
+        flush_backoff: backoff,
+        ..cluster.settings()
+    })
+}
+
+/// Writes rows `from..to` one at a time, until one is refused.
+async fn written_until_refused(tenant: &Tenant, from: u64, to: u64) -> (u64, Option<NodeError>) {
+    for n in from..to {
+        let row = note(n, "row", Some(vec![n as f32, 1.0]));
+        if let Err(refused) = tenant.write(vec![row]).await {
+            return (n, Some(refused));
+        }
+    }
+    (to, None)
+}
+
+/// Track 2, V1: a flush that fails is not kept in memory instead, so the
+/// rows wait for one that does. A tenant does not take more than four
+/// flushes' worth meanwhile: writes past that are refused, saying when to
+/// try again, until a flush goes through.
+#[tokio::test]
+async fn writes_are_refused_while_four_flushes_of_rows_wait_and_taken_once_one_goes_through() {
+    let cluster = Cluster::new();
+    let node = backlogging(&cluster, 10, Duration::from_millis(20));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    let (refused_at, refused) = written_until_refused(&acme, 0, 100).await;
+    assert_eq!(refused_at, 40, "four flushes' worth taken, then refused");
+    let wait = match refused {
+        Some(NodeError::Backlogged { wait, .. }) => wait,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        wait > Duration::ZERO && wait <= Duration::from_secs(60),
+        "{wait:?}"
+    );
+    assert_eq!(
+        acme.read(State::unflushed),
+        40,
+        "nothing taken past the backlog"
+    );
+    assert!(node.flushing().failed >= 1);
+    assert_eq!(node.flushing().unflushed_rows, 40);
+    assert!(node.flushing().unflushed_bytes > 0);
+
+    cluster.store.fault(None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match acme.write(vec![note(1_000, "after", None)]).await {
+            Ok(_) => break,
+            Err(NodeError::Backlogged { wait, .. }) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(wait.min(Duration::from_millis(50))).await;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(acme.read(State::unflushed) < 40);
+    assert!(node.flushing().backlogged >= 1);
+}
+
+/// Failed flushes are not tried back to back: each waits twice as long as
+/// the one before, however hard writes ask for one.
+#[tokio::test]
+async fn failed_flushes_are_tried_again_further_and_further_apart() {
+    let cluster = Cluster::new();
+    let backoff = Duration::from_millis(100);
+    let node = backlogging(&cluster, 2, backoff);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    let started = std::time::Instant::now();
+    let mut n = 0;
+    // Asking all the while: each write past the threshold asks for one.
+    while started.elapsed() < Duration::from_millis(1_400) {
+        let _ = acme
+            .write(vec![note(n % 8, "row", Some(vec![1.0, 1.0]))])
+            .await;
+        n += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Tried at about 0, 0.1, 0.3, 0.7 and 1.5 seconds: four within the
+    // 1.4, five at the most with timing's slack. Back to back, they would
+    // have been tried about as often as written to.
+    let tried = cluster.store.vectors_written.load(Ordering::SeqCst);
+    assert!((3..=5).contains(&tried), "tried {tried} times in 1.4 s");
+    assert_eq!(node.flushing().failed, tried as u64);
 }
