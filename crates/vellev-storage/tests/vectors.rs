@@ -330,3 +330,129 @@ async fn a_segment_built_whose_copy_the_cache_cannot_keep_fails_the_build_rather
     let resident = |writer: &Writer| writer.partition().read(State::resident);
     assert!(resident(&writer) < resident(&held));
 }
+
+/// A store keeping copies whose copy of a vectors file it has just put is
+/// left torn: cut short after it was written, as a disk that lost its end
+/// would leave it.
+#[derive(Debug)]
+struct Tearing {
+    inner: CachedBlobs,
+    dir: std::path::PathBuf,
+}
+
+#[async_trait]
+impl Blobs for Tearing {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await?;
+        if key.ends_with(".vectors") {
+            let copy = std::fs::OpenOptions::new()
+                .write(true)
+                .open(self.dir.join(key))
+                .unwrap();
+            let length = copy.metadata().unwrap().len();
+            copy.set_len(length / 2).unwrap();
+        }
+        Ok(())
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
+        self.inner.local(key).await
+    }
+    async fn fetch_local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
+        self.inner.fetch_local(key).await
+    }
+}
+
+/// A segment built whose copy on local disk is torn is read in place from
+/// a whole copy fetched afresh, not held in memory as built.
+#[tokio::test]
+async fn a_segment_built_whose_cached_copy_is_torn_is_read_from_one_fetched_whole() {
+    let cluster = Cluster::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let tearing: Arc<dyn Blobs> = Arc::new(Tearing {
+        inner: CachedBlobs::new(cluster.blobs.clone(), dir.path()),
+        dir: dir.path().to_path_buf(),
+    });
+    let (lease, committed) = cluster.lease().await;
+    let writer = Writer::open(tearing, cluster.coordinator.clone(), lease, &committed)
+        .await
+        .unwrap();
+    let rows = (0..10).map(|n| upsert("notes", n, i64::from(n)));
+    writer
+        .commit([create("notes")].into_iter().chain(rows).collect())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let (held, _) = built_on(false, false).await;
+    let resident = |writer: &Writer| writer.partition().read(State::resident);
+    assert_eq!(resident(&writer) + 80, resident(&held), "none of them in memory");
+    writer
+        .partition()
+        .read(|state| assert_eq!(vector_of(state, 6), Some(vec![6.0, 0.5])));
+}
+
+/// The cache directory `dir`, and every directory in it, made to take no
+/// new file, or to take them again.
+#[cfg(unix)]
+fn writable(dir: &std::path::Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if writable { 0o755 } else { 0o555 };
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+/// A merge whose segment's copy the cache cannot keep fails as a flush
+/// does: nothing committed, the segments it would have replaced still
+/// read, and the merge made once the disk takes the copy.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_merge_whose_copy_the_cache_cannot_keep_fails_and_changes_nothing() {
+    let cluster = Cluster::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let cached: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(cluster.blobs.clone(), &cache));
+    let (lease, committed) = cluster.lease().await;
+    let writer = Writer::open(cached, cluster.coordinator.clone(), lease, &committed)
+        .await
+        .unwrap()
+        .merging_with(Merging {
+            fanout: 2,
+            ..Merging::default()
+        });
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for half in [0..5, 5..10] {
+        let rows = half.map(|n| upsert("notes", n, i64::from(n)));
+        writer.commit(rows.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    let before = cluster.committed().await.manifest;
+    writable(&cache, false);
+    let failed = writer.merge().await;
+    writable(&cache, true);
+    assert!(
+        matches!(&failed, Err(StorageError::Blob { key, .. }) if key.contains("/vectors/")),
+        "{failed:?}"
+    );
+    assert_eq!(cluster.committed().await.manifest, before, "nothing committed");
+    assert_eq!(segments_of(&cluster).await.len(), 2);
+    writer
+        .partition()
+        .read(|state| assert_eq!(vector_of(state, 7), Some(vec![7.0, 0.5])));
+    assert!(writer.merge().await.unwrap().is_some());
+    assert_eq!(segments_of(&cluster).await.len(), 1);
+}
