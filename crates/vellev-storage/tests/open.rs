@@ -254,7 +254,7 @@ async fn a_property_made_searchable_mid_replay_is_searched_from_then_on() {
     let writer = cluster.writer().await;
     writer.commit(vec![create(NOTES)]).await.unwrap();
     let note = |n: u32| {
-        let mut properties = json!({ "title": "otter hen", "n": n });
+        let mut properties = json!({ "title": "hen", "n": n });
         if n >= 4 {
             properties["body"] = json!("otter");
         }
