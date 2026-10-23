@@ -430,39 +430,32 @@ impl BinaryIndex {
     /// Index `vectors`, which must be in ascending row order and all of one
     /// length, for search under `metric`. Returns `None` when there is
     /// nothing to index.
-    pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
+    /// As [`Self::build`], with codes taken about `centre` (in the rotated
+    /// space) rather than about the vectors' own median.
+    pub fn build_about(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        centre: Vec<f32>,
+    ) -> Option<Self> {
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
-        let rotation = Rotation::new(dimensions, ROTATION_SEED);
-        let prepared = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
+        let mut index = Self::empty(metric, dimensions, centre);
         let (measured, unmeasured): (Vec<&(u32, &[f32])>, _) = vectors
             .iter()
             .partition(|(_, vector)| measurable(metric, vector));
-        let sampled: Vec<(usize, Vec<f32>)> = Random(ROTATION_SEED)
-            .sample(measured.len(), CENTRE_SAMPLE)
-            .into_par_iter()
-            .map(|at| (at, prepared(measured[at].1)))
-            .collect();
-        let centre = median(
-            rotation.width,
-            sampled.iter().map(|(_, vector)| vector.as_slice()),
-        );
-        let words = rotation.width / 64;
+        let words = index.words;
         let mut codes = vec![0u64; measured.len() * words];
+        let (rotation, centre) = (&index.rotation, &index.centre);
         let factors = codes
             .par_chunks_mut(words)
             .zip(measured.par_iter())
-            .enumerate()
-            .map(|(at, (code, (_, vector)))| {
-                let vector = match sampled.binary_search_by_key(&at, |(sampled, _)| *sampled) {
-                    Ok(found) => Cow::Borrowed(sampled[found].1.as_slice()),
-                    Err(_) => Cow::Owned(prepared(vector)),
-                };
+            .map(|(code, (_, vector))| {
+                let vector = rotation.apply(&normalised(metric, vector));
                 code.iter_mut()
-                    .zip(encode(&centre, &vector))
+                    .zip(encode(centre, &vector))
                     .for_each(|(slot, word)| *slot = word);
-                let (squared, along) = residual(&centre, &vector);
+                let (squared, along) = residual(centre, &vector);
                 let term = match metric {
                     Distance::L2 => squared,
                     Distance::Dot | Distance::Cosine => -along,
@@ -470,21 +463,131 @@ impl BinaryIndex {
                 (term, squared.sqrt())
             })
             .collect();
+        index.rows = measured.iter().map(|(row, _)| *row).collect();
+        index.codes = codes;
+        index.factors = factors;
+        index.unmeasured = unmeasured.iter().map(|(row, _)| *row).collect();
+        Some(index)
+    }
+
+    /// An index of `dimensions`, of no rows yet, its codes taken about
+    /// `centre`.
+    fn empty(metric: Distance, dimensions: usize, centre: Vec<f32>) -> Self {
+        let rotation = Rotation::new(dimensions, ROTATION_SEED);
+        debug_assert_eq!(centre.len(), rotation.width);
         let bits = rotation.width;
-        Some(Self {
+        Self {
             metric,
             dimensions,
+            words: rotation.width / 64,
             rotation,
             centre,
-            words,
-            rows: measured.iter().map(|(row, _)| *row).collect(),
-            codes,
-            factors,
-            unmeasured: unmeasured.iter().map(|(row, _)| *row).collect(),
+            rows: Vec::new(),
+            codes: Vec::new(),
+            factors: Vec::new(),
+            unmeasured: Vec::new(),
             cosines: (0..=bits)
                 .map(|hamming| ranked_cosine(hamming, bits))
                 .collect(),
-        })
+        }
+    }
+
+    pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
+        let dimensions = vectors.first()?.1.len();
+        let rotation = Rotation::new(dimensions, ROTATION_SEED);
+        let measured: Vec<&[f32]> = vectors
+            .iter()
+            .map(|(_, vector)| *vector)
+            .filter(|vector| measurable(metric, vector))
+            .collect();
+        let sampled: Vec<Vec<f32>> = Random(ROTATION_SEED)
+            .sample(measured.len(), CENTRE_SAMPLE)
+            .into_par_iter()
+            .map(|at| rotation.apply(&normalised(metric, measured[at])))
+            .collect();
+        let centre = median(rotation.width, sampled.iter().map(Vec::as_slice));
+        Self::build_about(metric, vectors, centre)
+    }
+
+    /// An index of no rows yet, its codes to be taken about the mean of
+    /// `first`: for rows coded one at a time with [`Self::push`] as they
+    /// come, such as those in memory since a checkpoint (burst plan F2b).
+    /// The vectors, normalised as codes are, are summed in `f64` one value
+    /// after another in the order given and rounded to `f32` once, so that
+    /// the mean comes out the same to the bit on every machine; and that
+    /// mean is rotated once into the space codes are taken in. The cost is
+    /// a sum over `first` and one rotation, whatever its length.
+    /// `None` when `first` has nothing to measure.
+    pub fn about_mean(metric: Distance, first: &[&[f32]]) -> Option<Self> {
+        let dimensions = first.first()?.len();
+        let mut sums = vec![0.0f64; dimensions];
+        let mut counted = 0usize;
+        for vector in first.iter().filter(|vector| measurable(metric, vector)) {
+            for (sum, value) in sums.iter_mut().zip(normalised(metric, vector).iter()) {
+                *sum += f64::from(*value);
+            }
+            counted += 1;
+        }
+        if counted == 0 {
+            return None;
+        }
+        let mean: Vec<f32> = sums
+            .iter()
+            .map(|sum| (sum / counted as f64) as f32)
+            .collect();
+        // The rotation is linear: the mean rotated once stands for the
+        // rotated vectors' mean, at a sum's cost rather than a rotation for
+        // every vector.
+        let centre = Rotation::new(dimensions, ROTATION_SEED).apply(&mean);
+        Some(Self::empty(metric, dimensions, centre))
+    }
+
+    /// Code `vector` as row `row`, which must come after every row coded
+    /// so far.
+    pub fn push(&mut self, row: u32, vector: &[f32]) {
+        debug_assert_eq!(vector.len(), self.dimensions);
+        if !measurable(self.metric, vector) {
+            self.unmeasured.push(row);
+            return;
+        }
+        let rotated = self.rotation.apply(&normalised(self.metric, vector));
+        let (squared, along) = residual(&self.centre, &rotated);
+        let term = match self.metric {
+            Distance::L2 => squared,
+            Distance::Dot | Distance::Cosine => -along,
+        };
+        self.codes.extend(encode(&self.centre, &rotated));
+        self.factors.push((term, squared.sqrt()));
+        self.rows.push(row);
+    }
+
+    /// Take row `row`, which must come after every row taken so far, to be
+    /// scored exactly beside whatever the codes shortlist, and never
+    /// coded: the rows a memtable's centre is taken from (burst plan F2b),
+    /// so that reaching the threshold codes none of them.
+    pub fn push_exact(&mut self, row: u32) {
+        self.unmeasured.push(row);
+    }
+
+    /// How many rows have a code.
+    pub fn coded(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The centre codes are taken about, in the rotated space.
+    pub fn centre(&self) -> &[f32] {
+        &self.centre
+    }
+
+    /// About how many bytes the index takes in memory.
+    pub fn resident(&self) -> usize {
+        use std::mem::size_of;
+        self.centre.len() * size_of::<f32>()
+            + self.rows.capacity() * size_of::<u32>()
+            + self.codes.capacity() * size_of::<u64>()
+            + self.factors.capacity() * size_of::<(f32, f32)>()
+            + self.unmeasured.capacity() * size_of::<u32>()
+            + self.cosines.len() * size_of::<f32>()
     }
 
     fn hamming(&self, position: usize, query: &[u64]) -> usize {
@@ -1241,5 +1344,114 @@ mod tests {
             Vec::<u32>::new()
         );
         assert!(BinaryIndex::build(Distance::Cosine, &[]).is_none());
+    }
+
+    /// The centre a growing index takes, worked out plainly: the vectors,
+    /// normalised as the index normalises them, summed in `f64` one after
+    /// another, divided and rounded to `f32` once; and that mean rotated
+    /// once, as the index rotates every vector. Rotating the mean rather
+    /// than every vector keeps the work at the threshold to a sum.
+    fn scalar_mean(metric: Distance, vectors: &[Vec<f32>]) -> Vec<f32> {
+        let rotation = Rotation::new(vectors[0].len(), ROTATION_SEED);
+        let measured: Vec<Vec<f32>> = vectors
+            .iter()
+            .filter(|vector| measurable(metric, vector))
+            .map(|vector| normalised(metric, vector).into_owned())
+            .collect();
+        let mean: Vec<f32> = (0..vectors[0].len())
+            .map(|at| {
+                let mut sum = 0.0f64;
+                for vector in &measured {
+                    sum += f64::from(vector[at]);
+                }
+                (sum / measured.len() as f64) as f32
+            })
+            .collect();
+        rotation.apply(&mean)
+    }
+
+    #[test]
+    fn a_growing_index_is_centred_on_the_scalar_mean_to_the_bit() {
+        let mut random = Random(23);
+        for (metric, dimensions) in [
+            (Distance::Cosine, 768),
+            (Distance::L2, 100),
+            (Distance::Dot, 64),
+        ] {
+            let vectors = grouped(&mut random, 1_024, dimensions, 0.4);
+            let first: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let index = BinaryIndex::about_mean(metric, &first).unwrap();
+            let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(index.centre()),
+                bits(&scalar_mean(metric, &vectors)),
+                "{metric:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_coded_one_at_a_time_rank_as_rows_coded_together_about_the_same_centre() {
+        let mut random = Random(29);
+        for metric in [Distance::Cosine, Distance::L2, Distance::Dot] {
+            let vectors = grouped(&mut random, 3_000, 128, 0.4);
+            let first: Vec<&[f32]> = vectors[..1_024].iter().map(Vec::as_slice).collect();
+            let mut growing = BinaryIndex::about_mean(metric, &first).unwrap();
+            for (row, vector) in vectors.iter().enumerate() {
+                growing.push(row as u32 * 3, vector);
+            }
+            let rows: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, vector)| (row as u32 * 3, vector.as_slice()))
+                .collect();
+            let together =
+                BinaryIndex::build_about(metric, &rows, growing.centre().to_vec()).unwrap();
+            assert_eq!(growing.len(), together.len());
+            for query in grouped(&mut random, 20, 128, 0.4) {
+                let ranked =
+                    |index: &BinaryIndex| index.estimates(&query, 200, None, &[], &in_row_order);
+                assert_eq!(ranked(&growing), ranked(&together), "{metric:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_growing_index_counts_its_codes_as_resident() {
+        let mut random = Random(31);
+        let vectors = grouped(&mut random, 2_000, 768, 0.4);
+        let first: Vec<&[f32]> = vectors[..1_024].iter().map(Vec::as_slice).collect();
+        let mut index = BinaryIndex::about_mean(Distance::Cosine, &first).unwrap();
+        let empty = index.resident();
+        for (row, vector) in vectors.iter().enumerate() {
+            index.push(row as u32, vector);
+        }
+        // A bit a rotated dimension and two factors, for each row.
+        assert!(index.resident() - empty >= 2_000 * (1_024 / 8 + 8));
+    }
+
+    #[test]
+    fn rows_pushed_as_exact_are_offered_whole_and_never_ranked() {
+        let mut random = Random(37);
+        let vectors = grouped(&mut random, 2_000, 128, 0.4);
+        let first: Vec<&[f32]> = vectors[..1_024].iter().map(Vec::as_slice).collect();
+        let mut index = BinaryIndex::about_mean(Distance::Cosine, &first).unwrap();
+        for row in 0..1_024u32 {
+            index.push_exact(row);
+        }
+        for (row, vector) in vectors.iter().enumerate().skip(1_024) {
+            index.push(row as u32, vector);
+        }
+        assert_eq!((index.len(), index.coded()), (2_000, 976));
+        assert_eq!(
+            index.unmeasured(None, &[]),
+            (0..1_024).collect::<Vec<u32>>()
+        );
+        let ranked = index.estimates(&vectors[5], 2_000, None, &[], &in_row_order);
+        assert!(
+            ranked.iter().all(|(_, row)| *row >= 1_024),
+            "only coded rows are ranked"
+        );
+        assert_eq!(ranked.len(), 976);
     }
 }
