@@ -266,6 +266,14 @@ pub struct Author {
     pub writer: uuid::Uuid,
 }
 
+/// Whether `key` is named as a checkpoint is, in every layout this
+/// release writes (see [`Layout::manifest`], and a link's from another
+/// store). Only a hint: what a head is, its frame says; a walk back that
+/// trusts this to fetch ahead checks every head it reaches all the same.
+pub(crate) fn named_as_checkpoint(key: &str) -> bool {
+    key.ends_with(".manifest")
+}
+
 /// Where a partition's files live.
 #[derive(Debug, Clone, Copy)]
 pub struct Layout<'a>(pub &'a PartitionKey);

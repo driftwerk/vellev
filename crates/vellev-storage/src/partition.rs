@@ -126,6 +126,9 @@ struct Ahead {
     from: u64,
     window: u64,
     incarnation: Incarnation,
+    /// The newest checkpoint listed, by its name: nothing below it is asked
+    /// for or fetched.
+    floor: Option<u64>,
 }
 
 impl Ahead {
@@ -135,6 +138,7 @@ impl Ahead {
             from: committed.log_position.0 + 1,
             window: FETCHED_FIRST,
             incarnation: committed.incarnation,
+            floor: None,
         }
     }
 
@@ -157,6 +161,11 @@ impl Ahead {
         if expected.0 >= self.from || expected <= position {
             return None;
         }
+        // Below the checkpoint listed, the walk has ended or the name
+        // misled: fetch alone.
+        if self.floor.is_some_and(|at| expected.0 < at) {
+            return None;
+        }
         let (below, window) = next_window(self.from, self.window, position);
         let asked = commits
             .commits_after(
@@ -176,9 +185,26 @@ impl Ahead {
         };
         self.from = below + 1;
         self.window = window;
-        let keys: Vec<String> = points
+        let listed: Vec<_> = points
             .into_iter()
             .filter(|point| point.position.0 < expected.0 + 1)
+            .collect();
+        // The walk back ends at the newest checkpoint: nothing from before
+        // it is fetched, and no window is asked for below it. Should the
+        // name mislead, the walk checks each head it reaches as ever, and
+        // fetches what it was not given alone.
+        let checkpoint = listed
+            .iter()
+            .filter(|point| crate::blobs::named_as_checkpoint(&point.head.0))
+            .map(|point| point.position.0)
+            .max();
+        if let Some(at) = checkpoint {
+            self.from = self.from.max(at);
+            self.floor = Some(at);
+        }
+        let keys: Vec<String> = listed
+            .into_iter()
+            .filter(|point| checkpoint.is_none_or(|at| point.position.0 >= at))
             .map(|point| point.head.0)
             .filter(|key| !self.fetched.contains_key(key))
             .collect();
