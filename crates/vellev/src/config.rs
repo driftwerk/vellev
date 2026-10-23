@@ -153,6 +153,16 @@ pub struct Config {
     /// flushed.
     #[arg(long, env = "VELLEV_FLUSH_ROWS", default_value_t = 50_000)]
     pub flush_rows: usize,
+    /// The most rows a tenant holds unflushed while its flushes fail; a
+    /// write past them is refused with 429 and a Retry-After until one goes
+    /// through. Four times `VELLEV_FLUSH_ROWS` unless set.
+    #[arg(long, env = "VELLEV_BACKLOG_ROWS")]
+    pub backlog_rows: Option<usize>,
+    /// How long after a failed flush the next is tried, at the least, in
+    /// milliseconds: twice as long after each that fails in a row, up to
+    /// 64 times this.
+    #[arg(long, env = "VELLEV_FLUSH_BACKOFF_MS", default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
+    pub flush_backoff_ms: u64,
     /// How far back a tenant may be restored unless it is set otherwise for
     /// it, in seconds. What a restore that far back needs is kept.
     #[arg(long, env = "VELLEV_RESTORE_WINDOW_SECS", default_value_t = 14 * 24 * 60 * 60)]
@@ -637,6 +647,8 @@ impl Config {
         let settings = Settings {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
+            backlog_rows: self.backlog_rows,
+            flush_backoff: Duration::from_millis(self.flush_backoff_ms),
             restore_window: Duration::from_secs(self.restore_window_secs),
             backups,
             backup_every: Duration::from_secs(self.backup_every_secs),

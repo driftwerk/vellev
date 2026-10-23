@@ -8607,7 +8607,9 @@ async fn writes_are_refused_while_four_flushes_of_rows_wait_and_taken_once_one_g
     let node = backlogging(&cluster, 10, Duration::from_millis(20));
     node.create_tenant(&tenant("acme")).await.unwrap();
     let acme = node.tenant(&tenant("acme")).await.unwrap();
-    acme.write(vec![schema(EmbeddingProvider::None)]).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
     cluster.store.fault(Some(("vectors", Fault::Fails)));
     let (refused_at, refused) = written_until_refused(&acme, 0, 100).await;
     assert_eq!(refused_at, 40, "four flushes' worth taken, then refused");
@@ -8615,8 +8617,15 @@ async fn writes_are_refused_while_four_flushes_of_rows_wait_and_taken_once_one_g
         Some(NodeError::Backlogged { wait, .. }) => wait,
         other => panic!("{other:?}"),
     };
-    assert!(wait > Duration::ZERO && wait <= Duration::from_secs(60), "{wait:?}");
-    assert_eq!(acme.read(State::unflushed), 40, "nothing taken past the backlog");
+    assert!(
+        wait > Duration::ZERO && wait <= Duration::from_secs(60),
+        "{wait:?}"
+    );
+    assert_eq!(
+        acme.read(State::unflushed),
+        40,
+        "nothing taken past the backlog"
+    );
     assert!(node.flushing().failed >= 1);
     assert_eq!(node.flushing().unflushed_rows, 40);
     assert!(node.flushing().unflushed_bytes > 0);
@@ -8645,13 +8654,17 @@ async fn failed_flushes_are_tried_again_further_and_further_apart() {
     let node = backlogging(&cluster, 2, backoff);
     node.create_tenant(&tenant("acme")).await.unwrap();
     let acme = node.tenant(&tenant("acme")).await.unwrap();
-    acme.write(vec![schema(EmbeddingProvider::None)]).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
     cluster.store.fault(Some(("vectors", Fault::Fails)));
     let started = std::time::Instant::now();
     let mut n = 0;
     // Asking all the while: each write past the threshold asks for one.
     while started.elapsed() < Duration::from_millis(1_400) {
-        let _ = acme.write(vec![note(n % 8, "row", Some(vec![1.0, 1.0]))]).await;
+        let _ = acme
+            .write(vec![note(n % 8, "row", Some(vec![1.0, 1.0]))])
+            .await;
         n += 1;
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

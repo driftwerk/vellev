@@ -391,9 +391,20 @@ async fn a_segment_built_whose_cached_copy_is_torn_is_read_from_one_fetched_whol
         .await
         .unwrap();
     writer.flush().await.unwrap();
-    let (held, _) = built_on(false, false).await;
+    // The same rows flushed alike on a store that keeps no copies.
+    let plain = Cluster::new().await;
+    let held = plain.writer().await;
+    let rows = (0..10).map(|n| upsert("notes", n, i64::from(n)));
+    held.commit([create("notes")].into_iter().chain(rows).collect())
+        .await
+        .unwrap();
+    held.flush().await.unwrap();
     let resident = |writer: &Writer| writer.partition().read(State::resident);
-    assert_eq!(resident(&writer) + 80, resident(&held), "none of them in memory");
+    assert_eq!(
+        resident(&writer) + 80,
+        resident(&held),
+        "none of them in memory"
+    );
     writer
         .partition()
         .read(|state| assert_eq!(vector_of(state, 6), Some(vec![6.0, 0.5])));
@@ -448,7 +459,11 @@ async fn a_merge_whose_copy_the_cache_cannot_keep_fails_and_changes_nothing() {
         matches!(&failed, Err(StorageError::Blob { key, .. }) if key.contains("/vectors/")),
         "{failed:?}"
     );
-    assert_eq!(cluster.committed().await.manifest, before, "nothing committed");
+    assert_eq!(
+        cluster.committed().await.manifest,
+        before,
+        "nothing committed"
+    );
     assert_eq!(segments_of(&cluster).await.len(), 2);
     writer
         .partition()
