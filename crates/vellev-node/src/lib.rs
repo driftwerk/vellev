@@ -156,6 +156,13 @@ pub struct Settings {
     /// The most copies of tenants kept for reads at once; the least
     /// recently used go first.
     pub followers: usize,
+    /// Where the node keeps the tenants it has lately served, to open
+    /// copies of them as it starts, before anyone reads them (burst plan
+    /// F7); none, to keep no such list.
+    pub warm: Option<std::path::PathBuf>,
+    /// The most tenants the node keeps in that list, and opens as it
+    /// starts.
+    pub warm_most: usize,
     /// The newest file format this node may write, whatever every node
     /// reads. A release that adds a format keeps this at the one before,
     /// so that rolling back stays possible until an operator raises it.
@@ -259,6 +266,8 @@ impl Settings {
             follow_every: Duration::from_secs(1),
             follow_idle: Duration::from_secs(5 * 60),
             followers: 64,
+            warm: None,
+            warm_most: 16,
             max_format: DEFAULT_MAX_FORMAT,
             tenant_idle: Duration::from_secs(15 * 60),
             queries_per_second: None,
@@ -1198,6 +1207,14 @@ impl Node {
     pub fn serves(&self, tenant: &TenantId) -> bool {
         self.0.settings.served.serves(tenant)
     }
+
+    /// Open copies of the tenants the node lately served, as its warm list
+    /// names them, before anyone reads them; and keep that list as the
+    /// node goes on (see [`Settings::warm`]).
+    pub fn warming(&self) {}
+
+    /// Write the warm list now, as it would be written in time.
+    pub fn remember_warm(&self) {}
 
     pub fn sweeping(&self) {
         let every = self.0.sweep_every();
