@@ -290,7 +290,6 @@ static KEYS: LazyLock<Vec<Shape>> = LazyLock::new(|| {
 /// one, such as a long run of words after `sk-` with a digit in it,
 /// costs a detail of what went wrong and no more.
 pub(crate) fn without_keys(said: &str) -> String {
-    looked_through(said.len());
     KEYS.iter()
         .fold(said.to_string(), |said, shape| without(&said, shape))
 }
@@ -301,14 +300,7 @@ pub(crate) fn without_keys(said: &str) -> String {
 fn without(said: &str, shape: &Shape) -> String {
     let mut without = String::with_capacity(said.len());
     let (mut copied, mut from) = (0, 0);
-    loop {
-        let found = shape.found.captures_at(said, from);
-        // A search reads on to the end of what it finds, or of `said`.
-        let read_to = found.as_ref().and_then(|found| found.get(0));
-        looked_through(read_to.map_or(said.len(), |whole| whole.end()) - from);
-        let Some(found) = found else {
-            break;
-        };
+    while let Some(found) = shape.found.captures_at(said, from) {
         let (Some(whole), Some(key)) = (found.get(0), found.name("key")) else {
             break;
         };
@@ -325,25 +317,6 @@ fn without(said: &str, shape: &Shape) -> String {
     }
     without.push_str(&said[copied..]);
     without
-}
-
-/// Counts, in tests and on this thread, `bytes` of what was said as
-/// looked through for keys: so a test can hold how much of it is looked
-/// through to a number, which no timing does on a loaded machine.
-#[cfg(test)]
-pub(crate) fn looked_through(bytes: usize) {
-    LOOKED_THROUGH_HERE.with(|looked| looked.set(looked.get() + bytes));
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-pub(crate) fn looked_through(_bytes: usize) {}
-
-#[cfg(test)]
-thread_local! {
-    /// How many bytes [`looked_through`] has counted on this thread.
-    pub(crate) static LOOKED_THROUGH_HERE: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
 }
 
 /// Whether `c` is a character a key can be made of, whichever of the

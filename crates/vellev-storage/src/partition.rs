@@ -99,19 +99,16 @@ pub struct Partition {
     replayed: std::sync::Mutex<Replayed>,
 }
 
-/// What loading a copy and replaying commits into it has done, since it
-/// was made.
+/// What replaying commits into a copy has done, since it was made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Replayed {
     /// How many threads coded rows at once, at the most, for the commits
     /// replayed together.
     pub coded_on_threads: usize,
-    /// How many threads split rows' text into tokens at once, at the most,
-    /// to index them: as a segment was loaded, or commits replayed.
-    pub tokenized_on_threads: usize,
 }
 
-use crate::state::REPLAYED_TOGETHER;
+/// How many logs a replay codes together before applying them.
+const REPLAYED_TOGETHER: usize = 16;
 /// How many fetches a load has under way at once, at the most.
 const FETCHED_AT_ONCE: usize = 16;
 /// How many commits back from the head a load first fetches together,
@@ -569,8 +566,9 @@ impl Partition {
                 let Loading { held, reloading } = loading;
                 let held = held.unwrap_or_else(|| self.held());
                 let mut state = self.restore(&key, manifest, held, reloading).await?;
-                let together = state.apply_together(&tail.logs)?;
-                self.replayed_together(together);
+                tail.logs
+                    .iter()
+                    .try_for_each(|(key, log)| state.apply(key, log))?;
                 *self.state.write().expect("partition lock") = state;
             }
             None => {
@@ -581,11 +579,24 @@ impl Partition {
                 // during it codes its rows as they are applied.
                 for run in tail.logs.chunks(REPLAYED_TOGETHER) {
                     let prepared: Vec<state::Prepared> = self.read(|state| {
-                        let (prepared, most) = state.prepared_together(run);
-                        self.replayed_together(state::Together {
-                            tokenized_on: most,
-                            coded_on: if state.coding_anything() { most } else { 0 },
-                        });
+                        use rayon::prelude::*;
+                        let threads = std::sync::atomic::AtomicUsize::new(0);
+                        let most = std::sync::atomic::AtomicUsize::new(0);
+                        let prepared = run
+                            .par_iter()
+                            .map(|(_, log)| {
+                                let now = threads.fetch_add(1, Ordering::Relaxed) + 1;
+                                most.fetch_max(now, Ordering::Relaxed);
+                                let made = state.prepared(log);
+                                threads.fetch_sub(1, Ordering::Relaxed);
+                                made
+                            })
+                            .collect();
+                        if state.coding_anything() {
+                            let mut replayed = self.replayed.lock().expect("replayed lock");
+                            replayed.coded_on_threads =
+                                replayed.coded_on_threads.max(most.into_inner());
+                        }
                         prepared
                     });
                     for ((key, log), prepared) in run.iter().zip(prepared) {
@@ -700,36 +711,17 @@ impl Partition {
                     .await?
             }
         };
-        let tokenized_on = segments
-            .iter()
-            .map(|loaded: &Loaded| loaded.tokenized_on)
-            .max()
-            .unwrap_or(0);
-        {
-            let mut replayed = self.replayed.lock().expect("replayed lock");
-            replayed.tokenized_on_threads = replayed.tokenized_on_threads.max(tokenized_on);
-        }
         let replay = try_join_all(manifest.replay.iter().map(|key| async move {
             let log: LogSegment = decode(key, Kind::Log, &self.fetch(key).await?)?;
             Ok::<_, StorageError>((key.clone(), log))
         }))
         .await?;
         let key = key.to_string();
-        let (state, together) = blocking(move || {
+        blocking(move || {
             let (position, after) = (manifest.position, manifest.replay_after);
             State::from_manifest(&key, manifest, segments)?.replayed(&key, position, after, &replay)
         })
-        .await??;
-        self.replayed_together(together);
-        Ok(state)
-    }
-
-    /// Counts in [`Replayed`] how many threads made what logs applied
-    /// together were applied with.
-    fn replayed_together(&self, together: state::Together) {
-        let mut replayed = self.replayed.lock().expect("replayed lock");
-        replayed.tokenized_on_threads = replayed.tokenized_on_threads.max(together.tokenized_on);
-        replayed.coded_on_threads = replayed.coded_on_threads.max(together.coded_on);
+        .await?
     }
 
     /// The clustered indexes kept under `key` for the segment under
@@ -2161,7 +2153,6 @@ impl Writer {
             vectors: Arc::new(vectors),
             indexes: Some(Arc::new(built.indexes)),
             stored: Stored::default(),
-            tokenized_on: 0,
         };
         Ok((meta, loaded))
     }

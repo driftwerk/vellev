@@ -222,68 +222,31 @@ pub struct TextIndex {
     fields: HashMap<String, Field>,
 }
 
-/// One row's searchable text, split into tokens and counted, ready for
-/// [`TextIndex::insert_tokenized`]: worked out apart from any index, so
-/// that many rows can be tokenized at once and then indexed in order.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Tokenized {
-    fields: Vec<TokenizedField>,
-}
-
-/// One searchable property's text in a row: its name, how many words it
-/// has, and how often each token not a stopword occurs.
-#[derive(Debug, Clone, PartialEq)]
-struct TokenizedField {
-    name: String,
-    length: u32,
-    frequencies: Vec<(String, u32)>,
-}
-
 impl TextIndex {
-    /// `object`'s searchable text as [`Self::insert`] would index it.
-    pub fn tokenize(collection: &Collection, object: &Object) -> Tokenized {
+    /// Record `object` as row `row`, indexing its searchable properties.
+    pub fn insert(&mut self, collection: &Collection, row: u32, object: &Object) {
         let searchable = object.properties.iter().filter(|(name, _)| {
             collection
                 .property(name)
                 .is_some_and(|property| property.searchable)
         });
-        let fields = searchable
-            .filter_map(|(name, value)| {
-                let texts: &[String] = match value {
-                    Value::Text(text) => std::slice::from_ref(text),
-                    Value::TextArray(texts) => texts,
-                    _ => return None,
-                };
-                let mut frequencies: HashMap<String, u32> = HashMap::new();
-                let mut length = 0;
-                for word in texts.iter().flat_map(|text| words(text)) {
-                    length += 1;
-                    if !is_stopword(&word) {
-                        *frequencies.entry(word).or_default() += 1;
-                    }
+        for (name, value) in searchable {
+            let texts: &[String] = match value {
+                Value::Text(text) => std::slice::from_ref(text),
+                Value::TextArray(texts) => texts,
+                _ => continue,
+            };
+            let mut frequencies: HashMap<String, u32> = HashMap::new();
+            let mut length = 0;
+            for word in texts.iter().flat_map(|text| words(text)) {
+                length += 1;
+                if !is_stopword(&word) {
+                    *frequencies.entry(word).or_default() += 1;
                 }
-                Some(TokenizedField {
-                    name: name.clone(),
-                    length,
-                    frequencies: frequencies.into_iter().collect(),
-                })
-            })
-            .collect();
-        Tokenized { fields }
-    }
-
-    /// Record a row tokenized as [`Self::tokenize`] does, as row `row`:
-    /// rows must come in ascending order, as for [`Self::insert`].
-    pub fn insert_tokenized(&mut self, row: u32, tokenized: Tokenized) {
-        for TokenizedField {
-            name,
-            length,
-            frequencies,
-        } in tokenized.fields
-        {
-            let field = match self.fields.get_mut(&name) {
+            }
+            let field = match self.fields.get_mut(name) {
                 Some(field) => field,
-                None => self.fields.entry(name).or_default(),
+                None => self.fields.entry(name.clone()).or_default(),
             };
             let holder = field.rows.len() as u32;
             field.rows.push(row);
@@ -296,11 +259,6 @@ impl TextIndex {
                     .push(holder, frequency, length);
             }
         }
-    }
-
-    /// Record `object` as row `row`, indexing its searchable properties.
-    pub fn insert(&mut self, collection: &Collection, row: u32, object: &Object) {
-        self.insert_tokenized(row, Self::tokenize(collection, object));
     }
 
     pub fn field(&self, property: &str) -> Option<&Field> {
@@ -471,139 +429,5 @@ mod tests {
             score(ignoring_length, 1.0, 1.0, 50.0, 10.0)
         );
         assert_eq!(score(bm25, 2.0, 1.0, 10.0, 10.0), 2.0 / 2.2);
-    }
-
-    /// Rows tokenized apart, on several threads, and then indexed in order
-    /// make the index rows inserted one by one make: every token's walk the
-    /// same, posting for posting, block for block.
-    #[test]
-    fn rows_tokenized_apart_and_indexed_in_order_index_as_rows_inserted_one_by_one() {
-        use rayon::prelude::*;
-        use vellev_core::{
-            CollectionName, DataType, Distance, Embedding, EmbeddingProvider, ObjectId, Property,
-        };
-        let collection = Collection {
-            name: CollectionName::new("notes").unwrap(),
-            properties: vec![
-                Property::new("title", DataType::Text).searchable(),
-                Property::new("tags", DataType::TextArray).searchable(),
-                Property::new("owner", DataType::Text),
-            ],
-            embedding: Embedding {
-                provider: EmbeddingProvider::None,
-                model: "m".into(),
-                dimensions: 2,
-                query_prefix: None,
-                document_prefix: None,
-                properties: vec![],
-            },
-            distance: Distance::Cosine,
-            bm25: Bm25::default(),
-            access_rule: None,
-        };
-        let words = [
-            "Fox", "hen", "den", "the", "owl", "ÉCOLE", "naïve", "go-out", "a", "東京",
-        ];
-        let objects: Vec<Object> = (0..3_000u32)
-            .map(|n| {
-                let pick = |k: u32| words[((n * 7 + k * 13) % 10) as usize];
-                let title: Vec<&str> = (0..(n % 40)).map(pick).collect();
-                let mut properties = std::collections::BTreeMap::new();
-                if n % 9 != 0 {
-                    properties.insert("title".to_string(), Value::Text(title.join(" ")));
-                }
-                if n % 4 == 0 {
-                    properties.insert(
-                        "tags".to_string(),
-                        Value::TextArray(vec![pick(1).into(), pick(2).into()]),
-                    );
-                }
-                properties.insert("owner".to_string(), Value::Text("ada".into()));
-                Object {
-                    id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
-                    properties,
-                    vector: None,
-                }
-            })
-            .collect();
-        let mut one_by_one = TextIndex::default();
-        for (row, object) in objects.iter().enumerate() {
-            one_by_one.insert(&collection, row as u32 * 2, object);
-        }
-        let tokenized: Vec<Tokenized> = objects
-            .par_iter()
-            .map(|object| TextIndex::tokenize(&collection, object))
-            .collect();
-        let mut apart = TextIndex::default();
-        for (row, tokenized) in tokenized.into_iter().enumerate() {
-            apart.insert_tokenized(row as u32 * 2, tokenized);
-        }
-        let parameters = Bm25::default();
-        for property in ["title", "tags"] {
-            let (a, b) = (
-                one_by_one.field(property).unwrap(),
-                apart.field(property).unwrap(),
-            );
-            assert_eq!((&a.rows, &a.lengths), (&b.rows, &b.lengths), "{property}");
-            let mut tokens: Vec<&String> = a.postings.keys().collect();
-            tokens.sort();
-            let mut theirs: Vec<&String> = b.postings.keys().collect();
-            theirs.sort();
-            assert_eq!(tokens, theirs, "{property}");
-            for token in tokens {
-                let walk = |field: &Field| -> Vec<(Posting, Option<(u32, u32)>)> {
-                    let cursor = field.cursor(token).unwrap();
-                    let mut walked = Vec::new();
-                    let mut at = cursor.clone();
-                    while let Some(row) = at.row() {
-                        let block = at
-                            .block_at(row, parameters, 1.0, 10.0)
-                            .map(|(end, bound)| (end, bound.to_bits()));
-                        walked.push((at.posting().unwrap(), block));
-                        at.advance();
-                    }
-                    walked
-                };
-                assert_eq!(walk(a), walk(b), "{property}: {token}");
-            }
-        }
-    }
-
-    /// A row's stopwords count toward its length but are no tokens of the
-    /// index.
-    #[test]
-    fn stopwords_are_counted_and_not_indexed() {
-        use vellev_core::{
-            CollectionName, DataType, Distance, Embedding, EmbeddingProvider, ObjectId, Property,
-        };
-        let collection = Collection {
-            name: CollectionName::new("notes").unwrap(),
-            properties: vec![Property::new("title", DataType::Text).searchable()],
-            embedding: Embedding {
-                provider: EmbeddingProvider::None,
-                model: "m".into(),
-                dimensions: 2,
-                query_prefix: None,
-                document_prefix: None,
-                properties: vec![],
-            },
-            distance: Distance::Cosine,
-            bm25: Bm25::default(),
-            access_rule: None,
-        };
-        let object = Object {
-            id: ObjectId(uuid::Uuid::from_u128(1)),
-            properties: [(
-                "title".to_string(),
-                Value::Text("the fox and the hen".into()),
-            )]
-            .into(),
-            vector: None,
-        };
-        let mut index = TextIndex::default();
-        index.insert(&collection, 0, &object);
-        let field = index.field("title").unwrap();
-        assert!(field.cursor("the").is_none() && field.cursor("and").is_none());
-        assert_eq!(field.holding("fox").next().unwrap().length, 5);
     }
 }
