@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use vellev_storage::Query;
+use vellev_storage::{Merging, Query};
 
 async fn segments_of(cluster: &Cluster) -> Vec<SegmentMeta> {
     let head = cluster.committed().await.manifest.unwrap().0;
@@ -224,5 +224,64 @@ async fn vectors_are_fetched_into_the_cache_and_read_there_never_held_in_memory(
         assert_eq!(vector, Some(vec![6.0, 0.5]));
         // Ten vectors of two numbers of four bytes.
         assert_eq!(resident + 80, in_memory, "none of them in memory");
+    }
+}
+
+/// A writer of the rows 0..5, flushed, then 5..10, flushed, on `blobs`
+/// over its own cluster; merged too, if `merged`.
+async fn built_on(cached: bool, merged: bool) -> (Writer, tempfile::TempDir) {
+    let cluster = Cluster::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn Blobs> = match cached {
+        true => Arc::new(CachedBlobs::new(cluster.blobs.clone(), dir.path())),
+        false => cluster.blobs.clone(),
+    };
+    let (lease, committed) = cluster.lease().await;
+    let writer = Writer::open(blobs, cluster.coordinator.clone(), lease, &committed)
+        .await
+        .unwrap()
+        .merging_with(Merging {
+            fanout: 2,
+            ..Merging::default()
+        });
+    writer.commit(vec![create("notes")]).await.unwrap();
+    for half in [0..5, 5..10] {
+        let rows = half.map(|n| upsert("notes", n, i64::from(n)));
+        writer.commit(rows.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    if merged {
+        assert!(
+            writer.merge().await.unwrap().is_some(),
+            "two segments merge"
+        );
+        assert_eq!(segments_of(&cluster).await.len(), 1);
+    }
+    (writer, dir)
+}
+
+/// The rule V1 holds a writer to (track 2): a segment it has just built,
+/// by a flush or a merge, on a store that keeps copies on local disk, is
+/// read from its copy there at once, holding none of its vectors in
+/// memory until it is next loaded.
+#[tokio::test]
+async fn a_segment_just_built_on_a_store_keeping_copies_holds_no_vectors_in_memory() {
+    for merged in [false, true] {
+        let (held, _) = built_on(false, merged).await;
+        let (read_in_place, _dir) = built_on(true, merged).await;
+        let resident = |writer: &Writer| writer.partition().read(State::resident);
+        // Ten vectors of two numbers of four bytes.
+        assert_eq!(
+            resident(&read_in_place) + 80,
+            resident(&held),
+            "merged: {merged}"
+        );
+        read_in_place.partition().read(|state| {
+            assert_eq!(vector_of(state, 7), Some(vec![7.0, 0.5]));
+            let hits = state
+                .search(&name("notes"), &Query::nearest(&[7.0, 0.5], 1))
+                .unwrap();
+            assert_eq!(hits[0].vector, &[7.0, 0.5]);
+        });
     }
 }
