@@ -1473,8 +1473,7 @@ impl Node {
     pub async fn shutdown(&self) {
         // Warming stopped first, so that what was served until now, and
         // what it had yet to warm, is the last the list is written with.
-        self.stop_warming().await;
-        self.remember_warm().await;
+        self.remember_warm_last().await;
         let openings: Vec<Opening> = {
             let mut open = self.0.opened();
             open.stopped = true;

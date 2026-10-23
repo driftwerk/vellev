@@ -65,7 +65,9 @@ impl From<Listed> for Entry {
 #[derive(Debug, Default)]
 pub(crate) struct Warm {
     /// Held while the list is written, so that writes at once take turns.
-    writing: Mutex<()>,
+    /// Whether the list has been written as the node stopped: the last
+    /// write, after which none is made.
+    writing: Mutex<bool>,
     /// The warming, and the keeping of the list after it.
     task: Mutex<Option<JoinHandle<()>>>,
     /// Whether warming is opening copies now.
@@ -196,17 +198,39 @@ impl Node {
     /// warming opened that nobody has read, as they were listed; then
     /// what warming has yet to come to; as many as it keeps.
     pub async fn remember_warm(&self) {
+        self.write_warm(false).await;
+    }
+
+    /// Stop warming, and write the warm list one last time: no write
+    /// begun before it, or asked for after, takes its place.
+    pub(crate) async fn remember_warm_last(&self) {
+        self.stop_warming().await;
+        self.write_warm(true).await;
+    }
+
+    /// Write the warm list, made at the moment it is written, so that of
+    /// writes at once the last made is the last written; none once it
+    /// has been written `last`.
+    async fn write_warm(&self, last: bool) {
         let Some(path) = self.0.settings.warm.clone() else {
             return;
         };
         if self.0.warm.unread.load(Ordering::SeqCst) {
+            if last {
+                *self.0.warm.writing.lock().expect("warm lock") = true;
+            }
             return;
         }
-        let kept = self.0.warm_list();
         let inner = self.0.clone();
         let written = tokio::task::spawn_blocking(move || {
-            let _turn = inner.warm.writing.lock().expect("warm lock");
-            write_list(&path, &kept)
+            let mut written_last = inner.warm.writing.lock().expect("warm lock");
+            if *written_last {
+                return Ok(());
+            }
+            let kept = inner.warm_list();
+            write_list(&path, &kept)?;
+            *written_last = last;
+            Ok(())
         })
         .await
         .unwrap_or_else(|error| Err(std::io::Error::other(error)));
