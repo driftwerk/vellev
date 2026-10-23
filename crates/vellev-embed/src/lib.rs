@@ -353,8 +353,19 @@ pub enum Purpose {
 /// panics, of anything but loading that makes no vector, is held against
 /// them, as it was spent: a load that fails is taken back from the time
 /// it was given while it was under way.
-#[derive(Debug, Default)]
-pub struct Activity(std::sync::Mutex<Acted>);
+#[derive(Debug)]
+pub struct Activity {
+    acted: std::sync::Mutex<Acted>,
+    /// What the times are read by: tokio's clock, unless a test hands in
+    /// its own.
+    clock: std::sync::Arc<dyn clock::Clock>,
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self::timed_by(clock::tokio())
+    }
+}
 
 /// The most loads that ended well, since the last vector, kept to be
 /// set against the time a waiter has waited. One more lets the oldest
@@ -373,29 +384,38 @@ struct Acted {
 }
 
 impl Activity {
+    /// Activity whose times are read by `clock`.
+    #[doc(hidden)]
+    pub fn timed_by(clock: std::sync::Arc<dyn clock::Clock>) -> Self {
+        Self {
+            acted: std::sync::Mutex::default(),
+            clock,
+        }
+    }
+
     /// The model has made a vector, for whomever.
     pub fn made(&self) {
-        let mut acted = self.0.lock().expect("activity lock");
-        acted.made = Some(tokio::time::Instant::now());
+        let mut acted = self.acted.lock().expect("activity lock");
+        acted.made = Some(self.clock.now());
         acted.loaded.clear();
     }
 
     /// The model has begun to load, and is given `at_most` to.
     pub fn loading(&self, at_most: std::time::Duration) {
-        let now = tokio::time::Instant::now();
+        let now = self.clock.now();
         let until = now.checked_add(at_most).unwrap_or(now + LONGEST);
-        self.0.lock().expect("activity lock").loading = Some((now, until));
+        self.acted.lock().expect("activity lock").loading = Some((now, until));
     }
 
     /// The load under way has ended with the model loaded: the time it
     /// took is not held against those who wait. It made no vector.
     pub fn loaded(&self) {
-        let mut acted = self.0.lock().expect("activity lock");
+        let mut acted = self.acted.lock().expect("activity lock");
         if let Some((began, _)) = acted.loading.take() {
             if acted.loaded.len() == LOADS_KEPT {
                 acted.loaded.pop_front();
             }
-            acted.loaded.push_back((began, tokio::time::Instant::now()));
+            acted.loaded.push_back((began, self.clock.now()));
         }
     }
 
@@ -403,7 +423,7 @@ impl Activity {
     /// without the model loaded, and its time is held against those
     /// who wait.
     pub fn not_loading(&self) {
-        self.0.lock().expect("activity lock").loading = None;
+        self.acted.lock().expect("activity lock").loading = None;
     }
 
     /// How long one who has waited on the model since `since` has waited
@@ -412,8 +432,8 @@ impl Activity {
     /// with the model loaded, and what a load under way has taken, up to
     /// what a load is given.
     pub(crate) fn quiet(&self, since: tokio::time::Instant) -> std::time::Duration {
-        let acted = self.0.lock().expect("activity lock");
-        let now = tokio::time::Instant::now();
+        let acted = self.acted.lock().expect("activity lock");
+        let now = self.clock.now();
         let from = acted.made.map_or(since, |made| made.max(since));
         let taken = |began: tokio::time::Instant, ended: tokio::time::Instant| {
             ended.saturating_duration_since(began.max(from))
@@ -432,7 +452,7 @@ impl Activity {
     /// When the load under way is no longer given, if one is.
     #[cfg(test)]
     pub(crate) fn loading_until(&self) -> Option<tokio::time::Instant> {
-        self.0
+        self.acted
             .lock()
             .expect("activity lock")
             .loading

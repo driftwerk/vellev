@@ -253,9 +253,20 @@ impl Local {
     }
 
     fn spawn(model: &str, load: Load, room: Arc<Room>) -> Result<Self> {
+        Self::spawn_timed(model, load, room, crate::clock::tokio())
+    }
+
+    /// As [`Self::spawn`], the model's activity read by `clock`: the
+    /// clock is handed to the model's thread, which reads it there.
+    fn spawn_timed(
+        model: &str,
+        load: Load,
+        room: Arc<Room>,
+        clock: Arc<dyn crate::clock::Clock>,
+    ) -> Result<Self> {
         let (jobs, waiting) = mpsc::channel(WAITING);
         let name = model.to_string();
-        let activity = Arc::new(Activity::default());
+        let activity = Arc::new(Activity::timed_by(clock));
         let acts = activity.clone();
         std::thread::Builder::new()
             .name(format!("embed {model}"))
@@ -647,6 +658,16 @@ mod tests {
     /// As [`local`], by the name `model` and loaded when there is a place
     /// for it in `room`.
     fn local_among(model: &str, failing_loads: usize, room: Arc<Room>) -> (Arc<Local>, Runs) {
+        local_timed(model, failing_loads, room, crate::clock::tokio())
+    }
+
+    /// As [`local_among`], the model's activity read by `clock`.
+    fn local_timed(
+        model: &str,
+        failing_loads: usize,
+        room: Arc<Room>,
+        clock: Arc<dyn crate::clock::Clock>,
+    ) -> (Arc<Local>, Runs) {
         let (report, ran) = channel();
         let (go, gate) = channel::<()>();
         let gate = Arc::new(std::sync::Mutex::new(gate));
@@ -676,7 +697,7 @@ mod tests {
             }) as Model)
         });
         (
-            Arc::new(Local::spawn(model, load, room).unwrap()),
+            Arc::new(Local::spawn_timed(model, load, room, clock).unwrap()),
             Runs { ran, go, loads },
         )
     }
@@ -905,6 +926,26 @@ mod tests {
     /// of at most a second or so, before failing rather than hanging: a
     /// hundred times as long and more.
     const BACKSTOP: Duration = Duration::from_secs(60);
+
+    /// Waits until `count` calls are asleep on `clock`, each until a
+    /// time still to come: whatever the clock last woke has looked and
+    /// gone back to sleep, or gone. When each ends, earliest first.
+    async fn asleep_on(clock: &crate::clock::Manual, count: usize) -> Vec<tokio::time::Instant> {
+        use crate::clock::Clock;
+        let began = std::time::Instant::now();
+        loop {
+            let asleep = clock.asleep();
+            if asleep.len() == count && asleep.iter().all(|at| *at > clock.now()) {
+                return asleep;
+            }
+            assert!(
+                began.elapsed() < BACKSTOP,
+                "{} asleep, not {count}",
+                asleep.len()
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 
     async fn until(what: impl Fn() -> bool) {
         for _ in 0..500 {
@@ -1613,31 +1654,46 @@ mod tests {
 
     /// A load longer than a write is given to wait, that then fails: the
     /// write waits for it, and is given up on within that time of its
-    /// failing, whenever that is.
+    /// failing, whenever that is. The load is held until the test fails
+    /// it, and the waits are timed by a clock the test moves itself, only
+    /// once the write is asleep on it: so the write is given up on when
+    /// it next looks, exactly a stall after the load failed.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_write_waits_for_a_long_load_and_is_given_up_on_soon_after_it_fails() {
+        use crate::clock::{Clock, Manual};
         let ms = Duration::from_millis;
         for load_takes in [ms(700), ms(2_000)] {
+            let clock = Manual::new();
+            let (fail, failing) = channel::<()>();
+            let failing = std::sync::Mutex::new(failing);
             let load: Load = Box::new(move || {
-                std::thread::sleep(load_takes);
+                failing.lock().unwrap().recv().unwrap();
                 Err(failed("no model to be had"))
             });
-            let local = Arc::new(Local::spawn("stand-in", load, alone()).unwrap());
-            let embedder = Arc::new(giving(&local, ms(200)));
-            let began = std::time::Instant::now();
+            let local = Local::spawn_timed("stand-in", load, alone(), clock.clone());
+            let local = Arc::new(local.unwrap());
+            let embedder = Arc::new(giving(&local, ms(200)).timed_by(clock.clone()));
+            let began = clock.now();
             let first = start(&local, vec!["first".into()], Purpose::Document);
-            tokio::time::sleep(ms(20)).await;
-            let given_up_on = embedder.documents(&["owl".to_string()]).await;
-            let took = began.elapsed();
-            assert!(given_up_on.is_err(), "{given_up_on:?}");
-            // Not before the load failed, and within the 400 ms a write
-            // waits with the model not at work after it.
-            assert!(took >= load_takes, "{load_takes:?}: {took:?}");
-            assert!(
-                took < load_takes + ms(400) + ms(300),
-                "{load_takes:?}: {took:?}"
-            );
+            until(|| local.activity.loading_until().is_some()).await;
+            let behind = {
+                let embedder = embedder.clone();
+                tokio::spawn(async move { embedder.documents(&["owl".to_string()]).await })
+            };
+            asleep_on(&clock, 1).await;
+            // The load takes so long by the clock: the write waits
+            // through it, looking as it goes.
+            clock.move_to(began + load_takes);
+            asleep_on(&clock, 1).await;
+            fail.send(()).unwrap();
             assert!(first.await.unwrap().is_err());
+            let next = asleep_on(&clock, 1).await;
+            clock.move_to(next[0]);
+            let stopped = failed("the model has made nothing for anyone in 400ms");
+            let given_up_on = tokio::time::timeout(BACKSTOP, behind).await;
+            assert_eq!(given_up_on.expect("given up on").unwrap(), Err(stopped));
+            // Not before the load failed, and a stall after it.
+            assert_eq!(clock.now() - began, load_takes + ms(400));
         }
     }
 
@@ -1729,40 +1785,48 @@ mod tests {
     /// A write waits its turn for as long as the model is at work for
     /// anyone: behind another's long write, with nothing of its own made
     /// for far longer than a model may go without making anything, it is
-    /// made. And when the model stops, it is given up on.
+    /// made. And when the model stops, it is given up on. The model's
+    /// runs are let through one by one, and the waits are timed by a
+    /// clock the test moves itself, only once the write is asleep on it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_write_waits_its_turn_while_the_model_works_for_others_and_no_longer() {
+        use crate::clock::{Clock, Manual};
         let ms = Duration::from_millis;
-        let (local, runs) = local(0);
+        let clock = Manual::new();
+        let (local, runs) = local_timed("stand-in", 0, alone(), clock.clone());
         // Given up on after 400 ms of nothing for anyone.
-        let embedder = Arc::new(giving(&local, ms(200)));
+        let embedder = Arc::new(giving(&local, ms(200)).timed_by(clock.clone()));
+        let began = clock.now();
         let ahead = start(&local, texts("a", 5 * RUN), Purpose::Document);
         assert_eq!(runs.next().len(), RUN);
         let behind = {
             let embedder = embedder.clone();
             tokio::spawn(async move { embedder.documents(&["owl".to_string()]).await })
         };
-        // Five runs of the write ahead, 250 ms each: a second and a
-        // quarter in which nothing is made for the one behind.
-        let began = std::time::Instant::now();
+        asleep_on(&clock, 1).await;
+        // Five runs of the write ahead, 250 ms each by the clock: a
+        // second and a quarter in which nothing is made for the one
+        // behind. Each run is made before the next is begun.
         for run in 0..5 {
-            tokio::time::sleep(ms(250)).await;
+            clock.move_to(clock.now() + ms(250));
             runs.let_through(1);
             if run < 4 {
                 assert_eq!(runs.next().len(), RUN);
             }
+            asleep_on(&clock, 1).await;
         }
         assert_eq!(ahead.await.unwrap().unwrap().len(), 5 * RUN);
         assert_eq!(runs.next(), ["owl"]);
         runs.let_through(1);
-        assert_eq!(behind.await.unwrap(), Ok(vec![Some(vec![3.0])]));
-        assert!(began.elapsed() > ms(1_200), "{:?}", began.elapsed());
+        let made = tokio::time::timeout(BACKSTOP, behind).await.expect("made");
+        assert_eq!(made.unwrap(), Ok(vec![Some(vec![3.0])]));
+        assert_eq!(clock.now() - began, ms(1_250));
 
         // The model stops, at a run that never comes back: the write in
         // it and the write behind it are both given up on, 400 ms after
-        // the model last made anything.
+        // the model last made anything, which was just now.
         let stopped = failed("the model has made nothing for anyone in 400ms");
-        let began = std::time::Instant::now();
+        let stopping = clock.now();
         let writes: Vec<_> = ["hen", "fox"]
             .into_iter()
             .map(|text| {
@@ -1770,11 +1834,17 @@ mod tests {
                 tokio::spawn(async move { embedder.documents(&[text.to_string()]).await })
             })
             .collect();
+        assert!(!runs.next().is_empty());
+        let asleep = asleep_on(&clock, 2).await;
+        clock.move_to(asleep[1]);
         for write in writes {
-            assert_eq!(write.await.unwrap(), Err(stopped.clone()));
+            let given_up_on = tokio::time::timeout(BACKSTOP, write).await;
+            assert_eq!(
+                given_up_on.expect("given up on").unwrap(),
+                Err(stopped.clone())
+            );
         }
-        let took = began.elapsed();
-        assert!((ms(400)..ms(1_500)).contains(&took), "{took:?}");
+        assert_eq!(clock.now() - stopping, ms(400));
     }
 
     /// A model that is loading is at work: six hundred writes made at

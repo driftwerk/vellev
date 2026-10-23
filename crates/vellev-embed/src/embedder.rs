@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
+
+use crate::clock::Clock;
 use vellev_core::{Embedding, ModelFault};
 
 use crate::{EmbedError, Provider, Purpose, Result};
@@ -107,12 +109,12 @@ struct Within {
 }
 
 impl Within {
-    /// `given` from now, or a day if that is less.
-    fn from_now(given: Duration) -> Self {
+    /// `given` from now on `clock`, or a day if that is less.
+    fn from_now(given: Duration, clock: &dyn Clock) -> Self {
         let given = given.min(LONGEST_WAIT);
         Self {
             given,
-            by: Instant::now() + given,
+            by: clock.now() + given,
         }
     }
 }
@@ -131,6 +133,9 @@ pub struct Embedder {
     /// documents is given up on.
     query_within: Duration,
     documents_within: Duration,
+    /// What calls are timed by: tokio's clock, unless a test hands in
+    /// its own.
+    clock: Arc<dyn Clock>,
 }
 
 /// What is known of whether the model can be used. It is looked at and
@@ -203,6 +208,26 @@ impl Embedder {
             fault_stands: FAULT_STANDS,
             query_within: QUERY_WITHIN,
             documents_within: DOCUMENTS_WITHIN,
+            clock: crate::clock::tokio(),
+        }
+    }
+
+    /// This embedder, timing its calls by `clock` rather than tokio's:
+    /// for tests that move the clock themselves, which hand the same
+    /// clock to what the model's activity is read by.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn timed_by(self, clock: Arc<dyn Clock>) -> Self {
+        Self { clock, ..self }
+    }
+
+    /// What `future` comes to, unless the clock reaches `at` first; it
+    /// is looked at first, as a timeout looks at what it times.
+    async fn by<T>(&self, at: Instant, future: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            done = future => Some(done),
+            () = self.clock.sleep_until(at) => None,
         }
     }
 
@@ -242,7 +267,7 @@ impl Embedder {
     /// say what it is doing is given that long for the call in all.
     pub async fn documents(&self, texts: &[String]) -> Result<Vec<Option<Vec<f32>>>> {
         let prefix = self.embedding.document_prefix.as_deref();
-        let within = Within::from_now(self.documents_within);
+        let within = Within::from_now(self.documents_within, &*self.clock);
         let sent = AtomicBool::new(false);
         self.embed(texts, prefix, Purpose::Document, within, &sent)
             .await
@@ -272,7 +297,7 @@ impl Embedder {
         if text.trim().is_empty() {
             return Ok(None);
         }
-        let within = Within::from_now(self.query_within);
+        let within = Within::from_now(self.query_within, &*self.clock);
         let prefix = self.embedding.query_prefix.as_deref();
         let embed = || async {
             let texts = [text.to_string()];
@@ -300,9 +325,9 @@ impl Embedder {
             }
             made
         });
-        match tokio::time::timeout_at(within.by, asked).await {
-            Ok(made) => made.clone(),
-            Err(_) => Err(self.late(within)),
+        match self.by(within.by, asked).await {
+            Some(made) => made.clone(),
+            None => Err(self.late(within)),
         }
     }
 
@@ -437,13 +462,13 @@ impl Embedder {
         activity: &crate::Activity,
         stalled: Duration,
     ) -> Result<T> {
-        let since = Instant::now();
+        let since = self.clock.now();
         let mut look = since + stalled;
         tokio::pin!(call);
         loop {
             tokio::select! {
                 made = &mut call => return made,
-                () = tokio::time::sleep_until(look) => {}
+                () = self.clock.sleep_until(look) => {}
             }
             // What has waited with the model not at work grows no faster
             // than time does: it cannot reach the stall before this is
@@ -457,7 +482,7 @@ impl Embedder {
                     format!("the model has made nothing for anyone in {stalled:?}"),
                 ));
             }
-            look = Instant::now() + (stalled - quiet);
+            look = self.clock.now() + (stalled - quiet);
         }
     }
 
@@ -482,9 +507,10 @@ impl Embedder {
             (Purpose::Document, Some(activity)) => {
                 self.unless_stopped(call, activity, within.given).await?
             }
-            _ => tokio::time::timeout_at(within.by, call)
+            _ => self
+                .by(within.by, call)
                 .await
-                .map_err(|_| self.late(within))??,
+                .ok_or_else(|| self.late(within))??,
         };
         let malformed = |reason: String| EmbedError::malformed(&self.embedding.model, reason);
         if vectors.len() != asked {
