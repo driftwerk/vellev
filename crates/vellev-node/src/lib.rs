@@ -1210,11 +1210,80 @@ impl Node {
 
     /// Open copies of the tenants the node lately served, as its warm list
     /// names them, before anyone reads them; and keep that list as the
-    /// node goes on (see [`Settings::warm`]).
-    pub fn warming(&self) {}
+    /// node goes on (see [`Settings::warm`]). Copies need no lease, so a
+    /// node warms tenants another node writes for as safely as its own.
+    pub fn warming(&self) {
+        let Some(path) = self.0.settings.warm.clone() else {
+            return;
+        };
+        let most = self.0.settings.warm_most;
+        let node = self.clone();
+        let every = self.0.sweep_every();
+        tokio::spawn(async move {
+            let listed: Vec<TenantId> = match std::fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice::<Vec<TenantId>>(&bytes).unwrap_or_else(|error| {
+                    tracing::warn!(path = %path.display(), %error, "the warm list is unreadable; warming nothing");
+                    Vec::new()
+                }),
+                Err(_) => Vec::new(),
+            };
+            for tenant in listed.into_iter().take(most) {
+                if node.0.opened().stopped {
+                    return;
+                }
+                if !node.serves(&tenant) {
+                    continue;
+                }
+                if let Err(error) = node.copy_of(&tenant).await {
+                    tracing::info!(%tenant, %error, "a tenant on the warm list was not opened");
+                }
+            }
+            loop {
+                tokio::time::sleep(every).await;
+                if node.0.opened().stopped {
+                    return;
+                }
+                node.remember_warm();
+            }
+        });
+    }
 
-    /// Write the warm list now, as it would be written in time.
-    pub fn remember_warm(&self) {}
+    /// Write the warm list now: the tenants this node holds, written for or
+    /// copied for reads, the most lately used first, as many as it keeps.
+    pub fn remember_warm(&self) {
+        let Some(path) = &self.0.settings.warm else {
+            return;
+        };
+        let mut used: Vec<(Duration, TenantId)> = {
+            let open = self.0.opened();
+            let writers = open
+                .tenants
+                .iter()
+                .filter_map(|(tenant, opening)| Some((opening.get()?.idle(), tenant.clone())));
+            let copies = open
+                .followers
+                .iter()
+                .filter_map(|(tenant, following)| Some((following.get()?.idle(), tenant.clone())));
+            writers.chain(copies).collect()
+        };
+        used.sort();
+        let mut kept: Vec<TenantId> = Vec::new();
+        for (_, tenant) in used {
+            if !kept.contains(&tenant) && kept.len() < self.0.settings.warm_most {
+                kept.push(tenant);
+            }
+        }
+        let written = serde_json::to_vec(&kept)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                let partial = path.with_extension("partial");
+                std::fs::write(&partial, bytes)?;
+                std::fs::rename(&partial, path)
+            });
+        if let Err(error) = written {
+            tracing::warn!(path = %path.display(), %error, "the warm list could not be written");
+        }
+    }
 
     pub fn sweeping(&self) {
         let every = self.0.sweep_every();
@@ -1468,6 +1537,8 @@ impl Node {
     /// Give up every tenant, so that another node can write for them at
     /// once rather than when the leases run out, and open no more.
     pub async fn shutdown(&self) {
+        // What was served until now, for the node that starts next.
+        self.remember_warm();
         let openings: Vec<Opening> = {
             let mut open = self.0.opened();
             open.stopped = true;

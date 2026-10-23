@@ -258,7 +258,7 @@ impl Node {
     /// arriving together share one opening, which runs to its end and
     /// cleans up after itself even if they all stop waiting: it is the
     /// first's, and the others only wait for it.
-    async fn copy_of(&self, tenant: &TenantId) -> Result<(Arc<Followed>, bool)> {
+    pub(crate) async fn copy_of(&self, tenant: &TenantId) -> Result<(Arc<Followed>, bool)> {
         let following = {
             let mut open = self.0.opened();
             if open.stopped {
