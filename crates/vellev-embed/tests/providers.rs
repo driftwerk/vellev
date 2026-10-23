@@ -1315,39 +1315,43 @@ async fn a_text_bedrock_refuses_is_not_bedrock_at_work() {
 
 /// One batch is given so long, every try included: an endpoint that goes
 /// on saying it is busy is given up on then, and not after every try it
-/// asks for, which here would take seven and a half seconds. On a paused
-/// clock, which moves only when the endpoint and the caller, in this one
-/// runtime, have nothing left to do but wait: so it is asked at once and
-/// after half a second, and given up on at 1.2 seconds, before the third
-/// try at 1.5.
-#[tokio::test(start_paused = true)]
+/// asks for, which here would take seven and a half seconds. The waits
+/// are timed by a clock the test moves itself, and only once the caller
+/// is asleep on it, with nothing left on its way: so it is asked at once
+/// and after half a second, and given up on at 1.2 seconds, before the
+/// third try at 1.5.
+#[tokio::test]
 async fn a_batch_is_given_so_long_however_many_tries_the_endpoint_asks_for() {
+    use vellev_embed::clock::{Clock, Manual};
     let ms = Duration::from_millis;
     let busy = Seen::refusing(usize::MAX, 503);
     let url = tei(busy.clone()).await;
+    let clock = Manual::new();
+    let began = clock.now();
     let provider = Http::new(&url, HttpApi::Tei, "bge", None)
         .unwrap()
-        .answering_each_batch_within(ms(1_200));
-    let began = tokio::time::Instant::now();
-    let given_up_on = {
-        let provider = Arc::new(provider);
-        let asking = tokio::spawn(async move {
-            provider.embed(vec!["fox".into()], Purpose::Document).await
-        });
-        // The first try's connection is made and the try reaches the
-        // endpoint before any time passes: a task on the blocking pool
-        // keeps the paused clock still until it has.
-        let seen = busy.clone();
-        tokio::task::spawn_blocking(move || {
-            while seen.bodies().is_empty() {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        })
-        .await
-        .unwrap();
-        asking.await.unwrap()
-    };
-    let took = began.elapsed();
+        .answering_each_batch_within(ms(1_200))
+        .timed_by(clock.clone());
+    let asking =
+        tokio::spawn(async move { provider.embed(vec!["fox".into()], Purpose::Document).await });
+    // Asleep on the batch's bound and on a wait between tries: then, and
+    // only then, the clock is moved to the first of them to end.
+    let mut moved = Vec::new();
+    let waited = std::time::Instant::now();
+    while !asking.is_finished() {
+        assert!(
+            waited.elapsed() < BACKSTOP,
+            "moved to {moved:?}, then stuck"
+        );
+        let asleep = clock.asleep();
+        if asleep.len() == 2 {
+            moved.push(asleep[0] - began);
+            clock.move_to(asleep[0]);
+        }
+        assert!(moved.len() <= 5, "moved to {moved:?}");
+        tokio::time::sleep(ms(1)).await;
+    }
+    let given_up_on = asking.await.unwrap();
     assert_eq!(
         given_up_on,
         Err(EmbedError::Failed {
@@ -1355,9 +1359,9 @@ async fn a_batch_is_given_so_long_however_many_tries_the_endpoint_asks_for() {
             reason: "no answer within 1.2s".into(),
         })
     );
-    // To the millisecond the timer keeps time in.
-    assert!((ms(1_200)..=ms(1_201)).contains(&took), "{took:?}");
-    // It had been asked twice, and was to be asked a third time.
+    // The wait after the first try, then the bound: before the wait
+    // after the second try, which ends at 1.5 s.
+    assert_eq!(moved, [ms(500), ms(1_200)]);
     assert_eq!(busy.bodies().len(), 2);
 }
 

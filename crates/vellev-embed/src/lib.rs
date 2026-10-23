@@ -1,6 +1,8 @@
 //! Turning text into vectors, with the model chosen per collection.
 
 mod bedrock;
+#[doc(hidden)]
+pub mod clock;
 mod embedder;
 mod http;
 #[cfg(feature = "local")]

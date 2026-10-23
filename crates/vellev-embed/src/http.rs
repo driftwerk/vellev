@@ -45,6 +45,8 @@ pub struct Http {
     activity: Activity,
     /// How long one batch may take, every try included.
     batch_within: Duration,
+    /// What the waits between tries and a batch's bound are timed by.
+    clock: std::sync::Arc<dyn crate::clock::Clock>,
 }
 
 impl std::fmt::Debug for Http {
@@ -453,6 +455,7 @@ impl Http {
             key,
             activity: Activity::default(),
             batch_within: DEADLINE,
+            clock: crate::clock::tokio(),
         })
     }
 
@@ -467,6 +470,15 @@ impl Http {
             batch_within: within,
             ..self
         }
+    }
+
+    /// This, timing the waits between tries and each batch's bound by
+    /// `clock` rather than tokio's: for tests that move the clock
+    /// themselves.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn timed_by(self, clock: std::sync::Arc<dyn crate::clock::Clock>) -> Self {
+        Self { clock, ..self }
     }
 
     /// `text` without this endpoint's key, whatever its shape. Anything
@@ -666,7 +678,7 @@ impl Http {
             if !passing || attempt == ATTEMPTS {
                 return Err(failure);
             }
-            tokio::time::sleep(wait).await;
+            self.clock.sleep(wait).await;
             backoff *= 2;
             attempt += 1;
         }
@@ -711,8 +723,13 @@ impl Http {
         for batch in texts.chunks(BATCH) {
             let within = self.batch_within;
             let late = || self.failed(format!("no answer within {within:?}"));
-            let made = tokio::time::timeout(within, self.batch(batch)).await;
-            vectors.extend(made.unwrap_or_else(|_| Err(late()))?);
+            // As a timeout is: the batch is looked at first.
+            let made = tokio::select! {
+                biased;
+                made = self.batch(batch) => made,
+                () = self.clock.sleep(within) => Err(late()),
+            };
+            vectors.extend(made?);
             self.activity.made();
         }
         Ok(vectors)
@@ -933,6 +950,9 @@ mod tests {
     fn a_batch_is_given_two_minutes() {
         let http = Http::new("http://e.test", HttpApi::Tei, "m", None).expect("an endpoint");
         assert_eq!(http.batch_within, Duration::from_secs(120));
+        // Timed by tokio's clock, as everything is but tests that hand in
+        // their own.
+        assert_eq!(format!("{:?}", http.clock), "Tokio");
         let told = http.answering_each_batch_within(Duration::from_secs(3));
         assert_eq!(told.batch_within, Duration::from_secs(3));
     }
