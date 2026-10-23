@@ -2,7 +2,7 @@
 //! tenant, and otherwise from a copy that follows what the writer commits.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::time::Instant;
 
@@ -115,11 +115,26 @@ pub struct Followed {
     follower: Follower,
     embedders: Arc<Embedders>,
     used: Mutex<Instant>,
+    /// Where on the warm list the copy stood, while it was opened by
+    /// warming and nobody has read it since (see [`Node::warming`]); else
+    /// [`NOT_WARMED`]. Such a copy is not counted as used.
+    warmed: AtomicUsize,
 }
+
+/// See [`Followed::warmed`].
+const NOT_WARMED: usize = usize::MAX;
 
 impl Followed {
     fn touch(&self) {
         *self.used.lock().expect("use lock") = Instant::now();
+        self.warmed.store(NOT_WARMED, Ordering::Relaxed);
+    }
+
+    /// Where the copy stood on the warm list, if warming opened it and
+    /// nobody has read it since.
+    pub(crate) fn warmed(&self) -> Option<usize> {
+        let at = self.warmed.load(Ordering::Relaxed);
+        (at != NOT_WARMED).then_some(at)
     }
 
     pub(crate) fn idle(&self) -> std::time::Duration {
@@ -264,6 +279,17 @@ impl Node {
     /// cleans up after itself even if they all stop waiting: it is the
     /// first's, and the others only wait for it.
     pub(crate) async fn copy_of(&self, tenant: &TenantId) -> Result<(Arc<Followed>, bool)> {
+        self.copy(tenant, None).await
+    }
+
+    /// As [`Self::copy_of`], or, for warming, `warmed` with where the
+    /// tenant stood on the warm list: the copy then counts as not used,
+    /// unless a read shares or follows its opening.
+    pub(crate) async fn copy(
+        &self,
+        tenant: &TenantId,
+        warmed: Option<usize>,
+    ) -> Result<(Arc<Followed>, bool)> {
         let following = {
             let mut open = self.0.opened();
             if open.stopped {
@@ -278,7 +304,7 @@ impl Node {
         let followed = tokio::spawn(async move {
             let open = || {
                 opening.store(true, Ordering::Relaxed);
-                inner.following(&id)
+                inner.following(&id, warmed)
             };
             let opened = following.copy.get_or_try_init(open).await.cloned();
             inner.asked(&id, &following);
@@ -289,7 +315,9 @@ impl Node {
             Ok(panic) => std::panic::resume_unwind(panic),
             Err(_) => Err(NodeError::Stopped),
         })?;
-        followed.touch();
+        if warmed.is_none() {
+            followed.touch();
+        }
         self.bound();
         Ok((followed, opened.load(Ordering::Relaxed)))
     }
@@ -322,7 +350,11 @@ impl Inner {
         writer.held().then(|| writer.clone())
     }
 
-    async fn following(self: &Arc<Self>, tenant: &TenantId) -> Result<Arc<Followed>> {
+    async fn following(
+        self: &Arc<Self>,
+        tenant: &TenantId,
+        warmed: Option<usize>,
+    ) -> Result<Arc<Followed>> {
         let committed = self
             .coordinator
             .committed(&key(tenant))
@@ -340,6 +372,7 @@ impl Inner {
             follower,
             embedders: self.embedders.clone(),
             used: Mutex::new(Instant::now()),
+            warmed: AtomicUsize::new(warmed.unwrap_or(NOT_WARMED)),
         });
         self.bound_followers();
         self.polling(tenant.clone(), Arc::downgrade(&followed));

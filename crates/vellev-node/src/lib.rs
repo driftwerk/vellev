@@ -36,6 +36,7 @@ mod keys;
 mod limits;
 mod purging;
 mod reading;
+mod warm;
 
 use keys::Keys;
 use limits::Asked;
@@ -1048,6 +1049,8 @@ struct Held {
     kind: Kind,
     unused: Duration,
     size: usize,
+    /// A copy warming opened that nobody has read.
+    warmed: bool,
 }
 
 enum Kind {
@@ -1081,6 +1084,8 @@ struct Inner {
     /// The newest file format the cluster was seen to write; it never
     /// falls.
     cluster_format: AtomicU16,
+    /// The warm list, and the warming that reads it.
+    warm: warm::Warm,
 }
 
 #[derive(Debug, Clone)]
@@ -1116,6 +1121,7 @@ impl Node {
             copies_opened: AtomicU64::new(0),
             dropped: Mutex::default(),
             cluster_format: AtomicU16::new(0),
+            warm: warm::Warm::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -1211,91 +1217,6 @@ impl Node {
     /// Whether this node serves `tenant`: see [`Settings::served`].
     pub fn serves(&self, tenant: &TenantId) -> bool {
         self.0.settings.served.serves(tenant)
-    }
-
-    /// Open copies of the tenants the node lately served, as its warm list
-    /// names them, before anyone reads them; and keep that list as the
-    /// node goes on (see [`Settings::warm`]). Copies need no lease, so a
-    /// node warms tenants another node writes for as safely as its own.
-    pub fn warming(&self) {
-        let Some(path) = self.0.settings.warm.clone() else {
-            return;
-        };
-        let most = self.0.settings.warm_most;
-        let node = self.clone();
-        let every = self.0.sweep_every();
-        tokio::spawn(async move {
-            let listed: Vec<TenantId> = match std::fs::read(&path) {
-                Ok(bytes) => serde_json::from_slice::<Vec<TenantId>>(&bytes).unwrap_or_else(|error| {
-                    tracing::warn!(path = %path.display(), %error, "the warm list is unreadable; warming nothing");
-                    Vec::new()
-                }),
-                Err(_) => Vec::new(),
-            };
-            for tenant in listed.into_iter().take(most) {
-                if node.0.opened().stopped {
-                    return;
-                }
-                if !node.serves(&tenant) {
-                    continue;
-                }
-                if let Err(error) = node.copy_of(&tenant).await {
-                    tracing::info!(%tenant, %error, "a tenant on the warm list was not opened");
-                }
-            }
-            loop {
-                tokio::time::sleep(every).await;
-                if node.0.opened().stopped {
-                    return;
-                }
-                node.remember_warm().await;
-            }
-        });
-    }
-
-    /// Write the warm list now: the tenants this node holds, written for or
-    /// copied for reads, the most lately used first, as many as it keeps.
-    pub async fn remember_warm(&self) {
-        let Some(path) = &self.0.settings.warm else {
-            return;
-        };
-        // Ordered by when each was last used, not by how long ago: an age
-        // read entry by entry is read at a different instant for each.
-        let mut used: Vec<(std::cmp::Reverse<Instant>, TenantId)> = {
-            let open = self.0.opened();
-            let writers = open.tenants.iter().filter_map(|(tenant, opening)| {
-                Some((std::cmp::Reverse(opening.get()?.used_at()), tenant.clone()))
-            });
-            let copies = open.followers.iter().filter_map(|(tenant, following)| {
-                Some((
-                    std::cmp::Reverse(following.get()?.used_at()),
-                    tenant.clone(),
-                ))
-            });
-            writers.chain(copies).collect()
-        };
-        used.sort();
-        let mut kept: Vec<TenantId> = Vec::new();
-        for (_, tenant) in used {
-            if !kept.contains(&tenant) && kept.len() < self.0.settings.warm_most {
-                kept.push(tenant);
-            }
-        }
-        let written = serde_json::to_vec(&kept)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| {
-                let partial = path.with_extension("partial");
-                std::fs::write(&partial, bytes)?;
-                std::fs::rename(&partial, path)
-            });
-        if let Err(error) = written {
-            tracing::warn!(path = %path.display(), %error, "the warm list could not be written");
-        }
-    }
-
-    /// Whether the node is warming tenants now.
-    pub fn warming_now(&self) -> bool {
-        false
     }
 
     pub fn sweeping(&self) {
@@ -1550,7 +1471,9 @@ impl Node {
     /// Give up every tenant, so that another node can write for them at
     /// once rather than when the leases run out, and open no more.
     pub async fn shutdown(&self) {
-        // What was served until now, for the node that starts next.
+        // Warming stopped first, so that what was served until now, and
+        // what it had yet to warm, is the last the list is written with.
+        self.stop_warming().await;
         self.remember_warm().await;
         let openings: Vec<Opening> = {
             let mut open = self.0.opened();
@@ -1631,7 +1554,8 @@ impl Inner {
                     held.unused >= recent && !chosen.iter().any(|c| std::ptr::eq(*c, *held))
                 })
                 .collect();
-            older.sort_by_key(|held| std::cmp::Reverse(held.unused));
+            // Copies warming opened that nobody has read go first.
+            older.sort_by_key(|held| (!held.warmed, std::cmp::Reverse(held.unused)));
             for held in older {
                 if total <= budget {
                     break;
@@ -1675,15 +1599,16 @@ impl Inner {
         };
         held.into_iter()
             .map(|(id, kind)| {
-                let (unused, size) = match &kind {
-                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.read(State::resident)),
-                    Kind::Copy(_, copy) => (copy.idle(), copy.resident()),
+                let (unused, size, warmed) = match &kind {
+                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.read(State::resident), false),
+                    Kind::Copy(_, copy) => (copy.idle(), copy.resident(), copy.warmed().is_some()),
                 };
                 Held {
                     id,
                     kind,
                     unused,
                     size,
+                    warmed,
                 }
             })
             .collect()
