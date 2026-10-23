@@ -41,6 +41,33 @@ jobs:
           path: crates/vellev-storage/tests/*.proptest-regressions
           if-no-files-found: ignore
 
+  # The default rescore budget's recall on real embeddings: the SQuAD 2.0
+  # fixture (CC BY-SA 4.0, see scripts/recall-fixture/ATTRIBUTION.md), fetched
+  # from its release and checked against the checksums committed here.
+  recall:
+    name: Recall on real embeddings
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      FIXTURE: fixture-recall-squad2-bge-base-v1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the fixture and check it
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixture"
+          cd "$RUNNER_TEMP/fixture"
+          gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.zst' --pattern ATTRIBUTION.md
+          sha256sum --check --strict "$GITHUB_WORKSPACE/scripts/recall-fixture/SHA256SUMS"
+          zstd --decompress --rm -- *.zst
+      - name: Recall gate
+        run: cargo test --release --locked -p vellev-storage --test recall_fixture -- --ignored --nocapture
+        env:
+          VELLEV_RECALL_FIXTURE: ${{ runner.temp }}/fixture/memories.jsonl
+          VELLEV_RECALL_QUERIES: ${{ runner.temp }}/fixture/queries.vectors.jsonl
+
   advisories:
     name: Advisories
     runs-on: ubuntu-latest
