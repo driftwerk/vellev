@@ -9,6 +9,9 @@ license = "FSL-1.1-ALv2"
 [features]
 default = ["local"]
 local = ["dep:fastembed", "dep:hf-hub"]
+# A clock a test moves by hand, and the hooks that hand one in: for this
+# crate's own tests, and those of crates that test through it.
+test-clock = []
 
 [dependencies]
 vellev-core.workspace = true
@@ -34,6 +37,8 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# Its own tests move a clock by hand.
+vellev-embed = { path = ".", features = ["test-clock"] }
 axum.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

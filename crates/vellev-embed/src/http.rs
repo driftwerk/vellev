@@ -476,7 +476,7 @@ impl Http {
     /// This, timing the waits between tries and each batch's bound by
     /// `clock` rather than tokio's: for tests that move the clock
     /// themselves.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-clock"))]
     #[must_use]
     pub fn timed_by(self, clock: std::sync::Arc<dyn crate::clock::Clock>) -> Self {
         Self { clock, ..self }

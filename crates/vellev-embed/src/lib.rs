@@ -1,8 +1,10 @@
 //! Turning text into vectors, with the model chosen per collection.
 
 mod bedrock;
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-clock"))]
 pub mod clock;
+#[cfg(not(any(test, feature = "test-clock")))]
+mod clock;
 mod embedder;
 mod http;
 #[cfg(feature = "local")]
