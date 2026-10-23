@@ -169,5 +169,10 @@ async fn a_partition_replaying_coded_rows_codes_them_several_at_once() {
         copy.partition()
             .read(|state| state.memtable_coding(&name(NOTES)).unwrap().coded),
         4_000 - vellev_storage::CODE_FROM
-    );
+    ); // Coded on several threads, a run at a time, the codes are those the
+       // writer made applying each commit as it was made, bit for bit.
+    let digest = |partition: &vellev_storage::Partition| {
+        partition.read(|state| state.memtable_coding(&name(NOTES)).unwrap().digest)
+    };
+    assert_eq!(digest(copy.partition()), digest(writer.partition()));
 }
