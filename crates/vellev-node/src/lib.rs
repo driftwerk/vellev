@@ -1248,14 +1248,14 @@ impl Node {
                 if node.0.opened().stopped {
                     return;
                 }
-                node.remember_warm();
+                node.remember_warm().await;
             }
         });
     }
 
     /// Write the warm list now: the tenants this node holds, written for or
     /// copied for reads, the most lately used first, as many as it keeps.
-    pub fn remember_warm(&self) {
+    pub async fn remember_warm(&self) {
         let Some(path) = &self.0.settings.warm else {
             return;
         };
@@ -1291,6 +1291,11 @@ impl Node {
         if let Err(error) = written {
             tracing::warn!(path = %path.display(), %error, "the warm list could not be written");
         }
+    }
+
+    /// Whether the node is warming tenants now.
+    pub fn warming_now(&self) -> bool {
+        false
     }
 
     pub fn sweeping(&self) {
@@ -1546,7 +1551,7 @@ impl Node {
     /// once rather than when the leases run out, and open no more.
     pub async fn shutdown(&self) {
         // What was served until now, for the node that starts next.
-        self.remember_warm();
+        self.remember_warm().await;
         let openings: Vec<Opening> = {
             let mut open = self.0.opened();
             open.stopped = true;
