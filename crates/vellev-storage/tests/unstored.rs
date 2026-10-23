@@ -435,7 +435,10 @@ async fn a_writer_of_format_1_refuses_an_unstored_property_and_stamps_every_file
     writer.flush().await.unwrap();
     let stamped = stamps(&cluster).await;
     assert!(stamped.iter().any(|(key, _)| key.contains("/vectors/")));
-    assert!(stamped.iter().all(|(_, format)| *format == 1), "{stamped:?}");
+    assert!(
+        stamped.iter().all(|(_, format)| *format == 1),
+        "{stamped:?}"
+    );
 }
 
 #[tokio::test]
@@ -451,7 +454,11 @@ async fn a_writer_of_format_2_stamps_every_file_it_writes_2_and_reads_format_1()
         .await
         .unwrap();
     older.flush().await.unwrap();
-    let before: Vec<String> = stamps(&cluster).await.into_iter().map(|(key, _)| key).collect();
+    let before: Vec<String> = stamps(&cluster)
+        .await
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
     drop(older);
     cluster.clock.advance(TTL);
 
@@ -462,10 +469,21 @@ async fn a_writer_of_format_2_stamps_every_file_it_writes_2_and_reads_format_1()
         .unwrap();
     writer.flush().await.unwrap();
     let stamped = stamps(&cluster).await;
-    let written: Vec<_> = stamped.iter().filter(|(key, _)| !before.contains(key)).collect();
+    let written: Vec<_> = stamped
+        .iter()
+        .filter(|(key, _)| !before.contains(key))
+        .collect();
     assert!(written.iter().any(|(key, _)| key.contains("/vectors/")));
-    assert!(written.iter().all(|(_, format)| *format == 2), "{written:?}");
-    assert!(stamped.iter().filter(|(key, _)| before.contains(key)).all(|(_, f)| *f == 1));
+    assert!(
+        written.iter().all(|(_, format)| *format == 2),
+        "{written:?}"
+    );
+    assert!(stamped
+        .iter()
+        .filter(|(key, _)| before.contains(key))
+        .all(|(_, f)| *f == 1));
     let reopened = cluster.open().await;
-    assert!(reopened.partition().read(|state| read(state, 1).1.is_some()));
+    assert!(reopened
+        .partition()
+        .read(|state| read(state, 1).1.is_some()));
 }

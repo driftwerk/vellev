@@ -1067,6 +1067,10 @@ struct Inner {
     /// The newest file format the cluster was seen to write; it never
     /// falls.
     cluster_format: AtomicU16,
+    /// The format every writer this node opens writes: the cluster's, as
+    /// far as `max_format` lets this node write it. 0 until the cluster's
+    /// is first seen, which a writer takes as format 1. It never falls.
+    writes_format: Arc<AtomicU16>,
 }
 
 #[derive(Debug, Clone)]
@@ -1102,6 +1106,7 @@ impl Node {
             copies_opened: AtomicU64::new(0),
             dropped: Mutex::default(),
             cluster_format: AtomicU16::new(0),
+            writes_format: Arc::new(AtomicU16::new(0)),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -1479,6 +1484,8 @@ impl Inner {
     /// time it is newer than this release reads.
     fn saw_format(&self, format: u16) {
         let before = self.cluster_format.fetch_max(format, Ordering::SeqCst);
+        let writes = format.min(self.settings.max_format);
+        self.writes_format.fetch_max(writes, Ordering::SeqCst);
         if format > FORMAT_VERSION && before <= FORMAT_VERSION {
             tracing::error!(
                 cluster = format,
@@ -1688,6 +1695,7 @@ impl Inner {
                 let documents = Arc::new(Documents(self.embedders.clone()));
                 Arc::new(
                     writer
+                        .writing_format(self.writes_format.clone())
                         .embedding_with(documents)
                         .transferring(self.settings.transfers)
                         .timed_by(self.settings.clock.clone()),

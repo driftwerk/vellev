@@ -10,7 +10,7 @@ use vellev_core::{
 use vellev_index::filter::Predicate;
 
 use crate::catalog::Catalog;
-use crate::format::{CollectionId, Op};
+use crate::format::{CollectionId, Op, UNSTORED_FORMAT};
 use crate::mutation::{Condition, Mutation, Outcome, DELETED_AT_MOST};
 use crate::state::{Live, State};
 use crate::{Capped, Over, Result, StorageError};
@@ -23,6 +23,8 @@ type RowKey = (CollectionId, ObjectId);
 pub(crate) struct Draft<'a> {
     state: &'a State,
     pending: Pending,
+    /// The file format the commit will be written in.
+    format: u16,
 }
 
 /// What has been resolved so far: the catalog as it will be, the rows that
@@ -75,7 +77,8 @@ struct Batch<'a> {
 }
 
 impl<'a> Draft<'a> {
-    pub fn new(state: &'a State) -> Self {
+    /// A draft of a commit to be written in `format`.
+    pub fn new(state: &'a State, format: u16) -> Self {
         let pending = Pending {
             catalog: state.catalog().clone(),
             rows: HashMap::new(),
@@ -84,7 +87,11 @@ impl<'a> Draft<'a> {
             texts: HashMap::new(),
             row_texts: HashMap::new(),
         };
-        Self { state, pending }
+        Self {
+            state,
+            pending,
+            format,
+        }
     }
 
     /// Resolve one caller's batch. Either all of it joins the draft, or, on
@@ -391,6 +398,15 @@ impl Batch<'_> {
     fn resolve(&mut self, mutation: Mutation) -> Result<Outcome> {
         match mutation {
             Mutation::CreateCollection(schema) => {
+                let format = self.draft.format;
+                if schema.has_unstored() && format < UNSTORED_FORMAT {
+                    return Err(invalid(format!(
+                        "{} has a property it does not store, which only format 2 \
+                         can hold, and the cluster writes format {format}: every node must \
+                         read format 2 and be let write it (VELLEV_MAX_FORMAT=2) first",
+                        schema.name
+                    )));
+                }
                 let op = self.catalog.create_collection(schema)?;
                 Ok(op.map_or(Outcome::Unchanged, |op| {
                     self.ops.push(op);
