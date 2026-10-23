@@ -294,44 +294,38 @@ impl Partition {
     /// afresh, as a load would. `held`, the column as built, is kept only
     /// where the store keeps no copies at all, or anywhere but on Unix.
     ///
-    /// A store meant to keep copies whose disk does not take one fails the
-    /// build, after [`RELOAD_TRIES`] tries in all where the disk only did
-    /// not answer in time: nothing is committed, the rows stay in memory
-    /// as they were, and the next build tries again. Held instead, the
-    /// vectors would be in memory until the partition is next loaded,
-    /// unseen under a cap on memory that counts on their being read in
-    /// place.
+    /// A store meant to keep copies whose disk does not take one, or does
+    /// not answer in time, fails the build at once: nothing is committed,
+    /// the rows stay in memory as they were, and the next build tries
+    /// again. It is not tried again here: a step that did not answer may
+    /// still hold the disk's turn at large files, which a second try would
+    /// wait on for as long as that step hangs. Held instead, the vectors
+    /// would be in memory until the partition is next loaded, unseen under
+    /// a cap on memory that counts on their being read in place.
     async fn column_built(&self, key: &str, held: Column) -> Result<Column> {
         self.own(key)?;
         if !cfg!(unix) {
             return Ok(held);
         }
-        let mut tried = 1;
-        loop {
-            let read = async {
-                if let Some(local) = self.blobs.local(key).await? {
-                    if let Some(column) = self.mapped(key, local).await? {
-                        return Ok(Some(column));
-                    }
+        let read = async {
+            if let Some(local) = self.blobs.local(key).await? {
+                if let Some(column) = self.mapped(key, local).await? {
+                    return Ok(Some(column));
                 }
-                match self.blobs.fetch_local(key).await? {
-                    None => Ok(None),
-                    Some(local) => self.mapped(key, local).await?.map(Some).ok_or_else(|| {
-                        StorageError::corrupt(key, "as fetched to local disk it is no vectors file")
-                    }),
-                }
-            };
-            match read.await {
-                Ok(Some(column)) => return Ok(column),
-                Ok(None) => return Ok(held),
-                Err(slow) if tried < RELOAD_TRIES && disk_timed_out(&slow) => {
-                    tracing::warn!(key, error = %slow, tried, "vectors just built whose local disk did not answer in time are read again");
-                    tried += 1;
-                }
-                Err(error) => {
-                    tracing::error!(key, %error, "a segment just built is not kept: its vectors could not be read from local disk");
-                    return Err(error);
-                }
+            }
+            match self.blobs.fetch_local(key).await? {
+                None => Ok(None),
+                Some(local) => self.mapped(key, local).await?.map(Some).ok_or_else(|| {
+                    StorageError::corrupt(key, "as fetched to local disk it is no vectors file")
+                }),
+            }
+        };
+        match read.await {
+            Ok(Some(column)) => Ok(column),
+            Ok(None) => Ok(held),
+            Err(error) => {
+                tracing::error!(key, %error, "a segment just built is not kept: its vectors could not be read from local disk");
+                Err(error)
             }
         }
     }
