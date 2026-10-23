@@ -1630,7 +1630,10 @@ async fn a_region_a_caller_gives_up_on_unanswered_is_marked_as_not_reached() {
     // Whoever asked, and the call it made for itself and any who ask the
     // same meanwhile; and Titan has the text in hand.
     settled(&clock, 2, &slow).await;
-    until("the slow one sent", || seen.in_flight.load(Ordering::SeqCst) == 1).await;
+    until("the slow one sent", || {
+        seen.in_flight.load(Ordering::SeqCst) == 1
+    })
+    .await;
     let asleep = clock.asleep();
     clock.move_to(asleep[0]);
     let slow = tokio::time::timeout(BACKSTOP, slow)

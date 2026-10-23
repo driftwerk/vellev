@@ -1317,8 +1317,6 @@ mod tests {
         assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// As long as no test waits: a run that takes this never comes back.
-
     /// A stand-in that takes `load_takes` to load, and then `run_takes`
     /// over each run.
     fn slow_to_load(load_takes: Duration, run_takes: Duration) -> Arc<Local> {
@@ -1729,7 +1727,7 @@ mod tests {
             &behind,
             || 1,
             || {
-                if (clock.now() - began).as_millis() % 300 == 0 && clock.now() > began {
+                if (clock.now() - began).as_millis().is_multiple_of(300) && clock.now() > began {
                     fail.send(()).unwrap();
                     failed_loads += 1;
                     while loaded() != failed_loads + 1 {
