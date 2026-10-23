@@ -285,3 +285,48 @@ async fn a_segment_just_built_on_a_store_keeping_copies_holds_no_vectors_in_memo
         });
     }
 }
+
+/// A segment built on a store meant to keep copies on local disk, whose
+/// copy cannot be kept there, is not held in memory instead: the flush or
+/// merge fails, said aloud, nothing is committed, and the rows stay in
+/// memory where they were, to be flushed once the disk takes them.
+#[tokio::test]
+async fn a_segment_built_whose_copy_the_cache_cannot_keep_fails_the_build_rather_than_be_held() {
+    let cluster = Cluster::new().await;
+    // A cache directory that is a file keeps nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = dir.path().join("a-file");
+    std::fs::write(&nowhere, b"in the way").unwrap();
+    let cached: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(cluster.blobs.clone(), &nowhere));
+    let (lease, committed) = cluster.lease().await;
+    let writer = Writer::open(cached, cluster.coordinator.clone(), lease, &committed)
+        .await
+        .unwrap();
+    let rows = (0..10).map(|n| upsert("notes", n, i64::from(n)));
+    writer
+        .commit([create("notes")].into_iter().chain(rows).collect())
+        .await
+        .unwrap();
+    let before = cluster.committed().await.manifest;
+    let failed = writer.flush().await;
+    assert!(
+        matches!(&failed, Err(StorageError::Blob { key, .. }) if key.contains("/vectors/")),
+        "{failed:?}"
+    );
+    assert_eq!(
+        cluster.committed().await.manifest,
+        before,
+        "nothing committed"
+    );
+    writer.partition().read(|state| {
+        assert_eq!(vector_of(state, 6), Some(vec![6.0, 0.5]));
+        assert_eq!(state.rows(), 10);
+    });
+    // Once the disk takes the copy, the same rows are flushed and read in place.
+    std::fs::remove_file(&nowhere).unwrap();
+    writer.flush().await.unwrap();
+    assert_eq!(segments_of(&cluster).await.len(), 1);
+    let (held, _) = built_on(false, false).await;
+    let resident = |writer: &Writer| writer.partition().read(State::resident);
+    assert!(resident(&writer) < resident(&held));
+}
