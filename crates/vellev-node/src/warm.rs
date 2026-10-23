@@ -234,43 +234,82 @@ impl Drop for Opening {
 
 impl Inner {
     fn warm_list(&self) -> Vec<Entry> {
-        // Each tenant by when it was last used, or where warming found it.
-        let mut used: HashMap<TenantId, (Option<Instant>, usize, bool)> = HashMap::new();
+        let mut held = Vec::new();
         {
             let open = self.opened();
             for (tenant, opening) in &open.tenants {
                 if let Some(writer) = opening.get() {
-                    used.insert(tenant.clone(), (Some(writer.used_at()), 0, true));
+                    held.push(Held {
+                        tenant: tenant.clone(),
+                        used: Some(writer.used_at()),
+                        rank: 0,
+                        wrote: true,
+                    });
                 }
             }
             for (tenant, following) in open.followers.iter() {
                 let Some(copy) = following.get() else {
                     continue;
                 };
-                let (at, rank) = match copy.warmed() {
+                let (used, rank) = match copy.warmed() {
                     Some(rank) => (None, rank),
                     None => (Some(copy.used_at()), 0),
                 };
-                used.entry(tenant.clone())
-                    .and_modify(|(was, _, _)| *was = (*was).max(at))
-                    .or_insert((at, rank, false));
+                held.push(Held {
+                    tenant: tenant.clone(),
+                    used,
+                    rank,
+                    wrote: false,
+                });
             }
         }
-        let mut used: Vec<_> = used.into_iter().collect();
-        // The used, most lately first; then the warmed, as they were listed.
-        used.sort_by_key(|(_, (at, rank, _))| (at.is_none(), std::cmp::Reverse(*at), *rank));
-        let mut kept: Vec<Entry> = used
-            .into_iter()
-            .map(|(tenant, (_, _, wrote))| Entry { tenant, wrote })
-            .collect();
-        for entry in self.warm.unwarmed.lock().expect("warm lock").iter() {
-            if !kept.iter().any(|kept| kept.tenant == entry.tenant) {
-                kept.push(entry.clone());
-            }
-        }
-        kept.truncate(self.settings.warm_most);
-        kept
+        let unwarmed = self.warm.unwarmed.lock().expect("warm lock").clone();
+        ordered(held, &unwarmed, self.settings.warm_most)
     }
+}
+
+/// A tenant the node holds, as the warm list is made from it.
+#[derive(Debug, Clone)]
+struct Held {
+    tenant: TenantId,
+    /// When it was last used; none for a copy warmed that nobody has read.
+    used: Option<Instant>,
+    /// Where on the list such a copy stood.
+    rank: usize,
+    /// Whether it is held as its writer.
+    wrote: bool,
+}
+
+/// The warm list made of what the node holds: the used, most lately
+/// first; then the copies warmed and not read, as they were listed; then
+/// `unwarmed`; at most `most`. A tenant held both as writer and copy is
+/// listed once, written for, by the later of its uses.
+fn ordered(held: Vec<Held>, unwarmed: &[Entry], most: usize) -> Vec<Entry> {
+    let mut used: HashMap<TenantId, (Option<Instant>, usize, bool)> = HashMap::new();
+    for held in held {
+        used.entry(held.tenant)
+            .and_modify(|(was, rank, wrote)| {
+                if held.used > *was {
+                    *was = held.used;
+                    *rank = held.rank;
+                }
+                *wrote |= held.wrote;
+            })
+            .or_insert((held.used, held.rank, held.wrote));
+    }
+    let mut used: Vec<_> = used.into_iter().collect();
+    used.sort_by_key(|(_, (at, rank, _))| (at.is_none(), std::cmp::Reverse(*at), *rank));
+    let mut kept: Vec<Entry> = used
+        .into_iter()
+        .map(|(tenant, (_, _, wrote))| Entry { tenant, wrote })
+        .collect();
+    for entry in unwarmed {
+        if !kept.iter().any(|kept| kept.tenant == entry.tenant) {
+            kept.push(entry.clone());
+        }
+    }
+    kept.truncate(most);
+    kept
 }
 
 /// The list at `path`, at most `most` of it: none if there is none, or it
