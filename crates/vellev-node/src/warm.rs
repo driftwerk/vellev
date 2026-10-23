@@ -404,27 +404,34 @@ mod tests {
             rank: 0,
             wrote,
         };
-        let listed = ordered(
+        // Whichever is come to first.
+        for listed in [
             vec![
                 held("acme", later(0), true),
                 held("beta", later(10), false),
                 held("acme", later(20), false),
             ],
-            &[],
-            16,
-        );
-        assert_eq!(
-            listed,
-            [
-                Entry {
-                    tenant: TenantId::new("acme").unwrap(),
-                    wrote: true
-                },
-                Entry {
-                    tenant: TenantId::new("beta").unwrap(),
-                    wrote: false
-                },
-            ]
-        );
+            vec![
+                held("acme", later(20), false),
+                held("beta", later(10), false),
+                held("acme", later(0), true),
+            ],
+        ]
+        .map(|held| ordered(held, &[], 16))
+        {
+            assert_eq!(
+                listed,
+                [
+                    Entry {
+                        tenant: TenantId::new("acme").unwrap(),
+                        wrote: true
+                    },
+                    Entry {
+                        tenant: TenantId::new("beta").unwrap(),
+                        wrote: false
+                    },
+                ]
+            );
+        }
     }
 }
