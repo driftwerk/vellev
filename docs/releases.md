@@ -376,6 +376,11 @@ and say what the caller then answers for.
   the defaults): multiply it by that to keep the old recall. Results can
   differ where the vector search's index would have needed more rows to
   find the nearest: name a larger `oversample` to have them.
+- **A restarted node opens what it lately served before it is read**
+  (`VELLEV_WARM_TENANTS`, 16; 0 for none): it keeps a list of those
+  tenants in its cache directory and opens copies of them as it starts.
+  Opening a tenant fetches the logs it replays sixteen at a time, named by
+  the commits the coordinator records, rather than one after another.
 - **Metrics for Prometheus**, on a listener of their own: set
   `VELLEV_METRICS_LISTEN`. Requests are timed whole and by stage, and
   searches report the rows they scored and how much their filter allowed;

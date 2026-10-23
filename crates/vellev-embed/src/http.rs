@@ -45,6 +45,8 @@ pub struct Http {
     activity: Activity,
     /// How long one batch may take, every try included.
     batch_within: Duration,
+    /// What the waits between tries and a batch's bound are timed by.
+    clock: std::sync::Arc<dyn crate::clock::Clock>,
 }
 
 impl std::fmt::Debug for Http {
@@ -213,6 +215,7 @@ fn escape(text: &str) -> Escape {
 
 /// `text` with its escapes undone.
 fn decoded(text: &str) -> Decoded {
+    crate::looked_through(text.len());
     let mut decoded = Decoded {
         chars: Vec::new(),
         from: Vec::new(),
@@ -453,6 +456,7 @@ impl Http {
             key,
             activity: Activity::default(),
             batch_within: DEADLINE,
+            clock: crate::clock::tokio(),
         })
     }
 
@@ -467,6 +471,15 @@ impl Http {
             batch_within: within,
             ..self
         }
+    }
+
+    /// This, timing the waits between tries and each batch's bound by
+    /// `clock` rather than tokio's: for tests that move the clock
+    /// themselves.
+    #[cfg(any(test, feature = "test-clock"))]
+    #[must_use]
+    pub fn timed_by(self, clock: std::sync::Arc<dyn crate::clock::Clock>) -> Self {
+        Self { clock, ..self }
     }
 
     /// `text` without this endpoint's key, whatever its shape. Anything
@@ -499,6 +512,7 @@ impl Http {
     /// the characters escapes stand for, and what stands for them is
     /// taken out, in one pass.
     fn without_own_key(&self, said: &str) -> String {
+        crate::looked_through(said.len());
         let Some(key) = self.key.as_deref() else {
             return said.to_string();
         };
@@ -666,7 +680,7 @@ impl Http {
             if !passing || attempt == ATTEMPTS {
                 return Err(failure);
             }
-            tokio::time::sleep(wait).await;
+            self.clock.sleep(wait).await;
             backoff *= 2;
             attempt += 1;
         }
@@ -711,8 +725,13 @@ impl Http {
         for batch in texts.chunks(BATCH) {
             let within = self.batch_within;
             let late = || self.failed(format!("no answer within {within:?}"));
-            let made = tokio::time::timeout(within, self.batch(batch)).await;
-            vectors.extend(made.unwrap_or_else(|_| Err(late()))?);
+            // As a timeout is: the batch is looked at first.
+            let made = tokio::select! {
+                biased;
+                made = self.batch(batch) => made,
+                () = self.clock.sleep(within) => Err(late()),
+            };
+            vectors.extend(made?);
             self.activity.made();
         }
         Ok(vectors)
@@ -933,6 +952,9 @@ mod tests {
     fn a_batch_is_given_two_minutes() {
         let http = Http::new("http://e.test", HttpApi::Tei, "m", None).expect("an endpoint");
         assert_eq!(http.batch_within, Duration::from_secs(120));
+        // Timed by tokio's clock, as everything is but tests that hand in
+        // their own.
+        assert_eq!(format!("{:?}", http.clock), "Tokio");
         let told = http.answering_each_batch_within(Duration::from_secs(3));
         assert_eq!(told.batch_within, Duration::from_secs(3));
     }
@@ -1128,11 +1150,43 @@ mod tests {
             Some("its-own-key-0123".into()),
         )
         .expect("an endpoint");
-        // The shapes are made ready when first looked for, which is not
-        // what is timed here.
-        crate::without_keys("");
+        // How many bytes of what is said are looked through for keys, and
+        // what is passed on.
+        let looked = |said: &str| {
+            crate::LOOKED_THROUGH_HERE.with(|looked| looked.set(0));
+            let opening = http.opening(said, true);
+            (
+                opening,
+                crate::LOOKED_THROUGH_HERE.with(std::cell::Cell::get),
+            )
+        };
+        // What follows the start goes unread: as many bytes are looked
+        // through of what is said as of its first LOOKED_THROUGH and a
+        // few more, however much follows, and those are no more than a
+        // look through it for each shape of key and a few besides.
+        //
+        // The count is of the passes that look for keys. A pass over all
+        // of what was said that looks for nothing, such as counting its
+        // characters, is not counted; the backstop for it is a wall
+        // clock, and a generous one so that a loaded machine does not
+        // fail it: a pass over sixteen megabytes takes some tens of
+        // milliseconds, and the limit is two seconds.
+        let unread_after_the_start = |said: &str, what: &str| {
+            let began = std::time::Instant::now();
+            let (opening, bytes) = looked(said);
+            let took = began.elapsed();
+            assert!(took < Duration::from_secs(2), "{what}: it took {took:?}");
+            let (_, of_the_start) = looked(&said[..LOOKED_THROUGH + 64]);
+            assert_eq!(bytes, of_the_start, "{what}: the rest was read");
+            assert!(bytes > 0, "{what}: nothing was counted");
+            assert!(
+                bytes <= (crate::KEYS.len() + 6) * LOOKED_THROUGH,
+                "{what}: {bytes} bytes were looked through"
+            );
+            opening
+        };
         // A key lying across where it is cut, however much is said after:
-        // sixteen megabytes of it take no longer than none.
+        // sixteen megabytes of it are looked through no further than none.
         for kept in [1, 8, 20, key.len()] {
             let start = format!("{} its-own-key-0123 {key} ", "é".repeat(280 - kept));
             let said = format!("{start}{}", "and more ".repeat(16 * 1024 * 1024 / 9));
@@ -1140,22 +1194,13 @@ mod tests {
                 .replace(key, "<redacted>")
                 .replace("its-own-key-0123", "<redacted>");
             let cut: String = whole.chars().take(REFUSAL_CHARS).collect();
-            let began = std::time::Instant::now();
-            assert_eq!(
-                http.opening(&said, true),
-                cut,
-                "with {kept} of the key before the cut"
-            );
-            let took = began.elapsed();
-            assert!(took < Duration::from_millis(50), "it took {took:?}");
+            let what = format!("with {kept} of the key before the cut");
+            assert_eq!(unread_after_the_start(&said, &what), cut, "{what}");
         }
-        // Nor does what is found over and over and is never a key.
+        // Nor what is found over and over and is never a key.
         for never in ["ask-", "-sk-", " hf_", ".eyJ", "AKIA", " bearer ", "-key="] {
             let said = never.repeat(4 * 1024 * 1024 / never.len());
-            let began = std::time::Instant::now();
-            let opening = http.opening(&said, true);
-            let took = began.elapsed();
-            assert!(took < Duration::from_millis(50), "{never} took {took:?}");
+            let opening = unread_after_the_start(&said, never);
             assert!(opening.chars().count() <= REFUSAL_CHARS);
         }
         // What is said is cut where a character ends, wherever that is.

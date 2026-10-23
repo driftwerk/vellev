@@ -4343,6 +4343,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vellev-core",
+ "vellev-embed",
 ]
 
 [[package]]
@@ -4374,6 +4375,7 @@ dependencies = [
  "futures",
  "nix",
  "object_store",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
@@ -4400,6 +4402,7 @@ dependencies = [
  "memmap2",
  "object_store",
  "proptest",
+ "rayon",
  "rmp-serde",
  "roaring",
  "serde",
