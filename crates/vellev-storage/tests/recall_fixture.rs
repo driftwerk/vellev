@@ -1,24 +1,30 @@
 //! The hybrid rescore budget's recall on real embeddings (burst plan F1).
 //!
 //! Ignored unless asked for, and reads its data from outside the
-//! repository: `VELLEV_RECALL_FIXTURE` names a JSON Lines file, one object
-//! a line, `{"id": "<uuid>", "content": "<text>", "vector": [f32; N]}`. No
-//! fixture is committed. Run it built for speed:
+//! repository; no fixture is committed. The nightly workflow runs it on the
+//! public SQuAD 2.0 fixture (see the README, "Recall on real embeddings"):
+//!
+//! - `VELLEV_RECALL_FIXTURE` names a JSON Lines file of the rows, one
+//!   object a line, `{"id": "<uuid>", "content": "<text>", "vector": [f32; N]}`.
+//! - `VELLEV_RECALL_QUERIES` names a JSON Lines file of the queries,
+//!   `{"text", "vector"}`, their vectors embedded with the model's query
+//!   prefix as a hub embeds them. Every row is written.
 //!
 //! ```sh
-//! VELLEV_RECALL_FIXTURE=/path/memories.jsonl \
+//! VELLEV_RECALL_FIXTURE=memories.jsonl VELLEV_RECALL_QUERIES=queries.vectors.jsonl \
 //!   cargo test --release -p vellev-storage --test recall_fixture -- --ignored --nocapture
 //! ```
 //!
-//! Every 69th object, up to 200, is held out as a query: its vector, and
-//! the first six words of its content as the text. Or, with
-//! `VELLEV_RECALL_QUERIES` naming a JSON Lines file of `{"text", "vector"}`
-//! (queries embedded with the model's query prefix, as a hub embeds them),
-//! those are the queries and every object is written. The rest are written
-//! in three layouts: one segment; segments of uneven size, one too small
-//! to shortlist, and a memtable; and one segment with a memtable. Each
-//! object is given a bucket from 0 to 99 by its id, so that a filter can
-//! allow all (no filter), a tenth (mid) or a hundredth (narrow).
+//! Only as a fallback, with no queries file, every 69th row, up to 200, is
+//! held out as a query: its document vector, and the first six words of its
+//! content as the text. That is easier than real queries, and is what the
+//! gate was first run with on driftwerk's memories.
+//!
+//! The rows are written in four layouts: one segment; segments of uneven
+//! size, one too small to shortlist, and a memtable; one segment with a
+//! memtable; and the memtable alone. Each row is given a bucket from 0 to
+//! 99 by its id, so that a filter can allow all (no filter), a tenth (mid)
+//! or a hundredth (narrow).
 //!
 //! For each layout, filter and limit (10, 50, 100) it compares the fused
 //! top `limit` of a hybrid search with the oversample a default search
