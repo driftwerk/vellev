@@ -15,6 +15,10 @@
 //!   nothing embedded keeps the vector, embedding nothing. Which of the two
 //!   it is depends on the change alone, not on what else shares its commit.
 //! - The text not kept is memory not held.
+//! - Format 2: a schema with an unstored property is written only once
+//!   the cluster writes format 2, and every file a writer writes is
+//!   stamped with the format it writes, so the release before, which reads
+//!   format 1 alone, never misreads one.
 
 mod common;
 
@@ -115,11 +119,17 @@ fn append(object: u8, tag: &str) -> Mutation {
     }
 }
 
+/// The format a writer writes once the cluster writes format 2.
+fn format(format: u16) -> Arc<std::sync::atomic::AtomicU16> {
+    Arc::new(std::sync::atomic::AtomicU16::new(format))
+}
+
 async fn writer(cluster: &Cluster, kept: bool) -> (Writer, Arc<Lengths>) {
     let lengths = Arc::new(Lengths::default());
     let writer = cluster
         .writer()
         .await
+        .writing_format(format(2))
         .embedding_with(lengths.clone())
         .merging_with(Merging {
             fanout: 2,
@@ -393,4 +403,69 @@ async fn the_last_whole_write_in_a_commit_is_the_text_embedded() {
             "grouped: {grouped}"
         );
     }
+}
+
+/// The format each file in the store is stamped with, by key.
+async fn stamps(cluster: &Cluster) -> Vec<(String, u16)> {
+    let mut stamped = Vec::new();
+    for listed in cluster.blobs.list("").await.unwrap() {
+        let frame = cluster.blobs.get(&listed.key).await.unwrap();
+        stamped.push((listed.key, u16::from_le_bytes([frame[5], frame[6]])));
+    }
+    stamped
+}
+
+#[tokio::test]
+async fn a_writer_of_format_1_refuses_an_unstored_property_and_stamps_every_file_1() {
+    let cluster = Cluster::new().await;
+    // As a node runs until the cluster writes format 2.
+    let writer = cluster
+        .writer()
+        .await
+        .embedding_with(Arc::new(Lengths::default()));
+    let refused = writer.commit(vec![pages(false)]).await;
+    assert!(
+        matches!(&refused, Err(StorageError::InvalidMutation(why)) if why.contains("format 2")),
+        "{refused:?}"
+    );
+    assert!(!writer.is_closed());
+    writer.commit(vec![pages(true)]).await.unwrap();
+    let rows = (0..5).map(|n| page(n, json!({ "title": "t", "body": "b" })));
+    writer.commit(rows.collect()).await.unwrap();
+    writer.flush().await.unwrap();
+    let stamped = stamps(&cluster).await;
+    assert!(stamped.iter().any(|(key, _)| key.contains("/vectors/")));
+    assert!(stamped.iter().all(|(_, format)| *format == 1), "{stamped:?}");
+}
+
+#[tokio::test]
+async fn a_writer_of_format_2_stamps_every_file_it_writes_2_and_reads_format_1() {
+    let cluster = Cluster::new().await;
+    // Format 1 written first, as before the cluster's format rose.
+    let older = cluster
+        .writer()
+        .await
+        .embedding_with(Arc::new(Lengths::default()));
+    older
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    older.flush().await.unwrap();
+    let before: Vec<String> = stamps(&cluster).await.into_iter().map(|(key, _)| key).collect();
+    drop(older);
+    cluster.clock.advance(TTL);
+
+    let (writer, _) = writer(&cluster, false).await;
+    writer
+        .commit(vec![page(1, json!({ "title": "t", "body": SECRET }))])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let stamped = stamps(&cluster).await;
+    let written: Vec<_> = stamped.iter().filter(|(key, _)| !before.contains(key)).collect();
+    assert!(written.iter().any(|(key, _)| key.contains("/vectors/")));
+    assert!(written.iter().all(|(_, format)| *format == 2), "{written:?}");
+    assert!(stamped.iter().filter(|(key, _)| before.contains(key)).all(|(_, f)| *f == 1));
+    let reopened = cluster.open().await;
+    assert!(reopened.partition().read(|state| read(state, 1).1.is_some()));
 }

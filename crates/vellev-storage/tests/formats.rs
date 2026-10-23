@@ -84,6 +84,41 @@ fn notes() -> Collection {
     }
 }
 
+/// From format 2: a collection embedding a property it does not store.
+fn pages() -> Collection {
+    Collection {
+        name: name("pages"),
+        properties: vec![
+            Property::new("title", DataType::Text),
+            Property::new("body", DataType::Text).unstored(),
+        ],
+        embedding: Embedding {
+            provider: EmbeddingProvider::Local,
+            model: "fixture".into(),
+            dimensions: 2,
+            query_prefix: None,
+            document_prefix: None,
+            properties: vec!["title".into(), "body".into()],
+        },
+        distance: Distance::Cosine,
+        bm25: Bm25::default(),
+        access_rule: None,
+    }
+}
+
+fn page(n: u32) -> Mutation {
+    Mutation::Upsert {
+        collection: name("pages"),
+        id: object(n),
+        properties: json!({ "title": format!("page {n}"), "body": format!("body {n}") })
+            .as_object()
+            .unwrap()
+            .clone(),
+        vector: Some(vector(n)),
+        only_if_version: None,
+    }
+}
+
 /// A partition with every kind of file and op: a large segment with its
 /// vectors and clustered index, then a later segment with tombstones
 /// flushed while commits went on, under a manifest naming the checkpoint
@@ -105,14 +140,30 @@ async fn write_fixtures() {
     let store = LocalFileSystem::new_with_prefix(&dir).unwrap();
     cluster.blobs = Arc::new(ObjectBlobs::on_disk(Arc::new(store), &dir));
     let (paused, mut stored) = Paused::new(&mut cluster, "/segment/");
-    let writer = Arc::new(cluster.writer().await.merging_with(Merging {
-        clustered_above: 4_000,
-        ..Merging::default()
-    }));
+    let writing = Arc::new(std::sync::atomic::AtomicU16::new(FORMAT_VERSION));
+    let writer = Arc::new(
+        cluster
+            .writer()
+            .await
+            .writing_format(writing)
+            .merging_with(Merging {
+                clustered_above: 4_000,
+                ..Merging::default()
+            }),
+    );
     writer
         .commit(vec![
             Mutation::CreateCollection(Box::new(notes())),
             create("scratch"),
+        ])
+        .await
+        .unwrap();
+    // What format 2 added, from the first commit after the schemas.
+    writer
+        .commit(vec![
+            Mutation::CreateCollection(Box::new(pages())),
+            page(1),
+            page(2),
         ])
         .await
         .unwrap();
@@ -262,6 +313,17 @@ async fn the_fixtures_of_every_format_read_as_they_were_written() {
                 .keyword(&notes, &Keywords::matching("owl", 3))
                 .unwrap();
             assert_eq!(words.len(), 3);
+            if format >= 2 {
+                let pages = name("pages");
+                assert_eq!(state.collection(&pages), Some(&self::pages()));
+                for n in [1, 2] {
+                    let found = state.get(&pages, object(n)).unwrap();
+                    let title = Value::Text(format!("page {n}"));
+                    assert_eq!(found.object.properties.get("title"), Some(&title));
+                    assert!(!found.object.properties.contains_key("body"));
+                    assert_eq!(found.vector, Some(&vector(n)[..]));
+                }
+            }
         });
     }
 }

@@ -8568,3 +8568,59 @@ async fn a_node_serves_every_tenant_unless_told_otherwise() {
         assert_eq!(reading.copies(), 1);
     }
 }
+
+/// Track 2, V3: a property embedded but not stored is new in format 2.
+/// A node refuses a schema with one until the cluster writes format 2,
+/// which it does once every node registered reads it and the nodes are
+/// allowed to write it (`max_format`): until then the release before,
+/// which reads format 1 alone, may read anything written.
+#[tokio::test]
+async fn an_unstored_property_is_refused_until_the_cluster_writes_format_2() {
+    let cluster = Cluster::new();
+    let url = embedding_server(Arc::new(AtomicUsize::new(0))).await;
+    let unstored = || {
+        let Mutation::CreateCollection(mut schema) = schema(served_by(&url, "lengths")) else {
+            unreachable!()
+        };
+        schema
+            .properties
+            .push(Property::new("body", DataType::Text).unstored());
+        schema.embedding.properties.push("body".into());
+        Mutation::CreateCollection(schema)
+    };
+
+    let node = cluster.node();
+    node.announcing();
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    let refused = acme.write(vec![unstored()]).await;
+    assert!(
+        matches!(&refused, Err(NodeError::Storage(StorageError::InvalidMutation(why))) if why.contains("format 2")),
+        "{refused:?}"
+    );
+    acme.write(vec![schema(served_by(&url, "lengths"))])
+        .await
+        .unwrap();
+    node.shutdown().await;
+
+    let raised = cluster.node_from(Settings {
+        max_format: 2,
+        ..cluster.settings()
+    });
+    raised.announcing();
+    raised.create_tenant(&tenant("beta")).await.unwrap();
+    let beta = raised.tenant(&tenant("beta")).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match beta.write(vec![unstored()]).await {
+            Ok(_) => break,
+            Err(NodeError::Storage(StorageError::InvalidMutation(_)))
+                if std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    raised.shutdown().await;
+}
