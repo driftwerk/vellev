@@ -1171,6 +1171,14 @@ impl State {
         self.apply_prepared(key, log, Prepared::default())
     }
 
+    /// Whether any collection's rows in the memtable are coded.
+    pub(crate) fn coding_anything(&self) -> bool {
+        self.memtable
+            .indexes
+            .values()
+            .any(|index| matches!(index.vectors, Some(Vectors::Binary(_))))
+    }
+
     /// The codes of `log`'s rows with a vector whose collection's memtable
     /// is coded now, worked out without changing the state: so that they
     /// can be made before the state is locked to apply the log, and the

@@ -4400,6 +4400,7 @@ dependencies = [
  "memmap2",
  "object_store",
  "proptest",
+ "rayon",
  "rmp-serde",
  "roaring",
  "serde",

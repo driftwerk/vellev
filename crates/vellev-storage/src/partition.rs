@@ -107,6 +107,8 @@ pub struct Replayed {
     pub coded_on_threads: usize,
 }
 
+/// How many logs a replay codes together before applying them.
+const REPLAYED_TOGETHER: usize = 16;
 /// How many fetches a load has under way at once, at the most.
 const FETCHED_AT_ONCE: usize = 16;
 /// How many commits back from the head a load first fetches together,
@@ -535,12 +537,37 @@ impl Partition {
                 *self.state.write().expect("partition lock") = state;
             }
             None => {
-                // A log at a time, its codes made while readers may still
-                // read, and only stored under the lock.
-                for (key, log) in &tail.logs {
-                    let prepared = self.read(|state| state.prepared(log));
-                    let mut state = self.state.write().expect("partition lock");
-                    state.apply_prepared(key, log, prepared)?;
+                // A run of logs at a time, the codes of each made together
+                // on several threads while readers may still read, and
+                // only stored under the lock, a log at a time. A run is
+                // coded as the state is when it begins: a collection coded
+                // during it codes its rows as they are applied.
+                for run in tail.logs.chunks(REPLAYED_TOGETHER) {
+                    let prepared: Vec<state::Prepared> = self.read(|state| {
+                        use rayon::prelude::*;
+                        let threads = std::sync::atomic::AtomicUsize::new(0);
+                        let most = std::sync::atomic::AtomicUsize::new(0);
+                        let prepared = run
+                            .par_iter()
+                            .map(|(_, log)| {
+                                let now = threads.fetch_add(1, Ordering::Relaxed) + 1;
+                                most.fetch_max(now, Ordering::Relaxed);
+                                let made = state.prepared(log);
+                                threads.fetch_sub(1, Ordering::Relaxed);
+                                made
+                            })
+                            .collect();
+                        if state.coding_anything() {
+                            let mut replayed = self.replayed.lock().expect("replayed lock");
+                            replayed.coded_on_threads =
+                                replayed.coded_on_threads.max(most.into_inner());
+                        }
+                        prepared
+                    });
+                    for ((key, log), prepared) in run.iter().zip(prepared) {
+                        let mut state = self.state.write().expect("partition lock");
+                        state.apply_prepared(key, log, prepared)?;
+                    }
                 }
             }
         }
