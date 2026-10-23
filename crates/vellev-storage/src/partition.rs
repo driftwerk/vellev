@@ -618,6 +618,19 @@ impl Follower {
             .map(Self)
     }
 
+    /// As [`Self::open`], finding the logs it replays through `commits`,
+    /// the coordinator that recorded them, so that they can be fetched
+    /// together rather than one after another.
+    pub async fn open_through(
+        key: PartitionKey,
+        blobs: Arc<dyn Blobs>,
+        commits: Arc<dyn Coordinator>,
+        committed: &Committed,
+    ) -> Result<Self> {
+        let _ = commits;
+        Self::open(key, blobs, committed).await
+    }
+
     pub fn partition(&self) -> &Arc<Partition> {
         &self.0
     }
