@@ -80,6 +80,9 @@ pub struct MemtableCoding {
     pub coded: usize,
     /// The centre the codes are taken about, in the rotated space.
     pub centre: Vec<f32>,
+    /// A digest of the codes, bit for bit: see [`vellev_index`]'s
+    /// `BinaryIndex::digest`.
+    pub digest: u64,
 }
 
 /// What is indexed about one collection's rows in a layer: their filterable
@@ -855,6 +858,7 @@ impl State {
                 applied: self.memtable.applied.get(&id).copied().unwrap_or(0),
                 coded: codes.coded(),
                 centre: codes.centre().to_vec(),
+                digest: codes.digest(),
             }),
             _ => None,
         }

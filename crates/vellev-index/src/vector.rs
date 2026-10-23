@@ -604,6 +604,24 @@ impl BinaryIndex {
         self.rows.len()
     }
 
+    /// A digest of every code, its factors and its row, and of the rows
+    /// scored exactly: equal for two indexes coded alike, bit for bit.
+    pub fn digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.rows.hash(&mut hasher);
+        self.codes.hash(&mut hasher);
+        for (term, length) in &self.factors {
+            (term.to_bits(), length.to_bits()).hash(&mut hasher);
+        }
+        self.unmeasured.hash(&mut hasher);
+        self.centre
+            .iter()
+            .map(|x| x.to_bits())
+            .for_each(|x| x.hash(&mut hasher));
+        hasher.finish()
+    }
+
     /// The centre codes are taken about, in the rotated space.
     pub fn centre(&self) -> &[f32] {
         &self.centre
