@@ -901,6 +901,11 @@ mod tests {
     }
 
     /// Wait for `what` to be so, which it must be within seconds.
+    /// How long a test waits on what a right build does within a bound
+    /// of at most a second or so, before failing rather than hanging: a
+    /// hundred times as long and more.
+    const BACKSTOP: Duration = Duration::from_secs(60);
+
     async fn until(what: impl Fn() -> bool) {
         for _ in 0..500 {
             if what() {
@@ -1131,37 +1136,56 @@ mod tests {
     /// A run cannot be stopped, and nothing in the model gives up on one.
     /// Whoever embeds through it waits no longer than a model is given;
     /// and the model, when the run does come back, goes on to the next.
-    #[tokio::test(flavor = "multi_thread")]
+    /// The run is held, so the clock is paused while it is: it moves only
+    /// when nothing is left to do but wait, and so by exactly the bounds.
+    #[tokio::test(start_paused = true)]
     async fn a_model_that_hangs_is_given_up_on_in_the_time_a_model_is_given() {
         let ms = Duration::from_millis;
         let (local, runs) = local(0);
-        let embedder = giving(&local, ms(200));
+        let embedder = Arc::new(giving(&local, ms(200)));
         let late = |within: &str| failed(&format!("no answer within {within}"));
 
-        // Left waiting on the run, this fails and does not hang.
+        // Left waiting on the run, this fails and does not hang. The run
+        // is waited for on a thread of the blocking pool, which keeps the
+        // paused clock where it is until it is seen: so the query was run
+        // before any time passed.
+        let runs = Arc::new(std::sync::Mutex::new(runs));
+        let next = |runs: &Arc<std::sync::Mutex<Runs>>| {
+            let runs = runs.clone();
+            tokio::task::spawn_blocking(move || runs.lock().unwrap().next())
+        };
         let seconds = Duration::from_secs(5);
-        let began = std::time::Instant::now();
-        let query = tokio::time::timeout(seconds, embedder.query("q")).await;
-        assert_eq!(query, Ok(Err(late("200ms"))));
+        let began = tokio::time::Instant::now();
+        let query = {
+            let embedder = embedder.clone();
+            tokio::spawn(async move { tokio::time::timeout(seconds, embedder.query("q")).await })
+        };
+        let ran = next(&runs).await.unwrap();
+        assert_eq!(ran, ["q"], "it was run, and has yet to come back");
+        assert_eq!(began.elapsed(), Duration::ZERO);
+        assert_eq!(query.await.unwrap(), Ok(Err(late("200ms"))));
+        // To the millisecond the timer keeps time in.
         let took = began.elapsed();
-        assert!((ms(200)..ms(2_000)).contains(&took), "{took:?}");
-        assert_eq!(runs.next(), ["q"], "it was run, and has yet to come back");
+        assert!((ms(200)..=ms(200) + ms(1)).contains(&took), "{took:?}");
         // A write behind it is given up on when the model has made
         // nothing for anyone for as long as it may go without: twice as
         // long as a query is given, here.
-        let began = std::time::Instant::now();
+        let began = tokio::time::Instant::now();
         let documents = texts("d", 5);
         let documents = tokio::time::timeout(seconds, embedder.documents(&documents)).await;
         let stopped = failed("the model has made nothing for anyone in 400ms");
         assert_eq!(documents, Ok(Err(stopped)));
+        // To the millisecond the timer keeps time in.
         let took = began.elapsed();
-        assert!((ms(400)..ms(2_400)).contains(&took), "{took:?}");
+        assert!((ms(400)..=ms(400) + ms(1)).contains(&took), "{took:?}");
 
-        // The run comes back. No one waits for it or for the documents
-        // any longer, so the next run is for whoever asks now.
-        runs.let_through(2);
+        // The run comes back, on a clock that runs again: the model's
+        // thread answers in its own time. No one waits for it or for the
+        // documents any longer, so the next run is for whoever asks now.
+        tokio::time::resume();
+        runs.lock().unwrap().let_through(2);
         assert_eq!(embedder.query("hen").await, Ok(Some(vec![3.0])));
-        assert_eq!(runs.next(), ["hen"]);
+        assert_eq!(next(&runs).await.unwrap(), ["hen"]);
     }
 
     /// A model is fetched and loaded when first asked for, which takes as
@@ -1474,15 +1498,18 @@ mod tests {
     /// A run that fails is not the model at work. A write that waits
     /// behind runs the model fails, one after another, is given up on
     /// when nothing has been made for anyone for as long as a model may
-    /// go without, though the line ahead of it is moving.
+    /// go without, though the line ahead of it is moving. The runs fail
+    /// for as long as it waits: were a run failed the model at work, it
+    /// would wait through all of them, and no clock decides which.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_run_that_fails_is_not_the_model_at_work() {
         let ms = Duration::from_millis;
         let (local, runs) = local(0);
         let embedder = Arc::new(giving(&local, ms(200)));
-        // Twelve writes the model fails, each a run by itself: a text
-        // that fails and three that fill the run.
-        let failing: Vec<_> = (0..12)
+        // More writes the model fails than there is time to fail before
+        // the backstop, each a run by itself: a text that fails and three
+        // that fill the run.
+        let failing: Vec<_> = (0..1_000)
             .map(|_| {
                 let mut texts = vec!["fail".to_string()];
                 texts.extend((0..3).map(|n| format!("{n}{}", "x".repeat(READS))));
@@ -1495,21 +1522,23 @@ mod tests {
             let embedder = embedder.clone();
             tokio::spawn(async move { embedder.documents(&["owl".to_string()]).await })
         };
-        // A run fails every hundred milliseconds, for over a second.
-        let failed_meanwhile = tokio::spawn(async move {
-            for _ in 0..12 {
-                tokio::time::sleep(ms(100)).await;
-                runs.let_through(1);
-            }
-            runs
-        });
+        // A run fails every hundred milliseconds, until the write behind
+        // them is given up on.
+        let mut failed_meanwhile = 0;
+        while !behind.is_finished() {
+            assert!(
+                began.elapsed() < BACKSTOP,
+                "not given up on through {failed_meanwhile} runs failed"
+            );
+            tokio::time::sleep(ms(100)).await;
+            runs.let_through(1);
+            failed_meanwhile += 1;
+        }
         let given_up_on = behind.await.unwrap();
-        let took = began.elapsed();
         let stopped = failed("the model has made nothing for anyone in 400ms");
         assert_eq!(given_up_on, Err(stopped));
-        assert!((ms(400)..ms(900)).contains(&took), "{took:?}");
-        let runs = failed_meanwhile.await.unwrap();
-        runs.let_through(2);
+        assert!(began.elapsed() >= ms(400), "{:?}", began.elapsed());
+        runs.let_through(failing.len());
         for write in failing {
             assert!(write.await.unwrap().is_err());
         }
@@ -1528,24 +1557,24 @@ mod tests {
             let embedder = embedder.clone();
             tokio::spawn(async move { embedder.documents(&["owl".to_string()]).await })
         };
-        // Another arrives every hundred milliseconds, for a second and a
-        // half.
-        let arriving = {
+        // Another arrives every hundred milliseconds, for as long as the
+        // first waits: were a caller arriving the model at work, the
+        // first would wait for ever.
+        let mut arrived = 0;
+        while !first.is_finished() {
+            assert!(
+                began.elapsed() < BACKSTOP,
+                "not given up on through {arrived} callers arriving"
+            );
+            tokio::time::sleep(ms(100)).await;
             let embedder = embedder.clone();
-            tokio::spawn(async move {
-                for n in 0..15 {
-                    tokio::time::sleep(ms(100)).await;
-                    let embedder = embedder.clone();
-                    tokio::spawn(async move { embedder.documents(&[format!("hen {n}")]).await });
-                }
-            })
-        };
+            tokio::spawn(async move { embedder.documents(&[format!("hen {arrived}")]).await });
+            arrived += 1;
+        }
         let given_up_on = first.await.unwrap();
-        let took = began.elapsed();
         let stopped = failed("the model has made nothing for anyone in 400ms");
         assert_eq!(given_up_on, Err(stopped));
-        assert!((ms(400)..ms(900)).contains(&took), "{took:?}");
-        arriving.await.unwrap();
+        assert!(began.elapsed() >= ms(400), "{:?}", began.elapsed());
     }
 
     /// Loads that fail, one after another, each slower than a write is
@@ -1560,7 +1589,10 @@ mod tests {
         });
         let local = Arc::new(Local::spawn("stand-in", load, alone()).unwrap());
         let embedder = Arc::new(giving(&local, ms(200)));
-        let ahead: Vec<_> = (0..10)
+        // More writes ahead than their loads, at 300 ms each, could fail
+        // before the backstop: were a load that fails the model at work,
+        // the write behind them would be kept for every one.
+        let ahead: Vec<_> = (0..300)
             .map(|_| {
                 let texts = (0..4)
                     .map(|n| format!("{n}{}", "x".repeat(READS)))
@@ -1569,16 +1601,13 @@ mod tests {
             })
             .collect();
         tokio::time::sleep(ms(50)).await;
-        let began = std::time::Instant::now();
-        let given_up_on = embedder.documents(&["owl".to_string()]).await;
-        let took = began.elapsed();
+        let given_up_on = tokio::time::timeout(BACKSTOP, embedder.documents(&["owl".to_string()]))
+            .await
+            .expect("given up on before the loads ahead of it are done");
         let stopped = failed("the model has made nothing for anyone in 400ms");
         assert_eq!(given_up_on, Err(stopped));
-        // Within the 400 ms of the first load it saw fail, which began
-        // before it came: well short of the three seconds ten take.
-        assert!(took < ms(1_200), "{took:?}");
         for write in ahead {
-            assert!(write.await.unwrap().is_err());
+            write.abort();
         }
     }
 
@@ -1619,7 +1648,7 @@ mod tests {
         let ms = Duration::from_millis;
         let (local, runs) = local(0);
         let embedder = Arc::new(giving(&local, ms(200)));
-        let panicking: Vec<_> = (0..12)
+        let panicking: Vec<_> = (0..1_000)
             .map(|_| {
                 let mut texts = vec!["panic".to_string()];
                 texts.extend((0..3).map(|n| format!("{n}{}", "x".repeat(READS))));
@@ -1632,23 +1661,25 @@ mod tests {
             let embedder = embedder.clone();
             tokio::spawn(async move { embedder.documents(&["owl".to_string()]).await })
         };
-        let meanwhile = tokio::spawn(async move {
-            for _ in 0..12 {
-                tokio::time::sleep(ms(100)).await;
-                runs.let_through(1);
-            }
+        // A run panics every hundred milliseconds, until the write
+        // behind them is given up on: were the reloads after them held
+        // against it as the runs are not, it would wait through all.
+        let mut panicked = 0;
+        while !behind.is_finished() {
+            assert!(
+                began.elapsed() < BACKSTOP,
+                "not given up on through {panicked} runs that panicked"
+            );
             tokio::time::sleep(ms(100)).await;
-            runs.let_through(2);
-            runs
-        });
+            runs.let_through(1);
+            panicked += 1;
+        }
         let given_up_on = behind.await.unwrap();
-        let took = began.elapsed();
         let stopped = failed("the model has made nothing for anyone in 400ms");
         assert_eq!(given_up_on, Err(stopped));
-        assert!((ms(400)..ms(900)).contains(&took), "{took:?}");
-        let _runs = meanwhile.await.unwrap();
+        assert!(began.elapsed() >= ms(400), "{:?}", began.elapsed());
         for write in panicking {
-            let _ = write.await;
+            write.abort();
         }
     }
 
@@ -1769,26 +1800,36 @@ mod tests {
     /// A model that has stopped is given up on by everyone who waits on
     /// it, in the time a model may go without making anything: those in
     /// the run, those in the line, and those not yet taken into the
-    /// line, of whom there are more than it takes in at once.
-    #[tokio::test(flavor = "multi_thread")]
+    /// line, of whom there are more than it takes in at once. The run
+    /// never comes back, and the clock is paused: it moves only once the
+    /// run is seen begun, and then only when nothing is left but to wait,
+    /// so every write is given up on exactly that long after it was made.
+    #[tokio::test(start_paused = true)]
     async fn a_model_that_stops_is_given_up_on_by_all_who_wait_however_many() {
         let ms = Duration::from_millis;
-        let local = slow_to_load(ms(0), NEVER);
+        let (local, runs) = local(0);
         let embedder = Arc::new(giving(&local, ms(200)));
-        let began = std::time::Instant::now();
-        let writes = (0..600).map(|n| {
-            let embedder = embedder.clone();
-            async move { embedder.documents(&[format!("text {n}")]).await }
-        });
-        let written = futures::future::join_all(writes);
-        let written = tokio::time::timeout(Duration::from_secs(30), written).await;
-        let written = written.expect("every write is answered");
+        let began = tokio::time::Instant::now();
+        let writes: Vec<_> = (0..600)
+            .map(|n| {
+                let embedder = embedder.clone();
+                tokio::spawn(async move { embedder.documents(&[format!("text {n}")]).await })
+            })
+            .collect();
+        // Seen on a thread of the blocking pool, which holds the paused
+        // clock still until it is.
+        let ran = tokio::task::spawn_blocking(move || (runs.next(), runs));
+        let (ran, runs) = ran.await.unwrap();
+        assert!(!ran.is_empty(), "the first run, which never comes back");
+        assert_eq!(began.elapsed(), Duration::ZERO);
         let stopped = failed("the model has made nothing for anyone in 400ms");
-        for made in written {
-            assert_eq!(made, Err(stopped.clone()));
+        for write in writes {
+            assert_eq!(write.await.unwrap(), Err(stopped.clone()));
         }
+        // To the millisecond the timer keeps time in.
         let took = began.elapsed();
-        assert!((ms(400)..ms(3_000)).contains(&took), "{took:?}");
+        assert!((ms(400)..=ms(401)).contains(&took), "{took:?}");
+        drop(runs);
     }
 
     #[test]
