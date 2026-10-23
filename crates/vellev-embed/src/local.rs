@@ -1672,7 +1672,7 @@ mod tests {
             });
             let local = Local::spawn_timed("stand-in", load, alone(), clock.clone());
             let local = Arc::new(local.unwrap());
-            let embedder = Arc::new(giving(&local, ms(200)).timed_by(clock.clone()));
+            let embedder = Arc::new(giving(&local, ms(200)));
             let began = clock.now();
             let first = start(&local, vec!["first".into()], Purpose::Document);
             until(|| local.activity.loading_until().is_some()).await;
@@ -1795,7 +1795,7 @@ mod tests {
         let clock = Manual::new();
         let (local, runs) = local_timed("stand-in", 0, alone(), clock.clone());
         // Given up on after 400 ms of nothing for anyone.
-        let embedder = Arc::new(giving(&local, ms(200)).timed_by(clock.clone()));
+        let embedder = Arc::new(giving(&local, ms(200)));
         let began = clock.now();
         let ahead = start(&local, texts("a", 5 * RUN), Purpose::Document);
         assert_eq!(runs.next().len(), RUN);

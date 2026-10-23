@@ -414,12 +414,17 @@ struct Acted {
 
 impl Activity {
     /// Activity whose times are read by `clock`.
-    #[doc(hidden)]
-    pub fn timed_by(clock: std::sync::Arc<dyn clock::Clock>) -> Self {
+    pub(crate) fn timed_by(clock: std::sync::Arc<dyn clock::Clock>) -> Self {
         Self {
             acted: std::sync::Mutex::default(),
             clock,
         }
+    }
+
+    /// What its times are read by: the clock what waits on the model
+    /// times its waits by too, so the two cannot disagree.
+    pub(crate) fn clock(&self) -> &std::sync::Arc<dyn clock::Clock> {
+        &self.clock
     }
 
     /// The model has made a vector, for whomever.

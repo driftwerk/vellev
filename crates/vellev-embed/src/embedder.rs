@@ -133,9 +133,6 @@ pub struct Embedder {
     /// documents is given up on.
     query_within: Duration,
     documents_within: Duration,
-    /// What calls are timed by: tokio's clock, unless a test hands in
-    /// its own.
-    clock: Arc<dyn Clock>,
 }
 
 /// What is known of whether the model can be used. It is looked at and
@@ -208,17 +205,18 @@ impl Embedder {
             fault_stands: FAULT_STANDS,
             query_within: QUERY_WITHIN,
             documents_within: DOCUMENTS_WITHIN,
-            clock: crate::clock::tokio(),
         }
     }
 
-    /// This embedder, timing its calls by `clock` rather than tokio's:
-    /// for tests that move the clock themselves, which hand the same
-    /// clock to what the model's activity is read by.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn timed_by(self, clock: Arc<dyn Clock>) -> Self {
-        Self { clock, ..self }
+    /// What calls are timed by: the clock the model's activity is read
+    /// by, so a call's bound and its looks at the model are on the one
+    /// clock the model stamps what it does by; tokio's, for a model that
+    /// says nothing of what it does.
+    fn clock(&self) -> Arc<dyn Clock> {
+        self.shared
+            .provider
+            .activity()
+            .map_or_else(crate::clock::tokio, |activity| activity.clock().clone())
     }
 
     /// What `future` comes to, unless the clock reaches `at` first; it
@@ -227,7 +225,7 @@ impl Embedder {
         tokio::select! {
             biased;
             done = future => Some(done),
-            () = self.clock.sleep_until(at) => None,
+            () = self.clock().sleep_until(at) => None,
         }
     }
 
@@ -267,7 +265,7 @@ impl Embedder {
     /// say what it is doing is given that long for the call in all.
     pub async fn documents(&self, texts: &[String]) -> Result<Vec<Option<Vec<f32>>>> {
         let prefix = self.embedding.document_prefix.as_deref();
-        let within = Within::from_now(self.documents_within, &*self.clock);
+        let within = Within::from_now(self.documents_within, &*self.clock());
         let sent = AtomicBool::new(false);
         self.embed(texts, prefix, Purpose::Document, within, &sent)
             .await
@@ -297,7 +295,7 @@ impl Embedder {
         if text.trim().is_empty() {
             return Ok(None);
         }
-        let within = Within::from_now(self.query_within, &*self.clock);
+        let within = Within::from_now(self.query_within, &*self.clock());
         let prefix = self.embedding.query_prefix.as_deref();
         let embed = || async {
             let texts = [text.to_string()];
@@ -462,13 +460,14 @@ impl Embedder {
         activity: &crate::Activity,
         stalled: Duration,
     ) -> Result<T> {
-        let since = self.clock.now();
+        let clock = activity.clock();
+        let since = clock.now();
         let mut look = since + stalled;
         tokio::pin!(call);
         loop {
             tokio::select! {
                 made = &mut call => return made,
-                () = self.clock.sleep_until(look) => {}
+                () = clock.sleep_until(look) => {}
             }
             // What has waited with the model not at work grows no faster
             // than time does: it cannot reach the stall before this is
@@ -482,7 +481,7 @@ impl Embedder {
                     format!("the model has made nothing for anyone in {stalled:?}"),
                 ));
             }
-            look = self.clock.now() + (stalled - quiet);
+            look = clock.now() + (stalled - quiet);
         }
     }
 
