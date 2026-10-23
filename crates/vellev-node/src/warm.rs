@@ -393,4 +393,38 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn a_tenant_held_as_writer_and_copy_is_listed_once_by_its_later_use() {
+        let at = Instant::now();
+        let later = |ms| Some(at + std::time::Duration::from_millis(ms));
+        let held = |name: &str, used, wrote| Held {
+            tenant: TenantId::new(name).unwrap(),
+            used,
+            rank: 0,
+            wrote,
+        };
+        let listed = ordered(
+            vec![
+                held("acme", later(0), true),
+                held("beta", later(10), false),
+                held("acme", later(20), false),
+            ],
+            &[],
+            16,
+        );
+        assert_eq!(
+            listed,
+            [
+                Entry {
+                    tenant: TenantId::new("acme").unwrap(),
+                    wrote: true
+                },
+                Entry {
+                    tenant: TenantId::new("beta").unwrap(),
+                    wrote: false
+                },
+            ]
+        );
+    }
 }

@@ -474,3 +474,19 @@ async fn a_node_stopped_before_it_has_read_its_list_keeps_the_list() {
     again.shutdown().await;
     assert_eq!(shared.listed(), ["acme", "beta"]);
 }
+
+#[tokio::test]
+async fn the_list_a_node_writes_as_it_stops_is_the_last_written() {
+    let shared = Shared::new();
+    let writer = shared.writer();
+    written(&writer, &["acme", "beta"]).await;
+    let first = shared.node(16);
+    first.warming();
+    read(&first, &["beta", "acme"]).await;
+    first.shutdown().await;
+    assert_eq!(shared.listed(), ["acme", "beta"]);
+    // A write of the list begun before the node stopped, or after it, is
+    // not written over what it wrote as it stopped.
+    first.remember_warm().await;
+    assert_eq!(shared.listed(), ["acme", "beta"]);
+}
