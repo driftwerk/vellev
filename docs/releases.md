@@ -363,7 +363,10 @@ and say what the caller then answers for.
   shortlist, and unflushed rows, are scored whole, as before. A search
   that names no `oversample` has a budget of no more than 2,048 rows
   whatever its `limit` (or `candidates`, if larger), the default being
-  lowered for large limits; one that names an `oversample` scores as many
+  lowered for large limits (checked by a recall sweep on 118,609
+  bge-base rows with 500 prefixed questions: at 2,048 the fused results
+  match an exact vector leg's at a worst mean overlap of 0.9992; 1,024
+  left too thin a margin); one that names an `oversample` scores as many
   as it asks for. **A caller that named an `oversample` for hybrid now
   scores `limit/candidates` times fewer rows than it did** (10/100 with
   the defaults): multiply it by that to keep the old recall. Results can
