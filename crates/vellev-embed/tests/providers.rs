@@ -1315,10 +1315,12 @@ async fn a_text_bedrock_refuses_is_not_bedrock_at_work() {
 
 /// One batch is given so long, every try included: an endpoint that goes
 /// on saying it is busy is given up on then, and not after every try it
-/// asks for, which here would take seven and a half seconds. What it is
-/// given up on with names the batch's bound, and the endpoint was asked
-/// no more than the twice there is time for: five tries would be five.
-#[tokio::test]
+/// asks for, which here would take seven and a half seconds. On a paused
+/// clock, which moves only when the endpoint and the caller, in this one
+/// runtime, have nothing left to do but wait: so it is asked at once and
+/// after half a second, and given up on at 1.2 seconds, before the third
+/// try at 1.5.
+#[tokio::test(start_paused = true)]
 async fn a_batch_is_given_so_long_however_many_tries_the_endpoint_asks_for() {
     let ms = Duration::from_millis;
     let busy = Seen::refusing(usize::MAX, 503);
@@ -1326,8 +1328,25 @@ async fn a_batch_is_given_so_long_however_many_tries_the_endpoint_asks_for() {
     let provider = Http::new(&url, HttpApi::Tei, "bge", None)
         .unwrap()
         .answering_each_batch_within(ms(1_200));
-    let began = std::time::Instant::now();
-    let given_up_on = provider.embed(vec!["fox".into()], Purpose::Document).await;
+    let began = tokio::time::Instant::now();
+    let given_up_on = {
+        let provider = Arc::new(provider);
+        let asking = tokio::spawn(async move {
+            provider.embed(vec!["fox".into()], Purpose::Document).await
+        });
+        // The first try's connection is made and the try reaches the
+        // endpoint before any time passes: a task on the blocking pool
+        // keeps the paused clock still until it has.
+        let seen = busy.clone();
+        tokio::task::spawn_blocking(move || {
+            while seen.bodies().is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+        .await
+        .unwrap();
+        asking.await.unwrap()
+    };
     let took = began.elapsed();
     assert_eq!(
         given_up_on,
@@ -1336,12 +1355,10 @@ async fn a_batch_is_given_so_long_however_many_tries_the_endpoint_asks_for() {
             reason: "no answer within 1.2s".into(),
         })
     );
-    assert!(took >= ms(1_200), "{took:?}");
-    // It had been asked twice, and was to be asked a third time at a
-    // second and a half: once, if the second try was kept past the bound
-    // by a loaded machine.
-    let asked = busy.bodies().len();
-    assert!((1..=2).contains(&asked), "asked {asked} times");
+    // To the millisecond the timer keeps time in.
+    assert!((ms(1_200)..=ms(1_201)).contains(&took), "{took:?}");
+    // It had been asked twice, and was to be asked a third time.
+    assert_eq!(busy.bodies().len(), 2);
 }
 
 /// An endpoint whose refusal is cut off on its way, partway through a
