@@ -80,6 +80,9 @@ pub struct MemtableCoding {
     pub coded: usize,
     /// The centre the codes are taken about, in the rotated space.
     pub centre: Vec<f32>,
+    /// A digest of the codes, bit for bit: see [`vellev_index`]'s
+    /// `BinaryIndex::digest`.
+    pub digest: u64,
 }
 
 /// What is indexed about one collection's rows in a layer: their filterable
@@ -764,6 +767,7 @@ impl State {
                 applied: self.memtable.applied.get(&id).copied().unwrap_or(0),
                 coded: codes.coded(),
                 centre: codes.centre().to_vec(),
+                digest: codes.digest(),
             }),
             _ => None,
         }
@@ -1169,6 +1173,14 @@ impl State {
     /// on error, none of it.
     pub(crate) fn apply(&mut self, key: &str, log: &LogSegment) -> Result<()> {
         self.apply_prepared(key, log, Prepared::default())
+    }
+
+    /// Whether any collection's rows in the memtable are coded.
+    pub(crate) fn coding_anything(&self) -> bool {
+        self.memtable
+            .indexes
+            .values()
+            .any(|index| matches!(index.vectors, Some(Vectors::Binary(_))))
     }
 
     /// The codes of `log`'s rows with a vector whose collection's memtable

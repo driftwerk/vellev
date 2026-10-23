@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
+use futures::StreamExt;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
@@ -90,6 +91,151 @@ pub struct Partition {
     /// Serialises catch-up, and remembers the newest coordinator generation
     /// seen so an older reading of the committed state is recognised as stale.
     seen: Mutex<Generation>,
+    /// Where the partition's commits are recorded, if known: so that the
+    /// logs a load replays can be fetched together, named by the commits'
+    /// rows, rather than one after another, each named by the next.
+    commits: Option<Arc<dyn Coordinator>>,
+    /// What replaying commits into this copy has done.
+    replayed: std::sync::Mutex<Replayed>,
+}
+
+/// What replaying commits into a copy has done, since it was made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Replayed {
+    /// How many threads coded rows at once, at the most, for the commits
+    /// replayed together.
+    pub coded_on_threads: usize,
+}
+
+/// How many logs a replay codes together before applying them.
+const REPLAYED_TOGETHER: usize = 16;
+/// How many fetches a load has under way at once, at the most.
+const FETCHED_AT_ONCE: usize = 16;
+/// How many commits back from the head a load first fetches together,
+/// doubled each time the walk back reaches past what it fetched.
+const FETCHED_FIRST: u64 = 64;
+
+/// The heads of commits a walk back from a head fetched before it reached
+/// them: the commits the coordinator records between a position and the
+/// head, fetched and decoded together, a window at a time from the head
+/// back, the window doubling each time the walk reaches past it.
+struct Ahead {
+    /// The heads fetched, by key: each decoded, or why not.
+    fetched: HashMap<String, Result<Head>>,
+    /// Down to which position commits have been asked for.
+    from: u64,
+    window: u64,
+    incarnation: Incarnation,
+    /// The newest checkpoint listed, by its name: nothing below it is asked
+    /// for or fetched.
+    floor: Option<u64>,
+}
+
+impl Ahead {
+    fn new(committed: &Committed) -> Self {
+        Self {
+            fetched: HashMap::new(),
+            from: committed.log_position.0 + 1,
+            window: FETCHED_FIRST,
+            incarnation: committed.incarnation,
+            floor: None,
+        }
+    }
+
+    /// The head of `key`, at `expected`, if it was or can now be fetched
+    /// together with others; `None` to fetch it alone: the partition knows
+    /// no coordinator to ask, or it names none of these commits.
+    async fn take(
+        &mut self,
+        partition: &Partition,
+        key: &str,
+        expected: LogPosition,
+        position: LogPosition,
+    ) -> Option<Result<Head>> {
+        if let Some(head) = self.fetched.remove(key) {
+            return Some(head);
+        }
+        let commits = partition.commits.as_ref()?;
+        // Asked for already as far down as this: the coordinator named
+        // none of them by this key.
+        if expected.0 >= self.from || expected <= position {
+            return None;
+        }
+        // Below the checkpoint listed, the walk has ended or the name
+        // misled: fetch alone.
+        if self.floor.is_some_and(|at| expected.0 < at) {
+            return None;
+        }
+        let (below, window) = next_window(self.from, self.window, position);
+        let asked = commits
+            .commits_after(
+                &partition.key,
+                self.incarnation,
+                LogPosition(below),
+                (self.from - below) as usize,
+            )
+            .await;
+        let points = match asked {
+            Ok(points) => points,
+            Err(error) => {
+                tracing::warn!(partition = %partition.key, %error, "the commits to load could not be listed; fetching them one by one");
+                self.from = 0;
+                return None;
+            }
+        };
+        self.from = below + 1;
+        self.window = window;
+        let listed: Vec<_> = points
+            .into_iter()
+            .filter(|point| point.position.0 < expected.0 + 1)
+            .collect();
+        // The walk back ends at the newest checkpoint: nothing from before
+        // it is fetched, and no window is asked for below it. Should the
+        // name mislead, the walk checks each head it reaches as ever, and
+        // fetches what it was not given alone.
+        let checkpoint = listed
+            .iter()
+            .filter(|point| crate::blobs::named_as_checkpoint(&point.head.0))
+            .map(|point| point.position.0)
+            .max();
+        if let Some(at) = checkpoint {
+            self.from = self.from.max(at);
+            self.floor = Some(at);
+        }
+        let keys: Vec<String> = listed
+            .into_iter()
+            .filter(|point| checkpoint.is_none_or(|at| point.position.0 >= at))
+            .map(|point| point.head.0)
+            .filter(|key| !self.fetched.contains_key(key))
+            .collect();
+        let fetched = futures::stream::iter(keys)
+            .map(|key| async move {
+                let head = match partition.fetch(&key).await {
+                    Ok(bytes) => {
+                        let decoding = key.clone();
+                        tokio::task::spawn_blocking(move || decode_head(&decoding, &bytes))
+                            .await
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
+                    }
+                    Err(error) => Err(error),
+                };
+                (key, head)
+            })
+            .buffer_unordered(FETCHED_AT_ONCE)
+            .collect::<Vec<_>>()
+            .await;
+        self.fetched.extend(fetched);
+        self.fetched.remove(key)
+    }
+}
+
+/// The next window of commits a walk back fetches together: from above
+/// `position` up to below `from`, `window` of them, and the window after
+/// it twice as long, so that a tail of `n` commits takes about
+/// `log2(n / FETCHED_FIRST)` asks of the coordinator.
+fn next_window(from: u64, window: u64, position: LogPosition) -> (u64, u64) {
+    let below = from.saturating_sub(window).max(position.0);
+    (below, window.saturating_mul(2))
 }
 
 /// The committed commits between a state and a newer head, oldest first, and
@@ -141,6 +287,22 @@ impl Partition {
         Self::load_reusing(key, blobs, committed, Loading::default()).await
     }
 
+    /// As [`Self::load`], the logs it replays found through `commits` and
+    /// fetched together; and so is every catch-up after.
+    async fn load_through(
+        key: PartitionKey,
+        blobs: Arc<dyn Blobs>,
+        commits: Arc<dyn Coordinator>,
+        committed: &Committed,
+    ) -> Result<Self> {
+        let mut partition = Self::empty(key, blobs, committed.incarnation);
+        partition.commits = Some(commits);
+        partition
+            .advance_reusing(committed, Loading::default())
+            .await?;
+        Ok(partition)
+    }
+
     /// Load the partition as committed, taking the segments `loading`
     /// holds as loaded already rather than reading them again.
     async fn load_reusing(
@@ -161,7 +323,14 @@ impl Partition {
             blobs,
             state: RwLock::new(State::default()),
             seen: Mutex::new(Generation(0)),
+            commits: None,
+            replayed: std::sync::Mutex::default(),
         }
+    }
+
+    /// What replaying commits into this copy has done.
+    pub fn replayed(&self) -> Replayed {
+        *self.replayed.lock().expect("replayed lock")
     }
 
     /// The files the partition as `committed` is loaded from: the logs back
@@ -403,12 +572,37 @@ impl Partition {
                 *self.state.write().expect("partition lock") = state;
             }
             None => {
-                // A log at a time, its codes made while readers may still
-                // read, and only stored under the lock.
-                for (key, log) in &tail.logs {
-                    let prepared = self.read(|state| state.prepared(log));
-                    let mut state = self.state.write().expect("partition lock");
-                    state.apply_prepared(key, log, prepared)?;
+                // A run of logs at a time, the codes of each made together
+                // on several threads while readers may still read, and
+                // only stored under the lock, a log at a time. A run is
+                // coded as the state is when it begins: a collection coded
+                // during it codes its rows as they are applied.
+                for run in tail.logs.chunks(REPLAYED_TOGETHER) {
+                    let prepared: Vec<state::Prepared> = self.read(|state| {
+                        use rayon::prelude::*;
+                        let threads = std::sync::atomic::AtomicUsize::new(0);
+                        let most = std::sync::atomic::AtomicUsize::new(0);
+                        let prepared = run
+                            .par_iter()
+                            .map(|(_, log)| {
+                                let now = threads.fetch_add(1, Ordering::Relaxed) + 1;
+                                most.fetch_max(now, Ordering::Relaxed);
+                                let made = state.prepared(log);
+                                threads.fetch_sub(1, Ordering::Relaxed);
+                                made
+                            })
+                            .collect();
+                        if state.coding_anything() {
+                            let mut replayed = self.replayed.lock().expect("replayed lock");
+                            replayed.coded_on_threads =
+                                replayed.coded_on_threads.max(most.into_inner());
+                        }
+                        prepared
+                    });
+                    for ((key, log), prepared) in run.iter().zip(prepared) {
+                        let mut state = self.state.write().expect("partition lock");
+                        state.apply_prepared(key, log, prepared)?;
+                    }
                 }
             }
         }
@@ -428,13 +622,20 @@ impl Partition {
         let mut logs = Vec::new();
         let mut cursor = committed.manifest.as_ref().map(|head| head.0.clone());
         let mut expected = committed.log_position;
+        let mut ahead = Ahead::new(committed);
         let checkpoint = loop {
             let key = match cursor {
                 reached if reached.as_deref() == known && expected == position => break None,
                 Some(key) if expected > position => key,
                 _ => return Ok(None),
             };
-            let head = decode_head(&key, &self.fetch(&key).await?)?;
+            // Fetched together with the commits before it when the
+            // coordinator names them; the walk back checks each as it
+            // would one fetched alone.
+            let head = match ahead.take(self, &key, expected, position).await {
+                Some(head) => head?,
+                None => decode_head(&key, &self.fetch(&key).await?)?,
+            };
             let found = match &head {
                 Head::Log(log) => log.position,
                 Head::Manifest(manifest) => manifest.position,
@@ -618,6 +819,21 @@ impl Follower {
             .map(Self)
     }
 
+    /// As [`Self::open`], finding the logs it replays through `commits`,
+    /// the coordinator that recorded them, so that they can be fetched
+    /// together rather than one after another.
+    pub async fn open_through(
+        key: PartitionKey,
+        blobs: Arc<dyn Blobs>,
+        commits: Arc<dyn Coordinator>,
+        committed: &Committed,
+    ) -> Result<Self> {
+        Partition::load_through(key, blobs, commits, committed)
+            .await
+            .map(Arc::new)
+            .map(Self)
+    }
+
     pub fn partition(&self) -> &Arc<Partition> {
         &self.0
     }
@@ -743,7 +959,10 @@ impl Writer {
         lease: Lease,
         committed: &Committed,
     ) -> Result<Self> {
-        let partition = Arc::new(Partition::load(lease.key.clone(), blobs, committed).await?);
+        let partition = Arc::new(
+            Partition::load_through(lease.key.clone(), blobs, coordinator.clone(), committed)
+                .await?,
+        );
         let author = Author {
             generation: lease.generation,
             writer: uuid::Uuid::new_v4(),
@@ -2940,6 +3159,26 @@ fn kept_out(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_walk_back_asks_for_twice_as_many_commits_each_time() {
+        let (mut from, mut window, mut asks) = (100_001u64, FETCHED_FIRST, 0);
+        while from > 1 {
+            let (below, next) = next_window(from, window, LogPosition(0));
+            assert!(below < from);
+            (from, window) = (below + 1, next);
+            asks += 1;
+            if below == 0 {
+                break;
+            }
+        }
+        assert!(asks <= 12, "{asks} asks for a tail of 100,000 commits");
+        assert_eq!(
+            next_window(1_000, 64, LogPosition(990)),
+            (990, 128),
+            "never below the state's own position"
+        );
+    }
     use super::*;
     use crate::blobs::ObjectBlobs;
     use crate::coordinator::{Acquired, MemoryCoordinator};

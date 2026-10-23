@@ -36,6 +36,7 @@ mod keys;
 mod limits;
 mod purging;
 mod reading;
+mod warm;
 
 use keys::Keys;
 use limits::Asked;
@@ -156,6 +157,13 @@ pub struct Settings {
     /// The most copies of tenants kept for reads at once; the least
     /// recently used go first.
     pub followers: usize,
+    /// Where the node keeps the tenants it has lately served, to open
+    /// copies of them as it starts, before anyone reads them (burst plan
+    /// F7); none, to keep no such list.
+    pub warm: Option<std::path::PathBuf>,
+    /// The most tenants the node keeps in that list, and opens as it
+    /// starts.
+    pub warm_most: usize,
     /// The newest file format this node may write, whatever every node
     /// reads. A release that adds a format keeps this at the one before,
     /// so that rolling back stays possible until an operator raises it.
@@ -259,6 +267,8 @@ impl Settings {
             follow_every: Duration::from_secs(1),
             follow_idle: Duration::from_secs(5 * 60),
             followers: 64,
+            warm: None,
+            warm_most: 16,
             max_format: DEFAULT_MAX_FORMAT,
             tenant_idle: Duration::from_secs(15 * 60),
             queries_per_second: None,
@@ -683,6 +693,11 @@ impl Tenant {
         self.used.lock().expect("used lock").elapsed()
     }
 
+    /// When the tenant was last used.
+    fn used_at(&self) -> Instant {
+        *self.used.lock().expect("used lock")
+    }
+
     /// The tenant's data as this node holds it in memory.
     pub fn partition(&self) -> &Arc<vellev_storage::Partition> {
         self.writer.partition()
@@ -1034,6 +1049,8 @@ struct Held {
     kind: Kind,
     unused: Duration,
     size: usize,
+    /// A copy warming opened that nobody has read.
+    warmed: bool,
 }
 
 enum Kind {
@@ -1067,6 +1084,8 @@ struct Inner {
     /// The newest file format the cluster was seen to write; it never
     /// falls.
     cluster_format: AtomicU16,
+    /// The warm list, and the warming that reads it.
+    warm: warm::Warm,
 }
 
 #[derive(Debug, Clone)]
@@ -1102,6 +1121,7 @@ impl Node {
             copies_opened: AtomicU64::new(0),
             dropped: Mutex::default(),
             cluster_format: AtomicU16::new(0),
+            warm: warm::Warm::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -1451,6 +1471,9 @@ impl Node {
     /// Give up every tenant, so that another node can write for them at
     /// once rather than when the leases run out, and open no more.
     pub async fn shutdown(&self) {
+        // Warming stopped first, so that what was served until now, and
+        // what it had yet to warm, is the last the list is written with.
+        self.remember_warm_last().await;
         let openings: Vec<Opening> = {
             let mut open = self.0.opened();
             open.stopped = true;
@@ -1530,7 +1553,8 @@ impl Inner {
                     held.unused >= recent && !chosen.iter().any(|c| std::ptr::eq(*c, *held))
                 })
                 .collect();
-            older.sort_by_key(|held| std::cmp::Reverse(held.unused));
+            // Copies warming opened that nobody has read go first.
+            older.sort_by_key(|held| (!held.warmed, std::cmp::Reverse(held.unused)));
             for held in older {
                 if total <= budget {
                     break;
@@ -1574,15 +1598,16 @@ impl Inner {
         };
         held.into_iter()
             .map(|(id, kind)| {
-                let (unused, size) = match &kind {
-                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.read(State::resident)),
-                    Kind::Copy(_, copy) => (copy.idle(), copy.resident()),
+                let (unused, size, warmed) = match &kind {
+                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.read(State::resident), false),
+                    Kind::Copy(_, copy) => (copy.idle(), copy.resident(), copy.warmed().is_some()),
                 };
                 Held {
                     id,
                     kind,
                     unused,
                     size,
+                    warmed,
                 }
             })
             .collect()
