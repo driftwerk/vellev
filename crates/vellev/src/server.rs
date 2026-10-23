@@ -263,6 +263,22 @@ impl App {
         })
     }
 
+    /// The oversample of a hybrid search for `limit` results: as asked,
+    /// within the most allowed; or, unasked,
+    /// [`vellev_storage::default_oversample`], which keeps `limit` times it
+    /// to [`vellev_storage::HYBRID_DEFAULT_RESCORE`] per shortlisting
+    /// segment. A caller who asks scores as many as it asks for.
+    pub(crate) fn hybrid_oversample(
+        &self,
+        asked: Option<u32>,
+        limit: usize,
+    ) -> Result<usize, ApiError> {
+        match asked {
+            Some(_) => self.oversample(asked),
+            None => Ok(vellev_storage::default_oversample(limit)),
+        }
+    }
+
     pub(crate) fn oversample(&self, asked: Option<u32>) -> Result<usize, ApiError> {
         asked.map_or(Ok(DEFAULT_OVERSAMPLE), |asked| {
             let most = self.allowed().oversample;

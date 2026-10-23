@@ -353,6 +353,22 @@ and say what the caller then answers for.
   (500), `VELLEV_CACHE_LOADS` (2), `VELLEV_STORE_TIMEOUT_SECS`,
   `VELLEV_STORE_MIN_BYTES_PER_SEC`, `VELLEV_UPLOAD_PART_MIB` and
   `VELLEV_DATABASE_TIMEOUT_SECS`; see the README.
+- **A hybrid search scores far fewer rows exactly.** Its vector search
+  scored `candidates × oversample` rows exactly (12,800 by default, nearly
+  every row of a mid-sized collection); it now scores `limit × oversample`,
+  and at least `candidates`: 1,280 for ten results by default. The budget
+  is per segment that shortlists by one-bit codes; the segments with a
+  clustered index (over 200,000 rows) share one budget between them, less
+  the nearest few each scores of its own; a segment too small to
+  shortlist, and unflushed rows, are scored whole, as before. A search
+  that names no `oversample` has a budget of no more than 2,048 rows
+  whatever its `limit` (or `candidates`, if larger), the default being
+  lowered for large limits; one that names an `oversample` scores as many
+  as it asks for. **A caller that named an `oversample` for hybrid now
+  scores `limit/candidates` times fewer rows than it did** (10/100 with
+  the defaults): multiply it by that to keep the old recall. Results can
+  differ where the vector search's index would have needed more rows to
+  find the nearest: name a larger `oversample` to have them.
 - **Metrics for Prometheus**, on a listener of their own: set
   `VELLEV_METRICS_LISTEN`. Requests are timed whole and by stage, and
   searches report the rows they scored and how much their filter allowed;

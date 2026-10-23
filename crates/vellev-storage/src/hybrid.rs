@@ -18,6 +18,18 @@ pub const DEFAULT_ALPHA: f32 = 0.75;
 /// no more.
 pub const DEFAULT_CANDIDATES: usize = 100;
 
+/// The most rows a hybrid search that names no `oversample` asks each
+/// segment that shortlists to score exactly, whatever its limit, unless
+/// its fusion pool is larger: see [`default_oversample`].
+pub const HYBRID_DEFAULT_RESCORE: usize = 2_048;
+
+/// The oversample of a hybrid search for `limit` results that names none:
+/// [`DEFAULT_OVERSAMPLE`], lowered for a large `limit` so that `limit`
+/// times it is at most [`HYBRID_DEFAULT_RESCORE`], and never below 1.
+pub fn default_oversample(limit: usize) -> usize {
+    DEFAULT_OVERSAMPLE.min((HYBRID_DEFAULT_RESCORE / limit.max(1)).max(1))
+}
+
 #[derive(Debug, Clone)]
 pub struct Hybrid<'a> {
     pub text: &'a str,
@@ -32,8 +44,16 @@ pub struct Hybrid<'a> {
     /// As [`Keywords::properties`].
     pub properties: &'a [(&'a str, f32)],
     pub limit: usize,
+    /// How many results each search offers for fusing.
     pub candidates: usize,
     pub filter: Option<&'a Filter>,
+    /// How many times `limit` rows the vector search scores exactly, and
+    /// at least `candidates`: it scales the results asked for, not the
+    /// pool fused from. Each segment that shortlists by one-bit codes
+    /// scores up to that many of its own; the segments with a clustered
+    /// index share it, less the nearest few each scores of its own (see
+    /// `nearest_across` in `search.rs`); a segment too small to shortlist,
+    /// and the memtable, are scored whole.
     pub oversample: usize,
 }
 
@@ -127,7 +147,12 @@ impl State {
         let alpha = query.vector.map_or(0.0, |_| query.alpha);
         let candidates = query.candidates.max(query.limit);
         let nearest = match query.vector {
-            Some(vector) if alpha > 0.0 => self.search_counted(
+            // The vector leg offers `candidates` for fusing, but scores
+            // exactly only as many rows as the results asked for call for:
+            // `limit × oversample`, or the pool itself if that is larger.
+            // Scaling the pool instead scored a 12,800-row budget for ten
+            // results, nearly every row of a mid-sized collection.
+            Some(vector) if alpha > 0.0 => self.search_within(
                 collection,
                 &Query {
                     vector,
@@ -135,6 +160,10 @@ impl State {
                     filter: query.filter,
                     oversample: query.oversample,
                 },
+                query
+                    .limit
+                    .saturating_mul(query.oversample.max(1))
+                    .max(candidates),
                 work,
             )?,
             _ => Vec::new(),

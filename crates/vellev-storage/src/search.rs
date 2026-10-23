@@ -79,6 +79,21 @@ impl State {
         query: &Query<'_>,
         work: &mut Work,
     ) -> Result<Vec<Hit<'_>>> {
+        let budget = query.limit.saturating_mul(query.oversample.max(1));
+        self.search_within(collection, query, budget, work)
+    }
+
+    /// As [`Self::search_counted`], scoring about `budget` rows exactly
+    /// rather than `limit × oversample`: each layer's own nearest `limit`,
+    /// and the rest of the budget from the nearest estimates across
+    /// layers.
+    pub(crate) fn search_within(
+        &self,
+        collection: &CollectionName,
+        query: &Query<'_>,
+        budget: usize,
+        work: &mut Work,
+    ) -> Result<Vec<Hit<'_>>> {
         let (id, schema) = self.catalog().known(collection)?;
         schema.embedding.check(query.vector)?;
         let predicate = query
@@ -86,7 +101,6 @@ impl State {
             .map(|filter| filter.compile(schema))
             .transpose()?;
         let scorer = Scorer::new(schema.distance, query.vector);
-        let budget = query.limit.saturating_mul(query.oversample.max(1));
         let layers: Vec<Layer<'_>> = self.layers().collect();
         let mut exact = Vec::new();
         let mut estimated = Vec::new();

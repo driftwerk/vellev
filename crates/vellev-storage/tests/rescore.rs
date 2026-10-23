@@ -14,7 +14,9 @@
 mod common;
 
 use common::*;
-use vellev_storage::{Hybrid, Query, Work, DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE};
+use vellev_storage::{
+    default_oversample, Hybrid, Query, Work, DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE,
+};
 
 const NOTES: &str = "notes";
 const DIMENSIONS: usize = 128;
@@ -107,7 +109,6 @@ fn hybrid_work(state: &State, query: &Hybrid<'_>) -> Work {
 }
 
 #[tokio::test]
-#[ignore = "F1: the hybrid rescore budget (burst plan PR4)"]
 async fn t1_a_default_hybrid_search_scores_at_most_its_default_budget() {
     let all = vectors(12_000, 3);
     let (_cluster, writer) = laid_out(&all, &[12_000], false).await;
@@ -142,6 +143,47 @@ async fn an_explicit_oversample_is_scored_as_asked() {
     });
 }
 
+#[tokio::test]
+async fn t1_the_budget_holds_per_shortlisting_segment_and_small_layers_are_scored_whole() {
+    let all = vectors(12_000, 13);
+    // Two segments that shortlist, one scored whole, and a memtable.
+    let (_cluster, writer) = laid_out(&all, &[6_500, 4_200, 800, 500], true).await;
+    writer.partition().read(|state| {
+        for limit in [10, 50] {
+            let query = Hybrid {
+                oversample: default_oversample(limit),
+                ..Hybrid::matching("fox", Some(&all[7]), limit)
+            };
+            let budget = (limit * default_oversample(limit)).max(DEFAULT_CANDIDATES) as u64;
+            let work = hybrid_work(state, &query);
+            assert!(
+                work.exact_segments <= 2 * budget + 800,
+                "limit {limit}: {} segment rows scored, the bound is {}",
+                work.exact_segments,
+                2 * budget + 800
+            );
+            assert!(work.exact_memtable <= 500, "{work:?}");
+        }
+    });
+}
+
+#[tokio::test]
+async fn a_small_explicit_oversample_still_scores_the_whole_fusion_pool() {
+    let all = vectors(12_000, 5);
+    let (_cluster, writer) = laid_out(&all, &[12_000], false).await;
+    writer.partition().read(|state| {
+        let query = Hybrid {
+            oversample: 1,
+            ..Hybrid::matching("fox", Some(&all[3]), 10)
+        };
+        let work = hybrid_work(state, &query);
+        assert!(
+            work.exact_segments >= DEFAULT_CANDIDATES as u64,
+            "10 x 1 asked for, but the vector leg offers {DEFAULT_CANDIDATES} for fusing: {work:?}"
+        );
+    });
+}
+
 /// How alike two orderings of results are: the share of `exact`'s ids
 /// that `found` holds, and whether both start with the same one.
 fn overlap(found: &[ObjectId], exact: &[ObjectId]) -> (f64, bool) {
@@ -154,9 +196,18 @@ fn overlap(found: &[ObjectId], exact: &[ObjectId]) -> (f64, bool) {
 }
 
 /// T2 over one layout: for queries near stored rows, under no filter, a
-/// tenth and a hundredth, the default budget's fused top ten against an
+/// tenth and a hundredth, the default budget's fused top ten, and top
+/// fifty where the node's 2,048-row cap lowers the oversample, against an
 /// exact vector leg's.
 fn holds_recall(state: &State, all: &[Vec<f32>], layout: &str) {
+    for limit in [10, 50] {
+        holds_recall_at(state, all, layout, limit);
+    }
+}
+
+/// As [`holds_recall`], for `limit` results and the oversample the node
+/// gives a search that names none.
+fn holds_recall_at(state: &State, all: &[Vec<f32>], layout: &str, limit: usize) {
     let filters = [None, Some(n_below(10)), Some(n_below(1))];
     for filter in &filters {
         let (mut shares, mut firsts, mut asked) = (0.0, 0, 0);
@@ -170,7 +221,8 @@ fn holds_recall(state: &State, all: &[Vec<f32>], layout: &str) {
             let text = ["fox", "hen den", "owl"][q % 3];
             let default = Hybrid {
                 filter: filter.as_ref(),
-                ..Hybrid::matching(text, Some(&query), 10)
+                oversample: default_oversample(limit),
+                ..Hybrid::matching(text, Some(&query), limit)
             };
             let exact = Hybrid {
                 oversample: usize::MAX,
@@ -193,7 +245,7 @@ fn holds_recall(state: &State, all: &[Vec<f32>], layout: &str) {
         let same_first = firsts as f64 / asked as f64;
         assert!(
             mean >= 0.99 && same_first >= 0.99,
-            "{layout}, filter {filter:?}: mean overlap {mean:.3}, same top result {same_first:.3}"
+            "{layout}, limit {limit}, filter {filter:?}: mean overlap {mean:.3}, same top result {same_first:.3}"
         );
     }
 }
