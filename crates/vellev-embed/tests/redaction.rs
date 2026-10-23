@@ -66,9 +66,11 @@ impl Framing {
 
     /// A 401 with `body`, on the wire.
     fn framed(self, body: &[u8]) -> Vec<u8> {
+        // The endpoint hangs up after every answer, and so says so: a
+        // caller is not to keep the connection for another request.
         let status = match self {
             Self::UntilClosedOld => "HTTP/1.0 401 Unauthorized\r\n",
-            _ => "HTTP/1.1 401 Unauthorized\r\n",
+            _ => "HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n",
         };
         let size = body.len();
         let head = match self {
@@ -83,7 +85,7 @@ impl Framing {
             Self::ChunkCutShort => {
                 format!("transfer-encoding: chunked\r\n\r\n{:x}\r\n", size + 50)
             }
-            Self::UntilClosed => "connection: close\r\n\r\n".to_string(),
+            Self::UntilClosed => "\r\n".to_string(),
             Self::UntilClosedOld => "\r\n".to_string(),
             Self::LengthBesideACoding => {
                 "transfer-encoding: gzip\r\ncontent-length: 500\r\n\r\n".to_string()
