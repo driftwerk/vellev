@@ -8,6 +8,7 @@ use crate::CollectionName;
 pub const MAX_DIMENSIONS: u32 = 8192;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SchemaError {
     #[error("property name {0:?} must be letters, digits or '_', starting with a letter or '_'")]
     PropertyName(String),

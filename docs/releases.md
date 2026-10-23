@@ -677,10 +677,28 @@ write the two out.
 Breaking:
 
 - `ObjectError` is `#[non_exhaustive]`.
+- `SchemaError` is `#[non_exhaustive]`: a `match` on it needs a wildcard
+  arm. It gains `UnstoredNotEmbedded` and `UnstoredIndexed`, and later
+  variants are no longer breaking.
+- `Property` gains a public field, `stored`, so it can no longer be written
+  as a struct literal without it: build one with `Property::new` and
+  `..Property::new(..)`, or set `stored: true`.
 
 New: `ModelFault`, itself `#[non_exhaustive]`; `Version` and
 `VersionError`, with `Version::of(properties, vector)` and
-`Object::version()`.
+`Object::version()`; `Property::unstored()`, `Collection::has_unstored()`
+and `Collection::stripped()`.
+
+A property can be embedded without its text being stored: one with
+`"stored": false` (and `"filterable": false`, as a property is filterable
+unless it says not) goes into its object's vector and is never read back,
+logged, written to a segment or backed up. It must be one the collection
+embeds, and can be neither filterable nor searchable. A schema with every
+property stored is written as before, byte for byte. A patch or append
+that changes what such a collection embeds must bring its vector, and a
+whole object written to one is always embedded afresh. A node of the
+release before reads `"stored": false` as nothing and stores the text of
+what it writes: do not run one as a writer of such a collection.
 
 Not changed, and why: `EmbeddingProvider`, `HttpApi`, `DataType` and
 `Distance` stay exhaustive. They are stored, so a new variant of any is a
