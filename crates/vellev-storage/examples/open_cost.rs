@@ -132,13 +132,13 @@ async fn main() {
                     properties: json!({
                         "content": content.join(" "),
                         "memoryId": uuid::Uuid::from_u128(written).to_string(),
-                        "layer": if written % 2 == 0 { "episodic" } else { "semantic" },
+                        "layer": if written.is_multiple_of(2) { "episodic" } else { "semantic" },
                         "owner": format!("agent-{}", written % 8),
                         "visibility": "private",
                         "source": "chat",
                         "identityId": format!("user-{}", written % 20),
                         "importance": (written % 100) as f64 / 100.0,
-                        "deleted": written % 20 == 0,
+                        "deleted": written.is_multiple_of(20),
                         "tags": ["a", "b"],
                         "createdAt": "2026-10-01T10:00:00Z",
                     })
