@@ -2792,7 +2792,9 @@ async fn a_node_registers_while_it_runs_and_will_not_serve_a_format_it_cannot_re
     let cluster = Cluster::new();
     let node = cluster.node();
     let ours = node.versions();
-    assert_eq!(node.cluster().await.unwrap(), ours);
+    // A new cluster writes format 1, older than the newest this reads.
+    let new = Versions { format: 1, ..ours };
+    assert_eq!(node.cluster().await.unwrap(), new);
     node.ready().await.unwrap();
 
     node.announcing();
