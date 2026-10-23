@@ -3,11 +3,13 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
-use vellev_core::{Collection, CollectionName, Object, ObjectId, RequestId, Value, Version};
+use vellev_core::{
+    Collection, CollectionName, Distance, Object, ObjectId, RequestId, Value, Version,
+};
 use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::TextIndex;
-use vellev_index::vector::{BinaryIndex, Ties, VectorIndex};
+use vellev_index::vector::{BinaryIndex, Coded, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
@@ -464,6 +466,93 @@ struct Memtable {
     indexes: Indexes,
     /// About how many bytes `rows` take, with what indexes them.
     bytes: usize,
+    /// For each collection, how many versions of its rows with a vector
+    /// have been applied since the checkpoint, dead or not: what decides
+    /// when its rows are coded (see [`CODE_FROM`]). It only rises.
+    applied: HashMap<CollectionId, usize>,
+    /// Moved on whenever a collection's memtable is coded afresh or let
+    /// go, so that codes prepared before are known for another centre's.
+    /// Unique in the process, not just in this state, so that codes
+    /// prepared from a state another has since replaced are known too.
+    coding: Coding,
+}
+
+/// A coding generation: drawn from one count for the whole process, so
+/// that no two states, and no two codings of one, share one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Coding(u64);
+
+impl Coding {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Default for Coding {
+    fn default() -> Self {
+        Self::next()
+    }
+}
+
+/// Codes worked out for a log's rows before it is applied: see
+/// [`State::prepared`]. Keyed by the row's place among the log's ops.
+#[derive(Debug, Default)]
+pub(crate) struct Prepared {
+    coding: Option<Coding>,
+    codes: HashMap<usize, Option<Coded>>,
+}
+
+/// The memtable a flush keeps, made before the state is locked to adopt
+/// the flush: see [`State::kept`].
+#[derive(Debug)]
+pub(crate) struct Kept {
+    held: usize,
+    rows: usize,
+    indexes: Indexes,
+    applied: HashMap<CollectionId, usize>,
+}
+
+/// From how many versions of a collection's rows with a vector applied
+/// since the checkpoint the memtable's rows of it are coded one bit a
+/// dimension, for a search to shortlist as it does a segment's (burst plan
+/// F2b). The codes are taken about the mean of those first versions, dead
+/// or not, in log order: what any copy replaying the log from the same
+/// checkpoint arrives at too. Once coded, the memtable stays coded until
+/// it is flushed, however many of its rows die.
+///
+/// Those first versions are never coded, and are scored exactly beside the
+/// shortlist: reaching the threshold sums them and codes nothing, so that
+/// the apply that does it holds the lock readers wait on for well under a
+/// millisecond.
+pub const CODE_FROM: usize = 1_024;
+
+/// The memtable's rows of `collection` with a vector, centred on the mean
+/// of the first [`CODE_FROM`] of them in row order, which is log order
+/// since the checkpoint: those first rows taken to be scored exactly and
+/// never coded, every row after them coded. At the threshold that is a sum
+/// and no code; at a flush, a code for each row kept past the first
+/// [`CODE_FROM`], as applying them would have made.
+fn coded(rows: &[Row], collection: CollectionId, metric: Distance) -> Option<Vectors> {
+    let vectored: Vec<(u32, &[f32])> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.collection == collection)
+        .filter_map(|(at, row)| Some((at as u32, row.object.vector.as_deref()?)))
+        .collect();
+    let first: Vec<&[f32]> = vectored
+        .iter()
+        .take(CODE_FROM)
+        .map(|(_, vector)| *vector)
+        .collect();
+    let mut codes = BinaryIndex::about_mean(metric, &first)?;
+    for (at, (row, vector)) in vectored.iter().enumerate() {
+        match at < CODE_FROM {
+            true => codes.push_exact(*row),
+            false => codes.push(*row, vector),
+        }
+    }
+    Some(Vectors::Binary(codes))
 }
 
 /// A partition in memory as of one position: flushed segments, the rows
@@ -648,7 +737,16 @@ impl State {
     /// is counted as it is made.
     pub fn resident(&self) -> usize {
         let segments: usize = self.segments.iter().map(|segment| segment.resident).sum();
-        segments + self.memtable.bytes
+        let codes: usize = self
+            .memtable
+            .indexes
+            .values()
+            .map(|index| match &index.vectors {
+                Some(Vectors::Binary(codes)) => codes.resident(),
+                _ => 0,
+            })
+            .sum();
+        segments + self.memtable.bytes + codes
     }
 
     /// How many rows are live. What a writer does in memory as it commits
@@ -657,14 +755,56 @@ impl State {
         self.live.len()
     }
 
-    /// How many rows have been written since the last checkpoint, counting
-    /// those since replaced: what a flush would move out of memory.
     /// How the memtable's rows of `collection` are coded for search, if
     /// they are: see [`MemtableCoding`].
-    pub fn memtable_coding(&self, _collection: &CollectionName) -> Option<MemtableCoding> {
-        None
+    pub fn memtable_coding(&self, collection: &CollectionName) -> Option<MemtableCoding> {
+        let (id, _) = self.catalog.known(collection).ok()?;
+        match &self.memtable.indexes.get(&id)?.vectors {
+            Some(Vectors::Binary(codes)) => Some(MemtableCoding {
+                applied: self.memtable.applied.get(&id).copied().unwrap_or(0),
+                coded: codes.coded(),
+                centre: codes.centre().to_vec(),
+            }),
+            _ => None,
+        }
     }
 
+    /// Code the memtable's row `row` of `collection`, just applied, if it
+    /// has a vector: on its own once the collection's rows are coded, or
+    /// with every row before it as this version is the
+    /// [`CODE_FROM`]th applied since the checkpoint.
+    fn code(&mut self, collection: CollectionId, row: usize, prepared: Option<Option<Coded>>) {
+        let Some(schema) = self.catalog.schema(collection) else {
+            return;
+        };
+        let metric = schema.distance;
+        let Memtable {
+            rows,
+            indexes,
+            applied,
+            ..
+        } = &mut self.memtable;
+        let Some(vector) = rows[row].object.vector.as_deref() else {
+            return;
+        };
+        let applied = applied.entry(collection).or_default();
+        *applied += 1;
+        let Some(index) = indexes.get_mut(&collection) else {
+            return;
+        };
+        match (&mut index.vectors, prepared) {
+            (Some(Vectors::Binary(codes)), Some(coded)) => codes.push_coded(row as u32, coded),
+            (Some(Vectors::Binary(codes)), None) => codes.push(row as u32, vector),
+            _ if *applied == CODE_FROM => {
+                index.vectors = coded(rows, collection, metric);
+                self.memtable.coding = Coding::next();
+            }
+            _ => {}
+        };
+    }
+
+    /// How many rows have been written since the last checkpoint, counting
+    /// those since replaced: what a flush would move out of memory.
     pub fn unflushed(&self) -> usize {
         self.memtable.rows.len()
     }
@@ -1028,6 +1168,47 @@ impl State {
     /// directly on top of this state. Either the whole commit is applied or,
     /// on error, none of it.
     pub(crate) fn apply(&mut self, key: &str, log: &LogSegment) -> Result<()> {
+        self.apply_prepared(key, log, Prepared::default())
+    }
+
+    /// The codes of `log`'s rows with a vector whose collection's memtable
+    /// is coded now, worked out without changing the state: so that they
+    /// can be made before the state is locked to apply the log, and the
+    /// apply only stores them. A row whose collection is coded only during
+    /// the log, at its threshold, is coded as it is applied.
+    pub(crate) fn prepared(&self, log: &LogSegment) -> Prepared {
+        let codes = log
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(at, op)| match op {
+                Op::Upsert { collection, object } => {
+                    let vector = object.vector.as_deref()?;
+                    match &self.memtable.indexes.get(collection)?.vectors {
+                        Some(Vectors::Binary(codes)) => Some((at, codes.code(vector))),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        Prepared {
+            coding: Some(self.memtable.coding),
+            codes,
+        }
+    }
+
+    /// As [`Self::apply`], storing the codes `prepared` holds for the rows
+    /// it holds them for, if it was prepared from the state as it is.
+    pub(crate) fn apply_prepared(
+        &mut self,
+        key: &str,
+        log: &LogSegment,
+        mut prepared: Prepared,
+    ) -> Result<()> {
+        if prepared.coding != Some(self.memtable.coding) {
+            prepared.codes.clear();
+        }
         let corrupt = |reason: String| StorageError::corrupt(key, reason);
         if self.position.next() != Some(log.position) || log.prev.as_deref() != self.head() {
             return Err(corrupt(format!(
@@ -1042,7 +1223,7 @@ impl State {
                 catalog.apply(op).map_err(corrupt)?;
                 Ok::<_, StorageError>(catalog)
             })?;
-        for op in &log.ops {
+        for (op_at, op) in log.ops.iter().enumerate() {
             match op {
                 Op::CreateCollection { .. } | Op::AddProperty { .. } => {}
                 Op::DropCollection { collection } => {
@@ -1057,6 +1238,8 @@ impl State {
                     // Nothing can ask for a dropped collection's rows;
                     // this only frees the memory.
                     self.memtable.indexes.remove(collection);
+                    self.memtable.applied.remove(collection);
+                    self.memtable.coding = Coding::next();
                     self.corpora.remove(collection);
                 }
                 Op::Upsert { collection, object } => {
@@ -1068,9 +1251,9 @@ impl State {
                     let row = self.memtable.rows.len();
                     self.live.insert(key, Location::Memtable(row));
                     // A memtable is flushed long before it holds as many
-                    // rows as a segment may number. It has no vector index:
-                    // its rows change, and are few enough to score one by
-                    // one.
+                    // rows as a segment may number. Its rows with a vector
+                    // are coded once a collection has CODE_FROM of them
+                    // (see `code`), the first of them scored one by one.
                     //
                     // A collection dropped later in the same commit is
                     // already gone from the catalog; its rows go unindexed.
@@ -1083,6 +1266,7 @@ impl State {
                         .entry(*collection)
                         .or_default()
                         .count(index, row as u32, true);
+                    let at = row;
                     let row = Row {
                         collection: *collection,
                         object: object.clone(),
@@ -1090,6 +1274,7 @@ impl State {
                     self.memtable.bytes += row_bytes(&row);
                     self.memtable.rows.push(row);
                     self.memtable.dead.push(false);
+                    self.code(*collection, at, prepared.codes.remove(&op_at));
                 }
                 Op::Delete { collection, id } => {
                     let key = (*collection, *id);
@@ -1444,6 +1629,7 @@ impl State {
         position: LogPosition,
         snapshot: Snapshot,
         segment: Option<Fit>,
+        kept: Option<Kept>,
     ) -> Discarded {
         if let Some(Fit {
             meta,
@@ -1483,7 +1669,7 @@ impl State {
         self.memtable
             .tombstones
             .retain(|tombstone| !flushed.contains(tombstone));
-        let discarded = self.drop_flushed_rows(snapshot.held);
+        let discarded = self.drop_flushed_rows(snapshot.held, kept);
         self.since.drain(..snapshot.logs);
         self.position = position;
         self.head = Some(manifest_key.to_string());
@@ -1491,16 +1677,64 @@ impl State {
         discarded
     }
 
+    /// The memtable as a flush that holds its first `held` rows leaves it:
+    /// the rows after them indexed and, past [`CODE_FROM`] versions of a
+    /// collection, coded, numbered as they will be. Made under the state's
+    /// read lock, which readers share, so that adopting the flush under
+    /// the write lock only swaps it in, however many rows were written
+    /// beside the flush.
+    pub(crate) fn kept(&self, snapshot: &Snapshot) -> Kept {
+        let held = snapshot.held;
+        let rows = &self.memtable.rows;
+        let kept = rows.get(held..).unwrap_or_default();
+        let mut indexes = Indexes::default();
+        let mut applied: HashMap<CollectionId, usize> = HashMap::new();
+        for (row, Row { collection, object }) in kept.iter().enumerate() {
+            if let Some(schema) = self.catalog.schema(*collection) {
+                indexes
+                    .entry(*collection)
+                    .or_default()
+                    .insert(schema, row as u32, object);
+            }
+            if object.vector.is_some() {
+                *applied.entry(*collection).or_default() += 1;
+            }
+        }
+        for (collection, versions) in &applied {
+            if *versions < CODE_FROM {
+                continue;
+            }
+            let (Some(schema), Some(index)) = (
+                self.catalog.schema(*collection),
+                indexes.get_mut(collection),
+            ) else {
+                continue;
+            };
+            index.vectors = coded(kept, *collection, schema.distance);
+        }
+        Kept {
+            held,
+            rows: rows.len(),
+            indexes,
+            applied,
+        }
+    }
+
     /// Take out the memtable's first `held` rows, every one of them dead,
     /// renumbering and indexing afresh those after them. Returns what was
     /// taken out, to be freed without holding the state.
-    fn drop_flushed_rows(&mut self, held: usize) -> Discarded {
+    fn drop_flushed_rows(&mut self, held: usize, kept: Option<Kept>) -> Discarded {
+        // Made beforehand of just these rows, it is swapped in; else the
+        // rows kept are indexed and coded here.
+        let kept = kept.filter(|kept| kept.held == held && kept.rows == self.memtable.rows.len());
+        self.memtable.coding = Coding::next();
         let Memtable {
             rows,
             dead,
             deaths,
             indexes,
             bytes,
+            applied,
             ..
         } = &mut self.memtable;
         let discarded = Discarded {
@@ -1510,6 +1744,21 @@ impl State {
         *bytes = rows.iter().map(row_bytes).sum();
         dead.drain(..held);
         *deaths -= held;
+        if let Some(Kept {
+            indexes: made,
+            applied: counted,
+            ..
+        }) = kept
+        {
+            *indexes = made;
+            *applied = counted;
+            for location in self.live.values_mut() {
+                if let Location::Memtable(row) = location {
+                    *row -= held;
+                }
+            }
+            return discarded;
+        }
         for (row, Row { collection, object }) in rows.iter().enumerate() {
             if let Some(schema) = self.catalog.schema(*collection) {
                 indexes
@@ -1517,6 +1766,25 @@ impl State {
                     .or_default()
                     .insert(schema, row as u32, object);
             }
+        }
+        // The rows kept are the versions applied since the new checkpoint,
+        // dead ones among them: coded again as a copy replaying the log
+        // from that checkpoint codes them.
+        applied.clear();
+        for row in rows.iter().filter(|row| row.object.vector.is_some()) {
+            *applied.entry(row.collection).or_default() += 1;
+        }
+        for (collection, versions) in applied.iter() {
+            if *versions < CODE_FROM {
+                continue;
+            }
+            let (Some(schema), Some(index)) = (
+                self.catalog.schema(*collection),
+                indexes.get_mut(collection),
+            ) else {
+                continue;
+            };
+            index.vectors = coded(rows, *collection, schema.distance);
         }
         for location in self.live.values_mut() {
             if let Location::Memtable(row) = location {
@@ -1697,8 +1965,13 @@ mod tests {
                 self.fit(file, &catalog)
             });
             let position = self.state.position().next().unwrap();
-            self.state
-                .flushed(&format!("manifest-{}", position.0), position, snapshot, fit);
+            self.state.flushed(
+                &format!("manifest-{}", position.0),
+                position,
+                snapshot,
+                fit,
+                None,
+            );
         }
 
         /// Merge a run of segments if there is one to merge.
@@ -2029,5 +2302,126 @@ mod tests {
         built.commit(vec![upsert(3, 5, 5)]);
         assert_eq!(built.walk("b", None, 4), [oid(5)]);
         assert_eq!(built.state.count(&b), 1);
+    }
+
+    /// Codes prepared for a log before a flush that codes the memtable
+    /// afresh, about another centre, are not stored when the log is applied
+    /// after it: the row is coded about the centre it is stored beside.
+    #[test]
+    fn codes_prepared_before_the_memtable_is_coded_afresh_are_not_stored() {
+        let index = |built: &Built| -> BinaryIndex {
+            match &built.state.memtable.indexes[&CollectionId(0)].vectors {
+                Some(Vectors::Binary(codes)) => codes.clone(),
+                _ => panic!("coded"),
+            }
+        };
+        let mut built = Built::new(&["notes"]);
+        built.commit((0..1_100).map(|n| upsert(0, n, n as i64)).collect());
+        let mut snapshot = built.state.snapshot().unwrap();
+        while built.state.copy_rows(&mut snapshot, 7) {}
+        // Beside the flush, more than CODE_FROM rows of other directions.
+        let beside: Vec<Op> = (5_000..6_100).map(|n| upsert(0, n, -(n as i64))).collect();
+        let late = vec![upsert(0, 9_999, 77)];
+        built.commit(beside.clone());
+        let position = built.state.position().next().unwrap();
+        let log = LogSegment {
+            position,
+            prev: built.state.head().map(str::to_string),
+            ops: late.clone(),
+            answered: Vec::new(),
+        };
+        let prepared = built.state.prepared(&log);
+        let before = index(&built).centre().to_vec();
+        let file = SegmentFile {
+            position: snapshot.position,
+            rows: snapshot.rows.clone(),
+            tombstones: snapshot.tombstones.clone(),
+        };
+        let catalog = snapshot.catalog.clone();
+        let fit = built.fit(file, &catalog);
+        let at = built.state.position().next().unwrap();
+        built
+            .state
+            .flushed(&format!("manifest-{}", at.0), at, snapshot, Some(fit), None);
+        assert_ne!(index(&built).centre(), before.as_slice(), "coded afresh");
+        let position = built.state.position().next().unwrap();
+        let log = LogSegment {
+            prev: built.state.head().map(str::to_string),
+            position,
+            ..log
+        };
+        built
+            .state
+            .apply_prepared(&format!("log-{}", position.0), &log, prepared)
+            .unwrap();
+        // The rows the flush kept, and the late one, coded with nothing
+        // prepared.
+        let mut plain = Built::new(&["notes"]);
+        plain.commit(beside.into_iter().chain(late).collect());
+        let query = [0.3f32, -0.9];
+        let ranked = |codes: &BinaryIndex| {
+            codes
+                .estimates(
+                    &query,
+                    10_000,
+                    None,
+                    &[],
+                    &vellev_index::vector::in_row_order,
+                )
+                .into_iter()
+                .map(|(estimate, _)| estimate.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranked(&index(&built)), ranked(&index(&plain)));
+    }
+
+    /// Codes prepared from one state are not stored by another, however
+    /// alike the two have been changed: a state replaced, as a writer's is
+    /// when it reopens or restores, is coded about its own centre.
+    #[test]
+    fn codes_prepared_from_one_state_are_not_stored_by_another() {
+        let index = |built: &Built| -> BinaryIndex {
+            match &built.state.memtable.indexes[&CollectionId(0)].vectors {
+                Some(Vectors::Binary(codes)) => codes.clone(),
+                _ => panic!("coded"),
+            }
+        };
+        // Alike in every count, coded about different centres.
+        let mut one = Built::new(&["notes"]);
+        one.commit((0..1_100).map(|n| upsert(0, n, n as i64)).collect());
+        let mut other = Built::new(&["notes"]);
+        other.commit((0..1_100).map(|n| upsert(0, n, -(n as i64) - 7)).collect());
+        assert_ne!(index(&one).centre(), index(&other).centre());
+        let late = vec![upsert(0, 9_999, 77)];
+        let position = other.state.position().next().unwrap();
+        let log = LogSegment {
+            position,
+            prev: other.state.head().map(str::to_string),
+            ops: late.clone(),
+            answered: Vec::new(),
+        };
+        let prepared = one.state.prepared(&log);
+        other
+            .state
+            .apply_prepared(&format!("log-{}", position.0), &log, prepared)
+            .unwrap();
+        let mut plain = Built::new(&["notes"]);
+        plain.commit((0..1_100).map(|n| upsert(0, n, -(n as i64) - 7)).collect());
+        plain.commit(late);
+        let query = [0.3f32, -0.9];
+        let ranked = |codes: &BinaryIndex| {
+            codes
+                .estimates(
+                    &query,
+                    10_000,
+                    None,
+                    &[],
+                    &vellev_index::vector::in_row_order,
+                )
+                .into_iter()
+                .map(|(estimate, _)| estimate.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranked(&index(&other)), ranked(&index(&plain)));
     }
 }

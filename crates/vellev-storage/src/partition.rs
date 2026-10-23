@@ -403,10 +403,13 @@ impl Partition {
                 *self.state.write().expect("partition lock") = state;
             }
             None => {
-                let mut state = self.state.write().expect("partition lock");
-                tail.logs
-                    .iter()
-                    .try_for_each(|(key, log)| state.apply(key, log))?;
+                // A log at a time, its codes made while readers may still
+                // read, and only stored under the lock.
+                for (key, log) in &tail.logs {
+                    let prepared = self.read(|state| state.prepared(log));
+                    let mut state = self.state.write().expect("partition lock");
+                    state.apply_prepared(key, log, prepared)?;
+                }
             }
         }
         Ok(committed.log_position)
@@ -1109,8 +1112,11 @@ impl Writer {
                 // waiting, which closes the writer: the commit is made.
                 let (partition, applied) = (self.partition.clone(), key.clone());
                 turn.at_once(move || {
+                    // Coded first, while readers may still read; the apply
+                    // under the lock then only stores the codes.
+                    let prepared = partition.read(|state| state.prepared(&log));
                     let mut state = partition.state.write().expect("partition lock");
-                    state.apply(&applied, &log)
+                    state.apply_prepared(&applied, &log, prepared)
                 })
                 .await??;
                 tracing::debug!(
@@ -1257,8 +1263,11 @@ impl Writer {
             .read(|state| state.flushed_manifest(position, &snapshot, segment.as_ref()))?;
         let frame = encode(Kind::Manifest, &manifest)?;
         staged.keep();
+        // The memtable it keeps, made while readers may still read: with
+        // the turn held, nothing is committed before it is adopted.
+        let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, |state| {
-            state.flushed(&key, position, snapshot, segment)
+            state.flushed(&key, position, snapshot, segment, Some(kept))
         })
         .await?;
         Ok(position)
@@ -1985,9 +1994,10 @@ impl Writer {
         };
         let frame = encode(Kind::Manifest, &manifest)?;
         staged.keep();
+        let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, |state| {
             state.compacted(&merge, merged);
-            state.flushed(&key, position, snapshot, segment)
+            state.flushed(&key, position, snapshot, segment, Some(kept))
         })
         .await?;
         Ok(Some(position))

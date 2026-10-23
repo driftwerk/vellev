@@ -360,7 +360,11 @@ and say what the caller then answers for.
   is per segment that shortlists by one-bit codes; the segments with a
   clustered index (over 200,000 rows) share one budget between them, less
   the nearest few each scores of its own; a segment too small to
-  shortlist, and unflushed rows, are scored whole, as before. A search
+  shortlist is scored whole, as before. Unflushed rows are scored whole
+  too until a collection has 1,024 with a vector applied since the
+  checkpoint and more allowed than a segment scores whole; past that they
+  are coded one bit a dimension and shortlisted as a segment's are, the
+  first 1,024 scored exactly besides (burst plan F2b). A search
   that names no `oversample` has a budget of no more than 2,048 rows
   whatever its `limit` (or `candidates`, if larger), the default being
   lowered for large limits (checked by a recall sweep on 118,609

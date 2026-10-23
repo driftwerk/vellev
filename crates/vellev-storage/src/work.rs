@@ -5,9 +5,10 @@
 /// The work of one or more searches, summed over their layers and legs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Work {
-    /// Rows of the memtable scored exactly against the query's vector.
-    /// The memtable has no vector index, so this is every allowed live row
-    /// of it.
+    /// Rows of the memtable scored exactly against the query's vector:
+    /// every allowed live row of it while it is too few to shortlist or not
+    /// yet coded; once coded, those its codes shortlist and the first
+    /// [`crate::CODE_FROM`] rows, which are never coded.
     pub exact_memtable: u64,
     /// Rows of the memtable a search ranked by their one-bit codes before
     /// scoring the nearest of them exactly, once the memtable is coded.

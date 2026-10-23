@@ -214,6 +214,11 @@ fn candidates(
     };
     let ties = |a, b| layer.id(a).cmp(&layer.id(b));
     let unmeasured = vectors.unmeasured(only.as_ref(), layer.dead);
+    // The memtable's live allowed rows ranked by their codes: every one but
+    // those scored exactly anyway.
+    if layer.vectors.is_none() {
+        work.coded_memtable += (live().count() - unmeasured.len()) as u64;
+    }
     match vectors {
         Vectors::Clustered(clustered) => Candidates {
             exact: unmeasured,
