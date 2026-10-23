@@ -472,14 +472,34 @@ struct Memtable {
     applied: HashMap<CollectionId, usize>,
     /// Moved on whenever a collection's memtable is coded afresh or let
     /// go, so that codes prepared before are known for another centre's.
-    coding: u64,
+    /// Unique in the process, not just in this state, so that codes
+    /// prepared from a state another has since replaced are known too.
+    coding: Coding,
+}
+
+/// A coding generation: drawn from one count for the whole process, so
+/// that no two states, and no two codings of one, share one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Coding(u64);
+
+impl Coding {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Default for Coding {
+    fn default() -> Self {
+        Self::next()
+    }
 }
 
 /// Codes worked out for a log's rows before it is applied: see
 /// [`State::prepared`]. Keyed by the row's place among the log's ops.
 #[derive(Debug, Default)]
 pub(crate) struct Prepared {
-    coding: u64,
+    coding: Option<Coding>,
     codes: HashMap<usize, Option<Coded>>,
 }
 
@@ -777,7 +797,7 @@ impl State {
             (Some(Vectors::Binary(codes)), None) => codes.push(row as u32, vector),
             _ if *applied == CODE_FROM => {
                 index.vectors = coded(rows, collection, metric);
-                self.memtable.coding += 1;
+                self.memtable.coding = Coding::next();
             }
             _ => {}
         };
@@ -1173,7 +1193,7 @@ impl State {
             })
             .collect();
         Prepared {
-            coding: self.memtable.coding,
+            coding: Some(self.memtable.coding),
             codes,
         }
     }
@@ -1186,7 +1206,7 @@ impl State {
         log: &LogSegment,
         mut prepared: Prepared,
     ) -> Result<()> {
-        if prepared.coding != self.memtable.coding {
+        if prepared.coding != Some(self.memtable.coding) {
             prepared.codes.clear();
         }
         let corrupt = |reason: String| StorageError::corrupt(key, reason);
@@ -1219,7 +1239,7 @@ impl State {
                     // this only frees the memory.
                     self.memtable.indexes.remove(collection);
                     self.memtable.applied.remove(collection);
-                    self.memtable.coding += 1;
+                    self.memtable.coding = Coding::next();
                     self.corpora.remove(collection);
                 }
                 Op::Upsert { collection, object } => {
@@ -1707,7 +1727,7 @@ impl State {
         // Made beforehand of just these rows, it is swapped in; else the
         // rows kept are indexed and coded here.
         let kept = kept.filter(|kept| kept.held == held && kept.rows == self.memtable.rows.len());
-        self.memtable.coding += 1;
+        self.memtable.coding = Coding::next();
         let Memtable {
             rows,
             dead,
