@@ -1263,35 +1263,38 @@ async fn a_region_that_refuses_or_throttles_has_been_reached_and_is_asked_again(
 /// anyone for as long as a model may go without, however many texts of
 /// other writes it refuses meanwhile.
 ///
-/// Titan never answers the write's text, and goes on refusing others for
-/// as long as the write is waited on. Were a refusal taken for Titan at
-/// work, the write would never be given up on while they go on, and the
-/// refusals would run out first: no clock decides which.
+/// Titan never answers the write's text, and refuses another every
+/// hundred milliseconds by a clock the test moves itself, only once the
+/// write is asleep on it, for as long as the write is waited on. It is
+/// given up on at exactly half a second; were a refusal taken for Titan
+/// at work, never.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_text_bedrock_refuses_is_not_bedrock_at_work() {
+    use vellev_embed::clock::{Clock, Manual};
     let ms = Duration::from_millis;
+    let clock = Manual::new();
     let seen = Seen::refusing(usize::MAX, 400);
     let titan = EmbeddingProvider::Bedrock {
         region: "eu-west-2".into(),
     };
     let embedder = Embedder::new(
-        Arc::new(bedrock(seen.clone()).await),
+        Arc::new(bedrock(seen.clone()).await.timed_by(clock.clone())),
         embedding_with(titan, TITAN, 2),
     );
     let embedder = Arc::new(embedder.answering_within(ms(2_000), ms(500)));
-    let began = std::time::Instant::now();
+    let began = clock.now();
     let held = {
         let embedder = embedder.clone();
         tokio::spawn(async move { embedder.documents(&["held one".to_string()]).await })
     };
-    // Meanwhile it refuses a text every eighty milliseconds or so, until
-    // the write is given up on. The minute is only so that a wrong build
-    // cannot wait forever: a right one gives up after half a second, and
-    // would reach it only were its timer late by a hundred times as long.
     let mut refused = 0;
-    while !held.is_finished() {
+    loop {
+        settled(&clock, 1, &held).await;
+        if held.is_finished() {
+            break;
+        }
         assert!(
-            began.elapsed() < BACKSTOP,
+            clock.now() - began < ms(10_000),
             "the write was not given up on through {refused} refusals"
         );
         let said = embedder
@@ -1301,16 +1304,41 @@ async fn a_text_bedrock_refuses_is_not_bedrock_at_work() {
             .to_string();
         assert!(said.contains("ValidationException"), "{said}");
         refused += 1;
-        tokio::time::sleep(ms(80)).await;
+        settled(&clock, 1, &held).await;
+        clock.move_to(clock.now() + ms(100));
     }
     let given_up_on = held.await.unwrap().unwrap_err().to_string();
     assert!(
         given_up_on.ends_with("the model has made nothing for anyone in 500ms"),
         "{given_up_on}"
     );
-    // Not before then, and with refusals made meanwhile.
-    assert!(began.elapsed() >= ms(500), "{:?}", began.elapsed());
-    assert!(refused >= 1);
+    assert_eq!(clock.now() - began, ms(500));
+    assert_eq!(refused, 5, "one at the start and after each step");
+}
+
+/// Waits until `waiting` is finished, or `count` calls are asleep on
+/// `clock`, each until a time still to come: whatever the clock last
+/// woke has looked and gone back to sleep, or gone.
+async fn settled<T>(
+    clock: &vellev_embed::clock::Manual,
+    count: usize,
+    waiting: &tokio::task::JoinHandle<T>,
+) {
+    use vellev_embed::clock::Clock;
+    let began = std::time::Instant::now();
+    loop {
+        let asleep = clock.asleep();
+        let calm = asleep.len() == count && asleep.iter().all(|at| *at > clock.now());
+        if waiting.is_finished() || calm {
+            return;
+        }
+        assert!(
+            began.elapsed() < BACKSTOP,
+            "{} asleep, not {count}",
+            asleep.len()
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 /// One batch is given so long, every try included: an endpoint that goes
@@ -1585,20 +1613,36 @@ async fn a_region_a_caller_gives_up_on_unanswered_is_marked_as_not_reached() {
         Arc::new(embedder.answering_within(ms(300), ms(300)))
     };
     // Titan takes a second over a text that says it is slow, and the
-    // search is given 300 ms: given up on after 200 ms unanswered marks
-    // the region, and the next search is refused, unsent: Titan had only
-    // ever the slow one in hand.
+    // search is given 300 ms by a clock the test moves itself, only once
+    // the search is asleep on it: given up on at exactly 300 ms, which is
+    // after 200 ms unanswered and marks the region, and the next search
+    // is refused, unsent: Titan had only ever the slow one in hand.
+    use vellev_embed::clock::{Clock, Manual};
+    let clock = Manual::new();
     let seen = Arc::new(Seen::default());
-    let provider = bedrock(seen.clone()).await.unreached_after(ms(200));
-    let embedder = giving_up(provider);
-    let began = std::time::Instant::now();
-    assert!(embedder.query("slow one").await.is_err());
+    let provider = bedrock(seen.clone()).await.timed_by(clock.clone());
+    let embedder = giving_up(provider.unreached_after(ms(200)));
+    let began = clock.now();
+    let slow = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.query("slow one").await })
+    };
+    // Whoever asked, and the call it made for itself and any who ask the
+    // same meanwhile; and Titan has the text in hand.
+    settled(&clock, 2, &slow).await;
+    until("the slow one sent", || seen.in_flight.load(Ordering::SeqCst) == 1).await;
+    let asleep = clock.asleep();
+    clock.move_to(asleep[0]);
+    let slow = tokio::time::timeout(BACKSTOP, slow)
+        .await
+        .expect("given up on");
+    assert!(slow.unwrap().is_err());
+    assert_eq!(clock.now() - began, ms(300));
     let refused = embedder.query("quick").await.unwrap_err().to_string();
     assert!(
         refused.contains("was not reached a moment ago") && refused.contains("given up on after"),
         "{refused}"
     );
-    assert!(began.elapsed() >= ms(300), "{:?}", began.elapsed());
     // Titan was called once: the quick one was never sent.
     assert_eq!(seen.most_in_flight.load(Ordering::SeqCst), 1);
 
