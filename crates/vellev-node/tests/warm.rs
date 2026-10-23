@@ -146,6 +146,15 @@ async fn a_node_keeps_no_more_tenants_warm_than_it_is_set_to() {
             .unwrap();
     }
     first.remember_warm();
+    let listed: Vec<String> = serde_json::from_slice(
+        &std::fs::read(shared.dir.path().join("warm-tenants.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        listed,
+        ["delta", "gamma"],
+        "the two read last, the last first"
+    );
     first.shutdown().await;
     let again = shared.node(2);
     again.warming();
@@ -189,4 +198,15 @@ async fn a_tenant_gone_since_or_a_list_unreadable_is_passed_over() {
         .reader(&tenant("acme"), Freshness::Eventual)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_node_stopping_remembers_what_it_served() {
+    let shared = Shared::new();
+    let first = shared.node(16);
+    written(&first, &["acme"]).await;
+    first.shutdown().await;
+    let again = shared.node(16);
+    again.warming();
+    assert!(soon(|| again.copies() == 1).await, "{}", again.copies());
 }

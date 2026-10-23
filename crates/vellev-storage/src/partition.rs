@@ -157,7 +157,7 @@ impl Ahead {
         if expected.0 >= self.from || expected <= position {
             return None;
         }
-        let below = self.from.saturating_sub(self.window).max(position.0);
+        let (below, window) = next_window(self.from, self.window, position);
         let asked = commits
             .commits_after(
                 &partition.key,
@@ -175,7 +175,7 @@ impl Ahead {
             }
         };
         self.from = below + 1;
-        self.window = self.window.saturating_mul(2);
+        self.window = window;
         let keys: Vec<String> = points
             .into_iter()
             .filter(|point| point.position.0 < expected.0 + 1)
@@ -201,6 +201,15 @@ impl Ahead {
         self.fetched.extend(fetched);
         self.fetched.remove(key)
     }
+}
+
+/// The next window of commits a walk back fetches together: from above
+/// `position` up to below `from`, `window` of them, and the window after
+/// it twice as long, so that a tail of `n` commits takes about
+/// `log2(n / FETCHED_FIRST)` asks of the coordinator.
+fn next_window(from: u64, window: u64, position: LogPosition) -> (u64, u64) {
+    let below = from.saturating_sub(window).max(position.0);
+    (below, window.saturating_mul(2))
 }
 
 /// The committed commits between a state and a newer head, oldest first, and
@@ -3124,6 +3133,26 @@ fn kept_out(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_walk_back_asks_for_twice_as_many_commits_each_time() {
+        let (mut from, mut window, mut asks) = (100_001u64, FETCHED_FIRST, 0);
+        while from > 1 {
+            let (below, next) = next_window(from, window, LogPosition(0));
+            assert!(below < from);
+            (from, window) = (below + 1, next);
+            asks += 1;
+            if below == 0 {
+                break;
+            }
+        }
+        assert!(asks <= 12, "{asks} asks for a tail of 100,000 commits");
+        assert_eq!(
+            next_window(1_000, 64, LogPosition(990)),
+            (990, 128),
+            "never below the state's own position"
+        );
+    }
     use super::*;
     use crate::blobs::ObjectBlobs;
     use crate::coordinator::{Acquired, MemoryCoordinator};
