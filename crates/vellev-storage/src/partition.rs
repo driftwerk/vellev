@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
+use futures::StreamExt;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
@@ -90,6 +91,114 @@ pub struct Partition {
     /// Serialises catch-up, and remembers the newest coordinator generation
     /// seen so an older reading of the committed state is recognised as stale.
     seen: Mutex<Generation>,
+    /// Where the partition's commits are recorded, if known: so that the
+    /// logs a load replays can be fetched together, named by the commits'
+    /// rows, rather than one after another, each named by the next.
+    commits: Option<Arc<dyn Coordinator>>,
+    /// What replaying commits into this copy has done.
+    replayed: std::sync::Mutex<Replayed>,
+}
+
+/// What replaying commits into a copy has done, since it was made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Replayed {
+    /// How many threads coded rows at once, at the most, for the commits
+    /// replayed together.
+    pub coded_on_threads: usize,
+}
+
+/// How many fetches a load has under way at once, at the most.
+const FETCHED_AT_ONCE: usize = 16;
+/// How many commits back from the head a load first fetches together,
+/// doubled each time the walk back reaches past what it fetched.
+const FETCHED_FIRST: u64 = 64;
+
+/// The heads of commits a walk back from a head fetched before it reached
+/// them: the commits the coordinator records between a position and the
+/// head, fetched and decoded together, a window at a time from the head
+/// back, the window doubling each time the walk reaches past it.
+struct Ahead {
+    /// The heads fetched, by key: each decoded, or why not.
+    fetched: HashMap<String, Result<Head>>,
+    /// Down to which position commits have been asked for.
+    from: u64,
+    window: u64,
+    incarnation: Incarnation,
+}
+
+impl Ahead {
+    fn new(committed: &Committed) -> Self {
+        Self {
+            fetched: HashMap::new(),
+            from: committed.log_position.0 + 1,
+            window: FETCHED_FIRST,
+            incarnation: committed.incarnation,
+        }
+    }
+
+    /// The head of `key`, at `expected`, if it was or can now be fetched
+    /// together with others; `None` to fetch it alone: the partition knows
+    /// no coordinator to ask, or it names none of these commits.
+    async fn take(
+        &mut self,
+        partition: &Partition,
+        key: &str,
+        expected: LogPosition,
+        position: LogPosition,
+    ) -> Option<Result<Head>> {
+        if let Some(head) = self.fetched.remove(key) {
+            return Some(head);
+        }
+        let commits = partition.commits.as_ref()?;
+        // Asked for already as far down as this: the coordinator named
+        // none of them by this key.
+        if expected.0 >= self.from || expected <= position {
+            return None;
+        }
+        let below = self.from.saturating_sub(self.window).max(position.0);
+        let asked = commits
+            .commits_after(
+                &partition.key,
+                self.incarnation,
+                LogPosition(below),
+                (self.from - below) as usize,
+            )
+            .await;
+        let points = match asked {
+            Ok(points) => points,
+            Err(error) => {
+                tracing::warn!(partition = %partition.key, %error, "the commits to load could not be listed; fetching them one by one");
+                self.from = 0;
+                return None;
+            }
+        };
+        self.from = below + 1;
+        self.window = self.window.saturating_mul(2);
+        let keys: Vec<String> = points
+            .into_iter()
+            .filter(|point| point.position.0 < expected.0 + 1)
+            .map(|point| point.head.0)
+            .filter(|key| !self.fetched.contains_key(key))
+            .collect();
+        let fetched = futures::stream::iter(keys)
+            .map(|key| async move {
+                let head = match partition.fetch(&key).await {
+                    Ok(bytes) => {
+                        let decoding = key.clone();
+                        tokio::task::spawn_blocking(move || decode_head(&decoding, &bytes))
+                            .await
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
+                    }
+                    Err(error) => Err(error),
+                };
+                (key, head)
+            })
+            .buffer_unordered(FETCHED_AT_ONCE)
+            .collect::<Vec<_>>()
+            .await;
+        self.fetched.extend(fetched);
+        self.fetched.remove(key)
+    }
 }
 
 /// The committed commits between a state and a newer head, oldest first, and
@@ -141,6 +250,22 @@ impl Partition {
         Self::load_reusing(key, blobs, committed, Loading::default()).await
     }
 
+    /// As [`Self::load`], the logs it replays found through `commits` and
+    /// fetched together; and so is every catch-up after.
+    async fn load_through(
+        key: PartitionKey,
+        blobs: Arc<dyn Blobs>,
+        commits: Arc<dyn Coordinator>,
+        committed: &Committed,
+    ) -> Result<Self> {
+        let mut partition = Self::empty(key, blobs, committed.incarnation);
+        partition.commits = Some(commits);
+        partition
+            .advance_reusing(committed, Loading::default())
+            .await?;
+        Ok(partition)
+    }
+
     /// Load the partition as committed, taking the segments `loading`
     /// holds as loaded already rather than reading them again.
     async fn load_reusing(
@@ -161,7 +286,14 @@ impl Partition {
             blobs,
             state: RwLock::new(State::default()),
             seen: Mutex::new(Generation(0)),
+            commits: None,
+            replayed: std::sync::Mutex::default(),
         }
+    }
+
+    /// What replaying commits into this copy has done.
+    pub fn replayed(&self) -> Replayed {
+        *self.replayed.lock().expect("replayed lock")
     }
 
     /// The files the partition as `committed` is loaded from: the logs back
@@ -428,13 +560,20 @@ impl Partition {
         let mut logs = Vec::new();
         let mut cursor = committed.manifest.as_ref().map(|head| head.0.clone());
         let mut expected = committed.log_position;
+        let mut ahead = Ahead::new(committed);
         let checkpoint = loop {
             let key = match cursor {
                 reached if reached.as_deref() == known && expected == position => break None,
                 Some(key) if expected > position => key,
                 _ => return Ok(None),
             };
-            let head = decode_head(&key, &self.fetch(&key).await?)?;
+            // Fetched together with the commits before it when the
+            // coordinator names them; the walk back checks each as it
+            // would one fetched alone.
+            let head = match ahead.take(self, &key, expected, position).await {
+                Some(head) => head?,
+                None => decode_head(&key, &self.fetch(&key).await?)?,
+            };
             let found = match &head {
                 Head::Log(log) => log.position,
                 Head::Manifest(manifest) => manifest.position,
@@ -627,8 +766,10 @@ impl Follower {
         commits: Arc<dyn Coordinator>,
         committed: &Committed,
     ) -> Result<Self> {
-        let _ = commits;
-        Self::open(key, blobs, committed).await
+        Partition::load_through(key, blobs, commits, committed)
+            .await
+            .map(Arc::new)
+            .map(Self)
     }
 
     pub fn partition(&self) -> &Arc<Partition> {
@@ -756,7 +897,10 @@ impl Writer {
         lease: Lease,
         committed: &Committed,
     ) -> Result<Self> {
-        let partition = Arc::new(Partition::load(lease.key.clone(), blobs, committed).await?);
+        let partition = Arc::new(
+            Partition::load_through(lease.key.clone(), blobs, coordinator.clone(), committed)
+                .await?,
+        );
         let author = Author {
             generation: lease.generation,
             writer: uuid::Uuid::new_v4(),

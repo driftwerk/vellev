@@ -122,3 +122,52 @@ async fn a_writer_opened_fetches_the_logs_it_replays_together() {
     let expected: Vec<Option<i64>> = (1..=COMMITS).map(|n| Some(i64::from(n))).collect();
     assert_eq!(writer.partition().read(every_note), expected);
 }
+
+/// A partition replaying many commits to a collection coded in memory codes
+/// their rows on several threads before applying them: how many it codes
+/// at once, at the most, shows in what the load reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partition_replaying_coded_rows_codes_them_several_at_once() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    let mut schema = schema(NOTES);
+    schema.embedding.dimensions = 64;
+    writer
+        .commit(vec![Mutation::CreateCollection(Box::new(schema))])
+        .await
+        .unwrap();
+    let mut random = Random(61);
+    for batch in 0..40u32 {
+        let rows: Vec<Mutation> = (0..100u32)
+            .map(|n| Mutation::Upsert {
+                collection: name(NOTES),
+                id: ObjectId(uuid::Uuid::from_u128(u128::from(batch * 100 + n))),
+                properties: json!({ "title": "fox", "n": n })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                vector: Some(random.vector(64)),
+                only_if_version: None,
+            })
+            .collect();
+        writer.commit(rows).await.unwrap();
+    }
+    let copy = Follower::open_through(
+        cluster.key.clone(),
+        cluster.blobs.clone(),
+        cluster.coordinator.clone(),
+        &cluster.committed().await,
+    )
+    .await
+    .unwrap();
+    let replayed = copy.partition().replayed();
+    assert!(
+        replayed.coded_on_threads > 1,
+        "{replayed:?}: the rows past the threshold coded on one thread"
+    );
+    assert_eq!(
+        copy.partition()
+            .read(|state| state.memtable_coding(&name(NOTES)).unwrap().coded),
+        4_000 - vellev_storage::CODE_FROM
+    );
+}
