@@ -804,3 +804,64 @@ async fn a_batch_to_a_coded_collection_is_coded_before_the_lock() {
         "readers waited up to {median:?} (median of {waits:?})"
     );
 }
+
+/// A coded memtable's dead rows take no place in its shortlist: with hot
+/// rows replaced again and again, nearer the query each time than their
+/// live versions, a search asking for no more than its limit finds just
+/// what it finds in a memtable holding the same live rows and no dead
+/// ones, coded about the same centre.
+#[tokio::test]
+async fn dead_rows_take_no_place_in_a_coded_memtables_shortlist() {
+    let mut random = Random(53);
+    let groups = centres(&mut random, 20);
+    let first: Vec<Mutation> = (0..5_000u32)
+        .map(|n| row(NOTES, n, about(&mut random, &groups, n as usize, 0.3)))
+        .collect();
+    // The first 300 rows written eight times more, each version but the
+    // last about the query's group and dead, the last about their own.
+    let mut churn = Vec::new();
+    for _ in 0..7 {
+        churn.extend((0..300u32).map(|n| row(NOTES, n, about(&mut random, &groups, 0, 0.05))));
+    }
+    let last: Vec<Mutation> = (0..300u32)
+        .map(|n| row(NOTES, n, about(&mut random, &groups, n as usize + 1, 0.3)))
+        .collect();
+    let churned = Cluster::new().await;
+    let churned = churned.writer().await;
+    churned.commit(vec![wide(NOTES)]).await.unwrap();
+    commit(&churned, first.clone()).await;
+    commit(&churned, churn).await;
+    commit(&churned, last.clone()).await;
+    // The same live rows, each written once after the same first versions,
+    // so the same centre: only the dead versions are missing.
+    let plain = Cluster::new().await;
+    let plain = plain.writer().await;
+    plain.commit(vec![wide(NOTES)]).await.unwrap();
+    commit(&plain, first).await;
+    commit(&plain, last).await;
+    let found = |writer: &Writer, query: &[f32], limit: usize| -> Vec<(ObjectId, u32)> {
+        writer.partition().read(|state| {
+            assert!(state.memtable_coding(&name(NOTES)).is_some(), "coded");
+            state
+                .search(
+                    &name(NOTES),
+                    &Query {
+                        oversample: 1,
+                        ..Query::nearest(query, limit)
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.object.id, hit.distance.to_bits()))
+                .collect()
+        })
+    };
+    for (q, limit) in [(0u64, 10usize), (1, 50), (2, 100)] {
+        let query = about(&mut Random(900 + q), &groups, 0, 0.05);
+        assert_eq!(
+            found(&churned, &query, limit),
+            found(&plain, &query, limit),
+            "limit {limit}: the dead versions took places in the shortlist"
+        );
+    }
+}
