@@ -99,12 +99,16 @@ pub struct Partition {
     replayed: std::sync::Mutex<Replayed>,
 }
 
-/// What replaying commits into a copy has done, since it was made.
+/// What loading a copy and replaying commits into it has done, since it
+/// was made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Replayed {
     /// How many threads coded rows at once, at the most, for the commits
     /// replayed together.
     pub coded_on_threads: usize,
+    /// How many threads split rows' text into tokens at once, at the most,
+    /// to index them: as a segment was loaded, or commits replayed.
+    pub tokenized_on_threads: usize,
 }
 
 /// How many logs a replay codes together before applying them.
