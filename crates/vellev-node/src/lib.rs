@@ -692,6 +692,11 @@ impl Tenant {
         self.used.lock().expect("used lock").elapsed()
     }
 
+    /// When the tenant was last used.
+    fn used_at(&self) -> Instant {
+        *self.used.lock().expect("used lock")
+    }
+
     /// The tenant's data as this node holds it in memory.
     pub fn partition(&self) -> &Arc<vellev_storage::Partition> {
         self.writer.partition()
@@ -1254,16 +1259,19 @@ impl Node {
         let Some(path) = &self.0.settings.warm else {
             return;
         };
-        let mut used: Vec<(Duration, TenantId)> = {
+        // Ordered by when each was last used, not by how long ago: an age
+        // read entry by entry is read at a different instant for each.
+        let mut used: Vec<(std::cmp::Reverse<Instant>, TenantId)> = {
             let open = self.0.opened();
-            let writers = open
-                .tenants
-                .iter()
-                .filter_map(|(tenant, opening)| Some((opening.get()?.idle(), tenant.clone())));
-            let copies = open
-                .followers
-                .iter()
-                .filter_map(|(tenant, following)| Some((following.get()?.idle(), tenant.clone())));
+            let writers = open.tenants.iter().filter_map(|(tenant, opening)| {
+                Some((std::cmp::Reverse(opening.get()?.used_at()), tenant.clone()))
+            });
+            let copies = open.followers.iter().filter_map(|(tenant, following)| {
+                Some((
+                    std::cmp::Reverse(following.get()?.used_at()),
+                    tenant.clone(),
+                ))
+            });
             writers.chain(copies).collect()
         };
         used.sort();

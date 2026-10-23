@@ -126,6 +126,11 @@ impl Followed {
         self.used.lock().expect("use lock").elapsed()
     }
 
+    /// When the copy was last used.
+    pub(crate) fn used_at(&self) -> Instant {
+        *self.used.lock().expect("use lock")
+    }
+
     /// About how many bytes the copy takes in memory.
     pub(crate) fn resident(&self) -> usize {
         self.follower.partition().read(State::resident)
