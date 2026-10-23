@@ -5,7 +5,8 @@ the same inputs give the same files, byte for byte.
 Inputs (SRC):
   wiki/train-*-of-00041.parquet  wikimedia/wikipedia 20231101.en, revision
                                  b04c8d1ceb2f5cd4588862100d08de323dccfbaa
-  squad/dev-v2.0.json            SQuAD 2.0 dev
+  squad/train-v2.0.json, squad/dev-v2.0.json
+                                 SQuAD 2.0
   nq/queries.jsonl, nq/corpus.jsonl, nq/qrels/test.tsv
                                  Natural Questions test, as BEIR ships it
 
@@ -27,11 +28,13 @@ their titles, until there are exactly 1,000,000 passages. The articles
 asked of come first, so that the first 100,000 passages, the slice a pull
 request is checked on, hold the answers too.
 
-Questions: SQuAD 2.0 dev questions that have an answer (the unanswerable
-ones are left out), and Natural Questions test questions, each only if
-its article is in the dump under that title. Each source's questions are
-shuffled with a fixed seed; the first 500 of each are measured and the
-next 500 warm up.
+Questions: SQuAD 2.0 questions that have an answer, from train and dev
+(the unanswerable ones are left out), and Natural Questions test
+questions, each only if its article is in the dump under that title. So
+that they are spread over many articles, at most PER_ARTICLE questions
+are taken of any one article, chosen with a fixed seed; then each
+source's are shuffled with a fixed seed, and the first 500 of each are
+measured and the next 500 warm up.
 """
 
 import hashlib
@@ -40,12 +43,15 @@ import random
 import sys
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import unquote
 
 import pyarrow.parquet as pq
 
 PASSAGES = 1_000_000
 MEASURED, WARMUP = 500, 500
 WORDS = (60, 300)
+# The most questions taken of one article, measured and warm-up together.
+PER_ARTICLE = 5
 # Articles whose title hashes below this share of the space are kept as
 # candidates to fill with, so the whole dump need not be held at once.
 CANDIDATES = 0.12
@@ -70,10 +76,14 @@ def paragraphs(text: str):
 
 def main(src: Path, out: Path):
     out.mkdir(parents=True, exist_ok=True)
-    squad = json.load(open(src / "squad/dev-v2.0.json"))["data"]
+    squad = [
+        article
+        for name in ("train-v2.0.json", "dev-v2.0.json")
+        for article in json.load(open(src / "squad" / name))["data"]
+    ]
     asked = defaultdict(list)  # source -> [(question, title)]
     for article in squad:
-        title = article["title"].replace("_", " ")
+        title = unquote(article["title"]).replace("_", " ")
         for paragraph in article["paragraphs"]:
             for qa in paragraph["qas"]:
                 if not qa.get("is_impossible") and qa["question"].strip():
@@ -127,6 +137,16 @@ def main(src: Path, out: Path):
     for source in ("squad", "nq"):
         pairs = [p for p in asked[source] if p[1] in found]
         left_out[f"{source}: article not in the dump or with no passage"] += len(asked[source]) - len(pairs)
+        of = defaultdict(list)
+        for pair in pairs:
+            of[pair[1]].append(pair)
+        capped = []
+        for title in sorted(of, key=h):
+            questions = sorted(set(of[title]))
+            random.Random(f"bench-{source}-{title}").shuffle(questions)
+            capped.extend(questions[:PER_ARTICLE])
+        left_out[f"{source}: over {PER_ARTICLE} of one article"] += len(pairs) - len(capped)
+        pairs = capped
         random.Random(f"bench-{source}").shuffle(pairs)
         assert len(pairs) >= MEASURED + WARMUP, f"{source}: only {len(pairs)} questions"
         chosen[source] = pairs[: MEASURED + WARMUP]
