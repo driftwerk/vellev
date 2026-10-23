@@ -176,3 +176,71 @@ async fn a_partition_replaying_coded_rows_codes_them_several_at_once() {
     };
     assert_eq!(digest(copy.partition()), digest(writer.partition()));
 }
+
+/// A store that counts the logs and checkpoints fetched from it.
+#[derive(Debug)]
+struct Counting {
+    inner: Arc<dyn Blobs>,
+    heads: AtomicUsize,
+}
+
+#[async_trait]
+impl Blobs for Counting {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        if key.ends_with(".log") || key.ends_with(".manifest") {
+            self.heads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// The heads a copy opened cold fetches, `after` commits made since the
+/// writer last checkpointed a long history.
+async fn heads_fetched_opening(after: u8) -> usize {
+    let cluster = committed_one_by_one().await;
+    let writer = cluster.writer().await;
+    writer.flush().await.unwrap();
+    for n in 1..=after {
+        writer
+            .commit(vec![upsert(NOTES, n, -i64::from(n))])
+            .await
+            .unwrap();
+    }
+    let counting = Arc::new(Counting {
+        inner: cluster.blobs.clone(),
+        heads: AtomicUsize::new(0),
+    });
+    let copy = Follower::open_through(
+        cluster.key.clone(),
+        counting.clone(),
+        cluster.coordinator.clone(),
+        &cluster.committed().await,
+    )
+    .await
+    .unwrap();
+    for n in 1..=after {
+        assert_eq!(
+            copy.partition().read(|state| n_of(state, NOTES, n)),
+            Some(-i64::from(n))
+        );
+    }
+    counting.heads.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn a_cold_open_fetches_no_log_from_before_the_newest_checkpoint() {
+    // The logs since the checkpoint, and the checkpoint: none before it,
+    // though the coordinator lists a hundred commits before it.
+    assert_eq!(heads_fetched_opening(3).await, 4);
+    // A checkpoint at the head: that alone.
+    assert_eq!(heads_fetched_opening(0).await, 1);
+}
