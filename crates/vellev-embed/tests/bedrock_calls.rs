@@ -34,6 +34,9 @@ struct Seen {
     calls: AtomicUsize,
     /// To each region: in flight now, and the most.
     regions: Mutex<HashMap<String, (usize, usize)>>,
+    /// Whether texts that say they are held are answered now.
+    released: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
 }
 
 impl Seen {
@@ -48,6 +51,28 @@ impl Seen {
         regions.get(region).map_or(0, |(_, most)| *most)
     }
 
+    /// How many calls are in flight to `region` now.
+    fn now_to(&self, region: &str) -> usize {
+        let regions = self.regions.lock().unwrap();
+        regions.get(region).map_or(0, |(now, _)| *now)
+    }
+
+    /// Waits until held texts are released.
+    async fn held(&self) {
+        loop {
+            let released = self.release.notified();
+            if self.released.load(Ordering::SeqCst) {
+                return;
+            }
+            released.await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+
     fn to(&self, region: &str, by: isize) {
         let mut regions = self.regions.lock().unwrap();
         let (now, most) = regions.entry(region.to_string()).or_default();
@@ -56,8 +81,9 @@ impl Seen {
     }
 }
 
-/// Titan, taking 50 ms a text, and a second over one that says it is
-/// slow: in every region but those that never answer. The region a
+/// Titan, taking 50 ms a text, a second over one that says it is slow,
+/// and answering one that says it is held once held texts are released:
+/// in every region but those that never answer. The region a
 /// call is to is the one it was signed for.
 fn titan(seen: Arc<Seen>) -> Router {
     let invoke = |State(seen): State<Arc<Seen>>, headers: HeaderMap, Json(body): Json<Value>| async move {
@@ -76,6 +102,9 @@ fn titan(seen: Arc<Seen>) -> Router {
         if region.starts_with("us-") {
             std::future::pending::<()>().await;
         }
+        if text.starts_with("held") {
+            seen.held().await;
+        }
         let slow = text.starts_with("slow");
         tokio::time::sleep(Duration::from_millis(if slow { 1_000 } else { 50 })).await;
         seen.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -89,6 +118,14 @@ fn titan(seen: Arc<Seen>) -> Router {
     Router::new()
         .route("/model/{model}/invoke", post(invoke))
         .with_state(seen)
+}
+
+/// Waits until `now` holds: what nothing waits for ever for, as the
+/// test's own bound sees to.
+async fn until(now: impl Fn() -> bool) {
+    while !now() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 fn through_bedrock(region: &str, dimensions: u32) -> Embedding {
@@ -207,18 +244,17 @@ async fn one_region(seen: Arc<Seen>) {
     // What is held for Titan is not forgotten while it is written
     // through, however many other models are asked for meanwhile: and
     // forgotten once it is not, it is held afresh with the same calls.
-    let slow = writing(&embedders, &models[0], texts("slow", 16));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let documents = || seen.documents.load(Ordering::SeqCst);
+    let slow = writing(&embedders, &models[0], texts("held", 16));
+    until(|| documents() == 8).await;
     for model in 0..200 {
         embedders.embedder(&through_an_endpoint(model)).unwrap();
     }
-    let again = writing(&embedders, &models[0], texts("slow", 16));
-    let another = writing(&embedders, &models[2], texts("slow", 16));
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(seen.documents.load(Ordering::SeqCst), 8);
+    let again = writing(&embedders, &models[0], texts("held", 16));
+    let another = writing(&embedders, &models[2], texts("held", 16));
     // The two calls kept for queries are still kept, whichever of the
-    // models a query is for.
-    let began = std::time::Instant::now();
+    // models a query is for: the documents are held until the queries
+    // are answered, and a query that waited on them would never be.
     let query = |model: &Embedding, text: &str| {
         let embedder = embedders.embedder(model).unwrap().unwrap();
         let text = text.to_string();
@@ -229,8 +265,8 @@ async fn one_region(seen: Arc<Seen>) {
         query(&models[2], "query two")
     );
     assert_eq!(sizes, (512, 1024));
-    let took = began.elapsed();
-    assert!(took < Duration::from_millis(800), "two took {took:?}");
+    assert_eq!(documents(), 8, "no more than the documents' calls");
+    seen.release();
     for write in [slow, again, another] {
         assert_eq!(write.await.unwrap(), Ok(16));
     }
@@ -299,26 +335,19 @@ async fn all_but_one_stopped(seen: Arc<Seen>) {
             }));
         }
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    for region in ["us-west-1", "us-east-1", "us-east-2"] {
+        until(|| seen.now_to(region) == 2).await;
+    }
 
-    let began = std::time::Instant::now();
+    // What is written and searched through the fifth is answered: were
+    // it to wait on a call of a stopped region's, it would never be.
     let write = writing(&embedders, &well, texts("text", 4));
     let embedder = embedders.embedder(&well).unwrap().unwrap();
     assert_eq!(
         embedder.query("query one").await.map(|made| made.is_some()),
         Ok(true)
     );
-    let searched = began.elapsed();
-    assert!(
-        searched < Duration::from_millis(800),
-        "it took {searched:?}"
-    );
     assert_eq!(write.await.unwrap(), Ok(4));
-    let written = began.elapsed();
-    assert!(
-        written < Duration::from_millis(1_500),
-        "it took {written:?}"
-    );
     for region in ["us-west-1", "us-east-1", "us-east-2"] {
         assert_eq!(seen.most_to(region), 2, "{region}");
     }
@@ -355,12 +384,12 @@ async fn one_stopped(seen: Arc<Seen>) {
                 .map(|made| made.map_or(0, |made| made.len()))
         }));
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    until(|| seen.now_to(STOPPED) == 5).await;
     assert_eq!(seen.most_to(STOPPED), 5, "its half of the node's ten");
 
-    // Through the other, a write and searches are answered in about
-    // their own time: 16 texts, four at a time at 50 ms, and two queries.
-    let began = std::time::Instant::now();
+    // Through the other, a write and searches are answered as if nothing
+    // were wrong: were they to wait on a call of the stopped region's,
+    // they would never be, as nothing here waits for ever.
     let write = writing(&embedders, &well, texts("text", 16));
     let query = |text: &str| {
         let embedder = embedders.embedder(&well).unwrap().unwrap();
@@ -373,17 +402,7 @@ async fn one_stopped(seen: Arc<Seen>) {
         }
     };
     assert_eq!(query("query one").await, Ok(Some(256)));
-    let searched = began.elapsed();
-    assert!(
-        searched < Duration::from_millis(800),
-        "it took {searched:?}"
-    );
     assert_eq!(write.await.unwrap(), Ok(16));
-    let written = began.elapsed();
-    assert!(
-        written < Duration::from_millis(1_500),
-        "it took {written:?}"
-    );
     assert_eq!(query("query two").await, Ok(Some(256)));
 
     // Each region has had its half and no more, and the node its ten.

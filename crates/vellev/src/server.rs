@@ -191,6 +191,7 @@ impl App {
     pub fn start(&self, node: Arc<Node>) {
         if self.serve_from(node.clone()) {
             node.announcing();
+            node.warming();
             node.sweeping();
             node.backing_up();
             node.purging();
