@@ -8,7 +8,7 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -47,77 +47,88 @@ pub fn tokio() -> Arc<dyn Clock> {
     Arc::new(Tokio)
 }
 
-/// A clock a test moves by hand. It starts where tokio's clock was when
-/// it was made, and stands still until moved.
-#[derive(Debug)]
-pub struct Manual {
-    started: Instant,
-    state: Mutex<State>,
-}
+#[cfg(any(test, feature = "test-clock"))]
+pub use manual::Manual;
 
-#[derive(Debug, Default)]
-struct State {
-    gone: Duration,
-    asleep: Vec<(Instant, tokio::sync::oneshot::Sender<()>)>,
-}
+#[cfg(any(test, feature = "test-clock"))]
+mod manual {
+    use super::{Clock, Sleep};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
-impl Manual {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            started: Instant::now(),
-            state: Mutex::new(State::default()),
-        })
+    /// A clock a test moves by hand. It starts where tokio's clock was when
+    /// it was made, and stands still until moved.
+    #[derive(Debug)]
+    pub struct Manual {
+        started: Instant,
+        state: Mutex<State>,
     }
 
-    /// How far it has been moved.
-    pub fn gone(&self) -> Duration {
-        self.state.lock().expect("clock lock").gone
+    #[derive(Debug, Default)]
+    struct State {
+        gone: Duration,
+        asleep: Vec<(Instant, tokio::sync::oneshot::Sender<()>)>,
     }
 
-    /// When each sleep still waited on ends, earliest first. A sleep no
-    /// longer waited on, its waiter having gone on without it, is not
-    /// counted.
-    pub fn asleep(&self) -> Vec<Instant> {
-        let mut state = self.state.lock().expect("clock lock");
-        state.asleep.retain(|(_, woken)| !woken.is_closed());
-        let mut ends: Vec<Instant> = state.asleep.iter().map(|(at, _)| *at).collect();
-        ends.sort();
-        ends
-    }
+    impl Manual {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                started: Instant::now(),
+                state: Mutex::new(State::default()),
+            })
+        }
 
-    /// Moves the clock to `at`, if that is later, waking every sleep that
-    /// ends by then.
-    pub fn move_to(&self, at: Instant) {
-        let mut state = self.state.lock().expect("clock lock");
-        let gone = at.saturating_duration_since(self.started);
-        state.gone = state.gone.max(gone);
-        let now = self.started + state.gone;
-        let (due, still): (Vec<_>, Vec<_>) = std::mem::take(&mut state.asleep)
-            .into_iter()
-            .partition(|(at, _)| *at <= now);
-        state.asleep = still;
-        drop(state);
-        for (_, woken) in due {
-            let _ = woken.send(());
+        /// How far it has been moved.
+        pub fn gone(&self) -> Duration {
+            self.state.lock().expect("clock lock").gone
+        }
+
+        /// When each sleep still waited on ends, earliest first. A sleep no
+        /// longer waited on, its waiter having gone on without it, is not
+        /// counted.
+        pub fn asleep(&self) -> Vec<Instant> {
+            let mut state = self.state.lock().expect("clock lock");
+            state.asleep.retain(|(_, woken)| !woken.is_closed());
+            let mut ends: Vec<Instant> = state.asleep.iter().map(|(at, _)| *at).collect();
+            ends.sort();
+            ends
+        }
+
+        /// Moves the clock to `at`, if that is later, waking every sleep that
+        /// ends by then.
+        pub fn move_to(&self, at: Instant) {
+            let mut state = self.state.lock().expect("clock lock");
+            let gone = at.saturating_duration_since(self.started);
+            state.gone = state.gone.max(gone);
+            let now = self.started + state.gone;
+            let (due, still): (Vec<_>, Vec<_>) = std::mem::take(&mut state.asleep)
+                .into_iter()
+                .partition(|(at, _)| *at <= now);
+            state.asleep = still;
+            drop(state);
+            for (_, woken) in due {
+                let _ = woken.send(());
+            }
         }
     }
-}
 
-impl Clock for Manual {
-    fn now(&self) -> Instant {
-        self.started + self.state.lock().expect("clock lock").gone
-    }
-
-    fn sleep_until(&self, at: Instant) -> Sleep {
-        let mut state = self.state.lock().expect("clock lock");
-        if at <= self.started + state.gone {
-            return Box::pin(std::future::ready(()));
+    impl Clock for Manual {
+        fn now(&self) -> Instant {
+            self.started + self.state.lock().expect("clock lock").gone
         }
-        let (woken, wakes) = tokio::sync::oneshot::channel();
-        state.asleep.push((at, woken));
-        Box::pin(async move {
-            let _ = wakes.await;
-        })
+
+        fn sleep_until(&self, at: Instant) -> Sleep {
+            let mut state = self.state.lock().expect("clock lock");
+            if at <= self.started + state.gone {
+                return Box::pin(std::future::ready(()));
+            }
+            let (woken, wakes) = tokio::sync::oneshot::channel();
+            state.asleep.push((at, woken));
+            Box::pin(async move {
+                let _ = wakes.await;
+            })
+        }
     }
 }
 
