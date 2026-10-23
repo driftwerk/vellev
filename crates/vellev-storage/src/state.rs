@@ -2354,4 +2354,54 @@ mod tests {
         };
         assert_eq!(ranked(&index(&built)), ranked(&index(&plain)));
     }
+
+    /// Codes prepared from one state are not stored by another, however
+    /// alike the two have been changed: a state replaced, as a writer's is
+    /// when it reopens or restores, is coded about its own centre.
+    #[test]
+    fn codes_prepared_from_one_state_are_not_stored_by_another() {
+        let index = |built: &Built| -> BinaryIndex {
+            match &built.state.memtable.indexes[&CollectionId(0)].vectors {
+                Some(Vectors::Binary(codes)) => codes.clone(),
+                _ => panic!("coded"),
+            }
+        };
+        // Alike in every count, coded about different centres.
+        let mut one = Built::new(&["notes"]);
+        one.commit((0..1_100).map(|n| upsert(0, n, n as i64)).collect());
+        let mut other = Built::new(&["notes"]);
+        other.commit((0..1_100).map(|n| upsert(0, n, -(n as i64) - 7)).collect());
+        assert_ne!(index(&one).centre(), index(&other).centre());
+        let late = vec![upsert(0, 9_999, 77)];
+        let position = other.state.position().next().unwrap();
+        let log = LogSegment {
+            position,
+            prev: other.state.head().map(str::to_string),
+            ops: late.clone(),
+            answered: Vec::new(),
+        };
+        let prepared = one.state.prepared(&log);
+        other
+            .state
+            .apply_prepared(&format!("log-{}", position.0), &log, prepared)
+            .unwrap();
+        let mut plain = Built::new(&["notes"]);
+        plain.commit((0..1_100).map(|n| upsert(0, n, -(n as i64) - 7)).collect());
+        plain.commit(late);
+        let query = [0.3f32, -0.9];
+        let ranked = |codes: &BinaryIndex| {
+            codes
+                .estimates(
+                    &query,
+                    10_000,
+                    None,
+                    &[],
+                    &vellev_index::vector::in_row_order,
+                )
+                .into_iter()
+                .map(|(estimate, _)| estimate.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranked(&index(&other)), ranked(&index(&plain)));
+    }
 }
