@@ -8,7 +8,7 @@ use vellev_core::{
 };
 use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
-use vellev_index::text::TextIndex;
+use vellev_index::text::{TextIndex, Tokenized};
 use vellev_index::vector::{BinaryIndex, Coded, Ties, VectorIndex};
 
 use crate::answers::Answers;
@@ -306,6 +306,9 @@ pub(crate) struct Loaded {
     pub vectors: Arc<Column>,
     pub indexes: Option<Arc<Indexes>>,
     pub stored: Stored,
+    /// How many threads split its rows' text at once, at the most, as its
+    /// indexes were built here: 0 if they were not.
+    pub tokenized_on: usize,
 }
 
 impl Loaded {
@@ -315,15 +318,17 @@ impl Loaded {
             vectors: Arc::new(vectors),
             indexes: None,
             stored,
+            tokenized_on: 0,
         }
     }
 
     /// The segment with its indexes built, under the collections of
     /// `catalog`, so that building them need not wait for other segments.
     pub fn indexed_now(self, key: &str, catalog: &Catalog) -> Result<Self> {
-        let indexes = self.indexed(key, catalog)?;
+        let (indexes, tokenized_on) = self.indexed_on(key, catalog)?;
         Ok(Self {
             indexes: Some(indexes),
+            tokenized_on,
             ..self
         })
     }
@@ -336,6 +341,12 @@ impl Loaded {
     /// the collection back: they are then built again, keeping whatever
     /// clustered indexes they had.
     fn indexed(&self, key: &str, catalog: &Catalog) -> Result<Arc<Indexes>> {
+        self.indexed_on(key, catalog).map(|(indexes, _)| indexes)
+    }
+
+    /// As [`Self::indexed`], with how many threads split the rows' text at
+    /// once, at the most, if they were built here.
+    fn indexed_on(&self, key: &str, catalog: &Catalog) -> Result<(Arc<Indexes>, usize)> {
         if self.vectors.len() != self.file.rows.len() {
             return Err(StorageError::corrupt(
                 key,
@@ -354,18 +365,13 @@ impl Loaded {
                     "a segment's stored index is not used"
                 );
             };
-            Arc::new(indexed(
-                catalog,
-                &self.file.rows,
-                column,
-                stored,
-                unused,
-                None,
-            ))
+            let (indexes, threads) =
+                indexed_on(catalog, &self.file.rows, column, stored, unused, None);
+            (Arc::new(indexes), threads)
         };
         Ok(match &self.indexes {
             Some(indexes) if self.lacking(indexes, catalog) => built(&stored(key, indexes).into()),
-            Some(indexes) => indexes.clone(),
+            Some(indexes) => (indexes.clone(), 0),
             None => built(&self.stored),
         })
     }
@@ -501,6 +507,21 @@ impl Default for Coding {
 pub(crate) struct Prepared {
     coding: Option<Coding>,
     codes: HashMap<usize, Option<Coded>>,
+    /// Each upsert's text split into tokens, with the searchable properties
+    /// of its collection it was split by: used only if they are still the
+    /// searchable properties as the upsert is applied.
+    texts: HashMap<usize, (Vec<String>, Tokenized)>,
+}
+
+/// The searchable properties of `schema`, in its order: what splitting an
+/// object's text into tokens depends on.
+fn searchable(schema: &Collection) -> Vec<String> {
+    schema
+        .properties
+        .iter()
+        .filter(|property| property.searchable)
+        .map(|property| property.name.clone())
+        .collect()
 }
 
 /// The memtable a flush keeps, made before the state is locked to adopt
@@ -648,12 +669,37 @@ pub(crate) fn indexed<'a>(
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
 ) -> Indexes {
+    indexed_on(catalog, rows, vector_of, stored, unused, clustered_above).0
+}
+
+/// As [`indexed`], with how many threads split the rows' text at once, at
+/// the most. The text of every row is split on several threads first, and
+/// then indexed in row order, which is what indexing each row in turn
+/// makes.
+pub(crate) fn indexed_on<'a>(
+    catalog: &Catalog,
+    rows: &'a [Row],
+    vector_of: impl Fn(usize) -> Option<&'a [f32]>,
+    stored: &Stored,
+    unused: impl Fn(CollectionId, Unfit),
+    clustered_above: Option<usize>,
+) -> (Indexes, usize) {
+    use rayon::prelude::*;
+    let threads = Threads::default();
+    let tokenized: Vec<Option<Tokenized>> = rows
+        .par_iter()
+        .map(|Row { collection, object }| {
+            let schema = catalog.schema(*collection)?;
+            Some(threads.on(|| TextIndex::tokenize(schema, object)))
+        })
+        .collect();
     let mut indexes = Indexes::new();
     let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
-    for (row, Row { collection, object }) in rows.iter().enumerate() {
-        if let Some(schema) = catalog.schema(*collection) {
+    for ((row, Row { collection, object }), tokenized) in rows.iter().enumerate().zip(tokenized) {
+        if let (Some(schema), Some(tokenized)) = (catalog.schema(*collection), tokenized) {
             let index = indexes.entry(*collection).or_default();
-            index.insert(schema, row as u32, object);
+            index.rows.insert(schema, row as u32, object);
+            index.text.insert_tokenized(row as u32, tokenized);
             if let Some(vector) = vector_of(row) {
                 vectors
                     .entry(*collection)
@@ -687,7 +733,30 @@ pub(crate) fn indexed<'a>(
     for index in indexes.values_mut() {
         index.rows.summarise();
     }
-    indexes
+    (indexes, threads.most())
+}
+
+/// How many threads were at some work at once, at the most.
+#[derive(Debug, Default)]
+pub(crate) struct Threads {
+    now: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl Threads {
+    /// Run `work`, counted as one thread at it while it runs.
+    pub(crate) fn on<T>(&self, work: impl FnOnce() -> T) -> T {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = self.now.fetch_add(1, Relaxed) + 1;
+        self.most.fetch_max(now, Relaxed);
+        let done = work();
+        self.now.fetch_sub(1, Relaxed);
+        done
+    }
+
+    pub(crate) fn most(&self) -> usize {
+        self.most.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Whether indexing `rows` with `clustered_above` builds any clustered
@@ -1021,6 +1090,7 @@ impl State {
                 vectors: segment.vectors.clone(),
                 indexes: Some(segment.indexes.clone()),
                 stored: Stored::default(),
+                tokenized_on: 0,
             };
             (segment.meta.key.as_str(), loaded)
         })
@@ -1200,9 +1270,25 @@ impl State {
                 _ => None,
             })
             .collect();
+        let texts = log
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(at, op)| match op {
+                Op::Upsert { collection, object } => {
+                    let schema = self.catalog.schema(*collection)?;
+                    Some((
+                        at,
+                        (searchable(schema), TextIndex::tokenize(schema, object)),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
         Prepared {
             coding: Some(self.memtable.coding),
             codes,
+            texts,
         }
     }
 
@@ -1265,9 +1351,16 @@ impl State {
                     //
                     // A collection dropped later in the same commit is
                     // already gone from the catalog; its rows go unindexed.
+                    let text = prepared.texts.remove(&op_at);
                     let index = self.catalog.schema(*collection).map(|schema| {
                         let index = self.memtable.indexes.entry(*collection).or_default();
-                        index.insert(schema, row as u32, object);
+                        match text.filter(|(by, _)| *by == searchable(schema)) {
+                            Some((_, tokenized)) => {
+                                index.rows.insert(schema, row as u32, object);
+                                index.text.insert_tokenized(row as u32, tokenized);
+                            }
+                            None => index.insert(schema, row as u32, object),
+                        }
                         &*index
                     });
                     self.corpora

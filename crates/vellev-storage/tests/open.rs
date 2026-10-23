@@ -243,3 +243,63 @@ async fn a_segment_loaded_and_commits_replayed_split_their_text_on_several_threa
         );
     }
 }
+
+/// A property added searchable among commits replayed together: the rows
+/// after it are found by its words too, in a copy as in the writer that
+/// applied them one by one, though the commits were split into tokens
+/// together before the property was there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_property_made_searchable_mid_replay_is_searched_from_then_on() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer.commit(vec![create(NOTES)]).await.unwrap();
+    let note = |n: u32| {
+        let mut properties = json!({ "title": "otter hen", "n": n });
+        if n >= 4 {
+            properties["body"] = json!("otter");
+        }
+        Mutation::Upsert {
+            collection: name(NOTES),
+            id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+            properties: properties.as_object().unwrap().clone(),
+            vector: None,
+            only_if_version: None,
+        }
+    };
+    for n in 0..4u32 {
+        writer.commit(vec![note(n)]).await.unwrap();
+    }
+    writer
+        .commit(vec![Mutation::AddProperty {
+            collection: name(NOTES),
+            property: Property::new("body", DataType::Text).searchable(),
+        }])
+        .await
+        .unwrap();
+    for n in 4..8u32 {
+        writer.commit(vec![note(n)]).await.unwrap();
+    }
+    let copy = Follower::open_through(
+        cluster.key.clone(),
+        cluster.blobs.clone(),
+        cluster.coordinator.clone(),
+        &cluster.committed().await,
+    )
+    .await
+    .unwrap();
+    let found = |state: &State| {
+        let mut ids: Vec<u128> = state
+            .keyword(
+                &name(NOTES),
+                &vellev_storage::Keywords::matching("otter", 50),
+            )
+            .unwrap()
+            .iter()
+            .map(|scored| scored.object.id.0.as_u128())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(writer.partition().read(found), [4, 5, 6, 7]);
+    assert_eq!(copy.partition().read(found), [4, 5, 6, 7]);
+}

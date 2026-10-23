@@ -227,49 +227,63 @@ pub struct TextIndex {
 /// that many rows can be tokenized at once and then indexed in order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Tokenized {
-    /// Each searchable property with text: its name, how many words it
-    /// has, and how often each token not a stopword occurs.
-    fields: Vec<(String, u32, Vec<(String, u32)>)>,
+    fields: Vec<TokenizedField>,
+}
+
+/// One searchable property's text in a row: its name, how many words it
+/// has, and how often each token not a stopword occurs.
+#[derive(Debug, Clone, PartialEq)]
+struct TokenizedField {
+    name: String,
+    length: u32,
+    frequencies: Vec<(String, u32)>,
 }
 
 impl TextIndex {
     /// `object`'s searchable text as [`Self::insert`] would index it.
     pub fn tokenize(collection: &Collection, object: &Object) -> Tokenized {
-        let _ = (collection, object);
-        unimplemented!("burst plan, open CPU")
-    }
-
-    /// Record a row tokenized as [`Self::tokenize`] does, as row `row`:
-    /// rows must come in ascending order, as for [`Self::insert`].
-    pub fn insert_tokenized(&mut self, row: u32, tokenized: Tokenized) {
-        let _ = (row, tokenized);
-        unimplemented!("burst plan, open CPU")
-    }
-
-    /// Record `object` as row `row`, indexing its searchable properties.
-    pub fn insert(&mut self, collection: &Collection, row: u32, object: &Object) {
         let searchable = object.properties.iter().filter(|(name, _)| {
             collection
                 .property(name)
                 .is_some_and(|property| property.searchable)
         });
-        for (name, value) in searchable {
-            let texts: &[String] = match value {
-                Value::Text(text) => std::slice::from_ref(text),
-                Value::TextArray(texts) => texts,
-                _ => continue,
-            };
-            let mut frequencies: HashMap<String, u32> = HashMap::new();
-            let mut length = 0;
-            for word in texts.iter().flat_map(|text| words(text)) {
-                length += 1;
-                if !is_stopword(&word) {
-                    *frequencies.entry(word).or_default() += 1;
+        let fields = searchable
+            .filter_map(|(name, value)| {
+                let texts: &[String] = match value {
+                    Value::Text(text) => std::slice::from_ref(text),
+                    Value::TextArray(texts) => texts,
+                    _ => return None,
+                };
+                let mut frequencies: HashMap<String, u32> = HashMap::new();
+                let mut length = 0;
+                for word in texts.iter().flat_map(|text| words(text)) {
+                    length += 1;
+                    if !is_stopword(&word) {
+                        *frequencies.entry(word).or_default() += 1;
+                    }
                 }
-            }
-            let field = match self.fields.get_mut(name) {
+                Some(TokenizedField {
+                    name: name.clone(),
+                    length,
+                    frequencies: frequencies.into_iter().collect(),
+                })
+            })
+            .collect();
+        Tokenized { fields }
+    }
+
+    /// Record a row tokenized as [`Self::tokenize`] does, as row `row`:
+    /// rows must come in ascending order, as for [`Self::insert`].
+    pub fn insert_tokenized(&mut self, row: u32, tokenized: Tokenized) {
+        for TokenizedField {
+            name,
+            length,
+            frequencies,
+        } in tokenized.fields
+        {
+            let field = match self.fields.get_mut(&name) {
                 Some(field) => field,
-                None => self.fields.entry(name.clone()).or_default(),
+                None => self.fields.entry(name).or_default(),
             };
             let holder = field.rows.len() as u32;
             field.rows.push(row);
@@ -282,6 +296,11 @@ impl TextIndex {
                     .push(holder, frequency, length);
             }
         }
+    }
+
+    /// Record `object` as row `row`, indexing its searchable properties.
+    pub fn insert(&mut self, collection: &Collection, row: u32, object: &Object) {
+        self.insert_tokenized(row, Self::tokenize(collection, object));
     }
 
     pub fn field(&self, property: &str) -> Option<&Field> {

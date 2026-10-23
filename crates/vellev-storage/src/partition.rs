@@ -570,10 +570,11 @@ impl Partition {
                                 made
                             })
                             .collect();
+                        let most = most.into_inner();
+                        let mut replayed = self.replayed.lock().expect("replayed lock");
+                        replayed.tokenized_on_threads = replayed.tokenized_on_threads.max(most);
                         if state.coding_anything() {
-                            let mut replayed = self.replayed.lock().expect("replayed lock");
-                            replayed.coded_on_threads =
-                                replayed.coded_on_threads.max(most.into_inner());
+                            replayed.coded_on_threads = replayed.coded_on_threads.max(most);
                         }
                         prepared
                     });
@@ -689,6 +690,15 @@ impl Partition {
                     .await?
             }
         };
+        let tokenized_on = segments
+            .iter()
+            .map(|loaded: &Loaded| loaded.tokenized_on)
+            .max()
+            .unwrap_or(0);
+        {
+            let mut replayed = self.replayed.lock().expect("replayed lock");
+            replayed.tokenized_on_threads = replayed.tokenized_on_threads.max(tokenized_on);
+        }
         let replay = try_join_all(manifest.replay.iter().map(|key| async move {
             let log: LogSegment = decode(key, Kind::Log, &self.fetch(key).await?)?;
             Ok::<_, StorageError>((key.clone(), log))
@@ -2131,6 +2141,7 @@ impl Writer {
             vectors: Arc::new(vectors),
             indexes: Some(Arc::new(built.indexes)),
             stored: Stored::default(),
+            tokenized_on: 0,
         };
         Ok((meta, loaded))
     }
