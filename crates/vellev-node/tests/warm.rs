@@ -210,3 +210,32 @@ async fn a_node_stopping_remembers_what_it_served() {
     again.warming();
     assert!(soon(|| again.copies() == 1).await, "{}", again.copies());
 }
+
+#[tokio::test]
+async fn a_node_warms_no_tenant_it_does_not_serve() {
+    let shared = Shared::new();
+    let first = shared.node(16);
+    written(&first, &["acme", "beta"]).await;
+    for name in ["acme", "beta"] {
+        first
+            .reader(&tenant(name), Freshness::Eventual)
+            .await
+            .unwrap();
+    }
+    first.shutdown().await;
+    let again = Node::new(
+        shared.coordinator.clone(),
+        shared.blobs.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            warm: Some(shared.dir.path().join("warm-tenants.json")),
+            warm_most: 16,
+            served: vellev_node::Served::Only([tenant("acme")].into_iter().collect()),
+            ..Settings::new(NodeId::generate("node"))
+        },
+    );
+    again.warming();
+    assert!(soon(|| again.copies() == 1).await, "{}", again.copies());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(again.copies(), 1, "only the tenant it serves");
+}
