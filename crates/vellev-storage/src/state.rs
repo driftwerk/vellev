@@ -664,7 +664,7 @@ impl Snapshot {
 pub(crate) fn indexed<'a>(
     catalog: &Catalog,
     rows: &'a [Row],
-    vector_of: impl Fn(usize) -> Option<&'a [f32]>,
+    vector_of: impl Fn(usize) -> Option<&'a [f32]> + Sync,
     stored: &Stored,
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
@@ -679,7 +679,7 @@ pub(crate) fn indexed<'a>(
 pub(crate) fn indexed_on<'a>(
     catalog: &Catalog,
     rows: &'a [Row],
-    vector_of: impl Fn(usize) -> Option<&'a [f32]>,
+    vector_of: impl Fn(usize) -> Option<&'a [f32]> + Sync,
     stored: &Stored,
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
@@ -693,20 +693,42 @@ pub(crate) fn indexed_on<'a>(
             Some(threads.on(|| TextIndex::tokenize(schema, object)))
         })
         .collect();
-    let mut indexes = Indexes::new();
-    let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
-    for ((row, Row { collection, object }), tokenized) in rows.iter().enumerate().zip(tokenized) {
-        if let (Some(schema), Some(tokenized)) = (catalog.schema(*collection), tokenized) {
-            let index = indexes.entry(*collection).or_default();
-            index.rows.insert(schema, row as u32, object);
-            index.text.insert_tokenized(row as u32, tokenized);
-            if let Some(vector) = vector_of(row) {
-                vectors
-                    .entry(*collection)
-                    .or_default()
-                    .push((row as u32, vector));
+    // The filterable values and vectors on one thread, the text on
+    // another: each in row order, as indexing each row in turn makes them.
+    let ((mut indexes, vectors), texts) = rayon::join(
+        || {
+            let mut indexes = Indexes::new();
+            let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
+            for (row, Row { collection, object }) in rows.iter().enumerate() {
+                if let Some(schema) = catalog.schema(*collection) {
+                    let index = indexes.entry(*collection).or_default();
+                    index.rows.insert(schema, row as u32, object);
+                    if let Some(vector) = vector_of(row) {
+                        vectors
+                            .entry(*collection)
+                            .or_default()
+                            .push((row as u32, vector));
+                    }
+                }
             }
-        }
+            (indexes, vectors)
+        },
+        || {
+            let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
+            for ((row, Row { collection, .. }), tokenized) in rows.iter().enumerate().zip(tokenized)
+            {
+                if let Some(tokenized) = tokenized {
+                    texts
+                        .entry(*collection)
+                        .or_default()
+                        .insert_tokenized(row as u32, tokenized);
+                }
+            }
+            texts
+        },
+    );
+    for (collection, text) in texts {
+        indexes.entry(collection).or_default().text = text;
     }
     for (collection, vectors) in vectors.iter().filter(|(_, v)| v.len() > SHORTLIST_ABOVE) {
         let Some((index, schema)) = indexes.get_mut(collection).zip(catalog.schema(*collection))
