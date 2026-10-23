@@ -70,6 +70,10 @@ pub(crate) struct Warm {
     task: Mutex<Option<JoinHandle<()>>>,
     /// Whether warming is opening copies now.
     opening: AtomicBool,
+    /// Whether warming has begun and not yet read the list: until it has,
+    /// the list is not written over, for what the node holds is not yet
+    /// what it had.
+    unread: AtomicBool,
     /// What the list named that warming has yet to come to: kept on the
     /// list should the node stop first.
     unwarmed: Mutex<Vec<Entry>>,
@@ -88,11 +92,13 @@ impl Node {
             return;
         };
         let node = self.clone();
+        self.0.warm.unread.store(true, Ordering::SeqCst);
         let task = tokio::spawn(async move {
             let most = node.0.settings.warm_most;
             let opening = Opening::begun(&node);
             let listed = read_list(path, most).await;
             *node.0.warm.unwarmed.lock().expect("warm lock") = listed.clone();
+            node.0.warm.unread.store(false, Ordering::SeqCst);
             node.warm(listed).await;
             node.0.warm.unwarmed.lock().expect("warm lock").clear();
             drop(opening);
@@ -193,6 +199,9 @@ impl Node {
         let Some(path) = self.0.settings.warm.clone() else {
             return;
         };
+        if self.0.warm.unread.load(Ordering::SeqCst) {
+            return;
+        }
         let kept = self.0.warm_list();
         let inner = self.0.clone();
         let written = tokio::task::spawn_blocking(move || {
