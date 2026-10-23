@@ -568,4 +568,42 @@ mod tests {
             }
         }
     }
+
+    /// A row's stopwords count toward its length but are no tokens of the
+    /// index.
+    #[test]
+    fn stopwords_are_counted_and_not_indexed() {
+        use vellev_core::{
+            CollectionName, DataType, Distance, Embedding, EmbeddingProvider, ObjectId, Property,
+        };
+        let collection = Collection {
+            name: CollectionName::new("notes").unwrap(),
+            properties: vec![Property::new("title", DataType::Text).searchable()],
+            embedding: Embedding {
+                provider: EmbeddingProvider::None,
+                model: "m".into(),
+                dimensions: 2,
+                query_prefix: None,
+                document_prefix: None,
+                properties: vec![],
+            },
+            distance: Distance::Cosine,
+            bm25: Bm25::default(),
+            access_rule: None,
+        };
+        let object = Object {
+            id: ObjectId(uuid::Uuid::from_u128(1)),
+            properties: [(
+                "title".to_string(),
+                Value::Text("the fox and the hen".into()),
+            )]
+            .into(),
+            vector: None,
+        };
+        let mut index = TextIndex::default();
+        index.insert(&collection, 0, &object);
+        let field = index.field("title").unwrap();
+        assert!(field.cursor("the").is_none() && field.cursor("and").is_none());
+        assert_eq!(field.holding("fox").next().unwrap().length, 5);
+    }
 }

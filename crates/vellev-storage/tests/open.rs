@@ -255,7 +255,7 @@ async fn a_property_made_searchable_mid_replay_is_searched_from_then_on() {
     writer.commit(vec![create(NOTES)]).await.unwrap();
     let note = |n: u32| {
         let mut properties = json!({ "title": "hen", "n": n });
-        if n >= 4 {
+        if (4..100).contains(&n) {
             properties["body"] = json!("otter");
         }
         Mutation::Upsert {
@@ -266,6 +266,11 @@ async fn a_property_made_searchable_mid_replay_is_searched_from_then_on() {
             only_if_version: None,
         }
     };
+    // Enough commits first that the ones around the property are split
+    // into tokens together with the collection there, as it was before it.
+    for n in 100..116u32 {
+        writer.commit(vec![note(n)]).await.unwrap();
+    }
     for n in 0..4u32 {
         writer.commit(vec![note(n)]).await.unwrap();
     }
