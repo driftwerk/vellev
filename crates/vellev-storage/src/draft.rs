@@ -34,6 +34,7 @@ struct Pending {
     ops: Vec<Op>,
     ends: Vec<usize>,
     texts: HashMap<usize, String>,
+    row_texts: HashMap<RowKey, Option<String>>,
 }
 
 /// An object a commit writes without the vector its collection embeds for
@@ -66,6 +67,11 @@ struct Batch<'a> {
     /// an object of a collection not storing all it embeds, and wants a
     /// vector: the op's object no longer holds all of it.
     texts: HashMap<usize, String>,
+    /// The text to embed for each object of such a collection as its last
+    /// write in the commit, a whole one, left it, or none if that brought
+    /// its vector or had no text: what a change to nothing embedded that
+    /// follows it in the commit is embedded from.
+    row_texts: HashMap<RowKey, Option<String>>,
 }
 
 impl<'a> Draft<'a> {
@@ -76,6 +82,7 @@ impl<'a> Draft<'a> {
             ops: vec![],
             ends: vec![],
             texts: HashMap::new(),
+            row_texts: HashMap::new(),
         };
         Self { state, pending }
     }
@@ -112,6 +119,7 @@ impl<'a> Draft<'a> {
             rows: HashMap::new(),
             ops: vec![],
             texts: HashMap::new(),
+            row_texts: HashMap::new(),
         };
         let outcomes = mutations
             .into_iter()
@@ -122,6 +130,7 @@ impl<'a> Draft<'a> {
             rows,
             ops,
             texts,
+            row_texts,
             ..
         } = batch;
         let before = self.pending.ops.len();
@@ -130,6 +139,7 @@ impl<'a> Draft<'a> {
         self.pending.ops.extend(ops);
         let texts = texts.into_iter().map(|(op, text)| (before + op, text));
         self.pending.texts.extend(texts);
+        self.pending.row_texts.extend(row_texts);
         Ok(outcomes)
     }
 
@@ -251,6 +261,16 @@ impl Batch<'_> {
         }
     }
 
+    /// The text the last whole write of the object in this commit left it
+    /// to be embedded from, if any.
+    fn row_text(&self, key: RowKey) -> Option<String> {
+        self.row_texts
+            .get(&key)
+            .or_else(|| self.draft.pending.row_texts.get(&key))
+            .cloned()
+            .flatten()
+    }
+
     fn collection(&self, name: &CollectionName) -> Result<(CollectionId, Collection)> {
         self.catalog
             .known(name)
@@ -307,12 +327,16 @@ impl Batch<'_> {
     /// otherwise none, to be made before the commit is logged.
     ///
     /// A collection that does not store all it embeds keeps none of that
-    /// text: not here, nor in what the commit logs. So a stored row's text
-    /// cannot be compared with a `whole` object's, which the caller wrote
-    /// in full: that is always embedded afresh, from the text it was given.
-    /// One made from a stored row and a change to it has the vector the
-    /// row has, as the change is refused before here if it changes what is
-    /// embedded.
+    /// text: not in its rows, this commit's included, nor in what the
+    /// commit logs. So no row's text can be compared with another's:
+    /// - A `whole` object, which the caller wrote in full, is always
+    ///   embedded afresh, from the text it was given, and is never taken
+    ///   for unchanged: two whole writes that differ only in that text
+    ///   read the same.
+    /// - One made from the object as it is and a change to it, which is
+    ///   refused before here if it changes what is embedded, has the
+    ///   object's vector; or, if the object has none yet, as a whole write
+    ///   earlier in the commit left it, is embedded from that write's text.
     fn write(
         &mut self,
         collection: CollectionId,
@@ -327,20 +351,30 @@ impl Batch<'_> {
         let mut text = None;
         if !supplied && embedding.provider != EmbeddingProvider::None {
             let embedded = next.embedded_text(embedding);
-            next.vector = match unstored && whole {
-                true => None,
-                false => [self.row(key), self.draft.state.row(collection, next.id)]
-                    .into_iter()
-                    .flatten()
-                    .filter(|stored| stored.object.embedded_text(embedding) == embedded)
-                    .find_map(|stored| stored.vector.map(<[f32]>::to_vec)),
-            };
-            text = (unstored && whole && !embedded.trim().is_empty()).then_some(embedded);
+            match (unstored, whole) {
+                (true, true) => {
+                    next.vector = None;
+                    text = Some(embedded).filter(|text| !text.trim().is_empty());
+                }
+                (true, false) if next.vector.is_none() => text = self.row_text(key),
+                (true, false) => {}
+                (false, _) => {
+                    next.vector = [self.row(key), self.draft.state.row(collection, next.id)]
+                        .into_iter()
+                        .flatten()
+                        .filter(|stored| stored.object.embedded_text(embedding) == embedded)
+                        .find_map(|stored| stored.vector.map(<[f32]>::to_vec));
+                }
+            }
         }
         if unstored {
             next = schema.stripped(next);
+            if whole {
+                self.row_texts.insert(key, text.clone());
+            }
         }
-        if self.row(key).is_some_and(|stored| stored.is(&next)) {
+        let afresh = unstored && whole && !supplied;
+        if !afresh && self.row(key).is_some_and(|stored| stored.is(&next)) {
             return Outcome::Unchanged;
         }
         if let Some(text) = text {
@@ -519,6 +553,7 @@ impl Batch<'_> {
 
     fn delete(&mut self, collection: CollectionId, id: ObjectId) {
         self.rows.insert((collection, id), None);
+        self.row_texts.insert((collection, id), None);
         self.ops.push(Op::Delete { collection, id });
     }
 
