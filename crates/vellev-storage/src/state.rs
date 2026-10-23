@@ -513,7 +513,7 @@ pub(crate) struct Prepared {
     /// Each upsert's text split into tokens, with the searchable properties
     /// of its collection it was split by: used only if they are still the
     /// searchable properties as the upsert is applied.
-    texts: HashMap<usize, (Vec<String>, Tokenized)>,
+    texts: HashMap<usize, (std::sync::Arc<Vec<String>>, Tokenized)>,
 }
 
 /// The searchable properties of `schema`, in its order: what splitting an
@@ -600,6 +600,20 @@ pub struct State {
     /// in the memtable and in no segment.
     since: Vec<String>,
     answers: Answers,
+    texts_applied: TextsApplied,
+}
+
+/// How the text of the upserts a state applied was split into tokens: by
+/// [`State::prepared`], before the state was locked, or under the lock,
+/// because it was not prepared or the searchable properties it was split
+/// by had changed. Counted so a test can hold that prepared tokens are
+/// used, and not split again under the lock.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TextsApplied {
+    /// Upserts indexed with the tokens prepared for them.
+    pub prepared: usize,
+    /// Upserts whose text was split into tokens under the lock.
+    pub under_lock: usize,
 }
 
 /// What a flush takes out of the memtable: freeing it takes long enough
@@ -816,6 +830,12 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
 }
 
 impl State {
+    /// How the text of the upserts this state applied was split into
+    /// tokens: see [`TextsApplied`].
+    pub fn texts_applied(&self) -> TextsApplied {
+        self.texts_applied
+    }
+
     pub fn position(&self) -> LogPosition {
         self.position
     }
@@ -1192,6 +1212,7 @@ impl State {
             checkpoint: Some(key.to_string()),
             catalog,
             answers: Answers::of(manifest.answered),
+            texts_applied: TextsApplied::default(),
             ..State::default()
         };
         manifest
@@ -1262,7 +1283,9 @@ impl State {
 
     /// Apply one committed log segment, which must be the commit made
     /// directly on top of this state. Either the whole commit is applied or,
-    /// on error, none of it.
+    /// on error, none of it. Its text is split into tokens as it is
+    /// applied: a test's way of applying one log as it is.
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, key: &str, log: &LogSegment) -> Result<()> {
         self.apply_prepared(key, log, Prepared::default())
     }
@@ -1296,6 +1319,7 @@ impl State {
                 _ => None,
             })
             .collect();
+        let mut by: HashMap<CollectionId, std::sync::Arc<Vec<String>>> = HashMap::new();
         let texts = log
             .ops
             .iter()
@@ -1303,10 +1327,11 @@ impl State {
             .filter_map(|(at, op)| match op {
                 Op::Upsert { collection, object } => {
                     let schema = self.catalog.schema(*collection)?;
-                    Some((
-                        at,
-                        (searchable(schema), TextIndex::tokenize(schema, object)),
-                    ))
+                    let by = by
+                        .entry(*collection)
+                        .or_insert_with(|| std::sync::Arc::new(searchable(schema)))
+                        .clone();
+                    Some((at, (by, TextIndex::tokenize(schema, object))))
                 }
                 _ => None,
             })
@@ -1343,6 +1368,9 @@ impl State {
                 catalog.apply(op).map_err(corrupt)?;
                 Ok::<_, StorageError>(catalog)
             })?;
+        // The catalog is the commit's whole catalog by now: each
+        // collection's searchable properties are worked out once for it.
+        let mut searchable_now: HashMap<CollectionId, Vec<String>> = HashMap::new();
         for (op_at, op) in log.ops.iter().enumerate() {
             match op {
                 Op::CreateCollection { .. } | Op::AddProperty { .. } => {}
@@ -1378,14 +1406,22 @@ impl State {
                     // A collection dropped later in the same commit is
                     // already gone from the catalog; its rows go unindexed.
                     let text = prepared.texts.remove(&op_at);
+                    let texts_applied = &mut self.texts_applied;
                     let index = self.catalog.schema(*collection).map(|schema| {
+                        let now = searchable_now
+                            .entry(*collection)
+                            .or_insert_with(|| searchable(schema));
                         let index = self.memtable.indexes.entry(*collection).or_default();
-                        match text.filter(|(by, _)| *by == searchable(schema)) {
+                        match text.filter(|(by, _)| **by == *now) {
                             Some((_, tokenized)) => {
+                                texts_applied.prepared += 1;
                                 index.rows.insert(schema, row as u32, object);
                                 index.text.insert_tokenized(row as u32, tokenized);
                             }
-                            None => index.insert(schema, row as u32, object),
+                            None => {
+                                texts_applied.under_lock += 1;
+                                index.insert(schema, row as u32, object);
+                            }
                         }
                         &*index
                     });
@@ -1932,31 +1968,77 @@ impl State {
         position: LogPosition,
         after: LogPosition,
         logs: &[(String, LogSegment)],
-    ) -> Result<Self> {
+    ) -> Result<(Self, Together)> {
         let Some((_, first)) = logs.first() else {
-            return Ok(self);
+            return Ok((self, Together::default()));
         };
         let mut state = State {
             position: after,
             head: first.prev.clone(),
             ..self
         };
-        for (log_key, log) in logs {
-            state.apply(log_key, log)?;
-        }
+        let together = state.apply_together(logs)?;
         if state.position.next() != Some(position) {
             return Err(StorageError::corrupt(
                 key,
                 "its replayed logs do not end just before it",
             ));
         }
-        Ok(State {
-            position,
-            head: Some(key.to_string()),
-            checkpoint: Some(key.to_string()),
-            ..state
-        })
+        Ok((
+            State {
+                position,
+                head: Some(key.to_string()),
+                checkpoint: Some(key.to_string()),
+                ..state
+            },
+            together,
+        ))
     }
+
+    /// Applies `logs` in turn, [`REPLAYED_TOGETHER`] at a time: the text
+    /// and codes of each run of them made together on several threads
+    /// from the state as the run begins, and only stored as each log is
+    /// applied. A collection made, coded or made searchable during a run
+    /// has its rows split or coded as they are applied.
+    ///
+    /// How many threads made them at once, at the most.
+    pub(crate) fn apply_together(&mut self, logs: &[(String, LogSegment)]) -> Result<Together> {
+        let mut together = Together::default();
+        for run in logs.chunks(REPLAYED_TOGETHER) {
+            let (prepared, most) = self.prepared_together(run);
+            together.tokenized_on = together.tokenized_on.max(most);
+            if self.coding_anything() {
+                together.coded_on = together.coded_on.max(most);
+            }
+            for ((key, log), prepared) in run.iter().zip(prepared) {
+                self.apply_prepared(key, log, prepared)?;
+            }
+        }
+        Ok(together)
+    }
+
+    /// What [`Self::prepared`] makes of each of `run`, made on several
+    /// threads, and how many made them at once, at the most.
+    pub(crate) fn prepared_together(&self, run: &[(String, LogSegment)]) -> (Vec<Prepared>, usize) {
+        use rayon::prelude::*;
+        let threads = Threads::default();
+        let prepared = run
+            .par_iter()
+            .map(|(_, log)| threads.on(|| self.prepared(log)))
+            .collect();
+        (prepared, threads.most())
+    }
+}
+
+/// How many logs a replay prepares together before applying them.
+pub(crate) const REPLAYED_TOGETHER: usize = 16;
+
+/// How many threads at once, at the most, split rows' text into tokens
+/// and coded their vectors for logs applied together.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Together {
+    pub tokenized_on: usize,
+    pub coded_on: usize,
 }
 
 #[cfg(test)]

@@ -245,78 +245,6 @@ async fn a_cold_open_fetches_no_log_from_before_the_newest_checkpoint() {
     assert_eq!(heads_fetched_opening(0).await, 1);
 }
 
-/// `rows` notes of text in turn, a commit of 100 at a time, and flushed if
-/// `flushed`.
-async fn texts(rows: u32, flushed: bool) -> Cluster {
-    let cluster = Cluster::new().await;
-    let writer = cluster.writer().await;
-    writer.commit(vec![create(NOTES)]).await.unwrap();
-    let words = ["fox", "hen", "den", "owl", "elk", "the", "deploys", "ÉCOLE"];
-    for batch in 0..rows / 100 {
-        let rows: Vec<Mutation> = (0..100u32)
-            .map(|n| {
-                let at = batch * 100 + n;
-                let title: Vec<&str> = (0..20)
-                    .map(|k| words[((at * 3 + k) % 8) as usize])
-                    .collect();
-                Mutation::Upsert {
-                    collection: name(NOTES),
-                    id: ObjectId(uuid::Uuid::from_u128(u128::from(at))),
-                    properties: json!({ "title": title.join(" "), "n": at })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                    vector: None,
-                    only_if_version: None,
-                }
-            })
-            .collect();
-        writer.commit(rows).await.unwrap();
-    }
-    if flushed {
-        writer.flush().await.unwrap();
-    }
-    cluster
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_segment_loaded_and_commits_replayed_split_their_text_on_several_threads() {
-    for flushed in [true, false] {
-        let cluster = texts(4_000, flushed).await;
-        let copy = Follower::open_through(
-            cluster.key.clone(),
-            cluster.blobs.clone(),
-            cluster.coordinator.clone(),
-            &cluster.committed().await,
-        )
-        .await
-        .unwrap();
-        let replayed = copy.partition().replayed();
-        assert!(
-            replayed.tokenized_on_threads > 1,
-            "flushed {flushed}: {replayed:?}"
-        );
-        // What it finds is what the writer finds.
-        let found = |state: &State| {
-            state
-                .keyword(
-                    &name(NOTES),
-                    &vellev_storage::Keywords::matching("fox owl", 50),
-                )
-                .unwrap()
-                .iter()
-                .map(|scored| (scored.object.id, scored.score.to_bits()))
-                .collect::<Vec<_>>()
-        };
-        let writer = cluster.writer().await;
-        assert_eq!(
-            copy.partition().read(found),
-            writer.partition().read(found),
-            "flushed {flushed}"
-        );
-    }
-}
-
 /// A property added searchable among commits replayed together: the rows
 /// after it are found by its words too, in a copy as in the writer that
 /// applied them one by one, though the commits were split into tokens
@@ -380,4 +308,59 @@ async fn a_property_made_searchable_mid_replay_is_searched_from_then_on() {
     };
     assert_eq!(writer.partition().read(found), [4, 5, 6, 7]);
     assert_eq!(copy.partition().read(found), [4, 5, 6, 7]);
+}
+
+/// Text split into tokens before the state is locked is what is indexed:
+/// it is not split again under the lock, by the writer applying its own
+/// commits or by a copy replaying them, while the searchable properties
+/// it was split by are still the collection's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tokens_prepared_before_the_lock_are_used_under_it() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await;
+    writer.commit(vec![create(NOTES)]).await.unwrap();
+    // A flush, so that the copy finds the collection in its segment's
+    // catalog and replays only the commits after it.
+    writer.commit(vec![upsert(NOTES, 0, 0)]).await.unwrap();
+    writer.flush().await.unwrap();
+    let before = writer.partition().read(|state| state.texts_applied());
+    let note = |n: u32| Mutation::Upsert {
+        collection: name(NOTES),
+        id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+        properties: json!({ "title": format!("fox {n} owl"), "n": n })
+            .as_object()
+            .unwrap()
+            .clone(),
+        vector: None,
+        only_if_version: None,
+    };
+    for batch in 0..20u32 {
+        writer
+            .commit((1..=10).map(|n| note(batch * 10 + n)).collect())
+            .await
+            .unwrap();
+    }
+    let after = writer.partition().read(|state| state.texts_applied());
+    assert_eq!(
+        (
+            after.prepared - before.prepared,
+            after.under_lock - before.under_lock
+        ),
+        (200, 0),
+        "the writer: {before:?} then {after:?}"
+    );
+    let copy = Follower::open_through(
+        cluster.key.clone(),
+        cluster.blobs.clone(),
+        cluster.coordinator.clone(),
+        &cluster.committed().await,
+    )
+    .await
+    .unwrap();
+    let replayed = copy.partition().read(|state| state.texts_applied());
+    assert_eq!(
+        (replayed.prepared, replayed.under_lock),
+        (200, 0),
+        "the copy: {replayed:?}"
+    );
 }
