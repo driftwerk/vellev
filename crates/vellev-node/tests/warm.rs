@@ -457,3 +457,20 @@ async fn a_node_stopping_stops_warming_and_remembers_what_it_had_yet_to_warm() {
     assert_eq!(shared.listed(), ["acme", "beta"], "what it had yet to warm");
     held.open.send_replace(true);
 }
+
+#[tokio::test]
+async fn a_node_stopped_before_it_has_read_its_list_keeps_the_list() {
+    let shared = Shared::new();
+    let writer = shared.writer();
+    written(&writer, &["acme", "beta"]).await;
+    let first = shared.node(16);
+    read(&first, &["beta", "acme"]).await;
+    first.shutdown().await;
+    assert_eq!(shared.listed(), ["acme", "beta"]);
+    // Stopped at once: warming has not read the list yet, and the list it
+    // has yet to read is not written over with what the node holds, none.
+    let again = shared.node(16);
+    again.warming();
+    again.shutdown().await;
+    assert_eq!(shared.listed(), ["acme", "beta"]);
+}
