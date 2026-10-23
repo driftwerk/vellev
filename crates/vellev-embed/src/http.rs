@@ -1144,8 +1144,18 @@ mod tests {
         // through of what is said as of its first LOOKED_THROUGH and a
         // few more, however much follows, and those are no more than a
         // look through it for each shape of key and a few besides.
+        //
+        // The count is of the passes that look for keys. A pass over all
+        // of what was said that looks for nothing, such as counting its
+        // characters, is not counted; the backstop for it is a wall
+        // clock, and a generous one so that a loaded machine does not
+        // fail it: a pass over sixteen megabytes takes some tens of
+        // milliseconds, and the limit is two seconds.
         let unread_after_the_start = |said: &str, what: &str| {
+            let began = std::time::Instant::now();
             let (opening, bytes) = looked(said);
+            let took = began.elapsed();
+            assert!(took < Duration::from_secs(2), "{what}: it took {took:?}");
             let (_, of_the_start) = looked(&said[..LOOKED_THROUGH + 64]);
             assert_eq!(bytes, of_the_start, "{what}: the rest was read");
             assert!(bytes > 0, "{what}: nothing was counted");
