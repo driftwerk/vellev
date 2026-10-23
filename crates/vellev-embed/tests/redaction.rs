@@ -66,9 +66,11 @@ impl Framing {
 
     /// A 401 with `body`, on the wire.
     fn framed(self, body: &[u8]) -> Vec<u8> {
+        // The endpoint hangs up after every answer, and so says so: a
+        // caller is not to keep the connection for another request.
         let status = match self {
             Self::UntilClosedOld => "HTTP/1.0 401 Unauthorized\r\n",
-            _ => "HTTP/1.1 401 Unauthorized\r\n",
+            _ => "HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n",
         };
         let size = body.len();
         let head = match self {
@@ -83,7 +85,7 @@ impl Framing {
             Self::ChunkCutShort => {
                 format!("transfer-encoding: chunked\r\n\r\n{:x}\r\n", size + 50)
             }
-            Self::UntilClosed => "connection: close\r\n\r\n".to_string(),
+            Self::UntilClosed => "\r\n".to_string(),
             Self::UntilClosedOld => "\r\n".to_string(),
             Self::LengthBesideACoding => {
                 "transfer-encoding: gzip\r\ncontent-length: 500\r\n\r\n".to_string()
@@ -101,7 +103,15 @@ impl Framing {
 }
 
 /// An endpoint that answers each caller with the next of what it is
-/// given to say, byte for byte, and hangs up.
+/// given to say, byte for byte, and hangs up. When what it says ends
+/// where it said it would, by its length or its last chunk, it hangs up
+/// only once the caller has made its next move: closed its end, or sent
+/// another request on the connection, which the hang-up then refuses. A
+/// scheduler may leave a real endpoint's hang-up that late; waiting for it
+/// here makes the case certain rather than a race, so that a caller led to
+/// keep the connection for another request fails every time, not one run
+/// in many. (Any other answer ends only as the endpoint hangs up, so it
+/// hangs up at once.)
 async fn endpoint() -> (String, Arc<Mutex<VecDeque<Vec<u8>>>>) {
     let says: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -121,12 +131,36 @@ async fn endpoint() -> (String, Arc<Mutex<VecDeque<Vec<u8>>>>) {
                         Ok(read) => asked.extend_from_slice(&more[..read]),
                     }
                 }
-                let _ = caller.write_all(&says.expect("something to say")).await;
+                let says = says.expect("something to say");
+                let _ = caller.write_all(&says).await;
+                if ends_where_it_said(&says) {
+                    let _ = caller.read(&mut more).await;
+                }
                 let _ = caller.shutdown().await;
             });
         }
     });
     (url, says)
+}
+
+/// Whether `said`, an answer on the wire, ends where its head said it
+/// would: by a length it holds all of, or by a last chunk.
+fn ends_where_it_said(said: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(said).to_ascii_lowercase();
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length: "))
+        .and_then(|length| length.trim().parse::<usize>().ok());
+    let chunked = head
+        .lines()
+        .any(|line| line == "transfer-encoding: chunked");
+    match length {
+        Some(length) => !chunked && body.len() == length,
+        None => chunked && body.ends_with("\r\n0\r\n\r\n"),
+    }
 }
 
 /// A key as an endpoint might quote it back: what comes before it that
