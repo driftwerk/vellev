@@ -17,3 +17,15 @@ So:
 - **42,377 SQuAD questions and 885 NQ questions were dropped** because their article is not in the source.
 
 Every measured question's article is in the corpus, and the truth is exact over the corpus as it is. The skew changes what the corpus is like, not whether the recall figures are right.
+
+## Embedding on a GPU
+
+The 1M vectors were embedded on a RunPod A40 with the `cuda` feature. It took 56 minutes and cost about $0.67; the Mac would have taken about a day. ONNX Runtime's own download for the `cuda` feature is built only for CUDA 13, so the run linked Microsoft's `onnxruntime-linux-x64-gpu_cuda12-1.28.0` build, the same ONNX Runtime version, into the image `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04`:
+
+```sh
+ORT_LIB_LOCATION=/opt/ort/lib ORT_PREFER_DYNAMIC_LINK=1 \
+  cargo build --release --locked -p vellev-embed --features cuda --example embed_shards
+LD_LIBRARY_PATH=/opt/ort/lib target/release/examples/embed_shards passages.jsonl out/passages
+```
+
+Before the full run, 10,000 passages and 200 prefixed queries were re-embedded on the GPU and compared with the Mac's CPU vectors. The smallest cosine was 1.000000000 and the largest element difference 3.6e-7. The CUDA build can segfault at exit after its last shard is written, so judge a run by its shard sizes, not its exit code.
