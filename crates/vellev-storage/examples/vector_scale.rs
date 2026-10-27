@@ -63,15 +63,17 @@ fn collection(dimensions: u32) -> Collection {
     }
 }
 
-fn resident_mb() -> u64 {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok();
-    output
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .map_or(0, |kb| kb / 1024)
+fn resident_mb() -> String {
+    // Scratch: anonymous and file-backed apart, where /proc says so.
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => status
+            .lines()
+            .filter(|line| line.starts_with("RssAnon") || line.starts_with("RssFile"))
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Err(_) => String::from("?"),
+    }
 }
 
 #[tokio::main]
@@ -199,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flush.await??;
         writer.clean(Duration::ZERO).await?;
         println!(
-            "segment {segment}: committed and flushed by {:.1?} (flush {:.1?}, {during} commits during it, the longest {waited:.1?}), rss {} MB",
+            "segment {segment}: committed and flushed by {:.1?} (flush {:.1?}, {during} commits during it, the longest {waited:.1?}), rss {}",
             started.elapsed(),
             flushing.elapsed(),
             resident_mb()
@@ -212,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.clean(Duration::ZERO).await?;
     }
     println!(
-        "{merges} merges in {:.1?}, rss {} MB",
+        "{merges} merges in {:.1?}, rss {}",
         merging.elapsed(),
         resident_mb()
     );
@@ -311,7 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    println!("rss {} MB", resident_mb());
+    println!("rss {}", resident_mb());
 
     let committed = coordinator.committed(&key).await?.ok_or("registered")?;
     let empty = tempfile::tempdir()?;

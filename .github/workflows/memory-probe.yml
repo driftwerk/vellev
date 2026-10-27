@@ -1,7 +1,6 @@
 name: Memory probe (scratch)
 
-# A scratch probe of vellev-storage's memory at 1M rows of 768 dimensions:
-# not for merging.
+# A scratch probe of vellev-storage's memory: not for merging.
 on:
   push:
     branches: [scratch-vellev-memory]
@@ -16,8 +15,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q heaptrack > /dev/null
       - run: cargo build --release --locked -p vellev-storage --example vector_scale
-      - name: 1M rows, 4 segments, stored on disk
+      - name: 1M rows, anon and file apart
         run: |
           STORE=file OBJECTS=1000000 DIMS=768 SEGMENTS=4 QUERIES=20 \
-            /usr/bin/time -v target/release/examples/vector_scale 2>&1 | grep -vE "^\s+(Page size|Socket|Signals|Swaps|File system|Average|Exit status|Voluntary|Involuntary|Command)" 
+            /usr/bin/time -v target/release/examples/vector_scale 2>&1 | grep -E "segment|merges|rss|Maximum resident|Elapsed"
+      - name: 250k rows in one segment, under heaptrack
+        run: |
+          STORE=file OBJECTS=250000 DIMS=768 SEGMENTS=1 QUERIES=5 \
+            heaptrack -o "$RUNNER_TEMP/scale" target/release/examples/vector_scale 2>&1 | grep -E "segment|merges|rss|heaptrack"
+          f=$(ls "$RUNNER_TEMP"/scale* | head -1)
+          heaptrack_print -f "$f" --print-peaks 1 --print-allocators 0 --print-leaks 0 --print-temporary 0 --peak-limit 25 -s 0 2>&1 | head -300
