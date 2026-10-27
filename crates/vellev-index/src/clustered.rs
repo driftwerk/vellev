@@ -909,6 +909,51 @@ mod le {
 
 #[cfg(test)]
 mod tests {
+
+    /// The scan's estimate as it was first written, word by word in five
+    /// passes: what any faster one must equal to the bit.
+    fn inner_as_first_written(probe: &Probe, code: &[u64], factor: &Factor) -> f32 {
+        let ones: u32 = code.iter().map(|word| word.count_ones()).sum();
+        let weighted: u32 = (0..QUERY_BITS)
+            .map(|bit| {
+                let plane = &probe.planes[bit as usize * probe.words..][..probe.words];
+                let count: u32 = code
+                    .iter()
+                    .zip(plane)
+                    .map(|(c, p)| (c & p).count_ones())
+                    .sum();
+                count << bit
+            })
+            .sum();
+        let set = probe.lower * ones as f32 + probe.delta * weighted as f32;
+        (2.0 * set - probe.sum) * probe.scale / factor.align
+    }
+
+    proptest::proptest! {
+        /// Speed is the scan's only change: every code is estimated as it
+        /// was, to the bit.
+        #[test]
+        fn the_scan_estimates_every_code_as_first_written(
+            seed in 0u64..u64::MAX,
+            words in 1usize..20,
+            align in 0.05f32..1.0,
+        ) {
+            let mut random = Random(seed | 1);
+            let width = words * 64;
+            let mut unit = || (random.next() >> 40) as f32 / (1u64 << 24) as f32;
+            let query: Vec<f32> = (0..width).map(|_| unit() * 2.0 - 1.0).collect();
+            let centroid: Vec<f32> = (0..width).map(|_| unit() - 0.5).collect();
+            let probe = Probe::new(&query, &centroid);
+            let factor = Factor { norm: 1.0, align, along: 0.0 };
+            for _ in 0..8 {
+                let code: Vec<u64> = (0..words).map(|_| random.next()).collect();
+                let fast = probe.inner(&code, &factor);
+                let first = inner_as_first_written(&probe, &code, &factor);
+                proptest::prop_assert_eq!(fast.to_bits(), first.to_bits());
+            }
+        }
+    }
+
     use super::*;
     use crate::vector::distance;
     use vellev_core::SQUARED_LENGTH_UNDER;
