@@ -1,6 +1,6 @@
 # Benchmark fixture: 1M Wikipedia passages
 
-The data for vellev's nightly benchmark against Weaviate. **It is not a vellev release.** `prepare.py` builds the text; `crates/vellev-embed/examples/embed_shards.rs` embeds it in resumable shards.
+The data for vellev's nightly benchmark against Weaviate. **It is not a vellev release.** `prepare.py` builds the text; `crates/vellev-embed/examples/embed_shards.rs` embeds it in resumable shards; `truth.py` finds each query's exact nearest rows.
 
 ## Sources
 
@@ -29,3 +29,22 @@ LD_LIBRARY_PATH=/opt/ort/lib target/release/examples/embed_shards passages.jsonl
 ```
 
 Before the full run, 10,000 passages and 200 prefixed queries were re-embedded on the GPU and compared with the Mac's CPU vectors. The smallest cosine was 1.000000000 and the largest element difference 3.6e-7. The CUDA build can segfault at exit after its last shard is written, so judge a run by its shard sizes, not its exit code.
+
+## Truth
+
+`truth.py` writes the exact top 100 rows by cosine, in f64, for every measured query under every filter case, with equal scores ordered by row id. Every case leaves out deleted rows:
+
+| Case | Rows |
+|---|---|
+| broad | all |
+| mid | `bucket < 10` |
+| narrow | `bucket < 1` |
+| owner | the owner of the article the query was asked of |
+
+The design left open which owner the owner case filters on. It is the query's own article's owner: a search within one person's data, which holds the answer, as a hub searches one owner's memories. That keeps 11.9% of the rows.
+
+It writes `truth.jsonl` over all 1,000,000 rows and `truth-100000.jsonl` over the first 100,000, the slice a pull request is checked on. Before writing, it recomputes 20 queries chosen with a fixed seed in a brute force that shares no code with the main pass. Its rules are tested in `test_truth.py`:
+
+```sh
+python3 -m unittest discover -s scripts/bench-fixture -p 'test_*.py'
+```
