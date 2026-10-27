@@ -1,0 +1,7 @@
+# Scratch: vellev under heaptrack, for a memory diagnosis. Not for merging.
+FROM vellev:bench
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends heaptrack && rm -rf /var/lib/apt/lists/*
+USER vellev
+ENTRYPOINT ["tini", "--", "heaptrack", "--record-only", "-o", "/profile/vellev", "vellev"]
+CMD ["serve"]
