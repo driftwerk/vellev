@@ -405,6 +405,16 @@ fn any_filter() -> impl Strategy<Value = Filter> {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        // Beside the test, where CI keeps it, and said so: proptest looks for
+        // a lib.rs above an integration test by default, finds none, and
+        // falls back here with a warning.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::default()
+    })]
+
     #[test]
     fn the_index_selects_exactly_the_rows_the_predicate_accepts(
         objects in prop::collection::vec(any_object(), 0..24),
@@ -423,6 +433,16 @@ proptest! {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        // Beside the test, where CI keeps it, and said so: proptest looks for
+        // a lib.rs above an integration test by default, finds none, and
+        // falls back here with a warning.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::default()
+    })]
+
     /// Over enough values for the index to summarise them, a range selects
     /// what it selects unsummarised and what asking each object says,
     /// whatever its bounds, at the edges of the runs or between them.

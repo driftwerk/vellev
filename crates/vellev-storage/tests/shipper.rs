@@ -664,6 +664,67 @@ async fn a_stale_shipper_of_a_run_since_re_based_ships_nothing_more_and_stalls_n
     );
 }
 
+#[tokio::test]
+async fn a_stale_shipper_whose_rows_were_forgotten_since_links_nothing_on_its_stale_base() {
+    // A run shipped to its base, at 3, as a stale shipper last read it; then
+    // a checkpoint at 6, and the run shipped on to 5 by the shipper now
+    // holding it, so the logs at 4 and 5 are below shipping's floor and
+    // forgotten.
+    let (cluster, writer) = written().await;
+    let base = begun(&cluster).await;
+    let backup = a_backup();
+    let live = shipper_of(&cluster, &backup);
+    ship(&live, &cluster, 1).await;
+    let seen = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!(seen.shipped, Some(base.position));
+    writer.flush().await.unwrap();
+    let after = rows_after(&cluster, &base).await;
+    let (logs, checkpoint) = (&after[..2], &after[2]);
+    assert!(checkpoint.head.0.contains("/manifest/"), "{checkpoint:?}");
+    ship(&live, &cluster, 2).await;
+    // Every commit but the newest passes out of the window.
+    cluster.clock.advance(Duration::from_secs(1));
+    let forgot = cluster
+        .coordinator
+        .forget_history(&cluster.key, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(forgot >= 2, "forgot {forgot}");
+    assert_eq!(rows_after(&cluster, &base).await, vec![checkpoint.clone()]);
+    // The stale shipper, going on from the run as it saw it, is given only
+    // the checkpoint after its base: it links nothing on it.
+    let (stale, rows) = shipper_over_rows(&cluster, &backup);
+    *rows.shipping_once.lock().unwrap() = Some(seen);
+    let now = cluster.committed().await.incarnation;
+    // Refused at its read, as its run has shipped since.
+    let shipped = stale.ship_batch(now, 100).await;
+    assert!(
+        matches!(
+            &shipped,
+            Err(StorageError::Coordinator(CoordinatorError::ShippedSince {
+                seen: Some(seen),
+                shipped: Some(shipped),
+                ..
+            })) if *seen == base.position && *shipped == logs[1].position
+        ),
+        "{shipped:?}"
+    );
+    assert!(!links(&backup, &stale.timeline(now))
+        .await
+        .contains_key(&checkpoint.position));
+    // And the run ships on, the checkpoint made on the commit before it.
+    assert_eq!(
+        ship(&live, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(checkpoint.position),
+            stalled: None
+        }
+    );
+    let links = links(&backup, &live.timeline(now)).await;
+    let before = links[&checkpoint.position].header.before.clone().unwrap();
+    assert_eq!(before.position, logs[1].position);
+}
+
 /// The shipper of `cluster` over a coordinator whose commit rows the test
 /// gives, and that coordinator.
 fn shipper_over_rows(cluster: &Cluster, backup: &Arc<dyn Blobs>) -> (Shipper, Arc<Unreliable>) {
@@ -1336,11 +1397,11 @@ async fn a_run_re_based_during_a_batch_is_neither_noted_nor_stalled_by_it() {
         };
         let backup = a_backup();
         let (batch, rows) = shipper_over_rows(&cluster, &backup);
-        // The run is re-based as the batch reads its rows.
+        // The run is re-based as the batch reads its rows: just after.
         *rows.re_base.lock().unwrap() = Some(raised.clone());
+        let after = rows_after(&cluster, &base).await;
         if stalling {
             // And the batch would stall: a row it reads names no head.
-            let after = rows_after(&cluster, &base).await;
             let mut row = after[1].clone();
             row.head = after[0].head.clone();
             rows.rows.lock().unwrap().insert(row.position, Some(row));
@@ -1354,6 +1415,18 @@ async fn a_run_re_based_during_a_batch_is_neither_noted_nor_stalled_by_it() {
                 ))
             ),
             "{stalling}: {refused:?}"
+        );
+        // Refused at its note or its stall, not at its read: it linked
+        // from its base, up to the row it stalls at, if it does.
+        let made: Vec<_> = links(&backup, &batch.timeline(now))
+            .await
+            .into_keys()
+            .collect();
+        assert!(made.contains(&base.position), "{stalling}: {made:?}");
+        assert_eq!(
+            made.contains(&after[1].position),
+            !stalling,
+            "{stalling}: {made:?}"
         );
         let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
         assert_eq!(shipping.base, Some(raised.clone()), "{stalling}");
@@ -1644,28 +1717,33 @@ async fn a_log_spill_refused_or_landed_and_failed_makes_no_link_and_ends_the_bat
 async fn a_shipper_that_read_the_run_before_it_shipped_on_never_stalls_it() {
     let (cluster, _writer) = written().await;
     let base = begun(&cluster).await;
-    let before = cluster.coordinator.shipping(&cluster.key).await.unwrap();
     let backup = a_backup();
-    // The run ships its base, and notes it.
-    let live = shipper_of(&cluster, &backup);
-    ship(&live, &cluster, 1).await;
-    // A shipper that read the run before that: it finds the base's row
-    // gone, as `forget_history` may take it once the run has shipped on,
-    // and would stall the run for it.
+    // A shipper reads the run, nothing shipped, and its rows; just after,
+    // the run is noted shipped to its base by the shipper now holding it.
     let (stale, rows) = shipper_over_rows(&cluster, &backup);
-    *rows.shipping_once.lock().unwrap() = Some(before);
-    rows.rows.lock().unwrap().insert(base.position, None);
+    *rows.shipped_on.lock().unwrap() = Some(base.position);
+    // And the shipper would stall the run: a row it reads names no head.
+    let after = rows_after(&cluster, &base).await;
+    let mut row = after[1].clone();
+    row.head = after[0].head.clone();
+    rows.rows.lock().unwrap().insert(row.position, Some(row));
     let now = cluster.committed().await.incarnation;
     let refused = stale.ship_batch(now, 100).await;
     assert!(
         matches!(
-            refused,
+            &refused,
             Err(StorageError::Coordinator(
-                CoordinatorError::ShippedSince { .. }
-            ))
+                CoordinatorError::ShippedSince { seen: None, shipped: Some(shipped), .. }
+            )) if *shipped == base.position
         ),
         "{refused:?}"
     );
+    // Refused at its stall, not at its read: it linked up to the row.
+    let made: Vec<_> = links(&backup, &stale.timeline(now))
+        .await
+        .into_keys()
+        .collect();
+    assert_eq!(made, vec![base.position, after[0].position]);
     let shipping = cluster.coordinator.shipping(&cluster.key).await.unwrap();
     assert_eq!(
         (shipping.shipped, shipping.stalled),

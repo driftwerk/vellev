@@ -18,7 +18,12 @@
 //!    the next batch. The shipper never lists the store;
 //! 3. takes the commits after what the run has shipped (or from its base)
 //!    in order, positions skipping where they do (a restore commits past
-//!    the current position);
+//!    the current position), read in one step with the run and only if it
+//!    has shipped no further than the batch read and is of the same base
+//!    (`Coordinator::commits_to_ship`): rows a stale shipper reads after
+//!    what it saw may since be forgotten, below the floor of a run that
+//!    has shipped past them, and over the gap it would link a checkpoint
+//!    on a commit that is not the one before it;
 //! 4. ships each as a link: its frame read from the primary under the
 //!    row's head, checked by its CRC and decoded to the row's position
 //!    (and, for a log, made on the row before), its header made from the
@@ -333,13 +338,14 @@ impl Shipper {
                 Err(stall) => return self.stall(incarnation, &base, seen, None, stall).await,
             },
         };
-        let after = match &last {
-            Some(made) => made.position,
-            None => LogPosition(base.position.0.saturating_sub(1)),
-        };
+        // After what the run had shipped as this batch read it, in one step
+        // with the run: refused if it has shipped since, or been re-based,
+        // as rows after `seen` may be forgotten since (a stale shipper,
+        // given what is left, would link a checkpoint over the gap, on a
+        // commit that is not the one before it, and fork the run).
         let rows = self
             .coordinator
-            .commits_after(&self.key, incarnation, after, limit)
+            .commits_to_ship(&self.key, incarnation, base.position, seen, limit)
             .await?;
         let mut through = None;
         for row in &rows {
