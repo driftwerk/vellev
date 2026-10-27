@@ -141,8 +141,10 @@ jobs:
           sha256sum --check --strict wanted.sha256
           zstd -q -d --long=31 passages.jsonl.zst -o "$F/text/passages.jsonl"
           mv queries.jsonl warmup.jsonl "$F/text/"
+          # The archives were made on macOS and carry its AppleDouble
+          # entries (._name, extended attributes): metadata, not shards.
           for part in $parts vectors-queries.tar.zst; do
-            zstd -q -dc "$part" | tar -C "$F/vectors" -xf -
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
             rm "$part"
           done
           zstd -q -d "$truth.zst" -o "$F/truth/$truth"
