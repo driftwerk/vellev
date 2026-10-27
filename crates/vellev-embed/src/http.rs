@@ -479,7 +479,11 @@ impl Http {
     #[cfg(any(test, feature = "test-clock"))]
     #[must_use]
     pub fn timed_by(self, clock: std::sync::Arc<dyn crate::clock::Clock>) -> Self {
-        Self { clock, ..self }
+        Self {
+            activity: Activity::timed_by(clock.clone()),
+            clock,
+            ..self
+        }
     }
 
     /// `text` without this endpoint's key, whatever its shape. Anything

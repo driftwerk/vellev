@@ -1430,6 +1430,8 @@ The client crates, `vellev-core`, `vellev-index`, `vellev-api` and
 licence: anyone may use, change and run it, for themselves or for their
 customers, but not offer it as a service that competes with vellev's own;
 two years after each release, that release is Apache-2.0.
+Contributions are accepted under the terms in
+[CONTRIBUTING.md](CONTRIBUTING.md#licence).
 
 ## Releases
 
