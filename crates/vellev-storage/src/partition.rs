@@ -2198,12 +2198,11 @@ impl Writer {
         }
     }
 
-    /// Index a segment's rows, which have their vectors with them, then
-    /// take the vectors into their column and encode both, off the async
-    /// threads and before anything is written, so that readers are not
-    /// held behind the write lock while a large segment is indexed.
-    /// The segment of `file`, its vectors in `vectors` or, without, still
-    /// in its rows.
+    /// Index the segment of `file`, its vectors in `vectors` or, without,
+    /// still in its rows, to be taken from them into their column; then
+    /// encode both, off the async threads and before anything is written,
+    /// so that readers are not held behind the write lock while a large
+    /// segment is indexed.
     async fn built(
         &self,
         mut file: SegmentFile,
