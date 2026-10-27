@@ -24,6 +24,7 @@ http-body-util.workspace = true
 jsonwebtoken.workspace = true
 object_store.workspace = true
 prometheus-client.workspace = true
+tikv-jemallocator = "0.6"
 rayon.workspace = true
 reqwest.workspace = true
 serde.workspace = true

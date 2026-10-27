@@ -306,6 +306,10 @@ fn class_vector(given: &str) -> Result<(String, String)> {
     Ok((class.to_string(), vector.to_string()))
 }
 
+// Scratch: jemalloc, to see whether glibc keeps what is freed.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     match Cli::parse().command {

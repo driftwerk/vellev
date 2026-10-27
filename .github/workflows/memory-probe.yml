@@ -20,14 +20,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: arenas-2-1m
+          - name: jemalloc-1m
             rows: '1000000'
             heaptrack: false
-            extra: --vellev-env MALLOC_ARENA_MAX=2
-          - name: heaptrack-300k
-            rows: '300000'
-            heaptrack: true
             extra: ''
+
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -96,3 +93,22 @@ jobs:
             ${{ runner.temp }}/results
           retention-days: 14
           if-no-files-found: ignore
+
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: probe-heaptrack-300k
+          run-id: 40581203997
+          github-token: ${{ github.token }}
+          path: probe
+      - run: sudo apt-get update -q && sudo apt-get install -y -q heaptrack > /dev/null
+      - name: What vellev still held at its end
+        run: |
+          f=$(find probe -name 'vellev*' | head -1)
+          heaptrack_print -f "$f" --print-peaks 0 --print-allocators 0 --print-leaks 1 --print-temporary 0 --peak-limit 30 2>&1 | grep -vE "^\s+in /|at /rustc|core::ops::function|std::rt|tokio::runtime|std::panic|__rust|futures_util|<core::pin" | cut -c1-220 | head -400
+      - name: What its peak was made of, with callers
+        run: |
+          f=$(find probe -name 'vellev*' | head -1)
+          heaptrack_print -f "$f" --print-peaks 1 --print-allocators 0 --print-leaks 0 --print-temporary 0 --peak-limit 12 2>&1 | grep -E "peak memory consumed|vellev_|^  and" | cut -c1-200 | head -200
