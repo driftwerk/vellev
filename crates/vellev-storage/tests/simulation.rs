@@ -181,8 +181,9 @@ enum Canary {
     /// link that names it (DW-668, S3).
     SpillAfterLink,
     /// The coordinator takes a run's note or stall whatever base it names
-    /// and whatever it saw the run shipped to, as the run under way's: a
-    /// stale run is not fenced (DW-668, S5).
+    /// and whatever it saw the run shipped to, as the run under way's, and
+    /// gives it the commits after what it saw whatever the run has shipped
+    /// since: a stale run is not fenced (DW-668, S5).
     StaleRunWrites,
 }
 
@@ -857,6 +858,20 @@ impl Coordinator for StaleView {
             .commits_after(key, incarnation, after, limit)
             .await
     }
+    // To the coordinator as it stands, as any statement of the node's is:
+    // only what it last read of the run is stale.
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        self.inner
+            .commits_to_ship(key, incarnation, base, seen, limit)
+            .await
+    }
     async fn unshipped(
         &self,
         after: Option<&PartitionKey>,
@@ -1374,6 +1389,35 @@ impl Coordinator for SimCoordinator {
             .clean
             .commits_after(key, incarnation, after, limit)
             .await?;
+        if self.canary == Some(Canary::ShiftsCommitTimes) {
+            for row in &mut rows {
+                row.at += chrono::Duration::microseconds(1);
+            }
+        }
+        Ok(rows)
+    }
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        let mut rows = match self.canary {
+            // Unfenced, a stale run is given the rows after what it saw.
+            Some(Canary::StaleRunWrites) => {
+                let after = seen.unwrap_or(LogPosition(base.0.saturating_sub(1)));
+                self.clean
+                    .commits_after(key, incarnation, after, limit)
+                    .await?
+            }
+            _ => {
+                self.clean
+                    .commits_to_ship(key, incarnation, base, seen, limit)
+                    .await?
+            }
+        };
         if self.canary == Some(Canary::ShiftsCommitTimes) {
             for row in &mut rows {
                 row.at += chrono::Duration::microseconds(1);

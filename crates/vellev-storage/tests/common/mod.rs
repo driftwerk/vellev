@@ -529,6 +529,31 @@ impl Coordinator for Unreliable {
             })
             .collect())
     }
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        let re_base = self.re_base.lock().unwrap().take();
+        if let Some(base) = re_base {
+            self.inner.record_base(key, incarnation, &base).await?;
+        }
+        let rows = self
+            .inner
+            .commits_to_ship(key, incarnation, base, seen, limit)
+            .await?;
+        let given = self.rows.lock().unwrap();
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match given.get(&row.position) {
+                Some(instead) => instead.clone(),
+                None => Some(row),
+            })
+            .collect())
+    }
     async fn unshipped(
         &self,
         after: Option<&PartitionKey>,

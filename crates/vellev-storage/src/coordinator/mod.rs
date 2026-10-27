@@ -757,6 +757,27 @@ pub trait Coordinator: fmt::Debug + Send + Sync {
         limit: usize,
     ) -> Result<Vec<RestorePoint>>;
 
+    /// Up to `limit` commits a shipper of the run from `base` ships next,
+    /// read as [`Self::commits_after`] reads them, after `seen`, what the
+    /// run had shipped as the shipper read it (or from the base, if
+    /// nothing), in one step with the run (DW-668). Taken only if the run
+    /// still stands as read: [`Self::forget_history`] takes rows below the
+    /// run's floor, after what it has shipped, so a stale shipper given
+    /// what is left after `seen` would link a checkpoint over the gap, on a
+    /// commit that is not the one before it, and fork the run. Refused, as
+    /// a stall is, with [`CoordinatorError::ShippedSince`] for a run that
+    /// has shipped since; with [`CoordinatorError::OtherBase`] for a run of
+    /// another base or none; and for another incarnation than the
+    /// partition's current one, or a partition not registered. No default.
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        seen: Option<LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<RestorePoint>>;
+
     /// Up to `limit` partitions after `after`, in key order, whose run of
     /// shipping has commits it has yet to ship: a base is recorded, the run
     /// has not stalled, and the committed position is above what it has

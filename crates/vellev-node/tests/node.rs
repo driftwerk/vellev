@@ -1528,6 +1528,18 @@ impl Coordinator for Unrenewing {
             .commits_after(key, incarnation, after, limit)
             .await
     }
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        self.inner
+            .commits_to_ship(key, incarnation, base, seen, limit)
+            .await
+    }
     async fn unshipped(
         &self,
         after: Option<&PartitionKey>,
