@@ -1,0 +1,35 @@
+name: Clustered recall probe (scratch)
+
+on:
+  push:
+    branches: [scratch-clustered-recall]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        rows: ['250000', '800000']
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p vellev-index --example clustered_real
+      - name: Fetch the fixture
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"; mkdir -p "$F/d" "$F/text" "$F/vectors"; cd "$F/d"
+          for a in passages.jsonl.zst vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst; do
+            gh release download fixture-bench-wiki1m-bge-base-v1 --repo "$GITHUB_REPOSITORY" --pattern "$a"
+            grep "  $a\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> w.sha256
+          done
+          sha256sum --check --strict w.sha256
+          zstd -q -d --long=31 passages.jsonl.zst -o "$F/text/passages.jsonl"
+          for p in vectors-*.tar.zst; do zstd -q -dc "$p" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword; rm "$p"; done
+      - run: target/release/examples/clustered_real "$RUNNER_TEMP/fixture" ${{ matrix.rows }}
