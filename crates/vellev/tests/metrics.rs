@@ -284,3 +284,37 @@ async fn what_waits_for_a_flush_and_flushes_that_failed_are_reported() {
     );
     served.stop().await;
 }
+
+/// Bench signals: the thread pools a node runs on, and how many reads may
+/// run at once, are reported as they are, so that a run that sets them
+/// can check they took.
+#[tokio::test]
+async fn the_thread_pools_and_reads_at_once_are_reported_as_they_are() {
+    let (served, _) = embedded().await;
+    let text = served.app.metrics().encoded();
+    let threads = |pool: &str| sample(&text, "vellev_threads", &[("pool", pool)]);
+    let workers = tokio::runtime::Handle::current().metrics().num_workers();
+    assert_eq!(threads("tokio_workers"), Some(workers as f64), "{text}");
+    assert_eq!(threads("rayon"), Some(rayon::current_num_threads() as f64));
+    let limits = served.ok(Method::GET, "/v1/limits", None).await;
+    assert_eq!(
+        sample(&text, "vellev_reads_at_once", &[]),
+        limits["reads_at_once"].as_f64(),
+        "{limits}"
+    );
+    served.stop().await;
+}
+
+/// Bench signals: tenants with a flush or merge due or under way are
+/// counted; three notes are fewer than a flush.
+#[tokio::test]
+async fn tenants_with_a_flush_or_merge_due_are_counted() {
+    let (served, _) = embedded().await;
+    let text = served.app.metrics().encoded();
+    assert_eq!(
+        sample(&text, "vellev_tenants_unsettled", &[]),
+        Some(0.0),
+        "{text}"
+    );
+    served.stop().await;
+}

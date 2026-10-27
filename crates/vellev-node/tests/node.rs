@@ -40,6 +40,8 @@ enum Fault {
     /// The next write fails, and then they go right again.
     FailsOnce,
     NeverAnswers,
+    /// Each write waits for a permit from [`Store::gate`], then goes right.
+    Gated,
 }
 
 /// Object storage whose writes can be made to fail.
@@ -60,6 +62,8 @@ struct Store {
     /// When each vectors file was asked to be written, right or wrong:
     /// one for each flush that got as far as writing its segment.
     vectors_written: std::sync::Mutex<Vec<tokio::time::Instant>>,
+    /// Permits for [`Fault::Gated`] writes, none to begin with.
+    gate: tokio::sync::Semaphore,
 }
 
 impl Store {
@@ -90,7 +94,11 @@ impl Store {
         if let Some(Fault::NeverAnswers) = fault {
             std::future::pending::<()>().await;
         }
-        if self.failing.load(Ordering::SeqCst) || fault.is_some() {
+        if let Some(Fault::Gated) = fault {
+            self.gate.acquire().await.expect("gate open").forget();
+        }
+        let failed = fault.is_some_and(|fault| !matches!(fault, Fault::Gated));
+        if self.failing.load(Ordering::SeqCst) || failed {
             return Err(StorageError::Blob {
                 key: key.into(),
                 source: "connection reset".into(),
@@ -171,6 +179,7 @@ impl Cluster {
                 slow: std::sync::Mutex::new(None),
                 forgotten: std::sync::Mutex::default(),
                 vectors_written: std::sync::Mutex::default(),
+                gate: tokio::sync::Semaphore::new(0),
             }),
         }
     }
@@ -8907,4 +8916,136 @@ async fn a_node_writes_the_format_the_cluster_writes_whatever_its_own_max() {
     acme.flush().await.unwrap();
     assert_eq!(acme.read(State::unflushed), 0);
     default.shutdown().await;
+}
+
+/// Writes rows `from..to` in batches of `batch`, each with a vector.
+async fn written_in_batches(tenant: &Tenant, from: u64, to: u64, batch: u64) {
+    let mut n = from;
+    while n < to {
+        let rows = (n..(n + batch).min(to))
+            .map(|n| note(n, "row", Some(vec![n as f32, 1.0])))
+            .collect();
+        tenant.write(rows).await.unwrap();
+        n += batch;
+    }
+}
+
+/// Waits for the node to report every tenant it writes settled, and says
+/// whether it did within `within`.
+async fn settled_within(node: &Node, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if node.unsettled() == 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// Bench signals: a tenant with nothing written has nothing to flush or
+/// merge.
+#[tokio::test]
+async fn a_tenant_with_nothing_written_is_settled() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    assert_eq!(node.unsettled(), 0, "no tenant open");
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    assert_eq!(node.unsettled(), 0);
+    node.shutdown().await;
+}
+
+/// Bench signals: rows fewer than a flush stay in memory, searched
+/// exactly; that is the tenant at rest, not one waiting.
+#[tokio::test]
+async fn rows_below_a_flush_leave_a_tenant_settled() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    written_in_batches(&acme, 0, 9, 3).await;
+    assert_eq!(acme.read(State::unflushed), 9);
+    assert_eq!(node.unsettled(), 0);
+    node.shutdown().await;
+}
+
+/// Bench signals: a tenant whose rows reach a flush is unsettled from the
+/// write that reaches it until the flush and every merge after it are
+/// done; then compacting again merges nothing.
+#[tokio::test]
+async fn a_tenant_is_unsettled_until_its_flushes_and_merges_are_done() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    for round in 0..=6u64 {
+        // The flush's segment waits at the store until let through, so
+        // what is reported meanwhile is seen, not raced.
+        cluster.store.fault(Some(("vectors", Fault::Gated)));
+        written_in_batches(&acme, round * 10, round * 10 + 10, 10).await;
+        assert_eq!(node.unsettled(), 1, "round {round}: due from the write on");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(node.unsettled(), 1, "round {round}: under way");
+        cluster.store.fault(None);
+        cluster.store.gate.add_permits(1);
+        assert!(
+            settled_within(&node, Duration::from_secs(10)).await,
+            "round {round}"
+        );
+        assert_eq!(acme.read(State::unflushed), 0);
+    }
+    let segments = acme.read(|state| state.segments().count());
+    acme.compact(Duration::ZERO).await.unwrap();
+    assert_eq!(
+        acme.read(|state| state.segments().count()),
+        segments,
+        "nothing left to merge once settled"
+    );
+    node.shutdown().await;
+}
+
+/// Bench signals: a flush under way is not settled, however long it takes.
+#[tokio::test]
+async fn a_tenant_whose_flush_never_answers_stays_unsettled() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::NeverAnswers)));
+    written_in_batches(&acme, 0, 10, 10).await;
+    assert!(!settled_within(&node, Duration::from_millis(500)).await);
+    assert_eq!(node.unsettled(), 1);
+}
+
+/// Bench signals: a flush that failed leaves its rows due to flush.
+#[tokio::test]
+async fn a_tenant_whose_flush_failed_stays_unsettled() {
+    let cluster = Cluster::new();
+    let node = backlogging(&cluster, 10, Duration::from_millis(20));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    written_in_batches(&acme, 0, 10, 10).await;
+    assert!(!settled_within(&node, Duration::from_millis(500)).await);
+    assert!(node.flushing().failed >= 1);
+    cluster.store.fault(None);
+    assert!(settled_within(&node, Duration::from_secs(10)).await);
+    assert_eq!(acme.read(State::unflushed), 0);
+    node.shutdown().await;
 }
