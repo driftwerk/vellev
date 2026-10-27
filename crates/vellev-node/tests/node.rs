@@ -8724,9 +8724,12 @@ async fn a_flush_asked_for_by_a_caller_that_fails_is_counted() {
     let node = backlogging(&cluster, 1_000, Duration::from_secs(60));
     node.create_tenant(&tenant("acme")).await.unwrap();
     let acme = node.tenant(&tenant("acme")).await.unwrap();
-    acme.write(vec![schema(EmbeddingProvider::None), note(1, "row", Some(vec![1.0, 1.0]))])
-        .await
-        .unwrap();
+    acme.write(vec![
+        schema(EmbeddingProvider::None),
+        note(1, "row", Some(vec![1.0, 1.0])),
+    ])
+    .await
+    .unwrap();
     cluster.store.fault(Some(("vectors", Fault::Fails)));
     acme.flush().await.unwrap_err();
     assert_eq!(node.flushing().failed, 1);
