@@ -239,6 +239,14 @@ impl Local {
                     .with_cache_dir(cache.clone())
                     .with_intra_threads(threads.saturating_sub(1).max(1))
                     .with_show_download_progress(false);
+                // On the GPU when built for it, at full float32 precision
+                // (no TensorFloat-32), and failing rather than running on
+                // the CPU unseen if the CUDA provider cannot be loaded.
+                #[cfg(feature = "cuda")]
+                let options = options.with_execution_providers(vec![ort::ep::CUDA::default()
+                    .with_tf32(false)
+                    .build()
+                    .error_on_failure()]);
                 let mut session = TextEmbedding::try_new(options)
                     .map_err(|error| unloaded(&name, &kept, &error))?;
                 Ok(Box::new(move |texts: Vec<&str>| {
