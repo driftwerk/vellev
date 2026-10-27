@@ -116,9 +116,36 @@ pub fn gate(vellev: &[Measured], cases: &[Case], extra: Vec<Check>) -> Gate {
     }
 }
 
+/// The hard gate's hybrid check (§8): vellev's fused hybrid at its
+/// defaults against its own exact-leg answer, at limit 10 under broad.
+pub fn hybrid_check(points: &[crate::run::HybridPoint]) -> Option<Check> {
+    let default = points.iter().find(|p| p.knob == Knob::VellevDefault)?;
+    Some(Check {
+        check: "hybrid recall@10 against its exact-leg answer".into(),
+        case: Case::Broad,
+        value: Some(default.recall.share()),
+        required: GATE as f64 / 100.0,
+        passed: default.recall.at_or_above(GATE),
+    })
+}
+
+/// The cheapest hybrid point whose recall against the engine's own
+/// exact-leg answer reaches 0.99: where its hybrid latency is published.
+pub fn hybrid_matched(points: &[crate::run::HybridPoint]) -> Option<crate::run::HybridPoint> {
+    let measured: Vec<Point> = points
+        .iter()
+        .map(|p| Point {
+            recall: p.recall,
+            p99: p.p99_ms.median,
+        })
+        .collect();
+    matched(&measured, GATE).map(|at| points[at].clone())
+}
+
 /// The Markdown summary: the matched points first, then the gate.
 pub fn summary(
     matches: &[Match],
+    hybrids: &[(&str, Option<crate::run::HybridPoint>)],
     floors: &[(&str, crate::run::Floor)],
     gate: &Gate,
     rows: u64,
@@ -147,6 +174,23 @@ pub fn summary(
                 m.target,
                 m.engine
             )),
+        }
+    }
+    out.push_str(
+        "\n## Hybrid latency (limit 10, broad)\n\nEach engine at its cheapest point whose hybrid answer agrees with its own exact-leg answer at recall@10 of at least 0.99. Neither engine's hybrid recall is compared with the other's.\n\n| Engine | Point | Own-leg recall@10 | p50 ms | p99 ms |\n|---|---|---|---|---|\n",
+    );
+    for (engine, point) in hybrids {
+        match point {
+            Some(p) => out.push_str(&format!(
+                "| {engine} | {} | {:.4} | {:.2} | {:.2} ({:.2}–{:.2}) |\n",
+                p.label,
+                p.recall_share,
+                p.p50_ms.median,
+                p.p99_ms.median,
+                p.p99_ms.min,
+                p.p99_ms.max
+            )),
+            None => out.push_str(&format!("| {engine} | not reached | | | |\n")),
         }
     }
     out.push_str(
@@ -252,6 +296,47 @@ mod tests {
         let top = |m: Measured| gate(&[m], &[Case::Broad], vec![]).checks[1].passed;
         assert!(top(pass));
         assert!(!top(fail));
+    }
+
+    fn hybrid_at(knob: Knob, found: u64, p99: f64) -> crate::run::HybridPoint {
+        let r = |v| Repeated {
+            median: v,
+            min: v,
+            max: v,
+        };
+        crate::run::HybridPoint {
+            knob,
+            label: knob.label(),
+            recall: Recall { found, of: 10_000 },
+            recall_share: found as f64 / 10_000.0,
+            p50_ms: r(p99 / 2.0),
+            p99_ms: r(p99),
+        }
+    }
+
+    #[test]
+    fn the_hybrid_check_holds_vellevs_default_point() {
+        let points = [
+            hybrid_at(Knob::VellevDefault, 9_899, 1.0),
+            hybrid_at(Knob::Oversample(128), 10_000, 2.0),
+        ];
+        let check = hybrid_check(&points).unwrap();
+        assert!(!check.passed);
+        assert!(hybrid_check(&[hybrid_at(Knob::Oversample(4), 10_000, 1.0)]).is_none());
+        let measured = vec![at(Case::Broad, Knob::VellevDefault, 10_000, 1_000, 1.0)];
+        let gate = gate(&measured, &[Case::Broad], vec![check]);
+        assert!(!gate.passed);
+    }
+
+    #[test]
+    fn hybrid_latency_is_published_at_the_cheapest_point_reaching_its_own_099() {
+        let points = [
+            hybrid_at(Knob::Ef(16), 9_000, 1.0),
+            hybrid_at(Knob::Ef(64), 9_900, 3.0),
+            hybrid_at(Knob::Ef(128), 9_950, 2.0),
+        ];
+        assert_eq!(hybrid_matched(&points).unwrap().knob, Knob::Ef(128));
+        assert!(hybrid_matched(&points[..1]).is_none());
     }
 
     #[test]

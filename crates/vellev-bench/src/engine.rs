@@ -68,6 +68,17 @@ pub trait Engine: Send + Sync {
         limit: usize,
         knob: Knob,
     ) -> Result<Vec<u64>>;
+    /// The ids of the best `limit` rows for `text` and `vector` together,
+    /// fused at the engine's defaults (alpha 0.75, relative scores), that
+    /// pass `filter`.
+    async fn hybrid(
+        &self,
+        text: &str,
+        vector: &[f32],
+        filter: Filter,
+        limit: usize,
+        knob: Knob,
+    ) -> Result<Vec<u64>>;
     /// A search of the empty collection, as the measured searches are
     /// asked but with nothing to score.
     async fn floor(&self, vector: &[f32]) -> Result<()>;
@@ -201,6 +212,37 @@ impl Vellev {
             .collect()
     }
 
+    /// The best `limit` rows for the words of `text` that pass `filter`,
+    /// with their keyword scores: a hybrid search's keyword leg.
+    pub async fn keyword(
+        &self,
+        text: &str,
+        filter: Filter,
+        limit: usize,
+    ) -> Result<Vec<(u64, f32)>> {
+        let body = json!({ "text": text, "limit": limit, "filter": Vellev::filter(filter) });
+        let path = format!(
+            "/v1/tenants/{}/collections/{COLLECTION}/keyword",
+            self.tenant
+        );
+        let answer = self.call(reqwest::Method::POST, &path, Some(&body)).await?;
+        answer["results"]
+            .as_array()
+            .ok_or_else(|| eyre!("no results: {answer}"))?
+            .iter()
+            .map(|result| {
+                let score = result["keyword"]
+                    .as_f64()
+                    .or(result["score"].as_f64())
+                    .ok_or_else(|| eyre!("a keyword result with no score: {result}"))?;
+                Ok((
+                    id_of(result["id"].as_str().unwrap_or_default())?,
+                    score as f32,
+                ))
+            })
+            .collect()
+    }
+
     /// The node's metrics, as Prometheus text.
     pub async fn metrics(&self) -> Result<String> {
         let response = self
@@ -324,6 +366,42 @@ impl Engine for Vellev {
     ) -> Result<Vec<u64>> {
         self.nearest_in(COLLECTION, vector, filter, limit, knob)
             .await
+    }
+
+    async fn hybrid(
+        &self,
+        text: &str,
+        vector: &[f32],
+        filter: Filter,
+        limit: usize,
+        knob: Knob,
+    ) -> Result<Vec<u64>> {
+        let mut body = json!({
+            "text": text,
+            "vector": vector,
+            "limit": limit,
+            "filter": Vellev::filter(filter),
+        });
+        match knob {
+            Knob::VellevDefault => {}
+            Knob::Oversample(n) => body["oversample"] = json!(n),
+            other => bail!("vellev has no knob {other:?}"),
+        }
+        let path = format!(
+            "/v1/tenants/{}/collections/{COLLECTION}/hybrid",
+            self.tenant
+        );
+        let answer = self.call(reqwest::Method::POST, &path, Some(&body)).await?;
+        ensure!(
+            answer.get("degraded").is_none(),
+            "a degraded answer: {answer}"
+        );
+        answer["results"]
+            .as_array()
+            .ok_or_else(|| eyre!("no results: {answer}"))?
+            .iter()
+            .map(|result| id_of(result["id"].as_str().unwrap_or_default()))
+            .collect()
     }
 
     async fn floor(&self, vector: &[f32]) -> Result<()> {
@@ -572,6 +650,41 @@ impl Engine for Weaviate {
         _knob: Knob,
     ) -> Result<Vec<u64>> {
         self.nearest_in(COLLECTION, vector, filter, limit).await
+    }
+
+    async fn hybrid(
+        &self,
+        text: &str,
+        vector: &[f32],
+        filter: Filter,
+        limit: usize,
+        _knob: Knob,
+    ) -> Result<Vec<u64>> {
+        let vector: Vec<String> = vector.iter().map(f32::to_string).collect();
+        let query = format!(
+            "{{ Get {{ {COLLECTION}(hybrid: {{query: {}, vector: [{}], alpha: 0.75, fusionType: relativeScoreFusion}}, limit: {limit}, where: {}) {{ text bucket owner deleted _additional {{ id }} }} }} }}",
+            serde_json::to_string(text)?,
+            vector.join(","),
+            Weaviate::filter(filter),
+        );
+        let answer = self
+            .call(
+                reqwest::Method::POST,
+                "/v1/graphql",
+                Some(&json!({ "query": query })),
+            )
+            .await?;
+        ensure!(
+            answer.get("errors").is_none(),
+            "GraphQL: {}",
+            answer["errors"]
+        );
+        answer["data"]["Get"][COLLECTION]
+            .as_array()
+            .ok_or_else(|| eyre!("no results: {answer}"))?
+            .iter()
+            .map(|result| id_of(result["_additional"]["id"].as_str().unwrap_or_default()))
+            .collect()
     }
 
     async fn floor(&self, vector: &[f32]) -> Result<()> {
