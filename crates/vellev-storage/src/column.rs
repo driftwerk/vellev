@@ -34,19 +34,104 @@ pub(crate) struct Column {
 enum Values {
     Memory(Vec<f32>),
     Mapped(memmap2::Mmap, Range<usize>),
+    /// In the frame they are written as, gathered there: see [`Gathering`].
+    Framed(std::sync::Arc<Frame>, Range<usize>),
 }
 
-impl Column {
-    /// A column of `values`, each row's vector starting where `offsets`
-    /// says, with one offset past the last.
-    pub fn of(values: Vec<f32>, offsets: Vec<u64>) -> Self {
-        debug_assert_eq!(offsets.last().copied().unwrap_or(0), values.len() as u64);
+/// A vectors frame held in memory as whole words, so that its values,
+/// which start on a word, are read in place as floats.
+#[derive(Debug)]
+pub(crate) struct Frame {
+    words: Vec<u32>,
+    version: u16,
+}
+
+impl AsRef<[u8]> for Frame {
+    fn as_ref(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.words)
+    }
+}
+
+/// A gathered frame as the bytes it uploads as, shared, not copied.
+struct FrameBytes(std::sync::Arc<Frame>);
+
+impl AsRef<[u8]> for FrameBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref().as_ref()
+    }
+}
+
+/// The words before a frame's values: its header and the padding that
+/// starts the values on a word.
+const AHEAD: usize = (BODY + PADDING) / 4;
+
+/// A column gathered row by row straight into the frame it is written as,
+/// sized exactly beforehand: so that its vectors are held once, as the
+/// column a segment keeps and the file it uploads both.
+#[derive(Debug, Clone)]
+pub(crate) struct Gathering {
+    words: Vec<u32>,
+    offsets: Vec<u64>,
+    values: usize,
+}
+
+impl Gathering {
+    /// Room for `values` values in all, over `rows` rows.
+    pub fn with_capacity(values: usize, rows: usize) -> Self {
+        let mut words = Vec::with_capacity(AHEAD + values + 2 * (rows + 1) + 2);
+        words.resize(AHEAD, 0);
+        let mut offsets = Vec::with_capacity(rows + 1);
+        offsets.push(0);
         Self {
-            values: Values::Memory(values),
+            words,
             offsets,
+            values: 0,
         }
     }
 
+    /// The next row's vector, if it has one.
+    pub fn push(&mut self, vector: Option<&[f32]>) {
+        if let Some(vector) = vector {
+            self.words
+                .extend(vector.iter().map(|value| value.to_bits()));
+            self.values += vector.len();
+        }
+        self.offsets.push(self.values as u64);
+    }
+
+    /// The vector of row `row` as gathered so far.
+    #[cfg(test)]
+    pub fn get(&self, row: usize) -> Option<&[f32]> {
+        let (start, end) = (
+            *self.offsets.get(row)? as usize,
+            *self.offsets.get(row + 1)? as usize,
+        );
+        (start < end).then(|| bytemuck::cast_slice(&self.words[AHEAD + start..AHEAD + end]))
+    }
+
+    /// The gathered rows as a column whose values lie in its frame, stamped
+    /// as format `version`.
+    pub fn finish(self, version: u16) -> Column {
+        let Self {
+            mut words,
+            offsets,
+            values,
+        } = self;
+        let rows = offsets.len() - 1;
+        for word in offsets.iter().chain([&(rows as u64)]) {
+            words.push(*word as u32);
+            words.push((*word >> 32) as u32);
+        }
+        format::seal(Kind::Vectors, version, bytemuck::cast_slice_mut(&mut words));
+        let frame = std::sync::Arc::new(Frame { words, version });
+        Column {
+            values: Values::Framed(frame, AHEAD..AHEAD + values),
+            offsets,
+        }
+    }
+}
+
+impl Column {
     /// The vectors of `rows`, which are left without them.
     pub fn taken_from(rows: &mut [Row]) -> Self {
         let mut values = Vec::new();
@@ -74,6 +159,7 @@ impl Column {
         let values = match &self.values {
             Values::Memory(values) => values.len() * 4,
             Values::Mapped(..) => 0,
+            Values::Framed(frame, _) => frame.words.len() * 4,
         };
         values + self.offsets.len() * 8
     }
@@ -90,6 +176,7 @@ impl Column {
         match &self.values {
             Values::Memory(values) => values,
             Values::Mapped(map, range) => bytemuck::cast_slice(&map[range.clone()]),
+            Values::Framed(frame, range) => bytemuck::cast_slice(&frame.words[range.clone()]),
         }
     }
 
@@ -101,6 +188,11 @@ impl Column {
 
     /// As [`Self::encode`], stamped as format `version`.
     pub fn encode_as(&self, version: u16) -> Bytes {
+        if let Values::Framed(frame, _) = &self.values {
+            if frame.version == version {
+                return Bytes::from_owner(FrameBytes(frame.clone()));
+            }
+        }
         let values = self.values();
         let length = PADDING + values.len() * 4 + self.offsets.len() * 8 + 8;
         let frame = framed(Kind::Vectors, version, length, |frame| {

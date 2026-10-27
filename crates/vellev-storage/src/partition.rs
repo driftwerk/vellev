@@ -2152,7 +2152,7 @@ impl Writer {
         }
         let names = self.named(named_at, "");
         let rows = std::mem::take(&mut snapshot.rows);
-        let vectors = snapshot.column();
+        let vectors = snapshot.column(self.writes());
         let above = self.merging.clustered_above;
         let tombstones = snapshot.tombstones.len();
         let shape = Shape::of_column(&snapshot.catalog, &rows, &vectors, tombstones, above);
@@ -2320,7 +2320,8 @@ impl Writer {
         let above = self.merging.clustered_above;
         let Some((file, vectors, shape, named_at)) = self.partition.read(|state| {
             let named_at = state.position();
-            let (file, vectors) = state.merged(&merge, named_at)?;
+            let (file, gathered) = state.merged(&merge, named_at)?;
+            let vectors = gathered.finish(self.writes());
             let tombstones = file.tombstones.len();
             let shape = Shape::of_column(state.catalog(), &file.rows, &vectors, tombstones, above);
             Some((file, vectors, shape, named_at))
