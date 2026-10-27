@@ -103,5 +103,8 @@ async fn main() {
             embedded as f64 / seconds
         );
     }
+    // Let go of the model before the process ends, or ONNX Runtime may be
+    // torn down under it: on CUDA that crashed at exit.
+    local.close().await;
     eprintln!("done: {embedded} rows embedded in {:?}", started.elapsed());
 }

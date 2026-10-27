@@ -215,6 +215,8 @@ pub struct Local {
     jobs: mpsc::Sender<Job>,
     /// What the model's thread has lately done, for anyone.
     activity: Arc<Activity>,
+    /// Closed by the model's thread as it ends, the model let go.
+    ended: oneshot::Receiver<()>,
 }
 
 impl Local {
@@ -265,15 +267,31 @@ impl Local {
         let name = model.to_string();
         let activity = Arc::new(Activity::default());
         let acts = activity.clone();
+        let (end, ended) = oneshot::channel();
         std::thread::Builder::new()
             .name(format!("embed {model}"))
-            .spawn(move || run(&name, load, &room, waiting, &acts))
+            .spawn(move || {
+                run(&name, load, &room, waiting, &acts);
+                drop(end);
+            })
             .map_err(|error| failure(model, format!("no thread to run it on: {error}")))?;
         Ok(Self {
             model: model.to_string(),
             jobs,
             activity,
+            ended,
         })
+    }
+
+    /// Stops the model's thread once the jobs sent before are done, and
+    /// returns when it has let go of the model. A process that is to end
+    /// closes first: one that ends while the thread is still letting go
+    /// tears ONNX Runtime down under it, which on CUDA can crash.
+    pub async fn close(self) {
+        let Self { jobs, ended, .. } = self;
+        drop(jobs);
+        // An error is the thread's end: it only ever drops its end.
+        let _ = ended.await;
     }
 }
 
