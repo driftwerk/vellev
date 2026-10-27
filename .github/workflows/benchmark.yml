@@ -152,11 +152,24 @@ jobs:
           rm -rf "$F/download"
           ls "$F/vectors/passages" | wc -l
           df -h /
+      # The many-tenants measure runs on the SQuAD recall fixture (§3e),
+      # fetched and checked the same way.
+      - name: Fetch the recall fixture and check it
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/recall"
+          cd "$RUNNER_TEMP/recall"
+          gh release download fixture-recall-squad2-bge-base-v1 --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.zst' --pattern ATTRIBUTION.md
+          sha256sum --check --strict "$GITHUB_WORKSPACE/scripts/recall-fixture/SHA256SUMS"
+          zstd --decompress --rm -q -- *.zst
+          df -h /
       - name: Run
         run: |
           set -o pipefail
           taskset -c 3 target/release/vellev-bench \
             --fixture "$RUNNER_TEMP/fixture" --truth "$TRUTH" --rows "$ROWS" \
+            --tenants "$RUNNER_TEMP/recall" \
             --out "$RUNNER_TEMP/results" --data "$RUNNER_TEMP/engines" \
             --vellev-image vellev:bench --weaviate-image "$WEAVIATE_IMAGE" --postgres-image "$POSTGRES_IMAGE" \
             $TUNED 2>&1 | tee "$RUNNER_TEMP/run.log"

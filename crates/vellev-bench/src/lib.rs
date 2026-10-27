@@ -9,3 +9,4 @@ pub mod measure;
 pub mod report;
 pub mod run;
 pub mod sample;
+pub mod tenants;
