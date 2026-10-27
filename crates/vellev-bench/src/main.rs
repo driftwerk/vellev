@@ -68,6 +68,10 @@ struct Args {
     /// the many-tenants measure (§3e); left out, it is not run.
     #[arg(long)]
     tenants: Option<PathBuf>,
+    /// The pull-request gate (§8): vellev alone, at its defaults, limit 10;
+    /// no bursts, restarts or many tenants. Its exit says whether it held.
+    #[arg(long)]
+    gate_only: bool,
     /// Concurrent queries in a burst (§4).
     #[arg(long, value_delimiter = ',', default_value = "16,64")]
     burst_sizes: Vec<usize>,
@@ -279,7 +283,7 @@ async fn vellev(
         let at_rest = steady(&cgroups, &args.data).await?;
         sampler.phase("hybrid");
         let reference = run::vellev_reference(&engine, queries, truth).await?;
-        let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps).await?;
+        let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps, plan.defaults_only).await?;
         let settings = engine.settings().await?;
         std::fs::write(args.out.join("vellev-metrics.txt"), engine.metrics().await?)?;
         sampler.phase("open");
@@ -293,10 +297,13 @@ async fn vellev(
             up.vellev.stop()?;
             up.vellev.start()
         };
-        let opened = vec![
-            reopened("empty local disk (its cache directory emptied, the store kept) and the OS page cache dropped", plan.reps, &cold, &ready_url, &up.vellev, engine.as_ref(), &queries[0]).await?,
-            reopened("warm OS page cache", plan.reps, &warm, &ready_url, &up.vellev, engine.as_ref(), &queries[0]).await?,
-        ];
+        let opened = match plan.defaults_only {
+            true => vec![],
+            false => vec![
+                reopened("empty local disk (its cache directory emptied, the store kept) and the OS page cache dropped", plan.reps, &cold, &ready_url, &up.vellev, engine.as_ref(), &queries[0]).await?,
+                reopened("warm OS page cache", plan.reps, &warm, &ready_url, &up.vellev, engine.as_ref(), &queries[0]).await?,
+            ],
+        };
         let memory = memory(at_rest, sampler.stop());
         eyre::Ok(EngineRun {
             settings,
@@ -347,7 +354,7 @@ async fn weaviate(
         let at_rest = steady(&cgroups, &args.data).await?;
         sampler.phase("hybrid");
         let reference = run::weaviate_reference(engine.as_ref(), queries, plan.rows).await?;
-        let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps).await?;
+        let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps, plan.defaults_only).await?;
         let settings = engine.settings().await?;
         sampler.phase("open");
         engine.set(engine.points(10)[0]).await?;
@@ -586,6 +593,53 @@ fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
     out
 }
 
+/// The pull-request gate (§8): vellev alone at its defaults on the slice
+/// loaded, held to the same thresholds as the nightly.
+#[allow(clippy::too_many_arguments)]
+async fn gate_only(
+    args: &Args,
+    fixture: &Fixture,
+    truth: &Truth,
+    plan: &Plan,
+    pinning: &Pinning,
+    queries: &[Query],
+    warmup: &[Query],
+    cases: &[Case],
+    environment: Value,
+) -> Result<()> {
+    let run = vellev(args, fixture, truth, plan, pinning, queries, warmup).await?;
+    let gate = report::gate(
+        &run.measured,
+        cases,
+        report::hybrid_check(&run.hybrid).into_iter().collect(),
+    );
+    let results = json!({
+        "schema": 1,
+        "kind": "pull-request gate",
+        "rows": args.rows,
+        "queries": queries.len(),
+        "environment": environment,
+        "vellev": { "image": run.image, "settings": run.settings, "phases": run.phases, "points": run.measured, "hybrid": run.hybrid },
+        "gate": gate,
+    });
+    std::fs::write(
+        args.out.join("results.json"),
+        serde_json::to_string_pretty(&results)?,
+    )?;
+    let summary = report::summary(
+        &[],
+        &[],
+        &[],
+        &gate,
+        args.rows,
+        "The pull-request gate: vellev at its defaults, limit 10.",
+    );
+    std::fs::write(args.out.join("summary.md"), &summary)?;
+    println!("{summary}");
+    ensure!(gate.passed, "the hard gate failed: see summary.md");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -610,7 +664,11 @@ async fn main() -> Result<()> {
         batch: args.batch,
         in_flight: args.in_flight,
         settle_within: Duration::from_secs(3 * 3600),
-        burst_sizes: args.burst_sizes.clone(),
+        defaults_only: args.gate_only,
+        burst_sizes: match args.gate_only {
+            true => vec![],
+            false => args.burst_sizes.clone(),
+        },
         bursts: args.bursts,
     };
     let pinning = Pinning {
@@ -618,8 +676,22 @@ async fn main() -> Result<()> {
         cpus: args.cpus,
         memory_mb: args.memory_mb,
     };
-    let first_vellev = vellev_first(&args.order)?;
     let environment = environment();
+    if args.gate_only {
+        return gate_only(
+            &args,
+            &fixture,
+            &truth,
+            &plan,
+            &pinning,
+            &queries,
+            &warmup,
+            &cases,
+            environment,
+        )
+        .await;
+    }
+    let first_vellev = vellev_first(&args.order)?;
     let (mut vellev_run, mut weaviate_run) = (None, None);
     let (mut vellev_many, mut weaviate_many) = (Vec::new(), Vec::new());
     for turn in 0..2 {

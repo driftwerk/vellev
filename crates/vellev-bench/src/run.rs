@@ -27,6 +27,8 @@ pub struct Plan {
     pub in_flight: usize,
     /// The longest a load may take to settle.
     pub settle_within: Duration,
+    /// Only each engine's default point, for the pull-request gate (§8).
+    pub defaults_only: bool,
     /// Concurrent queries in a burst (§4), and bursts of each size.
     pub burst_sizes: Vec<usize>,
     pub bursts: usize,
@@ -185,7 +187,7 @@ pub async fn measure(
 ) -> Result<Vec<Measured>> {
     let mut measured = Vec::new();
     for &limit in &plan.limits {
-        for knob in engine.points(limit) {
+        for knob in points(engine, limit, plan.defaults_only) {
             engine.set(knob).await?;
             for &case in &plan.cases {
                 let started = Instant::now();
@@ -351,9 +353,10 @@ pub async fn hybrid(
     queries: &[Query],
     reference: &[Vec<u64>],
     reps: usize,
+    defaults_only: bool,
 ) -> Result<Vec<HybridPoint>> {
-    let mut points = Vec::new();
-    for knob in engine.points(10) {
+    let mut measured = Vec::new();
+    for knob in points(engine, 10, defaults_only) {
         engine.set(knob).await?;
         let (mut p50s, mut p99s) = (Vec::new(), Vec::new());
         let mut recall = Recall::default();
@@ -389,9 +392,19 @@ pub async fn hybrid(
             point.p50_ms.median,
             point.p99_ms.median
         );
-        points.push(point);
+        measured.push(point);
     }
-    Ok(points)
+    Ok(measured)
+}
+
+/// The knob points to measure at `limit`: all of them, or the default
+/// alone.
+fn points(engine: &dyn Engine, limit: usize, defaults_only: bool) -> Vec<Knob> {
+    let mut points = engine.points(limit);
+    if defaults_only {
+        points.truncate(1);
+    }
+    points
 }
 
 /// `count` bursts of `size` queries asked at once, the queries taken in

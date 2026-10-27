@@ -1,0 +1,76 @@
+name: Benchmark gate
+
+# The hard gate on pull requests that touch the storage or the index (§8):
+# vellev at its defaults on the fixture's first 100,000 passages, against
+# their own truth. The nightly on 1M rows is the backstop.
+on:
+  pull_request:
+    paths:
+      - crates/vellev-storage/**
+      - crates/vellev-index/**
+      - crates/vellev-bench/**
+      - .github/workflows/bench-gate.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  POSTGRES_IMAGE: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+  WEAVIATE_IMAGE: cr.weaviate.io/semitechnologies/weaviate:1.40.2@sha256:0083587dc01f33112e5406ce9b471df1abea480c71a0407af903929a389ae08a
+  FIXTURE: fixture-bench-wiki1m-bge-base-v1
+
+jobs:
+  gate:
+    name: Gate on 100k
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: vellev:bench
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: cargo build --release --locked -p vellev-bench
+      - name: Fetch the 100k slice and check it
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/download" "$F/text" "$F/vectors" "$F/truth"
+          cd "$F/download"
+          wanted="passages.jsonl.zst queries.jsonl warmup.jsonl vectors-queries.tar.zst vectors-passages-0.tar.zst truth-100000.jsonl.zst"
+          for asset in $wanted; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+            grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> wanted.sha256
+          done
+          sha256sum --check --strict wanted.sha256
+          zstd -q -d --long=31 passages.jsonl.zst -o "$F/text/passages.jsonl"
+          mv queries.jsonl warmup.jsonl "$F/text/"
+          for part in vectors-passages-0.tar.zst vectors-queries.tar.zst; do
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
+          done
+          zstd -q -d truth-100000.jsonl.zst -o "$F/truth/truth-100000.jsonl"
+      - name: Gate
+        run: |
+          taskset -c 3 target/release/vellev-bench --gate-only \
+            --fixture "$RUNNER_TEMP/fixture" --truth "$RUNNER_TEMP/fixture/truth/truth-100000.jsonl" --rows 100000 \
+            --out "$RUNNER_TEMP/results" --data "$RUNNER_TEMP/engines" --limits 10 \
+            --vellev-image vellev:bench --weaviate-image "$WEAVIATE_IMAGE" --postgres-image "$POSTGRES_IMAGE"
+      - if: always()
+        run: cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-gate-100k
+          path: ${{ runner.temp }}/results
+          retention-days: 90
+          if-no-files-found: ignore
