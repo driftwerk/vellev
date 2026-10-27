@@ -111,6 +111,32 @@ pub struct Refused {
     pub status: reqwest::StatusCode,
 }
 
+/// A GraphQL answer's errors: one that says 429 is the engine turning the
+/// query away as busy, which Weaviate reports inside a 200.
+pub fn graphql_answered(answer: &Value) -> Result<()> {
+    let Some(errors) = answer.get("errors") else {
+        return Ok(());
+    };
+    let busy = errors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|error| error["message"].as_str().is_some_and(|m| m.contains("429")));
+    if busy {
+        return Err(Refused {
+            what: format!("GraphQL: {errors}"),
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+        }
+        .into());
+    }
+    eyre::bail!("GraphQL: {errors}")
+}
+
+/// Whether `error` is an engine turning a request away as busy.
+pub fn is_refused(error: &eyre::Report) -> bool {
+    error.downcast_ref::<Refused>().is_some()
+}
+
 async fn answered(response: reqwest::Response, what: &str) -> Result<Value> {
     let status = response.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -563,11 +589,7 @@ impl Weaviate {
                 Some(&json!({ "query": query })),
             )
             .await?;
-        ensure!(
-            answer.get("errors").is_none(),
-            "GraphQL: {}",
-            answer["errors"]
-        );
+        crate::engine::graphql_answered(&answer)?;
         answer["data"]["Get"][name]
             .as_array()
             .ok_or_else(|| eyre!("no results: {answer}"))?
@@ -692,11 +714,7 @@ impl Engine for Weaviate {
                 Some(&json!({ "query": query })),
             )
             .await?;
-        ensure!(
-            answer.get("errors").is_none(),
-            "GraphQL: {}",
-            answer["errors"]
-        );
+        crate::engine::graphql_answered(&answer)?;
         answer["data"]["Get"][COLLECTION]
             .as_array()
             .ok_or_else(|| eyre!("no results: {answer}"))?
@@ -804,6 +822,16 @@ mod tests {
             Vellev::threads_as_set("", 3).is_err(),
             "unreported is not as set"
         );
+    }
+
+    #[test]
+    fn a_graphql_429_is_a_refusal_and_any_other_error_a_failure() {
+        let busy = json!({"errors": [{"message": "429 Too many requests", "path": ["Get"]}]});
+        assert!(is_refused(&graphql_answered(&busy).unwrap_err()));
+        let broken = json!({"errors": [{"message": "no such class"}]});
+        let error = graphql_answered(&broken).unwrap_err();
+        assert!(!is_refused(&error));
+        assert!(graphql_answered(&json!({"data": {}})).is_ok());
     }
 
     #[test]

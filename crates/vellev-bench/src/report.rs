@@ -249,6 +249,7 @@ mod tests {
             p50_ms: r(p99 / 2.0),
             p99_ms: r(p99),
             bursts: vec![],
+            refused: 0,
         }
     }
 
@@ -312,6 +313,7 @@ mod tests {
             recall_share: found as f64 / 10_000.0,
             p50_ms: r(p99 / 2.0),
             p99_ms: r(p99),
+            refused: 0,
         }
     }
 

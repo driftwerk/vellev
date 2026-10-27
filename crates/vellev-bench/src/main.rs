@@ -169,7 +169,7 @@ async fn measured(
         engine.name()
     );
     sampler.phase("warmup");
-    let warmup_seconds = run::warm(engine.as_ref(), warmup).await?;
+    let (warmup_seconds, warmup_refused) = run::warm(engine.as_ref(), warmup).await?;
     sampler.phase("measure");
     let started = std::time::Instant::now();
     let measured = run::measure(engine.as_ref(), queries, truth, plan).await?;
@@ -185,6 +185,7 @@ async fn measured(
             load_seconds,
             settle_seconds,
             warmup_seconds,
+            warmup_refused,
             measure_seconds: started.elapsed().as_secs_f64(),
             rows_per_second_loading: plan.rows as f64 / load_seconds,
         },
@@ -427,7 +428,7 @@ async fn many_tenants(
     index: &str,
     headline: bool,
 ) -> Result<tenants::Measured> {
-    let (load_seconds, settle_seconds, p50_ms, p99_ms) =
+    let (load_seconds, settle_seconds, p50_ms, p99_ms, refused) =
         tenants::measure(engine, memories, queries, reps, Duration::from_secs(3600)).await?;
     let anon = steady(cgroups, disk).await?.anon;
     eprintln!(
@@ -444,6 +445,7 @@ async fn many_tenants(
         p50_ms,
         p99_ms,
         anon_bytes: anon,
+        refused,
     })
 }
 
@@ -579,6 +581,21 @@ fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
             run.phases.load_seconds,
             run.phases.settle_seconds,
             run.phases.rows_per_second_loading,
+        ));
+    }
+    out.push_str("\nQueries turned away as busy (429 or 503), counted beside the times and never taken as answers:\n\n");
+    for (name, run) in runs {
+        let points: u64 = run.measured.iter().map(|m| m.refused).sum();
+        let bursts: u64 = run
+            .measured
+            .iter()
+            .flat_map(|m| &m.bursts)
+            .map(|b| b.refused)
+            .sum();
+        let hybrid: u64 = run.hybrid.iter().map(|h| h.refused).sum();
+        out.push_str(&format!(
+            "- {name}: {points} of the single queries, {bursts} in bursts, {hybrid} hybrid, {} warm-up, {} of the empty collection\n",
+            run.phases.warmup_refused, run.floor.refused
         ));
     }
     out.push_str("\n| Engine | Restart state | ready s | first query ms |\n|---|---|---|---|\n");
