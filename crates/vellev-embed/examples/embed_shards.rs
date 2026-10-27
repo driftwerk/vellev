@@ -3,7 +3,8 @@
 //! and a run skips the shards already there. So a run on a laptop that
 //! sleeps, or is stopped, goes on from the last whole shard.
 //!
-//! Reads `INPUT` (`{id, text}` per line, in order) and writes
+//! Reads `INPUT` (`{id, text}` per line, ids one after another from any
+//! first, as the warm-up questions start after the measured ones) and writes
 //! `OUT/NNNNN.f32`: the shard's vectors as little-endian `f32`s, row after
 //! row, in the order of the input. A shard is `SHARD` rows, the last one
 //! fewer. `PREFIX`, when given, is put before each text, as a query is
@@ -29,11 +30,13 @@ fn texts(input: &Path) -> Vec<String> {
     let file = std::fs::File::open(input).unwrap_or_else(|e| panic!("{}: {e}", input.display()));
     BufReader::new(file)
         .lines()
-        .enumerate()
-        .map(|(n, line)| {
+        .scan(None, |next: &mut Option<u64>, line| {
             let row: Value = serde_json::from_str(&line.unwrap()).unwrap();
-            assert_eq!(row["id"].as_u64(), Some(n as u64), "rows are in id order");
-            row["text"].as_str().expect("a text").to_string()
+            let id = row["id"].as_u64().expect("an id");
+            let n = *next.get_or_insert(id);
+            *next = Some(n + 1);
+            assert_eq!(id, n, "rows are in id order, one after another");
+            Some(row["text"].as_str().expect("a text").to_string())
         })
         .collect()
 }

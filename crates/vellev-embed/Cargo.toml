@@ -9,6 +9,11 @@ license = "FSL-1.1-ALv2"
 [features]
 default = ["local"]
 local = ["dep:fastembed", "dep:hf-hub"]
+# Runs local models on an NVIDIA GPU through ONNX Runtime's CUDA provider,
+# which fails to load rather than falling back to the CPU. Only for
+# one-off jobs such as embedding the benchmark fixture: it needs the CUDA
+# and cuDNN libraries ONNX Runtime's CUDA build is linked against.
+cuda = ["local", "dep:ort", "ort/cuda"]
 
 [dependencies]
 vellev-core.workspace = true
@@ -25,6 +30,9 @@ futures.workspace = true
 # models with, or a cache that cannot be written is no longer recognised.
 # A test in local.rs fails if Cargo.lock comes to hold two.
 hf-hub = { version = "0.5", optional = true, default-features = false, features = ["ureq"] }
+# Only for the `cuda` feature: keep it the version fastembed runs models
+# with, so the CUDA provider is that of the same ONNX Runtime.
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false }
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
