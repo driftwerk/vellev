@@ -10,6 +10,18 @@
 #[global_allocator]
 static GLOBAL: vellev::allocator::Allocator = vellev::allocator::Allocator::new();
 
+/// The node binary's jemalloc options, exported here as the binary does.
+#[cfg(target_os = "linux")]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static OPTIONS: vellev::allocator::Options =
+    vellev::allocator::Options(vellev::allocator::OPTIONS.as_ptr());
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_background_thread_that_gives_memory_back_is_on() {
+    assert_eq!(tikv_jemalloc_ctl::opt::background_thread::read(), Ok(true));
+}
+
 /// The process's anonymous resident memory, in bytes.
 #[cfg(target_os = "linux")]
 fn anon() -> u64 {
@@ -41,22 +53,20 @@ fn memory_freed_among_what_is_kept_is_given_back() {
         .collect();
     let held = kept.iter().map(|piece| piece.len() as u64).sum::<u64>();
     // An allocator that hands out small pieces from pages of several keeps
-    // a page any one of its pieces is still in: one kept in sixteen leaves
-    // about a quarter of jemalloc's pages for 3 KiB pieces in use. What is
-    // asked is that most of what was freed goes back, at least half; glibc
-    // gave back none of it.
-    let freed = 300_000 * 3 * 1024 - held;
-    let bound = before + held + freed / 2;
+    // a page any one of its pieces is still in: jemalloc's pages for 3 KiB
+    // pieces hold four, so one kept in sixteen keeps one page in four, four
+    // times what is kept (about 216 MiB here; 238 MiB measured with the
+    // rest of the process). glibc kept all 890 MiB.
+    let bound = before + 4 * held + 64 * MIB;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while anon() > bound && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     assert!(
         anon() <= bound,
-        "{} MiB anonymous with {} MiB kept of {} MiB: not half of what was freed was given back",
+        "{} MiB anonymous with {} MiB kept: what was freed was not given back",
         anon() / MIB,
-        held / MIB,
-        (held + freed) / MIB
+        held / MIB
     );
     drop(kept);
 }

@@ -38,6 +38,7 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 
 [dev-dependencies]
+tikv-jemalloc-ctl = "0.6"
 async-trait.workspace = true
 bytes.workspace = true
 ring.workspace = true

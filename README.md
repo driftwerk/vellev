@@ -444,8 +444,10 @@ malloc did not give that memory back, so a node held its high-water mark
 until it was killed (a 1M-row, 768-dimension load in 10 GiB). jemalloc gives
 it back: on Linux a background thread purges freed pages after about 10
 seconds (`background_thread:true`, jemalloc's default decay), so memory
-falls while the node is idle too. `MALLOC_CONF` tunes it further if ever
-needed, for example `dirty_decay_ms` for a shorter decay.
+falls while the node is idle too. `_RJEM_MALLOC_CONF` tunes it further if
+ever needed, for example `dirty_decay_ms:1000` for a shorter decay: the
+jemalloc the node links has its names prefixed, so `MALLOC_CONF` is not
+read and setting it does nothing.
 
 `VELLEV_TENANT_QUERIES_PER_SECOND` and
 `VELLEV_TENANT_WRITES_PER_SECOND` (objects) bound what one tenant may ask of

@@ -50,16 +50,18 @@ unsafe impl GlobalAlloc for Allocator {
     }
 }
 
-/// jemalloc's options, read once as it starts: a C string it finds by this
-/// name.
-#[cfg(target_os = "linux")]
+/// The options the `vellev` binary gives jemalloc, which reads them once
+/// as it starts from the symbol `_rjem_malloc_conf` (tikv-jemalloc-sys
+/// prefixes jemalloc's names): a background thread that purges freed pages
+/// on Linux, so that memory goes back while the node is idle too. Only a
+/// binary exports that symbol, so that a crate depending on this library
+/// is not given the node's options, nor kept from setting its own.
+pub const OPTIONS: &std::ffi::CStr = c"background_thread:true";
+
+/// What exports [`OPTIONS`] under the name jemalloc reads them from: a
+/// pointer to a static C string, which nothing writes.
 #[repr(transparent)]
-pub struct Options(*const u8);
+pub struct Options(pub *const std::ffi::c_char);
 
 // SAFETY: it points at a static string that nothing writes.
-#[cfg(target_os = "linux")]
 unsafe impl Sync for Options {}
-
-#[cfg(target_os = "linux")]
-#[unsafe(export_name = "_rjem_malloc_conf")]
-pub static OPTIONS: Options = Options(c"background_thread:true".as_ptr().cast());
