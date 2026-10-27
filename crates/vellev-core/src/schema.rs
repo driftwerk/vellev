@@ -8,6 +8,7 @@ use crate::CollectionName;
 pub const MAX_DIMENSIONS: u32 = 8192;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SchemaError {
     #[error("property name {0:?} must be letters, digits or '_', starting with a letter or '_'")]
     PropertyName(String),
@@ -31,6 +32,16 @@ pub enum SchemaError {
     AccessNotFilterableText(String),
     #[error("property {0:?} already exists with a different definition")]
     PropertyConflict(String),
+    #[error(
+        "property {0:?} is not stored, so it must be one the collection embeds, with a \
+         provider that embeds it"
+    )]
+    UnstoredNotEmbedded(String),
+    #[error(
+        "property {0:?} is not stored, so it cannot be filterable or searchable; a property \
+         is filterable unless it says \"filterable\": false"
+    )]
+    UnstoredIndexed(String),
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -81,10 +92,23 @@ pub struct Property {
     /// Tokenized and indexed for keyword search.
     #[serde(default)]
     pub searchable: bool,
+    /// Kept in the object as written. A property that is not is text the
+    /// collection embeds: it goes into the vector its object is given, and
+    /// is never read back, logged, written to a segment or backed up. It is
+    /// neither filterable nor searchable, and a patch or append that would
+    /// change what is embedded must bring its own vector, as the text is
+    /// not there to embed again. Written only when false, so a schema with
+    /// every property stored reads and is written as before.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub stored: bool,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn is_yes(value: &bool) -> bool {
+    *value
 }
 
 impl Property {
@@ -94,11 +118,20 @@ impl Property {
             data_type,
             filterable: true,
             searchable: false,
+            stored: true,
         }
     }
 
     pub fn searchable(mut self) -> Self {
         self.searchable = true;
+        self
+    }
+
+    /// Embedded but not stored: not filterable, searchable or kept.
+    pub fn unstored(mut self) -> Self {
+        self.stored = false;
+        self.filterable = false;
+        self.searchable = false;
         self
     }
 }
@@ -224,6 +257,19 @@ impl Collection {
         self.properties.iter().find(|p| p.name == name)
     }
 
+    /// Whether the collection embeds text it does not store.
+    pub fn has_unstored(&self) -> bool {
+        self.properties.iter().any(|p| !p.stored)
+    }
+
+    /// The object without the text it does not store.
+    pub fn stripped(&self, mut object: crate::Object) -> crate::Object {
+        for property in self.properties.iter().filter(|p| !p.stored) {
+            object.properties.remove(&property.name);
+        }
+        object
+    }
+
     pub fn validate(&self) -> Result<(), SchemaError> {
         for (i, property) in self.properties.iter().enumerate() {
             validate_property(property)?;
@@ -249,6 +295,15 @@ impl Collection {
                 ));
             }
         }
+        let embeds = e.provider != EmbeddingProvider::None;
+        for property in self.properties.iter().filter(|p| !p.stored) {
+            if !embeds || !e.properties.contains(&property.name) {
+                return Err(SchemaError::UnstoredNotEmbedded(property.name.clone()));
+            }
+            if property.filterable || property.searchable {
+                return Err(SchemaError::UnstoredIndexed(property.name.clone()));
+            }
+        }
         let Bm25 { k1, b } = self.bm25;
         if !(k1 >= 0.0 && k1.is_finite() && (0.0..=1.0).contains(&b)) {
             return Err(SchemaError::Bm25 { k1, b });
@@ -270,6 +325,11 @@ impl Collection {
     /// that already exists unchanged is a no-op, so migrations can be re-run.
     pub fn add_property(&mut self, property: Property) -> Result<bool, SchemaError> {
         validate_property(&property)?;
+        // What is embedded is fixed when the collection is made, so a
+        // property added later is embedded by nothing.
+        if !property.stored {
+            return Err(SchemaError::UnstoredNotEmbedded(property.name));
+        }
         match self.property(&property.name) {
             Some(existing) if *existing == property => Ok(false),
             Some(_) => Err(SchemaError::PropertyConflict(property.name)),
@@ -564,5 +624,91 @@ pub(crate) mod tests {
             Err(SchemaError::PropertyName("bad name".into()))
         );
         assert_eq!(c.validate(), Ok(()));
+    }
+
+    /// Track 2, V3: a property embedded but not stored.
+    fn unstored_body() -> Collection {
+        collection(
+            "pages",
+            bge(&["title", "body"]),
+            vec![
+                Property::new("title", Text),
+                Property::new("body", Text).unstored(),
+                Property::new("n", Int),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_unstored_property_is_embedded_text_that_nothing_indexes() {
+        assert_eq!(unstored_body().validate(), Ok(()));
+        fn body(c: &mut Collection) -> &mut Property {
+            c.properties.iter_mut().find(|p| p.name == "body").unwrap()
+        }
+        type Break = fn(&mut Collection);
+        let cases: Vec<(Break, SchemaError)> = vec![
+            (
+                |c| c.embedding.properties = vec!["title".into()],
+                SchemaError::UnstoredNotEmbedded("body".into()),
+            ),
+            (
+                |c| c.embedding.provider = EmbeddingProvider::None,
+                SchemaError::UnstoredNotEmbedded("body".into()),
+            ),
+            (
+                |c| {
+                    let n = c.properties.iter_mut().find(|p| p.name == "n").unwrap();
+                    n.stored = false;
+                    n.filterable = false;
+                },
+                SchemaError::UnstoredNotEmbedded("n".into()),
+            ),
+        ];
+        for (break_it, error) in cases {
+            let mut c = unstored_body();
+            break_it(&mut c);
+            assert_eq!(c.validate(), Err(error));
+        }
+        let mut c = unstored_body();
+        body(&mut c).filterable = true;
+        assert_eq!(
+            c.validate(),
+            Err(SchemaError::UnstoredIndexed("body".into()))
+        );
+        let mut c = unstored_body();
+        body(&mut c).searchable = true;
+        assert_eq!(
+            c.validate(),
+            Err(SchemaError::UnstoredIndexed("body".into()))
+        );
+        // A property added later is embedded by nothing, so is not unstored.
+        let mut c = unstored_body();
+        let added = Property::new("summary", Text).unstored();
+        assert_eq!(
+            c.add_property(added),
+            Err(SchemaError::UnstoredNotEmbedded("summary".into()))
+        );
+    }
+
+    #[test]
+    fn a_stored_property_is_written_as_before_and_stored_is_the_default() {
+        let stored = serde_json::to_value(Property::new("title", Text)).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::json!({ "name": "title", "data_type": "text", "filterable": true, "searchable": false })
+        );
+        let unstored = Property::new("body", Text).unstored();
+        assert!(!unstored.stored && !unstored.filterable && !unstored.searchable);
+        let json = serde_json::to_value(&unstored).unwrap();
+        assert_eq!(json["stored"], serde_json::json!(false));
+        assert_eq!(serde_json::from_value::<Property>(json).unwrap(), unstored);
+        let old: Property =
+            serde_json::from_value(serde_json::json!({ "name": "t", "data_type": "text" }))
+                .unwrap();
+        assert!(old.stored);
+        assert!(workforce_collections()
+            .iter()
+            .flat_map(|c| &c.properties)
+            .all(|p| p.stored));
     }
 }

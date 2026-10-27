@@ -33,7 +33,9 @@ fn frame() -> bytes::Bytes {
         ops: Vec::new(),
         answered: Vec::new(),
     };
-    format::encode(Kind::Log, &log).unwrap()
+    // Link version 1's fixtures carry a log of format 1, as a writer
+    // stamped them then.
+    format::encode_as(Kind::Log, 1, &log).unwrap()
 }
 
 /// The header of the log at position 7, inline.

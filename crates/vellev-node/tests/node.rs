@@ -18,7 +18,7 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{
-    ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Served, Settings,
+    ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Served, Settings, Tenant,
     LOOKED_OVER_EVERY, REMEMBERED,
 };
 use vellev_storage::backups::{Backup, Backups, DELETED_AT_ONCE};
@@ -57,6 +57,9 @@ struct Store {
     slow: std::sync::Mutex<Option<Duration>>,
     /// The prefixes whose cached copies were dropped.
     forgotten: std::sync::Mutex<Vec<String>>,
+    /// When each vectors file was asked to be written, right or wrong:
+    /// one for each flush that got as far as writing its segment.
+    vectors_written: std::sync::Mutex<Vec<tokio::time::Instant>>,
 }
 
 impl Store {
@@ -68,6 +71,12 @@ impl Store {
 
     /// A write of `key` goes wrong, if it is to, as it is to.
     async fn written(&self, key: &str) -> vellev_storage::Result<()> {
+        if key.ends_with(".vectors") {
+            self.vectors_written
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+        }
         let fault = {
             let mut faulty = self.faulty.lock().unwrap();
             let fault = faulty
@@ -161,6 +170,7 @@ impl Cluster {
                 failing_once: AtomicBool::new(false),
                 slow: std::sync::Mutex::new(None),
                 forgotten: std::sync::Mutex::default(),
+                vectors_written: std::sync::Mutex::default(),
             }),
         }
     }
@@ -1528,6 +1538,18 @@ impl Coordinator for Unrenewing {
             .commits_after(key, incarnation, after, limit)
             .await
     }
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        self.inner
+            .commits_to_ship(key, incarnation, base, seen, limit)
+            .await
+    }
     async fn unshipped(
         &self,
         after: Option<&PartitionKey>,
@@ -2792,7 +2814,9 @@ async fn a_node_registers_while_it_runs_and_will_not_serve_a_format_it_cannot_re
     let cluster = Cluster::new();
     let node = cluster.node();
     let ours = node.versions();
-    assert_eq!(node.cluster().await.unwrap(), ours);
+    // A new cluster writes format 1, older than the newest this reads.
+    let new = Versions { format: 1, ..ours };
+    assert_eq!(node.cluster().await.unwrap(), new);
     node.ready().await.unwrap();
 
     node.announcing();
@@ -8567,4 +8591,320 @@ async fn a_node_serves_every_tenant_unless_told_otherwise() {
         assert_eq!(read.unwrap().read(count), 1);
         assert_eq!(reading.copies(), 1);
     }
+}
+
+/// A tenant flushed every `flush_rows` rows, whose failed flushes are
+/// tried again no sooner than `backoff`, doubling.
+fn backlogging(cluster: &Cluster, flush_rows: usize, backoff: Duration) -> Node {
+    cluster.node_from(Settings {
+        flush_rows,
+        flush_backoff: backoff,
+        ..cluster.settings()
+    })
+}
+
+/// Writes rows `from..to` one at a time, until one is refused.
+async fn written_until_refused(tenant: &Tenant, from: u64, to: u64) -> (u64, Option<NodeError>) {
+    for n in from..to {
+        let row = note(n, "row", Some(vec![n as f32, 1.0]));
+        if let Err(refused) = tenant.write(vec![row]).await {
+            return (n, Some(refused));
+        }
+    }
+    (to, None)
+}
+
+/// Track 2, V1: a flush that fails is not kept in memory instead, so the
+/// rows wait for one that does. A tenant does not take more than four
+/// flushes' worth meanwhile: writes past that are refused, saying when to
+/// try again, until a flush goes through.
+#[tokio::test]
+async fn writes_are_refused_while_four_flushes_of_rows_wait_and_taken_once_one_goes_through() {
+    let cluster = Cluster::new();
+    let node = backlogging(&cluster, 10, Duration::from_millis(20));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    let (refused_at, refused) = written_until_refused(&acme, 0, 100).await;
+    assert_eq!(refused_at, 40, "four flushes' worth taken, then refused");
+    let wait = match refused {
+        Some(NodeError::Backlogged { wait, .. }) => wait,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        wait > Duration::ZERO && wait <= Duration::from_secs(60),
+        "{wait:?}"
+    );
+    assert_eq!(
+        acme.read(State::unflushed),
+        40,
+        "nothing taken past the backlog"
+    );
+    assert!(node.flushing().failed >= 1);
+    assert_eq!(node.flushing().unflushed_rows, 40);
+    assert!(node.flushing().unflushed_bytes > 0);
+
+    cluster.store.fault(None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match acme.write(vec![note(1_000, "after", None)]).await {
+            Ok(_) => break,
+            Err(NodeError::Backlogged { wait, .. }) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(wait.min(Duration::from_millis(50))).await;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(acme.read(State::unflushed) < 40);
+    assert!(node.flushing().backlogged >= 1);
+}
+
+/// Failed flushes are not tried back to back: each waits twice as long as
+/// the one before, however hard writes ask for one. On tokio's paused
+/// clock, so the times are exact.
+#[tokio::test(start_paused = true)]
+async fn failed_flushes_are_tried_again_further_and_further_apart() {
+    let cluster = Cluster::new();
+    let backoff = Duration::from_millis(100);
+    let node = backlogging(&cluster, 2, backoff);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    let started = tokio::time::Instant::now();
+    let mut n = 0;
+    // Asking all the while: each write past the threshold asks for one.
+    while started.elapsed() < Duration::from_millis(1_400) {
+        let _ = acme
+            .write(vec![note(n % 8, "row", Some(vec![1.0, 1.0]))])
+            .await;
+        n += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Tried at about 0, 0.1, 0.3 and 0.7 seconds, the next not before
+    // 1.5. Back to back, they would have been tried about as often as
+    // written to.
+    let tried = cluster.store.vectors_written.lock().unwrap().clone();
+    assert_eq!(tried.len(), 4, "{tried:?}");
+    for (k, pair) in tried.windows(2).enumerate() {
+        let gap = pair[1] - pair[0];
+        let least = backoff * 2u32.pow(k as u32);
+        assert!(
+            gap >= least && gap <= least + Duration::from_millis(10),
+            "try {} came {gap:?} after the one before, not {least:?}",
+            k + 2
+        );
+    }
+    assert_eq!(node.flushing().failed, tried.len() as u64);
+}
+
+/// A failed flush is tried again once its backoff lets it, with no write
+/// asking for one: the rows do not wait in memory for the tenant's next
+/// write, nor for its next looking after, an hour off by default.
+#[tokio::test(start_paused = true)]
+async fn a_failed_flush_is_tried_again_with_no_write_asking() {
+    let cluster = Cluster::new();
+    let node = backlogging(&cluster, 2, Duration::from_millis(100));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    for n in 0..3 {
+        acme.write(vec![note(n, "row", Some(vec![1.0, 1.0]))])
+            .await
+            .unwrap();
+    }
+    while node.flushing().failed == 0 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    cluster.store.fault(None);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(acme.read(State::unflushed), 0, "flushed on its own");
+    assert_eq!(node.flushing().failed, 1);
+}
+
+/// A flush however it is asked for, as by a caller, counts as the node's
+/// own do: one that fails is counted, and its backoff is the node's.
+#[tokio::test]
+async fn a_flush_asked_for_by_a_caller_that_fails_is_counted() {
+    let cluster = Cluster::new();
+    let node = backlogging(&cluster, 1_000, Duration::from_secs(60));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![
+        schema(EmbeddingProvider::None),
+        note(1, "row", Some(vec![1.0, 1.0])),
+    ])
+    .await
+    .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    acme.flush().await.unwrap_err();
+    assert_eq!(node.flushing().failed, 1);
+    cluster.store.fault(None);
+    acme.flush().await.unwrap();
+    assert_eq!(node.flushing().failed, 1);
+    assert_eq!(acme.read(State::unflushed), 0);
+}
+
+/// A backlog below the rows a tenant is flushed at would refuse every
+/// write before a flush is ever asked for: such settings are refused.
+#[test]
+fn settings_with_a_backlog_below_a_flush_are_refused() {
+    let with = |flush_rows, backlog_rows, flush_backoff| Settings {
+        flush_rows,
+        backlog_rows,
+        flush_backoff,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    let second = Duration::from_secs(1);
+    assert!(Settings::new(NodeId::generate("node")).check().is_ok());
+    assert_eq!(with(10, None, second).backlog_problem(), None);
+    assert_eq!(with(10, Some(10), second).backlog_problem(), None);
+    for refused in [
+        with(10, Some(9), second),
+        with(10, Some(0), second),
+        with(10, None, Duration::ZERO),
+    ] {
+        assert!(
+            matches!(refused.check(), Err(NodeError::Settings(_))),
+            "{:?} {:?}",
+            refused.backlog_rows,
+            refused.flush_backoff
+        );
+    }
+}
+
+/// Track 2, V3: a property embedded but not stored is new in format 2.
+/// A node refuses a schema with one until the cluster writes format 2,
+/// which it does once every node registered reads it and the nodes are
+/// allowed to write it (`max_format`): until then the release before,
+/// which reads format 1 alone, may read anything written.
+#[tokio::test]
+async fn an_unstored_property_is_refused_until_the_cluster_writes_format_2() {
+    let cluster = Cluster::new();
+    let url = embedding_server(Arc::new(AtomicUsize::new(0))).await;
+    let unstored = || {
+        let Mutation::CreateCollection(mut schema) = schema(served_by(&url, "lengths")) else {
+            unreachable!()
+        };
+        schema
+            .properties
+            .push(Property::new("body", DataType::Text).unstored());
+        schema.embedding.properties.push("body".into());
+        Mutation::CreateCollection(schema)
+    };
+
+    let node = cluster.node();
+    node.announcing();
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    let refused = acme.write(vec![unstored()]).await;
+    assert!(
+        matches!(&refused, Err(NodeError::Storage(StorageError::InvalidMutation(why))) if why.contains("format 2")),
+        "{refused:?}"
+    );
+    acme.write(vec![schema(served_by(&url, "lengths"))])
+        .await
+        .unwrap();
+    node.shutdown().await;
+
+    let raised = cluster.node_from(Settings {
+        max_format: 2,
+        ..cluster.settings()
+    });
+    raised.announcing();
+    raised.create_tenant(&tenant("beta")).await.unwrap();
+    let beta = raised.tenant(&tenant("beta")).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match beta.write(vec![unstored()]).await {
+            Ok(_) => break,
+            Err(NodeError::Storage(StorageError::InvalidMutation(_)))
+                if std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    raised.shutdown().await;
+}
+
+/// Track 2, V3: once any node raises the cluster's format, every node
+/// writes it, whatever its own `max_format`. A node left at the default
+/// that takes over a tenant given an unstored property checkpoints it, as
+/// format 2, rather than fail every flush; and it takes such a property
+/// itself.
+#[tokio::test]
+async fn a_node_writes_the_format_the_cluster_writes_whatever_its_own_max() {
+    let cluster = Cluster::new();
+    let url = embedding_server(Arc::new(AtomicUsize::new(0))).await;
+    let unstored = || {
+        let Mutation::CreateCollection(mut schema) = schema(served_by(&url, "lengths")) else {
+            unreachable!()
+        };
+        schema
+            .properties
+            .push(Property::new("body", DataType::Text).unstored());
+        schema.embedding.properties.push("body".into());
+        Mutation::CreateCollection(schema)
+    };
+    // Written until it goes through, as the node sees the cluster's rise.
+    async fn taken(tenant: &Tenant, mutation: Mutation) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tenant.write(vec![mutation.clone()]).await {
+                Ok(_) => return,
+                Err(NodeError::Storage(StorageError::InvalidMutation(_)))
+                    if std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    let raised = cluster.node_from(Settings {
+        max_format: 2,
+        ..cluster.settings()
+    });
+    raised.announcing();
+    raised.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = raised.tenant(&tenant("acme")).await.unwrap();
+    taken(&acme, unstored()).await;
+    let page = |n: u64| Mutation::Upsert {
+        collection: notes(),
+        id: id(n),
+        properties: json!({ "title": "t", "n": n, "body": "never kept" })
+            .as_object()
+            .unwrap()
+            .clone(),
+        vector: None,
+        only_if_version: None,
+    };
+    acme.write(vec![page(1)]).await.unwrap();
+    drop(acme);
+    raised.shutdown().await;
+
+    let default = cluster.node();
+    default.announcing();
+    // Taken once the node sees the cluster's rise.
+    default.create_tenant(&tenant("beta")).await.unwrap();
+    let beta = default.tenant(&tenant("beta")).await.unwrap();
+    taken(&beta, unstored()).await;
+    let acme = default.tenant(&tenant("acme")).await.unwrap();
+    // Held in memory, to be checkpointed with the unstored schema.
+    acme.write(vec![page(2)]).await.unwrap();
+    assert!(acme.read(State::unflushed) > 0);
+    acme.flush().await.unwrap();
+    assert_eq!(acme.read(State::unflushed), 0);
+    default.shutdown().await;
 }

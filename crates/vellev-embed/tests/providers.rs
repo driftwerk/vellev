@@ -22,6 +22,9 @@ struct Seen {
     refuse_with: AtomicUsize,
     in_flight: AtomicUsize,
     most_in_flight: AtomicUsize,
+    /// Whether texts that say they are held are answered now.
+    released: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
 }
 
 impl Seen {
@@ -62,6 +65,49 @@ impl Seen {
     fn bodies(&self) -> Vec<Value> {
         self.bodies.lock().unwrap().clone()
     }
+
+    /// Waits until held texts are released: so a test knows, and not
+    /// guesses from a clock, that what it asks meanwhile was answered
+    /// while they were still waited on.
+    async fn held(&self) {
+        loop {
+            let released = self.release.notified();
+            if self.released.load(Ordering::SeqCst) {
+                return;
+            }
+            released.await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+/// How long a test waits on what a right build does at once, or within a
+/// bound of at most a few seconds, before failing rather than hanging.
+const BACKSTOP: Duration = Duration::from_secs(60);
+
+/// Waits until `now` holds, failing after [`BACKSTOP`].
+async fn until(what: &str, now: impl Fn() -> bool) {
+    let began = std::time::Instant::now();
+    while !now() {
+        assert!(began.elapsed() < BACKSTOP, "{what} did not come to hold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// `future`, failing after [`BACKSTOP`] rather than hanging: for what a
+/// right build answers while something else is held.
+async fn soon<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(BACKSTOP, future)
+        .await
+        .unwrap_or_else(|_| panic!("{what} waited on what was held"))
+}
+
+fn held(count: usize) -> Vec<String> {
+    (0..count).map(|n| format!("held {n}")).collect()
 }
 
 async fn serve(router: Router) -> String {
@@ -611,7 +657,11 @@ async fn bedrock(seen: Arc<Seen>) -> Bedrock {
         assert_eq!(model, TITAN);
         let now = seen.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         seen.most_in_flight.fetch_max(now, Ordering::SeqCst);
-        // A text that says it is slow takes a second, not 20 ms.
+        // A text that says it is held is answered once released; one
+        // that says it is slow takes a second, not 20 ms.
+        if body["inputText"].as_str().unwrap().starts_with("held") {
+            seen.held().await;
+        }
         let slow = body["inputText"].as_str().unwrap().starts_with("slow");
         tokio::time::sleep(Duration::from_millis(if slow { 1_000 } else { 20 })).await;
         seen.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -857,8 +907,7 @@ async fn an_openai_endpoint_may_be_named_with_its_version_and_must_number_its_ve
 }
 
 #[tokio::test]
-async fn an_endpoint_is_given_the_wait_it_asks_for_and_a_request_that_cannot_be_sent_is_not_retried(
-) {
+async fn an_endpoint_is_given_the_wait_it_asks_for() {
     let calls = Arc::new(AtomicUsize::new(0));
     let throttled = |State(calls): State<Arc<AtomicUsize>>| async move {
         if calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -880,7 +929,13 @@ async fn an_endpoint_is_given_the_wait_it_asks_for_and_a_request_that_cannot_be_
         "{:?}",
         started.elapsed()
     );
+}
 
+/// A request that cannot be sent, its key being no header, is not tried
+/// again: on a paused clock, which a wait to try again would move, no
+/// time passes at all.
+#[tokio::test(start_paused = true)]
+async fn a_request_that_cannot_be_sent_is_not_retried() {
     let seen = Arc::new(Seen::default());
     let provider = Http::new(
         &tei(seen.clone()).await,
@@ -889,16 +944,12 @@ async fn an_endpoint_is_given_the_wait_it_asks_for_and_a_request_that_cannot_be_
         Some("sk-0123456789abcdef\u{7f}x".into()),
     )
     .unwrap();
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     assert!(matches!(
         provider.embed(numbered(1), Purpose::Query).await,
         Err(EmbedError::Failed { .. })
     ));
-    assert!(
-        started.elapsed() < Duration::from_millis(400),
-        "{:?}",
-        started.elapsed()
-    );
+    assert_eq!(started.elapsed(), Duration::ZERO);
     assert!(seen.bodies().is_empty());
 }
 
@@ -952,8 +1003,10 @@ async fn a_bedrock_that_never_answers_fails_rather_than_hangs() {
 
 /// Left to themselves, an endpoint that never answers is waited on for
 /// two minutes and Titan for as long for each text, every try included.
-/// Whoever embeds through them waits no longer than a model is given.
-#[tokio::test]
+/// Whoever embeds through them waits no longer than a model is given: on
+/// a paused clock, which moves only when nothing is left to do but wait,
+/// exactly that long.
+#[tokio::test(start_paused = true)]
 async fn an_endpoint_or_a_bedrock_that_never_answers_is_given_up_on_in_the_time_a_model_is_given() {
     let ms = Duration::from_millis;
     let late = |model: &str, within: &str| EmbedError::Failed {
@@ -966,12 +1019,13 @@ async fn an_endpoint_or_a_bedrock_that_never_answers_is_given_up_on_in_the_time_
         // Left waiting on what never answers, this fails and does not
         // hang.
         let seconds = Duration::from_secs(5);
-        let began = std::time::Instant::now();
+        let began = tokio::time::Instant::now();
         let query = tokio::time::timeout(seconds, embedder.query("fox")).await;
         assert_eq!(query, Ok(Err(late(model, "1s"))));
+        // To the millisecond the timer keeps time in.
         let took = began.elapsed();
-        assert!((ms(1_000)..ms(3_000)).contains(&took), "{took:?}");
-        let began = std::time::Instant::now();
+        assert!((ms(1_000)..=ms(1_000) + ms(1)).contains(&took), "{took:?}");
+        let began = tokio::time::Instant::now();
         let texts = numbered(3);
         let documents = tokio::time::timeout(seconds, embedder.documents(&texts)).await;
         let stalled = EmbedError::Failed {
@@ -979,8 +1033,9 @@ async fn an_endpoint_or_a_bedrock_that_never_answers_is_given_up_on_in_the_time_
             reason: "the model has made nothing for anyone in 1s".into(),
         };
         assert_eq!(documents, Ok(Err(stalled.clone())));
+        // To the millisecond the timer keeps time in.
         let took = began.elapsed();
-        assert!((ms(1_000)..ms(3_000)).contains(&took), "{took:?}");
+        assert!((ms(1_000)..=ms(1_000) + ms(1)).contains(&took), "{took:?}");
         assert_eq!(stalled.lasting(), None, "it may pass");
     };
 
@@ -1017,68 +1072,69 @@ async fn an_endpoint_or_a_bedrock_that_never_answers_is_given_up_on_in_the_time_
     given_up_on(Arc::new(embedder), TITAN).await;
 }
 
-/// Titan stands in at 20 ms a text, so a query alone takes a little over
-/// that. Before queries had calls kept for them, one asked beside many
-/// documents waited for every one of them: 4.8 seconds beside two
-/// thousand.
+/// Titan stands in at 20 ms a text. Before queries had calls kept for
+/// them, one asked beside many documents waited for every one of them:
+/// 4.8 seconds beside two thousand. Here the documents are held, and not
+/// answered until the queries are: a query that waited for them would
+/// never be answered, and no clock says whether it was quick enough.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_beside_many_documents_on_bedrock_is_answered_in_about_its_own_time() {
     let seen = Arc::new(Seen::default());
     let provider = Arc::new(bedrock(seen.clone()).await);
     let query = |n: usize| provider.embed(vec![format!("query {n}")], Purpose::Query);
-    // The first call makes the connection, which is not what is timed.
+    let in_flight = || seen.in_flight.load(Ordering::SeqCst);
+    let answered = |task: &tokio::task::JoinHandle<_>| task.is_finished();
     query(0).await.unwrap();
 
-    // Documents that Titan is slow over hold no more calls than are
-    // theirs, however many wait: the rest are free for queries, which so
-    // do not wait even for one text of them.
-    let slow = {
+    // Documents held hold no more calls than are theirs, however many
+    // wait: the rest are free for queries, which so do not wait even for
+    // one text of them.
+    let documents = {
         let provider = provider.clone();
-        let texts = (0..16).map(|n| format!("slow {n}")).collect();
-        tokio::spawn(async move { provider.embed(texts, Purpose::Document).await })
+        tokio::spawn(async move { provider.embed(held(16), Purpose::Document).await })
     };
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(seen.in_flight.load(Ordering::SeqCst), 8);
-    let began = std::time::Instant::now();
-    let (one, another) = tokio::join!(query(1), query(2));
-    let beside = began.elapsed();
+    until("eight calls held", || in_flight() == 8).await;
+    let (one, another) = soon("two queries", async { tokio::join!(query(1), query(2)) }).await;
     assert!(one.is_ok() && another.is_ok());
-    assert!(beside < Duration::from_millis(600), "two took {beside:?}");
-    assert_eq!(slow.await.unwrap().unwrap().len(), 16);
+    assert!(!answered(&documents), "the documents were held");
+    seen.release();
+    assert_eq!(documents.await.unwrap().unwrap().len(), 16);
     assert_eq!(seen.most_in_flight.load(Ordering::SeqCst), 10);
 
+    // Two calls of six hundred held documents each, side by side.
+    let seen = Arc::new(Seen::default());
+    let provider = Arc::new(bedrock(seen.clone()).await);
+    let query = |n: usize| provider.embed(vec![format!("query {n}")], Purpose::Query);
+    let in_flight = || seen.in_flight.load(Ordering::SeqCst);
+    query(0).await.unwrap();
     let bulk = || {
         let provider = provider.clone();
-        tokio::spawn(async move { provider.embed(numbered(600), Purpose::Document).await })
+        tokio::spawn(async move { provider.embed(held(600), Purpose::Document).await })
     };
     let (one, another) = (bulk(), bulk());
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let began = std::time::Instant::now();
-    assert_eq!(query(1).await.unwrap(), [vec![7.0, 1.0]]);
-    let alone = began.elapsed();
-    assert!(alone < Duration::from_millis(600), "one took {alone:?}");
+    until("eight calls held", || in_flight() == 8).await;
+    assert_eq!(soon("a query", query(1)).await.unwrap(), [vec![7.0, 1.0]]);
     // Many at once take every call as it comes free: the documents wait
     // for them, not they for the documents.
-    let began = std::time::Instant::now();
-    let answers = futures::future::join_all((0..20).map(query)).await;
-    let together = began.elapsed();
+    let answers = soon(
+        "twenty queries",
+        futures::future::join_all((0..20).map(query)),
+    )
+    .await;
     assert!(answers.iter().all(Result::is_ok));
-    assert!(
-        together < Duration::from_millis(1_000),
-        "twenty took {together:?}"
-    );
-    assert!(!one.is_finished() && !another.is_finished());
+    assert!(!answered(&one) && !answered(&another));
 
     // Calls for documents made side by side take turns: a short one made
-    // now is not kept until the long ones are done.
-    let began = std::time::Instant::now();
-    let short = provider.embed(numbered(8), Purpose::Document).await;
-    let beside = began.elapsed();
-    assert_eq!(short.unwrap().len(), 8);
-    assert!(beside < Duration::from_secs(2), "eight took {beside:?}");
-    assert!(!one.is_finished() && !another.is_finished());
-
+    // now, behind them, is answered after a turn or so of theirs, and not
+    // kept until they are done. Turns, not a clock: it needs eight texts,
+    // and they twelve hundred.
+    let short = {
+        let provider = provider.clone();
+        tokio::spawn(async move { provider.embed(numbered(8), Purpose::Document).await })
+    };
+    seen.release();
+    assert_eq!(short.await.unwrap().unwrap().len(), 8);
+    assert!(!answered(&one) && !answered(&another));
     for bulk in [one, another] {
         let vectors = bulk.await.unwrap().unwrap();
         assert_eq!(vectors.len(), 600);
@@ -1090,40 +1146,49 @@ async fn a_query_beside_many_documents_on_bedrock_is_answered_in_about_its_own_t
 
 /// An endpoint has no line of this node's making to stand in: a call
 /// sends its batches one after another, and no call waits on another's.
+/// The documents' batch is held until the queries are answered: a query
+/// that waited on it would never be.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_beside_many_documents_on_an_endpoint_is_sent_at_once() {
-    let slow = |Json(body): Json<Value>| async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let seen = Arc::new(Seen::default());
+    let embed = |State(seen): State<Arc<Seen>>, Json(body): Json<Value>| async move {
         let inputs = body["inputs"].as_array().unwrap();
+        if inputs[0].as_str().unwrap().starts_with("held") {
+            seen.in_flight.fetch_add(1, Ordering::SeqCst);
+            seen.held().await;
+        }
         Json(json!(inputs
             .iter()
             .map(|text| vector_of(text.as_str().unwrap()))
             .collect::<Vec<_>>()))
     };
-    let url = serve(Router::new().route("/embed", post(slow))).await;
+    let url = serve(
+        Router::new()
+            .route("/embed", post(embed))
+            .with_state(seen.clone()),
+    )
+    .await;
     let provider = Arc::new(Http::new(&url, HttpApi::Tei, "bge", None).unwrap());
     let query = |n: usize| provider.embed(vec![format!("query {n}")], Purpose::Query);
     query(0).await.unwrap();
-    // Forty batches, at 50 ms each: two seconds.
     let bulk = {
         let provider = provider.clone();
-        tokio::spawn(async move { provider.embed(numbered(1_280), Purpose::Document).await })
+        tokio::spawn(async move { provider.embed(held(1_280), Purpose::Document).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until("a batch held", || {
+        seen.in_flight.load(Ordering::SeqCst) == 1
+    })
+    .await;
 
-    let began = std::time::Instant::now();
-    assert_eq!(query(1).await.unwrap(), [vec![1.0]]);
-    let alone = began.elapsed();
-    assert!(alone < Duration::from_millis(700), "one took {alone:?}");
-    let began = std::time::Instant::now();
-    let answers = futures::future::join_all((0..20).map(query)).await;
-    let together = began.elapsed();
+    assert_eq!(soon("a query", query(1)).await.unwrap(), [vec![1.0]]);
+    let answers = soon(
+        "twenty queries",
+        futures::future::join_all((0..20).map(query)),
+    )
+    .await;
     assert!(answers.iter().all(Result::is_ok));
-    assert!(
-        together < Duration::from_millis(1_000),
-        "twenty took {together:?}"
-    );
     assert!(!bulk.is_finished());
+    seen.release();
     assert_eq!(bulk.await.unwrap().unwrap().len(), 1_280);
 }
 
@@ -1197,54 +1262,124 @@ async fn a_region_that_refuses_or_throttles_has_been_reached_and_is_asked_again(
 /// has yet to answer is given up on when Titan has made no vector for
 /// anyone for as long as a model may go without, however many texts of
 /// other writes it refuses meanwhile.
+///
+/// Titan never answers the write's text, and refuses another every
+/// hundred milliseconds by a clock the test moves itself, only once the
+/// write is asleep on it, for as long as the write is waited on. It is
+/// given up on at exactly half a second; were a refusal taken for Titan
+/// at work, never.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_text_bedrock_refuses_is_not_bedrock_at_work() {
+    use vellev_embed::clock::{Clock, Manual};
     let ms = Duration::from_millis;
+    let clock = Manual::new();
     let seen = Seen::refusing(usize::MAX, 400);
     let titan = EmbeddingProvider::Bedrock {
         region: "eu-west-2".into(),
     };
     let embedder = Embedder::new(
-        Arc::new(bedrock(seen.clone()).await),
+        Arc::new(bedrock(seen.clone()).await.timed_by(clock.clone())),
         embedding_with(titan, TITAN, 2),
     );
     let embedder = Arc::new(embedder.answering_within(ms(2_000), ms(500)));
-    // Titan takes a second over a text that says it is slow.
-    let began = std::time::Instant::now();
-    let slow = {
+    let began = clock.now();
+    let held = {
         let embedder = embedder.clone();
-        tokio::spawn(async move { embedder.documents(&["slow one".to_string()]).await })
+        tokio::spawn(async move { embedder.documents(&["held one".to_string()]).await })
     };
-    // Meanwhile it refuses a text every hundred milliseconds or so.
-    for n in 0..6 {
-        let refused = embedder.documents(&[format!("quick {n}")]).await;
-        let said = refused.unwrap_err().to_string();
+    let mut refused = 0;
+    loop {
+        settled(&clock, 1, &held).await;
+        if held.is_finished() {
+            break;
+        }
+        assert!(
+            clock.now() - began < ms(10_000),
+            "the write was not given up on through {refused} refusals"
+        );
+        let said = embedder
+            .documents(&[format!("quick {refused}")])
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(said.contains("ValidationException"), "{said}");
-        tokio::time::sleep(ms(80)).await;
+        refused += 1;
+        settled(&clock, 1, &held).await;
+        clock.move_to(clock.now() + ms(100));
     }
-    let given_up_on = slow.await.unwrap().unwrap_err().to_string();
+    let given_up_on = held.await.unwrap().unwrap_err().to_string();
     assert!(
         given_up_on.ends_with("the model has made nothing for anyone in 500ms"),
         "{given_up_on}"
     );
-    let took = began.elapsed();
-    assert!((ms(500)..ms(950)).contains(&took), "{took:?}");
+    assert_eq!(clock.now() - began, ms(500));
+    assert_eq!(refused, 5, "one at the start and after each step");
+}
+
+/// Waits until `waiting` is finished, or `count` calls are asleep on
+/// `clock`, each until a time still to come: whatever the clock last
+/// woke has looked and gone back to sleep, or gone.
+async fn settled<T>(
+    clock: &vellev_embed::clock::Manual,
+    count: usize,
+    waiting: &tokio::task::JoinHandle<T>,
+) {
+    use vellev_embed::clock::Clock;
+    let began = std::time::Instant::now();
+    loop {
+        let asleep = clock.asleep();
+        let calm = asleep.len() == count && asleep.iter().all(|at| *at > clock.now());
+        if waiting.is_finished() || calm {
+            return;
+        }
+        assert!(
+            began.elapsed() < BACKSTOP,
+            "{} asleep, not {count}",
+            asleep.len()
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 /// One batch is given so long, every try included: an endpoint that goes
 /// on saying it is busy is given up on then, and not after every try it
-/// asks for, which here would take seven and a half seconds.
+/// asks for, which here would take seven and a half seconds. The waits
+/// are timed by a clock the test moves itself, and only once the caller
+/// is asleep on it, with nothing left on its way: so it is asked at once
+/// and after half a second, and given up on at 1.2 seconds, before the
+/// third try at 1.5.
 #[tokio::test]
 async fn a_batch_is_given_so_long_however_many_tries_the_endpoint_asks_for() {
+    use vellev_embed::clock::{Clock, Manual};
     let ms = Duration::from_millis;
     let busy = Seen::refusing(usize::MAX, 503);
     let url = tei(busy.clone()).await;
+    let clock = Manual::new();
+    let began = clock.now();
     let provider = Http::new(&url, HttpApi::Tei, "bge", None)
         .unwrap()
-        .answering_each_batch_within(ms(1_200));
-    let began = std::time::Instant::now();
-    let given_up_on = provider.embed(vec!["fox".into()], Purpose::Document).await;
-    let took = began.elapsed();
+        .answering_each_batch_within(ms(1_200))
+        .timed_by(clock.clone());
+    let asking =
+        tokio::spawn(async move { provider.embed(vec!["fox".into()], Purpose::Document).await });
+    // Asleep on the batch's bound and on a wait between tries: then, and
+    // only then, the clock is moved to the first of them to end.
+    let mut moved = Vec::new();
+    let waited = std::time::Instant::now();
+    while !asking.is_finished() {
+        assert!(
+            waited.elapsed() < BACKSTOP,
+            "moved to {moved:?}, then stuck"
+        );
+        let asleep = clock.asleep();
+        if asleep.len() == 2 {
+            moved.push(asleep[0] - began);
+            clock.move_to(asleep[0]);
+        }
+        assert!(moved.len() <= 5, "moved to {moved:?}");
+        tokio::time::sleep(ms(1)).await;
+    }
+    let given_up_on = asking.await.unwrap();
     assert_eq!(
         given_up_on,
         Err(EmbedError::Failed {
@@ -1252,8 +1387,9 @@ async fn a_batch_is_given_so_long_however_many_tries_the_endpoint_asks_for() {
             reason: "no answer within 1.2s".into(),
         })
     );
-    assert!((ms(1_200)..ms(2_500)).contains(&took), "{took:?}");
-    // It had been asked twice, and was to be asked a third time.
+    // The wait after the first try, then the bound: before the wait
+    // after the second try, which ends at 1.5 s.
+    assert_eq!(moved, [ms(500), ms(1_200)]);
     assert_eq!(busy.bodies().len(), 2);
 }
 
@@ -1361,7 +1497,9 @@ async fn a_write_is_not_given_up_on_for_how_many_write_or_how_much_while_it_is_a
         matches!(&written, Err(EmbedError::Failed { reason, .. }) if reason == stopped),
         "{written:?}"
     );
-    assert!((ms(1_200)..ms(1_500)).contains(&took), "{took:?}");
+    // Given up on, and not made: the third try, at a second and a half,
+    // would have made it.
+    assert!(took >= ms(1_200), "{took:?}");
 
     // Titan at 20 ms a text, and twenty-four writes of forty texts at
     // once, for the eight calls there are for documents: the last is
@@ -1475,19 +1613,39 @@ async fn a_region_a_caller_gives_up_on_unanswered_is_marked_as_not_reached() {
         Arc::new(embedder.answering_within(ms(300), ms(300)))
     };
     // Titan takes a second over a text that says it is slow, and the
-    // search is given 300 ms: given up on after 200 ms unanswered marks
-    // the region, and the next search is refused at once, unsent.
+    // search is given 300 ms by a clock the test moves itself, only once
+    // the search is asleep on it: given up on at exactly 300 ms, which is
+    // after 200 ms unanswered and marks the region, and the next search
+    // is refused, unsent: Titan had only ever the slow one in hand.
+    use vellev_embed::clock::{Clock, Manual};
+    let clock = Manual::new();
     let seen = Arc::new(Seen::default());
-    let provider = bedrock(seen.clone()).await.unreached_after(ms(200));
-    let embedder = giving_up(provider);
-    let began = std::time::Instant::now();
-    assert!(embedder.query("slow one").await.is_err());
+    let provider = bedrock(seen.clone()).await.timed_by(clock.clone());
+    let embedder = giving_up(provider.unreached_after(ms(200)));
+    let began = clock.now();
+    let slow = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move { embedder.query("slow one").await })
+    };
+    // Whoever asked, and the call it made for itself and any who ask the
+    // same meanwhile; and Titan has the text in hand.
+    settled(&clock, 2, &slow).await;
+    until("the slow one sent", || {
+        seen.in_flight.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let asleep = clock.asleep();
+    clock.move_to(asleep[0]);
+    let slow = tokio::time::timeout(BACKSTOP, slow)
+        .await
+        .expect("given up on");
+    assert!(slow.unwrap().is_err());
+    assert_eq!(clock.now() - began, ms(300));
     let refused = embedder.query("quick").await.unwrap_err().to_string();
     assert!(
         refused.contains("was not reached a moment ago") && refused.contains("given up on after"),
         "{refused}"
     );
-    assert!(began.elapsed() < ms(600), "{:?}", began.elapsed());
     // Titan was called once: the quick one was never sent.
     assert_eq!(seen.most_in_flight.load(Ordering::SeqCst), 1);
 

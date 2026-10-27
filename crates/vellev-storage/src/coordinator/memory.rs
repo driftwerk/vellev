@@ -694,6 +694,34 @@ impl Coordinator for MemoryCoordinator {
         })
     }
 
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        seen: Option<LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<RestorePoint>> {
+        let after = seen.unwrap_or(LogPosition(base.0.saturating_sub(1)));
+        self.with_row(key, |row, _| {
+            let shipped = shipper_run(key, incarnation, base, row)?.shipped;
+            if shipped != seen {
+                return Err(CoordinatorError::ShippedSince {
+                    key: key.clone(),
+                    seen,
+                    shipped,
+                });
+            }
+            Ok(row
+                .history
+                .iter()
+                .filter(|commit| commit.position > after)
+                .take(limit)
+                .cloned()
+                .collect())
+        })
+    }
+
     async fn unshipped(
         &self,
         after: Option<&PartitionKey>,

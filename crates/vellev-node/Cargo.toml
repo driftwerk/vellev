@@ -7,6 +7,8 @@ publish.workspace = true
 license = "FSL-1.1-ALv2"
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 vellev-core.workspace = true
 vellev-embed.workspace = true
 vellev-storage.workspace = true

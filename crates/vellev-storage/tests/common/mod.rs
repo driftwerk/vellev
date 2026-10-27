@@ -324,6 +324,10 @@ pub struct Unreliable {
     /// A base recorded, once, as the next commit rows are read: a run
     /// re-based while a batch of it is under way.
     pub re_base: Mutex<Option<vellev_storage::coordinator::ShipBase>>,
+    /// The run noted shipped to here, once, as the next commit rows to
+    /// ship are read: by the shipper now holding it, while a batch of a
+    /// stale one is under way.
+    pub shipped_on: Mutex<Option<LogPosition>>,
     /// The record of shipping the next reading of it answers, once, in
     /// place of the one there: as a shipper read it before the run moved.
     pub shipping_once: Mutex<Option<vellev_storage::coordinator::Shipping>>,
@@ -351,6 +355,7 @@ impl Unreliable {
             rows: Mutex::new(BTreeMap::new()),
             unnoted: AtomicBool::new(false),
             re_base: Mutex::new(None),
+            shipped_on: Mutex::new(None),
             shipping_once: Mutex::new(None),
             committed_once: Mutex::new(None),
             hold_on_clean: Mutex::new(None),
@@ -520,6 +525,40 @@ impl Coordinator for Unreliable {
             .inner
             .commits_after(key, incarnation, after, limit)
             .await?;
+        let given = self.rows.lock().unwrap();
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match given.get(&row.position) {
+                Some(instead) => instead.clone(),
+                None => Some(row),
+            })
+            .collect())
+    }
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        let rows = self
+            .inner
+            .commits_to_ship(key, incarnation, base, seen, limit)
+            .await?;
+        // The run moves just after the read, fenced as it is on the run as
+        // read: before it, the read itself is refused, and the fences on a
+        // batch's note and stall would go untested.
+        let re_base = self.re_base.lock().unwrap().take();
+        if let Some(raised) = re_base {
+            self.inner.record_base(key, incarnation, &raised).await?;
+        }
+        let shipped_on = self.shipped_on.lock().unwrap().take();
+        if let Some(position) = shipped_on {
+            self.inner
+                .note_shipped(key, incarnation, base, position)
+                .await?;
+        }
         let given = self.rows.lock().unwrap();
         Ok(rows
             .into_iter()
