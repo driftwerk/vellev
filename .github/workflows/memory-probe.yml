@@ -11,19 +11,15 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update -q && sudo apt-get install -y -q heaptrack > /dev/null
-      - run: cargo build --release --locked -p vellev-storage --example vector_scale
-      - name: 500k rows, anon and file apart
+      - run: cargo test --release --locked -p vellev-storage --test flush_memory --no-run 2>&1 | tail -3
+      - name: What a flush's peak is made of
         run: |
-          STORE=file OBJECTS=500000 DIMS=768 SEGMENTS=2 QUERIES=20 \
-            /usr/bin/time -v target/release/examples/vector_scale 2>&1 | grep -E "segment|merges|rss|Maximum resident|Elapsed"
-      - name: 250k rows in one segment, under heaptrack
-        run: |
-          STORE=file OBJECTS=250000 DIMS=768 SEGMENTS=1 QUERIES=5 \
-            heaptrack -o "$RUNNER_TEMP/scale" target/release/examples/vector_scale 2>&1 | grep -E "segment|merges|rss|heaptrack"
-          f=$(ls "$RUNNER_TEMP"/scale* | head -1)
-          heaptrack_print -f "$f" --print-peaks 1 --print-allocators 0 --print-leaks 0 --print-temporary 0 --peak-limit 25 -s 0 2>&1 | head -300
+          bin=$(ls -t target/release/deps/flush_memory-* | grep -v '\.d$' | head -1)
+          heaptrack -o "$RUNNER_TEMP/flush" "$bin" --nocapture 2>&1 | grep -E "held|heaptrack|test result"
+          f=$(ls "$RUNNER_TEMP"/flush* | head -1)
+          heaptrack_print -f "$f" --print-peaks 1 --print-allocators 0 --print-leaks 0 --print-temporary 0 --peak-limit 15 -s 0 2>&1 | grep -E "peak memory consumed|vellev_|object_store|^  and" | cut -c1-200 | head -150
