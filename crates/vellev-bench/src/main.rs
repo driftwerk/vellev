@@ -110,6 +110,7 @@ struct EngineRun {
     settings: Value,
     phases: Phases,
     measured: Vec<Measured>,
+    floor: run::Floor,
     image: Value,
     extra: Value,
 }
@@ -121,7 +122,7 @@ async fn measured(
     plan: &Plan,
     queries: &[vellev_bench::fixture::Query],
     warmup: &[vellev_bench::fixture::Query],
-) -> Result<(Phases, Vec<Measured>)> {
+) -> Result<(Phases, Vec<Measured>, run::Floor)> {
     engine.create().await?;
     let load_seconds = run::load(engine.clone(), fixture, plan).await?;
     let settle_seconds = run::settle(engine.as_ref(), plan.settle_within).await?;
@@ -132,6 +133,13 @@ async fn measured(
     let warmup_seconds = run::warm(engine.as_ref(), warmup).await?;
     let started = std::time::Instant::now();
     let measured = run::measure(engine.as_ref(), queries, truth, plan).await?;
+    let floor = run::floor(engine.as_ref(), queries, plan.reps).await?;
+    eprintln!(
+        "{}: a query of the empty collection, p50 {:.2} ms p99 {:.2} ms",
+        engine.name(),
+        floor.p50_ms.median,
+        floor.p99_ms.median
+    );
     Ok((
         Phases {
             load_seconds,
@@ -141,6 +149,7 @@ async fn measured(
             rows_per_second_loading: plan.rows as f64 / load_seconds,
         },
         measured,
+        floor,
     ))
 }
 
@@ -171,23 +180,19 @@ async fn vellev(
             docker::VELLEV_KEY,
             "bench",
         )?);
-        let (phases, measured) = measured(engine.clone(), fixture, truth, plan, queries, warmup).await?;
+        // The pools were set by environment (§2): read back before anything
+        // is loaded, or the run fails.
+        Vellev::threads_as_set(&engine.metrics().await?, pinning.cpus)?;
+        let (phases, measured, floor) =
+            measured(engine.clone(), fixture, truth, plan, queries, warmup).await?;
         let settings = engine.settings().await?;
-        // The pools were set by environment (§2): read back, or the run fails.
-        for pool in ["tokio_workers", "rayon"] {
-            ensure!(
-                settings["threads"][pool] == json!(f64::from(pinning.cpus)),
-                "vellev's {pool} threads are {}, not {}",
-                settings["threads"][pool],
-                pinning.cpus
-            );
-        }
         let metrics = engine.metrics().await?;
         std::fs::write(args.out.join("vellev-metrics.txt"), &metrics)?;
         eyre::Ok(EngineRun {
             settings,
             phases,
             measured,
+            floor,
             image: json!({ "image": args.vellev_image, "digest": docker::digest(&args.vellev_image)?, "postgres": args.postgres_image, "postgres_digest": docker::digest(&args.postgres_image)? }),
             extra: json!({ "postgres": "runs on the same CPUs as vellev, within the same memory: 512 MiB of it" }),
         })
@@ -220,14 +225,19 @@ async fn weaviate(
             false => json!({}),
         };
         let engine = Arc::new(Weaviate::new(&url, index)?);
-        let (phases, measured) = measured(engine.clone(), fixture, truth, plan, queries, warmup).await?;
+        let (phases, measured, floor) =
+            measured(engine.clone(), fixture, truth, plan, queries, warmup).await?;
         let settings = engine.settings().await?;
         eyre::Ok(EngineRun {
             settings,
             phases,
             measured,
+            floor,
             image: json!({ "image": args.weaviate_image, "digest": docker::digest(&args.weaviate_image)?, "tuned": args.tuned }),
-            extra: json!({ "env": { "GOMAXPROCS": pinning.cpus, "LIMIT_RESOURCES": true } }),
+            extra: json!({
+                "env": { "GOMAXPROCS": pinning.cpus, "LIMIT_RESOURCES": true },
+                "settled": "the vector queue of every shard empty and its indexing READY; Weaviate exposes no signal for compaction, so compaction is not waited for",
+            }),
         })
     }
     .await;
@@ -296,6 +306,7 @@ async fn main() -> Result<()> {
             "settings": run.settings,
             "phases": run.phases,
             "notes": run.extra,
+            "query_floor": run.floor,
             "points": run.measured,
         })
     };
@@ -324,7 +335,11 @@ async fn main() -> Result<()> {
         args.memory_mb,
         args.reps
     );
-    let summary = report::summary(&matches, &gate, args.rows, &header);
+    let floors = [
+        ("vellev", vellev_run.floor),
+        ("weaviate", weaviate_run.floor),
+    ];
+    let summary = report::summary(&matches, &floors, &gate, args.rows, &header);
     std::fs::write(args.out.join("summary.md"), &summary)?;
     println!("{summary}");
     ensure!(gate.passed, "the hard gate failed: see summary.md");
