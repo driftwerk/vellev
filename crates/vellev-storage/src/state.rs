@@ -631,7 +631,13 @@ pub(crate) struct Snapshot {
     pub position: LogPosition,
     pub checkpoint: Option<String>,
     pub catalog: Catalog,
+    /// The rows taken, without their vectors, which are in `vectors`.
     pub rows: Vec<Row>,
+    /// The rows' vectors end to end, gathered once into the column the
+    /// flushed segment keeps, rather than copied with each row and gathered
+    /// again; and where each row's starts, with one offset past the last.
+    vectors: Vec<f32>,
+    offsets: Vec<u64>,
     pub tombstones: Vec<RowKey>,
     /// Where each of `rows` lies in the memtable.
     at: Vec<usize>,
@@ -651,8 +657,34 @@ impl State {
     }
 }
 
+impl Snapshot {
+    /// The taken rows' vectors as a column, taken out of the snapshot.
+    pub(crate) fn column(&mut self) -> Column {
+        let mut offsets = std::mem::take(&mut self.offsets);
+        if offsets.is_empty() {
+            offsets.push(0);
+        }
+        Column::of(std::mem::take(&mut self.vectors), offsets)
+    }
+}
+
 #[cfg(test)]
 impl Snapshot {
+    /// The taken rows with their vectors put back, as a segment file's rows
+    /// carry them before they are built.
+    pub(crate) fn rows_with_vectors(&self) -> Vec<Row> {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(n, row)| {
+                let (start, end) = (self.offsets[n] as usize, self.offsets[n + 1] as usize);
+                let mut row = row.clone();
+                row.object.vector = (start < end).then(|| self.vectors[start..end].to_vec());
+                row
+            })
+            .collect()
+    }
+
     /// As this, having taken none of the rows there were.
     pub(crate) fn taking_none(self) -> Self {
         Self {
@@ -1671,11 +1703,25 @@ impl State {
         let at: Vec<usize> = (0..self.memtable.rows.len())
             .filter(|row| !self.memtable.dead[*row])
             .collect();
+        let values: usize = at
+            .iter()
+            .map(|row| {
+                self.memtable.rows[*row]
+                    .object
+                    .vector
+                    .as_ref()
+                    .map_or(0, Vec::len)
+            })
+            .sum();
+        let mut offsets = Vec::with_capacity(at.len() + 1);
+        offsets.push(0);
         Snapshot {
             position: self.position,
             checkpoint: self.checkpoint.clone(),
             catalog: self.catalog.clone(),
             rows: Vec::with_capacity(at.len()),
+            vectors: Vec::with_capacity(values),
+            offsets,
             tombstones: self.memtable.tombstones.clone(),
             at,
             held: self.memtable.rows.len(),
@@ -1690,10 +1736,21 @@ impl State {
     pub(crate) fn copy_rows(&self, snapshot: &mut Snapshot, most: usize) -> bool {
         let from = snapshot.rows.len();
         let to = (from + most).min(snapshot.at.len());
-        let rows = &self.memtable.rows;
-        snapshot
-            .rows
-            .extend(snapshot.at[from..to].iter().map(|row| rows[*row].clone()));
+        for &row in &snapshot.at[from..to] {
+            let Row { collection, object } = &self.memtable.rows[row];
+            if let Some(vector) = &object.vector {
+                snapshot.vectors.extend_from_slice(vector);
+            }
+            snapshot.offsets.push(snapshot.vectors.len() as u64);
+            snapshot.rows.push(Row {
+                collection: *collection,
+                object: Object {
+                    id: object.id,
+                    properties: object.properties.clone(),
+                    vector: None,
+                },
+            });
+        }
         to < snapshot.at.len()
     }
 
@@ -2183,7 +2240,7 @@ mod tests {
             let fit = (!snapshot.rows.is_empty()).then(|| {
                 let file = SegmentFile {
                     position: snapshot.position,
-                    rows: snapshot.rows.clone(),
+                    rows: snapshot.rows_with_vectors(),
                     tombstones: snapshot.tombstones.clone(),
                 };
                 let catalog = snapshot.catalog.clone();
@@ -2559,7 +2616,7 @@ mod tests {
         let before = index(&built).centre().to_vec();
         let file = SegmentFile {
             position: snapshot.position,
-            rows: snapshot.rows.clone(),
+            rows: snapshot.rows_with_vectors(),
             tombstones: snapshot.tombstones.clone(),
         };
         let catalog = snapshot.catalog.clone();
