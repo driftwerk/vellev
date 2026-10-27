@@ -27,6 +27,9 @@ pub struct Plan {
     pub in_flight: usize,
     /// The longest a load may take to settle.
     pub settle_within: Duration,
+    /// Concurrent queries in a burst (§4), and bursts of each size.
+    pub burst_sizes: Vec<usize>,
+    pub bursts: usize,
 }
 
 /// A figure repeated: its median, and the spread of the repetitions.
@@ -60,6 +63,20 @@ pub struct Measured {
     /// Milliseconds, each the median of the repetitions.
     pub p50_ms: Repeated,
     pub p99_ms: Repeated,
+    /// At limit 10: queries asked `size` at once.
+    pub bursts: Vec<Burst>,
+}
+
+/// Queries asked `size` at once, `bursts` times (§4): each query's time
+/// from the burst's start to its answer, over every query of every burst,
+/// each figure the median of the repetitions.
+#[derive(Debug, Clone, Serialize)]
+pub struct Burst {
+    pub size: usize,
+    pub bursts: usize,
+    pub p50_ms: Repeated,
+    pub p99_ms: Repeated,
+    pub max_ms: Repeated,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -190,6 +207,15 @@ pub async fn measure(
                     p50s.push(percentile(&took, 50.0));
                     p99s.push(percentile(&took, 99.0));
                 }
+                let mut bursts = Vec::new();
+                if limit == 10 {
+                    for &size in &plan.burst_sizes {
+                        bursts.push(
+                            burst(engine, queries, case, knob, size, plan.bursts, plan.reps)
+                                .await?,
+                        );
+                    }
+                }
                 let point = Measured {
                     limit,
                     case,
@@ -200,6 +226,7 @@ pub async fn measure(
                     same_top_1: same,
                     p50_ms: Repeated::of(&p50s),
                     p99_ms: Repeated::of(&p99s),
+                    bursts,
                 };
                 eprintln!(
                     "{} limit {limit} {} {}: recall {:.4} top-1 {:.3} p50 {:.2} ms p99 {:.2} ms ({:.0} s)",
@@ -365,4 +392,57 @@ pub async fn hybrid(
         points.push(point);
     }
     Ok(points)
+}
+
+/// `count` bursts of `size` queries asked at once, the queries taken in
+/// turn from `queries`, at limit 10.
+pub async fn burst(
+    engine: &dyn Engine,
+    queries: &[Query],
+    case: Case,
+    knob: Knob,
+    size: usize,
+    count: usize,
+    reps: usize,
+) -> Result<Burst> {
+    let (mut p50s, mut p99s, mut maxes) = (Vec::new(), Vec::new(), Vec::new());
+    let mut next = 0;
+    for _ in 0..reps {
+        let mut took = Vec::with_capacity(size * count);
+        for _ in 0..count {
+            let asked: Vec<&Query> = (0..size)
+                .map(|n| &queries[(next + n) % queries.len()])
+                .collect();
+            next = (next + size) % queries.len();
+            let started = Instant::now();
+            let answered =
+                futures::future::try_join_all(asked.into_iter().map(|query| async move {
+                    engine
+                        .nearest(&query.vector, Filter::of(case, query.owner), 10, knob)
+                        .await?;
+                    eyre::Ok(started.elapsed().as_secs_f64() * 1e3)
+                }))
+                .await?;
+            took.extend(answered);
+        }
+        p50s.push(percentile(&took, 50.0));
+        p99s.push(percentile(&took, 99.0));
+        maxes.push(percentile(&took, 100.0));
+    }
+    Ok(Burst {
+        size,
+        bursts: count,
+        p50_ms: Repeated::of(&p50s),
+        p99_ms: Repeated::of(&p99s),
+        max_ms: Repeated::of(&maxes),
+    })
+}
+
+/// The first query after a restart (§4), in one stated state: how long
+/// the engine took to say it was ready, and the first query's own time.
+#[derive(Debug, Clone, Serialize)]
+pub struct Opened {
+    pub state: String,
+    pub ready_seconds: Repeated,
+    pub first_query_ms: Repeated,
 }

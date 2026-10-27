@@ -12,9 +12,10 @@ use eyre::{ensure, Result, WrapErr};
 use serde_json::{json, Value};
 use vellev_bench::docker::{self, Pinning};
 use vellev_bench::engine::{Engine, Vellev, Weaviate};
-use vellev_bench::fixture::{Case, Fixture, Truth};
+use vellev_bench::fixture::{Case, Filter, Fixture, Query, Truth};
 use vellev_bench::report;
 use vellev_bench::run::{self, Measured, Phases, Plan};
+use vellev_bench::sample::{self, Sampler};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -62,6 +63,12 @@ struct Args {
     /// Weaviate's tuned build (§1): maxConnections 64, efConstruction 256.
     #[arg(long)]
     tuned: bool,
+    /// Concurrent queries in a burst (§4).
+    #[arg(long, value_delimiter = ',', default_value = "16,64")]
+    burst_sizes: Vec<usize>,
+    /// Bursts of each size.
+    #[arg(long, default_value_t = 50)]
+    bursts: usize,
     /// Measure only the first N queries (a smoke run); all by default.
     #[arg(long)]
     queries: Option<usize>,
@@ -113,26 +120,36 @@ struct EngineRun {
     floor: run::Floor,
     hybrid: Vec<run::HybridPoint>,
     hybrid_reference: &'static str,
+    memory: Value,
+    opened: Vec<run::Opened>,
     image: Value,
     extra: Value,
 }
 
+/// What every engine goes through once it is up: load, settle, warm up,
+/// measure, the fixed cost of a query; each phase sampled for memory and
+/// disk.
 async fn measured(
     engine: Arc<dyn Engine>,
+    sampler: &Sampler,
     fixture: &Fixture,
     truth: &Truth,
     plan: &Plan,
-    queries: &[vellev_bench::fixture::Query],
-    warmup: &[vellev_bench::fixture::Query],
+    queries: &[Query],
+    warmup: &[Query],
 ) -> Result<(Phases, Vec<Measured>, run::Floor)> {
     engine.create().await?;
+    sampler.phase("load");
     let load_seconds = run::load(engine.clone(), fixture, plan).await?;
+    sampler.phase("settle");
     let settle_seconds = run::settle(engine.as_ref(), plan.settle_within).await?;
     eprintln!(
         "{}: loaded in {load_seconds:.0} s, settled {settle_seconds:.0} s later",
         engine.name()
     );
+    sampler.phase("warmup");
     let warmup_seconds = run::warm(engine.as_ref(), warmup).await?;
+    sampler.phase("measure");
     let started = std::time::Instant::now();
     let measured = run::measure(engine.as_ref(), queries, truth, plan).await?;
     let floor = run::floor(engine.as_ref(), queries, plan.reps).await?;
@@ -155,14 +172,78 @@ async fn measured(
     ))
 }
 
+/// The engine's anonymous memory at rest: read once settled, warmed and
+/// measured, after a few quiet seconds.
+async fn steady(cgroups: &[std::path::PathBuf], disk: &std::path::Path) -> Result<sample::Reading> {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    sample::read(cgroups, disk)
+}
+
+/// Restart the engine `reps` times in `state` and time it until ready and
+/// its first query answered (§4).
+async fn reopened(
+    state: &str,
+    reps: usize,
+    restart: &(dyn Fn() -> Result<()> + Sync),
+    ready_url: &str,
+    container: &docker::Container,
+    engine: &dyn Engine,
+    query: &Query,
+) -> Result<run::Opened> {
+    let (mut ready, mut first) = (Vec::new(), Vec::new());
+    for _ in 0..reps {
+        restart()?;
+        let ready_in = docker::ready(ready_url, Duration::from_secs(600), container).await?;
+        let started = std::time::Instant::now();
+        let default = engine.points(10)[0];
+        engine
+            .nearest(
+                &query.vector,
+                Filter::of(Case::Broad, query.owner),
+                10,
+                default,
+            )
+            .await?;
+        ready.push(ready_in.as_secs_f64());
+        first.push(started.elapsed().as_secs_f64() * 1e3);
+    }
+    let opened = run::Opened {
+        state: state.into(),
+        ready_seconds: run::Repeated::of(&ready),
+        first_query_ms: run::Repeated::of(&first),
+    };
+    eprintln!(
+        "{}: reopened ({state}): ready in {:.1} s, first query {:.1} ms",
+        engine.name(),
+        opened.ready_seconds.median,
+        opened.first_query_ms.median
+    );
+    Ok(opened)
+}
+
+fn memory(
+    steady: sample::Reading,
+    phases: std::collections::BTreeMap<String, sample::PhaseMemory>,
+) -> Value {
+    json!({
+        "steady": {
+            "anon_bytes": steady.anon,
+            "file_cache_bytes": steady.file,
+            "memory_peak_bytes_including_cache": steady.peak_including_cache,
+        },
+        "phases": phases,
+        "note": "anon is memory.stat anon, the engine's own; the file cache is reported apart; memory.peak includes the cache",
+    })
+}
+
 async fn vellev(
     args: &Args,
     fixture: &Fixture,
     truth: &Truth,
     plan: &Plan,
     pinning: &Pinning,
-    queries: &[vellev_bench::fixture::Query],
-    warmup: &[vellev_bench::fixture::Query],
+    queries: &[Query],
+    warmup: &[Query],
 ) -> Result<EngineRun> {
     docker::pull(&args.postgres_image).ok();
     let data = args.data.join("vellev");
@@ -175,7 +256,8 @@ async fn vellev(
     )?;
     let outcome = async {
         let url = format!("http://127.0.0.1:{}", docker::VELLEV_PORT);
-        docker::ready(&format!("{url}/health/ready"), Duration::from_secs(120), &up.vellev).await?;
+        let ready_url = format!("{url}/health/ready");
+        docker::ready(&ready_url, Duration::from_secs(120), &up.vellev).await?;
         let engine = Arc::new(Vellev::new(
             &url,
             &format!("http://127.0.0.1:{}", docker::VELLEV_METRICS_PORT),
@@ -185,13 +267,32 @@ async fn vellev(
         // The pools were set by environment (§2): read back before anything
         // is loaded, or the run fails.
         Vellev::threads_as_set(&engine.metrics().await?, pinning.cpus)?;
+        let cgroups = vec![up.vellev.cgroup()?, up.postgres.cgroup()?];
+        let sampler = Sampler::start(cgroups.clone(), args.data.clone(), "create");
         let (phases, measured, floor) =
-            measured(engine.clone(), fixture, truth, plan, queries, warmup).await?;
+            measured(engine.clone(), &sampler, fixture, truth, plan, queries, warmup).await?;
+        let at_rest = steady(&cgroups, &args.data).await?;
+        sampler.phase("hybrid");
         let reference = run::vellev_reference(&engine, queries, truth).await?;
         let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps).await?;
         let settings = engine.settings().await?;
-        let metrics = engine.metrics().await?;
-        std::fs::write(args.out.join("vellev-metrics.txt"), &metrics)?;
+        std::fs::write(args.out.join("vellev-metrics.txt"), engine.metrics().await?)?;
+        sampler.phase("open");
+        let cold = || {
+            up.vellev.stop()?;
+            docker::emptied(&up.cache)?;
+            docker::drop_caches()?;
+            up.vellev.start()
+        };
+        let warm = || {
+            up.vellev.stop()?;
+            up.vellev.start()
+        };
+        let opened = vec![
+            reopened("empty local disk (its cache directory emptied, the store kept) and the OS page cache dropped", plan.reps, &cold, &ready_url, &up.vellev, engine.as_ref(), &queries[0]).await?,
+            reopened("warm OS page cache", plan.reps, &warm, &ready_url, &up.vellev, engine.as_ref(), &queries[0]).await?,
+        ];
+        let memory = memory(at_rest, sampler.stop());
         eyre::Ok(EngineRun {
             settings,
             phases,
@@ -199,8 +300,10 @@ async fn vellev(
             floor,
             hybrid,
             hybrid_reference: "the truth's exact top 100 as the vector leg, vellev's keyword search as the keyword leg, fused by vellev's own fusion (vellev_index::fusion::fuse) at alpha 0.75 with relative scores; fused in f32 from f64 cosines, so fused scores within about 1e-6 may swap at the 10th place",
+            memory,
+            opened,
             image: json!({ "image": args.vellev_image, "digest": docker::digest(&args.vellev_image)?, "postgres": args.postgres_image, "postgres_digest": docker::digest(&args.postgres_image)? }),
-            extra: json!({ "postgres": "runs on the same CPUs as vellev, within the same memory: 512 MiB of it" }),
+            extra: json!({ "postgres": "runs on the same CPUs as vellev, within the same memory (512 MiB of it), and its memory is counted with vellev's" }),
         })
     }
     .await;
@@ -217,25 +320,46 @@ async fn weaviate(
     truth: &Truth,
     plan: &Plan,
     pinning: &Pinning,
-    queries: &[vellev_bench::fixture::Query],
-    warmup: &[vellev_bench::fixture::Query],
+    queries: &[Query],
+    warmup: &[Query],
 ) -> Result<EngineRun> {
     docker::pull(&args.weaviate_image).ok();
     let data = args.data.join("weaviate");
     let container = docker::weaviate_up(&args.weaviate_image, &data, pinning)?;
     let outcome = async {
         let url = format!("http://127.0.0.1:{}", docker::WEAVIATE_PORT);
-        docker::ready(&format!("{url}/v1/.well-known/ready"), Duration::from_secs(120), &container).await?;
+        let ready_url = format!("{url}/v1/.well-known/ready");
+        docker::ready(&ready_url, Duration::from_secs(120), &container).await?;
         let index = match args.tuned {
             true => json!({ "maxConnections": 64, "efConstruction": 256 }),
             false => json!({}),
         };
         let engine = Arc::new(Weaviate::new(&url, index)?);
+        let cgroups = vec![container.cgroup()?];
+        let sampler = Sampler::start(cgroups.clone(), args.data.clone(), "create");
         let (phases, measured, floor) =
-            measured(engine.clone(), fixture, truth, plan, queries, warmup).await?;
+            measured(engine.clone(), &sampler, fixture, truth, plan, queries, warmup).await?;
+        let at_rest = steady(&cgroups, &args.data).await?;
+        sampler.phase("hybrid");
         let reference = run::weaviate_reference(engine.as_ref(), queries, plan.rows).await?;
         let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps).await?;
         let settings = engine.settings().await?;
+        sampler.phase("open");
+        engine.set(engine.points(10)[0]).await?;
+        let cold = || {
+            container.stop()?;
+            docker::drop_caches()?;
+            container.start()
+        };
+        let warm = || {
+            container.stop()?;
+            container.start()
+        };
+        let opened = vec![
+            reopened("the OS page cache dropped (Weaviate keeps its data on the local disk alone, so there is no emptier state)", plan.reps, &cold, &ready_url, &container, engine.as_ref(), &queries[0]).await?,
+            reopened("warm OS page cache", plan.reps, &warm, &ready_url, &container, engine.as_ref(), &queries[0]).await?,
+        ];
+        let memory = memory(at_rest, sampler.stop());
         eyre::Ok(EngineRun {
             settings,
             phases,
@@ -243,6 +367,8 @@ async fn weaviate(
             floor,
             hybrid,
             hybrid_reference: "Weaviate's own hybrid (alpha 0.75, relativeScoreFusion) with ef set to the number of rows: near-exhaustive, not proven exact",
+            memory,
+            opened,
             image: json!({ "image": args.weaviate_image, "digest": docker::digest(&args.weaviate_image)?, "tuned": args.tuned }),
             extra: json!({
                 "env": { "GOMAXPROCS": pinning.cpus, "LIMIT_RESOURCES": true },
@@ -256,6 +382,66 @@ async fn weaviate(
     }
     docker::down(&[&container], &data)?;
     outcome
+}
+
+/// The resources section of the summary: memory, load and settle, open
+/// times, and bursts at each engine's matched broad point.
+fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
+    let mib = |bytes: &Value| bytes.as_f64().unwrap_or(0.0) / (1024.0 * 1024.0);
+    let mut out = String::from(
+        "\n## Memory, load and open time\n\nAnonymous memory is the engine's own (`memory.stat` anon); vellev's includes its Postgres. Load to settled is not a headline measure: the engines put the work in different places.\n\n| Engine | anon at rest MiB | anon peak MiB (phase) | disk peak GiB | load s | settle s | rows/s |\n|---|---|---|---|---|---|---|\n",
+    );
+    for (name, run) in runs {
+        let phases = run.memory["phases"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let (peak_phase, peak) = phases
+            .iter()
+            .map(|(phase, m)| (phase.clone(), mib(&m["anon_peak"])))
+            .fold((String::new(), 0.0), |a, b| if b.1 > a.1 { b } else { a });
+        let disk = phases
+            .values()
+            .map(|m| m["disk_used_peak"].as_f64().unwrap_or(0.0))
+            .fold(0.0, f64::max)
+            / (1024.0 * 1024.0 * 1024.0);
+        out.push_str(&format!(
+            "| {name} | {:.0} | {peak:.0} ({peak_phase}) | {disk:.1} | {:.0} | {:.0} | {:.0} |\n",
+            mib(&run.memory["steady"]["anon_bytes"]),
+            run.phases.load_seconds,
+            run.phases.settle_seconds,
+            run.phases.rows_per_second_loading,
+        ));
+    }
+    out.push_str("\n| Engine | Restart state | ready s | first query ms |\n|---|---|---|---|\n");
+    for (name, run) in runs {
+        for opened in &run.opened {
+            out.push_str(&format!(
+                "| {name} | {} | {:.1} | {:.1} |\n",
+                opened.state, opened.ready_seconds.median, opened.first_query_ms.median
+            ));
+        }
+    }
+    out.push_str("\n### Bursts at each engine's matched point (broad, limit 10, 0.99)\n\n| Engine | Point | Size | p50 ms | p99 ms | max ms |\n|---|---|---|---|---|---|\n");
+    for m in matches
+        .iter()
+        .filter(|m| m.case == Case::Broad && m.target == 0.99)
+    {
+        if let Some(point) = &m.point {
+            for burst in &point.bursts {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {:.2} | {:.2} | {:.2} |\n",
+                    m.engine,
+                    point.label,
+                    burst.size,
+                    burst.p50_ms.median,
+                    burst.p99_ms.median,
+                    burst.max_ms.median
+                ));
+            }
+        }
+    }
+    out
 }
 
 #[tokio::main]
@@ -282,6 +468,8 @@ async fn main() -> Result<()> {
         batch: args.batch,
         in_flight: args.in_flight,
         settle_within: Duration::from_secs(3 * 3600),
+        burst_sizes: args.burst_sizes.clone(),
+        bursts: args.bursts,
     };
     let pinning = Pinning {
         cpuset: args.cpuset.clone(),
@@ -323,6 +511,8 @@ async fn main() -> Result<()> {
             "phases": run.phases,
             "notes": run.extra,
             "query_floor": run.floor,
+            "memory": run.memory,
+            "opened": run.opened,
             "hybrid": { "reference": run.hybrid_reference, "points": run.hybrid, "matched_0_99": report::hybrid_matched(&run.hybrid) },
             "points": run.measured,
         })
@@ -360,7 +550,11 @@ async fn main() -> Result<()> {
         ("vellev", report::hybrid_matched(&vellev_run.hybrid)),
         ("weaviate", report::hybrid_matched(&weaviate_run.hybrid)),
     ];
-    let summary = report::summary(&matches, &hybrids, &floors, &gate, args.rows, &header);
+    let mut summary = report::summary(&matches, &hybrids, &floors, &gate, args.rows, &header);
+    summary.push_str(&resources(
+        &[("vellev", &vellev_run), ("weaviate", &weaviate_run)],
+        &matches,
+    ));
     std::fs::write(args.out.join("summary.md"), &summary)?;
     println!("{summary}");
     ensure!(gate.passed, "the hard gate failed: see summary.md");
