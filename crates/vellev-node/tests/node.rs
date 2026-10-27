@@ -9049,3 +9049,26 @@ async fn a_tenant_whose_flush_failed_stays_unsettled() {
     assert_eq!(acme.read(State::unflushed), 0);
     node.shutdown().await;
 }
+
+/// Bench signals: a flush that went through, whose merging and cleaning
+/// up then failed, may still have a merge due.
+#[tokio::test]
+async fn a_tenant_whose_round_failed_after_its_flush_stays_unsettled() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.unreadable.store(true, Ordering::SeqCst);
+    written_in_batches(&acme, 0, 10, 10).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while acme.read(State::unflushed) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(acme.read(State::unflushed), 0, "the flush went through");
+    assert!(!settled_within(&node, Duration::from_millis(500)).await);
+    cluster.store.unreadable.store(false, Ordering::SeqCst);
+    node.shutdown().await;
+}

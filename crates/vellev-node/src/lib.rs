@@ -578,32 +578,12 @@ pub struct Tenant {
 /// is due or under way.
 #[derive(Debug, Default)]
 struct Settling {
-    /// A maintenance round is under way: flushing, merging or cleaning.
-    busy: AtomicBool,
     /// Flushes that went through.
     flushed: AtomicU64,
     /// [`Self::flushed`] as it stood after the flush, if any, of the last
     /// round that went through. A round merges until a merge finds nothing
     /// to do, so once it has followed every flush, no merge is due.
     maintained: AtomicU64,
-}
-
-impl Settling {
-    /// Mark a maintenance round under way until what is returned is
-    /// dropped, however the round ends.
-    fn round(&self) -> Round<'_> {
-        self.busy.store(true, Ordering::SeqCst);
-        Round(&self.busy)
-    }
-}
-
-/// A maintenance round under way, until dropped.
-struct Round<'a>(&'a AtomicBool);
-
-impl Drop for Round<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
 }
 
 /// A node's hold on a tenant, as everything that works on the tenant sees
@@ -904,16 +884,13 @@ impl Tenant {
     }
 
     /// Whether no flush or merge is due or under way: fewer rows unflushed
-    /// than a flush, none asked of the maintenance task and not taken up,
-    /// no round under way, and every flush followed by a round that went
-    /// through. Rows fewer than a flush stay in memory, searched exactly,
-    /// and leave the tenant settled.
+    /// than a flush, which they stay until the flush of them is done, and
+    /// every flush followed by a maintenance round that went through. Rows
+    /// fewer than a flush stay in memory, searched exactly, and leave the
+    /// tenant settled.
     fn settled(&self) -> bool {
         let settling = &self.settling;
-        let asked = self.flushes.capacity() < self.flushes.max_capacity();
-        !asked
-            && !settling.busy.load(Ordering::SeqCst)
-            && self.read(State::unflushed) < self.flush_rows
+        self.read(State::unflushed) < self.flush_rows
             && settling.maintained.load(Ordering::SeqCst) >= settling.flushed.load(Ordering::SeqCst)
     }
 
@@ -2024,7 +2001,6 @@ impl Inner {
                 if !tenant.held() {
                     return;
                 }
-                let _round = tenant.settling.round();
                 // One that failed is tried again on its own, if no write
                 // asks, but never sooner than its backoff lets it. One put
                 // off for that still lets the tenant be looked after.
