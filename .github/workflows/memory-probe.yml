@@ -17,9 +17,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update -q && sudo apt-get install -y -q heaptrack > /dev/null
       - run: cargo test --release --locked -p vellev-storage --test flush_memory --no-run 2>&1 | tail -3
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
       - name: What a flush's peak is made of
         run: |
           bin=$(ls -t target/release/deps/flush_memory-* | grep -v '\.d$' | head -1)
           heaptrack -o "$RUNNER_TEMP/flush" "$bin" --nocapture 2>&1 | grep -E "held|heaptrack|test result"
           f=$(ls "$RUNNER_TEMP"/flush* | head -1)
-          heaptrack_print -f "$f" --print-peaks 1 --print-allocators 0 --print-leaks 0 --print-temporary 0 --peak-limit 15 -s 0 2>&1 | grep -E "peak memory consumed|vellev_|object_store|^  and" | cut -c1-200 | head -150
+          heaptrack_print -f "$f" --print-peaks 1 --print-allocators 0 --print-leaks 0 --print-temporary 0 --peak-limit 6 2>&1 | grep -vE "^\s+in /|at /rustc|core::|std::|tokio::|alloc::|futures|__rust|<F as" | cut -c1-200 | head -200
