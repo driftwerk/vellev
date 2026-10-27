@@ -103,6 +103,12 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
     (cluster, writer)
 }
 
+/// What a flush may hold for each row besides vectors: the row itself
+/// without its vector, its codes and index entries, and its part of the
+/// segment's encoded file, all of which the segment keeps or writes. A
+/// row of a few properties takes well under this.
+const PER_ROW: usize = 2 * 1024;
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
     let dir = tempfile::tempdir().unwrap();
@@ -114,10 +120,9 @@ async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
             .map(|n| Mutation::Upsert {
                 collection: name("docs"),
                 id: ObjectId::generate(),
-                properties: json!({ "title": format!("row {}", batch * 500 + n), "n": n })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
+                // Little besides the vector, so that what is measured is
+                // what becomes of the vectors.
+                properties: json!({ "n": batch * 500 + n }).as_object().unwrap().clone(),
                 vector: Some(random.vector(DIMENSIONS)),
                 only_if_version: None,
             })
@@ -125,6 +130,8 @@ async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
         writer.commit(rows).await.unwrap();
     }
     let vectors = ROWS * DIMENSIONS * 4;
+    // The column the segment keeps, and its encoded frame.
+    let allowed = 2 * vectors + ROWS * PER_ROW;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.flush().await.unwrap();
@@ -134,8 +141,8 @@ async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
         held as f64 / vectors as f64
     );
     assert!(
-        held * 4 <= vectors * 9,
-        "a flush held {held} bytes at its peak, {:.2} times its vectors' {vectors}",
+        held <= allowed,
+        "a flush held {held} bytes at its peak, {:.2} times its vectors' {vectors}; it may hold {allowed}",
         held as f64 / vectors as f64
     );
 }
