@@ -112,6 +112,8 @@ pub struct Measured {
     pub p99_ms: Repeated,
     /// memory.stat anon once loaded, settled and searched.
     pub anon_bytes: u64,
+    /// Queries the engine turned away as busy.
+    pub refused: u64,
 }
 
 /// One engine's many tenants: a way to make, load and search them.
@@ -131,7 +133,7 @@ pub async fn measure(
     queries: &[Vec<f32>],
     reps: usize,
     settle_within: Duration,
-) -> Result<(f64, f64, Repeated, Repeated)> {
+) -> Result<(f64, f64, Repeated, Repeated, u64)> {
     let tenants = tenants(memories.len())?;
     let names: Vec<String> = tenants.iter().map(|(name, _)| name.clone()).collect();
     engine.create(&names).await?;
@@ -154,11 +156,19 @@ pub async fn measure(
     let settle_seconds = started.elapsed().as_secs_f64();
     let asked = drawn(queries.len(), tenants.len());
     let (mut p50s, mut p99s) = (Vec::new(), Vec::new());
+    let mut refused = 0;
     for _ in 0..reps {
         let mut took = Vec::with_capacity(queries.len());
         for (vector, &tenant) in queries.iter().zip(&asked) {
             let started = Instant::now();
-            let found = engine.nearest(&tenants[tenant].0, vector).await?;
+            let found = match engine.nearest(&tenants[tenant].0, vector).await {
+                Ok(found) => found,
+                Err(error) if crate::engine::is_refused(&error) => {
+                    refused += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             took.push(started.elapsed().as_secs_f64() * 1e3);
             ensure!(
                 found.len() == 10,
@@ -167,6 +177,7 @@ pub async fn measure(
                 found.len()
             );
         }
+        ensure!(!took.is_empty(), "every many-tenants query was refused");
         p50s.push(percentile(&took, 50.0));
         p99s.push(percentile(&took, 99.0));
     }
@@ -175,6 +186,7 @@ pub async fn measure(
         settle_seconds,
         Repeated::of(&p50s),
         Repeated::of(&p99s),
+        refused,
     ))
 }
 
@@ -201,6 +213,15 @@ impl VellevTenants {
         }
         let response = request.send().await?;
         let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            return Err(crate::engine::Refused {
+                what: path.to_string(),
+                status,
+            }
+            .into());
+        }
         let text = response.text().await?;
         ensure!(
             status.is_success(),
@@ -313,6 +334,15 @@ impl WeaviateTenants {
         }
         let response = request.send().await?;
         let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            return Err(crate::engine::Refused {
+                what: path.to_string(),
+                status,
+            }
+            .into());
+        }
         let text = response.text().await?;
         ensure!(
             status.is_success(),
@@ -421,11 +451,7 @@ impl Tenanted for WeaviateTenants {
                 Some(&json!({ "query": query })),
             )
             .await?;
-        ensure!(
-            answer.get("errors").is_none(),
-            "GraphQL: {}",
-            answer["errors"]
-        );
+        crate::engine::graphql_answered(&answer)?;
         answer["data"]["Get"][&class]
             .as_array()
             .ok_or_else(|| eyre!("no results: {answer}"))?

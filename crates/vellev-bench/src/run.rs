@@ -67,6 +67,9 @@ pub struct Measured {
     pub p99_ms: Repeated,
     /// At limit 10: queries asked `size` at once.
     pub bursts: Vec<Burst>,
+    /// Queries the engine turned away as busy, over every repetition: no
+    /// answer for recall, no time for the latencies.
+    pub refused: u64,
 }
 
 /// Queries asked `size` at once, `bursts` times (§4): each query's time
@@ -90,8 +93,29 @@ pub struct Phases {
     pub load_seconds: f64,
     pub settle_seconds: f64,
     pub warmup_seconds: f64,
+    /// Warm-up questions the engine turned away as busy.
+    pub warmup_refused: u64,
     pub measure_seconds: f64,
     pub rows_per_second_loading: f64,
+}
+
+/// One query asked and timed: its answer and milliseconds, or `None` if
+/// the engine turned it away as busy. Refusals are counted and published
+/// beside the times, never taken as answers or as the run failing.
+async fn timed<T>(ask: impl std::future::Future<Output = Result<T>>) -> Result<Option<(T, f64)>> {
+    let started = Instant::now();
+    match ask.await {
+        Ok(answer) => Ok(Some((answer, started.elapsed().as_secs_f64() * 1e3))),
+        Err(error) if crate::engine::is_refused(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The p50 and p99 of `took`, which a pass all of whose queries were
+/// refused has not.
+fn quantiles(took: &[f64], what: &str) -> Result<(f64, f64)> {
+    ensure!(!took.is_empty(), "every query of {what} was refused");
+    Ok((percentile(took, 50.0), percentile(took, 99.0)))
 }
 
 /// Load the plan's rows, as many requests in flight as it says.
@@ -144,21 +168,21 @@ pub async fn settle(engine: &dyn Engine, within: Duration) -> Result<f64> {
 
 /// Ask each warm-up question once, at the engine's default, unfiltered but
 /// for deleted rows. Never measured.
-pub async fn warm(engine: &dyn Engine, warmup: &[Query]) -> Result<f64> {
+pub async fn warm(engine: &dyn Engine, warmup: &[Query]) -> Result<(f64, u64)> {
     let started = Instant::now();
     let default = engine.points(10)[0];
     engine.set(default).await?;
+    let mut refused = 0;
     for query in warmup {
-        engine
-            .nearest(
-                &query.vector,
-                Filter::of(Case::Broad, query.owner),
-                10,
-                default,
-            )
-            .await?;
+        let filter = Filter::of(Case::Broad, query.owner);
+        if timed(engine.nearest(&query.vector, filter, 10, default))
+            .await?
+            .is_none()
+        {
+            refused += 1;
+        }
     }
-    Ok(started.elapsed().as_secs_f64())
+    Ok((started.elapsed().as_secs_f64(), refused))
 }
 
 /// One pass over the queries, one at a time: the ids of each answer, and
@@ -169,17 +193,24 @@ async fn pass(
     case: Case,
     limit: usize,
     knob: Knob,
-) -> Result<(Vec<Vec<u64>>, Vec<f64>)> {
+) -> Result<(Vec<Vec<u64>>, Vec<f64>, u64)> {
     let mut answers = Vec::with_capacity(queries.len());
     let mut took = Vec::with_capacity(queries.len());
+    let mut refused = 0;
     for query in queries {
         let filter = Filter::of(case, query.owner);
-        let started = Instant::now();
-        let ids = engine.nearest(&query.vector, filter, limit, knob).await?;
-        took.push(started.elapsed().as_secs_f64() * 1e3);
-        answers.push(ids);
+        match timed(engine.nearest(&query.vector, filter, limit, knob)).await? {
+            Some((ids, ms)) => {
+                took.push(ms);
+                answers.push(ids);
+            }
+            None => {
+                refused += 1;
+                answers.push(Vec::new());
+            }
+        }
     }
-    Ok((answers, took))
+    Ok((answers, took, refused))
 }
 
 /// Every knob point of the plan, under every case, at every limit.
@@ -197,8 +228,10 @@ pub async fn measure(
                 let started = Instant::now();
                 let (mut p50s, mut p99s) = (Vec::new(), Vec::new());
                 let (mut recall, mut same) = (Recall::default(), Recall::default());
+                let mut refused = 0;
                 for rep in 0..plan.reps {
-                    let (answers, took) = pass(engine, queries, case, limit, knob).await?;
+                    let (answers, took, turned) = pass(engine, queries, case, limit, knob).await?;
+                    refused += turned;
                     if rep == 0 {
                         for (query, ids) in queries.iter().zip(&answers) {
                             let truth = truth.of(query.id, case)?;
@@ -210,8 +243,9 @@ pub async fn measure(
                                 };
                         }
                     }
-                    p50s.push(percentile(&took, 50.0));
-                    p99s.push(percentile(&took, 99.0));
+                    let (p50, p99) = quantiles(&took, &knob.label())?;
+                    p50s.push(p50);
+                    p99s.push(p99);
                 }
                 let mut bursts = Vec::new();
                 if limit == 10 {
@@ -233,6 +267,7 @@ pub async fn measure(
                     p50_ms: Repeated::of(&p50s),
                     p99_ms: Repeated::of(&p99s),
                     bursts,
+                    refused,
                 };
                 eprintln!(
                     "{} limit {limit} {} {}: recall {:.4} top-1 {:.3} p50 {:.2} ms p99 {:.2} ms ({:.0} s)",
@@ -260,23 +295,28 @@ pub async fn measure(
 pub struct Floor {
     pub p50_ms: Repeated,
     pub p99_ms: Repeated,
+    pub refused: u64,
 }
 
 pub async fn floor(engine: &dyn Engine, queries: &[Query], reps: usize) -> Result<Floor> {
     let (mut p50s, mut p99s) = (Vec::new(), Vec::new());
+    let mut refused = 0;
     for _ in 0..reps {
         let mut took = Vec::with_capacity(queries.len());
         for query in queries {
-            let started = Instant::now();
-            engine.floor(&query.vector).await?;
-            took.push(started.elapsed().as_secs_f64() * 1e3);
+            match timed(engine.floor(&query.vector)).await? {
+                Some((_, ms)) => took.push(ms),
+                None => refused += 1,
+            }
         }
-        p50s.push(percentile(&took, 50.0));
-        p99s.push(percentile(&took, 99.0));
+        let (p50, p99) = quantiles(&took, "the empty collection")?;
+        p50s.push(p50);
+        p99s.push(p99);
     }
     Ok(Floor {
         p50_ms: Repeated::of(&p50s),
         p99_ms: Repeated::of(&p99s),
+        refused,
     })
 }
 
@@ -295,6 +335,7 @@ pub struct HybridPoint {
     pub recall_share: f64,
     pub p50_ms: Repeated,
     pub p99_ms: Repeated,
+    pub refused: u64,
 }
 
 /// vellev's own answer with an exact vector leg, at limit 10 under broad:
@@ -341,11 +382,20 @@ pub async fn weaviate_reference(
     let mut reference = Vec::with_capacity(queries.len());
     for query in queries {
         let filter = Filter::of(Case::Broad, query.owner);
-        reference.push(
-            engine
-                .hybrid(&query.text, &query.vector, filter, 10, all)
-                .await?,
-        );
+        // The reference must be had: a refusal is asked again, a second
+        // later, up to a minute.
+        let mut tries = 0;
+        let answer = loop {
+            match timed(engine.hybrid(&query.text, &query.vector, filter, 10, all)).await? {
+                Some((answer, _)) => break answer,
+                None if tries < 60 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                None => eyre::bail!("query {}: refused a minute long", query.id),
+            }
+        };
+        reference.push(answer);
     }
     Ok(reference)
 }
@@ -364,21 +414,30 @@ pub async fn hybrid(
         engine.set(knob).await?;
         let (mut p50s, mut p99s) = (Vec::new(), Vec::new());
         let mut recall = Recall::default();
+        let mut refused = 0;
         for rep in 0..reps {
             let mut took = Vec::with_capacity(queries.len());
             for (query, wanted) in queries.iter().zip(reference) {
                 let filter = Filter::of(Case::Broad, query.owner);
-                let started = Instant::now();
-                let got = engine
-                    .hybrid(&query.text, &query.vector, filter, 10, knob)
-                    .await?;
-                took.push(started.elapsed().as_secs_f64() * 1e3);
+                let got = match timed(engine.hybrid(&query.text, &query.vector, filter, 10, knob))
+                    .await?
+                {
+                    Some((got, ms)) => {
+                        took.push(ms);
+                        got
+                    }
+                    None => {
+                        refused += 1;
+                        Vec::new()
+                    }
+                };
                 if rep == 0 {
                     recall = recall + found_at(10, &got, wanted);
                 }
             }
-            p50s.push(percentile(&took, 50.0));
-            p99s.push(percentile(&took, 99.0));
+            let (p50, p99) = quantiles(&took, &knob.label())?;
+            p50s.push(p50);
+            p99s.push(p99);
         }
         let point = HybridPoint {
             knob,
@@ -387,6 +446,7 @@ pub async fn hybrid(
             recall_share: recall.share(),
             p50_ms: Repeated::of(&p50s),
             p99_ms: Repeated::of(&p99s),
+            refused,
         };
         eprintln!(
             "{} hybrid {}: recall against its own exact-leg answer {:.4}, p50 {:.2} ms p99 {:.2} ms",
