@@ -1386,7 +1386,15 @@ async fn run(actions: Vec<Action>) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig {
+        // Beside the test, where CI keeps it, and said so: proptest looks for
+        // a lib.rs above an integration test by default, finds none, and
+        // falls back here with a warning.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::with_cases(256)
+    })]
 
     #[test]
     fn any_history_of_commits_flushes_restarts_and_takeovers_matches_a_plain_map(

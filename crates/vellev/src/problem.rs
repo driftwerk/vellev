@@ -289,7 +289,7 @@ impl From<NodeError> for ApiError {
                 let lasting = error.lasting();
                 Self::unembedded(error, lasting)
             }
-            NodeError::Limited { wait, .. } => Self {
+            NodeError::Limited { wait, .. } | NodeError::Backlogged { wait, .. } => Self {
                 retry_after: Some(wait),
                 ..Self::new(Code::Limited, error.to_string())
             },

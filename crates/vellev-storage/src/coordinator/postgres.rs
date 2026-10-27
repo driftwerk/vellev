@@ -519,6 +519,30 @@ struct Noted {
     committed_at: DateTime<Utc>,
 }
 
+/// A run of shipping, as [`Coordinator::commits_to_ship`] reads it with
+/// its partition, and a commit it ships next, if there is one.
+#[derive(FromRow)]
+struct ToShip {
+    incarnation: i64,
+    run_incarnation: Option<i64>,
+    run_base: Option<i64>,
+    shipped: Option<i64>,
+    position: Option<i64>,
+    head: Option<String>,
+    committed_at: Option<DateTime<Utc>>,
+}
+
+impl ToShip {
+    /// The commit read with the run, if any.
+    fn point(self) -> Option<Noted> {
+        Some(Noted {
+            position: self.position?,
+            head: self.head?,
+            committed_at: self.committed_at?,
+        })
+    }
+}
+
 impl Noted {
     fn point(self) -> Result<RestorePoint> {
         let position = u64::try_from(self.position)
@@ -1453,6 +1477,82 @@ impl Coordinator for PostgresCoordinator {
             same_incarnation(key, incarnation, row.current()?)?;
         }
         found.into_iter().map(Noted::point).collect()
+    }
+
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        seen: Option<LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<RestorePoint>> {
+        let after = seen.unwrap_or(LogPosition(base.0.saturating_sub(1)));
+        // The run and its rows in one statement, one snapshot: a delete by
+        // `forget_history`, whose floor is the run's in its own statement,
+        // is either seen with the run it was made under or not at all. The
+        // rows are read only if the run is as the shipper read it; the
+        // partition's row, and the run's, say why if not.
+        let found: Vec<ToShip> = sqlx::query_as(
+            "SELECT p.incarnation,
+                    s.incarnation AS run_incarnation, s.base AS run_base, s.shipped,
+                    c.position, c.head, c.committed_at
+             FROM vellev.partitions p
+             LEFT JOIN vellev.shipping s ON s.tenant = p.tenant AND s.partition = p.partition
+             LEFT JOIN LATERAL (
+                 SELECT c.position, c.head, c.committed_at
+                 FROM vellev.commits c
+                 WHERE c.tenant = p.tenant AND c.partition = p.partition
+                   AND c.incarnation = p.incarnation AND p.incarnation = $3
+                   AND s.incarnation = $3 AND s.base = $4
+                   AND s.shipped IS NOT DISTINCT FROM $5
+                   AND c.position > $6
+                 ORDER BY c.position
+                 LIMIT $7
+             ) c ON true
+             WHERE p.tenant = $1 AND p.partition = $2
+             ORDER BY c.position",
+        )
+        .bind(key.tenant.as_str())
+        .bind(i64::from(key.partition.0))
+        .bind(bigint(incarnation.0)?)
+        .bind(bigint(base.0)?)
+        .bind(seen.map(|seen| bigint(seen.0)).transpose()?)
+        .bind(bigint(after.0)?)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(run) = found.first() else {
+            return Err(CoordinatorError::UnknownPartition(key.clone()));
+        };
+        let current = Incarnation::try_from(run.incarnation)
+            .map_err(|error| invariant(format!("a stored incarnation: {error}")))?;
+        same_incarnation(key, incarnation, current)?;
+        let of_this = run.run_incarnation == Some(run.incarnation);
+        let recorded = (run.run_base)
+            .filter(|_| of_this)
+            .map(stored_position)
+            .transpose()?;
+        if recorded != Some(base) {
+            return Err(CoordinatorError::OtherBase {
+                key: key.clone(),
+                asked: base,
+                recorded,
+            });
+        }
+        let shipped = run.shipped.map(stored_position).transpose()?;
+        if shipped != seen {
+            return Err(CoordinatorError::ShippedSince {
+                key: key.clone(),
+                seen,
+                shipped,
+            });
+        }
+        found
+            .into_iter()
+            .filter_map(ToShip::point)
+            .map(Noted::point)
+            .collect()
     }
 
     async fn unshipped(

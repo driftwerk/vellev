@@ -3254,10 +3254,9 @@ fn collection(
                 ));
             }
             Some(Property {
-                name: property.name.clone(),
-                data_type,
                 filterable,
                 searchable,
+                ..Property::new(&property.name, data_type)
             })
         })
         .collect();

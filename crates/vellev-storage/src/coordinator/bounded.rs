@@ -158,6 +158,21 @@ impl Coordinator for Bounded {
             .await
     }
 
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: Incarnation,
+        base: LogPosition,
+        seen: Option<LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<RestorePoint>> {
+        self.bounded(
+            self.inner
+                .commits_to_ship(key, incarnation, base, seen, limit),
+        )
+        .await
+    }
+
     async fn unshipped(
         &self,
         after: Option<&PartitionKey>,

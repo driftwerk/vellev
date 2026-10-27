@@ -2693,6 +2693,96 @@ async fn a_runs_writes_are_fenced_by_its_base_and_only_raise(h: &dyn Harness) {
     assert_eq!(c.shipping(&key).await.unwrap(), based(now, 1, &second));
 }
 
+/// DW-668: the commits a run ships are read in one step with the run, by a
+/// shipper that read it as it stands: what it shipped is `seen`, and its
+/// base is the run's. A stale one, whose rows `forget_history` may have
+/// taken since as the run shipped past them, is refused, as its stall is:
+/// given what is left, it would link a checkpoint over the gap, on a
+/// commit that is not the one before it.
+async fn the_commits_a_run_ships_are_read_only_by_a_shipper_that_saw_the_run_as_it_stands(
+    h: &dyn Harness,
+) {
+    let c = h.coordinator();
+    let key = registered(h).await;
+    let now = incarnation_of(h, &key).await;
+    committed_heads(
+        h,
+        &key,
+        &[(1, "l1"), (2, "m2"), (3, "l3"), (4, "l4"), (5, "l5")],
+    )
+    .await;
+    c.hold_for_shipping(&key, now, LogPosition(2))
+        .await
+        .unwrap();
+    c.record_base(&key, now, &ship_base(1, 2, "m2"))
+        .await
+        .unwrap();
+    let to_ship = |incarnation: Incarnation, base: u64, seen: Option<u64>, limit: usize| {
+        c.commits_to_ship(
+            &key,
+            incarnation,
+            LogPosition(base),
+            seen.map(LogPosition),
+            limit,
+        )
+    };
+    let positions =
+        |rows: Vec<RestorePoint>| -> Vec<u64> { rows.iter().map(|row| row.position.0).collect() };
+    let shipped_since =
+        |result: &Result<Vec<RestorePoint>, CoordinatorError>, was: Option<u64>, is: u64| {
+            matches!(
+                result,
+                Err(CoordinatorError::ShippedSince { seen, shipped, .. })
+                    if *seen == was.map(LogPosition) && *shipped == Some(LogPosition(is))
+            )
+        };
+    // Nothing shipped: from the base.
+    let rows = to_ship(now, 1, None, 10).await.unwrap();
+    assert_eq!(positions(rows), vec![1, 2, 3, 4, 5]);
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(3))
+        .await
+        .unwrap();
+    // After what the run has shipped, up to the limit.
+    let rows = to_ship(now, 1, Some(3), 1).await.unwrap();
+    assert_eq!(positions(rows), vec![4]);
+    // A shipper that read the run before it shipped to 3: refused.
+    let stale = to_ship(now, 1, None, 10).await;
+    assert!(shipped_since(&stale, None, 3), "{stale:?}");
+    let stale = to_ship(now, 1, Some(2), 10).await;
+    assert!(shipped_since(&stale, Some(2), 3), "{stale:?}");
+    // Rows forgotten below the run's floor, after 3: still refused, and
+    // the run's own reads on from 3.
+    h.pass(&key, 2 * HOUR).await;
+    assert_eq!(c.forget_history(&key, HOUR).await.unwrap(), 3);
+    let stale = to_ship(now, 1, Some(2), 10).await;
+    assert!(shipped_since(&stale, Some(2), 3), "{stale:?}");
+    let rows = to_ship(now, 1, Some(3), 10).await.unwrap();
+    assert_eq!(positions(rows), vec![4, 5]);
+    // Of another base, or another incarnation: refused.
+    let other = to_ship(now, 2, Some(3), 10).await;
+    assert!(
+        matches!(
+            other,
+            Err(CoordinatorError::OtherBase {
+                asked: LogPosition(2),
+                recorded: Some(LogPosition(1)),
+                ..
+            })
+        ),
+        "{other:?}"
+    );
+    let other = to_ship(Incarnation(now.0 + 1), 1, Some(3), 10).await;
+    assert!(
+        matches!(other, Err(CoordinatorError::OtherIncarnation { .. })),
+        "{other:?}"
+    );
+    // Shipped to the last: none, and no refusal.
+    c.note_shipped(&key, now, LogPosition(1), LogPosition(5))
+        .await
+        .unwrap();
+    assert_eq!(to_ship(now, 1, Some(5), 10).await.unwrap(), Vec::new());
+}
+
 /// DW-668, S5: a stall is decided on what a batch read of the run, and a
 /// shipper of the same run that read it before the run moved on, a stale
 /// one, is refused: the run under way is never stopped by it. The stall
@@ -3451,6 +3541,7 @@ conformance! {
     shipping_stays_through_leases_and_is_of_its_own_partition_alone,
     a_partition_removed_loses_its_shipping_and_one_made_again_starts_with_none,
     the_commits_after_a_position_are_read_from_their_rows_in_order,
+    the_commits_a_run_ships_are_read_only_by_a_shipper_that_saw_the_run_as_it_stands,
     the_commits_read_skip_where_the_positions_do_and_lose_what_is_forgotten,
     the_commits_of_another_incarnation_are_refused,
     a_run_is_unshipped_while_commits_lie_above_what_it_shipped,

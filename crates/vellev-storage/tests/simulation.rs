@@ -182,8 +182,13 @@ enum Canary {
     SpillAfterLink,
     /// The coordinator takes a run's note or stall whatever base it names
     /// and whatever it saw the run shipped to, as the run under way's: a
-    /// stale run is not fenced (DW-668, S5).
+    /// stale run's writes are not fenced (DW-668, S5).
     StaleRunWrites,
+    /// The coordinator gives a run the commits after what it saw, whatever
+    /// the run has shipped since or whatever its base: a stale run's read
+    /// is not fenced, and what has been forgotten since is not seen to be
+    /// (DW-668).
+    StaleRunReads,
 }
 
 #[derive(Debug, Default)]
@@ -747,6 +752,49 @@ impl Blobs for BackupBlobs {
 struct StaleView {
     inner: Arc<SimCoordinator>,
     seen: vellev_storage::coordinator::Shipping,
+    fences: Arc<StaleFences>,
+    window: Arc<Window>,
+}
+
+/// Where a stale batch is held, once armed ([`Action::ReadStale`]),
+/// between its read of the commits it ships and its writes.
+#[derive(Debug, Default)]
+struct Window {
+    /// The batch's release, taken by the batch it holds.
+    armed: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Told when the batch is held.
+    reached: tokio::sync::Notify,
+}
+
+/// A stale batch held in its [`Window`], and its release.
+#[derive(Debug)]
+struct HeldBatch {
+    batch: tokio::task::JoinHandle<vellev_storage::Result<shipper::Batch>>,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+/// How often a stale node's note, and its stall, were refused by the
+/// fences on the run it read: so a history can show it met them.
+#[derive(Debug, Default)]
+struct StaleFences {
+    notes: AtomicUsize,
+    stalls: AtomicUsize,
+}
+
+impl StaleFences {
+    /// Count `result` in `count` if it is the run's fence refusing it.
+    fn count(
+        count: &AtomicUsize,
+        result: Result<vellev_storage::coordinator::Shipping, CoordinatorError>,
+    ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
+        if matches!(
+            result,
+            Err(CoordinatorError::OtherBase { .. } | CoordinatorError::ShippedSince { .. })
+        ) {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        result
+    }
 }
 
 #[async_trait]
@@ -829,9 +877,11 @@ impl Coordinator for StaleView {
         base: vellev_storage::coordinator::LogPosition,
         position: vellev_storage::coordinator::LogPosition,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
-        self.inner
+        let noted = self
+            .inner
             .note_shipped(key, incarnation, base, position)
-            .await
+            .await;
+        StaleFences::count(&self.fences.notes, noted)
     }
     async fn stall_shipping(
         &self,
@@ -842,9 +892,11 @@ impl Coordinator for StaleView {
         through: Option<vellev_storage::coordinator::LogPosition>,
         reason: &str,
     ) -> Result<vellev_storage::coordinator::Shipping, CoordinatorError> {
-        self.inner
+        let stalled = self
+            .inner
             .stall_shipping(key, incarnation, base, seen, through, reason)
-            .await
+            .await;
+        StaleFences::count(&self.fences.stalls, stalled)
     }
     async fn commits_after(
         &self,
@@ -856,6 +908,28 @@ impl Coordinator for StaleView {
         self.inner
             .commits_after(key, incarnation, after, limit)
             .await
+    }
+    // To the coordinator as it stands, as any statement of the node's is:
+    // only what it last read of the run is stale.
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        let rows = self
+            .inner
+            .commits_to_ship(key, incarnation, base, seen, limit)
+            .await?;
+        let armed = self.window.armed.lock().unwrap().take();
+        if let Some(released) = armed.filter(|_| !rows.is_empty()) {
+            self.window.reached.notify_one();
+            // Released, or the world it was held in gone: on either, on.
+            let _ = released.await;
+        }
+        Ok(rows)
     }
     async fn unshipped(
         &self,
@@ -1381,6 +1455,35 @@ impl Coordinator for SimCoordinator {
         }
         Ok(rows)
     }
+    async fn commits_to_ship(
+        &self,
+        key: &PartitionKey,
+        incarnation: vellev_storage::coordinator::Incarnation,
+        base: vellev_storage::coordinator::LogPosition,
+        seen: Option<vellev_storage::coordinator::LogPosition>,
+        limit: usize,
+    ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
+        let mut rows = match self.canary {
+            // Unfenced, a stale run is given the rows after what it saw.
+            Some(Canary::StaleRunReads) => {
+                let after = seen.unwrap_or(LogPosition(base.0.saturating_sub(1)));
+                self.clean
+                    .commits_after(key, incarnation, after, limit)
+                    .await?
+            }
+            _ => {
+                self.clean
+                    .commits_to_ship(key, incarnation, base, seen, limit)
+                    .await?
+            }
+        };
+        if self.canary == Some(Canary::ShiftsCommitTimes) {
+            for row in &mut rows {
+                row.at += chrono::Duration::microseconds(1);
+            }
+        }
+        Ok(rows)
+    }
     async fn unshipped(
         &self,
         after: Option<&PartitionKey>,
@@ -1747,8 +1850,16 @@ enum Action {
     /// (DW-668, S2).
     Ship(usize),
     /// A batch of up to so many is shipped by the node the partition was
-    /// last taken over from, as it last saw the run (DW-668, S5).
+    /// last taken over from, as it last saw the run (DW-668, S5); or, if
+    /// one is held ([`Action::ReadStale`]), that one goes on instead.
     ShipStale(usize),
+    /// As [`Action::ShipStale`], but the batch is held once it has read
+    /// the commits it ships, until the next `ShipStale` or the history's
+    /// end: so that the run moves between a stale batch's read and its
+    /// writes, and the fences on its note and stall decide. Only the
+    /// histories made by hand take it: the random ones keep their meaning,
+    /// and the seeds kept of them theirs.
+    ReadStale(usize),
     /// The backup store is one that creates files of so many bytes at
     /// most, in place of the one there: taken before anything is shipped,
     /// so that frames spill (DW-668, S3).
@@ -2092,6 +2203,11 @@ struct World {
     /// was last taken over from.
     node_shipper: Option<Shipper>,
     stale_shipper: Option<Shipper>,
+    /// What the fences refused of every stale node's.
+    stale_fences: Arc<StaleFences>,
+    /// Where a stale batch is held, and the one held there, if any.
+    stale_window: Arc<Window>,
+    held_stale: Option<HeldBatch>,
     /// Every link seen in the backup store, by incarnation and position.
     linked: BTreeSet<(Incarnation, LogPosition)>,
     shipping_from: Option<ShipBase>,
@@ -2238,6 +2354,12 @@ struct Made {
     /// Batches a stale shipper shipped something in, and those that failed.
     stale_shipped: usize,
     stale_failed: usize,
+    /// Stale batches held between their read and their writes
+    /// ([`Action::ReadStale`]), and stale notes and stalls the run's fences
+    /// refused.
+    stale_held: usize,
+    stale_notes_fenced: usize,
+    stale_stalls_fenced: usize,
 }
 
 impl Made {
@@ -2278,6 +2400,9 @@ impl Made {
             spilled_logs: self.spilled_logs + other.spilled_logs,
             stale_shipped: self.stale_shipped + other.stale_shipped,
             stale_failed: self.stale_failed + other.stale_failed,
+            stale_held: self.stale_held + other.stale_held,
+            stale_notes_fenced: self.stale_notes_fenced + other.stale_notes_fenced,
+            stale_stalls_fenced: self.stale_stalls_fenced + other.stale_stalls_fenced,
         }
     }
 }
@@ -2442,6 +2567,9 @@ impl World {
             bases: BTreeSet::new(),
             node_shipper: None,
             stale_shipper: None,
+            stale_fences: Arc::default(),
+            stale_window: Arc::default(),
+            held_stale: None,
             linked: BTreeSet::new(),
             step: 0,
             made: Made::default(),
@@ -2541,11 +2669,52 @@ impl World {
     /// was taken over from, as it last saw the run: what its fences let it
     /// do is all it does. Whatever it meets is its own, not the run's.
     async fn ship_stale(&mut self, limit: usize) {
+        if let Some(held) = self.held_stale.take() {
+            return self.release_stale(held).await;
+        }
         let Some(stale) = self.stale_shipper.clone() else {
             return;
         };
         let incarnation = self.cluster.committed().await.incarnation;
-        match stale.ship_batch(incarnation, limit).await {
+        let done = stale.ship_batch(incarnation, limit).await;
+        self.stale_done(done);
+    }
+
+    /// As [`Self::ship_stale`], the batch held once it has read the
+    /// commits it ships (see [`Action::ReadStale`]); one that ends before
+    /// it reads any is done with.
+    async fn read_stale(&mut self, limit: usize) {
+        if let Some(held) = self.held_stale.take() {
+            self.release_stale(held).await;
+        }
+        let Some(stale) = self.stale_shipper.clone() else {
+            return;
+        };
+        let incarnation = self.cluster.committed().await.incarnation;
+        let (release, released) = tokio::sync::oneshot::channel();
+        *self.stale_window.armed.lock().unwrap() = Some(released);
+        let mut batch = tokio::spawn(async move { stale.ship_batch(incarnation, limit).await });
+        tokio::select! {
+            done = &mut batch => {
+                self.stale_window.armed.lock().unwrap().take();
+                self.stale_done(done.expect("a stale batch runs to its end"));
+            }
+            () = self.stale_window.reached.notified() => {
+                self.made.stale_held += 1;
+                self.held_stale = Some(HeldBatch { batch, release });
+            }
+        }
+    }
+
+    /// The stale batch held let go, and run to its end.
+    async fn release_stale(&mut self, held: HeldBatch) {
+        let _ = held.release.send(());
+        let done = held.batch.await;
+        self.stale_done(done.expect("a stale batch runs to its end"));
+    }
+
+    fn stale_done(&mut self, done: vellev_storage::Result<shipper::Batch>) {
+        match done {
             Ok(shipper::Batch::Shipped {
                 through: Some(_), ..
             }) => self.made.stale_shipped += 1,
@@ -2816,6 +2985,8 @@ impl World {
             let view = StaleView {
                 inner: self.coordinator.clone(),
                 seen,
+                fences: self.stale_fences.clone(),
+                window: self.stale_window.clone(),
             };
             self.stale_shipper = Some(Shipper::new(
                 self.blobs.clone(),
@@ -3842,6 +4013,7 @@ impl World {
             Action::DeliverDelayedBackup => self.backup.deliver_delayed().await,
             Action::Ship(limit) => self.ship(limit).await,
             Action::ShipStale(limit) => self.ship_stale(limit).await,
+            Action::ReadStale(limit) => self.read_stale(limit).await,
             Action::BackupCreatesAtMost(bytes) => {
                 let canary = self.backup.canary;
                 self.backup = Arc::new(BackupBlobs::broken(bytes, canary));
@@ -4486,6 +4658,11 @@ async fn simulate(
             .await
             .map_err(|violation| format!("{described}: {violation}"))?;
     }
+    // A stale batch still held goes on, and is checked with the rest.
+    if let Some(held) = world.held_stale.take() {
+        world.release_stale(held).await;
+        world.blobs.settle().await;
+    }
     world.faults.lock().unwrap().failing_gets = 0;
     world.blobs.deliver_delayed().await;
     world.backup.deliver_delayed().await;
@@ -4493,6 +4670,8 @@ async fn simulate(
     world.made.held += held;
     world.made.late += took;
     world.made.passed = world.in_reach();
+    world.made.stale_notes_fenced = world.stale_fences.notes.load(Ordering::SeqCst);
+    world.made.stale_stalls_fenced = world.stale_fences.stalls.load(Ordering::SeqCst);
     world
         .verify()
         .await
@@ -4571,7 +4750,15 @@ fn histories() -> impl Strategy<Value = (Clocks, Vec<Action>)> {
 proptest! {
     // Four times as many histories as by default: some faults want a
     // writer left behind, a restore and a clean in just the right order.
-    #![proptest_config(ProptestConfig::with_cases(1_024))]
+    #![proptest_config(ProptestConfig {
+        // Beside the test, where CI keeps it, and said so: proptest looks for
+        // a lib.rs above an integration test by default, finds none, and
+        // falls back here with a warning.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::with_cases(1_024)
+    })]
 
     #[test]
     fn no_history_of_faults_loses_an_acknowledged_write_or_shows_an_unrecorded_one(
@@ -4631,7 +4818,15 @@ fn shipping_histories() -> impl Strategy<Value = (Clocks, Vec<Action>)> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig {
+        // Beside the test, where CI keeps it, and said so: proptest looks for
+        // a lib.rs above an integration test by default, finds none, and
+        // falls back here with a warning.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::with_cases(256)
+    })]
 
     #[test]
     fn no_history_of_shipping_ships_what_was_not_committed_or_notes_more_than_is_there(
@@ -4799,12 +4994,164 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
     assert!(capped.contains("PR 6:"), "{capped}");
     let shifted = caught_shipping(Canary::ShiftsCommitTimes);
     assert!(shifted.contains("I1:"), "{shifted}");
-    // A stale run unfenced stalls the run under way, as the fork it meets
-    // at the new run's base is taken for the new run's.
-    let stale = caught_shipping(Canary::StaleRunWrites);
-    assert!(stale.contains("the run's record is stalled"), "{stale}");
+    // The stale-run canaries are caught by histories made by hand, as
+    // only they hold a stale batch while its run moves:
+    // `a_stale_batch_held_while_its_run_is_re_based_is_fenced_at_its_note_and_its_stall`
+    // and `the_history_that_found_a_stale_read_over_forgotten_rows_catches_it_unfenced`.
     let spilled = caught_shipping(Canary::SpillAfterLink);
     assert!(spilled.contains("I3: the spilled link"), "{spilled}");
+}
+
+/// A history in which a stale node reads the commits it ships, after 4,
+/// what it saw the run shipped to, and is held there
+/// ([`Action::ReadStale`]) while the run is re-based at 5, and, if
+/// `shipped_on`, shipped from there by the node holding the partition;
+/// then goes on.
+fn re_based_under_a_stale_batch(shipped_on: bool) -> Vec<Action> {
+    let mut history = vec![
+        // A checkpoint at 3, the base, and a log at 4, shipped.
+        written(),
+        flushed(),
+        Action::BeginShipping,
+        Action::Ship(5),
+        written(),
+        Action::Ship(5),
+        // The stale node last saw the run shipped to 4.
+        Action::Takeover,
+        // A log at 5 and a checkpoint at 6 that replays it: a base at 5.
+        Action::WriteBesideFlush {
+            who: Who::Current,
+            rows: 1,
+            delete: None,
+            first: false,
+        },
+        Action::ReadStale(5),
+        Action::BeginShipping,
+    ];
+    if shipped_on {
+        history.push(Action::Ship(5));
+    }
+    history.push(Action::ShipStale(5));
+    history
+}
+
+/// DW-668, S5: a stale batch that read its run as it stood is fenced at
+/// its writes once the run is re-based under it. Shipped on from the new
+/// base, the batch meets the new run's base linked as a fork, and its
+/// stall, of nothing it shipped, is refused: unfenced, the run under way
+/// is stalled for it. Not shipped on, it links on over the new base, and
+/// its note is refused.
+#[test]
+fn a_stale_batch_held_while_its_run_is_re_based_is_fenced_at_its_note_and_its_stall() {
+    let fenced = |made: &Made| {
+        (
+            made.stale_held,
+            made.stale_stalls_fenced,
+            made.stale_notes_fenced,
+        )
+    };
+    let made = run(re_based_under_a_stale_batch(true), None).unwrap();
+    assert_eq!(fenced(&made), (1, 1, 0), "{made:?}");
+    let caught = run(
+        re_based_under_a_stale_batch(true),
+        Some(Canary::StaleRunWrites),
+    )
+    .unwrap_err();
+    assert!(caught.contains("the run's record is stalled"), "{caught}");
+    let made = run(re_based_under_a_stale_batch(false), None).unwrap();
+    assert_eq!(fenced(&made), (1, 0, 1), "{made:?}");
+}
+
+/// DW-668: the history the Nightly found (kept in
+/// `simulation.proptest-regressions` too). A stale node that shipped 4
+/// and 5 as it last saw the run, at 3, ships again from 3 after they are
+/// forgotten: its read, unfenced, gives it the checkpoint at 6 alone, and
+/// it links it on 3, not on 5, the commit just before it.
+#[test]
+fn the_history_that_found_a_stale_read_over_forgotten_rows_catches_it_unfenced() {
+    use Action::*;
+    use PutFault::LandThenFail;
+    use Who::Current;
+    let history: (Clocks, Vec<Action>) = (
+        Clocks {
+            coordinator: 0,
+            node: -1,
+        },
+        vec![
+            BackupCreatesAtMost(4096),
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            BeginShipping,
+            Flush { who: Current },
+            BeginShipping,
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Clean {
+                who: Current,
+                aged: false,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Conditional {
+                who: Current,
+                pick: 319227944,
+                kind: 0,
+                fresh: true,
+            },
+            Merge { who: Current },
+            Write {
+                who: Current,
+                rows: 3,
+                delete: Some(17705118915209389717),
+            },
+            Conditional {
+                who: Current,
+                pick: 16147907551293467594,
+                kind: 0,
+                fresh: true,
+            },
+            Flush { who: Current },
+            Ship(1),
+            Takeover,
+            ShipStale(2),
+            BackupFalselyThere(2),
+            ForgetHistory,
+            FailBackupPut(LandThenFail),
+            Ship(4),
+            ShipStale(3),
+        ],
+    );
+    run_on(history.clone(), None).unwrap();
+    let caught = run_on(history, Some(Canary::StaleRunReads)).unwrap_err();
+    assert!(
+        caught.contains("the link at LogPosition(6) is made on LogPosition(3)"),
+        "{caught}"
+    );
 }
 
 /// The first violation the simulation reports over a fixed set of histories
