@@ -278,37 +278,45 @@ pub fn vellev_up(
     })
 }
 
-pub fn weaviate_up(image: &str, data: &Path, pinning: &Pinning) -> Result<Container> {
+pub fn weaviate_up(
+    image: &str,
+    data: &Path,
+    pinning: &Pinning,
+    env: &[(String, String)],
+) -> Result<Container> {
     removed("bench-weaviate");
     fresh(data)?;
-    docker(&[
-        "run",
-        "-d",
-        "--name",
-        "bench-weaviate",
-        &format!("--cpuset-cpus={}", pinning.cpuset),
-        &format!("--cpus={}", pinning.cpus),
-        &format!("--memory={}m", pinning.memory_mb),
-        "-p",
-        &format!("{WEAVIATE_PORT}:8080"),
-        "-v",
-        &format!("{}:/var/lib/weaviate", data.display()),
-        "-e",
-        "PERSISTENCE_DATA_PATH=/var/lib/weaviate",
-        "-e",
-        "AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true",
-        "-e",
-        "DEFAULT_VECTORIZER_MODULE=none",
-        "-e",
-        "CLUSTER_HOSTNAME=node1",
-        "-e",
-        "DISABLE_TELEMETRY=true",
-        "-e",
-        &format!("GOMAXPROCS={}", pinning.cpus),
-        "-e",
-        "LIMIT_RESOURCES=true",
-        image,
-    ])?;
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        "bench-weaviate".into(),
+        format!("--cpuset-cpus={}", pinning.cpuset),
+        format!("--cpus={}", pinning.cpus),
+        format!("--memory={}m", pinning.memory_mb),
+        "-p".into(),
+        format!("{WEAVIATE_PORT}:8080"),
+        "-v".into(),
+        format!("{}:/var/lib/weaviate", data.display()),
+    ];
+    let mut all_env: Vec<(String, String)> = [
+        ("PERSISTENCE_DATA_PATH", "/var/lib/weaviate"),
+        ("AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED", "true"),
+        ("DEFAULT_VECTORIZER_MODULE", "none"),
+        ("CLUSTER_HOSTNAME", "node1"),
+        ("DISABLE_TELEMETRY", "true"),
+        ("LIMIT_RESOURCES", "true"),
+    ]
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .to_vec();
+    all_env.push(("GOMAXPROCS".into(), pinning.cpus.to_string()));
+    all_env.extend(env.iter().cloned());
+    for (key, value) in &all_env {
+        args.push("-e".into());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(image.into());
+    docker(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(Container {
         name: "bench-weaviate".into(),
     })

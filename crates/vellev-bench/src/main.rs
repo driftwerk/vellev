@@ -16,6 +16,7 @@ use vellev_bench::fixture::{Case, Filter, Fixture, Query, Truth};
 use vellev_bench::report;
 use vellev_bench::run::{self, Measured, Phases, Plan};
 use vellev_bench::sample::{self, Sampler};
+use vellev_bench::tenants;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -63,6 +64,10 @@ struct Args {
     /// Weaviate's tuned build (§1): maxConnections 64, efConstruction 256.
     #[arg(long)]
     tuned: bool,
+    /// The SQuAD recall fixture (memories.jsonl, queries.vectors.jsonl), for
+    /// the many-tenants measure (§3e); left out, it is not run.
+    #[arg(long)]
+    tenants: Option<PathBuf>,
     /// Concurrent queries in a burst (§4).
     #[arg(long, value_delimiter = ',', default_value = "16,64")]
     burst_sizes: Vec<usize>,
@@ -325,7 +330,7 @@ async fn weaviate(
 ) -> Result<EngineRun> {
     docker::pull(&args.weaviate_image).ok();
     let data = args.data.join("weaviate");
-    let container = docker::weaviate_up(&args.weaviate_image, &data, pinning)?;
+    let container = docker::weaviate_up(&args.weaviate_image, &data, pinning, &[])?;
     let outcome = async {
         let url = format!("http://127.0.0.1:{}", docker::WEAVIATE_PORT);
         let ready_url = format!("{url}/v1/.well-known/ready");
@@ -382,6 +387,143 @@ async fn weaviate(
     }
     docker::down(&[&container], &data)?;
     outcome
+}
+
+/// The many-tenants measure (§3e) on one engine, sampled for anonymous
+/// memory once loaded, settled and searched.
+#[allow(clippy::too_many_arguments)]
+async fn many_tenants(
+    engine: &dyn tenants::Tenanted,
+    cgroups: &[std::path::PathBuf],
+    disk: &std::path::Path,
+    memories: &[tenants::Memory],
+    queries: &[Vec<f32>],
+    reps: usize,
+    index: &str,
+    headline: bool,
+) -> Result<tenants::Measured> {
+    let (load_seconds, settle_seconds, p50_ms, p99_ms) =
+        tenants::measure(engine, memories, queries, reps, Duration::from_secs(3600)).await?;
+    let anon = steady(cgroups, disk).await?.anon;
+    eprintln!(
+        "many tenants ({index}): loaded in {load_seconds:.0} s, settled {settle_seconds:.0} s later; p50 {:.2} ms p99 {:.2} ms; anon {:.0} MiB",
+        p50_ms.median,
+        p99_ms.median,
+        anon as f64 / (1024.0 * 1024.0)
+    );
+    Ok(tenants::Measured {
+        index: index.into(),
+        headline,
+        load_seconds,
+        settle_seconds,
+        p50_ms,
+        p99_ms,
+        anon_bytes: anon,
+    })
+}
+
+async fn vellev_tenants(
+    args: &Args,
+    dir: &std::path::Path,
+    pinning: &Pinning,
+    reps: usize,
+) -> Result<Vec<tenants::Measured>> {
+    let memories = tenants::read_memories(&dir.join("memories.jsonl"))?;
+    let queries = tenants::read_queries(&dir.join("queries.vectors.jsonl"))?;
+    let data = args.data.join("vellev-tenants");
+    // A tenant not searched for 10 minutes is let go (§3e).
+    let env = [("VELLEV_TENANT_IDLE_SECS".to_string(), "600".to_string())];
+    let up = docker::vellev_up(
+        &args.vellev_image,
+        &args.postgres_image,
+        &data,
+        pinning,
+        &env,
+    )?;
+    let outcome = async {
+        let url = format!("http://127.0.0.1:{}", docker::VELLEV_PORT);
+        docker::ready(
+            &format!("{url}/health/ready"),
+            Duration::from_secs(120),
+            &up.vellev,
+        )
+        .await?;
+        let engine = tenants::VellevTenants {
+            url,
+            key: docker::VELLEV_KEY.into(),
+            metrics: format!("http://127.0.0.1:{}", docker::VELLEV_METRICS_PORT),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(600))
+                .build()?,
+        };
+        let cgroups = vec![up.vellev.cgroup()?, up.postgres.cgroup()?];
+        let measured = many_tenants(
+            &engine,
+            &cgroups,
+            &args.data,
+            &memories,
+            &queries,
+            reps,
+            "vellev, a tenant each",
+            true,
+        )
+        .await?;
+        eyre::Ok(vec![measured])
+    }
+    .await;
+    if outcome.is_err() {
+        eprintln!("vellev logs:\n{}", up.vellev.logs());
+    }
+    docker::down(&up.containers(), &data)?;
+    outcome
+}
+
+async fn weaviate_tenants(
+    args: &Args,
+    dir: &std::path::Path,
+    pinning: &Pinning,
+    reps: usize,
+) -> Result<Vec<tenants::Measured>> {
+    let memories = tenants::read_memories(&dir.join("memories.jsonl"))?;
+    let queries = tenants::read_queries(&dir.join("queries.vectors.jsonl"))?;
+    let mut measured = Vec::new();
+    // Weaviate's guidance for small tenants: dynamic as the headline, flat
+    // beside it; default HNSW reported but not as the headline (§3e). Each
+    // in a Weaviate of its own, so that each one's memory is its own.
+    for (index, headline) in [("dynamic", true), ("flat", false), ("hnsw", false)] {
+        let data = args.data.join(format!("weaviate-tenants-{index}"));
+        let env = [("ASYNC_INDEXING".to_string(), "true".to_string())];
+        let container = docker::weaviate_up(&args.weaviate_image, &data, pinning, &env)?;
+        let outcome = async {
+            let url = format!("http://127.0.0.1:{}", docker::WEAVIATE_PORT);
+            docker::ready(
+                &format!("{url}/v1/.well-known/ready"),
+                Duration::from_secs(120),
+                &container,
+            )
+            .await?;
+            let engine = tenants::WeaviateTenants {
+                url,
+                http: reqwest::Client::builder()
+                    .timeout(Duration::from_secs(600))
+                    .build()?,
+                index: index.into(),
+            };
+            let cgroups = vec![container.cgroup()?];
+            let label = format!("weaviate, {index}");
+            many_tenants(
+                &engine, &cgroups, &args.data, &memories, &queries, reps, &label, headline,
+            )
+            .await
+        }
+        .await;
+        if outcome.is_err() {
+            eprintln!("weaviate logs:\n{}", container.logs());
+        }
+        docker::down(&[&container], &data)?;
+        measured.push(outcome?);
+    }
+    Ok(measured)
 }
 
 /// The resources section of the summary: memory, load and settle, open
@@ -479,13 +621,20 @@ async fn main() -> Result<()> {
     let first_vellev = vellev_first(&args.order)?;
     let environment = environment();
     let (mut vellev_run, mut weaviate_run) = (None, None);
+    let (mut vellev_many, mut weaviate_many) = (Vec::new(), Vec::new());
     for turn in 0..2 {
         if (turn == 0) == first_vellev {
             vellev_run =
                 Some(vellev(&args, &fixture, &truth, &plan, &pinning, &queries, &warmup).await?);
+            if let Some(dir) = &args.tenants {
+                vellev_many = vellev_tenants(&args, dir, &pinning, args.reps).await?;
+            }
         } else {
             weaviate_run =
                 Some(weaviate(&args, &fixture, &truth, &plan, &pinning, &queries, &warmup).await?);
+            if let Some(dir) = &args.tenants {
+                weaviate_many = weaviate_tenants(&args, dir, &pinning, args.reps).await?;
+            }
         }
     }
     let (vellev_run, weaviate_run) = (vellev_run.expect("ran"), weaviate_run.expect("ran"));
@@ -528,6 +677,13 @@ async fn main() -> Result<()> {
         "environment": environment,
         "engines": { "vellev": engine_json(&vellev_run), "weaviate": engine_json(&weaviate_run) },
         "matched": matches,
+        "many_tenants": {
+            "vellev": vellev_many,
+            "weaviate": weaviate_many,
+            "tenants": "200 of 593 rows and one of 50,000, cut independently from the SQuAD recall fixture's 118,609 rows; each query asks a tenant drawn with a fixed seed",
+            "settings": "vellev lets a tenant go after 10 minutes idle (VELLEV_TENANT_IDLE_SECS=600); Weaviate runs with ASYNC_INDEXING=true, which its dynamic index needs",
+            "idle_tenant_open": "not published: Weaviate has no equivalent of letting a tenant go once idle (its tenants go cold only when told), so the same event cannot be measured on both sides (§3e)",
+        },
         "gate": gate,
     });
     std::fs::write(
@@ -551,6 +707,20 @@ async fn main() -> Result<()> {
         ("weaviate", report::hybrid_matched(&weaviate_run.hybrid)),
     ];
     let mut summary = report::summary(&matches, &hybrids, &floors, &gate, args.rows, &header);
+    if !vellev_many.is_empty() || !weaviate_many.is_empty() {
+        summary.push_str("\n## Many tenants\n\n200 tenants of 593 rows and one of 50,000, each query asking a tenant drawn with a fixed seed, limit 10. The cost of opening an idle tenant is not published: Weaviate has no equivalent of letting a tenant go once idle.\n\n| Engine | Headline | p50 ms | p99 ms | anon MiB | load s |\n|---|---|---|---|---|---|\n");
+        for m in vellev_many.iter().chain(&weaviate_many) {
+            summary.push_str(&format!(
+                "| {} | {} | {:.2} | {:.2} | {:.0} | {:.0} |\n",
+                m.index,
+                if m.headline { "yes" } else { "no" },
+                m.p50_ms.median,
+                m.p99_ms.median,
+                m.anon_bytes as f64 / (1024.0 * 1024.0),
+                m.load_seconds
+            ));
+        }
+    }
     summary.push_str(&resources(
         &[("vellev", &vellev_run), ("weaviate", &weaviate_run)],
         &matches,
