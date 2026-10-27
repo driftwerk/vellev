@@ -727,6 +727,49 @@ mod tests {
         }
     }
 
+    /// A model that takes a while to let go of, as one on a GPU does, and
+    /// says when it has.
+    struct SlowToLetGo(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SlowToLetGo {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(300));
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // A process that ends while the model's thread is still letting go of
+    // the model tears ONNX Runtime down under it: on CUDA that crashed the
+    // fixture's embedder at exit. Closing waits until it is let go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_returns_only_once_the_model_is_let_go() {
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = gone.clone();
+        let load: Load = Box::new(move || {
+            let held = SlowToLetGo(flag.clone());
+            Ok(Box::new(move |texts: Vec<&str>| {
+                let _ = &held;
+                Ok(texts.iter().map(|_| vec![1.0]).collect())
+            }) as Model)
+        });
+        let local = Local::spawn("stand-in", load, alone()).unwrap();
+        local.embed(vec!["a".into()], Purpose::Document).await.unwrap();
+        local.close().await;
+        assert!(
+            gone.load(std::sync::atomic::Ordering::SeqCst),
+            "the model is let go before closing returns"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_a_model_never_loaded_returns() {
+        let load: Load = Box::new(|| Err(failed("never asked to load")));
+        let local = Local::spawn("stand-in", load, alone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), local.close())
+            .await
+            .expect("closed");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_long_job_is_run_in_parts_and_waiting_callers_are_run_together() {
         let (local, runs) = local(0);
