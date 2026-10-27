@@ -48,12 +48,37 @@ fn removed(name: &str) {
         .output();
 }
 
+/// The image files are cleared with: its own `rm`, run as root, since what
+/// an engine wrote is owned by the user the engine ran as.
+const CLEARER: &str =
+    "postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab";
+
+/// Remove `dir` and everything in it, whoever wrote it.
+pub fn cleared(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mount = format!("{}:/cleared", dir.display());
+    docker(&[
+        "run",
+        "--rm",
+        "--user",
+        "0",
+        "--entrypoint",
+        "sh",
+        "-v",
+        &mount,
+        CLEARER,
+        "-c",
+        "rm -rf /cleared/* /cleared/.[!.]* /cleared/..?* 2>/dev/null; true",
+    ])?;
+    std::fs::remove_dir_all(dir).wrap_err_with(|| dir.display().to_string())
+}
+
 /// A directory the engine's containers write to, made afresh and open to
 /// the user the image runs as.
 fn fresh(dir: &Path) -> Result<()> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir).wrap_err_with(|| dir.display().to_string())?;
-    }
+    cleared(dir)?;
     std::fs::create_dir_all(dir)?;
     let status = Command::new("chmod").args(["0777"]).arg(dir).status()?;
     ensure!(status.success(), "chmod {}", dir.display());
@@ -277,10 +302,7 @@ pub fn down(containers: &[&Container], data: &Path) -> Result<()> {
     for container in containers {
         removed(&container.name);
     }
-    if data.exists() {
-        std::fs::remove_dir_all(data).wrap_err_with(|| data.display().to_string())?;
-    }
-    Ok(())
+    cleared(data)
 }
 
 /// Wait until `url` answers 2xx, at most `within`.
