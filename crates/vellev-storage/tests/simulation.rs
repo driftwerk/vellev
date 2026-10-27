@@ -753,6 +753,24 @@ struct StaleView {
     inner: Arc<SimCoordinator>,
     seen: vellev_storage::coordinator::Shipping,
     fences: Arc<StaleFences>,
+    window: Arc<Window>,
+}
+
+/// Where a stale batch is held, once armed ([`Action::ReadStale`]),
+/// between its read of the commits it ships and its writes.
+#[derive(Debug, Default)]
+struct Window {
+    /// The batch's release, taken by the batch it holds.
+    armed: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Told when the batch is held.
+    reached: tokio::sync::Notify,
+}
+
+/// A stale batch held in its [`Window`], and its release.
+#[derive(Debug)]
+struct HeldBatch {
+    batch: tokio::task::JoinHandle<vellev_storage::Result<shipper::Batch>>,
+    release: tokio::sync::oneshot::Sender<()>,
 }
 
 /// How often a stale node's note, and its stall, were refused by the
@@ -901,9 +919,17 @@ impl Coordinator for StaleView {
         seen: Option<vellev_storage::coordinator::LogPosition>,
         limit: usize,
     ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
-        self.inner
+        let rows = self
+            .inner
             .commits_to_ship(key, incarnation, base, seen, limit)
-            .await
+            .await?;
+        let armed = self.window.armed.lock().unwrap().take();
+        if let Some(released) = armed.filter(|_| !rows.is_empty()) {
+            self.window.reached.notify_one();
+            // Released, or the world it was held in gone: on either, on.
+            let _ = released.await;
+        }
+        Ok(rows)
     }
     async fn unshipped(
         &self,
@@ -2179,6 +2205,9 @@ struct World {
     stale_shipper: Option<Shipper>,
     /// What the fences refused of every stale node's.
     stale_fences: Arc<StaleFences>,
+    /// Where a stale batch is held, and the one held there, if any.
+    stale_window: Arc<Window>,
+    held_stale: Option<HeldBatch>,
     /// Every link seen in the backup store, by incarnation and position.
     linked: BTreeSet<(Incarnation, LogPosition)>,
     shipping_from: Option<ShipBase>,
@@ -2539,6 +2568,8 @@ impl World {
             node_shipper: None,
             stale_shipper: None,
             stale_fences: Arc::default(),
+            stale_window: Arc::default(),
+            held_stale: None,
             linked: BTreeSet::new(),
             step: 0,
             made: Made::default(),
@@ -2638,11 +2669,52 @@ impl World {
     /// was taken over from, as it last saw the run: what its fences let it
     /// do is all it does. Whatever it meets is its own, not the run's.
     async fn ship_stale(&mut self, limit: usize) {
+        if let Some(held) = self.held_stale.take() {
+            return self.release_stale(held).await;
+        }
         let Some(stale) = self.stale_shipper.clone() else {
             return;
         };
         let incarnation = self.cluster.committed().await.incarnation;
-        match stale.ship_batch(incarnation, limit).await {
+        let done = stale.ship_batch(incarnation, limit).await;
+        self.stale_done(done);
+    }
+
+    /// As [`Self::ship_stale`], the batch held once it has read the
+    /// commits it ships (see [`Action::ReadStale`]); one that ends before
+    /// it reads any is done with.
+    async fn read_stale(&mut self, limit: usize) {
+        if let Some(held) = self.held_stale.take() {
+            self.release_stale(held).await;
+        }
+        let Some(stale) = self.stale_shipper.clone() else {
+            return;
+        };
+        let incarnation = self.cluster.committed().await.incarnation;
+        let (release, released) = tokio::sync::oneshot::channel();
+        *self.stale_window.armed.lock().unwrap() = Some(released);
+        let mut batch = tokio::spawn(async move { stale.ship_batch(incarnation, limit).await });
+        tokio::select! {
+            done = &mut batch => {
+                self.stale_window.armed.lock().unwrap().take();
+                self.stale_done(done.expect("a stale batch runs to its end"));
+            }
+            () = self.stale_window.reached.notified() => {
+                self.made.stale_held += 1;
+                self.held_stale = Some(HeldBatch { batch, release });
+            }
+        }
+    }
+
+    /// The stale batch held let go, and run to its end.
+    async fn release_stale(&mut self, held: HeldBatch) {
+        let _ = held.release.send(());
+        let done = held.batch.await;
+        self.stale_done(done.expect("a stale batch runs to its end"));
+    }
+
+    fn stale_done(&mut self, done: vellev_storage::Result<shipper::Batch>) {
+        match done {
             Ok(shipper::Batch::Shipped {
                 through: Some(_), ..
             }) => self.made.stale_shipped += 1,
@@ -2914,6 +2986,7 @@ impl World {
                 inner: self.coordinator.clone(),
                 seen,
                 fences: self.stale_fences.clone(),
+                window: self.stale_window.clone(),
             };
             self.stale_shipper = Some(Shipper::new(
                 self.blobs.clone(),
@@ -3940,7 +4013,7 @@ impl World {
             Action::DeliverDelayedBackup => self.backup.deliver_delayed().await,
             Action::Ship(limit) => self.ship(limit).await,
             Action::ShipStale(limit) => self.ship_stale(limit).await,
-            Action::ReadStale(limit) => self.ship_stale(limit).await,
+            Action::ReadStale(limit) => self.read_stale(limit).await,
             Action::BackupCreatesAtMost(bytes) => {
                 let canary = self.backup.canary;
                 self.backup = Arc::new(BackupBlobs::broken(bytes, canary));
@@ -4585,6 +4658,11 @@ async fn simulate(
             .await
             .map_err(|violation| format!("{described}: {violation}"))?;
     }
+    // A stale batch still held goes on, and is checked with the rest.
+    if let Some(held) = world.held_stale.take() {
+        world.release_stale(held).await;
+        world.blobs.settle().await;
+    }
     world.faults.lock().unwrap().failing_gets = 0;
     world.blobs.deliver_delayed().await;
     world.backup.deliver_delayed().await;
@@ -4924,20 +5002,29 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
     assert!(spilled.contains("I3: the spilled link"), "{spilled}");
 }
 
-/// A history in which a stale node reads the commits it ships after its
-/// run's base, and is held there ([`Action::ReadStale`]) while the run is
-/// re-based on a newer checkpoint, and, if `shipped_on`, shipped from the
-/// new base by the node holding the partition; then goes on.
+/// A history in which a stale node reads the commits it ships, after 4,
+/// what it saw the run shipped to, and is held there
+/// ([`Action::ReadStale`]) while the run is re-based at 5, and, if
+/// `shipped_on`, shipped from there by the node holding the partition;
+/// then goes on.
 fn re_based_under_a_stale_batch(shipped_on: bool) -> Vec<Action> {
     let mut history = vec![
+        // A checkpoint at 3, the base, and a log at 4, shipped.
         written(),
         flushed(),
         Action::BeginShipping,
         Action::Ship(5),
+        written(),
+        Action::Ship(5),
+        // The stale node last saw the run shipped to 4.
         Action::Takeover,
-        written(),
-        written(),
-        flushed(),
+        // A log at 5 and a checkpoint at 6 that replays it: a base at 5.
+        Action::WriteBesideFlush {
+            who: Who::Current,
+            rows: 1,
+            delete: None,
+            first: false,
+        },
         Action::ReadStale(5),
         Action::BeginShipping,
     ];
@@ -4951,8 +5038,9 @@ fn re_based_under_a_stale_batch(shipped_on: bool) -> Vec<Action> {
 /// DW-668, S5: a stale batch that read its run as it stood is fenced at
 /// its writes once the run is re-based under it. Shipped on from the new
 /// base, the batch meets the new run's base linked as a fork, and its
-/// stall is refused: unfenced, the run under way is stalled for it. Not
-/// shipped on, it links on past the new base, and its note is refused.
+/// stall, of nothing it shipped, is refused: unfenced, the run under way
+/// is stalled for it. Not shipped on, it links on over the new base, and
+/// its note is refused.
 #[test]
 fn a_stale_batch_held_while_its_run_is_re_based_is_fenced_at_its_note_and_its_stall() {
     let fenced = |made: &Made| {
