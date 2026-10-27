@@ -128,7 +128,7 @@ pub struct Query {
 
 /// The exact top 100 of each query under each case.
 #[derive(Debug, Default)]
-pub struct Truth(HashMap<(u64, Case), Vec<u64>>);
+pub struct Truth(HashMap<(u64, Case), (Vec<u64>, Vec<f64>)>);
 
 impl Truth {
     pub fn read(path: &Path) -> Result<Truth> {
@@ -137,19 +137,34 @@ impl Truth {
             query: u64,
             case: String,
             ids: Vec<u64>,
+            scores: Vec<f64>,
         }
         let mut truth = HashMap::new();
         for line in lines(path)? {
             let line: Line = serde_json::from_str(&line?)?;
-            truth.insert((line.query, Case::from_name(&line.case)?), line.ids);
+            ensure!(
+                line.ids.len() == line.scores.len(),
+                "query {}: ids and scores differ in length",
+                line.query
+            );
+            truth.insert(
+                (line.query, Case::from_name(&line.case)?),
+                (line.ids, line.scores),
+            );
         }
         Ok(Truth(truth))
     }
 
+    /// The exact nearest ids, nearest first.
     pub fn of(&self, query: u64, case: Case) -> Result<&[u64]> {
+        Ok(self.with_scores(query, case)?.0)
+    }
+
+    /// The exact nearest ids with their cosines, nearest first.
+    pub fn with_scores(&self, query: u64, case: Case) -> Result<(&[u64], &[f64])> {
         self.0
             .get(&(query, case))
-            .map(Vec::as_slice)
+            .map(|(ids, scores)| (ids.as_slice(), scores.as_slice()))
             .ok_or_else(|| eyre!("no truth for query {query} under {}", case.name()))
     }
 }

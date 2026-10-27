@@ -111,6 +111,8 @@ struct EngineRun {
     phases: Phases,
     measured: Vec<Measured>,
     floor: run::Floor,
+    hybrid: Vec<run::HybridPoint>,
+    hybrid_reference: &'static str,
     image: Value,
     extra: Value,
 }
@@ -185,6 +187,8 @@ async fn vellev(
         Vellev::threads_as_set(&engine.metrics().await?, pinning.cpus)?;
         let (phases, measured, floor) =
             measured(engine.clone(), fixture, truth, plan, queries, warmup).await?;
+        let reference = run::vellev_reference(&engine, queries, truth).await?;
+        let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps).await?;
         let settings = engine.settings().await?;
         let metrics = engine.metrics().await?;
         std::fs::write(args.out.join("vellev-metrics.txt"), &metrics)?;
@@ -193,6 +197,8 @@ async fn vellev(
             phases,
             measured,
             floor,
+            hybrid,
+            hybrid_reference: "the truth's exact top 100 as the vector leg, vellev's keyword search as the keyword leg, fused by vellev's own fusion (vellev_index::fusion::fuse) at alpha 0.75 with relative scores; fused in f32 from f64 cosines, so fused scores within about 1e-6 may swap at the 10th place",
             image: json!({ "image": args.vellev_image, "digest": docker::digest(&args.vellev_image)?, "postgres": args.postgres_image, "postgres_digest": docker::digest(&args.postgres_image)? }),
             extra: json!({ "postgres": "runs on the same CPUs as vellev, within the same memory: 512 MiB of it" }),
         })
@@ -227,12 +233,16 @@ async fn weaviate(
         let engine = Arc::new(Weaviate::new(&url, index)?);
         let (phases, measured, floor) =
             measured(engine.clone(), fixture, truth, plan, queries, warmup).await?;
+        let reference = run::weaviate_reference(engine.as_ref(), queries, plan.rows).await?;
+        let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps).await?;
         let settings = engine.settings().await?;
         eyre::Ok(EngineRun {
             settings,
             phases,
             measured,
             floor,
+            hybrid,
+            hybrid_reference: "Weaviate's own hybrid (alpha 0.75, relativeScoreFusion) with ef set to the number of rows: near-exhaustive, not proven exact",
             image: json!({ "image": args.weaviate_image, "digest": docker::digest(&args.weaviate_image)?, "tuned": args.tuned }),
             extra: json!({
                 "env": { "GOMAXPROCS": pinning.cpus, "LIMIT_RESOURCES": true },
@@ -299,7 +309,13 @@ async fn main() -> Result<()> {
             .then(a.target.total_cmp(&b.target))
             .then(a.engine.cmp(&b.engine))
     });
-    let gate = report::gate(&vellev_run.measured, &cases, vec![]);
+    let gate = report::gate(
+        &vellev_run.measured,
+        &cases,
+        report::hybrid_check(&vellev_run.hybrid)
+            .into_iter()
+            .collect(),
+    );
     let engine_json = |run: &EngineRun| {
         json!({
             "image": run.image,
@@ -307,6 +323,7 @@ async fn main() -> Result<()> {
             "phases": run.phases,
             "notes": run.extra,
             "query_floor": run.floor,
+            "hybrid": { "reference": run.hybrid_reference, "points": run.hybrid, "matched_0_99": report::hybrid_matched(&run.hybrid) },
             "points": run.measured,
         })
     };
@@ -339,7 +356,11 @@ async fn main() -> Result<()> {
         ("vellev", vellev_run.floor),
         ("weaviate", weaviate_run.floor),
     ];
-    let summary = report::summary(&matches, &floors, &gate, args.rows, &header);
+    let hybrids = [
+        ("vellev", report::hybrid_matched(&vellev_run.hybrid)),
+        ("weaviate", report::hybrid_matched(&weaviate_run.hybrid)),
+    ];
+    let summary = report::summary(&matches, &hybrids, &floors, &gate, args.rows, &header);
     std::fs::write(args.out.join("summary.md"), &summary)?;
     println!("{summary}");
     ensure!(gate.passed, "the hard gate failed: see summary.md");

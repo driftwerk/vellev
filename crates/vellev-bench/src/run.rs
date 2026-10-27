@@ -246,3 +246,123 @@ pub async fn floor(engine: &dyn Engine, queries: &[Query], reps: usize) -> Resul
         p99_ms: Repeated::of(&p99s),
     })
 }
+
+/// How many results each leg of a hybrid search offers for fusing: both
+/// engines' default, and the truth's depth, so that the truth's top is
+/// exactly what an exact vector leg offers.
+pub const CANDIDATES: usize = 100;
+
+/// A hybrid knob point (§4): its recall@10 against the engine's own
+/// exact-leg answer, and its latency. Never compared across engines.
+#[derive(Debug, Clone, Serialize)]
+pub struct HybridPoint {
+    pub knob: Knob,
+    pub label: String,
+    pub recall: Recall,
+    pub recall_share: f64,
+    pub p50_ms: Repeated,
+    pub p99_ms: Repeated,
+}
+
+/// vellev's own answer with an exact vector leg, at limit 10 under broad:
+/// the truth's exact top 100 as the vector leg, vellev's keyword search as
+/// the keyword leg (exact, as keyword search always is), fused by vellev's
+/// own code at its defaults.
+pub async fn vellev_reference(
+    engine: &crate::engine::Vellev,
+    queries: &[Query],
+    truth: &Truth,
+) -> Result<Vec<Vec<u64>>> {
+    let mut reference = Vec::with_capacity(queries.len());
+    for query in queries {
+        let filter = Filter::of(Case::Broad, query.owner);
+        let wording = engine.keyword(&query.text, filter, CANDIDATES).await?;
+        let (ids, scores) = truth.with_scores(query.id, Case::Broad)?;
+        let meaning: Vec<(u64, f32)> = ids
+            .iter()
+            .zip(scores)
+            .take(CANDIDATES)
+            .map(|(&id, &cosine)| (id, cosine as f32))
+            .collect();
+        let fused = vellev_index::fusion::fuse(
+            vellev_index::fusion::Fusion::RelativeScore,
+            0.75,
+            &meaning,
+            &wording,
+            10,
+        );
+        reference.push(fused.iter().map(|f| f.key).collect());
+    }
+    Ok(reference)
+}
+
+/// Weaviate's own answer with a near-exhaustive vector leg (§4: `ef` =
+/// rows), at limit 10 under broad.
+pub async fn weaviate_reference(
+    engine: &dyn Engine,
+    queries: &[Query],
+    rows: u64,
+) -> Result<Vec<Vec<u64>>> {
+    let all = Knob::Ef(u32::try_from(rows)?);
+    engine.set(all).await?;
+    let mut reference = Vec::with_capacity(queries.len());
+    for query in queries {
+        let filter = Filter::of(Case::Broad, query.owner);
+        reference.push(
+            engine
+                .hybrid(&query.text, &query.vector, filter, 10, all)
+                .await?,
+        );
+    }
+    Ok(reference)
+}
+
+/// Every knob point's hybrid answers at limit 10 under broad, against the
+/// engine's own `reference`.
+pub async fn hybrid(
+    engine: &dyn Engine,
+    queries: &[Query],
+    reference: &[Vec<u64>],
+    reps: usize,
+) -> Result<Vec<HybridPoint>> {
+    let mut points = Vec::new();
+    for knob in engine.points(10) {
+        engine.set(knob).await?;
+        let (mut p50s, mut p99s) = (Vec::new(), Vec::new());
+        let mut recall = Recall::default();
+        for rep in 0..reps {
+            let mut took = Vec::with_capacity(queries.len());
+            for (query, wanted) in queries.iter().zip(reference) {
+                let filter = Filter::of(Case::Broad, query.owner);
+                let started = Instant::now();
+                let got = engine
+                    .hybrid(&query.text, &query.vector, filter, 10, knob)
+                    .await?;
+                took.push(started.elapsed().as_secs_f64() * 1e3);
+                if rep == 0 {
+                    recall = recall + found_at(10, &got, wanted);
+                }
+            }
+            p50s.push(percentile(&took, 50.0));
+            p99s.push(percentile(&took, 99.0));
+        }
+        let point = HybridPoint {
+            knob,
+            label: knob.label(),
+            recall,
+            recall_share: recall.share(),
+            p50_ms: Repeated::of(&p50s),
+            p99_ms: Repeated::of(&p99s),
+        };
+        eprintln!(
+            "{} hybrid {}: recall against its own exact-leg answer {:.4}, p50 {:.2} ms p99 {:.2} ms",
+            engine.name(),
+            point.label,
+            point.recall_share,
+            point.p50_ms.median,
+            point.p99_ms.median
+        );
+        points.push(point);
+    }
+    Ok(points)
+}
