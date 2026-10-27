@@ -68,6 +68,14 @@ struct Args {
     /// the many-tenants measure (§3e); left out, it is not run.
     #[arg(long)]
     tenants: Option<PathBuf>,
+    /// More environment for vellev's container, as KEY=VALUE: for a
+    /// diagnosis, never a published run.
+    #[arg(long)]
+    vellev_env: Vec<String>,
+    /// More volumes for vellev's container, as HOST:CONTAINER: for a
+    /// diagnosis, such as somewhere for a profile to be written.
+    #[arg(long)]
+    vellev_mount: Vec<String>,
     /// Run one engine alone (`vellev` or `weaviate`), for a timing or a
     /// diagnosis: no comparison, no gate.
     #[arg(long)]
@@ -265,7 +273,8 @@ async fn vellev(
         &args.postgres_image,
         &data,
         pinning,
-        &[],
+        &diagnosis_env(args)?,
+        &args.vellev_mount,
     )?;
     let outcome = async {
         let url = format!("http://127.0.0.1:{}", docker::VELLEV_PORT);
@@ -454,7 +463,8 @@ async fn vellev_tenants(
         &args.postgres_image,
         &data,
         pinning,
-        &env,
+        &[env.to_vec(), diagnosis_env(args)?].concat(),
+        &args.vellev_mount,
     )?;
     let outcome = async {
         let url = format!("http://127.0.0.1:{}", docker::VELLEV_PORT);
@@ -604,6 +614,18 @@ fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
     out
 }
 
+/// The `--vellev-env` settings as pairs.
+fn diagnosis_env(args: &Args) -> Result<Vec<(String, String)>> {
+    args.vellev_env
+        .iter()
+        .map(|pair| {
+            pair.split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .ok_or_else(|| eyre::eyre!("--vellev-env {pair:?} is not KEY=VALUE"))
+        })
+        .collect()
+}
+
 /// One engine alone, for a timing or a diagnosis: its whole run, written
 /// out, with no comparison and no gate.
 #[allow(clippy::too_many_arguments)]
@@ -642,6 +664,7 @@ async fn alone(
         "kind": format!("{engine} alone: no comparison, no gate"),
         "rows": args.rows,
         "environment": environment,
+        "vellev_diagnosis_env": args.vellev_env,
         "engine": {
             "image": run.image, "settings": run.settings, "phases": run.phases, "points": run.measured,
             "query_floor": run.floor, "memory": run.memory, "opened": run.opened, "hybrid": run.hybrid,
@@ -688,6 +711,7 @@ async fn gate_only(
         "rows": args.rows,
         "queries": queries.len(),
         "environment": environment,
+        "vellev_diagnosis_env": args.vellev_env,
         "vellev": { "image": run.image, "settings": run.settings, "phases": run.phases, "points": run.measured, "hybrid": run.hybrid },
         "gate": gate,
     });
@@ -830,6 +854,7 @@ async fn main() -> Result<()> {
         "reps": args.reps,
         "targets": report::TARGETS.map(|t| t as f64 / 100.0),
         "environment": environment,
+        "vellev_diagnosis_env": args.vellev_env,
         "engines": { "vellev": engine_json(&vellev_run), "weaviate": engine_json(&weaviate_run) },
         "matched": matches,
         "many_tenants": {
