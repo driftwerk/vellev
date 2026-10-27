@@ -824,7 +824,8 @@ impl ClusteredIndex {
         for rank in &ranks {
             found[*rank] += 1;
         }
-        let wanted = (ranks.len() as f64 * RECALL_FLOOR).ceil() as usize;
+        let floor: f64 = std::env::var("SCRATCH_RECALL_FLOOR").ok().and_then(|f| f.parse().ok()).unwrap_or(RECALL_FLOOR);
+        let wanted = (ranks.len() as f64 * floor).ceil() as usize;
         let mut seen = 0;
         for (rank, count) in found.iter().enumerate().take(self.clusters.len()) {
             seen += count;
