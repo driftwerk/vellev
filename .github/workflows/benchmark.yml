@@ -26,6 +26,11 @@ on:
         description: vellev alone at its defaults, the gate's checks only
         type: boolean
         default: false
+      only:
+        description: One engine alone, for a timing or a diagnosis (vellev or weaviate); both by default
+        type: string
+        default: ''
+
   pull_request:
     paths:
       - crates/vellev-bench/**
@@ -101,6 +106,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ROWS: ${{ inputs.rows || '1000000' }}
       GATE_ONLY: ${{ inputs.gate_only && '--gate-only --limits 10' || '' }}
+      ONLY: ${{ inputs.only && format('--only {0}', inputs.only) || '' }}
       TUNED: ${{ (inputs.tuned || github.event.schedule == '30 4 1 * *') && '--tuned' || '' }}
     outputs:
       gate: ${{ steps.gate.outputs.gate }}
@@ -181,7 +187,7 @@ jobs:
             --tenants "$RUNNER_TEMP/recall" \
             --out "$RUNNER_TEMP/results" --data "$RUNNER_TEMP/engines" \
             --vellev-image vellev:bench --weaviate-image "$WEAVIATE_IMAGE" --postgres-image "$POSTGRES_IMAGE" \
-            $TUNED $GATE_ONLY 2>&1 | tee "$RUNNER_TEMP/run.log"
+            $TUNED $GATE_ONLY $ONLY 2>&1 | tee "$RUNNER_TEMP/run.log"
       - if: always()
         run: cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
       # Whether the hard gate held, failed, or was never reached.

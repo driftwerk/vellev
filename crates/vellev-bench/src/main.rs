@@ -68,6 +68,10 @@ struct Args {
     /// the many-tenants measure (§3e); left out, it is not run.
     #[arg(long)]
     tenants: Option<PathBuf>,
+    /// Run one engine alone (`vellev` or `weaviate`), for a timing or a
+    /// diagnosis: no comparison, no gate.
+    #[arg(long)]
+    only: Option<String>,
     /// The pull-request gate (§8): vellev alone, at its defaults, limit 10;
     /// no bursts, restarts or many tenants. Its exit says whether it held.
     #[arg(long)]
@@ -277,7 +281,12 @@ async fn vellev(
         // is loaded, or the run fails.
         Vellev::threads_as_set(&engine.metrics().await?, pinning.cpus)?;
         let cgroups = vec![up.vellev.cgroup()?, up.postgres.cgroup()?];
-        let sampler = Sampler::start(cgroups.clone(), args.data.clone(), "create");
+        let sampler = Sampler::start(
+            cgroups.clone(),
+            args.data.clone(),
+            "create",
+            Some(format!("http://127.0.0.1:{}/metrics", docker::VELLEV_METRICS_PORT)),
+        );
         let (phases, measured, floor) =
             measured(engine.clone(), &sampler, fixture, truth, plan, queries, warmup).await?;
         let at_rest = steady(&cgroups, &args.data).await?;
@@ -348,7 +357,7 @@ async fn weaviate(
         };
         let engine = Arc::new(Weaviate::new(&url, index)?);
         let cgroups = vec![container.cgroup()?];
-        let sampler = Sampler::start(cgroups.clone(), args.data.clone(), "create");
+        let sampler = Sampler::start(cgroups.clone(), args.data.clone(), "create", None);
         let (phases, measured, floor) =
             measured(engine.clone(), &sampler, fixture, truth, plan, queries, warmup).await?;
         let at_rest = steady(&cgroups, &args.data).await?;
@@ -595,6 +604,64 @@ fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
     out
 }
 
+/// One engine alone, for a timing or a diagnosis: its whole run, written
+/// out, with no comparison and no gate.
+#[allow(clippy::too_many_arguments)]
+async fn alone(
+    args: &Args,
+    engine: &str,
+    fixture: &Fixture,
+    truth: &Truth,
+    plan: &Plan,
+    pinning: &Pinning,
+    queries: &[Query],
+    warmup: &[Query],
+    environment: Value,
+) -> Result<()> {
+    let (run, many) = match engine {
+        "vellev" => {
+            let run = vellev(args, fixture, truth, plan, pinning, queries, warmup).await?;
+            let many = match &args.tenants {
+                Some(dir) => vellev_tenants(args, dir, pinning, args.reps).await?,
+                None => vec![],
+            };
+            (run, many)
+        }
+        "weaviate" => {
+            let run = weaviate(args, fixture, truth, plan, pinning, queries, warmup).await?;
+            let many = match &args.tenants {
+                Some(dir) => weaviate_tenants(args, dir, pinning, args.reps).await?,
+                None => vec![],
+            };
+            (run, many)
+        }
+        other => eyre::bail!("no engine {other:?}"),
+    };
+    let results = json!({
+        "schema": 1,
+        "kind": format!("{engine} alone: no comparison, no gate"),
+        "rows": args.rows,
+        "environment": environment,
+        "engine": {
+            "image": run.image, "settings": run.settings, "phases": run.phases, "points": run.measured,
+            "query_floor": run.floor, "memory": run.memory, "opened": run.opened, "hybrid": run.hybrid,
+        },
+        "many_tenants": many,
+    });
+    std::fs::write(
+        args.out.join("results.json"),
+        serde_json::to_string_pretty(&results)?,
+    )?;
+    std::fs::write(
+        args.out.join("summary.md"),
+        format!(
+            "# {engine} alone, {} rows\n\nNo comparison and no gate: see results.json.\n",
+            args.rows
+        ),
+    )?;
+    Ok(())
+}
+
 /// The pull-request gate (§8): vellev alone at its defaults on the slice
 /// loaded, held to the same thresholds as the nightly.
 #[allow(clippy::too_many_arguments)]
@@ -689,6 +756,20 @@ async fn main() -> Result<()> {
             &queries,
             &warmup,
             &cases,
+            environment,
+        )
+        .await;
+    }
+    if let Some(engine) = &args.only {
+        return alone(
+            &args,
+            engine,
+            &fixture,
+            &truth,
+            &plan,
+            &pinning,
+            &queries,
+            &warmup,
             environment,
         )
         .await;

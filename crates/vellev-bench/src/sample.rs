@@ -98,7 +98,15 @@ impl Sampler {
     /// Sample the containers whose cgroups are `cgroups` and the disk
     /// holding `disk`, starting in `phase`. A container restarted keeps
     /// its cgroup directory, so the paths stay good.
-    pub fn start(cgroups: Vec<PathBuf>, disk: PathBuf, phase: &str) -> Sampler {
+    /// `metrics`, when given, is a Prometheus endpoint whose
+    /// `vellev_unflushed_rows`, `vellev_unflushed_bytes` and
+    /// `vellev_tenants_unsettled` are printed with each trace line.
+    pub fn start(
+        cgroups: Vec<PathBuf>,
+        disk: PathBuf,
+        phase: &str,
+        metrics: Option<String>,
+    ) -> Sampler {
         let phase = Arc::new(Mutex::new(phase.to_string()));
         let phases: Arc<Mutex<BTreeMap<String, PhaseMemory>>> = Arc::default();
         let last: Arc<Mutex<Reading>> = Arc::default();
@@ -114,8 +122,26 @@ impl Sampler {
                         *last.lock().expect("last") = reading;
                         let name = phase.lock().expect("phase").clone();
                         if tick.is_multiple_of(30) {
+                            let mut engine = String::new();
+                            if let Some(url) = &metrics {
+                                if let Ok(text) = reqwest::get(url.as_str())
+                                    .await
+                                    .and_then(|r| r.error_for_status())
+                                {
+                                    let text = text.text().await.unwrap_or_default();
+                                    for name in [
+                                        "vellev_unflushed_rows",
+                                        "vellev_unflushed_bytes",
+                                        "vellev_tenants_unsettled",
+                                    ] {
+                                        let value = crate::engine::Vellev::sample(&text, name)
+                                            .unwrap_or(f64::NAN);
+                                        engine.push_str(&format!("; {name} {value}"));
+                                    }
+                                }
+                            }
                             eprintln!(
-                                "memory ({name}): anon {:.0} MiB, file cache {:.0} MiB; disk used {:.1} GiB",
+                                "memory ({name}): anon {:.0} MiB, file cache {:.0} MiB; disk used {:.1} GiB{engine}",
                                 reading.anon as f64 / 1048576.0,
                                 reading.file as f64 / 1048576.0,
                                 reading.disk_used as f64 / 1073741824.0
