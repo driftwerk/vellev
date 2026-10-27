@@ -342,6 +342,16 @@ pub fn rekeyed_index(key: &str, frame: &[u8], from: &str, to: &str) -> Result<By
     encode_as(Kind::Index, version, &rekeyed)
 }
 
+/// How far into a file its format's stamp ends.
+pub(crate) const STAMPED_WITHIN: usize = 7;
+
+/// The format a file's frame is stamped as, if the file is of this crate's
+/// framing and long enough to say; nothing about whether it is whole.
+pub(crate) fn stamp(frame: &[u8]) -> Option<u16> {
+    (frame.len() >= STAMPED_WITHIN && frame[..4] == MAGIC)
+        .then(|| u16::from_le_bytes([frame[5], frame[6]]))
+}
+
 /// A file a head reference can point at.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Head {

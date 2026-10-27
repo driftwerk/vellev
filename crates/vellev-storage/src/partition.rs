@@ -1910,14 +1910,16 @@ impl Writer {
         let mut sent = Vec::new();
         if let Some(vectors) = meta.vectors.clone() {
             self.still(held)?;
-            let came = self.put_copy(source, &vectors, &names.vectors).await?;
+            let (came, stamp) = self.put_copy(source, &vectors, &names.vectors).await?;
             sent.push((Kind::Vectors, names.vectors.clone(), came));
+            self.copy_stamped(&vectors, stamp)?;
             files.push((vectors, names.vectors.clone()));
         }
         if let Some(index) = meta.index {
             self.still(held)?;
             let _one = indexing.lock().await;
             let frame = source.get(&index).await?;
+            self.copy_stamped(&index, crate::format::stamp(&frame))?;
             match rekeyed_index(&index, &frame, &meta.key, &names.segment) {
                 Ok(rekeyed) => {
                     drop(frame);
@@ -1931,8 +1933,9 @@ impl Writer {
             }
         }
         self.still(held)?;
-        let came = self.put_copy(source, &meta.key, &names.segment).await?;
+        let (came, stamp) = self.put_copy(source, &meta.key, &names.segment).await?;
         sent.push((Kind::Segment, names.segment.clone(), came));
+        self.copy_stamped(&meta.key, stamp)?;
         let linked = meta.vectors.clone().zip(Some(names.vectors));
         let reused = match donor {
             Some(donor) if donor.vectors == meta.vectors => {
@@ -1949,17 +1952,47 @@ impl Writer {
         })
     }
 
+    /// Refuse a copy of the source's file `key`, stamped as format
+    /// `version`, that is newer than this writer writes: a copy keeps the
+    /// stamp it came with, and one newer than the cluster writes is one the
+    /// release before, which the cluster's format still lets roll back to,
+    /// cannot read. The copy already put is staged, so it is cleaned up.
+    /// A stamp that cannot be read is left to the load, which reads every
+    /// copy and fails the restore on one that is not whole.
+    fn copy_stamped(&self, key: &str, version: Option<u16>) -> Result<()> {
+        let writes = self.writes();
+        match version {
+            Some(version) if version > writes => Err(StorageError::InvalidMutation(format!(
+                "{key} is stamped as file format {version}, and this cluster writes format \
+                 {writes}: a restore from it would leave files the release before cannot \
+                 read. Let every node write format {version} (VELLEV_MAX_FORMAT={version}) \
+                 first"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Put the file under `from` in `source` into the partition's store
-    /// under `to`, a part at a time; what it came to as the source sent it.
-    async fn put_copy(&self, source: &dyn Blobs, from: &str, to: &str) -> Result<Came> {
+    /// under `to`, a part at a time; what it came to as the source sent it,
+    /// and the format its frame is stamped as, if it is long enough to say.
+    async fn put_copy(
+        &self,
+        source: &dyn Blobs,
+        from: &str,
+        to: &str,
+    ) -> Result<(Came, Option<u16>)> {
         use futures::{StreamExt, TryStreamExt};
-        let coming = std::sync::Mutex::new(Coming::default());
+        let coming = std::sync::Mutex::new((Coming::default(), Vec::new()));
         let parts = source.parts(from).map_ok(|part| {
-            coming.lock().expect("coming").update(&part);
+            let (came, head) = &mut *coming.lock().expect("coming");
+            came.update(&part);
+            let wanted = crate::format::STAMPED_WITHIN.saturating_sub(head.len());
+            head.extend_from_slice(&part[..wanted.min(part.len())]);
             part
         });
         self.partition.blobs.put_parts(to, parts.boxed()).await?;
-        Ok(coming.into_inner().expect("coming").came())
+        let (came, head) = coming.into_inner().expect("coming");
+        Ok((came.came(), crate::format::stamp(&head)))
     }
 
     /// The segment the live state holds, `donor`, if the copies a restore

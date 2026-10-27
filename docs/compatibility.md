@@ -124,12 +124,18 @@ Then:
    format rise past it. Every writer stamps every file it puts (logs,
    manifests, segments, index files and vectors files) with the format it
    writes (`Writer::writes`), which a node shares with each writer it
-   opens: the cluster's format, as far as `VELLEV_MAX_FORMAT` lets it.
+   opens: the cluster's format, as far as the release reads it.
    `format::encode` alone stamps `FORMAT_VERSION`, and nothing puts what
    it frames in the store. A file that only a newer format than the
-   writer's can hold is refused rather than stamped older.
-3. A node may write no newer than `VELLEV_MAX_FORMAT`, whose default is
-   `DEFAULT_MAX_FORMAT`. A release that adds format N keeps that default
+   writer's can hold is refused rather than stamped older, and a restore
+   from another store refuses to copy a file stamped newer than the
+   writer writes, as a copy keeps its stamp.
+3. A node raises the cluster's format no further than `VELLEV_MAX_FORMAT`,
+   whose default is `DEFAULT_MAX_FORMAT`. Once the cluster writes a format,
+   raised by any node, every node writes it, whatever its own
+   `VELLEV_MAX_FORMAT`: every node registered read it before it rose, and
+   a node that wrote older could not checkpoint a tenant another had given
+   what only the newer format holds. A release that adds format N keeps that default
    at N - 1, so the cluster's format does not rise and a rollback finds
    nothing it cannot read. Operators raise it once the release has run
    long enough that they no longer want to roll back. A node refuses to
@@ -536,15 +542,19 @@ everything it wrote. A collection with an unstored property is refused
 until the cluster writes format 2. To allow one:
 
 1. Run 0.2.0 on every node, and no node of a release before.
-2. Set `VELLEV_MAX_FORMAT=2` on every node and restart them. The cluster's
-   format rises to 2 once every node registered reads it, and nodes write
-   format 2 from then on, as soon as each sees the rise.
+2. Set `VELLEV_MAX_FORMAT=2` on a node (on every node, so that the
+   setting outlives any one of them) and restart it. The cluster's format
+   rises to 2 once every node registered reads it, and every node writes
+   format 2 from then on, as soon as it sees the rise, whatever its own
+   `VELLEV_MAX_FORMAT`.
 3. After that, the release before refuses to start, and rolling back
    means restoring from before the rise.
 
-A restore or adoption into a cluster that writes format 1 of a state that
-holds an unstored property fails, plainly, rather than write it as
-format 1.
+A restore or adoption into a cluster that writes format 1 from a store
+written in format 2 fails, plainly, rather than leave files the release
+before cannot read: one of a state that holds an unstored property, and
+one that copies any file stamped as format 2, though it holds no such
+property. Raise the cluster's format first.
 
 ## What rollback covers
 
