@@ -215,8 +215,8 @@ pub struct Local {
     jobs: mpsc::Sender<Job>,
     /// What the model's thread has lately done, for anyone.
     activity: Arc<Activity>,
-    /// Closed by the model's thread as it ends, the model let go.
-    ended: oneshot::Receiver<()>,
+    /// The model's thread, joined on closing.
+    thread: std::thread::JoinHandle<()>,
 }
 
 impl Local {
@@ -267,31 +267,29 @@ impl Local {
         let name = model.to_string();
         let activity = Arc::new(Activity::default());
         let acts = activity.clone();
-        let (end, ended) = oneshot::channel();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name(format!("embed {model}"))
-            .spawn(move || {
-                run(&name, load, &room, waiting, &acts);
-                drop(end);
-            })
+            .spawn(move || run(&name, load, &room, waiting, &acts))
             .map_err(|error| failure(model, format!("no thread to run it on: {error}")))?;
         Ok(Self {
             model: model.to_string(),
             jobs,
             activity,
-            ended,
+            thread,
         })
     }
 
     /// Stops the model's thread once the jobs sent before are done, and
-    /// returns when it has let go of the model. A process that is to end
-    /// closes first: one that ends while the thread is still letting go
-    /// tears ONNX Runtime down under it, which on CUDA can crash.
+    /// returns when the thread has ended: the model let go, and what it
+    /// kept on the thread, as ONNX Runtime's CUDA provider keeps its cuBLAS
+    /// handles. A process that is to end closes first: one that ends while
+    /// the thread is still letting go tears ONNX Runtime down under it,
+    /// which on CUDA crashed at exit.
     pub async fn close(self) {
-        let Self { jobs, ended, .. } = self;
+        let Self { jobs, thread, .. } = self;
         drop(jobs);
-        // An error is the thread's end: it only ever drops its end.
-        let _ = ended.await;
+        // A thread that panicked has ended too, which is all that is asked.
+        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
     }
 }
 
