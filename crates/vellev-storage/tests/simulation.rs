@@ -4615,7 +4615,15 @@ fn histories() -> impl Strategy<Value = (Clocks, Vec<Action>)> {
 proptest! {
     // Four times as many histories as by default: some faults want a
     // writer left behind, a restore and a clean in just the right order.
-    #![proptest_config(ProptestConfig::with_cases(1_024))]
+    #![proptest_config(ProptestConfig {
+        // Beside the test, where CI keeps it, and said so: proptest looks for
+        // a lib.rs above an integration test by default, finds none, and
+        // falls back here with a warning.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::with_cases(1_024)
+    })]
 
     #[test]
     fn no_history_of_faults_loses_an_acknowledged_write_or_shows_an_unrecorded_one(
@@ -4675,7 +4683,15 @@ fn shipping_histories() -> impl Strategy<Value = (Clocks, Vec<Action>)> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig {
+        // Beside the test, where CI keeps it, and said so: proptest looks for
+        // a lib.rs above an integration test by default, finds none, and
+        // falls back here with a warning.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::with_cases(256)
+    })]
 
     #[test]
     fn no_history_of_shipping_ships_what_was_not_committed_or_notes_more_than_is_there(
