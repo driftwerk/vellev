@@ -402,8 +402,8 @@ impl Batch<'_> {
                 if schema.has_unstored() && format < UNSTORED_FORMAT {
                     return Err(invalid(format!(
                         "{} has a property it does not store, which only format 2 \
-                         can hold, and the cluster writes format {format}: every node must \
-                         read format 2 and be let write it (VELLEV_MAX_FORMAT=2) first",
+                         can hold, and the cluster writes format {format}: it rises to 2 once \
+                         every node reads format 2 and one is let raise it (VELLEV_MAX_FORMAT=2)",
                         schema.name
                     )));
                 }

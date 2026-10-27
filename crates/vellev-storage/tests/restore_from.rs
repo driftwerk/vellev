@@ -2115,7 +2115,11 @@ async fn a_restore_does_not_copy_files_stamped_newer_than_the_cluster_writes() {
     let source = Cluster::new().await;
     let writer = writing(source.writer().await, 2);
     writer
-        .commit(vec![create("notes"), upsert("notes", 1, 1), upsert("notes", 2, 2)])
+        .commit(vec![
+            create("notes"),
+            upsert("notes", 1, 1),
+            upsert("notes", 2, 2),
+        ])
         .await
         .unwrap();
     writer.flush().await.unwrap();
@@ -2134,7 +2138,11 @@ async fn a_restore_does_not_copy_files_stamped_newer_than_the_cluster_writes() {
         matches!(&refused, Err(StorageError::InvalidMutation(why)) if why.contains("format 2")),
         "{refused:?}"
     );
-    assert_eq!(settled(&target, &before).await, before, "nothing copied is kept");
+    assert_eq!(
+        settled(&target, &before).await,
+        before,
+        "nothing copied is kept"
+    );
     assert!(stamps(&*target.blobs)
         .await
         .iter()
@@ -2154,7 +2162,7 @@ async fn a_restore_does_not_copy_files_stamped_newer_than_the_cluster_writes() {
 async fn a_restore_of_an_unstored_property_into_format_1_is_refused() {
     let source = Cluster::new().await;
     let writer = writing(source.writer().await, 2);
-    let mut schema = Collection {
+    let schema = Collection {
         name: name("pages"),
         properties: vec![
             Property::new("title", DataType::Text),
@@ -2202,5 +2210,9 @@ async fn a_restore_of_an_unstored_property_into_format_1_is_refused() {
         matches!(&refused, Err(StorageError::Encode(why)) if why.contains("needs format 2")),
         "{refused:?}"
     );
-    assert_eq!(settled(&target, &before).await, before, "nothing built is kept");
+    assert_eq!(
+        settled(&target, &before).await,
+        before,
+        "nothing built is kept"
+    );
 }
