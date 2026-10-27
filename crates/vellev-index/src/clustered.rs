@@ -330,15 +330,22 @@ impl Probe {
         let levels = ((1u32 << QUERY_BITS) - 1) as f32;
         let delta = (upper - lower) / levels;
         let words = residual.len() / 64;
+        debug_assert_eq!(residual.len() % 64, 0, "a rotation's width is whole words");
         let mut planes = vec![0u64; words * QUERY_BITS as usize];
-        for (i, value) in residual.iter().enumerate() {
-            let level = match delta > 0.0 {
-                true => ((value - lower) / delta).round().clamp(0.0, levels) as u32,
-                false => 0,
-            };
-            for bit in 0..QUERY_BITS {
-                if level >> bit & 1 == 1 {
-                    planes[bit as usize * words + i / 64] |= 1 << (i % 64);
+        // A word of each plane at a time, each value's level taken as
+        // before and its bits laid into the words without a branch: the
+        // same planes, readied several times as fast.
+        if delta > 0.0 {
+            for (word, chunk) in residual.chunks_exact(64).enumerate() {
+                let mut bits = [0u64; QUERY_BITS as usize];
+                for (at, value) in chunk.iter().enumerate() {
+                    let level = ((value - lower) / delta).round().clamp(0.0, levels) as u64;
+                    for (bit, plane) in bits.iter_mut().enumerate() {
+                        *plane |= (level >> bit & 1) << at;
+                    }
+                }
+                for (bit, plane) in bits.into_iter().enumerate() {
+                    planes[bit * words + word] = plane;
                 }
             }
         }
@@ -486,6 +493,15 @@ impl<'a> Nearest<'a> {
         let distance = or_farthest(distance);
         if self.heap.len() < self.count {
             self.heap.push(Candidate { distance, row });
+            return;
+        }
+        // Most rows of a long scan are farther than the farthest kept:
+        // turned away on a look, without taking the heap's top to change.
+        if self
+            .heap
+            .peek()
+            .is_some_and(|worst| distance.total_cmp(&worst.distance).is_gt())
+        {
             return;
         }
         let Some(mut worst) = self.heap.peek_mut() else {
