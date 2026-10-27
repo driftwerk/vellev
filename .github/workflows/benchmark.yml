@@ -1,0 +1,85 @@
+name: Benchmark
+
+# vellev against Weaviate at matched recall (design r2, PR 3). Both engines
+# run in one job on one runner, one after the other, each pinned to CPUs
+# 0-2 with the client on CPU 3. The fixture (CC BY-SA 4.0, see
+# scripts/bench-fixture/ATTRIBUTION.md) is fetched from its release every
+# run and checked against the checksums committed here; the Actions cache
+# is never used for it.
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: Passages to load, from the first (1000000 or 100000)
+        type: choice
+        options: ['1000000', '100000']
+        default: '1000000'
+      tuned:
+        description: Weaviate's tuned build (maxConnections 64, efConstruction 256)
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - crates/vellev-bench/**
+      - scripts/bench-fixture/**
+      - .github/workflows/benchmark.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Newest stable Weaviate, by digest, bumped deliberately by a PR (§1).
+  WEAVIATE_IMAGE: cr.weaviate.io/semitechnologies/weaviate:1.40.2@sha256:0083587dc01f33112e5406ce9b471df1abea480c71a0407af903929a389ae08a
+  POSTGRES_IMAGE: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+  FIXTURE: fixture-bench-wiki1m-bge-base-v1
+
+jobs:
+  # The harness end to end on a synthetic 5,000-row fixture made on the
+  # runner: that it brings both engines up, loads, settles, measures and
+  # reports. Its numbers say nothing about either engine.
+  harness:
+    name: Harness on synthetic data
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: vellev:bench
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy==2.3.3
+      - name: Synthetic fixture
+        run: python scripts/bench-fixture/synthetic.py "$RUNNER_TEMP/fixture" --rows 5000 --queries 50
+      - run: cargo build --release --locked -p vellev-bench
+      - name: Run
+        run: |
+          taskset -c 3 target/release/vellev-bench \
+            --fixture "$RUNNER_TEMP/fixture" --truth "$RUNNER_TEMP/fixture/truth/truth.jsonl" \
+            --rows 5000 --out "$RUNNER_TEMP/results" --data "$RUNNER_TEMP/engines" \
+            --vellev-image vellev:bench --weaviate-image "$WEAVIATE_IMAGE" --postgres-image "$POSTGRES_IMAGE" \
+            --reps 1 || status=$?
+          cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+          # The gate is not held on synthetic data: only a run that did not
+          # finish fails here.
+          test -f "$RUNNER_TEMP/results/results.json"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-synthetic
+          path: ${{ runner.temp }}/results
+          retention-days: 90
+          if-no-files-found: ignore

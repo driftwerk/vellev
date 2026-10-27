@@ -8,10 +8,10 @@ license = "FSL-1.1-ALv2"
 description = "The nightly benchmark of vellev against Weaviate at matched recall"
 
 [dependencies]
+async-trait.workspace = true
 clap.workspace = true
 eyre.workspace = true
 futures.workspace = true
-memmap2.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

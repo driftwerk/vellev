@@ -4298,10 +4298,10 @@ dependencies = [
 name = "vellev-bench"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "clap",
  "eyre",
  "futures",
- "memmap2",
  "reqwest",
  "serde",
  "serde_json",
