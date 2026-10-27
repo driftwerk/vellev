@@ -89,11 +89,15 @@ static COUNTING: Counting = Counting::new();
 static ALONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const ROWS: usize = 20_000;
-const DIMENSIONS: usize = 768;
+/// The width measured, and one so narrow that its vectors cost next to
+/// nothing: the difference between their peaks is what the vectors cost,
+/// whatever each row costs besides.
+const WIDE: usize = 768;
+const NARROW: usize = 8;
 
-fn wide(collection: &str) -> Mutation {
-    let mut schema = schema(collection);
-    schema.embedding.dimensions = DIMENSIONS as u32;
+fn collection(dimensions: usize) -> Mutation {
+    let mut schema = schema("docs");
+    schema.embedding.dimensions = dimensions as u32;
     Mutation::CreateCollection(Box::new(schema))
 }
 
@@ -107,98 +111,97 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
     (cluster, writer)
 }
 
-/// What a flush may hold for each row besides vectors: the row itself
-/// without its vector, its codes and index entries, and its part of the
-/// segment's encoded file, all of which the segment keeps or writes. A
-/// row of a few properties takes well under this.
-const PER_ROW: usize = 2 * 1024;
-
-#[tokio::test(flavor = "current_thread")]
-async fn a_flush_holds_its_vectors_once() {
-    let _alone = ALONE.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    let (_cluster, writer) = on_disk(dir.path()).await;
-    writer.commit(vec![wide("docs")]).await.unwrap();
-    let mut random = Random(7);
-    for batch in 0..ROWS / 500 {
-        let rows = (0..500)
+/// Commit `rows` rows of `dimensions`, numbered from `first`, with little
+/// besides their vectors.
+async fn committed(
+    writer: &Writer,
+    random: &mut Random,
+    first: usize,
+    rows: usize,
+    dimensions: usize,
+) {
+    for batch in (0..rows).step_by(500) {
+        let writes = (batch..(batch + 500).min(rows))
             .map(|n| Mutation::Upsert {
                 collection: name("docs"),
                 id: ObjectId::generate(),
-                // Little besides the vector, so that what is measured is
-                // what becomes of the vectors.
-                properties: json!({ "n": batch * 500 + n }).as_object().unwrap().clone(),
-                vector: Some(random.vector(DIMENSIONS)),
+                properties: json!({ "n": first + n }).as_object().unwrap().clone(),
+                vector: Some(random.vector(dimensions)),
                 only_if_version: None,
             })
             .collect();
-        writer.commit(rows).await.unwrap();
+        writer.commit(writes).await.unwrap();
     }
-    let vectors = ROWS * DIMENSIONS * 4;
-    // The column the segment keeps, which is its encoded frame too.
-    let allowed = vectors + ROWS * PER_ROW;
+}
+
+/// What a flush of `ROWS` rows of `dimensions` holds at its peak beyond
+/// what was held before it.
+async fn flush_peak(dimensions: usize) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let (_cluster, writer) = on_disk(dir.path()).await;
+    writer.commit(vec![collection(dimensions)]).await.unwrap();
+    committed(&writer, &mut Random(7), 0, ROWS, dimensions).await;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.flush().await.unwrap();
-    let held = COUNTING.peak() - before;
-    eprintln!(
-        "a flush of {ROWS} rows held {:.2} times its vectors at its peak",
-        held as f64 / vectors as f64
-    );
-    assert!(
-        held <= allowed,
-        "a flush held {held} bytes at its peak, {:.2} times its vectors' {vectors}; it may hold {allowed}",
-        held as f64 / vectors as f64
-    );
+    COUNTING.peak() - before
 }
 
-/// A merge of the segments of `segments` flushes of `ROWS / segments` rows.
-async fn merged_peak(segments: usize) -> (usize, usize) {
+/// What a merge of four flushed segments of `ROWS` rows in all, of
+/// `dimensions`, holds at its peak beyond what was held before it.
+async fn merge_peak(dimensions: usize) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
     let writer = writer.merging_with(vellev_storage::Merging {
-        fanout: segments,
+        fanout: 4,
         ..vellev_storage::Merging::default()
     });
-    writer.commit(vec![wide("docs")]).await.unwrap();
+    writer.commit(vec![collection(dimensions)]).await.unwrap();
     let mut random = Random(11);
-    for segment in 0..segments {
-        for batch in 0..ROWS / segments / 500 {
-            let rows = (0..500)
-                .map(|n| Mutation::Upsert {
-                    collection: name("docs"),
-                    id: ObjectId::generate(),
-                    properties: json!({ "n": segment * ROWS + batch * 500 + n })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                    vector: Some(random.vector(DIMENSIONS)),
-                    only_if_version: None,
-                })
-                .collect();
-            writer.commit(rows).await.unwrap();
-        }
+    for segment in 0..4 {
+        committed(&writer, &mut random, segment * ROWS, ROWS / 4, dimensions).await;
         writer.flush().await.unwrap();
     }
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.merge().await.unwrap().expect("the segments merge");
-    (COUNTING.peak() - before, ROWS * DIMENSIONS * 4)
+    COUNTING.peak() - before
+}
+
+/// What coding a layer's vectors holds whatever the rows: the sample of
+/// rotated vectors its centre is taken from, and the rotation itself, at
+/// their widest about 17 MiB at 768 dimensions.
+const CODING: usize = 32 * 1024 * 1024;
+
+/// Hold the vectors' share of `wide` against `copies` copies of the
+/// vectors, with a tenth of one for what else grows with the width, and
+/// what coding holds whatever the rows.
+fn held_to(what: &str, wide: usize, narrow: usize, copies: usize) {
+    let vectors = ROWS * (WIDE - NARROW) * 4;
+    let theirs = wide.saturating_sub(narrow).saturating_sub(CODING);
+    eprintln!(
+        "{what} of {ROWS} rows held {:.2} times its vectors' worth for them ({wide} bytes at {WIDE} dimensions, {narrow} at {NARROW})",
+        theirs as f64 / vectors as f64
+    );
+    assert!(
+        theirs * 10 <= vectors * (10 * copies + 1),
+        "{what} held {theirs} bytes for its vectors at its peak, {:.2} times their {vectors}",
+        theirs as f64 / vectors as f64
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_flush_holds_its_vectors_once() {
+    let _alone = ALONE.lock().await;
+    let (wide, narrow) = (flush_peak(WIDE).await, flush_peak(NARROW).await);
+    // The column the segment keeps, which is its encoded frame too.
+    held_to("a flush", wide, narrow, 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_merge_holds_its_vectors_once() {
     let _alone = ALONE.lock().await;
-    let (held, vectors) = merged_peak(4).await;
+    let (wide, narrow) = (merge_peak(WIDE).await, merge_peak(NARROW).await);
     // The merged segment's column, which is its encoded frame too.
-    let allowed = vectors + ROWS * PER_ROW;
-    eprintln!(
-        "a merge of {ROWS} rows held {:.2} times its vectors at its peak",
-        held as f64 / vectors as f64
-    );
-    assert!(
-        held <= allowed,
-        "a merge held {held} bytes at its peak, {:.2} times its vectors' {vectors}; it may hold {allowed}",
-        held as f64 / vectors as f64
-    );
+    held_to("a merge", wide, narrow, 1);
 }
