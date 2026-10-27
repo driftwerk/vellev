@@ -13,7 +13,7 @@ use vellev_index::vector::{BinaryIndex, Coded, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
-use crate::column::Column;
+use crate::column::{Column, Gathering};
 use crate::coordinator::LogPosition;
 use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
@@ -161,15 +161,15 @@ impl Shape {
         Self::by(catalog, rows, has, tombstones, clustered_above)
     }
 
-    /// Of a segment of `rows`, whose vectors are in `vectors` instead.
-    pub fn of_column(
+    /// Of a segment of `rows`, whose vectors are gathered in `vectors`.
+    pub fn of_gathered(
         catalog: &Catalog,
         rows: &[Row],
-        vectors: &Column,
+        vectors: &Gathering,
         tombstones: usize,
         clustered_above: usize,
     ) -> Self {
-        let has = |row: usize| vectors.get(row).is_some();
+        let has = |row: usize| vectors.has(row);
         Self::by(catalog, rows, has, tombstones, clustered_above)
     }
 
@@ -657,11 +657,10 @@ pub(crate) struct Snapshot {
     pub catalog: Catalog,
     /// The rows taken, without their vectors, which are in `vectors`.
     pub rows: Vec<Row>,
-    /// The rows' vectors end to end, gathered once into the column the
+    /// The rows' vectors, gathered once into the frame of the column the
     /// flushed segment keeps, rather than copied with each row and gathered
-    /// again; and where each row's starts, with one offset past the last.
-    vectors: Vec<f32>,
-    offsets: Vec<u64>,
+    /// again.
+    vectors: Gathering,
     pub tombstones: Vec<RowKey>,
     /// Where each of `rows` lies in the memtable.
     at: Vec<usize>,
@@ -682,13 +681,10 @@ impl State {
 }
 
 impl Snapshot {
-    /// The taken rows' vectors as a column, taken out of the snapshot.
-    pub(crate) fn column(&mut self) -> Column {
-        let mut offsets = std::mem::take(&mut self.offsets);
-        if offsets.is_empty() {
-            offsets.push(0);
-        }
-        Column::of(std::mem::take(&mut self.vectors), offsets)
+    /// The taken rows' vectors as gathered, taken out of the snapshot, to
+    /// be sealed into their column where nothing waits on it.
+    pub(crate) fn gathered(&mut self) -> Gathering {
+        std::mem::replace(&mut self.vectors, Gathering::with_capacity(0, 0))
     }
 }
 
@@ -701,9 +697,8 @@ impl Snapshot {
             .iter()
             .enumerate()
             .map(|(n, row)| {
-                let (start, end) = (self.offsets[n] as usize, self.offsets[n + 1] as usize);
                 let mut row = row.clone();
-                row.object.vector = (start < end).then(|| self.vectors[start..end].to_vec());
+                row.object.vector = self.vectors.get(n).map(<[f32]>::to_vec);
                 row
             })
             .collect()
@@ -1608,7 +1603,7 @@ impl State {
         &self,
         merge: &Merge,
         position: LogPosition,
-    ) -> Option<(SegmentFile, Column)> {
+    ) -> Option<(SegmentFile, Gathering)> {
         if !self.unchanged(merge) {
             return None;
         }
@@ -1625,16 +1620,11 @@ impl State {
             })
         });
         let mut rows: Vec<Row> = Vec::with_capacity(count);
-        let mut vectors: Vec<f32> = Vec::with_capacity(values);
-        let mut offsets: Vec<u64> = Vec::with_capacity(count + 1);
-        offsets.push(0);
+        let mut vectors = Gathering::with_capacity(values, count);
         for segment in run {
             for row in live(segment) {
                 let Row { collection, object } = &segment.file.rows[row];
-                if let Some(vector) = segment.vectors.get(row) {
-                    vectors.extend_from_slice(vector);
-                }
-                offsets.push(vectors.len() as u64);
+                vectors.push(segment.vectors.get(row));
                 rows.push(Row {
                     collection: *collection,
                     object: Object {
@@ -1660,7 +1650,7 @@ impl State {
             rows,
             tombstones,
         };
-        Some((file, Column::of(vectors, offsets)))
+        Some((file, vectors))
     }
 
     /// Whether the run `merge` was planned over is still the same
@@ -1771,15 +1761,13 @@ impl State {
                     .map_or(0, Vec::len)
             })
             .sum();
-        let mut offsets = Vec::with_capacity(at.len() + 1);
-        offsets.push(0);
+        let vectors = Gathering::with_capacity(values, at.len());
         Snapshot {
             position: self.position,
             checkpoint: self.checkpoint.clone(),
             catalog: self.catalog.clone(),
             rows: Vec::with_capacity(at.len()),
-            vectors: Vec::with_capacity(values),
-            offsets,
+            vectors,
             tombstones: self.memtable.tombstones.clone(),
             at,
             held: self.memtable.rows.len(),
@@ -1796,10 +1784,7 @@ impl State {
         let to = (from + most).min(snapshot.at.len());
         for &row in &snapshot.at[from..to] {
             let Row { collection, object } = &self.memtable.rows[row];
-            if let Some(vector) = &object.vector {
-                snapshot.vectors.extend_from_slice(vector);
-            }
-            snapshot.offsets.push(snapshot.vectors.len() as u64);
+            snapshot.vectors.push(object.vector.as_deref());
             snapshot.rows.push(Row {
                 collection: *collection,
                 object: Object {
@@ -2323,9 +2308,9 @@ mod tests {
             let Some(plan) = self.state.merge_plan(&merging) else {
                 return false;
             };
-            let (mut file, column) = self.state.merged(&plan, self.state.position()).unwrap();
+            let (mut file, gathered) = self.state.merged(&plan, self.state.position()).unwrap();
             for (row, at) in file.rows.iter_mut().zip(0..) {
-                row.object.vector = column.get(at).map(<[f32]>::to_vec);
+                row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
             }
             let catalog = self.state.catalog().clone();
             let fit = self.fit(file, &catalog);
