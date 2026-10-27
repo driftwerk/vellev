@@ -793,7 +793,7 @@ impl ClusteredIndex {
     /// that can be measured, as no other is ever offered.
     fn tuned(&self, vectors: &[(u32, &[f32])], random: &mut Random) -> usize {
         let ranks: Vec<usize> = random
-            .sample(vectors.len(), TUNING_QUERIES)
+            .sample(vectors.len(), std::env::var("SCRATCH_TUNING_QUERIES").ok().and_then(|q| q.parse().ok()).unwrap_or(TUNING_QUERIES))
             .into_par_iter()
             .map(|at| &vectors[at])
             .flat_map_iter(|(row, query)| {
