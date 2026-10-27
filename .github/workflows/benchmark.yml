@@ -83,3 +83,89 @@ jobs:
           path: ${{ runner.temp }}/results
           retention-days: 90
           if-no-files-found: ignore
+
+  # The benchmark itself, on the published fixture: nightly on 1M rows, or
+  # on demand.
+  benchmark:
+    name: Benchmark
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ROWS: ${{ inputs.rows || '1000000' }}
+      TUNED: ${{ inputs.tuned && '--tuned' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+      # The runner's preinstalled toolchains the job does not use (§7).
+      - name: Disk cleanup
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/julia* \
+            /usr/local/share/powershell /usr/local/share/chromium /opt/microsoft /opt/google
+          docker image prune -af > /dev/null
+          df -h /
+      - uses: Swatinem/rust-cache@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: vellev:bench
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: cargo build --release --locked -p vellev-bench
+      # Downloaded from the release every run and checked against the
+      # checksums committed here; never kept in the Actions cache (§7).
+      - name: Fetch the fixture and check it
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/download" "$F/text" "$F/vectors" "$F/truth"
+          cd "$F/download"
+          case "$ROWS" in
+            1000000) parts="vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst"; truth=truth.jsonl ;;
+            100000) parts="vectors-passages-0.tar.zst"; truth=truth-100000.jsonl ;;
+            *) echo "::error::no fixture slice of $ROWS rows"; exit 1 ;;
+          esac
+          wanted="ATTRIBUTION.md manifest.json passages.jsonl.zst queries.jsonl warmup.jsonl vectors-queries.tar.zst $truth.zst $parts"
+          for asset in $wanted; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+          done
+          for asset in $wanted; do
+            grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS"
+          done > wanted.sha256
+          test "$(wc -l < wanted.sha256)" -eq "$(echo $wanted | wc -w)"
+          sha256sum --check --strict wanted.sha256
+          zstd -q -d --long=31 passages.jsonl.zst -o "$F/text/passages.jsonl"
+          mv queries.jsonl warmup.jsonl "$F/text/"
+          for part in $parts vectors-queries.tar.zst; do
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf -
+            rm "$part"
+          done
+          zstd -q -d "$truth.zst" -o "$F/truth/$truth"
+          echo "TRUTH=$F/truth/$truth" >> "$GITHUB_ENV"
+          rm -rf "$F/download"
+          ls "$F/vectors/passages" | wc -l
+          df -h /
+      - name: Run
+        run: |
+          set -o pipefail
+          taskset -c 3 target/release/vellev-bench \
+            --fixture "$RUNNER_TEMP/fixture" --truth "$TRUTH" --rows "$ROWS" \
+            --out "$RUNNER_TEMP/results" --data "$RUNNER_TEMP/engines" \
+            --vellev-image vellev:bench --weaviate-image "$WEAVIATE_IMAGE" --postgres-image "$POSTGRES_IMAGE" \
+            $TUNED 2>&1 | tee "$RUNNER_TEMP/run.log"
+      - if: always()
+        run: cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/results
+            ${{ runner.temp }}/run.log
+          retention-days: 90
+          if-no-files-found: ignore
