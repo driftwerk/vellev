@@ -48,6 +48,80 @@ impl Fusion {
     }
 }
 
+/// One object's place in a fused ranking.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fused<K> {
+    pub key: K,
+    /// Larger is better.
+    pub score: f32,
+    /// What the vector search gave it, when it offered it: larger is nearer.
+    pub nearness: Option<f32>,
+    /// What the keyword search gave it, when it offered it.
+    pub keyword: Option<f32>,
+}
+
+impl<K> Fused<K> {
+    /// What orders objects with the same score, as in Weaviate: the
+    /// wording's value where there is one, otherwise the vector's.
+    fn second(&self) -> f32 {
+        self.keyword.or(self.nearness).unwrap_or(f32::MIN)
+    }
+}
+
+/// The best `limit` of the objects two searches offered, fused: those
+/// `by_meaning` offered (with their nearness, best first) share `alpha`,
+/// those `by_wording` offered (with their keyword scores, best first)
+/// share the rest, each as `fusion` gives it, and an object both offered
+/// adds both. Equal scores are ordered by the keyword score, or without
+/// one the nearness, and then by key. The whole of a hybrid search but
+/// the searching, so that whoever needs a hybrid answer from legs found
+/// otherwise fuses them exactly as the engine does.
+pub fn fuse<K: Copy + Ord + std::hash::Hash>(
+    fusion: Fusion,
+    alpha: f32,
+    by_meaning: &[(K, f32)],
+    by_wording: &[(K, f32)],
+    limit: usize,
+) -> Vec<Fused<K>> {
+    let nearness: Vec<f32> = by_meaning.iter().map(|(_, value)| *value).collect();
+    let wording: Vec<f32> = by_wording.iter().map(|(_, value)| *value).collect();
+    let meant = by_meaning
+        .iter()
+        .zip(fusion.shares(alpha, &nearness))
+        .map(|(&(key, value), share)| (key, share, Some(value), None));
+    let worded = by_wording
+        .iter()
+        .zip(fusion.shares(1.0 - alpha, &wording))
+        .map(|(&(key, value), share)| (key, share, None, Some(value)));
+    let mut fused: Vec<Fused<K>> = meant
+        .chain(worded)
+        .fold(
+            std::collections::HashMap::<K, Fused<K>>::new(),
+            |mut fused, (key, share, nearness, keyword)| {
+                let entry = fused.entry(key).or_insert(Fused {
+                    key,
+                    score: 0.0,
+                    nearness: None,
+                    keyword: None,
+                });
+                entry.score += share;
+                entry.nearness = nearness.or(entry.nearness);
+                entry.keyword = keyword.or(entry.keyword);
+                fused
+            },
+        )
+        .into_values()
+        .collect();
+    fused.sort_unstable_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(b.second().total_cmp(&a.second()))
+            .then(a.key.cmp(&b.key))
+    });
+    fused.truncate(limit);
+    fused
+}
+
 /// `value` as a number that can be subtracted from any other: within what
 /// an `f32` holds, with one that is not a number counted as the least.
 fn bounded(value: f32) -> f64 {
@@ -99,6 +173,61 @@ mod tests {
         let shares = Fusion::Ranked.shares(0.6, &[100.0, 1.0, 1.0]);
         assert_eq!(shares, [0.6 / 60.0, 0.6 / 61.0, 0.6 / 62.0]);
         assert_eq!(Fusion::Ranked.shares(0.6, &[]), [] as [f32; 0]);
+    }
+
+    fn keys<K: Copy>(fused: &[Fused<K>]) -> Vec<K> {
+        fused.iter().map(|f| f.key).collect()
+    }
+
+    #[test]
+    fn each_search_gives_its_weight_and_an_object_both_offered_adds_both() {
+        let fused = fuse(
+            Fusion::RelativeScore,
+            0.75,
+            &[(1, 0.9), (2, 0.5), (3, 0.1)],
+            &[(3, 8.0), (4, 4.0), (1, 0.0)],
+            10,
+        );
+        // 1: 0.75 + 0; 3: 0 + 0.25; 2: 0.75 * 0.5; 4: 0.25 * 0.5.
+        assert_eq!(keys(&fused), [1, 2, 3, 4]);
+        assert_eq!(fused[0].score, 0.75);
+        assert_eq!(fused[1].score, 0.375);
+        assert_eq!(fused[2].score, 0.25);
+        assert_eq!(fused[3].score, 0.125);
+        assert_eq!(fused[0].nearness, Some(0.9));
+        assert_eq!(fused[0].keyword, Some(0.0));
+        assert_eq!(fused[3].nearness, None);
+    }
+
+    #[test]
+    fn equal_scores_are_ordered_by_keyword_then_nearness_then_key() {
+        // All three alone in their search, so each gets the whole weight.
+        let fused = fuse(Fusion::RelativeScore, 0.5, &[(9, 0.3)], &[(7, 2.0)], 10);
+        assert_eq!(keys(&fused), [7, 9], "keyword 2.0 before nearness 0.3");
+        let fused = fuse(Fusion::RelativeScore, 0.5, &[(9, 0.3), (8, 0.3)], &[], 10);
+        assert_eq!(keys(&fused), [8, 9], "then by key");
+    }
+
+    #[test]
+    fn one_search_alone_ranks_as_it_did() {
+        let fused = fuse(
+            Fusion::RelativeScore,
+            0.0,
+            &[],
+            &[(5, 3.0), (6, 2.0), (4, 1.0)],
+            10,
+        );
+        assert_eq!(keys(&fused), [5, 6, 4]);
+        let fused = fuse(Fusion::Ranked, 1.0, &[(5, 0.1), (6, 0.9)], &[], 10);
+        assert_eq!(keys(&fused), [5, 6], "ranked counts place alone");
+    }
+
+    #[test]
+    fn only_the_best_limit_are_kept() {
+        let meaning: Vec<(u32, f32)> = (0..50).map(|n| (n, 1.0 - n as f32 / 100.0)).collect();
+        let fused = fuse(Fusion::RelativeScore, 0.75, &meaning, &[], 10);
+        assert_eq!(keys(&fused), (0..10).collect::<Vec<_>>());
+        assert!(fuse(Fusion::RelativeScore, 0.75, &meaning, &[], 0).is_empty());
     }
 
     #[test]
