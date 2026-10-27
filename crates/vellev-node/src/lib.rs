@@ -559,6 +559,8 @@ pub struct Tenant {
     /// The node's counts of flushes failed and writes refused for them.
     flushing: Arc<FlushCounts>,
     flushes: mpsc::Sender<()>,
+    /// Whether a flush or merge is due or under way: see [`Node::unsettled`].
+    settling: Settling,
     /// Lost once the writer can no longer write or the node lets the tenant
     /// go, so that the node opens the tenant afresh for the next caller.
     hold: Arc<Hold>,
@@ -570,6 +572,18 @@ pub struct Tenant {
     limits: Arc<Limits>,
     /// The restore running here, if any.
     running: Mutex<Option<Running>>,
+}
+
+/// What a tenant's maintenance has done, to tell whether a flush or merge
+/// is due or under way.
+#[derive(Debug, Default)]
+struct Settling {
+    /// Flushes that went through.
+    flushed: AtomicU64,
+    /// [`Self::flushed`] as it stood after the flush, if any, of the last
+    /// round that went through. A round merges until a merge finds nothing
+    /// to do, so once it has followed every flush, no merge is due.
+    maintained: AtomicU64,
 }
 
 /// A node's hold on a tenant, as everything that works on the tenant sees
@@ -869,6 +883,17 @@ impl Tenant {
         Ok(receipt)
     }
 
+    /// Whether no flush or merge is due or under way: fewer rows unflushed
+    /// than a flush, which they stay until the flush of them is done, and
+    /// every flush followed by a maintenance round that went through. Rows
+    /// fewer than a flush stay in memory, searched exactly, and leave the
+    /// tenant settled.
+    fn settled(&self) -> bool {
+        let settling = &self.settling;
+        self.read(State::unflushed) < self.flush_rows
+            && settling.maintained.load(Ordering::SeqCst) >= settling.flushed.load(Ordering::SeqCst)
+    }
+
     /// Refuse a write while the tenant holds [`Settings::backlog_rows`]
     /// rows unflushed, asking for a flush, and saying when one may next
     /// be tried.
@@ -920,6 +945,9 @@ impl Tenant {
     pub async fn flush(&self) -> Result<LogPosition> {
         let flushed = self.writer.flush().await;
         self.flush_tried(flushed.is_ok());
+        if flushed.is_ok() {
+            self.settling.flushed.fetch_add(1, Ordering::SeqCst);
+        }
         flushed.map_err(|error| self.failed(error))
     }
 
@@ -1431,6 +1459,17 @@ impl Node {
         }
     }
 
+    /// How many tenants this node writes for have a flush or merge due or
+    /// under way. A node with none has nothing left to do in the
+    /// background but clean up files past their grace.
+    pub fn unsettled(&self) -> usize {
+        self.0
+            .held_now()
+            .iter()
+            .filter(|held| matches!(&held.kind, Kind::Writer(_, tenant) if !tenant.settled()))
+            .count()
+    }
+
     /// How many tenants this node has opened since it started: as their
     /// writer, and as copies to read from.
     pub fn opens(&self) -> Opens {
@@ -1914,6 +1953,7 @@ impl Inner {
             backoff: Mutex::new((0, None)),
             flushing: self.flushing.clone(),
             flushes,
+            settling: Settling::default(),
             hold,
             deadline,
             used: Mutex::new(Instant::now()),
@@ -1974,10 +2014,18 @@ impl Inner {
                         continue;
                     }
                 }
+                let through = tenant.settling.flushed.load(Ordering::SeqCst);
                 let maintained = tenant.maintained(coordinator.as_ref(), restore_window, grace);
                 match maintained.await {
-                    Ok(0) => {}
-                    Ok(deleted) => tracing::info!(tenant = %tenant.id, deleted, "cleaned up"),
+                    Ok(deleted) => {
+                        tenant
+                            .settling
+                            .maintained
+                            .fetch_max(through, Ordering::SeqCst);
+                        if deleted > 0 {
+                            tracing::info!(tenant = %tenant.id, deleted, "cleaned up");
+                        }
+                    }
                     Err(error) => tracing::warn!(tenant = %tenant.id, %error, "compaction failed"),
                 }
             }

@@ -234,13 +234,41 @@ impl Collector for Counted {
         for (name, help, value) in [
             ("reads_in_flight", "Reads that have a turn now", reading),
             ("reads_waiting", "Reads waiting for a turn now", waiting),
+            (
+                "reads_at_once",
+                "How many reads may have a turn at once",
+                self.turns.most(),
+            ),
         ] {
             let gauge = ConstGauge::new(value as i64);
             gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
         }
+        let gauge = ConstGauge::new(0i64);
+        let mut family = encoder.encode_descriptor(
+            "threads",
+            "The threads of each pool the node runs on: the async runtime's workers, and Rayon's, which builds indexes",
+            None,
+            gauge.metric_type(),
+        )?;
+        let workers = tokio::runtime::Handle::try_current()
+            .map_or(0, |runtime| runtime.metrics().num_workers());
+        for (pool, count) in [
+            ("tokio_workers", workers),
+            ("rayon", rayon::current_num_threads()),
+        ] {
+            ConstGauge::new(i64::try_from(count).unwrap_or(i64::MAX))
+                .encode(family.encode_family(&[("pool", pool)])?)?;
+        }
         let Some(node) = self.node.get() else {
             return Ok(());
         };
+        let gauge = ConstGauge::new(i64::try_from(node.unsettled()).unwrap_or(i64::MAX));
+        gauge.encode(encoder.encode_descriptor(
+            "tenants_unsettled",
+            "Tenants this node writes for with a flush or merge due or under way",
+            None,
+            gauge.metric_type(),
+        )?)?;
         let keys = node.key_lookups();
         let counter = ConstCounter::new(0u64);
         let mut family = encoder.encode_descriptor(
