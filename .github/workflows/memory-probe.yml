@@ -1,0 +1,23 @@
+name: Memory probe (scratch)
+
+# A scratch probe of vellev-storage's memory at 1M rows of 768 dimensions:
+# not for merging.
+on:
+  push:
+    branches: [scratch-vellev-memory]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p vellev-storage --example vector_scale
+      - name: 1M rows, 4 segments, stored on disk
+        run: |
+          STORE=file OBJECTS=1000000 DIMS=768 SEGMENTS=4 QUERIES=20 \
+            /usr/bin/time -v target/release/examples/vector_scale 2>&1 | grep -vE "^\s+(Page size|Socket|Signals|Swaps|File system|Average|Exit status|Voluntary|Involuntary|Command)" 
