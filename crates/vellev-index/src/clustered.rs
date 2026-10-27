@@ -308,6 +308,9 @@ impl TryFrom<ClusterWire> for Cluster {
 struct Probe {
     planes: Vec<u64>,
     words: usize,
+    /// How this machine counts a code's bits against the planes: with its
+    /// popcount instruction where it has one.
+    counted: Counted,
     lower: f32,
     delta: f32,
     sum: f32,
@@ -342,6 +345,7 @@ impl Probe {
         Self {
             planes,
             words,
+            counted: counter(),
             lower,
             delta,
             sum: residual.iter().sum(),
@@ -354,18 +358,7 @@ impl Probe {
     /// The inner product of the direction a code stands for with the
     /// query's difference from the centroid.
     fn inner(&self, code: &[u64], factor: &Factor) -> f32 {
-        let ones: u32 = code.iter().map(|word| word.count_ones()).sum();
-        let weighted: u32 = (0..QUERY_BITS)
-            .map(|bit| {
-                let plane = &self.planes[bit as usize * self.words..][..self.words];
-                let count: u32 = code
-                    .iter()
-                    .zip(plane)
-                    .map(|(c, p)| (c & p).count_ones())
-                    .sum();
-                count << bit
-            })
-            .sum();
+        let (ones, weighted) = (self.counted)(code, &self.planes, self.words);
         let set = self.lower * ones as f32 + self.delta * weighted as f32;
         (2.0 * set - self.sum) * self.scale / factor.align
     }
@@ -381,6 +374,59 @@ impl Probe {
             }
         }
     }
+}
+
+/// A code's set bits, and its bits set in each of the query's planes
+/// weighted by the plane's place: `(ones, weighted)`.
+type Counted = fn(&[u64], &[u64], usize) -> (u32, u32);
+
+const _: () = assert!(QUERY_BITS == 4, "the scan counts four planes");
+
+/// Every count of a code in one pass over its words, rather than one pass
+/// for its bits and one for each plane: the same integers, so the same
+/// estimate to the bit.
+#[inline(always)]
+fn counted_in_one_pass(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
+    let code = &code[..words];
+    let (p0, rest) = planes.split_at(words);
+    let (p1, rest) = rest.split_at(words);
+    let (p2, p3) = rest.split_at(words);
+    let p3 = &p3[..words];
+    let (mut ones, mut w0, mut w1, mut w2, mut w3) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    for i in 0..words {
+        let c = code[i];
+        ones += c.count_ones();
+        w0 += (c & p0[i]).count_ones();
+        w1 += (c & p1[i]).count_ones();
+        w2 += (c & p2[i]).count_ones();
+        w3 += (c & p3[i]).count_ones();
+    }
+    (ones, w0 + (w1 << 1) + (w2 << 2) + (w3 << 3))
+}
+
+fn counted_portably(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
+    counted_in_one_pass(code, planes, words)
+}
+
+/// As [`counted_portably`], compiled to use the popcount instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+fn counted_with_popcount(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
+    counted_in_one_pass(code, planes, words)
+}
+
+/// The counter for this machine: decided once per process.
+fn counter() -> Counted {
+    static COUNTER: std::sync::OnceLock<Counted> = std::sync::OnceLock::new();
+    *COUNTER.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("popcnt") {
+            // SAFETY: called only where the CPU has just said it has
+            // popcount, which is all the function asks.
+            return |code, planes, words| unsafe { counted_with_popcount(code, planes, words) };
+        }
+        counted_portably
+    })
 }
 
 #[derive(PartialEq)]
@@ -917,6 +963,51 @@ mod le {
 
 #[cfg(test)]
 mod tests {
+
+    /// The scan's estimate as it was first written, word by word in five
+    /// passes: what any faster one must equal to the bit.
+    fn inner_as_first_written(probe: &Probe, code: &[u64], factor: &Factor) -> f32 {
+        let ones: u32 = code.iter().map(|word| word.count_ones()).sum();
+        let weighted: u32 = (0..QUERY_BITS)
+            .map(|bit| {
+                let plane = &probe.planes[bit as usize * probe.words..][..probe.words];
+                let count: u32 = code
+                    .iter()
+                    .zip(plane)
+                    .map(|(c, p)| (c & p).count_ones())
+                    .sum();
+                count << bit
+            })
+            .sum();
+        let set = probe.lower * ones as f32 + probe.delta * weighted as f32;
+        (2.0 * set - probe.sum) * probe.scale / factor.align
+    }
+
+    proptest::proptest! {
+        /// Speed is the scan's only change: every code is estimated as it
+        /// was, to the bit.
+        #[test]
+        fn the_scan_estimates_every_code_as_first_written(
+            seed in 0u64..u64::MAX,
+            words in 1usize..20,
+            align in 0.05f32..1.0,
+        ) {
+            let mut random = Random(seed | 1);
+            let width = words * 64;
+            let mut unit = || (random.next() >> 40) as f32 / (1u64 << 24) as f32;
+            let query: Vec<f32> = (0..width).map(|_| unit() * 2.0 - 1.0).collect();
+            let centroid: Vec<f32> = (0..width).map(|_| unit() - 0.5).collect();
+            let probe = Probe::new(&query, &centroid);
+            let factor = Factor { norm: 1.0, align, along: 0.0 };
+            for _ in 0..8 {
+                let code: Vec<u64> = (0..words).map(|_| random.next()).collect();
+                let fast = probe.inner(&code, &factor);
+                let first = inner_as_first_written(&probe, &code, &factor);
+                proptest::prop_assert_eq!(fast.to_bits(), first.to_bits());
+            }
+        }
+    }
+
     use super::*;
     use crate::vector::distance;
     use vellev_core::SQUARED_LENGTH_UNDER;

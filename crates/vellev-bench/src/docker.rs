@@ -210,6 +210,7 @@ pub fn vellev_up(
     data: &Path,
     pinning: &Pinning,
     env: &[(String, String)],
+    mounts: &[String],
 ) -> Result<VellevUp> {
     network();
     removed("bench-vellev");
@@ -262,6 +263,10 @@ pub fn vellev_up(
         "-v".into(),
         format!("{}:/bench/cache", cache.display()),
     ]);
+    for mount in mounts {
+        args.push("-v".into());
+        args.push(mount.clone());
+    }
     let mut all_env: Vec<(String, String)> = vec![
         (
             "VELLEV_DATABASE_URL".into(),
@@ -340,6 +345,11 @@ pub fn weaviate_up(
 
 pub fn down(containers: &[&Container], data: &Path) -> Result<()> {
     for container in containers {
+        // Stopped first, so that whatever the engine writes as it ends (a
+        // profile, a last flush) is written; then removed.
+        let _ = Command::new("docker")
+            .args(["stop", "-t", "60", &container.name])
+            .output();
         removed(&container.name);
     }
     cleared(data)

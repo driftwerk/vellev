@@ -68,6 +68,14 @@ struct Args {
     /// the many-tenants measure (§3e); left out, it is not run.
     #[arg(long)]
     tenants: Option<PathBuf>,
+    /// More environment for vellev's container, as KEY=VALUE: for a
+    /// diagnosis, never a published run.
+    #[arg(long)]
+    vellev_env: Vec<String>,
+    /// More volumes for vellev's container, as HOST:CONTAINER: for a
+    /// diagnosis, such as somewhere for a profile to be written.
+    #[arg(long)]
+    vellev_mount: Vec<String>,
     /// Run one engine alone (`vellev` or `weaviate`), for a timing or a
     /// diagnosis: no comparison, no gate.
     #[arg(long)]
@@ -161,7 +169,7 @@ async fn measured(
         engine.name()
     );
     sampler.phase("warmup");
-    let warmup_seconds = run::warm(engine.as_ref(), warmup).await?;
+    let (warmup_seconds, warmup_refused) = run::warm(engine.as_ref(), warmup).await?;
     sampler.phase("measure");
     let started = std::time::Instant::now();
     let measured = run::measure(engine.as_ref(), queries, truth, plan).await?;
@@ -177,6 +185,7 @@ async fn measured(
             load_seconds,
             settle_seconds,
             warmup_seconds,
+            warmup_refused,
             measure_seconds: started.elapsed().as_secs_f64(),
             rows_per_second_loading: plan.rows as f64 / load_seconds,
         },
@@ -265,7 +274,8 @@ async fn vellev(
         &args.postgres_image,
         &data,
         pinning,
-        &[],
+        &diagnosis_env(args)?,
+        &args.vellev_mount,
     )?;
     let outcome = async {
         let url = format!("http://127.0.0.1:{}", docker::VELLEV_PORT);
@@ -418,7 +428,7 @@ async fn many_tenants(
     index: &str,
     headline: bool,
 ) -> Result<tenants::Measured> {
-    let (load_seconds, settle_seconds, p50_ms, p99_ms) =
+    let (load_seconds, settle_seconds, p50_ms, p99_ms, refused) =
         tenants::measure(engine, memories, queries, reps, Duration::from_secs(3600)).await?;
     let anon = steady(cgroups, disk).await?.anon;
     eprintln!(
@@ -435,6 +445,7 @@ async fn many_tenants(
         p50_ms,
         p99_ms,
         anon_bytes: anon,
+        refused,
     })
 }
 
@@ -454,7 +465,8 @@ async fn vellev_tenants(
         &args.postgres_image,
         &data,
         pinning,
-        &env,
+        &[env.to_vec(), diagnosis_env(args)?].concat(),
+        &args.vellev_mount,
     )?;
     let outcome = async {
         let url = format!("http://127.0.0.1:{}", docker::VELLEV_PORT);
@@ -571,6 +583,21 @@ fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
             run.phases.rows_per_second_loading,
         ));
     }
+    out.push_str("\nQueries turned away as busy (429 or 503), counted beside the times and never taken as answers:\n\n");
+    for (name, run) in runs {
+        let points: u64 = run.measured.iter().map(|m| m.refused).sum();
+        let bursts: u64 = run
+            .measured
+            .iter()
+            .flat_map(|m| &m.bursts)
+            .map(|b| b.refused)
+            .sum();
+        let hybrid: u64 = run.hybrid.iter().map(|h| h.refused).sum();
+        out.push_str(&format!(
+            "- {name}: {points} of the single queries, {bursts} in bursts, {hybrid} hybrid, {} warm-up, {} of the empty collection\n",
+            run.phases.warmup_refused, run.floor.refused
+        ));
+    }
     out.push_str("\n| Engine | Restart state | ready s | first query ms |\n|---|---|---|---|\n");
     for (name, run) in runs {
         for opened in &run.opened {
@@ -602,6 +629,18 @@ fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
         }
     }
     out
+}
+
+/// The `--vellev-env` settings as pairs.
+fn diagnosis_env(args: &Args) -> Result<Vec<(String, String)>> {
+    args.vellev_env
+        .iter()
+        .map(|pair| {
+            pair.split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .ok_or_else(|| eyre::eyre!("--vellev-env {pair:?} is not KEY=VALUE"))
+        })
+        .collect()
 }
 
 /// One engine alone, for a timing or a diagnosis: its whole run, written
@@ -642,6 +681,7 @@ async fn alone(
         "kind": format!("{engine} alone: no comparison, no gate"),
         "rows": args.rows,
         "environment": environment,
+        "vellev_diagnosis_env": args.vellev_env,
         "engine": {
             "image": run.image, "settings": run.settings, "phases": run.phases, "points": run.measured,
             "query_floor": run.floor, "memory": run.memory, "opened": run.opened, "hybrid": run.hybrid,
@@ -688,6 +728,7 @@ async fn gate_only(
         "rows": args.rows,
         "queries": queries.len(),
         "environment": environment,
+        "vellev_diagnosis_env": args.vellev_env,
         "vellev": { "image": run.image, "settings": run.settings, "phases": run.phases, "points": run.measured, "hybrid": run.hybrid },
         "gate": gate,
     });
@@ -830,6 +871,7 @@ async fn main() -> Result<()> {
         "reps": args.reps,
         "targets": report::TARGETS.map(|t| t as f64 / 100.0),
         "environment": environment,
+        "vellev_diagnosis_env": args.vellev_env,
         "engines": { "vellev": engine_json(&vellev_run), "weaviate": engine_json(&weaviate_run) },
         "matched": matches,
         "many_tenants": {
