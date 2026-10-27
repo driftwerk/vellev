@@ -538,7 +538,10 @@ impl<'a> Nearest<'a> {
 
 fn clusters_for(count: usize) -> usize {
     // Scratch: a multiple of the usual count, for an experiment.
-    let times: f64 = std::env::var("SCRATCH_CLUSTERS_TIMES").ok().and_then(|t| t.parse().ok()).unwrap_or(1.0);
+    let times: f64 = std::env::var("SCRATCH_CLUSTERS_TIMES")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(1.0);
     (((count as f64).sqrt() * times) as usize).clamp(1, (MOST_CLUSTERS * 4).min(count))
 }
 
@@ -702,6 +705,40 @@ impl ClusteredIndex {
     /// How many clusters a query scans.
     pub fn probes(&self) -> usize {
         self.probes
+    }
+
+    /// Scratch: the clusters a query would scan were it to scan those whose
+    /// centroid lies within `1 + margin` of the nearest's squared distance,
+    /// at least `least`.
+    pub fn scratch_probes_within(&self, query: &[f32], margin: f32, least: usize) -> usize {
+        let order = self.order(&self.prepared(query));
+        let first = order.first().map_or(0.0, |(d, _)| *d);
+        order
+            .iter()
+            .take_while(|(d, _)| *d <= first * (1.0 + margin))
+            .count()
+            .max(least)
+    }
+
+    /// Scratch: estimates scanning `probes` clusters, unfiltered.
+    pub fn scratch_estimates(&self, query: &[f32], count: usize, probes: usize) -> Vec<(f32, u32)> {
+        let mut nearest = Nearest::new(count, &crate::vector::in_row_order);
+        let query = self.prepared(query);
+        for (probed, (_, cluster)) in self.order(&query).into_iter().enumerate() {
+            if probed >= probes && nearest.is_full() {
+                break;
+            }
+            let probe = Probe::new(&query, self.centroid(cluster));
+            let members = &self.clusters[cluster];
+            for (index, row) in members.rows.iter().enumerate() {
+                let code = self.code(members, index);
+                nearest.offer(
+                    probe.distance(self.metric, code, &members.factors[index]),
+                    *row,
+                );
+            }
+        }
+        nearest.estimates()
     }
 
     /// Scratch: this index scanning `probes` clusters at least.
