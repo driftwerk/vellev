@@ -2152,6 +2152,7 @@ impl Writer {
         }
         let names = self.named(named_at, "");
         let rows = std::mem::take(&mut snapshot.rows);
+        let vectors = snapshot.column();
         let above = self.merging.clustered_above;
         let shape = Shape::of(&snapshot.catalog, &rows, snapshot.tombstones.len(), above);
         let file = SegmentFile {
@@ -2159,7 +2160,9 @@ impl Writer {
             rows,
             tombstones: snapshot.tombstones.clone(),
         };
-        let built = self.built(file, snapshot.catalog.clone()).await?;
+        let built = self
+            .built(file, Some(vectors), snapshot.catalog.clone())
+            .await?;
         let prepared = Self::prepared(names.meta(shape), built, self.writes())?;
         self.upload(&prepared, staged).await?;
         Ok(Some(prepared))
@@ -2198,20 +2201,36 @@ impl Writer {
     /// take the vectors into their column and encode both, off the async
     /// threads and before anything is written, so that readers are not
     /// held behind the write lock while a large segment is indexed.
-    async fn built(&self, mut file: SegmentFile, catalog: Catalog) -> Result<Built> {
+    /// The segment of `file`, its vectors in `vectors` or, without, still
+    /// in its rows.
+    async fn built(
+        &self,
+        mut file: SegmentFile,
+        vectors: Option<Column>,
+        catalog: Catalog,
+    ) -> Result<Built> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
         blocking(move || {
-            let inline = |row: usize| file.rows[row].object.vector.as_deref();
-            let indexes = state::indexed(
-                &catalog,
-                &file.rows,
-                inline,
-                &Stored::default(),
-                |_, _| {},
-                above,
-            );
-            let vectors = Column::taken_from(&mut file.rows);
+            let indexes = match &vectors {
+                Some(column) => state::indexed(
+                    &catalog,
+                    &file.rows,
+                    |row: usize| column.get(row),
+                    &Stored::default(),
+                    |_, _| {},
+                    above,
+                ),
+                None => state::indexed(
+                    &catalog,
+                    &file.rows,
+                    |row: usize| file.rows[row].object.vector.as_deref(),
+                    &Stored::default(),
+                    |_, _| {},
+                    above,
+                ),
+            };
+            let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
             let segment = encode_as(Kind::Segment, format, &file)?;
             let column = vectors.encode_as(format);
             Ok(Built {
@@ -2307,7 +2326,7 @@ impl Writer {
             return Ok(None);
         };
         let catalog = self.partition.read(|state| state.catalog().clone());
-        let built = self.built(file, catalog.clone()).await?;
+        let built = self.built(file, None, catalog.clone()).await?;
         // Both segments, however large, are uploaded without the writer,
         // under names of their own at the position each was built from;
         // see `clean` for why nothing deletes them first.

@@ -37,6 +37,16 @@ enum Values {
 }
 
 impl Column {
+    /// A column of `values`, each row's vector starting where `offsets`
+    /// says, with one offset past the last.
+    pub fn of(values: Vec<f32>, offsets: Vec<u64>) -> Self {
+        debug_assert_eq!(offsets.last().copied().unwrap_or(0), values.len() as u64);
+        Self {
+            values: Values::Memory(values),
+            offsets,
+        }
+    }
+
     /// The vectors of `rows`, which are left without them.
     pub fn taken_from(rows: &mut [Row]) -> Self {
         let mut values = Vec::new();
