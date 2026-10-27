@@ -114,7 +114,7 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
 const PER_ROW: usize = 2 * 1024;
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
+async fn a_flush_holds_its_vectors_once() {
     let _alone = ALONE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
@@ -135,8 +135,8 @@ async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
         writer.commit(rows).await.unwrap();
     }
     let vectors = ROWS * DIMENSIONS * 4;
-    // The column the segment keeps, and its encoded frame.
-    let allowed = 2 * vectors + ROWS * PER_ROW;
+    // The column the segment keeps, which is its encoded frame too.
+    let allowed = vectors + ROWS * PER_ROW;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.flush().await.unwrap();
@@ -187,11 +187,11 @@ async fn merged_peak(segments: usize) -> (usize, usize) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_merge_holds_its_vectors_no_more_than_twice_over() {
+async fn a_merge_holds_its_vectors_once() {
     let _alone = ALONE.lock().await;
     let (held, vectors) = merged_peak(4).await;
-    // The merged segment's column and its encoded frame.
-    let allowed = 2 * vectors + ROWS * PER_ROW;
+    // The merged segment's column, which is its encoded frame too.
+    let allowed = vectors + ROWS * PER_ROW;
     eprintln!(
         "a merge of {ROWS} rows held {:.2} times its vectors at its peak",
         held as f64 / vectors as f64
