@@ -259,3 +259,28 @@ async fn the_stages_of_a_request_do_not_overlap() {
     );
     served.stop().await;
 }
+
+/// Track 2, V1: what waits in memory for a flush, and flushes that failed,
+/// are on /metrics, so that rows piling up behind failing flushes are seen
+/// before writes are refused for them.
+#[tokio::test]
+async fn what_waits_for_a_flush_and_flushes_that_failed_are_reported() {
+    let (served, _key) = embedded().await;
+    let text = served.app.metrics().encoded();
+    let value = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .and_then(|value| value.parse::<f64>().ok())
+    };
+    assert_eq!(value("vellev_flush_failures_total"), Some(0.0), "{text}");
+    assert_eq!(value("vellev_writes_backlogged_total"), Some(0.0), "{text}");
+    assert!(
+        value("vellev_unflushed_rows").is_some_and(|rows| rows >= 1.0),
+        "{text}"
+    );
+    assert!(
+        value("vellev_unflushed_bytes").is_some_and(|bytes| bytes > 0.0),
+        "{text}"
+    );
+    served.stop().await;
+}

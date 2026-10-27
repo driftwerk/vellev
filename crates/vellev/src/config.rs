@@ -153,6 +153,18 @@ pub struct Config {
     /// flushed.
     #[arg(long, env = "VELLEV_FLUSH_ROWS", default_value_t = 50_000)]
     pub flush_rows: usize,
+    /// The most rows a tenant holds unflushed: once it holds them, as its
+    /// flushes fail or fall behind, a write is refused with 429 and a
+    /// Retry-After until one goes through. Writes let through at once may
+    /// pass it by what they carry. Four times `VELLEV_FLUSH_ROWS` unless
+    /// set, and no fewer than it.
+    #[arg(long, env = "VELLEV_BACKLOG_ROWS")]
+    pub backlog_rows: Option<usize>,
+    /// How long after a failed flush the next is tried, at the least, in
+    /// milliseconds: twice as long after each that fails in a row, up to
+    /// 64 times this.
+    #[arg(long, env = "VELLEV_FLUSH_BACKOFF_MS", default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
+    pub flush_backoff_ms: u64,
     /// The most tenants the node keeps a list of, the most lately served
     /// first, in its cache directory, to open copies of as it starts again
     /// before anyone reads them; 0, or no cache directory, to keep none.
@@ -642,6 +654,8 @@ impl Config {
         let settings = Settings {
             lease: Duration::from_secs(self.lease_secs),
             flush_rows: self.flush_rows,
+            backlog_rows: self.backlog_rows,
+            flush_backoff: Duration::from_millis(self.flush_backoff_ms),
             warm: self
                 .cache_dir
                 .as_ref()
@@ -673,6 +687,9 @@ impl Config {
         };
         if let Some(problem) = settings.request_bounds.grace_problem(settings.grace) {
             bail!("VELLEV_GRACE_SECS cannot be as it is set: {problem}");
+        }
+        if let Some(problem) = settings.backlog_problem() {
+            bail!("VELLEV_BACKLOG_ROWS cannot be as it is set: {problem}");
         }
         settings
             .check()
@@ -726,6 +743,25 @@ mod tests {
         let (limits, _) = set.checked().unwrap();
         assert_eq!(limits.reads, 7);
         assert_eq!(limits.reads_wait, Duration::from_millis(20));
+    }
+
+    /// Track 2, V1: a backlog below the rows a tenant is flushed at would
+    /// refuse every write before a flush is ever asked for.
+    #[test]
+    fn a_backlog_smaller_than_a_flush_is_refused() {
+        assert!(config(&[]).checked().is_ok());
+        assert!(config(&["--flush-rows", "10", "--backlog-rows", "10"])
+            .checked()
+            .is_ok());
+        for backlog in ["0", "9"] {
+            let refused = config(&["--flush-rows", "10", "--backlog-rows", backlog])
+                .checked()
+                .unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("VELLEV_BACKLOG_ROWS"),
+                "{refused:#}"
+            );
+        }
     }
 
     fn config(extra: &[&str]) -> Config {

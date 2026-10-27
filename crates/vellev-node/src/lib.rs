@@ -136,6 +136,21 @@ pub struct Settings {
     /// A tenant with this many rows written since its last checkpoint is
     /// flushed.
     pub flush_rows: usize,
+    /// The most rows a tenant holds in memory unflushed: once it holds
+    /// them, a write is refused, [`NodeError::Backlogged`], until a flush
+    /// goes through. They pile up while flushes fail, as one does whose
+    /// segment's vectors cannot be kept on local disk, or while writes come
+    /// faster than flushes keep up with. The bound is checked as a write
+    /// arrives, so the writes let through at once, each up to a whole
+    /// batch, may each add to what is held: it is passed by at most what
+    /// those carry. `None` is four times `flush_rows`; one below
+    /// `flush_rows` is refused by [`Settings::check`], as no flush would
+    /// ever be asked for and every write would be refused.
+    pub backlog_rows: Option<usize>,
+    /// How long after a failed flush the tenant's next is tried, at the
+    /// least: twice as long after each that fails in a row, up to 64 times
+    /// this, and from this again once one goes through.
+    pub flush_backoff: Duration,
     /// How far back a tenant may be restored, unless it says otherwise; at
     /// most [`MAX_RESTORE_WINDOW`]. What a restore that far back needs is
     /// kept, every log among it. A tenant open here is looked after every
@@ -262,6 +277,8 @@ impl Settings {
             group: 64,
             queue: 1_024,
             flush_rows: 50_000,
+            backlog_rows: None,
+            flush_backoff: Duration::from_secs(1),
             restore_window: Duration::from_secs(14 * 24 * 60 * 60),
             grace: Duration::from_secs(60 * 60),
             follow_every: Duration::from_secs(1),
@@ -299,7 +316,31 @@ impl Settings {
         self.request_bounds
             .grace_problem(self.grace)
             .or_else(|| self.request_bounds.claim_problem(self.backup_claim))
+            .or_else(|| self.backlog_problem())
             .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
+    }
+
+    /// The most rows a tenant holds unflushed, as these settings say.
+    pub fn backlog(&self) -> usize {
+        self.backlog_rows
+            .unwrap_or(self.flush_rows.saturating_mul(4))
+    }
+
+    /// Why a tenant could not be written to with these settings' backlog,
+    /// if it could not: one below `flush_rows` refuses every write before
+    /// a flush is ever asked for, and one of no time at all between
+    /// flushes tried after a failure tries them back to back.
+    pub fn backlog_problem(&self) -> Option<String> {
+        if self.backlog() < self.flush_rows.max(1) {
+            return Some(format!(
+                "a backlog of {} rows is below the {} a tenant is flushed at, so no flush \
+                 would be asked for and every write would be refused",
+                self.backlog(),
+                self.flush_rows
+            ));
+        }
+        (self.flush_backoff.is_zero())
+            .then(|| "a flush backoff of no time would try failed flushes back to back".into())
     }
 }
 
@@ -369,6 +410,14 @@ pub enum NodeError {
     KeyLookupPanicked,
     #[error("tenant {tenant} is asking too much of this node; try again in {wait:?}")]
     Limited { tenant: TenantId, wait: Duration },
+    /// The tenant holds as many rows unflushed as it may
+    /// ([`Settings::backlog_rows`]), as its flushes fail or fall behind,
+    /// and takes no more until one goes through.
+    #[error(
+        "tenant {tenant} holds as many rows unflushed as it may, and takes no more \
+         until a flush goes through; try again in {wait:?}"
+    )]
+    Backlogged { tenant: TenantId, wait: Duration },
     #[error("this node's hold on tenant {0} was lost; ask again")]
     Lost(TenantId),
     #[error("this node has not caught up with tenant {0} as far as asked")]
@@ -499,6 +548,14 @@ pub struct Tenant {
     commits: GroupCommitter,
     embedders: Arc<Embedders>,
     flush_rows: usize,
+    /// See [`Settings::backlog_rows`].
+    backlog_rows: usize,
+    /// See [`Settings::flush_backoff`].
+    flush_backoff: Duration,
+    /// Failed flushes in a row, and when the next may be tried.
+    backoff: Mutex<(u32, Option<Instant>)>,
+    /// The node's counts of flushes failed and writes refused for them.
+    flushing: Arc<FlushCounts>,
     flushes: mpsc::Sender<()>,
     /// Lost once the writer can no longer write or the node lets the tenant
     /// go, so that the node opens the tenant afresh for the next caller.
@@ -777,6 +834,9 @@ impl Tenant {
             .request
             .is_some_and(|request| self.read(|state| state.answered(request)));
         if !answered {
+            // Refused for its backlog before it is counted against the
+            // tenant's limits: a write turned away costs it nothing.
+            self.not_backlogged()?;
             self.limits
                 .admit(&self.id, Asked::Write, batch.mutations.len())?;
             self.can_embed(&batch.mutations)?;
@@ -807,12 +867,58 @@ impl Tenant {
         Ok(receipt)
     }
 
+    /// Refuse a write while the tenant holds [`Settings::backlog_rows`]
+    /// rows unflushed, asking for a flush, and saying when one may next
+    /// be tried.
+    fn not_backlogged(&self) -> Result<()> {
+        if self.read(State::unflushed) < self.backlog_rows {
+            return Ok(());
+        }
+        let _ = self.flushes.try_send(());
+        self.flushing.backlogged.fetch_add(1, Ordering::Relaxed);
+        let next = self.backoff.lock().expect("backoff lock").1;
+        let wait = next.map_or(Duration::ZERO, |next| {
+            next.saturating_duration_since(Instant::now())
+        });
+        Err(NodeError::Backlogged {
+            tenant: self.id.clone(),
+            wait: wait.max(self.flush_backoff),
+        })
+    }
+
+    /// Whether a flush may be tried now, none having failed lately.
+    fn flush_may_be_tried(&self) -> bool {
+        let next = self.backoff.lock().expect("backoff lock").1;
+        next.is_none_or(|next| Instant::now() >= next)
+    }
+
+    /// When the next flush may be tried, if the last one tried failed.
+    fn flush_retried_at(&self) -> Option<Instant> {
+        self.backoff.lock().expect("backoff lock").1
+    }
+
+    /// Note how the flush tried went: one that failed puts the next off,
+    /// twice as long as the one before, and one that went through ends that.
+    fn flush_tried(&self, went_through: bool) {
+        let mut backoff = self.backoff.lock().expect("backoff lock");
+        if went_through {
+            *backoff = (0, None);
+            return;
+        }
+        self.flushing.failed.fetch_add(1, Ordering::Relaxed);
+        let failed = backoff.0.saturating_add(1);
+        let wait = self.flush_backoff * 2u32.pow((failed - 1).min(6));
+        *backoff = (failed, Some(Instant::now() + wait));
+    }
+
     /// Move what has been written since the last checkpoint out of memory.
+    /// However it is asked for, one that fails puts the next the node
+    /// tries off, as [`Settings::flush_backoff`] says, and is counted in
+    /// [`Node::flushing`]; one that goes through ends that.
     pub async fn flush(&self) -> Result<LogPosition> {
-        self.writer
-            .flush()
-            .await
-            .map_err(|error| self.failed(error))
+        let flushed = self.writer.flush().await;
+        self.flush_tried(flushed.is_ok());
+        flushed.map_err(|error| self.failed(error))
     }
 
     /// Merge segments until a merge finds nothing to do, and then delete
@@ -1084,8 +1190,30 @@ struct Inner {
     /// The newest file format the cluster was seen to write; it never
     /// falls.
     cluster_format: AtomicU16,
+    /// Flushes failed and writes refused for them, on every tenant.
+    flushing: Arc<FlushCounts>,
     /// The warm list, and the warming that reads it.
     warm: warm::Warm,
+}
+
+/// Flushes that failed, and writes refused while they did.
+#[derive(Debug, Default)]
+struct FlushCounts {
+    failed: AtomicU64,
+    backlogged: AtomicU64,
+}
+
+/// What this node's tenants hold unflushed, and how their flushes went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flushing {
+    /// Flushes that failed, since the node started.
+    pub failed: u64,
+    /// Writes refused as their tenant held its backlog, since it started.
+    pub backlogged: u64,
+    /// Rows written to the tenants this node writes and not flushed yet.
+    pub unflushed_rows: usize,
+    /// About how many bytes those rows take in memory.
+    pub unflushed_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1121,6 +1249,7 @@ impl Node {
             copies_opened: AtomicU64::new(0),
             dropped: Mutex::default(),
             cluster_format: AtomicU16::new(0),
+            flushing: Arc::default(),
             warm: warm::Warm::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
@@ -1269,6 +1398,24 @@ impl Node {
     /// started.
     pub fn key_lookups(&self) -> KeyLookups {
         self.0.keys.lookups()
+    }
+
+    /// What the tenants this node writes hold unflushed, and how many of
+    /// their flushes failed.
+    pub fn flushing(&self) -> Flushing {
+        let (mut rows, mut bytes) = (0, 0);
+        for held in self.0.held_now() {
+            if let Kind::Writer(_, tenant) = &held.kind {
+                rows += tenant.read(State::unflushed);
+                bytes += tenant.read(State::unflushed_bytes);
+            }
+        }
+        Flushing {
+            failed: self.0.flushing.failed.load(Ordering::Relaxed),
+            backlogged: self.0.flushing.backlogged.load(Ordering::Relaxed),
+            unflushed_rows: rows,
+            unflushed_bytes: bytes,
+        }
     }
 
     /// How many tenants this node has opened since it started: as their
@@ -1674,6 +1821,7 @@ impl Inner {
             group,
             queue,
             flush_rows,
+            flush_backoff,
             ..
         } = &self.settings;
         let (lease, committed) = match self.coordinator.acquire(&key(tenant), node, *lease).await {
@@ -1745,6 +1893,10 @@ impl Inner {
             writer,
             embedders: self.embedders.clone(),
             flush_rows: *flush_rows,
+            backlog_rows: self.settings.backlog(),
+            flush_backoff: *flush_backoff,
+            backoff: Mutex::new((0, None)),
+            flushing: self.flushing.clone(),
             flushes,
             hold,
             deadline,
@@ -1774,7 +1926,15 @@ impl Inner {
         let tenant = Arc::downgrade(tenant);
         let maintaining = tokio::spawn(async move {
             loop {
-                let flush = match tokio::time::timeout(every, wanted.recv()).await {
+                // While flushes fail, the next is tried as soon as its
+                // backoff lets it, whether or not a write asks for it.
+                let retried_at = tenant
+                    .upgrade()
+                    .and_then(|tenant| tenant.flush_retried_at());
+                let wait = retried_at.map_or(every, |at| {
+                    every.min(at.saturating_duration_since(Instant::now()))
+                });
+                let flush = match tokio::time::timeout(wait, wanted.recv()).await {
                     Ok(Some(())) => true,
                     Ok(None) => return,
                     Err(_) => false,
@@ -1785,9 +1945,16 @@ impl Inner {
                 if !tenant.held() {
                     return;
                 }
-                if flush && tenant.read(State::unflushed) >= tenant.flush_rows {
+                // One that failed is tried again on its own, if no write
+                // asks, but never sooner than its backoff lets it. One put
+                // off for that still lets the tenant be looked after.
+                let due = flush || tenant.flush_retried_at().is_some();
+                if due
+                    && tenant.read(State::unflushed) >= tenant.flush_rows
+                    && tenant.flush_may_be_tried()
+                {
                     if let Err(error) = tenant.flush().await {
-                        tracing::warn!(tenant = %tenant.id, %error, "flush failed");
+                        tracing::error!(tenant = %tenant.id, %error, "flush failed; rows wait in memory");
                         continue;
                     }
                 }
