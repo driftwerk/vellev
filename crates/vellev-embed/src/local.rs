@@ -771,7 +771,10 @@ mod tests {
             }) as Model)
         });
         let local = Local::spawn("stand-in", load, alone()).unwrap();
-        local.embed(vec!["a".into()], Purpose::Document).await.unwrap();
+        local
+            .embed(vec!["a".into()], Purpose::Document)
+            .await
+            .unwrap();
         local.close().await;
         assert!(
             gone.load(std::sync::atomic::Ordering::SeqCst),
