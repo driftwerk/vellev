@@ -260,6 +260,13 @@ async fn built_on(cached: bool, merged: bool) -> (Writer, tempfile::TempDir) {
     (writer, dir)
 }
 
+/// The bytes of a vectors file of `rows` rows of `dimensions`: its header
+/// and padding (20), the values, a row table of an offset a row and one
+/// past the last, and the row count.
+fn vectors_file(rows: usize, dimensions: usize) -> usize {
+    20 + rows * dimensions * 4 + (rows + 1) * 8 + 8
+}
+
 /// The rule V1 holds a writer to (track 2): a segment it has just built,
 /// by a flush or a merge, on a store that keeps copies on local disk, is
 /// read from its copy there at once, holding none of its vectors in
@@ -270,9 +277,15 @@ async fn a_segment_just_built_on_a_store_keeping_copies_holds_no_vectors_in_memo
         let (held, _) = built_on(false, merged).await;
         let (read_in_place, _dir) = built_on(true, merged).await;
         let resident = |writer: &Writer| writer.partition().read(State::resident);
-        // Ten vectors of two numbers of four bytes.
+        // Held, a just-built segment's vectors are its vectors file itself,
+        // as it was gathered: the ten vectors with each file's header and
+        // row table, in two files of five rows or, merged, one of ten.
+        let files = match merged {
+            true => vectors_file(10, 2),
+            false => 2 * vectors_file(5, 2),
+        };
         assert_eq!(
-            resident(&read_in_place) + 80,
+            resident(&read_in_place) + files,
             resident(&held),
             "merged: {merged}"
         );
@@ -401,7 +414,7 @@ async fn a_segment_built_whose_cached_copy_is_torn_is_read_from_one_fetched_whol
     held.flush().await.unwrap();
     let resident = |writer: &Writer| writer.partition().read(State::resident);
     assert_eq!(
-        resident(&writer) + 80,
+        resident(&writer) + vectors_file(10, 2),
         resident(&held),
         "none of them in memory"
     );
