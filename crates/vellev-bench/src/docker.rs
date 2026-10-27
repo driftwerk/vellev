@@ -152,6 +152,22 @@ impl Container {
     }
 }
 
+/// Drop the runner's page cache, so that what an engine reads next comes
+/// from the disk.
+pub fn drop_caches() -> Result<()> {
+    let status = Command::new("sudo")
+        .args(["sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"])
+        .status()
+        .wrap_err("sudo")?;
+    ensure!(status.success(), "dropping the page cache failed");
+    Ok(())
+}
+
+/// Empty `dir` and leave it open to the user the image runs as.
+pub fn emptied(dir: &Path) -> Result<()> {
+    fresh(dir)
+}
+
 /// vellev and the Postgres it keeps its commit pointer in.
 pub struct VellevUp {
     pub vellev: Container,

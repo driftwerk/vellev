@@ -248,6 +248,7 @@ mod tests {
             },
             p50_ms: r(p99 / 2.0),
             p99_ms: r(p99),
+            bursts: vec![],
         }
     }
 
