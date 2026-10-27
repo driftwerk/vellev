@@ -782,6 +782,41 @@ mod tests {
         );
     }
 
+    thread_local! {
+        /// What a model leaves on its thread, as ONNX Runtime's CUDA
+        /// provider leaves its cuBLAS handles: let go only as the thread
+        /// itself ends.
+        static LEFT_ON_THE_THREAD: std::cell::RefCell<Option<SlowToLetGo>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // On CUDA what crashed at exit was not the session but the provider's
+    // handles kept per thread, let go only as the thread ended, after the
+    // model was. Closing waits for the thread to have ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_returns_only_once_the_models_thread_has_ended() {
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = gone.clone();
+        let load: Load = Box::new(move || {
+            let flag = flag.clone();
+            Ok(Box::new(move |texts: Vec<&str>| {
+                LEFT_ON_THE_THREAD
+                    .with(|left| *left.borrow_mut() = Some(SlowToLetGo(flag.clone())));
+                Ok(texts.iter().map(|_| vec![1.0]).collect())
+            }) as Model)
+        });
+        let local = Local::spawn("stand-in", load, alone()).unwrap();
+        local
+            .embed(vec!["a".into()], Purpose::Document)
+            .await
+            .unwrap();
+        local.close().await;
+        assert!(
+            gone.load(std::sync::atomic::Ordering::SeqCst),
+            "what the model left on its thread is let go before closing returns"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn closing_a_model_never_loaded_returns() {
         let load: Load = Box::new(|| Err(failed("never asked to load")));
