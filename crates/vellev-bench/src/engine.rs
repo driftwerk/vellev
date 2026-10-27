@@ -12,6 +12,9 @@ use serde_json::{json, Value};
 use crate::fixture::{id_of, uuid_of, Filter, Row, DIMENSIONS};
 
 pub const COLLECTION: &str = "Passages";
+/// A collection left empty, searched to measure what a query costs that
+/// finds nothing to score: the client's and the engine's fixed cost.
+pub const FLOOR: &str = "Floor";
 
 /// A point on an engine's knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -46,7 +49,8 @@ pub const EFS: [u32; 9] = [16, 32, 48, 64, 96, 128, 192, 256, 512];
 #[async_trait]
 pub trait Engine: Send + Sync {
     fn name(&self) -> &'static str;
-    /// Make the collection the passages go into.
+    /// Make the collection the passages go into, and the empty one the
+    /// fixed cost of a query is measured on.
     async fn create(&self) -> Result<()>;
     async fn load(&self, rows: &[Row]) -> Result<()>;
     /// Whether the engine says the writes are all in place: nothing queued
@@ -64,8 +68,20 @@ pub trait Engine: Send + Sync {
         limit: usize,
         knob: Knob,
     ) -> Result<Vec<u64>>;
+    /// A search of the empty collection, as the measured searches are
+    /// asked but with nothing to score.
+    async fn floor(&self, vector: &[f32]) -> Result<()>;
     /// The engine's settings in effect, read back from it.
     async fn settings(&self) -> Result<Value>;
+}
+
+/// At most `n` bytes of `text`, cut at a character.
+fn cut(text: &str, n: usize) -> &str {
+    let mut end = n.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn client() -> Result<reqwest::Client> {
@@ -81,13 +97,12 @@ async fn answered(response: reqwest::Response, what: &str) -> Result<Value> {
     ensure!(
         status.is_success(),
         "{what}: {status}: {}",
-        &text[..text.len().min(2000)]
+        cut(&text, 2000)
     );
     if text.is_empty() {
         return Ok(Value::Null);
     }
-    serde_json::from_str(&text)
-        .wrap_err_with(|| format!("{what}: {}", &text[..text.len().min(500)]))
+    serde_json::from_str(&text).wrap_err_with(|| format!("{what}: {}", cut(&text, 500)))
 }
 
 pub struct Vellev {
@@ -136,6 +151,56 @@ impl Vellev {
         json!({ "and": all })
     }
 
+    async fn create_named(&self, name: &str) -> Result<()> {
+        let schema = json!({
+            "name": name,
+            "properties": [
+                {"name": "text", "data_type": "text", "searchable": true, "filterable": false},
+                {"name": "bucket", "data_type": "int"},
+                {"name": "owner", "data_type": "int"},
+                {"name": "deleted", "data_type": "bool"},
+            ],
+            "embedding": {"provider": "none", "model": "client", "dimensions": DIMENSIONS},
+            "distance": "cosine",
+        });
+        let path = format!("/v1/tenants/{}/collections/{name}", self.tenant);
+        self.call(reqwest::Method::PUT, &path, Some(&schema))
+            .await?;
+        Ok(())
+    }
+
+    async fn nearest_in(
+        &self,
+        name: &str,
+        vector: &[f32],
+        filter: Filter,
+        limit: usize,
+        knob: Knob,
+    ) -> Result<Vec<u64>> {
+        let mut body = json!({
+            "vector": vector,
+            "limit": limit,
+            "filter": Vellev::filter(filter),
+        });
+        match knob {
+            Knob::VellevDefault => {}
+            Knob::Oversample(n) => body["oversample"] = json!(n),
+            other => bail!("vellev has no knob {other:?}"),
+        }
+        let path = format!("/v1/tenants/{}/collections/{name}/nearest", self.tenant);
+        let answer = self.call(reqwest::Method::POST, &path, Some(&body)).await?;
+        ensure!(
+            answer.get("degraded").is_none(),
+            "a degraded answer: {answer}"
+        );
+        answer["results"]
+            .as_array()
+            .ok_or_else(|| eyre!("no results: {answer}"))?
+            .iter()
+            .map(|result| id_of(result["id"].as_str().unwrap_or_default()))
+            .collect()
+    }
+
     /// The node's metrics, as Prometheus text.
     pub async fn metrics(&self) -> Result<String> {
         let response = self
@@ -149,6 +214,19 @@ impl Vellev {
             response.status()
         );
         Ok(response.text().await?)
+    }
+
+    /// Fail unless the node runs its Tokio workers and its Rayon pool on
+    /// `cpus` threads each, as the run set them (§2).
+    pub fn threads_as_set(metrics: &str, cpus: u32) -> Result<()> {
+        for pool in ["tokio_workers", "rayon"] {
+            let threads = Vellev::sample(metrics, &format!("vellev_threads{{pool=\"{pool}\"}}"));
+            ensure!(
+                threads == Some(f64::from(cpus)),
+                "vellev's {pool} threads are {threads:?}, not the {cpus} set"
+            );
+        }
+        Ok(())
     }
 
     /// A sample of the metrics, as `name{labels} value`.
@@ -168,20 +246,9 @@ impl Engine for Vellev {
     async fn create(&self) -> Result<()> {
         let tenant = format!("/v1/tenants/{}", self.tenant);
         self.call(reqwest::Method::PUT, &tenant, None).await?;
-        let schema = json!({
-            "name": COLLECTION,
-            "properties": [
-                {"name": "text", "data_type": "text", "searchable": true, "filterable": false},
-                {"name": "bucket", "data_type": "int"},
-                {"name": "owner", "data_type": "int"},
-                {"name": "deleted", "data_type": "bool"},
-            ],
-            "embedding": {"provider": "none", "model": "client", "dimensions": DIMENSIONS},
-            "distance": "cosine",
-        });
-        let path = format!("{tenant}/collections/{COLLECTION}");
-        self.call(reqwest::Method::PUT, &path, Some(&schema))
-            .await?;
+        for name in [COLLECTION, FLOOR] {
+            self.create_named(name).await?;
+        }
         Ok(())
     }
 
@@ -255,31 +322,17 @@ impl Engine for Vellev {
         limit: usize,
         knob: Knob,
     ) -> Result<Vec<u64>> {
-        let mut body = json!({
-            "vector": vector,
-            "limit": limit,
-            "filter": Vellev::filter(filter),
-        });
-        match knob {
-            Knob::VellevDefault => {}
-            Knob::Oversample(n) => body["oversample"] = json!(n),
-            other => bail!("vellev has no knob {other:?}"),
-        }
-        let path = format!(
-            "/v1/tenants/{}/collections/{COLLECTION}/nearest",
-            self.tenant
-        );
-        let answer = self.call(reqwest::Method::POST, &path, Some(&body)).await?;
-        ensure!(
-            answer.get("degraded").is_none(),
-            "a degraded answer: {answer}"
-        );
-        answer["results"]
-            .as_array()
-            .ok_or_else(|| eyre!("no results: {answer}"))?
-            .iter()
-            .map(|result| id_of(result["id"].as_str().unwrap_or_default()))
-            .collect()
+        self.nearest_in(COLLECTION, vector, filter, limit, knob)
+            .await
+    }
+
+    async fn floor(&self, vector: &[f32]) -> Result<()> {
+        let broad = Filter::of(crate::fixture::Case::Broad, 0);
+        let found = self
+            .nearest_in(FLOOR, vector, broad, 10, Knob::VellevDefault)
+            .await?;
+        ensure!(found.is_empty(), "the empty collection answered {found:?}");
+        Ok(())
     }
 
     async fn settings(&self) -> Result<Value> {
@@ -348,19 +401,37 @@ impl Weaviate {
         }
         format!("{{operator: And, operands: [{}]}}", all.join(", "))
     }
-}
 
-#[async_trait]
-impl Engine for Weaviate {
-    fn name(&self) -> &'static str {
-        "weaviate"
+    /// Whether every shard of the passages has nothing queued to index,
+    /// as `/v1/nodes?output=verbose` says. A shard that does not say is an
+    /// error, not settled: a renamed field must not pass as an empty queue.
+    pub fn shards_settled(nodes: &Value) -> Result<bool> {
+        let shards: Vec<&Value> = nodes["nodes"]
+            .as_array()
+            .ok_or_else(|| eyre!("nodes: {nodes}"))?
+            .iter()
+            .flat_map(|node| node["shards"].as_array().into_iter().flatten())
+            .filter(|shard| shard["class"] == COLLECTION)
+            .collect();
+        ensure!(!shards.is_empty(), "no shard of {COLLECTION}: {nodes}");
+        let mut settled = true;
+        for shard in shards {
+            let queued = shard["vectorQueueLength"]
+                .as_u64()
+                .ok_or_else(|| eyre!("a shard with no vectorQueueLength: {shard}"))?;
+            let status = shard["vectorIndexingStatus"]
+                .as_str()
+                .ok_or_else(|| eyre!("a shard with no vectorIndexingStatus: {shard}"))?;
+            settled &= queued == 0 && status == "READY";
+        }
+        Ok(settled)
     }
 
-    async fn create(&self) -> Result<()> {
+    async fn create_named(&self, name: &str) -> Result<()> {
         let mut index = self.index.clone();
         index["distance"] = json!("cosine");
         let class = json!({
-            "class": COLLECTION,
+            "class": name,
             "vectorizer": "none",
             "vectorIndexType": "hnsw",
             "vectorIndexConfig": index,
@@ -373,6 +444,53 @@ impl Engine for Weaviate {
         });
         self.call(reqwest::Method::POST, "/v1/schema", Some(&class))
             .await?;
+        Ok(())
+    }
+
+    async fn nearest_in(
+        &self,
+        name: &str,
+        vector: &[f32],
+        filter: Filter,
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        let vector: Vec<String> = vector.iter().map(f32::to_string).collect();
+        let query = format!(
+            "{{ Get {{ {name}(nearVector: {{vector: [{}]}}, limit: {limit}, where: {}) {{ text bucket owner deleted _additional {{ id }} }} }} }}",
+            vector.join(","),
+            Weaviate::filter(filter),
+        );
+        let answer = self
+            .call(
+                reqwest::Method::POST,
+                "/v1/graphql",
+                Some(&json!({ "query": query })),
+            )
+            .await?;
+        ensure!(
+            answer.get("errors").is_none(),
+            "GraphQL: {}",
+            answer["errors"]
+        );
+        answer["data"]["Get"][name]
+            .as_array()
+            .ok_or_else(|| eyre!("no results: {answer}"))?
+            .iter()
+            .map(|result| id_of(result["_additional"]["id"].as_str().unwrap_or_default()))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Engine for Weaviate {
+    fn name(&self) -> &'static str {
+        "weaviate"
+    }
+
+    async fn create(&self) -> Result<()> {
+        for name in [COLLECTION, FLOOR] {
+            self.create_named(name).await?;
+        }
         Ok(())
     }
 
@@ -414,18 +532,7 @@ impl Engine for Weaviate {
         let nodes = self
             .call(reqwest::Method::GET, "/v1/nodes?output=verbose", None)
             .await?;
-        let shards: Vec<&Value> = nodes["nodes"]
-            .as_array()
-            .ok_or_else(|| eyre!("nodes: {nodes}"))?
-            .iter()
-            .flat_map(|node| node["shards"].as_array().into_iter().flatten())
-            .filter(|shard| shard["class"] == COLLECTION)
-            .collect();
-        ensure!(!shards.is_empty(), "no shard of {COLLECTION}: {nodes}");
-        Ok(shards.iter().all(|shard| {
-            shard["vectorQueueLength"].as_u64().unwrap_or(0) == 0
-                && shard["vectorIndexingStatus"].as_str().unwrap_or("READY") == "READY"
-        }))
+        Weaviate::shards_settled(&nodes)
     }
 
     fn points(&self, limit: usize) -> Vec<Knob> {
@@ -464,30 +571,14 @@ impl Engine for Weaviate {
         limit: usize,
         _knob: Knob,
     ) -> Result<Vec<u64>> {
-        let vector: Vec<String> = vector.iter().map(f32::to_string).collect();
-        let query = format!(
-            "{{ Get {{ {COLLECTION}(nearVector: {{vector: [{}]}}, limit: {limit}, where: {}) {{ text bucket owner deleted _additional {{ id }} }} }} }}",
-            vector.join(","),
-            Weaviate::filter(filter),
-        );
-        let answer = self
-            .call(
-                reqwest::Method::POST,
-                "/v1/graphql",
-                Some(&json!({ "query": query })),
-            )
-            .await?;
-        ensure!(
-            answer.get("errors").is_none(),
-            "GraphQL: {}",
-            answer["errors"]
-        );
-        answer["data"]["Get"][COLLECTION]
-            .as_array()
-            .ok_or_else(|| eyre!("no results: {answer}"))?
-            .iter()
-            .map(|result| id_of(result["_additional"]["id"].as_str().unwrap_or_default()))
-            .collect()
+        self.nearest_in(COLLECTION, vector, filter, limit).await
+    }
+
+    async fn floor(&self, vector: &[f32]) -> Result<()> {
+        let broad = Filter::of(crate::fixture::Case::Broad, 0);
+        let found = self.nearest_in(FLOOR, vector, broad, 10).await?;
+        ensure!(found.is_empty(), "the empty class answered {found:?}");
+        Ok(())
     }
 
     async fn settings(&self) -> Result<Value> {
@@ -548,6 +639,46 @@ mod tests {
         assert!(weaviate.contains(r#"{path: ["deleted"], operator: Equal, valueBoolean: false}"#));
         assert!(weaviate.contains(r#"{path: ["bucket"], operator: LessThan, valueInt: 10}"#));
         assert!(weaviate.contains(r#"{path: ["owner"], operator: Equal, valueInt: 3}"#));
+    }
+
+    #[test]
+    fn a_weaviate_shard_that_does_not_say_its_queue_is_an_error_not_settled() {
+        let nodes = |shard: Value| json!({"nodes": [{"shards": [shard]}]});
+        let ready =
+            json!({"class": COLLECTION, "vectorQueueLength": 0, "vectorIndexingStatus": "READY"});
+        assert!(Weaviate::shards_settled(&nodes(ready)).unwrap());
+        let queued = json!({"class": COLLECTION, "vectorQueueLength": 3, "vectorIndexingStatus": "INDEXING"});
+        assert!(!Weaviate::shards_settled(&nodes(queued)).unwrap());
+        let silent = json!({"class": COLLECTION, "vectorIndexingStatus": "READY"});
+        assert!(Weaviate::shards_settled(&nodes(silent)).is_err());
+        let no_status = json!({"class": COLLECTION, "vectorQueueLength": 0});
+        assert!(Weaviate::shards_settled(&nodes(no_status)).is_err());
+        let other =
+            json!({"class": FLOOR, "vectorQueueLength": 0, "vectorIndexingStatus": "READY"});
+        assert!(
+            Weaviate::shards_settled(&nodes(other)).is_err(),
+            "no shard of the passages"
+        );
+    }
+
+    #[test]
+    fn vellevs_threads_must_be_as_set() {
+        let text = "vellev_threads{pool=\"tokio_workers\"} 3\nvellev_threads{pool=\"rayon\"} 3\n";
+        assert!(Vellev::threads_as_set(text, 3).is_ok());
+        assert!(Vellev::threads_as_set(text, 4).is_err());
+        let rayon_off =
+            "vellev_threads{pool=\"tokio_workers\"} 3\nvellev_threads{pool=\"rayon\"} 4\n";
+        assert!(Vellev::threads_as_set(rayon_off, 3).is_err());
+        assert!(
+            Vellev::threads_as_set("", 3).is_err(),
+            "unreported is not as set"
+        );
+    }
+
+    #[test]
+    fn an_error_body_is_cut_at_a_character() {
+        assert_eq!(cut("aé", 2), "a");
+        assert_eq!(cut("abc", 10), "abc");
     }
 
     #[test]

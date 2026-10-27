@@ -117,7 +117,13 @@ pub fn gate(vellev: &[Measured], cases: &[Case], extra: Vec<Check>) -> Gate {
 }
 
 /// The Markdown summary: the matched points first, then the gate.
-pub fn summary(matches: &[Match], gate: &Gate, rows: u64, header: &str) -> String {
+pub fn summary(
+    matches: &[Match],
+    floors: &[(&str, crate::run::Floor)],
+    gate: &Gate,
+    rows: u64,
+    header: &str,
+) -> String {
     let mut out = format!("# vellev against Weaviate, {rows} rows\n\n{header}\n\n");
     out.push_str("## Matched points (recall@10, vector-only, limit 10)\n\n");
     out.push_str("| Case | Target | Engine | Point | recall@10 | p50 ms | p99 ms |\n|---|---|---|---|---|---|---|\n");
@@ -142,6 +148,15 @@ pub fn summary(matches: &[Match], gate: &Gate, rows: u64, header: &str) -> Strin
                 m.engine
             )),
         }
+    }
+    out.push_str(
+        "\n## Fixed cost of a query\n\nEach measured question asked of an empty collection, as the searches are asked: what a query costs the client and the engine with nothing to score. Shown beside the latencies above, not taken off them.\n\n| Engine | p50 ms | p99 ms |\n|---|---|---|\n",
+    );
+    for (engine, floor) in floors {
+        out.push_str(&format!(
+            "| {engine} | {:.2} | {:.2} ({:.2}–{:.2}) |\n",
+            floor.p50_ms.median, floor.p99_ms.median, floor.p99_ms.min, floor.p99_ms.max
+        ));
     }
     out.push_str(&format!(
         "\n## Hard gate: {}\n\n| Check | Case | Value | Required | |\n|---|---|---|---|---|\n",

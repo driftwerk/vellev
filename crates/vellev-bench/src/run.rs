@@ -218,3 +218,31 @@ pub async fn measure(
     }
     Ok(measured)
 }
+
+/// The fixed cost of a query (§4 beside the latencies): each measured
+/// question asked of the empty collection, as the searches are asked, the
+/// figures each the median of the repetitions. Reported beside the
+/// latencies, never taken off them.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Floor {
+    pub p50_ms: Repeated,
+    pub p99_ms: Repeated,
+}
+
+pub async fn floor(engine: &dyn Engine, queries: &[Query], reps: usize) -> Result<Floor> {
+    let (mut p50s, mut p99s) = (Vec::new(), Vec::new());
+    for _ in 0..reps {
+        let mut took = Vec::with_capacity(queries.len());
+        for query in queries {
+            let started = Instant::now();
+            engine.floor(&query.vector).await?;
+            took.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        p50s.push(percentile(&took, 50.0));
+        p99s.push(percentile(&took, 99.0));
+    }
+    Ok(Floor {
+        p50_ms: Repeated::of(&p50s),
+        p99_ms: Repeated::of(&p99s),
+    })
+}
