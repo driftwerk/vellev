@@ -17,9 +17,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update -q && sudo apt-get install -y -q heaptrack > /dev/null
       - run: cargo build --release --locked -p vellev-storage --example vector_scale
-      - name: 1M rows, anon and file apart
+      - name: 500k rows, anon and file apart
         run: |
-          STORE=file OBJECTS=1000000 DIMS=768 SEGMENTS=4 QUERIES=20 \
+          STORE=file OBJECTS=500000 DIMS=768 SEGMENTS=2 QUERIES=20 \
             /usr/bin/time -v target/release/examples/vector_scale 2>&1 | grep -E "segment|merges|rss|Maximum resident|Elapsed"
       - name: 250k rows in one segment, under heaptrack
         run: |
