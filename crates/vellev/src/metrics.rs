@@ -267,6 +267,42 @@ impl Collector for Counted {
         for (kind, count) in [("writer", opens.writers), ("copy", opens.copies)] {
             ConstCounter::new(count).encode(family.encode_family(&[("kind", kind)])?)?;
         }
+        let flushing = node.flushing();
+        for (name, help, count) in [
+            (
+                "flush_failures",
+                "Flushes that failed, their rows left in memory for the next try",
+                flushing.failed,
+            ),
+            (
+                "writes_backlogged",
+                "Writes refused as their tenant held as many rows unflushed as it may",
+                flushing.backlogged,
+            ),
+        ] {
+            let counter = ConstCounter::new(count);
+            counter.encode(encoder.encode_descriptor(
+                name,
+                help,
+                None,
+                counter.metric_type(),
+            )?)?;
+        }
+        for (name, help, value) in [
+            (
+                "unflushed_rows",
+                "Rows written to the tenants this node writes and not flushed yet",
+                flushing.unflushed_rows,
+            ),
+            (
+                "unflushed_bytes",
+                "About how many bytes the rows not flushed yet take in memory",
+                flushing.unflushed_bytes,
+            ),
+        ] {
+            let gauge = ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX));
+            gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+        }
         Ok(())
     }
 }

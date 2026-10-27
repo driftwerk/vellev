@@ -112,6 +112,11 @@ impl Calls {
     /// of them: an equal share of the node's, and two at the least, one
     /// of them kept for queries.
     fn of(regions: usize) -> Arc<Self> {
+        Self::timed(regions, crate::clock::tokio())
+    }
+
+    /// As [`Self::of`], what the region does read by `clock`.
+    fn timed(regions: usize, clock: Arc<dyn crate::clock::Clock>) -> Arc<Self> {
         debug_assert!(regions <= MOST_REGIONS, "{regions} regions");
         let at_once = CONCURRENCY / regions.max(1);
         let kept = (KEPT_FOR_QUERIES * at_once / CONCURRENCY).max(1);
@@ -122,7 +127,7 @@ impl Calls {
             documents: Semaphore::new(documents_at_once),
             documents_at_once,
             unreached: Mutex::default(),
-            activity: Activity::default(),
+            activity: Activity::timed_by(clock),
         })
     }
 
@@ -142,7 +147,7 @@ impl Calls {
     /// a while.
     fn mark_unreached(&self, said: String) {
         let mut unreached = self.unreached.lock().expect("unreached lock");
-        *unreached = Some((Instant::now(), said));
+        *unreached = Some((self.activity.clock().now(), said));
     }
 
     /// What was said of the region when it was not reached, if that was
@@ -150,7 +155,9 @@ impl Calls {
     fn unreached(&self) -> Option<String> {
         let mut unreached = self.unreached.lock().expect("unreached lock");
         match &*unreached {
-            Some((since, said)) if since.elapsed() < UNREACHED_FOR => Some(said.clone()),
+            Some((since, said)) if self.activity.clock().now() - *since < UNREACHED_FOR => {
+                Some(said.clone())
+            }
             _ => unreached.take().and(None),
         }
     }
@@ -167,7 +174,7 @@ struct GivenUpOn<'a> {
 
 impl Drop for GivenUpOn<'_> {
     fn drop(&mut self) {
-        let waited = self.began.elapsed();
+        let waited = self.calls.activity.clock().now() - self.began;
         if !self.answered && waited >= self.after {
             self.calls.mark_unreached(format!(
                 "a call to it was given up on after {waited:.0?} without an answer"
@@ -305,6 +312,19 @@ impl Bedrock {
         })
     }
 
+    /// This, standing in for a node of its own as [`Self::with_client`]
+    /// makes it, with what Titan does read by `clock`: for tests that
+    /// move the clock themselves. Whatever waits on it times its waits
+    /// by the same clock.
+    #[cfg(any(test, feature = "test-clock"))]
+    #[must_use]
+    pub fn timed_by(self, clock: Arc<dyn crate::clock::Clock>) -> Self {
+        Self {
+            calls: Calls::timed(1, clock),
+            ..self
+        }
+    }
+
     pub fn retries() -> RetryConfig {
         RetryConfig::standard().with_max_attempts(ATTEMPTS)
     }
@@ -357,7 +377,7 @@ impl Bedrock {
         // itself never would.
         let mut given_up = GivenUpOn {
             calls: &self.calls,
-            began: Instant::now(),
+            began: self.calls.activity.clock().now(),
             after: self.unreached_after,
             answered: false,
         };

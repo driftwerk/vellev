@@ -622,7 +622,15 @@ fn step() -> impl Strategy<Value = Step> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig {
+        // Beside the test, where CI keeps it, and said so: proptest looks for
+        // a lib.rs above an integration test by default, finds none, and
+        // falls back here with a warning.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::with_cases(64)
+    })]
 
     #[test]
     fn scores_never_drift_from_the_long_way(steps in prop::collection::vec(step(), 1..40)) {

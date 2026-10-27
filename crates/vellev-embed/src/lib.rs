@@ -1,6 +1,10 @@
 //! Turning text into vectors, with the model chosen per collection.
 
 mod bedrock;
+#[cfg(any(test, feature = "test-clock"))]
+pub mod clock;
+#[cfg(not(any(test, feature = "test-clock")))]
+mod clock;
 mod embedder;
 mod http;
 #[cfg(feature = "local")]
@@ -290,6 +294,7 @@ static KEYS: LazyLock<Vec<Shape>> = LazyLock::new(|| {
 /// one, such as a long run of words after `sk-` with a digit in it,
 /// costs a detail of what went wrong and no more.
 pub(crate) fn without_keys(said: &str) -> String {
+    looked_through(said.len());
     KEYS.iter()
         .fold(said.to_string(), |said, shape| without(&said, shape))
 }
@@ -300,7 +305,14 @@ pub(crate) fn without_keys(said: &str) -> String {
 fn without(said: &str, shape: &Shape) -> String {
     let mut without = String::with_capacity(said.len());
     let (mut copied, mut from) = (0, 0);
-    while let Some(found) = shape.found.captures_at(said, from) {
+    loop {
+        let found = shape.found.captures_at(said, from);
+        // A search reads on to the end of what it finds, or of `said`.
+        let read_to = found.as_ref().and_then(|found| found.get(0));
+        looked_through(read_to.map_or(said.len(), |whole| whole.end()) - from);
+        let Some(found) = found else {
+            break;
+        };
         let (Some(whole), Some(key)) = (found.get(0), found.name("key")) else {
             break;
         };
@@ -317,6 +329,25 @@ fn without(said: &str, shape: &Shape) -> String {
     }
     without.push_str(&said[copied..]);
     without
+}
+
+/// Counts, in tests and on this thread, `bytes` of what was said as
+/// looked through for keys: so a test can hold how much of it is looked
+/// through to a number, which no timing does on a loaded machine.
+#[cfg(test)]
+pub(crate) fn looked_through(bytes: usize) {
+    LOOKED_THROUGH_HERE.with(|looked| looked.set(looked.get() + bytes));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn looked_through(_bytes: usize) {}
+
+#[cfg(test)]
+thread_local! {
+    /// How many bytes [`looked_through`] has counted on this thread.
+    pub(crate) static LOOKED_THROUGH_HERE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Whether `c` is a character a key can be made of, whichever of the
@@ -351,8 +382,19 @@ pub enum Purpose {
 /// panics, of anything but loading that makes no vector, is held against
 /// them, as it was spent: a load that fails is taken back from the time
 /// it was given while it was under way.
-#[derive(Debug, Default)]
-pub struct Activity(std::sync::Mutex<Acted>);
+#[derive(Debug)]
+pub struct Activity {
+    acted: std::sync::Mutex<Acted>,
+    /// What the times are read by: tokio's clock, unless a test hands in
+    /// its own.
+    clock: std::sync::Arc<dyn clock::Clock>,
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self::timed_by(clock::tokio())
+    }
+}
 
 /// The most loads that ended well, since the last vector, kept to be
 /// set against the time a waiter has waited. One more lets the oldest
@@ -371,29 +413,43 @@ struct Acted {
 }
 
 impl Activity {
+    /// Activity whose times are read by `clock`.
+    pub(crate) fn timed_by(clock: std::sync::Arc<dyn clock::Clock>) -> Self {
+        Self {
+            acted: std::sync::Mutex::default(),
+            clock,
+        }
+    }
+
+    /// What its times are read by: the clock what waits on the model
+    /// times its waits by too, so the two cannot disagree.
+    pub(crate) fn clock(&self) -> &std::sync::Arc<dyn clock::Clock> {
+        &self.clock
+    }
+
     /// The model has made a vector, for whomever.
     pub fn made(&self) {
-        let mut acted = self.0.lock().expect("activity lock");
-        acted.made = Some(tokio::time::Instant::now());
+        let mut acted = self.acted.lock().expect("activity lock");
+        acted.made = Some(self.clock.now());
         acted.loaded.clear();
     }
 
     /// The model has begun to load, and is given `at_most` to.
     pub fn loading(&self, at_most: std::time::Duration) {
-        let now = tokio::time::Instant::now();
+        let now = self.clock.now();
         let until = now.checked_add(at_most).unwrap_or(now + LONGEST);
-        self.0.lock().expect("activity lock").loading = Some((now, until));
+        self.acted.lock().expect("activity lock").loading = Some((now, until));
     }
 
     /// The load under way has ended with the model loaded: the time it
     /// took is not held against those who wait. It made no vector.
     pub fn loaded(&self) {
-        let mut acted = self.0.lock().expect("activity lock");
+        let mut acted = self.acted.lock().expect("activity lock");
         if let Some((began, _)) = acted.loading.take() {
             if acted.loaded.len() == LOADS_KEPT {
                 acted.loaded.pop_front();
             }
-            acted.loaded.push_back((began, tokio::time::Instant::now()));
+            acted.loaded.push_back((began, self.clock.now()));
         }
     }
 
@@ -401,7 +457,7 @@ impl Activity {
     /// without the model loaded, and its time is held against those
     /// who wait.
     pub fn not_loading(&self) {
-        self.0.lock().expect("activity lock").loading = None;
+        self.acted.lock().expect("activity lock").loading = None;
     }
 
     /// How long one who has waited on the model since `since` has waited
@@ -410,8 +466,8 @@ impl Activity {
     /// with the model loaded, and what a load under way has taken, up to
     /// what a load is given.
     pub(crate) fn quiet(&self, since: tokio::time::Instant) -> std::time::Duration {
-        let acted = self.0.lock().expect("activity lock");
-        let now = tokio::time::Instant::now();
+        let acted = self.acted.lock().expect("activity lock");
+        let now = self.clock.now();
         let from = acted.made.map_or(since, |made| made.max(since));
         let taken = |began: tokio::time::Instant, ended: tokio::time::Instant| {
             ended.saturating_duration_since(began.max(from))
@@ -430,7 +486,7 @@ impl Activity {
     /// When the load under way is no longer given, if one is.
     #[cfg(test)]
     pub(crate) fn loading_until(&self) -> Option<tokio::time::Instant> {
-        self.0
+        self.acted
             .lock()
             .expect("activity lock")
             .loading

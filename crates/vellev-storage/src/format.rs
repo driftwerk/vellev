@@ -26,15 +26,31 @@ use crate::{Refusal, Result, StorageError};
 
 const MAGIC: [u8; 4] = *b"VLLV";
 const HEADER: usize = 4 + 1 + 2 + 8 + 4;
-/// The newest format this release reads and can write. Every writer stamps
-/// the files it writes with it today; a release that adds a format must
-/// write the one the cluster writes instead (see docs/compatibility.md).
-pub const FORMAT_VERSION: u16 = 1;
+/// The newest format this release reads and can write. A writer stamps
+/// the files it writes with the format it writes, the one the cluster
+/// writes, which may be older (see docs/compatibility.md).
+///
+/// Format 2 adds a property embedded but not stored (`Property::stored`
+/// false), which a node of format 1 would read as stored and so write the
+/// text of. Nothing else differs: a file of format 2 that holds no such
+/// property is, but for its stamp, as format 1 writes it.
+pub const FORMAT_VERSION: u16 = 2;
 
 /// The newest format a node writes unless an operator allows a newer one:
 /// the format before the newest when a release adds one, so that the
 /// release before can read everything written while both run.
 pub const DEFAULT_MAX_FORMAT: u16 = 1;
+
+/// The first format that can hold a property embedded but not stored.
+pub const UNSTORED_FORMAT: u16 = 2;
+
+/// The oldest format that can hold every collection of `collections`.
+fn format_holding<'a>(mut collections: impl Iterator<Item = &'a Collection>) -> u16 {
+    match collections.any(Collection::has_unstored) {
+        true => UNSTORED_FORMAT,
+        false => 1,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -100,6 +116,16 @@ pub struct LogSegment {
     /// made.
     #[serde(default)]
     pub answered: Vec<Answered>,
+}
+
+impl LogSegment {
+    /// The oldest format that can hold what this log records.
+    pub fn least_format(&self) -> u16 {
+        format_holding(self.ops.iter().filter_map(|op| match op {
+            Op::CreateCollection { schema, .. } => Some(&**schema),
+            _ => None,
+        }))
+    }
 }
 
 /// A request a commit answered: how, and when the commit was made, in
@@ -186,6 +212,13 @@ pub struct Manifest {
     /// it became visible at.
     #[serde(default)]
     pub answered: Vec<(LogPosition, Answered)>,
+}
+
+impl Manifest {
+    /// The oldest format that can hold what this checkpoint says.
+    pub fn least_format(&self) -> u16 {
+        format_holding(self.collections.iter().map(|(_, schema)| schema))
+    }
 }
 
 impl Manifest {
@@ -297,6 +330,8 @@ impl Manifest {
 /// searched by.
 pub fn rekeyed_index(key: &str, frame: &[u8], from: &str, to: &str) -> Result<Bytes> {
     let SegmentIndex { segment, vectors } = decode(key, Kind::Index, frame)?;
+    // Stamped as it was: rekeyed, it holds nothing newer.
+    let version = u16::from_le_bytes([frame[5], frame[6]]);
     if segment != from {
         return Err(StorageError::corrupt(key, "it indexes another segment"));
     }
@@ -304,7 +339,17 @@ pub fn rekeyed_index(key: &str, frame: &[u8], from: &str, to: &str) -> Result<By
         segment: to.to_string(),
         vectors,
     };
-    encode(Kind::Index, &rekeyed)
+    encode_as(Kind::Index, version, &rekeyed)
+}
+
+/// How far into a file its format's stamp ends.
+pub(crate) const STAMPED_WITHIN: usize = 7;
+
+/// The format a file's frame is stamped as, if the file is of this crate's
+/// framing and long enough to say; nothing about whether it is whole.
+pub(crate) fn stamp(frame: &[u8]) -> Option<u16> {
+    (frame.len() >= STAMPED_WITHIN && frame[..4] == MAGIC)
+        .then(|| u16::from_le_bytes([frame[5], frame[6]]))
 }
 
 /// A file a head reference can point at.
@@ -314,9 +359,17 @@ pub enum Head {
     Manifest(Manifest),
 }
 
+/// `value` framed as a file of `kind`, stamped as the newest format,
+/// [`FORMAT_VERSION`]. What a writer puts in the store is stamped with the
+/// format it writes instead, by [`encode_as`].
 pub fn encode<T: Serialize>(kind: Kind, value: &T) -> Result<Bytes> {
+    encode_as(kind, FORMAT_VERSION, value)
+}
+
+/// `value` framed as a file of `kind`, stamped as format `version`.
+pub fn encode_as<T: Serialize>(kind: Kind, version: u16, value: &T) -> Result<Bytes> {
     rmp_serde::to_vec_named(value)
-        .map(|body| Bytes::from(frame(kind, FORMAT_VERSION, &body)))
+        .map(|body| Bytes::from(frame(kind, version, &body)))
         .map_err(|e| StorageError::Encode(e.to_string()))
 }
 
