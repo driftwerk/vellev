@@ -8922,7 +8922,7 @@ async fn a_node_writes_the_format_the_cluster_writes_whatever_its_own_max() {
 async fn written_in_batches(tenant: &Tenant, from: u64, to: u64, batch: u64) {
     let mut n = from;
     while n < to {
-        let rows = (n..(n + batch).min(to))
+        let rows: Vec<Mutation> = (n..(n + batch).min(to))
             .map(|n| note(n, "row", Some(vec![n as f32, 1.0])))
             .collect();
         tenant.write(rows).await.unwrap();

@@ -4259,6 +4259,7 @@ dependencies = [
  "jsonwebtoken",
  "object_store",
  "prometheus-client",
+ "rayon",
  "reqwest",
  "ring",
  "serde",
