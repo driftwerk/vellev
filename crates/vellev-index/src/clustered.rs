@@ -975,6 +975,74 @@ mod tests {
         (2.0 * set - probe.sum) * probe.scale / factor.align
     }
 
+    /// A query readied for a cluster as first written: what any faster
+    /// readying must equal to the bit.
+    fn probe_as_first_written(query: &[f32], centroid: &[f32]) -> (Vec<u64>, [u32; 6]) {
+        let residual: Vec<f32> = query.iter().zip(centroid).map(|(q, c)| q - c).collect();
+        let (mut lower, mut upper) = (f32::INFINITY, f32::NEG_INFINITY);
+        for value in &residual {
+            lower = lower.min(*value);
+            upper = upper.max(*value);
+        }
+        let levels = ((1u32 << QUERY_BITS) - 1) as f32;
+        let delta = (upper - lower) / levels;
+        let words = residual.len() / 64;
+        let mut planes = vec![0u64; words * QUERY_BITS as usize];
+        for (i, value) in residual.iter().enumerate() {
+            let level = match delta > 0.0 {
+                true => ((value - lower) / delta).round().clamp(0.0, levels) as u32,
+                false => 0,
+            };
+            for bit in 0..QUERY_BITS {
+                if level >> bit & 1 == 1 {
+                    planes[bit as usize * words + i / 64] |= 1 << (i % 64);
+                }
+            }
+        }
+        let sum: f32 = residual.iter().sum();
+        let scalars = [
+            lower.to_bits(),
+            delta.to_bits(),
+            sum.to_bits(),
+            dot(&residual, &residual).to_bits(),
+            dot(query, centroid).to_bits(),
+            (1.0 / (residual.len() as f32).sqrt()).to_bits(),
+        ];
+        (planes, scalars)
+    }
+
+    proptest::proptest! {
+        /// A query is readied for each cluster as it was, to the bit.
+        #[test]
+        fn a_query_is_readied_for_a_cluster_as_first_written(
+            seed in 0u64..u64::MAX,
+            words in 1usize..20,
+            flat in proptest::bool::weighted(0.1),
+        ) {
+            let mut random = Random(seed | 1);
+            let width = words * 64;
+            let mut unit = || (random.next() >> 40) as f32 / (1u64 << 24) as f32;
+            let query: Vec<f32> = (0..width).map(|_| unit() * 2.0 - 1.0).collect();
+            // A query on its centroid leaves nothing to quantize.
+            let centroid: Vec<f32> = match flat {
+                true => query.clone(),
+                false => (0..width).map(|_| unit() - 0.5).collect(),
+            };
+            let probe = Probe::new(&query, &centroid);
+            let (planes, scalars) = probe_as_first_written(&query, &centroid);
+            proptest::prop_assert_eq!(&probe.planes, &planes);
+            let got = [
+                probe.lower.to_bits(),
+                probe.delta.to_bits(),
+                probe.sum.to_bits(),
+                probe.norm_squared.to_bits(),
+                probe.centroid_dot.to_bits(),
+                probe.scale.to_bits(),
+            ];
+            proptest::prop_assert_eq!(got, scalars);
+        }
+    }
+
     proptest::proptest! {
         /// Speed is the scan's only change: every code is estimated as it
         /// was, to the bit.
