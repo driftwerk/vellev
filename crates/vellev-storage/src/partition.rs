@@ -2154,7 +2154,8 @@ impl Writer {
         let rows = std::mem::take(&mut snapshot.rows);
         let vectors = snapshot.column();
         let above = self.merging.clustered_above;
-        let shape = Shape::of(&snapshot.catalog, &rows, snapshot.tombstones.len(), above);
+        let tombstones = snapshot.tombstones.len();
+        let shape = Shape::of_column(&snapshot.catalog, &rows, &vectors, tombstones, above);
         let file = SegmentFile {
             position: snapshot.position,
             rows,

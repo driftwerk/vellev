@@ -156,11 +156,34 @@ pub(crate) struct Shape {
 impl Shape {
     /// Of a segment of `rows`, which have their vectors with them still.
     pub fn of(catalog: &Catalog, rows: &[Row], tombstones: usize, clustered_above: usize) -> Self {
+        let has = |row: usize| rows[row].object.vector.is_some();
+        Self::by(catalog, rows, has, tombstones, clustered_above)
+    }
+
+    /// Of a segment of `rows`, whose vectors are in `vectors` instead.
+    pub fn of_column(
+        catalog: &Catalog,
+        rows: &[Row],
+        vectors: &Column,
+        tombstones: usize,
+        clustered_above: usize,
+    ) -> Self {
+        let has = |row: usize| vectors.get(row).is_some();
+        Self::by(catalog, rows, has, tombstones, clustered_above)
+    }
+
+    fn by(
+        catalog: &Catalog,
+        rows: &[Row],
+        has: impl Fn(usize) -> bool,
+        tombstones: usize,
+        clustered_above: usize,
+    ) -> Self {
         Self {
             rows: rows.len(),
             tombstones,
-            clustered: clustered(catalog, rows, clustered_above),
-            vectors: rows.iter().any(|row| row.object.vector.is_some()),
+            clustered: clustered(catalog, rows, &has, clustered_above),
+            vectors: (0..rows.len()).any(&has),
         }
     }
 }
@@ -832,10 +855,15 @@ impl Threads {
 
 /// Whether indexing `rows` with `clustered_above` builds any clustered
 /// index, which is to say whether the segment has an index file.
-pub(crate) fn clustered(catalog: &Catalog, rows: &[Row], clustered_above: usize) -> bool {
+pub(crate) fn clustered(
+    catalog: &Catalog,
+    rows: &[Row],
+    has_vector: impl Fn(usize) -> bool,
+    clustered_above: usize,
+) -> bool {
     let mut counts: HashMap<CollectionId, usize> = HashMap::new();
-    for Row { collection, object } in rows {
-        if object.vector.is_some() && catalog.schema(*collection).is_some() {
+    for (row, Row { collection, .. }) in rows.iter().enumerate() {
+        if has_vector(row) && catalog.schema(*collection).is_some() {
             *counts.entry(*collection).or_default() += 1;
         }
     }
