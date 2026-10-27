@@ -53,14 +53,16 @@ fn main() {
         chunks.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
     println!("{} live rows, exact answers in {:.1?}", live.len(), started.elapsed());
+    let skipped = vec![false; rows];
+    for times in ["0.5", "2", "4"] {
+    std::env::set_var("SCRATCH_CLUSTERS_TIMES", times);
     let started = Instant::now();
     let index = ClusteredIndex::build(Distance::Cosine, &live).unwrap();
-    println!("built in {:.1?}: {} clusters, {} probes tuned", started.elapsed(), index.clusters(), index.probes());
+    println!("clusters x{times}: built in {:.1?}: {} clusters, {} probes tuned", started.elapsed(), index.clusters(), index.probes());
     let tuned = index.probes();
-    let skipped = vec![false; rows];
-    for multiple in [1usize, 2, 3, 4, 6, 8, 12, 16, 32] {
+    for multiple in [1usize, 2, 4, 6, 8, 12, 16] {
         let probing = index.clone().with_probes(tuned * multiple);
-        for budget in [1280usize, 5120] {
+        for budget in [1280usize] {
             let mut found = 0;
             let mut top1 = 0;
             let started = Instant::now();
@@ -81,5 +83,6 @@ fn main() {
                 each
             );
         }
+    }
     }
 }

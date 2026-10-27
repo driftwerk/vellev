@@ -491,7 +491,9 @@ impl<'a> Nearest<'a> {
 }
 
 fn clusters_for(count: usize) -> usize {
-    ((count as f64).sqrt() as usize).clamp(1, MOST_CLUSTERS.min(count))
+    // Scratch: a multiple of the usual count, for an experiment.
+    let times: f64 = std::env::var("SCRATCH_CLUSTERS_TIMES").ok().and_then(|t| t.parse().ok()).unwrap_or(1.0);
+    (((count as f64).sqrt() * times) as usize).clamp(1, (MOST_CLUSTERS * 4).min(count))
 }
 
 /// Which of `centroids` (laid out `width` values each) is nearest `vector`
