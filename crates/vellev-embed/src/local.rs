@@ -215,6 +215,8 @@ pub struct Local {
     jobs: mpsc::Sender<Job>,
     /// What the model's thread has lately done, for anyone.
     activity: Arc<Activity>,
+    /// The model's thread, joined on closing.
+    thread: std::thread::JoinHandle<()>,
 }
 
 impl Local {
@@ -276,7 +278,7 @@ impl Local {
         let name = model.to_string();
         let activity = Arc::new(Activity::timed_by(clock));
         let acts = activity.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name(format!("embed {model}"))
             .spawn(move || run(&name, load, &room, waiting, &acts))
             .map_err(|error| failure(model, format!("no thread to run it on: {error}")))?;
@@ -284,7 +286,21 @@ impl Local {
             model: model.to_string(),
             jobs,
             activity,
+            thread,
         })
+    }
+
+    /// Stops the model's thread once the jobs sent before are done, and
+    /// returns when the thread has ended: the model let go, and what it
+    /// kept on the thread, as ONNX Runtime's CUDA provider keeps its cuBLAS
+    /// handles. A process that is to end closes first: one that ends while
+    /// the thread is still letting go tears ONNX Runtime down under it,
+    /// which on CUDA crashed at exit.
+    pub async fn close(self) {
+        let Self { jobs, thread, .. } = self;
+        drop(jobs);
+        // A thread that panicked has ended too, which is all that is asked.
+        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
     }
 }
 
@@ -746,6 +762,87 @@ mod tests {
             model: "stand-in".into(),
             reason: reason.into(),
         }
+    }
+
+    /// A model that takes a while to let go of, as one on a GPU does, and
+    /// says when it has.
+    struct SlowToLetGo(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SlowToLetGo {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(300));
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // A process that ends while the model's thread is still letting go of
+    // the model tears ONNX Runtime down under it: on CUDA that crashed the
+    // fixture's embedder at exit. Closing waits until it is let go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_returns_only_once_the_model_is_let_go() {
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = gone.clone();
+        let load: Load = Box::new(move || {
+            let held = SlowToLetGo(flag.clone());
+            Ok(Box::new(move |texts: Vec<&str>| {
+                let _ = &held;
+                Ok(texts.iter().map(|_| vec![1.0_f32]).collect())
+            }) as Model)
+        });
+        let local = Local::spawn("stand-in", load, alone()).unwrap();
+        local
+            .embed(vec!["a".into()], Purpose::Document)
+            .await
+            .unwrap();
+        local.close().await;
+        assert!(
+            gone.load(std::sync::atomic::Ordering::SeqCst),
+            "the model is let go before closing returns"
+        );
+    }
+
+    thread_local! {
+        /// What a model leaves on its thread, as ONNX Runtime's CUDA
+        /// provider leaves its cuBLAS handles: let go only as the thread
+        /// itself ends.
+        static LEFT_ON_THE_THREAD: std::cell::RefCell<Option<SlowToLetGo>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // On CUDA what crashed at exit was not the session but the provider's
+    // handles kept per thread, let go only as the thread ended, after the
+    // model was. Closing waits for the thread to have ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_returns_only_once_the_models_thread_has_ended() {
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = gone.clone();
+        let load: Load = Box::new(move || {
+            let flag = flag.clone();
+            Ok(Box::new(move |texts: Vec<&str>| {
+                LEFT_ON_THE_THREAD
+                    .with(|left| *left.borrow_mut() = Some(SlowToLetGo(flag.clone())));
+                Ok(texts.iter().map(|_| vec![1.0_f32]).collect())
+            }) as Model)
+        });
+        let local = Local::spawn("stand-in", load, alone()).unwrap();
+        local
+            .embed(vec!["a".into()], Purpose::Document)
+            .await
+            .unwrap();
+        local.close().await;
+        assert!(
+            gone.load(std::sync::atomic::Ordering::SeqCst),
+            "what the model left on its thread is let go before closing returns"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_a_model_never_loaded_returns() {
+        let load: Load = Box::new(|| Err(failed("never asked to load")));
+        let local = Local::spawn("stand-in", load, alone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), local.close())
+            .await
+            .expect("closed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
