@@ -27,6 +27,8 @@ pub struct Plan {
     pub in_flight: usize,
     /// The longest a load may take to settle.
     pub settle_within: Duration,
+    /// Only each engine's default point, for the pull-request gate (§8).
+    pub defaults_only: bool,
     /// Concurrent queries in a burst (§4), and bursts of each size.
     pub burst_sizes: Vec<usize>,
     pub bursts: usize,
@@ -74,6 +76,10 @@ pub struct Measured {
 pub struct Burst {
     pub size: usize,
     pub bursts: usize,
+    /// Queries the engine turned away as busy (429 or 503), over the
+    /// repetitions: left out of the times, and published beside them.
+    pub refused: u64,
+    pub asked: u64,
     pub p50_ms: Repeated,
     pub p99_ms: Repeated,
     pub max_ms: Repeated,
@@ -185,7 +191,7 @@ pub async fn measure(
 ) -> Result<Vec<Measured>> {
     let mut measured = Vec::new();
     for &limit in &plan.limits {
-        for knob in engine.points(limit) {
+        for knob in points(engine, limit, plan.defaults_only) {
             engine.set(knob).await?;
             for &case in &plan.cases {
                 let started = Instant::now();
@@ -351,9 +357,10 @@ pub async fn hybrid(
     queries: &[Query],
     reference: &[Vec<u64>],
     reps: usize,
+    defaults_only: bool,
 ) -> Result<Vec<HybridPoint>> {
-    let mut points = Vec::new();
-    for knob in engine.points(10) {
+    let mut measured = Vec::new();
+    for knob in points(engine, 10, defaults_only) {
         engine.set(knob).await?;
         let (mut p50s, mut p99s) = (Vec::new(), Vec::new());
         let mut recall = Recall::default();
@@ -389,9 +396,19 @@ pub async fn hybrid(
             point.p50_ms.median,
             point.p99_ms.median
         );
-        points.push(point);
+        measured.push(point);
     }
-    Ok(points)
+    Ok(measured)
+}
+
+/// The knob points to measure at `limit`: all of them, or the default
+/// alone.
+fn points(engine: &dyn Engine, limit: usize, defaults_only: bool) -> Vec<Knob> {
+    let mut points = engine.points(limit);
+    if defaults_only {
+        points.truncate(1);
+    }
+    points
 }
 
 /// `count` bursts of `size` queries asked at once, the queries taken in
@@ -406,6 +423,7 @@ pub async fn burst(
     reps: usize,
 ) -> Result<Burst> {
     let (mut p50s, mut p99s, mut maxes) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut refused, mut asked_all) = (0u64, 0u64);
     let mut next = 0;
     for _ in 0..reps {
         let mut took = Vec::with_capacity(size * count);
@@ -417,14 +435,24 @@ pub async fn burst(
             let started = Instant::now();
             let answered =
                 futures::future::try_join_all(asked.into_iter().map(|query| async move {
-                    engine
-                        .nearest(&query.vector, Filter::of(case, query.owner), 10, knob)
-                        .await?;
-                    eyre::Ok(started.elapsed().as_secs_f64() * 1e3)
+                    let filter = Filter::of(case, query.owner);
+                    match engine.nearest(&query.vector, filter, 10, knob).await {
+                        Ok(_) => eyre::Ok(Some(started.elapsed().as_secs_f64() * 1e3)),
+                        Err(error) if error.downcast_ref::<crate::engine::Refused>().is_some() => {
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
                 }))
                 .await?;
-            took.extend(answered);
+            asked_all += answered.len() as u64;
+            refused += answered.iter().filter(|took| took.is_none()).count() as u64;
+            took.extend(answered.into_iter().flatten());
         }
+        ensure!(
+            !took.is_empty(),
+            "every query of {count} bursts of {size} was refused"
+        );
         p50s.push(percentile(&took, 50.0));
         p99s.push(percentile(&took, 99.0));
         maxes.push(percentile(&took, 100.0));
@@ -432,6 +460,8 @@ pub async fn burst(
     Ok(Burst {
         size,
         bursts: count,
+        refused,
+        asked: asked_all,
         p50_ms: Repeated::of(&p50s),
         p99_ms: Repeated::of(&p99s),
         max_ms: Repeated::of(&maxes),

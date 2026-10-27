@@ -124,7 +124,23 @@ impl Container {
         docker(&["start", &self.name]).map(|_| ())
     }
 
+    /// How the container stands, whether the kernel killed it for memory,
+    /// and the end of its log: what is printed when an engine fails.
     pub fn logs(&self) -> String {
+        let state = Command::new("docker")
+            .args(["inspect", "-f", "{{json .State}}", &self.name])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        let killed = Command::new("sh")
+            .args(["-c", "sudo dmesg 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -5"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        format!("state: {state}\nkernel: {killed}\n{}", self.log_tail())
+    }
+
+    fn log_tail(&self) -> String {
         Command::new("docker")
             .args(["logs", "--tail", "200", &self.name])
             .output()

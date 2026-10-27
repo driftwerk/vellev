@@ -9,6 +9,8 @@ name: Benchmark
 on:
   schedule:
     - cron: '30 3 * * *'
+    # Weaviate's tuned build, monthly beside the nightly defaults (§1).
+    - cron: '30 4 1 * *'
   workflow_dispatch:
     inputs:
       rows:
@@ -20,6 +22,15 @@ on:
         description: Weaviate's tuned build (maxConnections 64, efConstruction 256)
         type: boolean
         default: false
+      gate_only:
+        description: vellev alone at its defaults, the gate's checks only
+        type: boolean
+        default: false
+      only:
+        description: One engine alone, for a timing or a diagnosis (vellev or weaviate); both by default
+        type: string
+        default: ''
+
   pull_request:
     paths:
       - crates/vellev-bench/**
@@ -71,7 +82,7 @@ jobs:
             --fixture "$RUNNER_TEMP/fixture" --truth "$RUNNER_TEMP/fixture/truth/truth.jsonl" \
             --rows 5000 --out "$RUNNER_TEMP/results" --data "$RUNNER_TEMP/engines" \
             --vellev-image vellev:bench --weaviate-image "$WEAVIATE_IMAGE" --postgres-image "$POSTGRES_IMAGE" \
-            --reps 1 || status=$?
+            --reps 1 || true
           cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
           # The gate is not held on synthetic data: only a run that did not
           # finish fails here.
@@ -94,7 +105,11 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       ROWS: ${{ inputs.rows || '1000000' }}
-      TUNED: ${{ inputs.tuned && '--tuned' || '' }}
+      GATE_ONLY: ${{ inputs.gate_only && '--gate-only --limits 10' || '' }}
+      ONLY: ${{ inputs.only && format('--only {0}', inputs.only) || '' }}
+      TUNED: ${{ (inputs.tuned || github.event.schedule == '30 4 1 * *') && '--tuned' || '' }}
+    outputs:
+      gate: ${{ steps.gate.outputs.gate }}
     steps:
       - uses: actions/checkout@v5
       # The runner's preinstalled toolchains the job does not use (§7).
@@ -127,7 +142,7 @@ jobs:
           cd "$F/download"
           case "$ROWS" in
             1000000) parts="vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst"; truth=truth.jsonl ;;
-            100000) parts="vectors-passages-0.tar.zst"; truth=truth-100000.jsonl ;;
+            100000) parts="vectors-passages-0.tar.zst"; truth="truth-100000.jsonl" ;;
             *) echo "::error::no fixture slice of $ROWS rows"; exit 1 ;;
           esac
           wanted="ATTRIBUTION.md manifest.json passages.jsonl.zst queries.jsonl warmup.jsonl vectors-queries.tar.zst $truth.zst $parts"
@@ -172,9 +187,19 @@ jobs:
             --tenants "$RUNNER_TEMP/recall" \
             --out "$RUNNER_TEMP/results" --data "$RUNNER_TEMP/engines" \
             --vellev-image vellev:bench --weaviate-image "$WEAVIATE_IMAGE" --postgres-image "$POSTGRES_IMAGE" \
-            $TUNED 2>&1 | tee "$RUNNER_TEMP/run.log"
+            $TUNED $GATE_ONLY $ONLY 2>&1 | tee "$RUNNER_TEMP/run.log"
       - if: always()
         run: cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+      # Whether the hard gate held, failed, or was never reached.
+      - id: gate
+        if: always()
+        run: |
+          r="$RUNNER_TEMP/results/results.json"
+          if [ -f "$r" ]; then
+            echo "gate=$(jq -r 'if .gate.passed then "passed" else "failed" end' "$r")" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate=not-reached" >> "$GITHUB_OUTPUT"
+          fi
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -184,3 +209,64 @@ jobs:
             ${{ runner.temp }}/run.log
           retention-days: 90
           if-no-files-found: ignore
+
+  # Each night's grid appended to the benchmark-history branch (§7). Only
+  # this job may write, and only there: main's rulesets refuse it a push.
+  history:
+    name: History
+    needs: benchmark
+    if: always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.benchmark.outputs.gate != 'not-reached'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      soft: ${{ steps.append.outputs.soft }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: source
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: results
+      - name: Append to the history branch
+        id: append
+        run: |
+          set -euo pipefail
+          git config --global user.name "vellev benchmark"
+          git config --global user.email "benchmark@users.noreply.github.com"
+          if git ls-remote --exit-code --heads "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY" benchmark-history; then
+            git clone --branch benchmark-history --depth 50 "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY" history
+          else
+            git init -b benchmark-history history
+            git -C history remote add origin "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY"
+          fi
+          r=$(find results -name results.json | head -1)
+          found=$(python3 source/scripts/bench-fixture/history.py history "$r" "$(date -u +%F)" "$GITHUB_RUN_ID")
+          echo "$found"
+          echo "soft=$(echo "$found" | jq -r '.soft_gate_tripped')" >> "$GITHUB_OUTPUT"
+          git -C history add -A
+          git -C history commit -q -m "Benchmark of $(date -u +%F), run $GITHUB_RUN_ID"
+          git -C history push -q origin benchmark-history
+
+  # A failed hard gate opens an issue (§8); so does the soft gate, which
+  # never fails the run.
+  issues:
+    name: Issues
+    needs: [benchmark, history]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && (needs.benchmark.outputs.gate == 'failed' || needs.history.outputs.soft == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - if: needs.benchmark.outputs.gate == 'failed'
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Benchmark hard gate failed ($(date -u +%F))" \
+            --body "The nightly benchmark's hard gate failed: $RUN. The fix is a budget or code change through the same review as #93/#96 (design note, rule-first test, numbers); the default budget is never raised automatically."
+      - if: needs.history.outputs.soft == 'true'
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Benchmark soft gate: vellev's default p99 over its 7-day median ($(date -u +%F))" \
+            --body "vellev's default-setting p99 (broad, limit 10) is more than 25% over its 7-day rolling median: $RUN. This does not fail the run."
