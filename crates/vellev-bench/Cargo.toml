@@ -1,0 +1,20 @@
+[package]
+name = "vellev-bench"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+license = "FSL-1.1-ALv2"
+description = "The nightly benchmark of vellev against Weaviate at matched recall"
+
+[dependencies]
+clap.workspace = true
+eyre.workspace = true
+futures.workspace = true
+memmap2.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["time", "fs", "process"] }
+uuid.workspace = true

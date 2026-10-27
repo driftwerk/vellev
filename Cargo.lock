@@ -4295,6 +4295,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vellev-bench"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "eyre",
+ "futures",
+ "memmap2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "vellev-client"
 version = "0.2.0"
 dependencies = [

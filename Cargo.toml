@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vellev",
     "crates/vellev-api",
+    "crates/vellev-bench",
     "crates/vellev-client",
     "crates/vellev-core",
     "crates/vellev-embed",
