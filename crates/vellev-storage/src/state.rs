@@ -13,7 +13,7 @@ use vellev_index::vector::{BinaryIndex, Coded, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
-use crate::column::Column;
+use crate::column::{Column, Gathering};
 use crate::coordinator::LogPosition;
 use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
@@ -155,12 +155,36 @@ pub(crate) struct Shape {
 
 impl Shape {
     /// Of a segment of `rows`, which have their vectors with them still.
+    #[cfg(test)]
     pub fn of(catalog: &Catalog, rows: &[Row], tombstones: usize, clustered_above: usize) -> Self {
+        let has = |row: usize| rows[row].object.vector.is_some();
+        Self::by(catalog, rows, has, tombstones, clustered_above)
+    }
+
+    /// Of a segment of `rows`, whose vectors are in `vectors` instead.
+    pub fn of_column(
+        catalog: &Catalog,
+        rows: &[Row],
+        vectors: &Column,
+        tombstones: usize,
+        clustered_above: usize,
+    ) -> Self {
+        let has = |row: usize| vectors.get(row).is_some();
+        Self::by(catalog, rows, has, tombstones, clustered_above)
+    }
+
+    fn by(
+        catalog: &Catalog,
+        rows: &[Row],
+        has: impl Fn(usize) -> bool,
+        tombstones: usize,
+        clustered_above: usize,
+    ) -> Self {
         Self {
             rows: rows.len(),
             tombstones,
-            clustered: clustered(catalog, rows, clustered_above),
-            vectors: rows.iter().any(|row| row.object.vector.is_some()),
+            clustered: clustered(catalog, rows, &has, clustered_above),
+            vectors: (0..rows.len()).any(&has),
         }
     }
 }
@@ -633,11 +657,10 @@ pub(crate) struct Snapshot {
     pub catalog: Catalog,
     /// The rows taken, without their vectors, which are in `vectors`.
     pub rows: Vec<Row>,
-    /// The rows' vectors end to end, gathered once into the column the
+    /// The rows' vectors, gathered once into the frame of the column the
     /// flushed segment keeps, rather than copied with each row and gathered
-    /// again; and where each row's starts, with one offset past the last.
-    vectors: Vec<f32>,
-    offsets: Vec<u64>,
+    /// again.
+    vectors: Gathering,
     pub tombstones: Vec<RowKey>,
     /// Where each of `rows` lies in the memtable.
     at: Vec<usize>,
@@ -658,13 +681,10 @@ impl State {
 }
 
 impl Snapshot {
-    /// The taken rows' vectors as a column, taken out of the snapshot.
-    pub(crate) fn column(&mut self) -> Column {
-        let mut offsets = std::mem::take(&mut self.offsets);
-        if offsets.is_empty() {
-            offsets.push(0);
-        }
-        Column::of(std::mem::take(&mut self.vectors), offsets)
+    /// The taken rows' vectors as a column, stamped as format `version`,
+    /// taken out of the snapshot.
+    pub(crate) fn column(&mut self, version: u16) -> Column {
+        std::mem::replace(&mut self.vectors, Gathering::with_capacity(0, 0)).finish(version)
     }
 }
 
@@ -677,9 +697,8 @@ impl Snapshot {
             .iter()
             .enumerate()
             .map(|(n, row)| {
-                let (start, end) = (self.offsets[n] as usize, self.offsets[n + 1] as usize);
                 let mut row = row.clone();
-                row.object.vector = (start < end).then(|| self.vectors[start..end].to_vec());
+                row.object.vector = self.vectors.get(n).map(<[f32]>::to_vec);
                 row
             })
             .collect()
@@ -832,10 +851,15 @@ impl Threads {
 
 /// Whether indexing `rows` with `clustered_above` builds any clustered
 /// index, which is to say whether the segment has an index file.
-pub(crate) fn clustered(catalog: &Catalog, rows: &[Row], clustered_above: usize) -> bool {
+pub(crate) fn clustered(
+    catalog: &Catalog,
+    rows: &[Row],
+    has_vector: impl Fn(usize) -> bool,
+    clustered_above: usize,
+) -> bool {
     let mut counts: HashMap<CollectionId, usize> = HashMap::new();
-    for Row { collection, object } in rows {
-        if object.vector.is_some() && catalog.schema(*collection).is_some() {
+    for (row, Row { collection, .. }) in rows.iter().enumerate() {
+        if has_vector(row) && catalog.schema(*collection).is_some() {
             *counts.entry(*collection).or_default() += 1;
         }
     }
@@ -1571,23 +1595,46 @@ impl State {
     /// The segment that replaces `merge`'s run: their live rows, oldest
     /// first, and their tombstones if there is anything older left for the
     /// tombstones to act on. `position` is the one the rows are taken at.
-    pub(crate) fn merged(&self, merge: &Merge, position: LogPosition) -> Option<SegmentFile> {
+    /// The live rows of the run `merge` was planned over, without their
+    /// vectors, and those vectors gathered once into the merged segment's
+    /// column, sized exactly beforehand: not copied into each row and then
+    /// gathered again.
+    pub(crate) fn merged(
+        &self,
+        merge: &Merge,
+        position: LogPosition,
+    ) -> Option<(SegmentFile, Gathering)> {
         if !self.unchanged(merge) {
             return None;
         }
         let run = &self.segments[merge.run.clone()];
-        let rows: Vec<Row> = run
-            .iter()
-            .flat_map(|segment| {
-                (0..segment.file.rows.len())
-                    .filter(|row| !segment.dead[*row])
-                    .map(|row| {
-                        let mut copy = segment.file.rows[row].clone();
-                        copy.object.vector = segment.vectors.get(row).map(<[f32]>::to_vec);
-                        copy
-                    })
+        fn live(segment: &Segment) -> impl Iterator<Item = usize> + '_ {
+            (0..segment.file.rows.len()).filter(|row| !segment.dead[*row])
+        }
+        let (count, values) = run.iter().fold((0, 0), |(count, values), segment| {
+            live(segment).fold((count, values), |(count, values), row| {
+                (
+                    count + 1,
+                    values + segment.vectors.get(row).map_or(0, <[f32]>::len),
+                )
             })
-            .collect();
+        });
+        let mut rows: Vec<Row> = Vec::with_capacity(count);
+        let mut vectors = Gathering::with_capacity(values, count);
+        for segment in run {
+            for row in live(segment) {
+                let Row { collection, object } = &segment.file.rows[row];
+                vectors.push(segment.vectors.get(row));
+                rows.push(Row {
+                    collection: *collection,
+                    object: Object {
+                        id: object.id,
+                        properties: object.properties.clone(),
+                        vector: None,
+                    },
+                });
+            }
+        }
         let tombstones: Vec<RowKey> = match merge.run.start {
             0 => Vec::new(),
             _ => {
@@ -1598,11 +1645,12 @@ impl State {
                     .collect()
             }
         };
-        Some(SegmentFile {
+        let file = SegmentFile {
             position,
             rows,
             tombstones,
-        })
+        };
+        Some((file, vectors))
     }
 
     /// Whether the run `merge` was planned over is still the same
@@ -1713,15 +1761,13 @@ impl State {
                     .map_or(0, Vec::len)
             })
             .sum();
-        let mut offsets = Vec::with_capacity(at.len() + 1);
-        offsets.push(0);
+        let vectors = Gathering::with_capacity(values, at.len());
         Snapshot {
             position: self.position,
             checkpoint: self.checkpoint.clone(),
             catalog: self.catalog.clone(),
             rows: Vec::with_capacity(at.len()),
-            vectors: Vec::with_capacity(values),
-            offsets,
+            vectors,
             tombstones: self.memtable.tombstones.clone(),
             at,
             held: self.memtable.rows.len(),
@@ -1738,10 +1784,7 @@ impl State {
         let to = (from + most).min(snapshot.at.len());
         for &row in &snapshot.at[from..to] {
             let Row { collection, object } = &self.memtable.rows[row];
-            if let Some(vector) = &object.vector {
-                snapshot.vectors.extend_from_slice(vector);
-            }
-            snapshot.offsets.push(snapshot.vectors.len() as u64);
+            snapshot.vectors.push(object.vector.as_deref());
             snapshot.rows.push(Row {
                 collection: *collection,
                 object: Object {
@@ -2265,7 +2308,10 @@ mod tests {
             let Some(plan) = self.state.merge_plan(&merging) else {
                 return false;
             };
-            let file = self.state.merged(&plan, self.state.position()).unwrap();
+            let (mut file, gathered) = self.state.merged(&plan, self.state.position()).unwrap();
+            for (row, at) in file.rows.iter_mut().zip(0..) {
+                row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
+            }
             let catalog = self.state.catalog().clone();
             let fit = self.fit(file, &catalog);
             self.state.compacted(&plan, fit);

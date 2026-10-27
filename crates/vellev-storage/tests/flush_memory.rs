@@ -1,4 +1,5 @@
-//! What a flush holds in memory while it runs (vellev memory note, fix 2).
+//! What a flush or a merge holds in memory while it runs (vellev memory
+//! note, fixes 2 and 4).
 //!
 //! A flush of a memtable of N rows of d-dimensional vectors writes them to
 //! a segment. It used to copy every memtable row, vector and properties,
@@ -84,6 +85,9 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static COUNTING: Counting = Counting::new();
 
+/// One measurement at a time: the count is the whole process's.
+static ALONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const ROWS: usize = 20_000;
 const DIMENSIONS: usize = 768;
 
@@ -103,8 +107,15 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
     (cluster, writer)
 }
 
+/// What a flush may hold for each row besides vectors: the row itself
+/// without its vector, its codes and index entries, and its part of the
+/// segment's encoded file, all of which the segment keeps or writes. A
+/// row of a few properties takes well under this.
+const PER_ROW: usize = 2 * 1024;
+
 #[tokio::test(flavor = "current_thread")]
-async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
+async fn a_flush_holds_its_vectors_once() {
+    let _alone = ALONE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
     writer.commit(vec![wide("docs")]).await.unwrap();
@@ -114,10 +125,9 @@ async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
             .map(|n| Mutation::Upsert {
                 collection: name("docs"),
                 id: ObjectId::generate(),
-                properties: json!({ "title": format!("row {}", batch * 500 + n), "n": n })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
+                // Little besides the vector, so that what is measured is
+                // what becomes of the vectors.
+                properties: json!({ "n": batch * 500 + n }).as_object().unwrap().clone(),
                 vector: Some(random.vector(DIMENSIONS)),
                 only_if_version: None,
             })
@@ -125,6 +135,8 @@ async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
         writer.commit(rows).await.unwrap();
     }
     let vectors = ROWS * DIMENSIONS * 4;
+    // The column the segment keeps, which is its encoded frame too.
+    let allowed = vectors + ROWS * PER_ROW;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.flush().await.unwrap();
@@ -134,8 +146,59 @@ async fn a_flush_holds_its_vectors_no_more_than_twice_over() {
         held as f64 / vectors as f64
     );
     assert!(
-        held * 4 <= vectors * 9,
-        "a flush held {held} bytes at its peak, {:.2} times its vectors' {vectors}",
+        held <= allowed,
+        "a flush held {held} bytes at its peak, {:.2} times its vectors' {vectors}; it may hold {allowed}",
+        held as f64 / vectors as f64
+    );
+}
+
+/// A merge of the segments of `segments` flushes of `ROWS / segments` rows.
+async fn merged_peak(segments: usize) -> (usize, usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_cluster, writer) = on_disk(dir.path()).await;
+    let writer = writer.merging_with(vellev_storage::Merging {
+        fanout: segments,
+        ..vellev_storage::Merging::default()
+    });
+    writer.commit(vec![wide("docs")]).await.unwrap();
+    let mut random = Random(11);
+    for segment in 0..segments {
+        for batch in 0..ROWS / segments / 500 {
+            let rows = (0..500)
+                .map(|n| Mutation::Upsert {
+                    collection: name("docs"),
+                    id: ObjectId::generate(),
+                    properties: json!({ "n": segment * ROWS + batch * 500 + n })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    vector: Some(random.vector(DIMENSIONS)),
+                    only_if_version: None,
+                })
+                .collect();
+            writer.commit(rows).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+    }
+    COUNTING.reset_peak();
+    let before = COUNTING.now();
+    writer.merge().await.unwrap().expect("the segments merge");
+    (COUNTING.peak() - before, ROWS * DIMENSIONS * 4)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_merge_holds_its_vectors_once() {
+    let _alone = ALONE.lock().await;
+    let (held, vectors) = merged_peak(4).await;
+    // The merged segment's column, which is its encoded frame too.
+    let allowed = vectors + ROWS * PER_ROW;
+    eprintln!(
+        "a merge of {ROWS} rows held {:.2} times its vectors at its peak",
+        held as f64 / vectors as f64
+    );
+    assert!(
+        held <= allowed,
+        "a merge held {held} bytes at its peak, {:.2} times its vectors' {vectors}; it may hold {allowed}",
         held as f64 / vectors as f64
     );
 }

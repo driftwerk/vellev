@@ -2152,9 +2152,10 @@ impl Writer {
         }
         let names = self.named(named_at, "");
         let rows = std::mem::take(&mut snapshot.rows);
-        let vectors = snapshot.column();
+        let vectors = snapshot.column(self.writes());
         let above = self.merging.clustered_above;
-        let shape = Shape::of(&snapshot.catalog, &rows, snapshot.tombstones.len(), above);
+        let tombstones = snapshot.tombstones.len();
+        let shape = Shape::of_column(&snapshot.catalog, &rows, &vectors, tombstones, above);
         let file = SegmentFile {
             position: snapshot.position,
             rows,
@@ -2317,16 +2318,18 @@ impl Writer {
             return Ok(None);
         };
         let above = self.merging.clustered_above;
-        let Some((file, shape, named_at)) = self.partition.read(|state| {
+        let Some((file, vectors, shape, named_at)) = self.partition.read(|state| {
             let named_at = state.position();
-            let file = state.merged(&merge, named_at)?;
-            let shape = Shape::of(state.catalog(), &file.rows, file.tombstones.len(), above);
-            Some((file, shape, named_at))
+            let (file, gathered) = state.merged(&merge, named_at)?;
+            let vectors = gathered.finish(self.writes());
+            let tombstones = file.tombstones.len();
+            let shape = Shape::of_column(state.catalog(), &file.rows, &vectors, tombstones, above);
+            Some((file, vectors, shape, named_at))
         }) else {
             return Ok(None);
         };
         let catalog = self.partition.read(|state| state.catalog().clone());
-        let built = self.built(file, None, catalog.clone()).await?;
+        let built = self.built(file, Some(vectors), catalog.clone()).await?;
         // Both segments, however large, are uploaded without the writer,
         // under names of their own at the position each was built from;
         // see `clean` for why nothing deletes them first.
