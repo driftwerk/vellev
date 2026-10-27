@@ -181,10 +181,14 @@ enum Canary {
     /// link that names it (DW-668, S3).
     SpillAfterLink,
     /// The coordinator takes a run's note or stall whatever base it names
-    /// and whatever it saw the run shipped to, as the run under way's, and
-    /// gives it the commits after what it saw whatever the run has shipped
-    /// since: a stale run is not fenced (DW-668, S5).
+    /// and whatever it saw the run shipped to, as the run under way's: a
+    /// stale run's writes are not fenced (DW-668, S5).
     StaleRunWrites,
+    /// The coordinator gives a run the commits after what it saw, whatever
+    /// the run has shipped since or whatever its base: a stale run's read
+    /// is not fenced, and what has been forgotten since is not seen to be
+    /// (DW-668).
+    StaleRunReads,
 }
 
 #[derive(Debug, Default)]
@@ -1406,7 +1410,7 @@ impl Coordinator for SimCoordinator {
     ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
         let mut rows = match self.canary {
             // Unfenced, a stale run is given the rows after what it saw.
-            Some(Canary::StaleRunWrites) => {
+            Some(Canary::StaleRunReads) => {
                 let after = seen.unwrap_or(LogPosition(base.0.saturating_sub(1)));
                 self.clean
                     .commits_after(key, incarnation, after, limit)
@@ -4859,6 +4863,11 @@ fn the_checker_passes_healthy_shipping_and_catches_a_broken_backup() {
     assert!(capped.contains("PR 6:"), "{capped}");
     let shifted = caught_shipping(Canary::ShiftsCommitTimes);
     assert!(shifted.contains("I1:"), "{shifted}");
+    // A stale run's read unfenced links a commit over rows forgotten since,
+    // on one that is not the one before it: the run under way meets it as
+    // a fork.
+    let read = caught_shipping(Canary::StaleRunReads);
+    assert!(read.contains("the run's record is stalled"), "{read}");
     // A stale run unfenced stalls the run under way, as the fork it meets
     // at the new run's base is taken for the new run's.
     let stale = caught_shipping(Canary::StaleRunWrites);
