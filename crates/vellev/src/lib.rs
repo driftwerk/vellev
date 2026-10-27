@@ -1,5 +1,6 @@
 //! The vellev node: its HTTP API over the tenants it writes for.
 
+pub mod allocator;
 mod api;
 pub mod config;
 pub mod identity;
