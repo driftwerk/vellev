@@ -306,6 +306,11 @@ fn class_vector(given: &str) -> Result<(String, String)> {
     Ok((class.to_string(), vector.to_string()))
 }
 
+/// jemalloc, which gives back what flushes and merges free: see
+/// [`vellev::allocator`].
+#[global_allocator]
+static GLOBAL: vellev::allocator::Allocator = vellev::allocator::Allocator::new();
+
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     match Cli::parse().command {
