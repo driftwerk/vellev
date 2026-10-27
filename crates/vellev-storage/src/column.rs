@@ -99,6 +99,11 @@ impl Gathering {
         self.offsets.push(self.values as u64);
     }
 
+    /// Whether row `row` has a vector.
+    pub fn has(&self, row: usize) -> bool {
+        matches!((self.offsets.get(row), self.offsets.get(row + 1)), (Some(start), Some(end)) if start < end)
+    }
+
     /// The vector of row `row` as gathered so far.
     #[cfg(test)]
     pub fn get(&self, row: usize) -> Option<&[f32]> {
@@ -497,6 +502,56 @@ mod tests {
                 vector,
             },
         }
+    }
+
+    /// Rows of every kind a column holds: with a vector, with none, and
+    /// with an empty one.
+    fn mixed() -> Vec<Option<Vec<f32>>> {
+        vec![
+            Some(vec![1.0, 2.0]),
+            None,
+            Some(vec![3.0, -4.5, 5.25]),
+            Some(vec![]),
+            Some(vec![f32::MIN_POSITIVE, f32::MAX]),
+        ]
+    }
+
+    fn gathered(vectors: &[Option<Vec<f32>>]) -> Column {
+        let values = vectors.iter().flatten().map(Vec::len).sum();
+        let mut gathering = Gathering::with_capacity(values, vectors.len());
+        for vector in vectors {
+            gathering.push(vector.as_deref());
+        }
+        gathering.finish(format::FORMAT_VERSION)
+    }
+
+    #[test]
+    fn a_frame_gathered_in_place_is_the_frame_a_column_encodes_byte_for_byte() {
+        let vectors = mixed();
+        let mut rows: Vec<Row> = vectors.iter().cloned().map(row).collect();
+        let column = Column::taken_from(&mut rows);
+        let gathered = gathered(&vectors);
+        assert_eq!(
+            gathered.encode_as(format::FORMAT_VERSION),
+            column.encode_as(format::FORMAT_VERSION)
+        );
+        for (n, vector) in vectors.iter().enumerate() {
+            let expected = vector.as_deref().filter(|vector| !vector.is_empty());
+            assert_eq!(gathered.get(n), expected, "row {n}");
+        }
+    }
+
+    #[test]
+    fn a_gathered_frame_asked_for_as_another_version_is_encoded_afresh() {
+        let vectors = mixed();
+        let mut rows: Vec<Row> = vectors.iter().cloned().map(row).collect();
+        let column = Column::taken_from(&mut rows);
+        let gathered = gathered(&vectors);
+        let older = format::FORMAT_VERSION - 1;
+        let afresh = gathered.encode_as(older);
+        assert_eq!(afresh, column.encode_as(older));
+        assert_ne!(afresh, gathered.encode_as(format::FORMAT_VERSION));
+        assert!(format::verify("k", &afresh).is_ok());
     }
 
     #[test]

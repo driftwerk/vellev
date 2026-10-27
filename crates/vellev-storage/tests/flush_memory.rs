@@ -88,7 +88,11 @@ static COUNTING: Counting = Counting::new();
 /// One measurement at a time: the count is the whole process's.
 static ALONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-const ROWS: usize = 20_000;
+/// Rows flushed or merged: two counts, so that what is held whatever the
+/// rows (coding's sample of rotated vectors and its rotation, say) falls
+/// out of the difference.
+const FEWER: usize = 10_000;
+const MORE: usize = 20_000;
 /// The width measured, and one so narrow that its vectors cost next to
 /// nothing: the difference between their peaks is what the vectors cost,
 /// whatever each row costs besides.
@@ -111,8 +115,7 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
     (cluster, writer)
 }
 
-/// Commit `rows` rows of `dimensions`, numbered from `first`, with little
-/// besides their vectors.
+/// Commit `rows` rows of `dimensions`, numbered from `first`.
 async fn committed(
     writer: &Writer,
     random: &mut Random,
@@ -125,7 +128,10 @@ async fn committed(
             .map(|n| Mutation::Upsert {
                 collection: name("docs"),
                 id: ObjectId::generate(),
-                properties: json!({ "n": first + n }).as_object().unwrap().clone(),
+                properties: json!({ "title": format!("row {}", first + n), "n": first + n })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
                 vector: Some(random.vector(dimensions)),
                 only_if_version: None,
             })
@@ -134,22 +140,22 @@ async fn committed(
     }
 }
 
-/// What a flush of `ROWS` rows of `dimensions` holds at its peak beyond
+/// What a flush of `rows` rows of `dimensions` holds at its peak beyond
 /// what was held before it.
-async fn flush_peak(dimensions: usize) -> usize {
+async fn flush_peak(rows: usize, dimensions: usize) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
     writer.commit(vec![collection(dimensions)]).await.unwrap();
-    committed(&writer, &mut Random(7), 0, ROWS, dimensions).await;
+    committed(&writer, &mut Random(7), 0, rows, dimensions).await;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.flush().await.unwrap();
     COUNTING.peak() - before
 }
 
-/// What a merge of four flushed segments of `ROWS` rows in all, of
+/// What a merge of four flushed segments of `rows` rows in all, of
 /// `dimensions`, holds at its peak beyond what was held before it.
-async fn merge_peak(dimensions: usize) -> usize {
+async fn merge_peak(rows: usize, dimensions: usize) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
     let writer = writer.merging_with(vellev_storage::Merging {
@@ -159,7 +165,7 @@ async fn merge_peak(dimensions: usize) -> usize {
     writer.commit(vec![collection(dimensions)]).await.unwrap();
     let mut random = Random(11);
     for segment in 0..4 {
-        committed(&writer, &mut random, segment * ROWS, ROWS / 4, dimensions).await;
+        committed(&writer, &mut random, segment * rows, rows / 4, dimensions).await;
         writer.flush().await.unwrap();
     }
     COUNTING.reset_peak();
@@ -168,40 +174,41 @@ async fn merge_peak(dimensions: usize) -> usize {
     COUNTING.peak() - before
 }
 
-/// What coding a layer's vectors holds whatever the rows: the sample of
-/// rotated vectors its centre is taken from, and the rotation itself, at
-/// their widest about 17 MiB at 768 dimensions.
-const CODING: usize = 32 * 1024 * 1024;
-
-/// Hold the vectors' share of `wide` against `copies` copies of the
-/// vectors, with a tenth of one for what else grows with the width, and
-/// what coding holds whatever the rows.
-fn held_to(what: &str, wide: usize, narrow: usize, copies: usize) {
-    let vectors = ROWS * (WIDE - NARROW) * 4;
-    let theirs = wide.saturating_sub(narrow).saturating_sub(CODING);
+/// Hold what a further row's vector costs at the peak against `copies`
+/// copies of it, with a tenth of one for what else grows with the width:
+/// the slope between `FEWER` and `MORE` rows of what the wide peak holds
+/// over the narrow, in which whatever is held whatever the rows cancels.
+async fn held_to<F, P>(what: &str, peak: F, copies: usize)
+where
+    F: Fn(usize, usize) -> P,
+    P: std::future::Future<Output = usize>,
+{
+    let theirs = |wide: usize, narrow: usize| wide as f64 - narrow as f64;
+    let fewer = theirs(peak(FEWER, WIDE).await, peak(FEWER, NARROW).await);
+    let more = theirs(peak(MORE, WIDE).await, peak(MORE, NARROW).await);
+    let per_row = (more - fewer) / (MORE - FEWER) as f64;
+    let vector = ((WIDE - NARROW) * 4) as f64;
     eprintln!(
-        "{what} of {ROWS} rows held {:.2} times its vectors' worth for them ({wide} bytes at {WIDE} dimensions, {narrow} at {NARROW})",
-        theirs as f64 / vectors as f64
+        "{what} held {:.2} times each further row's vector at its peak ({per_row:.0} bytes a row)",
+        per_row / vector
     );
     assert!(
-        theirs * 10 <= vectors * (10 * copies + 1),
-        "{what} held {theirs} bytes for its vectors at its peak, {:.2} times their {vectors}",
-        theirs as f64 / vectors as f64
+        per_row <= vector * (copies as f64 + 0.1),
+        "{what} held {per_row:.0} bytes for each further row's vector at its peak, {:.2} times its {vector}",
+        per_row / vector
     );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_flush_holds_its_vectors_once() {
     let _alone = ALONE.lock().await;
-    let (wide, narrow) = (flush_peak(WIDE).await, flush_peak(NARROW).await);
     // The column the segment keeps, which is its encoded frame too.
-    held_to("a flush", wide, narrow, 1);
+    held_to("a flush", flush_peak, 1).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_merge_holds_its_vectors_once() {
     let _alone = ALONE.lock().await;
-    let (wide, narrow) = (merge_peak(WIDE).await, merge_peak(NARROW).await);
     // The merged segment's column, which is its encoded frame too.
-    held_to("a merge", wide, narrow, 1);
+    held_to("a merge", merge_peak, 1).await;
 }

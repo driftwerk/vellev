@@ -161,15 +161,15 @@ impl Shape {
         Self::by(catalog, rows, has, tombstones, clustered_above)
     }
 
-    /// Of a segment of `rows`, whose vectors are in `vectors` instead.
-    pub fn of_column(
+    /// Of a segment of `rows`, whose vectors are gathered in `vectors`.
+    pub fn of_gathered(
         catalog: &Catalog,
         rows: &[Row],
-        vectors: &Column,
+        vectors: &Gathering,
         tombstones: usize,
         clustered_above: usize,
     ) -> Self {
-        let has = |row: usize| vectors.get(row).is_some();
+        let has = |row: usize| vectors.has(row);
         Self::by(catalog, rows, has, tombstones, clustered_above)
     }
 
@@ -681,10 +681,10 @@ impl State {
 }
 
 impl Snapshot {
-    /// The taken rows' vectors as a column, stamped as format `version`,
-    /// taken out of the snapshot.
-    pub(crate) fn column(&mut self, version: u16) -> Column {
-        std::mem::replace(&mut self.vectors, Gathering::with_capacity(0, 0)).finish(version)
+    /// The taken rows' vectors as gathered, taken out of the snapshot, to
+    /// be sealed into their column where nothing waits on it.
+    pub(crate) fn gathered(&mut self) -> Gathering {
+        std::mem::replace(&mut self.vectors, Gathering::with_capacity(0, 0))
     }
 }
 
