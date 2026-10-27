@@ -786,7 +786,7 @@ mod tests {
             let held = SlowToLetGo(flag.clone());
             Ok(Box::new(move |texts: Vec<&str>| {
                 let _ = &held;
-                Ok(texts.iter().map(|_| vec![1.0]).collect())
+                Ok(texts.iter().map(|_| vec![1.0_f32]).collect())
             }) as Model)
         });
         let local = Local::spawn("stand-in", load, alone()).unwrap();
@@ -821,7 +821,7 @@ mod tests {
             Ok(Box::new(move |texts: Vec<&str>| {
                 LEFT_ON_THE_THREAD
                     .with(|left| *left.borrow_mut() = Some(SlowToLetGo(flag.clone())));
-                Ok(texts.iter().map(|_| vec![1.0]).collect())
+                Ok(texts.iter().map(|_| vec![1.0_f32]).collect())
             }) as Model)
         });
         let local = Local::spawn("stand-in", load, alone()).unwrap();
