@@ -542,14 +542,23 @@ impl Coordinator for Unreliable {
         seen: Option<vellev_storage::coordinator::LogPosition>,
         limit: usize,
     ) -> Result<Vec<vellev_storage::coordinator::RestorePoint>, CoordinatorError> {
-        let re_base = self.re_base.lock().unwrap().take();
-        if let Some(base) = re_base {
-            self.inner.record_base(key, incarnation, &base).await?;
-        }
         let rows = self
             .inner
             .commits_to_ship(key, incarnation, base, seen, limit)
             .await?;
+        // The run moves just after the read, fenced as it is on the run as
+        // read: before it, the read itself is refused, and the fences on a
+        // batch's note and stall would go untested.
+        let re_base = self.re_base.lock().unwrap().take();
+        if let Some(raised) = re_base {
+            self.inner.record_base(key, incarnation, &raised).await?;
+        }
+        let shipped_on = self.shipped_on.lock().unwrap().take();
+        if let Some(position) = shipped_on {
+            self.inner
+                .note_shipped(key, incarnation, base, position)
+                .await?;
+        }
         let given = self.rows.lock().unwrap();
         Ok(rows
             .into_iter()
