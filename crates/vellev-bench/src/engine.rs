@@ -102,8 +102,26 @@ fn client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+/// A request the engine turned away as too busy (429 or 503), rather than
+/// failed: counted in a burst, not taken as the run failing.
+#[derive(Debug, thiserror::Error)]
+#[error("{what}: refused as busy, {status}")]
+pub struct Refused {
+    pub what: String,
+    pub status: reqwest::StatusCode,
+}
+
 async fn answered(response: reqwest::Response, what: &str) -> Result<Value> {
     let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return Err(Refused {
+            what: what.into(),
+            status,
+        }
+        .into());
+    }
     let text = response.text().await?;
     ensure!(
         status.is_success(),

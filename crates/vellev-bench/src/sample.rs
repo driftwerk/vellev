@@ -88,6 +88,12 @@ pub struct Sampler {
     task: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl Sampler {
     /// Sample the containers whose cgroups are `cgroups` and the disk
     /// holding `disk`, starting in `phase`. A container restarted keeps
@@ -99,12 +105,22 @@ impl Sampler {
         let task = {
             let (phase, phases, last) = (phase.clone(), phases.clone(), last.clone());
             tokio::spawn(async move {
+                let mut tick: u64 = 0;
                 loop {
+                    tick += 1;
                     // A container between a stop and a start has no cgroup
                     // to read: that second is not counted.
                     if let Ok(reading) = read(&cgroups, &disk) {
                         *last.lock().expect("last") = reading;
                         let name = phase.lock().expect("phase").clone();
+                        if tick.is_multiple_of(30) {
+                            eprintln!(
+                                "memory ({name}): anon {:.0} MiB, file cache {:.0} MiB; disk used {:.1} GiB",
+                                reading.anon as f64 / 1048576.0,
+                                reading.file as f64 / 1048576.0,
+                                reading.disk_used as f64 / 1073741824.0
+                            );
+                        }
                         let mut phases = phases.lock().expect("phases");
                         let seen = phases.entry(name).or_default();
                         seen.anon_peak = seen.anon_peak.max(reading.anon);
@@ -134,7 +150,8 @@ impl Sampler {
 
     pub fn stop(self) -> BTreeMap<String, PhaseMemory> {
         self.task.abort();
-        self.phases.lock().expect("phases").clone()
+        let phases = self.phases.lock().expect("phases").clone();
+        phases
     }
 }
 

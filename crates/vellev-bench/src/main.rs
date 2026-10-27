@@ -571,7 +571,7 @@ fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
             ));
         }
     }
-    out.push_str("\n### Bursts at each engine's matched point (broad, limit 10, 0.99)\n\n| Engine | Point | Size | p50 ms | p99 ms | max ms |\n|---|---|---|---|---|---|\n");
+    out.push_str("\n### Bursts at each engine's matched point (broad, limit 10, 0.99)\n\nQueries an engine turned away as busy (429 or 503) are left out of the times and counted beside them.\n\n| Engine | Point | Size | p50 ms | p99 ms | max ms | refused |\n|---|---|---|---|---|---|---|\n");
     for m in matches
         .iter()
         .filter(|m| m.case == Case::Broad && m.target == 0.99)
@@ -579,13 +579,15 @@ fn resources(runs: &[(&str, &EngineRun)], matches: &[report::Match]) -> String {
         if let Some(point) = &m.point {
             for burst in &point.bursts {
                 out.push_str(&format!(
-                    "| {} | {} | {} | {:.2} | {:.2} | {:.2} |\n",
+                    "| {} | {} | {} | {:.2} | {:.2} | {:.2} | {} of {} |\n",
                     m.engine,
                     point.label,
                     burst.size,
                     burst.p50_ms.median,
                     burst.p99_ms.median,
-                    burst.max_ms.median
+                    burst.max_ms.median,
+                    burst.refused,
+                    burst.asked
                 ));
             }
         }

@@ -22,6 +22,10 @@ on:
         description: Weaviate's tuned build (maxConnections 64, efConstruction 256)
         type: boolean
         default: false
+      gate_only:
+        description: vellev alone at its defaults, the gate's checks only
+        type: boolean
+        default: false
   pull_request:
     paths:
       - crates/vellev-bench/**
@@ -96,6 +100,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       ROWS: ${{ inputs.rows || '1000000' }}
+      GATE_ONLY: ${{ inputs.gate_only && '--gate-only --limits 10' || '' }}
       TUNED: ${{ (inputs.tuned || github.event.schedule == '30 4 1 * *') && '--tuned' || '' }}
     outputs:
       gate: ${{ steps.gate.outputs.gate }}
@@ -131,7 +136,7 @@ jobs:
           cd "$F/download"
           case "$ROWS" in
             1000000) parts="vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst"; truth=truth.jsonl ;;
-            100000) parts="vectors-passages-0.tar.zst"; truth=truth-100000.jsonl ;;
+            100000) parts="vectors-passages-0.tar.zst"; truth="truth-100000.jsonl" ;;
             *) echo "::error::no fixture slice of $ROWS rows"; exit 1 ;;
           esac
           wanted="ATTRIBUTION.md manifest.json passages.jsonl.zst queries.jsonl warmup.jsonl vectors-queries.tar.zst $truth.zst $parts"
@@ -176,7 +181,7 @@ jobs:
             --tenants "$RUNNER_TEMP/recall" \
             --out "$RUNNER_TEMP/results" --data "$RUNNER_TEMP/engines" \
             --vellev-image vellev:bench --weaviate-image "$WEAVIATE_IMAGE" --postgres-image "$POSTGRES_IMAGE" \
-            $TUNED 2>&1 | tee "$RUNNER_TEMP/run.log"
+            $TUNED $GATE_ONLY 2>&1 | tee "$RUNNER_TEMP/run.log"
       - if: always()
         run: cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
       # Whether the hard gate held, failed, or was never reached.
