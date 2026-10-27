@@ -401,6 +401,19 @@ pub(crate) fn framed(
     frame
 }
 
+/// Write the header of `frame`, whose body is in place after it already:
+/// for a frame gathered where it is to be read, which nothing copies.
+pub(crate) fn seal(kind: Kind, version: u16, frame: &mut [u8]) {
+    let length = (frame.len() - HEADER) as u64;
+    frame[..MAGIC.len()].copy_from_slice(&MAGIC);
+    frame[4] = kind as u8;
+    frame[5..7].copy_from_slice(&version.to_le_bytes());
+    frame[7..15].copy_from_slice(&length.to_le_bytes());
+    let (header, body) = frame.split_at(HEADER);
+    let checksum = checksum(&header[MAGIC.len()..HEADER - 4], body).to_le_bytes();
+    frame[HEADER - 4..HEADER].copy_from_slice(&checksum);
+}
+
 /// Where a frame's body starts.
 pub(crate) const BODY: usize = HEADER;
 
