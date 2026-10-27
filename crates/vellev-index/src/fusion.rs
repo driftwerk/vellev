@@ -83,11 +83,43 @@ pub fn fuse<K: Copy + Ord + std::hash::Hash>(
     by_wording: &[(K, f32)],
     limit: usize,
 ) -> Vec<Fused<K>> {
-    todo!(
-        "{fusion:?} {alpha} {} {} {limit}",
-        by_meaning.len(),
-        by_wording.len()
-    )
+    let nearness: Vec<f32> = by_meaning.iter().map(|(_, value)| *value).collect();
+    let wording: Vec<f32> = by_wording.iter().map(|(_, value)| *value).collect();
+    let meant = by_meaning
+        .iter()
+        .zip(fusion.shares(alpha, &nearness))
+        .map(|(&(key, value), share)| (key, share, Some(value), None));
+    let worded = by_wording
+        .iter()
+        .zip(fusion.shares(1.0 - alpha, &wording))
+        .map(|(&(key, value), share)| (key, share, None, Some(value)));
+    let mut fused: Vec<Fused<K>> = meant
+        .chain(worded)
+        .fold(
+            std::collections::HashMap::<K, Fused<K>>::new(),
+            |mut fused, (key, share, nearness, keyword)| {
+                let entry = fused.entry(key).or_insert(Fused {
+                    key,
+                    score: 0.0,
+                    nearness: None,
+                    keyword: None,
+                });
+                entry.score += share;
+                entry.nearness = nearness.or(entry.nearness);
+                entry.keyword = keyword.or(entry.keyword);
+                fused
+            },
+        )
+        .into_values()
+        .collect();
+    fused.sort_unstable_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(b.second().total_cmp(&a.second()))
+            .then(a.key.cmp(&b.key))
+    });
+    fused.truncate(limit);
+    fused
 }
 
 /// `value` as a number that can be subtracted from any other: within what
