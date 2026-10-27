@@ -179,9 +179,11 @@ pub struct Settings {
     /// The most tenants the node keeps in that list, and opens as it
     /// starts.
     pub warm_most: usize,
-    /// The newest file format this node may write, whatever every node
-    /// reads. A release that adds a format keeps this at the one before,
-    /// so that rolling back stays possible until an operator raises it.
+    /// The newest file format this node raises the cluster's to, whatever
+    /// every node reads. A release that adds a format keeps this at the one
+    /// before, so that rolling back stays possible until an operator raises
+    /// it. Once the cluster writes a format, raised by any node, this node
+    /// writes it too, as far as it reads it.
     pub max_format: u16,
     /// How long a tenant this node writes for is kept unused before it is
     /// let go, its memory given back and its lease left for any node.
@@ -1190,6 +1192,16 @@ struct Inner {
     /// The newest file format the cluster was seen to write; it never
     /// falls.
     cluster_format: AtomicU16,
+    /// The format every writer this node opens writes: the cluster's, as
+    /// far as this release reads it. 0 until the cluster's is first seen,
+    /// which a writer takes as format 1. It never falls.
+    ///
+    /// `max_format` bounds how far this node raises the cluster's format,
+    /// not what it writes once the cluster writes a format: that rose only
+    /// as every node registered read it, so each can read what any writes,
+    /// and a node that wrote older would fail to checkpoint a tenant
+    /// another had given what only the newer format holds.
+    writes_format: Arc<AtomicU16>,
     /// Flushes failed and writes refused for them, on every tenant.
     flushing: Arc<FlushCounts>,
     /// The warm list, and the warming that reads it.
@@ -1249,6 +1261,7 @@ impl Node {
             copies_opened: AtomicU64::new(0),
             dropped: Mutex::default(),
             cluster_format: AtomicU16::new(0),
+            writes_format: Arc::new(AtomicU16::new(0)),
             flushing: Arc::default(),
             warm: warm::Warm::default(),
             limits: Arc::new(Limits::new(
@@ -1649,6 +1662,8 @@ impl Inner {
     /// time it is newer than this release reads.
     fn saw_format(&self, format: u16) {
         let before = self.cluster_format.fetch_max(format, Ordering::SeqCst);
+        self.writes_format
+            .fetch_max(format.min(FORMAT_VERSION), Ordering::SeqCst);
         if format > FORMAT_VERSION && before <= FORMAT_VERSION {
             tracing::error!(
                 cluster = format,
@@ -1861,6 +1876,7 @@ impl Inner {
                 let documents = Arc::new(Documents(self.embedders.clone()));
                 Arc::new(
                     writer
+                        .writing_format(self.writes_format.clone())
                         .embedding_with(documents)
                         .transferring(self.settings.transfers)
                         .timed_by(self.settings.clock.clone()),

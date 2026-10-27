@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
-use crate::format::{self, framed, Kind, Row, BODY, FORMAT_VERSION};
+use crate::format::{self, framed, Kind, Row, BODY};
 use crate::{Result, StorageError};
 
 const _: () = assert!(
@@ -83,10 +83,17 @@ impl Column {
         }
     }
 
+    /// As [`Self::encode_as`], stamped as the newest format.
+    #[cfg(test)]
     pub fn encode(&self) -> Bytes {
+        self.encode_as(format::FORMAT_VERSION)
+    }
+
+    /// As [`Self::encode`], stamped as format `version`.
+    pub fn encode_as(&self, version: u16) -> Bytes {
         let values = self.values();
         let length = PADDING + values.len() * 4 + self.offsets.len() * 8 + 8;
-        let frame = framed(Kind::Vectors, FORMAT_VERSION, length, |frame| {
+        let frame = framed(Kind::Vectors, version, length, |frame| {
             frame.extend_from_slice(&[0; PADDING]);
             frame.extend_from_slice(bytemuck::cast_slice(values));
             for offset in &self.offsets {
@@ -540,7 +547,7 @@ mod tests {
         let reframed = |offsets: &[u64], rows: u64| {
             let values = [1.0f32, 2.0, 3.0];
             let length = PADDING + values.len() * 4 + offsets.len() * 8 + 8;
-            let frame = framed(Kind::Vectors, FORMAT_VERSION, length, |frame| {
+            let frame = framed(Kind::Vectors, format::FORMAT_VERSION, length, |frame| {
                 frame.extend_from_slice(&[0; PADDING]);
                 frame.extend_from_slice(bytemuck::cast_slice(&values));
                 offsets

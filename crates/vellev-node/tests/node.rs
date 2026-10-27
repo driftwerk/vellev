@@ -2802,7 +2802,9 @@ async fn a_node_registers_while_it_runs_and_will_not_serve_a_format_it_cannot_re
     let cluster = Cluster::new();
     let node = cluster.node();
     let ours = node.versions();
-    assert_eq!(node.cluster().await.unwrap(), ours);
+    // A new cluster writes format 1, older than the newest this reads.
+    let new = Versions { format: 1, ..ours };
+    assert_eq!(node.cluster().await.unwrap(), new);
     node.ready().await.unwrap();
 
     node.announcing();
@@ -8765,4 +8767,132 @@ fn settings_with_a_backlog_below_a_flush_are_refused() {
             refused.flush_backoff
         );
     }
+}
+
+/// Track 2, V3: a property embedded but not stored is new in format 2.
+/// A node refuses a schema with one until the cluster writes format 2,
+/// which it does once every node registered reads it and the nodes are
+/// allowed to write it (`max_format`): until then the release before,
+/// which reads format 1 alone, may read anything written.
+#[tokio::test]
+async fn an_unstored_property_is_refused_until_the_cluster_writes_format_2() {
+    let cluster = Cluster::new();
+    let url = embedding_server(Arc::new(AtomicUsize::new(0))).await;
+    let unstored = || {
+        let Mutation::CreateCollection(mut schema) = schema(served_by(&url, "lengths")) else {
+            unreachable!()
+        };
+        schema
+            .properties
+            .push(Property::new("body", DataType::Text).unstored());
+        schema.embedding.properties.push("body".into());
+        Mutation::CreateCollection(schema)
+    };
+
+    let node = cluster.node();
+    node.announcing();
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    let refused = acme.write(vec![unstored()]).await;
+    assert!(
+        matches!(&refused, Err(NodeError::Storage(StorageError::InvalidMutation(why))) if why.contains("format 2")),
+        "{refused:?}"
+    );
+    acme.write(vec![schema(served_by(&url, "lengths"))])
+        .await
+        .unwrap();
+    node.shutdown().await;
+
+    let raised = cluster.node_from(Settings {
+        max_format: 2,
+        ..cluster.settings()
+    });
+    raised.announcing();
+    raised.create_tenant(&tenant("beta")).await.unwrap();
+    let beta = raised.tenant(&tenant("beta")).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match beta.write(vec![unstored()]).await {
+            Ok(_) => break,
+            Err(NodeError::Storage(StorageError::InvalidMutation(_)))
+                if std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    raised.shutdown().await;
+}
+
+/// Track 2, V3: once any node raises the cluster's format, every node
+/// writes it, whatever its own `max_format`. A node left at the default
+/// that takes over a tenant given an unstored property checkpoints it, as
+/// format 2, rather than fail every flush; and it takes such a property
+/// itself.
+#[tokio::test]
+async fn a_node_writes_the_format_the_cluster_writes_whatever_its_own_max() {
+    let cluster = Cluster::new();
+    let url = embedding_server(Arc::new(AtomicUsize::new(0))).await;
+    let unstored = || {
+        let Mutation::CreateCollection(mut schema) = schema(served_by(&url, "lengths")) else {
+            unreachable!()
+        };
+        schema
+            .properties
+            .push(Property::new("body", DataType::Text).unstored());
+        schema.embedding.properties.push("body".into());
+        Mutation::CreateCollection(schema)
+    };
+    // Written until it goes through, as the node sees the cluster's rise.
+    async fn taken(tenant: &Tenant, mutation: Mutation) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tenant.write(vec![mutation.clone()]).await {
+                Ok(_) => return,
+                Err(NodeError::Storage(StorageError::InvalidMutation(_)))
+                    if std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    let raised = cluster.node_from(Settings {
+        max_format: 2,
+        ..cluster.settings()
+    });
+    raised.announcing();
+    raised.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = raised.tenant(&tenant("acme")).await.unwrap();
+    taken(&acme, unstored()).await;
+    let page = |n: u64| Mutation::Upsert {
+        collection: notes(),
+        id: id(n),
+        properties: json!({ "title": "t", "n": n, "body": "never kept" })
+            .as_object()
+            .unwrap()
+            .clone(),
+        vector: None,
+        only_if_version: None,
+    };
+    acme.write(vec![page(1)]).await.unwrap();
+    drop(acme);
+    raised.shutdown().await;
+
+    let default = cluster.node();
+    default.announcing();
+    // Taken once the node sees the cluster's rise.
+    default.create_tenant(&tenant("beta")).await.unwrap();
+    let beta = default.tenant(&tenant("beta")).await.unwrap();
+    taken(&beta, unstored()).await;
+    let acme = default.tenant(&tenant("acme")).await.unwrap();
+    // Held in memory, to be checkpointed with the unstored schema.
+    acme.write(vec![page(2)]).await.unwrap();
+    assert!(acme.read(State::unflushed) > 0);
+    acme.flush().await.unwrap();
+    assert_eq!(acme.read(State::unflushed), 0);
+    default.shutdown().await;
 }

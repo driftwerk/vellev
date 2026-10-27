@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
 use futures::StreamExt;
+use serde::Serialize;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
@@ -21,8 +22,9 @@ use crate::coordinator::{
 };
 use crate::draft::{Draft, Wanted};
 use crate::format::{
-    decode, decode_head, encode, rekeyed_index, Answer, Answered, Came, Coming, Framed, Head, Kind,
-    LogSegment, Manifest, Op, SegmentFile, SegmentIndex, SegmentMeta, SUMMED_AT_ONCE,
+    decode, decode_head, encode, encode_as, rekeyed_index, Answer, Answered, Came, Coming, Framed,
+    Head, Kind, LogSegment, Manifest, Op, SegmentFile, SegmentIndex, SegmentMeta,
+    DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
@@ -937,6 +939,9 @@ pub struct Writer {
     /// When the turn now held, if any, was taken, and how long it may be
     /// held in all.
     held: Arc<std::sync::Mutex<Option<Holding>>>,
+    /// The file format the cluster writes, as far as this release writes
+    /// it: what every file this writer puts is stamped as.
+    format: Arc<AtomicU16>,
 }
 
 /// A turn being held: since when, how long it may be in all, since when
@@ -1031,7 +1036,27 @@ impl Writer {
             building: Mutex::new(()),
             restoring: AtomicBool::new(false),
             held: Arc::default(),
+            format: Arc::new(AtomicU16::new(DEFAULT_MAX_FORMAT)),
         })
+    }
+
+    /// Write the format `format` holds, as it is when each file is
+    /// written, instead of [`DEFAULT_MAX_FORMAT`]: a node shares the
+    /// format the cluster writes with every writer it opens.
+    pub fn writing_format(self, format: Arc<AtomicU16>) -> Self {
+        Self { format, ..self }
+    }
+
+    /// The format this writer writes now: no older than 1, and no newer
+    /// than this release writes.
+    pub fn writes(&self) -> u16 {
+        self.format.load(Ordering::SeqCst).clamp(1, FORMAT_VERSION)
+    }
+
+    /// `value`, which format `least` can hold, framed as `kind` in the
+    /// format this writer writes.
+    fn stamped<T: Serialize>(&self, kind: Kind, value: &T, least: u16) -> Result<Bytes> {
+        stamped(kind, value, least, self.writes())
     }
 
     /// Embed with `vectorize` for the collections that embed their own
@@ -1146,7 +1171,7 @@ impl Writer {
     /// commit of these still decides what is made.
     pub fn creates(&self, mutations: &[Mutation]) -> Vec<vellev_core::Collection> {
         self.partition.read(|state| {
-            let mut draft = Draft::new(state);
+            let mut draft = Draft::new(state, self.writes());
             let _ = draft.batch(mutations.to_vec());
             let (ops, _) = draft.finish();
             ops.into_iter()
@@ -1165,7 +1190,7 @@ impl Writer {
     /// while every other write waits.
     pub fn wanted(&self, mutations: &[Mutation]) -> Vec<(Embedding, String)> {
         self.partition.read(|state| {
-            let mut draft = Draft::new(state);
+            let mut draft = Draft::new(state, self.writes());
             let _ = draft.batch(mutations.to_vec());
             let (_, wanted) = draft.finish();
             wanted
@@ -1266,6 +1291,9 @@ impl Writer {
             })
             .collect();
         let mut failed: HashMap<Embedding, Unembedded> = HashMap::new();
+        // One format for the whole commit, drafted and logged alike, though
+        // the cluster's rise meanwhile.
+        let format = self.writes();
         let ((position, prev), outcomes, ops) = loop {
             let decided: Vec<bool> = unembedded
                 .iter()
@@ -1277,7 +1305,7 @@ impl Writer {
             let (partition, batches) = (self.partition.clone(), batches.clone());
             let resolved = turn.at_once(move || {
                 partition.read(|state| {
-                    let mut draft = Draft::new(state);
+                    let mut draft = Draft::new(state, format);
                     let outcomes: Vec<_> = batches
                         .iter()
                         .zip(decided)
@@ -1370,7 +1398,8 @@ impl Writer {
                             ops,
                             answered,
                         };
-                        encode(Kind::Log, &log).map(|frame| (log, frame))
+                        let least = log.least_format();
+                        stamped(Kind::Log, &log, least, format).map(|frame| (log, frame))
                     })
                     .await??;
                 let (encoded, bytes) = (turn.taken.elapsed(), frame.len());
@@ -1530,7 +1559,7 @@ impl Writer {
         let manifest = self
             .partition
             .read(|state| state.flushed_manifest(position, &snapshot, segment.as_ref()))?;
-        let frame = encode(Kind::Manifest, &manifest)?;
+        let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
         staged.keep();
         // The memtable it keeps, made while readers may still read: with
         // the turn held, nothing is committed before it is adopted.
@@ -1693,7 +1722,7 @@ impl Writer {
         let manifest = self.partition.read(|current| {
             target.read(|target| current.restored_manifest(restored, target, segment))
         });
-        let frame = encode(Kind::Manifest, &manifest)?;
+        let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
         let state = target.restore(&key, manifest, held, None).await?;
         let turn = self.turn().await?;
         // Were the partition anywhere else, what was made above would put
@@ -1923,14 +1952,16 @@ impl Writer {
         let mut sent = Vec::new();
         if let Some(vectors) = meta.vectors.clone() {
             self.still(held)?;
-            let came = self.put_copy(source, &vectors, &names.vectors).await?;
+            let (came, stamp) = self.put_copy(source, &vectors, &names.vectors).await?;
             sent.push((Kind::Vectors, names.vectors.clone(), came));
+            self.copy_stamped(&vectors, stamp)?;
             files.push((vectors, names.vectors.clone()));
         }
         if let Some(index) = meta.index {
             self.still(held)?;
             let _one = indexing.lock().await;
             let frame = source.get(&index).await?;
+            self.copy_stamped(&index, crate::format::stamp(&frame))?;
             match rekeyed_index(&index, &frame, &meta.key, &names.segment) {
                 Ok(rekeyed) => {
                     drop(frame);
@@ -1944,8 +1975,9 @@ impl Writer {
             }
         }
         self.still(held)?;
-        let came = self.put_copy(source, &meta.key, &names.segment).await?;
+        let (came, stamp) = self.put_copy(source, &meta.key, &names.segment).await?;
         sent.push((Kind::Segment, names.segment.clone(), came));
+        self.copy_stamped(&meta.key, stamp)?;
         let linked = meta.vectors.clone().zip(Some(names.vectors));
         let reused = match donor {
             Some(donor) if donor.vectors == meta.vectors => {
@@ -1962,17 +1994,47 @@ impl Writer {
         })
     }
 
+    /// Refuse a copy of the source's file `key`, stamped as format
+    /// `version`, that is newer than this writer writes: a copy keeps the
+    /// stamp it came with, and one newer than the cluster writes is one the
+    /// release before, which the cluster's format still lets roll back to,
+    /// cannot read. The copy already put is staged, so it is cleaned up.
+    /// A stamp that cannot be read is left to the load, which reads every
+    /// copy and fails the restore on one that is not whole.
+    fn copy_stamped(&self, key: &str, version: Option<u16>) -> Result<()> {
+        let writes = self.writes();
+        match version {
+            Some(version) if version > writes => Err(StorageError::InvalidMutation(format!(
+                "{key} is stamped as file format {version}, and this cluster writes format \
+                 {writes}: a restore from it would leave files the release before cannot \
+                 read. Let every node write format {version} (VELLEV_MAX_FORMAT={version}) \
+                 first"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Put the file under `from` in `source` into the partition's store
-    /// under `to`, a part at a time; what it came to as the source sent it.
-    async fn put_copy(&self, source: &dyn Blobs, from: &str, to: &str) -> Result<Came> {
+    /// under `to`, a part at a time; what it came to as the source sent it,
+    /// and the format its frame is stamped as, if it is long enough to say.
+    async fn put_copy(
+        &self,
+        source: &dyn Blobs,
+        from: &str,
+        to: &str,
+    ) -> Result<(Came, Option<u16>)> {
         use futures::{StreamExt, TryStreamExt};
-        let coming = std::sync::Mutex::new(Coming::default());
+        let coming = std::sync::Mutex::new((Coming::default(), Vec::new()));
         let parts = source.parts(from).map_ok(|part| {
-            coming.lock().expect("coming").update(&part);
+            let (came, head) = &mut *coming.lock().expect("coming");
+            came.update(&part);
+            let wanted = crate::format::STAMPED_WITHIN.saturating_sub(head.len());
+            head.extend_from_slice(&part[..wanted.min(part.len())]);
             part
         });
         self.partition.blobs.put_parts(to, parts.boxed()).await?;
-        Ok(coming.into_inner().expect("coming").came())
+        let (came, head) = coming.into_inner().expect("coming");
+        Ok((came.came(), crate::format::stamp(&head)))
     }
 
     /// The segment the live state holds, `donor`, if the copies a restore
@@ -2098,7 +2160,7 @@ impl Writer {
             tombstones: snapshot.tombstones.clone(),
         };
         let built = self.built(file, snapshot.catalog.clone()).await?;
-        let prepared = Self::prepared(names.meta(shape), built)?;
+        let prepared = Self::prepared(names.meta(shape), built, self.writes())?;
         self.upload(&prepared, staged).await?;
         Ok(Some(prepared))
     }
@@ -2138,6 +2200,7 @@ impl Writer {
     /// held behind the write lock while a large segment is indexed.
     async fn built(&self, mut file: SegmentFile, catalog: Catalog) -> Result<Built> {
         let above = Some(self.merging.clustered_above);
+        let format = self.writes();
         blocking(move || {
             let inline = |row: usize| file.rows[row].object.vector.as_deref();
             let indexes = state::indexed(
@@ -2149,8 +2212,8 @@ impl Writer {
                 above,
             );
             let vectors = Column::taken_from(&mut file.rows);
-            let segment = encode(Kind::Segment, &file)?;
-            let column = vectors.encode();
+            let segment = encode_as(Kind::Segment, format, &file)?;
+            let column = vectors.encode_as(format);
             Ok(Built {
                 file,
                 vectors,
@@ -2164,11 +2227,17 @@ impl Writer {
 
     /// A built segment as `meta` names it, with its index file's frame if
     /// it has one.
-    fn prepared(meta: SegmentMeta, built: Built) -> Result<Prepared> {
+    fn prepared(meta: SegmentMeta, built: Built, format: u16) -> Result<Prepared> {
         let index = meta
             .index
             .is_some()
-            .then(|| encode(Kind::Index, &state::stored(&meta.key, &built.indexes)))
+            .then(|| {
+                encode_as(
+                    Kind::Index,
+                    format,
+                    &state::stored(&meta.key, &built.indexes),
+                )
+            })
             .transpose()?;
         Ok(Prepared { meta, built, index })
     }
@@ -2243,7 +2312,11 @@ impl Writer {
         // under names of their own at the position each was built from;
         // see `clean` for why nothing deletes them first.
         let mut staged = self.staging();
-        let merged = Self::prepared(self.named(named_at, "-merged").meta(shape), built)?;
+        let merged = Self::prepared(
+            self.named(named_at, "-merged").meta(shape),
+            built,
+            self.writes(),
+        )?;
         self.upload(&merged, &mut staged).await?;
         let merged = self.fit(merged, &catalog).await?;
         let snapshot = self.partition.read(State::taken);
@@ -2262,7 +2335,7 @@ impl Writer {
         else {
             return Ok(None);
         };
-        let frame = encode(Kind::Manifest, &manifest)?;
+        let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
         staged.keep();
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, |state| {
@@ -2923,6 +2996,20 @@ struct Donor {
 /// Whether `error` is a step on local disk that did not answer in time,
 /// as the disk itself says, and nothing else: not a store that did not
 /// answer, nor a time-out passed on in another failure.
+/// `value`, which format `least` can hold, framed as `kind` and stamped as
+/// format `format`. Refused if `format` is older than `least`: a file the
+/// release before would read without what it cannot see. Nothing a writer
+/// commits is, as its drafts refuse what its format cannot hold; a
+/// checkpoint of what a newer format restored might be.
+fn stamped<T: Serialize>(kind: Kind, value: &T, least: u16, format: u16) -> Result<Bytes> {
+    if least > format {
+        return Err(StorageError::Encode(format!(
+            "this {kind:?} file needs format {least}, and the cluster writes format {format}"
+        )));
+    }
+    encode_as(kind, format, value)
+}
+
 fn disk_timed_out(error: &StorageError) -> bool {
     let StorageError::Blob { source, .. } = error else {
         return false;
@@ -2998,7 +3085,7 @@ impl RestoreFrom<'_> {
             .partition
             .read(|now| target.read(|target| now.restored_manifest(restored, target, segment)));
         kept_out(&manifest, &put, &source, rested_on.as_deref())?;
-        let frame = encode(Kind::Manifest, &manifest)?;
+        let frame = writer.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
         let state = target.restore(&key, manifest, held, None).await?;
         let turn = writer.turn().await?;
         // Nothing moves the partition while the building lock is held and

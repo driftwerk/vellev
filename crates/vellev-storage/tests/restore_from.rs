@@ -2075,3 +2075,144 @@ async fn a_restore_from_a_source_commits_without_reading_the_source() {
 
     assert_eq!(target.open().await.partition().read(ns), frozen.rows);
 }
+
+/// A writer that writes format `format`, as a node shares the cluster's.
+fn writing(writer: Writer, format: u16) -> Writer {
+    writer.writing_format(Arc::new(std::sync::atomic::AtomicU16::new(format)))
+}
+
+/// The keys `cluster` holds once what a failed restore staged is deleted,
+/// which it is in the background: `before` once it is, or what is there
+/// after a while.
+async fn settled(cluster: &Cluster, before: &BTreeSet<String>) -> BTreeSet<String> {
+    for _ in 0..200 {
+        let now = keys(cluster).await;
+        if now == *before {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    keys(cluster).await
+}
+
+/// The format each file `blobs` holds is stamped as, by key.
+async fn stamps(blobs: &dyn Blobs) -> Vec<(String, u16)> {
+    let mut stamped = Vec::new();
+    for listed in blobs.list("").await.unwrap() {
+        let frame = blobs.get(&listed.key).await.unwrap();
+        stamped.push((listed.key, u16::from_le_bytes([frame[5], frame[6]])));
+    }
+    stamped
+}
+
+/// Track 2, V3: a copy keeps the stamp it came with. A restore into a
+/// cluster that writes format 1 from a store written in format 2 is
+/// refused, though it holds nothing only format 2 holds, rather than leave
+/// files the release before cannot read; and nothing it copied is kept.
+/// Once the cluster writes format 2, the same restore goes through.
+#[tokio::test]
+async fn a_restore_does_not_copy_files_stamped_newer_than_the_cluster_writes() {
+    let source = Cluster::new().await;
+    let writer = writing(source.writer().await, 2);
+    writer
+        .commit(vec![
+            create("notes"),
+            upsert("notes", 1, 1),
+            upsert("notes", 2, 2),
+        ])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    drop(writer);
+    let frozen = frozen(&source).await;
+    assert!(stamps(&*frozen.source.inner)
+        .await
+        .iter()
+        .all(|(_, format)| *format == 2));
+
+    let target = Cluster::new().await;
+    let writer = lived_in(&target).await;
+    let before = keys(&target).await;
+    let refused = restored_from(&target, &writer, &frozen).await;
+    assert!(
+        matches!(&refused, Err(StorageError::InvalidMutation(why)) if why.contains("format 2")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        settled(&target, &before).await,
+        before,
+        "nothing copied is kept"
+    );
+    assert!(stamps(&*target.blobs)
+        .await
+        .iter()
+        .all(|(_, format)| *format == 1));
+    drop(writer);
+    target.clock.advance(TTL);
+
+    let writer = writing(target.writer().await, 2);
+    restored_from(&target, &writer, &frozen).await.unwrap();
+    assert_eq!(target.open().await.partition().read(ns), frozen.rows);
+}
+
+/// Track 2, V3: a restore into a cluster that writes format 1 of a state
+/// holding a property embedded but not stored is refused, rather than
+/// checkpoint it as format 1, though every file it copies would be.
+#[tokio::test]
+async fn a_restore_of_an_unstored_property_into_format_1_is_refused() {
+    let source = Cluster::new().await;
+    let writer = writing(source.writer().await, 2);
+    let schema = Collection {
+        name: name("pages"),
+        properties: vec![
+            Property::new("title", DataType::Text),
+            Property::new("body", DataType::Text).unstored(),
+        ],
+        embedding: Embedding {
+            provider: EmbeddingProvider::Local,
+            model: "lengths".into(),
+            dimensions: 2,
+            query_prefix: None,
+            document_prefix: None,
+            properties: vec!["title".into(), "body".into()],
+        },
+        distance: Distance::Cosine,
+        bm25: Bm25::default(),
+        access_rule: None,
+    };
+    schema.validate().unwrap();
+    writer
+        .commit(vec![
+            Mutation::CreateCollection(Box::new(schema)),
+            Mutation::Upsert {
+                collection: name("pages"),
+                id: id(1),
+                properties: json!({ "title": "t", "body": "b" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                vector: Some(vec![1.0, 2.0]),
+                only_if_version: None,
+            },
+        ])
+        .await
+        .unwrap();
+    drop(writer);
+    // Its logs alone: nothing is copied, so no copy's stamp refuses it.
+    let frozen = frozen(&source).await;
+    assert!(frozen.checkpoint.is_none());
+
+    let target = Cluster::new().await;
+    let writer = lived_in(&target).await;
+    let before = keys(&target).await;
+    let refused = restored_from(&target, &writer, &frozen).await;
+    assert!(
+        matches!(&refused, Err(StorageError::Encode(why)) if why.contains("needs format 2")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        settled(&target, &before).await,
+        before,
+        "nothing built is kept"
+    );
+}

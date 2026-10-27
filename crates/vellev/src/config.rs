@@ -279,10 +279,11 @@ pub struct Config {
         default_value = "*"
     )]
     pub tenants: Vec<String>,
-    /// The newest file format nodes may write, so that the release before
-    /// can still read everything if this one is rolled back. Raise it once
-    /// every node runs the release that reads it and rollback is no longer
-    /// wanted; see docs/compatibility.md.
+    /// The newest file format this node raises the cluster's to, so that
+    /// the release before can still read everything if this one is rolled
+    /// back. Raise it once every node runs the release that reads it and
+    /// rollback is no longer wanted. Once any node raises the cluster's
+    /// format, every node writes it; see docs/compatibility.md.
     #[arg(
         long,
         env = "VELLEV_MAX_FORMAT",
