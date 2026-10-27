@@ -434,7 +434,20 @@ answered 403.
 A node lets go of a tenant nobody has used for `VELLEV_TENANT_IDLE_SECS`
 (15 minutes), flushing it first, so any node can take it. `VELLEV_MEMORY_MB`
 bounds what the tenants a node holds may take in memory together; past it
-the least recently used are let go. `VELLEV_TENANT_QUERIES_PER_SECOND` and
+the least recently used are let go. It counts what the tenants hold at rest,
+not what a flush or merge copies while it runs, and with one tenant there is
+nothing to let go.
+
+The node runs on jemalloc rather than the system's malloc. A flush or merge
+copies a run's vectors and frees the copies among what it keeps; glibc's
+malloc did not give that memory back, so a node held its high-water mark
+until it was killed (a 1M-row, 768-dimension load in 10 GiB). jemalloc gives
+it back: on Linux a background thread purges freed pages after about 10
+seconds (`background_thread:true`, jemalloc's default decay), so memory
+falls while the node is idle too. `MALLOC_CONF` tunes it further if ever
+needed, for example `dirty_decay_ms` for a shorter decay.
+
+`VELLEV_TENANT_QUERIES_PER_SECOND` and
 `VELLEV_TENANT_WRITES_PER_SECOND` (objects) bound what one tenant may ask of
 each node, not of the cluster; a tenant asking more is answered 429 with
 `Retry-After`, and the client waits as long and asks the same node again.
