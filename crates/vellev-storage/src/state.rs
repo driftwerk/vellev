@@ -155,6 +155,7 @@ pub(crate) struct Shape {
 
 impl Shape {
     /// Of a segment of `rows`, which have their vectors with them still.
+    #[cfg(test)]
     pub fn of(catalog: &Catalog, rows: &[Row], tombstones: usize, clustered_above: usize) -> Self {
         let has = |row: usize| rows[row].object.vector.is_some();
         Self::by(catalog, rows, has, tombstones, clustered_above)
@@ -1599,23 +1600,51 @@ impl State {
     /// The segment that replaces `merge`'s run: their live rows, oldest
     /// first, and their tombstones if there is anything older left for the
     /// tombstones to act on. `position` is the one the rows are taken at.
-    pub(crate) fn merged(&self, merge: &Merge, position: LogPosition) -> Option<SegmentFile> {
+    /// The live rows of the run `merge` was planned over, without their
+    /// vectors, and those vectors gathered once into the merged segment's
+    /// column, sized exactly beforehand: not copied into each row and then
+    /// gathered again.
+    pub(crate) fn merged(
+        &self,
+        merge: &Merge,
+        position: LogPosition,
+    ) -> Option<(SegmentFile, Column)> {
         if !self.unchanged(merge) {
             return None;
         }
         let run = &self.segments[merge.run.clone()];
-        let rows: Vec<Row> = run
-            .iter()
-            .flat_map(|segment| {
-                (0..segment.file.rows.len())
-                    .filter(|row| !segment.dead[*row])
-                    .map(|row| {
-                        let mut copy = segment.file.rows[row].clone();
-                        copy.object.vector = segment.vectors.get(row).map(<[f32]>::to_vec);
-                        copy
-                    })
+        fn live(segment: &Segment) -> impl Iterator<Item = usize> + '_ {
+            (0..segment.file.rows.len()).filter(|row| !segment.dead[*row])
+        }
+        let (count, values) = run.iter().fold((0, 0), |(count, values), segment| {
+            live(segment).fold((count, values), |(count, values), row| {
+                (
+                    count + 1,
+                    values + segment.vectors.get(row).map_or(0, <[f32]>::len),
+                )
             })
-            .collect();
+        });
+        let mut rows: Vec<Row> = Vec::with_capacity(count);
+        let mut vectors: Vec<f32> = Vec::with_capacity(values);
+        let mut offsets: Vec<u64> = Vec::with_capacity(count + 1);
+        offsets.push(0);
+        for segment in run {
+            for row in live(segment) {
+                let Row { collection, object } = &segment.file.rows[row];
+                if let Some(vector) = segment.vectors.get(row) {
+                    vectors.extend_from_slice(vector);
+                }
+                offsets.push(vectors.len() as u64);
+                rows.push(Row {
+                    collection: *collection,
+                    object: Object {
+                        id: object.id,
+                        properties: object.properties.clone(),
+                        vector: None,
+                    },
+                });
+            }
+        }
         let tombstones: Vec<RowKey> = match merge.run.start {
             0 => Vec::new(),
             _ => {
@@ -1626,11 +1655,12 @@ impl State {
                     .collect()
             }
         };
-        Some(SegmentFile {
+        let file = SegmentFile {
             position,
             rows,
             tombstones,
-        })
+        };
+        Some((file, Column::of(vectors, offsets)))
     }
 
     /// Whether the run `merge` was planned over is still the same
@@ -2293,7 +2323,10 @@ mod tests {
             let Some(plan) = self.state.merge_plan(&merging) else {
                 return false;
             };
-            let file = self.state.merged(&plan, self.state.position()).unwrap();
+            let (mut file, column) = self.state.merged(&plan, self.state.position()).unwrap();
+            for (row, at) in file.rows.iter_mut().zip(0..) {
+                row.object.vector = column.get(at).map(<[f32]>::to_vec);
+            }
             let catalog = self.state.catalog().clone();
             let fit = self.fit(file, &catalog);
             self.state.compacted(&plan, fit);
