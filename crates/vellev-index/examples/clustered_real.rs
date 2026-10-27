@@ -54,7 +54,8 @@ fn main() {
     });
     println!("{} live rows, exact answers in {:.1?}", live.len(), started.elapsed());
     let skipped = vec![false; rows];
-    for times in ["0.5", "2", "4"] {
+    let list = std::env::var("SCRATCH_TIMES_LIST").unwrap_or_else(|_| "0.5,2,4".into());
+    for times in list.split(',') {
     std::env::set_var("SCRATCH_CLUSTERS_TIMES", times);
     let started = Instant::now();
     let index = ClusteredIndex::build(Distance::Cosine, &live).unwrap();
