@@ -98,7 +98,7 @@ fn main() {
             index.probes()
         );
         let tuned = index.probes();
-        for margin in [0.02f32, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20] {
+        for margin in [0.25f32, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60, 0.70] {
             let (mut found, mut top1, mut probed) = (0usize, 0usize, 0usize);
             let started = Instant::now();
             for (q, truth) in queries.iter().zip(&exact) {
