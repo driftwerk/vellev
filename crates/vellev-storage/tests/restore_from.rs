@@ -2081,6 +2081,20 @@ fn writing(writer: Writer, format: u16) -> Writer {
     writer.writing_format(Arc::new(std::sync::atomic::AtomicU16::new(format)))
 }
 
+/// The keys `cluster` holds once what a failed restore staged is deleted,
+/// which it is in the background: `before` once it is, or what is there
+/// after a while.
+async fn settled(cluster: &Cluster, before: &BTreeSet<String>) -> BTreeSet<String> {
+    for _ in 0..200 {
+        let now = keys(cluster).await;
+        if now == *before {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    keys(cluster).await
+}
+
 /// The format each file `blobs` holds is stamped as, by key.
 async fn stamps(blobs: &dyn Blobs) -> Vec<(String, u16)> {
     let mut stamped = Vec::new();
@@ -2120,7 +2134,7 @@ async fn a_restore_does_not_copy_files_stamped_newer_than_the_cluster_writes() {
         matches!(&refused, Err(StorageError::InvalidMutation(why)) if why.contains("format 2")),
         "{refused:?}"
     );
-    assert_eq!(keys(&target).await, before, "nothing copied is kept");
+    assert_eq!(settled(&target, &before).await, before, "nothing copied is kept");
     assert!(stamps(&*target.blobs)
         .await
         .iter()
@@ -2188,5 +2202,5 @@ async fn a_restore_of_an_unstored_property_into_format_1_is_refused() {
         matches!(&refused, Err(StorageError::Encode(why)) if why.contains("needs format 2")),
         "{refused:?}"
     );
-    assert_eq!(keys(&target).await, before);
+    assert_eq!(settled(&target, &before).await, before, "nothing built is kept");
 }
