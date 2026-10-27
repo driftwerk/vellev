@@ -324,6 +324,10 @@ pub struct Unreliable {
     /// A base recorded, once, as the next commit rows are read: a run
     /// re-based while a batch of it is under way.
     pub re_base: Mutex<Option<vellev_storage::coordinator::ShipBase>>,
+    /// The run noted shipped to here, once, as the next commit rows to
+    /// ship are read: by the shipper now holding it, while a batch of a
+    /// stale one is under way.
+    pub shipped_on: Mutex<Option<LogPosition>>,
     /// The record of shipping the next reading of it answers, once, in
     /// place of the one there: as a shipper read it before the run moved.
     pub shipping_once: Mutex<Option<vellev_storage::coordinator::Shipping>>,
@@ -351,6 +355,7 @@ impl Unreliable {
             rows: Mutex::new(BTreeMap::new()),
             unnoted: AtomicBool::new(false),
             re_base: Mutex::new(None),
+            shipped_on: Mutex::new(None),
             shipping_once: Mutex::new(None),
             committed_once: Mutex::new(None),
             hold_on_clean: Mutex::new(None),
