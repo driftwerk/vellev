@@ -57,9 +57,9 @@ struct Store {
     slow: std::sync::Mutex<Option<Duration>>,
     /// The prefixes whose cached copies were dropped.
     forgotten: std::sync::Mutex<Vec<String>>,
-    /// How many vectors files were asked to be written, right or wrong:
+    /// When each vectors file was asked to be written, right or wrong:
     /// one for each flush that got as far as writing its segment.
-    vectors_written: AtomicUsize,
+    vectors_written: std::sync::Mutex<Vec<tokio::time::Instant>>,
 }
 
 impl Store {
@@ -72,7 +72,10 @@ impl Store {
     /// A write of `key` goes wrong, if it is to, as it is to.
     async fn written(&self, key: &str) -> vellev_storage::Result<()> {
         if key.ends_with(".vectors") {
-            self.vectors_written.fetch_add(1, Ordering::SeqCst);
+            self.vectors_written
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
         }
         let fault = {
             let mut faulty = self.faulty.lock().unwrap();
@@ -167,7 +170,7 @@ impl Cluster {
                 failing_once: AtomicBool::new(false),
                 slow: std::sync::Mutex::new(None),
                 forgotten: std::sync::Mutex::default(),
-                vectors_written: AtomicUsize::new(0),
+                vectors_written: std::sync::Mutex::default(),
             }),
         }
     }
@@ -8646,8 +8649,9 @@ async fn writes_are_refused_while_four_flushes_of_rows_wait_and_taken_once_one_g
 }
 
 /// Failed flushes are not tried back to back: each waits twice as long as
-/// the one before, however hard writes ask for one.
-#[tokio::test]
+/// the one before, however hard writes ask for one. On tokio's paused
+/// clock, so the times are exact.
+#[tokio::test(start_paused = true)]
 async fn failed_flushes_are_tried_again_further_and_further_apart() {
     let cluster = Cluster::new();
     let backoff = Duration::from_millis(100);
@@ -8658,7 +8662,7 @@ async fn failed_flushes_are_tried_again_further_and_further_apart() {
         .await
         .unwrap();
     cluster.store.fault(Some(("vectors", Fault::Fails)));
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let mut n = 0;
     // Asking all the while: each write past the threshold asks for one.
     while started.elapsed() < Duration::from_millis(1_400) {
@@ -8668,10 +8672,94 @@ async fn failed_flushes_are_tried_again_further_and_further_apart() {
         n += 1;
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    // Tried at about 0, 0.1, 0.3, 0.7 and 1.5 seconds: four within the
-    // 1.4, five at the most with timing's slack. Back to back, they would
-    // have been tried about as often as written to.
-    let tried = cluster.store.vectors_written.load(Ordering::SeqCst);
-    assert!((3..=5).contains(&tried), "tried {tried} times in 1.4 s");
-    assert_eq!(node.flushing().failed, tried as u64);
+    // Tried at about 0, 0.1, 0.3 and 0.7 seconds, the next not before
+    // 1.5. Back to back, they would have been tried about as often as
+    // written to.
+    let tried = cluster.store.vectors_written.lock().unwrap().clone();
+    assert_eq!(tried.len(), 4, "{tried:?}");
+    for (k, pair) in tried.windows(2).enumerate() {
+        let gap = pair[1] - pair[0];
+        let least = backoff * 2u32.pow(k as u32);
+        assert!(
+            gap >= least && gap <= least + Duration::from_millis(10),
+            "try {} came {gap:?} after the one before, not {least:?}",
+            k + 2
+        );
+    }
+    assert_eq!(node.flushing().failed, tried.len() as u64);
+}
+
+/// A failed flush is tried again once its backoff lets it, with no write
+/// asking for one: the rows do not wait in memory for the tenant's next
+/// write, nor for its next looking after, an hour off by default.
+#[tokio::test(start_paused = true)]
+async fn a_failed_flush_is_tried_again_with_no_write_asking() {
+    let cluster = Cluster::new();
+    let node = backlogging(&cluster, 2, Duration::from_millis(100));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    for n in 0..3 {
+        acme.write(vec![note(n, "row", Some(vec![1.0, 1.0]))])
+            .await
+            .unwrap();
+    }
+    while node.flushing().failed == 0 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    cluster.store.fault(None);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(acme.read(State::unflushed), 0, "flushed on its own");
+    assert_eq!(node.flushing().failed, 1);
+}
+
+/// A flush however it is asked for, as by a caller, counts as the node's
+/// own do: one that fails is counted, and its backoff is the node's.
+#[tokio::test]
+async fn a_flush_asked_for_by_a_caller_that_fails_is_counted() {
+    let cluster = Cluster::new();
+    let node = backlogging(&cluster, 1_000, Duration::from_secs(60));
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "row", Some(vec![1.0, 1.0]))])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    acme.flush().await.unwrap_err();
+    assert_eq!(node.flushing().failed, 1);
+    cluster.store.fault(None);
+    acme.flush().await.unwrap();
+    assert_eq!(node.flushing().failed, 1);
+    assert_eq!(acme.read(State::unflushed), 0);
+}
+
+/// A backlog below the rows a tenant is flushed at would refuse every
+/// write before a flush is ever asked for: such settings are refused.
+#[test]
+fn settings_with_a_backlog_below_a_flush_are_refused() {
+    let with = |flush_rows, backlog_rows, flush_backoff| Settings {
+        flush_rows,
+        backlog_rows,
+        flush_backoff,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    let second = Duration::from_secs(1);
+    assert!(Settings::new(NodeId::generate("node")).check().is_ok());
+    assert_eq!(with(10, None, second).backlog_problem(), None);
+    assert_eq!(with(10, Some(10), second).backlog_problem(), None);
+    for refused in [
+        with(10, Some(9), second),
+        with(10, Some(0), second),
+        with(10, None, Duration::ZERO),
+    ] {
+        assert!(
+            matches!(refused.check(), Err(NodeError::Settings(_))),
+            "{:?} {:?}",
+            refused.backlog_rows,
+            refused.flush_backoff
+        );
+    }
 }
