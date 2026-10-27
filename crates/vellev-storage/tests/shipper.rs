@@ -664,6 +664,65 @@ async fn a_stale_shipper_of_a_run_since_re_based_ships_nothing_more_and_stalls_n
     );
 }
 
+#[tokio::test]
+async fn a_stale_shipper_whose_rows_were_forgotten_since_links_nothing_on_its_stale_base() {
+    // A run shipped to its base, at 3, as a stale shipper last read it; then
+    // a checkpoint at 6, and the run shipped on to 5 by the shipper now
+    // holding it, so the logs at 4 and 5 are below shipping's floor and
+    // forgotten.
+    let (cluster, writer) = written().await;
+    let base = begun(&cluster).await;
+    let backup = a_backup();
+    let live = shipper_of(&cluster, &backup);
+    ship(&live, &cluster, 1).await;
+    let seen = cluster.coordinator.shipping(&cluster.key).await.unwrap();
+    assert_eq!(seen.shipped, Some(base.position));
+    writer.flush().await.unwrap();
+    let after = rows_after(&cluster, &base).await;
+    let (logs, checkpoint) = (&after[..2], &after[2]);
+    assert!(checkpoint.head.0.contains("/manifest/"), "{checkpoint:?}");
+    ship(&live, &cluster, 2).await;
+    // Every commit but the newest passes out of the window.
+    cluster.clock.advance(Duration::from_secs(1));
+    let forgot = cluster
+        .coordinator
+        .forget_history(&cluster.key, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(forgot >= 2, "forgot {forgot}");
+    assert_eq!(rows_after(&cluster, &base).await, vec![checkpoint.clone()]);
+    // The stale shipper, going on from the run as it saw it, is given only
+    // the checkpoint after its base: it links nothing on it.
+    let (stale, rows) = shipper_over_rows(&cluster, &backup);
+    *rows.shipping_once.lock().unwrap() = Some(seen);
+    let now = cluster.committed().await.incarnation;
+    let shipped = stale.ship_batch(now, 100).await;
+    assert!(
+        !matches!(
+            shipped,
+            Ok(Batch::Shipped {
+                through: Some(_),
+                ..
+            })
+        ),
+        "{shipped:?}"
+    );
+    assert!(!links(&backup, &stale.timeline(now))
+        .await
+        .contains_key(&checkpoint.position));
+    // And the run ships on, the checkpoint made on the commit before it.
+    assert_eq!(
+        ship(&live, &cluster, 100).await,
+        Batch::Shipped {
+            through: Some(checkpoint.position),
+            stalled: None
+        }
+    );
+    let links = links(&backup, &live.timeline(now)).await;
+    let before = links[&checkpoint.position].header.before.clone().unwrap();
+    assert_eq!(before.position, logs[1].position);
+}
+
 /// The shipper of `cluster` over a coordinator whose commit rows the test
 /// gives, and that coordinator.
 fn shipper_over_rows(cluster: &Cluster, backup: &Arc<dyn Blobs>) -> (Shipper, Arc<Unreliable>) {
