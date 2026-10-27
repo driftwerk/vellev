@@ -7,7 +7,15 @@
 /// held to its own length. Counted, so that a recall summed over queries
 /// is compared with a target exactly.
 pub fn found_at(k: usize, got: &[u64], truth: &[u64]) -> Recall {
-    todo!("{k} {got:?} {truth:?}")
+    let truth = &truth[..k.min(truth.len())];
+    let mut got: Vec<u64> = got[..k.min(got.len())].to_vec();
+    got.sort_unstable();
+    got.dedup();
+    let found = got.iter().filter(|id| truth.contains(id)).count();
+    Recall {
+        found: found as u64,
+        of: truth.len() as u64,
+    }
 }
 
 /// True ids found, of those there were to find.
@@ -19,12 +27,15 @@ pub struct Recall {
 
 impl Recall {
     pub fn share(&self) -> f64 {
-        todo!()
+        match self.of {
+            0 => 1.0,
+            of => self.found as f64 / of as f64,
+        }
     }
 
-    /// Whether this is at or above `target`, a whole number of hundredths.
+    /// Whether this is at or above a target of `hundredths`.
     pub fn at_or_above(&self, hundredths: u64) -> bool {
-        todo!("{hundredths}")
+        u128::from(self.found) * 100 >= u128::from(hundredths) * u128::from(self.of)
     }
 }
 
@@ -46,19 +57,24 @@ impl std::iter::Sum for Recall {
 
 /// Whether the first answer is the true first.
 pub fn same_top_1(got: &[u64], truth: &[u64]) -> bool {
-    todo!("{got:?} {truth:?}")
+    matches!((got.first(), truth.first()), (Some(a), Some(b)) if a == b)
 }
 
 /// The nearest-rank percentile `p` (in (0, 100]) of `samples`: the
 /// smallest sample at or above `p`% of them. Never interpolated.
 pub fn percentile(samples: &[f64], p: f64) -> f64 {
-    todo!("{samples:?} {p}")
+    assert!(!samples.is_empty(), "a percentile of nothing");
+    assert!(p > 0.0 && p <= 100.0, "percentile {p}");
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = (p / 100.0 * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
 /// The median of `values`, the lower middle one for an even count, so that
 /// it is always one of them.
 pub fn median(values: &[f64]) -> f64 {
-    todo!("{values:?}")
+    percentile(values, 50.0)
 }
 
 /// A measured knob point: its recall, and its p99 latency.
@@ -73,7 +89,12 @@ pub struct Point {
 /// target, the first such on a tie. `None` is "not reached". Nothing is
 /// interpolated: the answer is always a point that was measured.
 pub fn matched(points: &[Point], hundredths: u64) -> Option<usize> {
-    todo!("{points:?} {hundredths}")
+    points
+        .iter()
+        .enumerate()
+        .filter(|(_, point)| point.recall.at_or_above(hundredths))
+        .min_by(|(a, x), (b, y)| x.p99.total_cmp(&y.p99).then(a.cmp(b)))
+        .map(|(at, _)| at)
 }
 
 #[cfg(test)]
