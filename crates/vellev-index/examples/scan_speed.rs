@@ -70,6 +70,90 @@ fn main() {
             .map(|(d, r)| d.to_bits() as u64 ^ *r as u64)
             .fold(0u64, |a, b| a.wrapping_add(b))
     };
+    if std::env::var("SCRATCH_FILTERED").is_ok() {
+        use std::io::BufRead;
+        // Each passage's bucket, owner, deletion and title; each question's
+        // owner by its article's title, as the benchmark asks.
+        let passages: Vec<(i64, i64, bool, String)> =
+            std::io::BufReader::new(std::fs::File::open(dir.join("text/passages.jsonl")).unwrap())
+                .lines()
+                .take(rows)
+                .map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(&l.unwrap()).unwrap();
+                    (
+                        v["bucket"].as_i64().unwrap(),
+                        v["owner"].as_i64().unwrap(),
+                        v["deleted"].as_bool().unwrap(),
+                        v["title"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+        let mut owners = std::collections::HashMap::new();
+        for p in &passages {
+            owners.entry(p.3.clone()).or_insert(p.1);
+        }
+        let asked: Vec<i64> =
+            std::io::BufReader::new(std::fs::File::open(dir.join("text/queries.jsonl")).unwrap())
+                .lines()
+                .map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(&l.unwrap()).unwrap();
+                    owners
+                        .get(v["title"].as_str().unwrap())
+                        .copied()
+                        .unwrap_or(-1)
+                })
+                .collect();
+        let allowed = |keep: &dyn Fn(&(i64, i64, bool, String)) -> bool| -> roaring::RoaringBitmap {
+            passages
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.2 && keep(p))
+                .map(|(n, _)| n as u32)
+                .collect()
+        };
+        let mid = allowed(&|p| p.0 < 10);
+        let narrow = allowed(&|p| p.0 < 1);
+        let mut by_owner: std::collections::HashMap<i64, roaring::RoaringBitmap> =
+            Default::default();
+        for (n, p) in passages.iter().enumerate() {
+            if !p.2 {
+                by_owner.entry(p.1).or_default().insert(n as u32);
+            }
+        }
+        let empty = roaring::RoaringBitmap::new();
+        let index = built.clone().with_probes(560);
+        for case in ["mid", "narrow", "owner"] {
+            let mut took = Vec::new();
+            let mut sum = 0u64;
+            let mut size = 0u64;
+            for _ in 0..2 {
+                took.clear();
+                for (q, query) in queries.iter().enumerate() {
+                    let only = match case {
+                        "mid" => &mid,
+                        "narrow" => &narrow,
+                        _ => by_owner.get(&asked[q]).unwrap_or(&empty),
+                    };
+                    size += only.len();
+                    let at = Instant::now();
+                    let found = index.estimates(query, 1280, Some(only), &skipped, &in_row_order);
+                    took.push(at.elapsed().as_secs_f64() * 1e3);
+                    let mut cut = found.clone();
+                    cut.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    cut.truncate(1280);
+                    sum = sum.wrapping_add(checksum(&cut));
+                }
+            }
+            took.sort_by(f64::total_cmp);
+            println!(
+                "{case}: {} rows allowed a query on average, mean {:.2} ms, p50 {:.2} ms, p99 {:.2} ms (checksum {sum:x})",
+                size / (2 * queries.len() as u64),
+                took.iter().sum::<f64>() / took.len() as f64,
+                took[took.len() / 2],
+                took[took.len() * 99 / 100]
+            );
+        }
+    }
     for p in &probes {
         let index = built.clone().with_probes(*p);
         let mut sum = 0u64;
