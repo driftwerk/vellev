@@ -4,6 +4,8 @@
 #
 #   onnxruntime.sh fetch TARGET DIR   unpack TARGET's pinned library into DIR,
 #                                     for ORT_LIB_LOCATION=DIR
+#   onnxruntime.sh download TARGET FILE
+#                                     save TARGET's pinned archive as FILE
 #   onnxruntime.sh check              fail unless the pins are the locked
 #                                     ort-sys's own
 #   onnxruntime.sh mirror             upload the pinned archives to the deps
@@ -133,12 +135,19 @@ check() {
   echo "onnxruntime.sh: $checked pins are the locked ort-sys's own"
 }
 
+# TARGET's pinned archive, as fetched and checked, saved as FILE.
+download() {
+  fetch "$1" "$WORK/unpacked-$1" >&2
+  cp "$WORK/$1.tar.lzma2" "$2"
+}
+
 # The release must exist; it is made by hand, not as the latest release.
 mirror() {
   local target archive_sha library_sha url
   while IFS=$'\t' read -r target archive_sha library_sha url; do
     [[ -z $target || $target == \#* ]] && continue
-    SOURCES=$url fetch "$target" "$WORK/unpacked-$target"
+    SOURCES=$url download "$target" "$WORK/$target.upload"
+    mv "$WORK/$target.upload" "$WORK/$target.tar.lzma2"
     gh release upload --repo "$REPOSITORY" "$(release_of "$url")" "$WORK/$target.tar.lzma2"
   done <"$PINS"
 }
@@ -148,7 +157,11 @@ case "${1:-}" in
     [ $# -eq 3 ] || die "usage: onnxruntime.sh fetch TARGET DIR"
     fetch "$2" "$3"
     ;;
+  download)
+    [ $# -eq 3 ] || die "usage: onnxruntime.sh download TARGET FILE"
+    download "$2" "$3"
+    ;;
   check) check ;;
   mirror) mirror ;;
-  *) die "usage: onnxruntime.sh fetch TARGET DIR | check | mirror" ;;
+  *) die "usage: onnxruntime.sh fetch TARGET DIR | download TARGET FILE | check | mirror" ;;
 esac

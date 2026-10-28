@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The rules onnxruntime.sh is held to. Fetches the x86_64 archive once from
-# ort-sys's own CDN, then serves copies of it, good and bad, from files.
+# The rules onnxruntime.sh is held to. Downloads the x86_64 archive once, as
+# the image does, then serves copies of it, good and bad, from files.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -81,9 +81,10 @@ refused "a target the locked ort-sys does not build" "has no $target build" \
 
 ## Fetched, and taken only as pinned.
 mkdir -p "$work/served"
-curl -fsSL --retry 5 -o "$work/served/good.tar.lzma2" "$url"
+# As the image gets it: our release first, the CDN after.
+RETRIES=5 "$script" download "$target" "$work/served/good.tar.lzma2"
 [ "$(sha256 "$work/served/good.tar.lzma2")" = "$archive_sha" ] || {
-  echo "the CDN's archive is not the pinned one" >&2
+  echo "the archive downloaded is not the pinned one" >&2
   exit 1
 }
 cp "$work/served/good.tar.lzma2" "$work/served/tampered.tar.lzma2"
