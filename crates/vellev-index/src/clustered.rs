@@ -42,19 +42,6 @@ const MOST_CLUSTERS: usize = 4096;
 /// How many vectors per cluster k-means is trained on, at most.
 const TRAINING_PER_CLUSTER: usize = 64;
 
-/// A row's place where the row is not indexed.
-const NOWHERE: u32 = u32::MAX;
-
-/// Each row's place in `rows`, sorted, up to the last: see
-/// [`ClusteredIndex::positions`].
-fn positions_of(rows: &[u32]) -> Vec<u32> {
-    let mut positions = vec![NOWHERE; rows.last().map_or(0, |last| *last as usize + 1)];
-    for (place, row) in rows.iter().enumerate() {
-        positions[*row as usize] = place as u32;
-    }
-    positions
-}
-
 /// In what an index is not one of the vectors it is asked to stand for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Unfit {
@@ -80,11 +67,11 @@ pub struct ClusteredIndex {
     /// its place in it; both follow from the clusters.
     rows: Vec<u32>,
     at: Vec<(u32, u32)>,
-    /// For each row up to the last indexed, its place in `rows`, or
-    /// [`NOWHERE`] for a row not indexed: a lookup where a search of
-    /// `rows` took a score of cache misses a row. Four bytes for every row
-    /// up to the last; it follows from `rows`.
-    positions: Vec<u32>,
+    /// The rows, as a bitmap: a row's place in `rows` is its rank among
+    /// them, a lookup where a search of `rows` took a score of cache misses
+    /// a row. It costs memory by the rows held, not by the highest of them,
+    /// and follows from `rows`.
+    indexed: RoaringBitmap,
     /// The rows with no estimate, in ascending order; they follow from the
     /// clusters too.
     unmeasured: Vec<u32>,
@@ -234,6 +221,9 @@ impl TryFrom<Wire> for ClusteredIndex {
             })
             .collect();
         rows.sort_unstable();
+        if rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err("a row in two clusters".to_string());
+        }
         let (rows, at): (Vec<u32>, Vec<(u32, u32)>) = rows.into_iter().unzip();
         Ok(Self {
             metric: wire.metric,
@@ -242,7 +232,7 @@ impl TryFrom<Wire> for ClusteredIndex {
             rotation: wire.rotation,
             centroids: wire.centroids,
             clusters: wire.clusters,
-            positions: positions_of(&rows),
+            indexed: rows.iter().copied().collect(),
             rows,
             at,
             probes: wire.probes,
@@ -788,7 +778,7 @@ impl ClusteredIndex {
             rotation,
             centroids,
             clusters,
-            positions: positions_of(&vectors.iter().map(|(row, _)| *row).collect::<Vec<_>>()),
+            indexed: vectors.iter().map(|(row, _)| *row).collect(),
             rows: vectors.iter().map(|(row, _)| *row).collect(),
             at,
             probes: 1,
@@ -902,10 +892,31 @@ impl ClusteredIndex {
     }
 
     fn position(&self, row: u32) -> Option<usize> {
-        self.positions
-            .get(row as usize)
-            .filter(|place| **place != NOWHERE)
-            .map(|place| *place as usize)
+        self.indexed
+            .contains(row)
+            .then(|| self.indexed.rank(row) as usize - 1)
+    }
+
+    /// About how many bytes the index takes in memory: its codes and
+    /// their counts, the factors, the rows and their places, the centroids
+    /// and the rows it has no estimate for.
+    pub fn resident(&self) -> usize {
+        use std::mem::size_of;
+        let clusters: usize = self
+            .clusters
+            .iter()
+            .map(|cluster| {
+                cluster.rows.capacity() * size_of::<u32>()
+                    + cluster.blocks.resident()
+                    + cluster.factors.capacity() * size_of::<Factor>()
+            })
+            .sum();
+        clusters
+            + self.rows.capacity() * size_of::<u32>()
+            + self.at.capacity() * size_of::<(u32, u32)>()
+            + self.indexed.serialized_size()
+            + self.centroids.capacity() * size_of::<f32>()
+            + self.unmeasured.capacity() * size_of::<u32>()
     }
 
     fn centroid(&self, cluster: usize) -> &[f32] {
@@ -1507,7 +1518,11 @@ mod tests {
             ClusteredIndex::build(Distance::Cosine, &rows).unwrap()
         };
         let (packed, spread) = (at(1), at(3_333));
-        assert!(packed.resident() > 3_000 * (16 + 12 + 4), "codes, factors and rows are counted: {}", packed.resident());
+        assert!(
+            packed.resident() > 3_000 * (16 + 12 + 4),
+            "codes, factors and rows are counted: {}",
+            packed.resident()
+        );
         assert!(
             spread.resident() < packed.resident() + 64 * 1024,
             "{} spread against {} packed",
@@ -2247,7 +2262,6 @@ mod tests {
                 let row = wire.clusters[0].rows[0];
                 wire.clusters[1].rows[0] = row;
             }),
-
             ("no clusters", |wire| {
                 wire.clusters.clear();
                 wire.centroids.clear();
