@@ -31,7 +31,7 @@ fn the_background_thread_that_gives_memory_back_is_on() {
 #[test]
 fn the_node_binary_gives_jemalloc_its_options() {
     use std::io::BufRead;
-    let binary = env!("CARGO_BIN_EXE_vellev");
+    let binary = "/nonexistent/vellev";
     // Read a line at a time, so that the listing is never held whole.
     let mut nm = std::process::Command::new("nm")
         .arg("--defined-only")

@@ -1,0 +1,17 @@
+name: Memory test lows planted (scratch)
+on:
+  push:
+    branches: [scratch-mem-lows-planted]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: nm pointed at no binary (must fail as nm failing)
+        run: cargo test -q --locked -p vellev --test allocator 2>&1 | grep -E "nm could not list|does not export|test result" || true
+      - name: memory test (must pass, figures from one epoch)
+        run: cargo test -q --locked -p vellev --test memory -- --nocapture 2>&1 | grep -E "at rest|test result" || true
