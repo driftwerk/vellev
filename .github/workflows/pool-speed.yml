@@ -42,7 +42,7 @@ jobs:
         run: lscpu | grep -E "Model name|^CPU\(s\)|Flags" | cut -c1-200
       - name: Read pool against global pool while a build runs, alternately, twice
         run: |
-          for mode in global read global read; do
+          for mode in read read; do
             if [ $mode = global ]; then export SCRATCH_GLOBAL_READS=1; else unset SCRATCH_GLOBAL_READS; fi
             RAYON_NUM_THREADS=3 "$RUNNER_TEMP/pool_speed" "$RUNNER_TEMP/fixture" 912500 300000 560
           done

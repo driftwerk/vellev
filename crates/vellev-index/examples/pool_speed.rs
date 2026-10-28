@@ -134,10 +134,11 @@ fn main() {
         "no build: lone split query p50 {p50:.2} ms p99 {p99:.2} ms; build alone {alone:.1} s"
     );
     // While a build runs on the global pool.
+    let (p50, p99) = lone(1, 300);
+    println!("no build: lone unsplit query p50 {p50:.2} ms p99 {p99:.2} ms");
     for (what, split, clients) in [
+        ("lone unsplit query", 1usize, 1usize),
         ("lone split query", threads, 1usize),
-        ("saturated, unsplit", 1, threads),
-        ("saturated, split", threads, threads),
     ] {
         let stop = AtomicBool::new(false);
         let (built, measured) = std::thread::scope(|scope| {
