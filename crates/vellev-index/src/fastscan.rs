@@ -100,6 +100,11 @@ impl Blocks {
         codes
     }
 
+    /// About how many bytes the blocks take in memory.
+    pub(crate) fn resident(&self) -> usize {
+        self.bytes.capacity() + self.ones.capacity() * std::mem::size_of::<u16>()
+    }
+
     /// Row `row`'s count of set bits.
     pub(crate) fn ones(&self, row: usize) -> u32 {
         u32::from(self.ones[row])

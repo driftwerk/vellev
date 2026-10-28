@@ -441,3 +441,24 @@ async fn the_nearest_all_in_one_of_several_clustered_segments_are_all_found() {
         assert_eq!(found, nearest, "oversample {oversample}");
     }
 }
+
+/// A clustered segment's index is counted in what the state holds.
+#[tokio::test]
+async fn a_clustered_index_is_counted_in_what_the_state_holds() {
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let segment = segments_of(&cluster).await[0].clone();
+    let key = segment.index.clone().unwrap();
+    let frame = cluster.blobs.get(&key).await.unwrap();
+    let stored: SegmentIndex = format::decode(&key, Kind::Index, &frame).unwrap();
+    let index = stored.vectors[0].1.resident();
+    writer.partition().read(|state| {
+        let counted = state.indexes_resident();
+        assert!(
+            counted * 10 >= index * 9 && counted <= index * 2,
+            "{counted} against {index}"
+        );
+        assert!(state.resident() >= counted + vectors.len() * DIMENSIONS * 4);
+    });
+}

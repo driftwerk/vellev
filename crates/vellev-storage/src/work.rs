@@ -30,9 +30,36 @@ pub struct Work {
     /// a hybrid search counts both legs, which leaves it unchanged.
     pub filtered: u64,
     pub allowed: u64,
+    /// How many parts a vector search was split into on the read pool: 1
+    /// unsplit, 0 where no vector search ran.
+    pub split_parts: u64,
 }
 
 impl Work {
+    /// `other`'s counts added to these.
+    pub fn add(&mut self, other: &Work) {
+        let Work {
+            exact_memtable,
+            coded_memtable,
+            exact_segments,
+            estimated,
+            postings,
+            keyword_rows,
+            filtered,
+            allowed,
+            split_parts,
+        } = other;
+        self.exact_memtable += exact_memtable;
+        self.coded_memtable += coded_memtable;
+        self.exact_segments += exact_segments;
+        self.estimated += estimated;
+        self.postings += postings;
+        self.keyword_rows += keyword_rows;
+        self.filtered += filtered;
+        self.allowed += allowed;
+        self.split_parts = self.split_parts.max(*split_parts);
+    }
+
     /// The share of the rows a filter allowed, or `None` where no leg was
     /// filtered.
     pub fn selectivity(&self) -> Option<f64> {
