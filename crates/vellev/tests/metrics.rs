@@ -318,3 +318,23 @@ async fn tenants_with_a_flush_or_merge_due_are_counted() {
     );
     served.stop().await;
 }
+
+/// The segments a node's tenants hold are reported by whether they are
+/// clustered, with their rows; three notes are in no segment yet.
+#[tokio::test]
+async fn segments_are_reported_by_whether_they_are_clustered() {
+    let (served, _) = embedded().await;
+    let text = served.app.metrics().encoded();
+    for index in ["clustered", "plain"] {
+        assert_eq!(
+            sample(&text, "vellev_segments", &[("index", index)]),
+            Some(0.0),
+            "{text}"
+        );
+        assert_eq!(
+            sample(&text, "vellev_segment_rows", &[("index", index)]),
+            Some(0.0)
+        );
+    }
+    served.stop().await;
+}

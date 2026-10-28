@@ -269,6 +269,26 @@ impl Collector for Counted {
             None,
             gauge.metric_type(),
         )?)?;
+        let held = node.segments();
+        for (name, help, values) in [
+            (
+                "segments",
+                "Segments the tenants this node writes hold, by whether they have a clustered vector index",
+                [("clustered", held.clustered as u64), ("plain", held.plain as u64)],
+            ),
+            (
+                "segment_rows",
+                "Rows in the segments the tenants this node writes hold, by whether the segment has a clustered vector index",
+                [("clustered", held.clustered_rows), ("plain", held.plain_rows)],
+            ),
+        ] {
+            let gauge = ConstGauge::new(0i64);
+            let mut family = encoder.encode_descriptor(name, help, None, gauge.metric_type())?;
+            for (index, value) in values {
+                ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX))
+                    .encode(family.encode_family(&[("index", index)])?)?;
+            }
+        }
         let keys = node.key_lookups();
         let counter = ConstCounter::new(0u64);
         let mut family = encoder.encode_descriptor(
