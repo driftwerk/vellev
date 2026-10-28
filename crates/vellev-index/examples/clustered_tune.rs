@@ -135,6 +135,54 @@ fn main() {
             ids,
         );
     }
+    let mut truth_broad: HashMap<usize, Vec<(u64, f32)>> = HashMap::new();
+    for l in
+        std::io::BufReader::new(std::fs::File::open(dir.join("truth/truth.jsonl")).unwrap()).lines()
+    {
+        let v: serde_json::Value = serde_json::from_str(&l.unwrap()).unwrap();
+        if v["case"] != "broad" {
+            continue;
+        }
+        let pairs: Vec<(u64, f32)> = v["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(v["scores"].as_array().unwrap())
+            .map(|(i, s)| (i.as_u64().unwrap(), s.as_f64().unwrap() as f32))
+            .collect();
+        truth_broad.insert(v["query"].as_u64().unwrap() as usize, pairs);
+    }
+    let keyword: Vec<Vec<(u64, f32)>> =
+        std::fs::read_to_string("/Volumes/T9/vellev-scratch/tmp/keyword-leg.jsonl")
+            .map(|text| {
+                text.lines()
+                    .map(|l| {
+                        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                        v["found"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|p| (p[0].as_u64().unwrap(), p[1].as_f64().unwrap() as f32))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    let fused = |meaning: &[(u64, f32)], q: usize| -> Vec<u64> {
+        vellev_index::fusion::fuse(
+            vellev_index::fusion::Fusion::RelativeScore,
+            0.75,
+            meaning,
+            &keyword[q],
+            10,
+        )
+        .iter()
+        .map(|f| f.key)
+        .collect()
+    };
+    let reference: Vec<Vec<u64>> = (0..keyword.len().min(queries.len()))
+        .map(|q| fused(&truth_broad[&q][..100], q))
+        .collect();
     let agree = (0..queries.len())
         .filter(|q| truth_case[&(*q, "broad".to_string())] == truth_q[*q])
         .count();
@@ -292,6 +340,392 @@ fn main() {
                     );
                 }
                 println!("{line}");
+            }
+        }
+        if !reference.is_empty() {
+            let mut settings: Vec<(String, Vec<usize>)> = [0.997, 0.998]
+                .iter()
+                .map(|target| {
+                    (
+                        format!("target {target}"),
+                        local
+                            .iter()
+                            .map(|ranks| probes_for(ranks, *target))
+                            .collect(),
+                    )
+                })
+                .collect();
+            settings.push((
+                "every cluster".to_string(),
+                segments.iter().map(|(_, _, i)| i.clusters()).collect(),
+            ));
+            for (target, probes) in settings {
+                // The vector leg as the node asks it: 100 candidates, a
+                // budget of 1,280 scored exactly, each layer's own nearest
+                // 100 by estimate always scored, the rest the nearest
+                // estimates across layers; rows past the clustered ones
+                // scored whole.
+                let found: usize = queries
+                    .par_iter()
+                    .enumerate()
+                    .map(|(q, vector)| {
+                        let mut scored: Vec<u32> = live
+                            .iter()
+                            .filter(|(n, _)| *n as usize >= clustered_rows)
+                            .map(|(n, _)| *n)
+                            .collect();
+                        let mut pooled: Vec<(f32, u32)> = Vec::new();
+                        for ((_, _, index), p) in segments.iter().zip(&probes) {
+                            let mut estimates = index.scratch_estimates(vector, 1280, *p);
+                            estimates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                            scored.extend(estimates.iter().take(100).map(|(_, n)| *n));
+                            pooled.extend(estimates.into_iter().skip(100));
+                        }
+                        let floors = 100 * segments.len();
+                        pooled.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                        scored.extend(
+                            pooled
+                                .iter()
+                                .take(1280usize.saturating_sub(floors))
+                                .map(|(_, n)| *n),
+                        );
+                        let known: HashMap<u64, f32> = truth_broad[&q].iter().copied().collect();
+                        let mut exact: Vec<(u64, f32)> = scored
+                            .iter()
+                            .map(|n| {
+                                let id = *n as u64;
+                                let cosine = known.get(&id).copied().unwrap_or_else(|| {
+                                    1.0 - distance(Distance::Cosine, vector, live_vector(&all, *n))
+                                });
+                                (id, cosine)
+                            })
+                            .collect();
+                        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                        exact.dedup_by_key(|p| p.0);
+                        exact.truncate(100);
+                        let got = fused(&exact, q);
+                        reference[q].iter().filter(|id| got.contains(id)).count()
+                    })
+                    .sum();
+                println!(
+                    "hybrid at {target}, probes {probes:?}: recall@10 against the exact-leg answer {:.4}",
+                    found as f64 / (reference.len() * 10) as f64
+                );
+            }
+        }
+        if std::env::var("SCRATCH_ORDERS").is_ok() && layout.len() == 1 {
+            let (from, to, index) = &segments[0];
+            let rows: Vec<(u32, &[f32])> = live
+                .iter()
+                .filter(|(n, _)| (*from..*to).contains(&(*n as usize)))
+                .copied()
+                .collect();
+            let local_w = exact(
+                &format!("{tmp}/exact-warmup-{from}-{to}.bin"),
+                &warmup,
+                &rows,
+            );
+            let mean = |vs: Vec<Vec<f32>>| -> Vec<f32> {
+                let mut m = vec![0f32; vs[0].len()];
+                for v in &vs {
+                    for (a, b) in m.iter_mut().zip(v) {
+                        *a += b / vs.len() as f32;
+                    }
+                }
+                m
+            };
+            let mu_q = mean(warmup.iter().map(|q| index.scratch_prepared(q)).collect());
+            let mu_p = mean(
+                rows.iter()
+                    .step_by(17)
+                    .map(|(_, v)| index.scratch_prepared(v))
+                    .collect(),
+            );
+            let sizes: Vec<usize> = {
+                let mut s = vec![0usize; index.clusters()];
+                for (n, _) in &rows {
+                    s[index.scratch_cluster_of(*n).unwrap()] += 1;
+                }
+                s
+            };
+            for (label, shift, by_dot) in [
+                ("distance", false, false),
+                ("inner product", false, true),
+                ("distance, shifted", true, false),
+                ("inner product, shifted", true, true),
+            ] {
+                let ranks_of = |q: &[f32]| -> Vec<u32> {
+                    let mut r = index.scratch_prepared(q);
+                    if shift {
+                        for ((x, a), b) in r.iter_mut().zip(&mu_q).zip(&mu_p) {
+                            *x += b - a;
+                        }
+                    }
+                    index.scratch_ranks_by(&r, by_dot)
+                };
+                let warm_ranks: Vec<u32> = warmup
+                    .par_iter()
+                    .zip(&local_w)
+                    .flat_map_iter(|(q, near)| {
+                        let ranks = ranks_of(q);
+                        near.iter()
+                            .map(|row| ranks[index.scratch_cluster_of(*row).unwrap()])
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                let measured_ranks: Vec<(Vec<u32>, Vec<u32>)> = queries
+                    .par_iter()
+                    .enumerate()
+                    .map(|(q, v)| {
+                        let ranks = ranks_of(v);
+                        let mut order: Vec<u32> = (0..index.clusters() as u32).collect();
+                        order.sort_by_key(|c| ranks[*c as usize]);
+                        let near: Vec<u32> = truth_case[&(q, "broad".to_string())]
+                            .iter()
+                            .filter(|n| (*from..*to).contains(&(**n as usize)))
+                            .map(|n| ranks[index.scratch_cluster_of(*n).unwrap()])
+                            .collect();
+                        (near, order)
+                    })
+                    .collect();
+                for target in [0.997, 0.998] {
+                    let p = probes_for(&warm_ranks, target);
+                    let missed: usize = measured_ranks
+                        .iter()
+                        .map(|(near, _)| near.iter().filter(|r| **r as usize >= p).count())
+                        .sum();
+                    let codes: f64 = measured_ranks
+                        .iter()
+                        .map(|(_, order)| {
+                            order[..p].iter().map(|c| sizes[*c as usize]).sum::<usize>() as f64
+                        })
+                        .sum::<f64>()
+                        / queries.len() as f64;
+                    println!(
+                        "order by {label}, target {target}: probes {p} of {}, broad {:.4}, codes a query {codes:.0}",
+                        index.clusters(),
+                        1.0 - missed as f64 / (queries.len() * 10) as f64,
+                    );
+                }
+            }
+        }
+        if std::env::var("SCRATCH_GUIDED").is_ok() && layout.len() == 1 {
+            // Probing guided by questions seen: a measured question's
+            // nearest warm-up questions, and the clusters their own nearest
+            // rows lay in, ranked by how many; then the rest by centroid.
+            let (from, to, index) = &segments[0];
+            let rows: Vec<(u32, &[f32])> = live
+                .iter()
+                .filter(|(n, _)| (*from..*to).contains(&(*n as usize)))
+                .copied()
+                .collect();
+            let local_w = exact(
+                &format!("{tmp}/exact-warmup-{from}-{to}.bin"),
+                &warmup,
+                &rows,
+            );
+            let sizes: Vec<usize> = {
+                let mut s = vec![0usize; index.clusters()];
+                for (n, _) in &rows {
+                    s[index.scratch_cluster_of(*n).unwrap()] += 1;
+                }
+                s
+            };
+            // Each warm-up question's neighbours' clusters.
+            let held: Vec<Vec<usize>> = local_w
+                .iter()
+                .map(|near| {
+                    near.iter()
+                        .map(|r| index.scratch_cluster_of(*r).unwrap())
+                        .collect()
+                })
+                .collect();
+            for (guides, depth) in [(10usize, 10usize), (30, 10), (100, 10), (30, 100)] {
+                // with depth 100: the warm-up questions' nearest 100 rows
+                let held_deep: Vec<Vec<usize>> = if depth > 10 {
+                    warmup
+                        .par_iter()
+                        .map(|q| {
+                            let mut best: Vec<(f32, u32)> = rows
+                                .iter()
+                                .map(|(n, v)| (distance(Distance::Cosine, q, v), *n))
+                                .collect();
+                            best.select_nth_unstable_by(depth, |a, b| a.0.total_cmp(&b.0));
+                            best[..depth]
+                                .iter()
+                                .map(|(_, r)| index.scratch_cluster_of(*r).unwrap())
+                                .collect()
+                        })
+                        .collect()
+                } else {
+                    held.clone()
+                };
+                let measured_ranks: Vec<(Vec<u32>, Vec<u32>)> = queries
+                    .par_iter()
+                    .enumerate()
+                    .map(|(q, v)| {
+                        let base = index.scratch_cluster_ranks(v);
+                        let mut nearest_w: Vec<(f32, usize)> = warmup
+                            .iter()
+                            .enumerate()
+                            .map(|(w, wv)| (distance(Distance::Cosine, v, wv), w))
+                            .collect();
+                        nearest_w.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        let mut votes = vec![0usize; index.clusters()];
+                        for (_, w) in nearest_w.iter().take(guides) {
+                            for c in &held_deep[*w] {
+                                votes[*c] += 1;
+                            }
+                        }
+                        let mut order: Vec<u32> = (0..index.clusters() as u32).collect();
+                        order.sort_by_key(|c| {
+                            (std::cmp::Reverse(votes[*c as usize]), base[*c as usize])
+                        });
+                        let mut ranks = vec![0u32; index.clusters()];
+                        for (r, c) in order.iter().enumerate() {
+                            ranks[*c as usize] = r as u32;
+                        }
+                        let near: Vec<u32> = truth_case[&(q, "broad".to_string())]
+                            .iter()
+                            .filter(|n| (*from..*to).contains(&(**n as usize)))
+                            .map(|n| ranks[index.scratch_cluster_of(*n).unwrap()])
+                            .collect();
+                        (near, order)
+                    })
+                    .collect();
+                for share in [0.05f64, 0.1, 0.2, 0.3, 0.45, 0.6] {
+                    let p = (index.clusters() as f64 * share).ceil() as usize;
+                    let missed: usize = measured_ranks
+                        .iter()
+                        .map(|(near, _)| near.iter().filter(|r| **r as usize >= p).count())
+                        .sum();
+                    let codes: f64 = measured_ranks
+                        .iter()
+                        .map(|(_, order)| {
+                            order[..p].iter().map(|c| sizes[*c as usize]).sum::<usize>() as f64
+                        })
+                        .sum::<f64>()
+                        / queries.len() as f64;
+                    println!(
+                        "guided by {guides} warm-up questions' nearest {depth}: probes {p} ({share}), broad {:.4}, codes {codes:.0}",
+                        1.0 - missed as f64 / (queries.len() * 10) as f64
+                    );
+                }
+            }
+            // The same shares by centroid alone, for comparison.
+            let base: Vec<Vec<u32>> = queries
+                .par_iter()
+                .map(|v| index.scratch_cluster_ranks(v))
+                .collect();
+            for share in [0.05f64, 0.1, 0.2, 0.3, 0.45, 0.6] {
+                let p = (index.clusters() as f64 * share).ceil() as usize;
+                let missed: usize = (0..queries.len())
+                    .map(|q| {
+                        truth_case[&(q, "broad".to_string())]
+                            .iter()
+                            .filter(|n| (*from..*to).contains(&(**n as usize)))
+                            .filter(|n| {
+                                base[q][index.scratch_cluster_of(**n).unwrap()] as usize >= p
+                            })
+                            .count()
+                    })
+                    .sum();
+                println!(
+                    "by centroid: probes {p} ({share}), broad {:.4}",
+                    1.0 - missed as f64 / (queries.len() * 10) as f64
+                );
+            }
+        }
+        if std::env::var("SCRATCH_SOAR").is_ok() && layout.len() == 1 {
+            let (from, to, index) = &segments[0];
+            let rows: Vec<(u32, &[f32])> = live
+                .iter()
+                .filter(|(n, _)| (*from..*to).contains(&(*n as usize)))
+                .copied()
+                .collect();
+            for lambda in [0.0f32, 1.0] {
+                let started = Instant::now();
+                let spills: HashMap<u32, (usize, usize)> = rows
+                    .par_iter()
+                    .map(|(n, v)| (*n, index.scratch_spill(v, lambda)))
+                    .collect();
+                let mut sizes = vec![0usize; index.clusters()];
+                for (own, spill) in spills.values() {
+                    sizes[*own] += 1;
+                    sizes[*spill] += 1;
+                }
+                let plain: Vec<usize> = {
+                    let mut s = vec![0usize; index.clusters()];
+                    spills.values().for_each(|(own, _)| s[*own] += 1);
+                    s
+                };
+                // Rank of the nearer of a row's two clusters.
+                let rank = |ranks: &[u32], row: u32| -> u32 {
+                    let (own, spill) = spills[&row];
+                    ranks[own].min(ranks[spill])
+                };
+                let local_w = exact(
+                    &format!("{tmp}/exact-warmup-{from}-{to}.bin"),
+                    &warmup,
+                    &rows,
+                );
+                let warm_ranks: Vec<u32> = warmup
+                    .par_iter()
+                    .zip(&local_w)
+                    .flat_map_iter(|(v, near)| {
+                        let ranks = index.scratch_cluster_ranks(v);
+                        near.iter()
+                            .map(|row| rank(&ranks, *row))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                let measured_ranks: Vec<(Vec<u32>, Vec<u32>)> = queries
+                    .par_iter()
+                    .enumerate()
+                    .map(|(q, v)| {
+                        let ranks = index.scratch_cluster_ranks(v);
+                        let mut order: Vec<u32> = (0..index.clusters() as u32).collect();
+                        order.sort_by_key(|c| ranks[*c as usize]);
+                        let near: Vec<u32> = truth_case[&(q, "broad".to_string())]
+                            .iter()
+                            .filter(|n| (*from..*to).contains(&(**n as usize)))
+                            .map(|n| rank(&ranks, *n))
+                            .collect();
+                        (near, order)
+                    })
+                    .collect();
+                for target in [0.997, 0.998] {
+                    let p = probes_for(&warm_ranks, target);
+                    let missed: usize = measured_ranks
+                        .iter()
+                        .map(|(near, _)| near.iter().filter(|r| **r as usize >= p).count())
+                        .sum();
+                    let codes: f64 = measured_ranks
+                        .iter()
+                        .map(|(_, order)| {
+                            order[..p].iter().map(|c| sizes[*c as usize]).sum::<usize>() as f64
+                        })
+                        .sum::<f64>()
+                        / queries.len() as f64;
+                    let p0 = probes_for(&local[0], target);
+                    let codes0: f64 = measured_ranks
+                        .iter()
+                        .map(|(_, order)| {
+                            order[..p0]
+                                .iter()
+                                .map(|c| plain[*c as usize])
+                                .sum::<usize>() as f64
+                        })
+                        .sum::<f64>()
+                        / queries.len() as f64;
+                    println!(
+                        "spill lambda {lambda} (assigned in {:.0?}), target {target}: probes {p} (without spill {p0}), broad {:.4}, codes a query {:.0} (without spill {:.0})",
+                        started.elapsed(),
+                        1.0 - missed as f64 / (queries.len() * 10) as f64,
+                        codes,
+                        codes0
+                    );
+                }
             }
         }
         let rows_tuned: Vec<usize> = segments.iter().map(|(_, _, i)| i.probes()).collect();

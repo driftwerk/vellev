@@ -777,6 +777,62 @@ impl ClusteredIndex {
         ranks
     }
 
+    /// Scratch: a vector's own cluster and the one SOAR would spill it to:
+    /// the cluster minimising |r'|² + λ (r·r')² / |r|², r its residual from
+    /// its own centroid and r' from the other's.
+    pub fn scratch_spill(&self, vector: &[f32], lambda: f32) -> (usize, usize) {
+        let v = self.prepared(vector);
+        let width = self.rotation.width;
+        let own = nearest_centroid(&self.centroids, width, &v);
+        let r: Vec<f32> = v
+            .iter()
+            .zip(self.centroid(own))
+            .map(|(a, c)| a - c)
+            .collect();
+        let rr = dot(&r, &r).max(1e-12);
+        let mut best = (f32::INFINITY, own);
+        for (cluster, centroid) in self.centroids.chunks_exact(width).enumerate() {
+            if cluster == own {
+                continue;
+            }
+            let r2: Vec<f32> = v.iter().zip(centroid).map(|(a, c)| a - c).collect();
+            let along = dot(&r, &r2);
+            let loss = dot(&r2, &r2) + lambda * along * along / rr;
+            if loss < best.0 {
+                best = (loss, cluster);
+            }
+        }
+        (own, best.1)
+    }
+
+    /// Scratch: a vector rotated as the index rotates queries.
+    pub fn scratch_prepared(&self, vector: &[f32]) -> Vec<f32> {
+        self.prepared(vector)
+    }
+
+    /// Scratch: each cluster's rank in the order of `rotated`'s nearness to
+    /// the centroids, by squared distance or by inner product.
+    pub fn scratch_ranks_by(&self, rotated: &[f32], by_dot: bool) -> Vec<u32> {
+        let mut order: Vec<(f32, usize)> = self
+            .centroids
+            .chunks_exact(self.rotation.width)
+            .enumerate()
+            .map(|(cluster, centroid)| {
+                let d = match by_dot {
+                    true => -dot(rotated, centroid),
+                    false => squared_l2(rotated, centroid),
+                };
+                (d, cluster)
+            })
+            .collect();
+        order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut ranks = vec![0u32; order.len()];
+        for (rank, (_, cluster)) in order.into_iter().enumerate() {
+            ranks[cluster] = rank as u32;
+        }
+        ranks
+    }
+
     /// Scratch: the cluster a row is in.
     pub fn scratch_cluster_of(&self, row: u32) -> Option<usize> {
         self.position(row).map(|at| self.at[at].0 as usize)
