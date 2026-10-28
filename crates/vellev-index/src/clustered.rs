@@ -792,15 +792,23 @@ impl ClusteredIndex {
     /// `vectors` themselves, each left out of its own neighbours: the rows
     /// that can be measured, as no other is ever offered.
     fn tuned(&self, vectors: &[(u32, &[f32])], random: &mut Random) -> usize {
-        let ranks: Vec<usize> = random
-            .sample(vectors.len(), std::env::var("SCRATCH_TUNING_QUERIES").ok().and_then(|q| q.parse().ok()).unwrap_or(TUNING_QUERIES))
-            .into_par_iter()
-            .map(|at| &vectors[at])
+        let samples = std::env::var("SCRATCH_TUNING_QUERIES").ok().and_then(|q| q.parse().ok()).unwrap_or(TUNING_QUERIES);
+        let midpoints = std::env::var("SCRATCH_MIDPOINTS").is_ok_and(|m| m == "1");
+        // Scratch: queries are rows, or halfway between two random rows.
+        let queries: Vec<(Option<u32>, Vec<f32>)> = match midpoints {
+            false => random.sample(vectors.len(), samples).into_iter().map(|at| (Some(vectors[at].0), vectors[at].1.to_vec())).collect(),
+            true => (0..samples).map(|_| {
+                let (a, b) = (random.below(vectors.len()), random.below(vectors.len()));
+                (None, vectors[a].1.iter().zip(vectors[b].1).map(|(x, y)| (x + y) / 2.0).collect())
+            }).collect(),
+        };
+        let ranks: Vec<usize> = queries
+            .par_iter()
             .flat_map_iter(|(row, query)| {
                 let scorer = Scorer::new(self.metric, query);
                 let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
                 for (other, vector) in vectors {
-                    if other != row {
+                    if Some(*other) != *row {
                         nearest.offer(scorer.distance(vector), *other);
                     }
                 }
@@ -815,6 +823,7 @@ impl ClusteredIndex {
                     .estimates()
                     .into_iter()
                     .map(move |(_, row)| rank_of(self.at[self.position(row).unwrap()].0))
+                    .collect::<Vec<_>>()
             })
             .collect();
         if ranks.is_empty() {
