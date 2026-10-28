@@ -794,14 +794,7 @@ impl ClusteredIndex {
             probes: 1,
             curve: None,
         };
-        let samples = random.sample(measured.len(), TUNING_QUERIES);
-        let ranks = index.sample_ranks(&measured, &samples);
-        index.curve = Curve::of(
-            Source::Rows,
-            samples.len() as u32,
-            index.clusters.len() as u32,
-            ranks,
-        );
+        index.curve = index.curve_of_measured(&measured);
         // Every cluster a sample's nearest rows lay in, as the curve says;
         // also what a node that knows nothing of curves scans.
         index.probes = index.curve.as_ref().map_or(1, Curve::probes);
@@ -842,6 +835,36 @@ impl ClusteredIndex {
     /// keeps.
     pub fn rows_curve(&self) -> Option<Curve> {
         self.curve.clone()
+    }
+
+    /// The curve of the rows of `vectors`, as the build of an index of
+    /// them makes it: for an index read back from its file, whose curve is
+    /// not in it, from the vectors it indexes, in ascending row order. The
+    /// same rows give the same curve, whenever it is made.
+    pub fn curve_of_rows(&self, vectors: &[(u32, &[f32])]) -> Option<Curve> {
+        let measured: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .copied()
+            .filter(|(_, vector)| measurable(self.metric, vector))
+            .collect();
+        self.curve_of_measured(&measured)
+    }
+
+    /// As [`Self::curve_of_rows`], of rows already found measurable: its
+    /// samples drawn by a generator of their own, seeded by how many rows
+    /// there are and their dimensions alone.
+    fn curve_of_measured(&self, measured: &[(u32, &[f32])]) -> Option<Curve> {
+        let mut random = Random(
+            (measured.len() as u64 ^ ((self.dimensions as u64) << 32)) ^ 0x7465_6e65_645f_7631,
+        );
+        let samples = random.sample(measured.len(), TUNING_QUERIES);
+        let ranks = self.sample_ranks(measured, &samples);
+        Curve::of(
+            Source::Rows,
+            samples.len() as u32,
+            self.clusters.len() as u32,
+            ranks,
+        )
     }
 
     /// Each of `samples`' nearest [`TUNING_NEIGHBOURS`] of `vectors`, the
@@ -1653,6 +1676,35 @@ mod tests {
             }
             assert_eq!(answer, Ok(samples.len() * TUNING_NEIGHBOURS));
         });
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
+        /// An index read back from its file has no curve of its rows, and a
+        /// pass over the rows it indexes gives the very curve its build
+        /// gave: a segment built before curves gets the one it would have.
+        #[test]
+        fn a_rows_pass_over_an_index_read_back_gives_the_curve_its_build_gave(
+            seed in 1u64..u64::MAX,
+            rows in 30usize..1200,
+            dimensions in 2usize..40,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let built = indexed(metric, &vectors);
+            let read: ClusteredIndex =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
+            proptest::prop_assert_eq!(read.rows_curve(), None);
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+                .collect();
+            proptest::prop_assert_eq!(read.curve_of_rows(&numbered), built.rows_curve());
+        }
     }
 
     proptest::proptest! {

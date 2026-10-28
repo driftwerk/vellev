@@ -472,3 +472,245 @@ async fn a_built_clustered_segment_keeps_the_curve_of_its_rows() {
         .read(|state| state.segments().cloned().collect());
     assert_eq!(&opened[0].probes, curves, "every node reads the same curve");
 }
+
+/// Curves committed for a segment are kept in its entry and read by every
+/// node, the memtable flushed along; a curve for a segment a merge has
+/// replaced is not committed; and a later merge's segment keeps none of
+/// its run's.
+#[tokio::test]
+async fn curves_committed_for_a_segment_are_kept_and_a_replaced_one_gets_none() {
+    use vellev_index::curve::{Curve, Source};
+    use vellev_storage::format::SegmentCurve;
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let segment = segments_of(&cluster).await[0].clone();
+    let built = segment.probes[0].clone();
+    let clusters = built.curve.clusters;
+    let asked = SegmentCurve {
+        collection: built.collection,
+        band: 0,
+        curve: Curve::of(
+            Source::Queries,
+            50,
+            clusters,
+            (0..500).map(|n| n % clusters).collect(),
+        )
+        .unwrap(),
+    };
+    // One row more in the memtable, flushed along with the commit.
+    writer
+        .commit(vec![row("notes", ROWS, vectors[0].clone())])
+        .await
+        .unwrap();
+    let committed = writer
+        .commit_curves(vec![(segment.key.clone(), asked.clone())])
+        .await
+        .unwrap();
+    assert!(committed.is_some(), "a curve for a segment that is there");
+    let kept = segments_of(&cluster).await;
+    assert_eq!(kept.len(), 2, "the memtable was flushed along: {kept:?}");
+    assert_eq!(kept[0].key, segment.key);
+    assert_eq!(
+        kept[0].probes,
+        vec![asked.clone()],
+        "the queries curve replaces the rows one"
+    );
+    let follower = cluster.open().await;
+    let read: Vec<SegmentMeta> = follower
+        .partition()
+        .read(|state| state.segments().cloned().collect());
+    assert_eq!(read[0].probes, vec![asked.clone()], "every node reads it");
+
+    // A curve for a segment no longer there: nothing committed.
+    let gone = writer
+        .commit_curves(vec![("tenant-a/0/segment/not-there.segment".into(), asked)])
+        .await
+        .unwrap();
+    assert_eq!(gone, None);
+}
+
+/// Blobs as a node of a version before curves would leave them: every
+/// manifest read with its segments' curves left out.
+#[derive(Debug)]
+struct Older {
+    inner: Arc<dyn Blobs>,
+}
+
+#[async_trait::async_trait]
+impl Blobs for Older {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        let bytes = self.inner.get(key).await?;
+        if !key.ends_with(".manifest") {
+            return Ok(bytes);
+        }
+        let mut manifest: Manifest = format::decode(key, Kind::Manifest, &bytes)?;
+        manifest
+            .segments
+            .iter_mut()
+            .for_each(|segment| segment.probes.clear());
+        format::encode(Kind::Manifest, &manifest)
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A segment from before curves, its index read back from its file, gets
+/// the very curve its build would have given, by a pass over its rows; a
+/// segment that has its curve gets nothing.
+#[tokio::test]
+async fn a_segment_from_before_curves_gets_the_curve_its_build_would_have_given() {
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let built = segments_of(&cluster).await[0].probes.clone();
+    assert_eq!(built.len(), 1);
+    assert_eq!(writer.rows_pass().await.unwrap(), None, "nothing missing");
+    drop(writer);
+
+    let (lease, committed) = cluster.lease().await;
+    let older: Arc<dyn Blobs> = Arc::new(Older {
+        inner: cluster.blobs.clone(),
+    });
+    let successor = Writer::open(older, cluster.coordinator.clone(), lease, &committed)
+        .await
+        .unwrap();
+    let seen: Vec<SegmentMeta> = successor
+        .partition()
+        .read(|state| state.segments().cloned().collect());
+    assert!(seen[0].probes.is_empty(), "read as before curves");
+    assert!(successor.rows_pass().await.unwrap().is_some());
+    let after = segments_of(&cluster).await;
+    assert_eq!(after[0].probes, built, "the curve its build gave");
+    let kept: Vec<SegmentMeta> = successor
+        .partition()
+        .read(|state| state.segments().cloned().collect());
+    assert_eq!(kept[0].probes, built);
+}
+
+/// The clustered indexes a partition holds are counted one for each, by
+/// where their probes come from (recall note, R7): the curve of band 0 for
+/// the index's collection by its source, a curve of a source this version
+/// does not know as unknown, one of a known source that does not fit the
+/// index as unfit, and none at all as the index's own count. A curve of
+/// another band, or for a collection with no clustered index in the
+/// segment, counts for nothing, and neither does a segment with no index.
+#[tokio::test]
+async fn clustered_indexes_are_counted_one_each_by_where_their_probes_come_from() {
+    use vellev_index::curve::{Curve, Source};
+    use vellev_storage::format::{CollectionId, SegmentCurve};
+    use vellev_storage::{Probes, State};
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    writer
+        .commit(vec![row("notes", ROWS, vectors[0].clone())])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let segments = segments_of(&cluster).await;
+    assert_eq!(segments.len(), 2, "{segments:?}");
+    let segment = segments.iter().find(|s| s.index.is_some()).unwrap().clone();
+    assert!(segments.iter().any(|s| s.index.is_none()));
+    let built = segment.probes[0].clone();
+    let probes = |writer: &Writer| writer.partition().read(State::probes);
+    assert_eq!(
+        probes(&writer),
+        Probes {
+            rows: 1,
+            ..Probes::default()
+        }
+    );
+
+    let clusters = built.curve.clusters;
+    let curve = |source, clusters| SegmentCurve {
+        collection: built.collection,
+        band: 0,
+        curve: Curve::of(
+            source,
+            50,
+            clusters,
+            (0..500).map(|n| n % clusters).collect(),
+        )
+        .unwrap(),
+    };
+    let one = |field: fn(&mut Probes) -> &mut u64| {
+        let mut probes = Probes::default();
+        *field(&mut probes) = 1;
+        probes
+    };
+    for (what, given, counted) in [
+        (
+            "questions",
+            curve(Source::Queries, clusters),
+            one(|p| &mut p.queries),
+        ),
+        (
+            "unknown",
+            curve(Source::Unknown, clusters),
+            one(|p| &mut p.unknown),
+        ),
+        (
+            "unfit",
+            curve(Source::Rows, clusters + 1),
+            one(|p| &mut p.unfit),
+        ),
+    ] {
+        writer
+            .commit_curves(vec![(segment.key.clone(), given)])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(probes(&writer), counted, "a curve of {what}");
+    }
+
+    // The rows curve back, with one of another band and one for a
+    // collection the segment has no index of: still one index, of rows.
+    let elsewhere = SegmentCurve {
+        collection: CollectionId(built.collection.0 + 1),
+        ..built.clone()
+    };
+    let banded = SegmentCurve {
+        band: 2,
+        ..curve(Source::Queries, clusters)
+    };
+    writer
+        .commit_curves(vec![
+            (segment.key.clone(), built.clone()),
+            (segment.key.clone(), elsewhere),
+            (segment.key.clone(), banded),
+        ])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        segments_of(&cluster)
+            .await
+            .iter()
+            .map(|s| s.probes.len())
+            .sum::<usize>(),
+        3
+    );
+    assert_eq!(probes(&writer), one(|p| &mut p.rows));
+    drop(writer);
+
+    // Read as before curves: the index scans by its own count.
+    let (lease, committed) = cluster.lease().await;
+    let older: Arc<dyn Blobs> = Arc::new(Older {
+        inner: cluster.blobs.clone(),
+    });
+    let successor = Writer::open(older, cluster.coordinator.clone(), lease, &committed)
+        .await
+        .unwrap();
+    assert_eq!(probes(&successor), one(|p| &mut p.index));
+}
