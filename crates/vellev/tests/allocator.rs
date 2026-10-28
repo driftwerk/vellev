@@ -90,6 +90,32 @@ fn memory_freed_among_what_is_kept_is_given_back() {
     while anon() > bound && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    // Scratch: what jemalloc holds, and the process's memory by kind.
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    let read = |name: &str| -> usize {
+        let name = format!("{name}\0");
+        // SAFETY: jemalloc's names, of size_t statistics.
+        unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name.as_bytes()) }.unwrap_or(0)
+    };
+    let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+    let rollup: String = rollup
+        .lines()
+        .filter(|l| ["Rss:", "Anonymous:", "Private_Dirty:", "Shared_Clean:"].iter().any(|k| l.starts_with(k)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    println!(
+        "scratch: {} MiB anonymous ({} MiB before, bound {} MiB) with {} MiB kept; jemalloc allocated {} MiB, active {} MiB, metadata {} MiB, dirty {} MiB, resident {} MiB; RUST_BACKTRACE={:?}; {rollup}",
+        anon() / MIB,
+        before / MIB,
+        bound / MIB,
+        held / MIB,
+        read("stats.allocated") >> 20,
+        read("stats.active") >> 20,
+        read("stats.metadata") >> 20,
+        read("stats.arenas.4096.pdirty") * 4096 >> 20,
+        read("stats.resident") >> 20,
+        std::env::var("RUST_BACKTRACE").ok(),
+    );
     assert!(
         anon() <= bound,
         "{} MiB anonymous with {} MiB kept: what was freed was not given back",
