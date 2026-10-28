@@ -9072,3 +9072,28 @@ async fn a_tenant_whose_round_failed_after_its_flush_stays_unsettled() {
     cluster.store.unreadable.store(false, Ordering::SeqCst);
     node.shutdown().await;
 }
+
+/// The segments the tenants a node writes hold, by whether they have a
+/// clustered index, with their rows: so that a run meant to exercise the
+/// clustered index can tell that it did.
+#[tokio::test]
+async fn the_segments_a_node_holds_are_counted_with_their_rows() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    assert_eq!(node.segments(), vellev_node::Segments::default());
+    node.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = node.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    written_in_batches(&acme, 0, 10, 10).await;
+    assert!(settled_within(&node, Duration::from_secs(10)).await);
+    written_in_batches(&acme, 10, 15, 5).await;
+    acme.flush().await.unwrap();
+    let held = node.segments();
+    let rows: u64 = acme.read(|state| state.segments().map(|segment| segment.rows).sum());
+    assert_eq!(held.clustered, 0, "{held:?}");
+    assert_eq!(held.plain, acme.read(|state| state.segments().count()));
+    assert_eq!(held.plain_rows, rows);
+    assert_eq!(rows, 15);
+}
