@@ -7,7 +7,7 @@ use vellev_index::curve::Curve;
 use vellev_index::filter::{Filter, Predicate};
 use vellev_index::vector::{nearest, Scorer, VectorIndex};
 
-use crate::format::CollectionId;
+use crate::format::{CollectionId, SegmentCurve};
 use crate::state::{Layer, State, Vectors, SHORTLIST_ABOVE};
 use crate::{Result, Work};
 
@@ -308,15 +308,11 @@ fn candidates(
 /// How many clusters `collection`'s clustered index scans in a layer: as
 /// the layer's curve for it says, where it has one that fits the index,
 /// else as the index was built to.
-fn probes_for(
-    curves: &[(CollectionId, Curve)],
-    collection: CollectionId,
-    index: &ClusteredIndex,
-) -> usize {
+fn probes_for(curves: &[SegmentCurve], collection: CollectionId, index: &ClusteredIndex) -> usize {
     curves
         .iter()
-        .find(|(of, _)| *of == collection)
-        .map(|(_, curve)| curve)
+        .find(|entry| entry.collection == collection && entry.band == 0)
+        .map(|entry| &entry.curve)
         .filter(|curve| curve.fits(index.clusters()))
         .map_or(index.probes(), Curve::probes)
 }
@@ -402,19 +398,36 @@ mod tests {
         )
         .unwrap();
         let (mine, theirs) = (CollectionId(3), CollectionId(4));
+        let entry = |collection, band, curve: &Curve| SegmentCurve {
+            collection,
+            band,
+            curve: curve.clone(),
+        };
         assert_eq!(
-            probes_for(&[(mine, deep.clone())], mine, &index),
+            probes_for(&[entry(mine, 0, &deep)], mine, &index),
             clusters as usize
         );
         assert_eq!(
-            probes_for(&[(theirs, deep)], mine, &index),
+            probes_for(&[entry(theirs, 0, &deep)], mine, &index),
             index.probes(),
             "another collection's"
         );
         assert_eq!(
-            probes_for(&[(mine, other)], mine, &index),
+            probes_for(&[entry(mine, 0, &other)], mine, &index),
             index.probes(),
             "a curve of another index"
+        );
+        assert_eq!(
+            probes_for(&[entry(mine, 2, &deep)], mine, &index),
+            index.probes(),
+            "another band's"
+        );
+        let mut unknown = deep.clone();
+        unknown.source = vellev_index::curve::Source::Unknown;
+        assert_eq!(
+            probes_for(&[entry(mine, 0, &unknown)], mine, &index),
+            index.probes(),
+            "of a source not known"
         );
         assert_eq!(probes_for(&[], mine, &index), index.probes());
     }

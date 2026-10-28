@@ -73,3 +73,27 @@ fn a_curve_reads_back_as_written() {
     let back: Curve = rmp_serde::from_slice(&bytes).unwrap();
     assert_eq!(back, curve);
 }
+
+/// A curve of a source a later version names is read, so that the segment
+/// it belongs to is, but never fits, so that the segment scans as its
+/// index was built to.
+#[test]
+fn a_curve_of_a_source_this_version_does_not_know_is_read_and_never_used() {
+    #[derive(serde::Serialize)]
+    struct Later {
+        source: &'static str,
+        samples: u32,
+        clusters: u32,
+        ranks: Vec<u16>,
+    }
+    let bytes = rmp_serde::to_vec_named(&Later {
+        source: "calibration",
+        samples: 400,
+        clusters: 10,
+        ranks: vec![3; POINTS],
+    })
+    .unwrap();
+    let read: Curve = rmp_serde::from_slice(&bytes).unwrap();
+    assert_eq!(read.source, Source::Unknown);
+    assert!(!read.fits(10));
+}

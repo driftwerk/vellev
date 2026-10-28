@@ -34,6 +34,11 @@ pub enum Source {
     /// Questions asked of the node: the probes hold [`TARGET`] of their
     /// nearest rows.
     Queries,
+    /// A source this version does not know, written by a later one: read,
+    /// so that the segment it belongs to is, but never used, so that the
+    /// segment scans as its index was built to.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A segment's probe curve for one collection's clustered index.
@@ -83,7 +88,7 @@ impl Curve {
     /// the index has.
     pub fn probes(&self) -> usize {
         let share = match self.source {
-            Source::Rows => 1.0,
+            Source::Rows | Source::Unknown => 1.0,
             Source::Queries => TARGET,
         };
         let point = (((share - FROM) / STEP).round() as usize).min(POINTS - 1);
@@ -91,10 +96,11 @@ impl Curve {
         (usize::from(rank) + 1).clamp(1, self.clusters.max(1) as usize)
     }
 
-    /// Whether this curve is one for an index of `clusters`, and whole: a
-    /// curve that is not is never used.
+    /// Whether this curve is one for an index of `clusters`, whole, and
+    /// of a source this version knows: a curve that is not is never used.
     pub fn fits(&self, clusters: usize) -> bool {
-        self.clusters as usize == clusters
+        self.source != Source::Unknown
+            && self.clusters as usize == clusters
             && self.ranks.len() == POINTS
             && self
                 .ranks

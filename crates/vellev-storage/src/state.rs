@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
-use vellev_index::curve::Curve;
 
 use roaring::RoaringBitmap;
 use vellev_core::{
@@ -17,7 +16,8 @@ use crate::catalog::Catalog;
 use crate::column::{Column, Gathering};
 use crate::coordinator::LogPosition;
 use crate::format::{
-    Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
+    Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
+    SegmentMeta,
 };
 use crate::{Result, StorageError};
 
@@ -308,7 +308,7 @@ pub(crate) struct Layer<'a> {
     pub vectors: Option<&'a Column>,
     /// How many clusters each collection's clustered index scans, where
     /// the segment's curve says (recall note, R7); none for the memtable.
-    pub curves: &'a [(CollectionId, Curve)],
+    pub curves: &'a [SegmentCurve],
 }
 
 impl<'a> Layer<'a> {
