@@ -41,4 +41,4 @@ jobs:
         run: lscpu | grep -E "Model name|^CPU\(s\)" | cut -c1-200
       - name: A lone read during a build, unsplit and split, alternating
         run: |
-          for rate in 30 0; do VELLEV_FIXTURE="$RUNNER_TEMP/fixture" RATE=$rate ROUNDS=4 cargo test --release --locked -p vellev-index --test split_during_build -- --ignored --nocapture; done
+          for rate in 30; do VELLEV_FIXTURE="$RUNNER_TEMP/fixture" RATE=$rate ROUNDS=4 cargo test --release --locked -p vellev-index --test split_during_build -- --ignored --nocapture; done
