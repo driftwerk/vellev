@@ -189,23 +189,27 @@ mod tests {
     use super::*;
 
     /// A read splits its search over the threads no other read is using,
-    /// and never when every thread is busy or reads wait: split, a search
-    /// is faster alone and slower among others (see #141's measurements).
+    /// and never when every thread is busy, reads wait, or an index is
+    /// being built: split, a search is faster alone and slower among
+    /// others (#141's measurements), and no faster during a build, which
+    /// it slows (the review's).
     #[test]
     fn a_read_splits_only_over_threads_others_leave_idle() {
         // Alone on three threads: all three.
-        assert_eq!(split_for(3, 1, 0), 3);
+        assert_eq!(split_for(3, 1, 0, 0), 3);
         // Two reads on four threads: two each.
-        assert_eq!(split_for(4, 2, 0), 2);
+        assert_eq!(split_for(4, 2, 0, 0), 2);
         // As many reads as threads, or more: one each.
-        assert_eq!(split_for(3, 3, 0), 1);
-        assert_eq!(split_for(3, 8, 0), 1);
+        assert_eq!(split_for(3, 3, 0, 0), 1);
+        assert_eq!(split_for(3, 8, 0, 0), 1);
         // Reads waiting for a turn: one, whatever is free.
-        assert_eq!(split_for(8, 1, 1), 1);
+        assert_eq!(split_for(8, 1, 1, 0), 1);
+        // An index being built: one, whatever is free.
+        assert_eq!(split_for(8, 1, 0, 1), 1);
         // One thread: one.
-        assert_eq!(split_for(1, 1, 0), 1);
+        assert_eq!(split_for(1, 1, 0, 0), 1);
         // Never none, even counted oddly.
-        assert_eq!(split_for(0, 0, 0), 1);
+        assert_eq!(split_for(0, 0, 0, 0), 1);
     }
 
     fn tenant(name: &str) -> TenantId {

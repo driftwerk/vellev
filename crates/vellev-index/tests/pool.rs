@@ -24,3 +24,21 @@ fn the_read_pool_is_sized_as_the_global_pool_whoever_asks_first() {
         "as rayon's own global pool"
     );
 }
+
+/// Builds are counted while they run, across threads, and no longer once
+/// each is done.
+#[test]
+fn builds_are_counted_while_they_run() {
+    assert_eq!(vellev_index::pool::builds(), 0);
+    let first = vellev_index::pool::Building::begun();
+    let second = std::thread::spawn(|| {
+        let _building = vellev_index::pool::Building::begun();
+        vellev_index::pool::builds()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(second, 2);
+    assert_eq!(vellev_index::pool::builds(), 1);
+    drop(first);
+    assert_eq!(vellev_index::pool::builds(), 0);
+}
