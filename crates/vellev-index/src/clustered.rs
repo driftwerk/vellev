@@ -1109,6 +1109,135 @@ mod tests {
         }
     }
 
+    /// The scan as it was before codes were laid out in blocks: every
+    /// cluster's rows estimated code by code, in the same order. What the
+    /// scan of blocks must equal, estimate for estimate and in order.
+    fn estimates_code_by_code(
+        index: &ClusteredIndex,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+    ) -> Vec<(f32, u32)> {
+        let kept = |row: u32| {
+            !skipped.get(row as usize).copied().unwrap_or(false)
+                && index.unmeasured.binary_search(&row).is_err()
+        };
+        let mut nearest = Nearest::new(count, &in_row_order);
+        let query = index.prepared(query);
+        let words = index.rotation.width / 64;
+        let mut code = vec![0u64; words];
+        let allowed = |row: u32| kept(row) && only.is_none_or(|only| only.contains(row));
+        for (probed, (_, cluster)) in index.order(&query).into_iter().enumerate() {
+            if probed >= index.probes && nearest.is_full() {
+                break;
+            }
+            let probe = Probe::new(&query, index.centroid(cluster));
+            let members = &index.clusters[cluster];
+            for (at, row) in members.rows.iter().enumerate() {
+                if allowed(*row) {
+                    members.blocks.code(at, &mut code);
+                    nearest.offer(
+                        probe.distance(index.metric, &code, &members.factors[at]),
+                        *row,
+                    );
+                }
+            }
+        }
+        nearest.estimates()
+    }
+
+    /// The visit of allowed rows as it was: each estimated from its code.
+    fn visited_code_by_code(
+        index: &ClusteredIndex,
+        query: &[f32],
+        count: usize,
+        only: &RoaringBitmap,
+        skipped: &[bool],
+    ) -> Vec<(f32, u32)> {
+        let kept = |row: u32| {
+            !skipped.get(row as usize).copied().unwrap_or(false)
+                && index.unmeasured.binary_search(&row).is_err()
+        };
+        let mut nearest = Nearest::new(count, &in_row_order);
+        let query = index.prepared(query);
+        let mut code = vec![0u64; index.rotation.width / 64];
+        for row in only.iter().filter(|row| kept(*row)) {
+            let Some(position) = index.position(row) else {
+                continue;
+            };
+            let (cluster, at) = index.at[position];
+            let probe = Probe::new(&query, index.centroid(cluster as usize));
+            let members = &index.clusters[cluster as usize];
+            members.blocks.code(at as usize, &mut code);
+            nearest.offer(
+                probe.distance(index.metric, &code, &members.factors[at as usize]),
+                row,
+            );
+        }
+        nearest.estimates()
+    }
+
+    /// The scan of the clusters a query probes, whatever share of rows is
+    /// allowed.
+    fn scan_only(
+        index: &ClusteredIndex,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+    ) -> Vec<(f32, u32)> {
+        index.scanned(&index.prepared(query), count, only, skipped, &in_row_order)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        /// Laying the codes out in blocks changes no estimate: a scan of
+        /// every cluster it probes gives the estimates the code-by-code
+        /// scan gives, to the bit and in the same order, filtered or not,
+        /// with rows skipped or not, for every metric.
+        #[test]
+        fn the_scan_of_blocks_estimates_as_code_by_code(
+            seed in 1u64..u64::MAX,
+            rows in 40usize..1500,
+            dimensions in 2usize..160,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+            count in 1usize..300,
+            share in proptest::option::of(1u32..100),
+            skip in proptest::bool::ANY,
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let index = indexed(metric, &vectors);
+            let mut noise = Noise(seed.rotate_left(17) | 1);
+            // `indexed` numbers the rows 0, 2, 4, ...
+            let only: Option<RoaringBitmap> = share.map(|share| {
+                (0..rows as u32 * 2)
+                    .filter(|row| (row.wrapping_mul(2_654_435_761) >> 7) % 100 < share)
+                    .collect()
+            });
+            let skipped: Vec<bool> = (0..rows * 2)
+                .map(|row| skip && row % 7 == 3)
+                .collect();
+            for _ in 0..4 {
+                let query = noise.vector(dimensions);
+                let got = scan_only(&index, &query, count, only.as_ref(), &skipped);
+                let want = estimates_code_by_code(&index, &query, count, only.as_ref(), &skipped);
+                let bits = |found: &[(f32, u32)]| -> Vec<(u32, u32)> {
+                    found.iter().map(|(d, row)| (d.to_bits(), *row)).collect()
+                };
+                proptest::prop_assert_eq!(bits(&got), bits(&want));
+                if let Some(only) = &only {
+                    let got = index.visited(&index.prepared(&query), count, only, &skipped, &in_row_order);
+                    let want = visited_code_by_code(&index, &query, count, only, &skipped);
+                    proptest::prop_assert_eq!(bits(&got), bits(&want));
+                }
+            }
+        }
+    }
+
     use super::*;
     use crate::vector::distance;
     use vellev_core::SQUARED_LENGTH_UNDER;
