@@ -39,14 +39,23 @@ pub fn reads() -> &'static ThreadPool {
 /// that long at each merge, and reads waited. On one thread it takes
 /// longer and leaves the rest to reads, flushes and merges. A rows pass,
 /// the same work for a segment from before curves, has [`passes`].
+///
+/// It runs at the process's own priority, never lower: a merge, or a flush
+/// large enough to cluster, holds its partition's building lock while it
+/// tunes, and flushes wait on that lock. Run lower, a tuning the scheduler
+/// starved under load would hold them back for as long (build-priority
+/// review). So it is made, like the read pool, before the passes' pool.
 pub fn tuning() -> &'static ThreadPool {
     static TUNING: OnceLock<ThreadPool> = OnceLock::new();
     TUNING.get_or_init(|| {
+        debug_assert!(
+            !LOWERED.with(std::cell::Cell::get),
+            "the tuning pool made from a background thread"
+        );
         reads();
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-tune".to_string())
-            .start_handler(|_| lowered())
             .build()
             .expect("the tuning pool's thread")
     })
@@ -57,10 +66,13 @@ pub fn tuning() -> &'static ThreadPool {
 /// tuning never waits behind the passes an upgrade makes, segment after
 /// segment, each tens of seconds a million rows. At most one pass runs on
 /// a node at a time, so tuning and passes take two threads at the most.
+/// Nobody waits on a pass, so its thread runs lower than the rest of the
+/// process ([`BACKGROUND_NICE`]).
 pub fn passes() -> &'static ThreadPool {
     static PASSES: OnceLock<ThreadPool> = OnceLock::new();
     PASSES.get_or_init(|| {
         reads();
+        tuning();
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-pass".to_string())
@@ -70,16 +82,15 @@ pub fn passes() -> &'static ThreadPool {
     })
 }
 
-/// How far below the rest of the process the background pools' threads
-/// run, tuning's and the rows passes': on Linux, where a thread has a
-/// priority of its own, so that on a small box they yield the CPU to reads
-/// while reads want it and take it back when they do not (measured for
-/// builds in #150: reads during a build at nice 10 about twice as fast,
-/// the build no slower).
+/// How far below the rest of the process the rows passes' thread runs: on
+/// Linux, where a thread has a priority of its own, so that on a small box
+/// it yields the CPU to reads while reads want it and takes it back when
+/// they do not (measured for builds in #150: reads during a build at nice
+/// 10 about twice as fast, the build no slower).
 pub const BACKGROUND_NICE: i32 = 10;
 
 std::thread_local! {
-    /// Whether this thread is one of a background pool's, run lower.
+    /// Whether this thread is the rows passes' pool's, run lower.
     static LOWERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -88,9 +99,8 @@ std::thread_local! {
 /// refuses, as the thread then runs as it would have.
 ///
 /// A thread such a thread makes would run lower too, for good, and do
-/// whatever work it is given: so the read pool is made before the
-/// background pools, and is said never to be made from one of their
-/// threads. A background thread has no async runtime to start a blocking
+/// whatever work it is given: so the read and tuning pools are made before
+/// the passes' pool, and are said never to be made from its thread. A background thread has no async runtime to start a blocking
 /// thread on.
 fn lowered() {
     LOWERED.with(|lowered| lowered.set(true));
