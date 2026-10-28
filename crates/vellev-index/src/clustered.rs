@@ -677,6 +677,7 @@ impl ClusteredIndex {
     /// settles how many clusters a query scans; it takes a while for many
     /// vectors and is meant for a background thread.
     pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
+        let _building = crate::pool::Building::begun();
         let dimensions = vectors.first()?.1.len();
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));

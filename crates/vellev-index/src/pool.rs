@@ -9,6 +9,7 @@
 //! a read splits only over the threads other reads leave idle, so that
 //! lasts no longer than a build overlaps a lull in reads.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -37,4 +38,30 @@ fn global_threads() -> usize {
         .and_then(|threads| threads.parse::<usize>().ok())
         .filter(|threads| *threads > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// How many index builds are under way in the process.
+static BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many index builds are under way: a read does not split while any
+/// is, as split it is no faster then and slows the build (review of #141).
+pub fn builds() -> usize {
+    BUILDS.load(Ordering::Relaxed)
+}
+
+/// A build counted as under way until this is dropped.
+#[must_use = "a build is counted only while this is held"]
+pub struct Building(());
+
+impl Building {
+    pub fn begun() -> Self {
+        BUILDS.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for Building {
+    fn drop(&mut self) {
+        BUILDS.fetch_sub(1, Ordering::Relaxed);
+    }
 }

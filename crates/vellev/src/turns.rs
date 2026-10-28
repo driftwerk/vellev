@@ -70,17 +70,25 @@ impl Turn {
     /// busy the node is now: see [`split_for`].
     pub fn split(&self) -> usize {
         let (taken, waiting) = self.turns.counts();
-        split_for(rayon::current_num_threads(), taken, waiting)
+        split_for(
+            rayon::current_num_threads(),
+            taken,
+            waiting,
+            vellev_index::pool::builds(),
+        )
     }
 }
 
 /// How many parts a read may split its search into on `threads` threads
-/// while `taken` turns are held, its own among them, and `waiting` reads
-/// wait for one: the threads the other reads leave it, one at least, and
-/// one whenever a read waits. Split, a search is faster alone but costs
-/// more in all, so a node that is busy answers more by not splitting.
-pub(crate) fn split_for(threads: usize, taken: usize, waiting: usize) -> usize {
-    if waiting > 0 {
+/// while `taken` turns are held, its own among them, `waiting` reads wait
+/// for one, and `building` index builds run: the threads the other reads
+/// leave it, one at least, and one whenever a read waits or an index is
+/// being built. Split, a search is faster alone but costs more in all, so
+/// a node that is busy answers more by not splitting; and during a build
+/// a split read was measured no faster than an unsplit one, and slowed
+/// the build.
+pub(crate) fn split_for(threads: usize, taken: usize, waiting: usize, building: usize) -> usize {
+    if waiting > 0 || building > 0 {
         return 1;
     }
     (threads / taken.max(1)).max(1)
