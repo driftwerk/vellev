@@ -101,10 +101,22 @@ fn memory_freed_among_what_is_kept_is_given_back() {
     const MIB: u64 = 1024 * 1024;
     // Scratch: another thread allocates and frees about 100 MiB of large
     // blocks while this test runs, as a flush on another pool would.
+    let started = std::time::Instant::now();
     let other = std::thread::spawn(|| {
         let blocks: Vec<Vec<u8>> = (0..25).map(|n| vec![n as u8; 4 * 1024 * 1024]).collect();
         std::thread::sleep(std::time::Duration::from_millis(500));
         drop(blocks);
+        // And the original pattern: nm's whole listing taken at once, and
+        // copied into a string, on this other thread.
+        let listed = std::process::Command::new("nm")
+            .arg("--defined-only")
+            .arg(env!("CARGO_BIN_EXE_vellev"))
+            .output()
+            .expect("nm");
+        let text = String::from_utf8_lossy(&listed.stdout).into_owned();
+        let size = (listed.stdout.capacity() + text.capacity()) >> 20;
+        drop((listed, text));
+        size
     });
     let before = anon();
     // About 900 MiB in 3 KiB pieces, as a flush's copies of its vectors.
@@ -130,8 +142,16 @@ fn memory_freed_among_what_is_kept_is_given_back() {
     while anon() > bound && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    other.join().unwrap();
-    eprintln!("scratch: {} MiB anonymous at the end; {}", anon() / MIB, jemalloc());
+    let listing = other.join().unwrap();
+    panic!(
+        "scratch report: nm's listing took {listing} MiB on the other thread; {} MiB anonymous ({} MiB before, bound {} MiB) {:.1} s in; {}",
+        anon() / MIB,
+        before / MIB,
+        bound / MIB,
+        started.elapsed().as_secs_f64(),
+        jemalloc()
+    );
+    #[allow(unreachable_code)]
     assert!(
         anon() <= bound,
         "{} MiB anonymous ({} MiB before, bound {} MiB) with {} MiB kept: what was freed was not given back; {}",
