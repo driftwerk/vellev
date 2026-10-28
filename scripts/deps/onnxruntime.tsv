@@ -1,0 +1,8 @@
+# The ONNX Runtime the image links local embedding against: the very archives
+# the locked ort-sys downloads (its build/download/dist.tsv, feature set
+# "none"), pinned by their SHA-256 and by that of the library they unpack to.
+# `onnxruntime.sh check` fails when these differ from the locked ort-sys's.
+#
+# target	archive sha256	libonnxruntime.a sha256	ort-sys's url
+x86_64-unknown-linux-gnu	e454f710f8a49f53aa5b4ff51e3454ae1835777e431c6c35c5255ce6f205fd68	0bb8a9982b44df690195c2c34b75ca791c3b9f20070b8cecbd8f50c6264dd2e2	https://cdn.pyke.io/0/pyke:ort-rs/ms@1.28.0/x86_64-unknown-linux-gnu.tar.lzma2
+aarch64-unknown-linux-gnu	06a050ab9137ccb32421d0cb49e9ccf72d9e18ab0aeb8f8d038d1b5cc844b35a	cd9aef90524b9814b0b0230927fb9e1938d7a2b4c70a83ca276e4b7755bb1724	https://cdn.pyke.io/0/pyke:ort-rs/ms@1.28.0/aarch64-unknown-linux-gnu.tar.lzma2
