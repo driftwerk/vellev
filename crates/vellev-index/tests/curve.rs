@@ -113,7 +113,10 @@ fn a_curves_source_is_a_string_and_anything_else_there_reads_as_unknown() {
     plain.extend_from_slice(b"source");
     plain.push(0xa0 + 7);
     plain.extend_from_slice(b"queries");
-    assert!(written.windows(plain.len()).any(|w| w == plain.as_slice()), "a plain string");
+    assert!(
+        written.windows(plain.len()).any(|w| w == plain.as_slice()),
+        "a plain string"
+    );
 
     #[derive(serde::Serialize)]
     enum LaterSource {
@@ -135,8 +138,18 @@ fn a_curves_source_is_a_string_and_anything_else_there_reads_as_unknown() {
     };
     for bytes in [
         rmp_serde::to_vec_named(&later(LaterSource::Mixed(7))).unwrap(),
-        rmp_serde::to_vec_named(&later(LaterSource::Weighted { rows: 0.5, questions: 0.5 })).unwrap(),
-        rmp_serde::to_vec_named(&Later { source: 12u32, samples: 400, clusters: 10, ranks: vec![3; POINTS] }).unwrap(),
+        rmp_serde::to_vec_named(&later(LaterSource::Weighted {
+            rows: 0.5,
+            questions: 0.5,
+        }))
+        .unwrap(),
+        rmp_serde::to_vec_named(&Later {
+            source: 12u32,
+            samples: 400,
+            clusters: 10,
+            ranks: vec![3; POINTS],
+        })
+        .unwrap(),
     ] {
         let read: Curve = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(read.source, Source::Unknown);
