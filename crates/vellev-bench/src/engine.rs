@@ -315,6 +315,20 @@ impl Vellev {
         Ok(())
     }
 
+    /// The segments the node's tenants hold, as /metrics reports them: how
+    /// many, and their rows, with a clustered index and without.
+    pub fn segments(metrics: &str) -> Value {
+        let read = |name: &str, index: &str| {
+            Vellev::sample(metrics, &format!("{name}{{index=\"{index}\"}}"))
+        };
+        json!({
+            "clustered": read("vellev_segments", "clustered"),
+            "clustered_rows": read("vellev_segment_rows", "clustered"),
+            "plain": read("vellev_segments", "plain"),
+            "plain_rows": read("vellev_segment_rows", "plain"),
+        })
+    }
+
     /// A sample of the metrics, as `name{labels} value`.
     pub fn sample(text: &str, name: &str) -> Option<f64> {
         text.lines()
@@ -473,6 +487,7 @@ impl Engine for Vellev {
                 "reads_at_once": Vellev::sample(&metrics, "vellev_reads_at_once"),
             },
             "default_oversample": "the node's own, no oversample asked",
+            "segments": Vellev::segments(&metrics),
         }))
     }
 }
@@ -838,6 +853,20 @@ mod tests {
     fn an_error_body_is_cut_at_a_character() {
         assert_eq!(cut("aé", 2), "a");
         assert_eq!(cut("abc", 10), "abc");
+    }
+
+    #[test]
+    fn segments_are_read_by_their_index() {
+        let text = "vellev_segments{index=\"clustered\"} 1\nvellev_segments{index=\"plain\"} 2\nvellev_segment_rows{index=\"clustered\"} 760000\nvellev_segment_rows{index=\"plain\"} 240000\n";
+        assert_eq!(
+            Vellev::segments(text),
+            json!({"clustered": 1.0, "clustered_rows": 760000.0, "plain": 2.0, "plain_rows": 240000.0})
+        );
+        assert_eq!(
+            Vellev::segments("")["clustered"],
+            Value::Null,
+            "unreported is not none"
+        );
     }
 
     #[test]
