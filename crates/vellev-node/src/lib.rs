@@ -2195,6 +2195,7 @@ mod segment_tests {
             tombstones: 0,
             index: clustered.then(|| format!("index-{rows}")),
             vectors: Some(format!("vectors-{rows}")),
+            probes: vec![],
         }
     }
 

@@ -16,7 +16,8 @@ use crate::catalog::Catalog;
 use crate::column::{Column, Gathering};
 use crate::coordinator::LogPosition;
 use crate::format::{
-    Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentFile, SegmentIndex, SegmentMeta,
+    Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
+    SegmentMeta,
 };
 use crate::{Result, StorageError};
 
@@ -199,6 +200,9 @@ impl Names {
             tombstones: shape.tombstones as u64,
             index: shape.clustered.then(|| self.index.clone()),
             vectors: shape.vectors.then(|| self.vectors.clone()),
+            // A new segment scans as its index was built: its curve comes
+            // with the pass that makes one (recall note, R7).
+            probes: vec![],
         }
     }
 }
@@ -302,6 +306,9 @@ pub(crate) struct Layer<'a> {
     pub deaths: usize,
     pub indexes: &'a Indexes,
     pub vectors: Option<&'a Column>,
+    /// How many clusters each collection's clustered index scans, where
+    /// the segment's curve says (recall note, R7); none for the memtable.
+    pub curves: &'a [SegmentCurve],
 }
 
 impl<'a> Layer<'a> {
@@ -899,6 +906,25 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
     }
 }
 
+/// The curves of the rows each clustered index among `indexes` was tuned
+/// on when built, as the segment's manifest entry keeps them (recall note,
+/// R7): none for an index read back from a file.
+pub(crate) fn curves(indexes: &Indexes) -> Vec<SegmentCurve> {
+    let mut curves: Vec<SegmentCurve> = indexes
+        .iter()
+        .filter_map(|(collection, index)| match &index.vectors {
+            Some(Vectors::Clustered(clustered)) => Some(SegmentCurve {
+                collection: *collection,
+                band: 0,
+                curve: clustered.rows_curve()?,
+            }),
+            _ => None,
+        })
+        .collect();
+    curves.sort_by_key(|entry| entry.collection);
+    curves
+}
+
 impl State {
     /// How the text of the upserts this state applied was split into
     /// tokens: see [`TextsApplied`].
@@ -1182,6 +1208,7 @@ impl State {
             deaths: self.memtable.deaths,
             indexes: &self.memtable.indexes,
             vectors: None,
+            curves: &[],
         };
         self.segments
             .iter()
@@ -1191,6 +1218,7 @@ impl State {
                 deaths: segment.deaths,
                 indexes: &segment.indexes,
                 vectors: Some(&segment.vectors),
+                curves: &segment.meta.probes,
             })
             .chain([memtable])
     }
