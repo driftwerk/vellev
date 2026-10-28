@@ -2227,6 +2227,43 @@ mod segment_tests {
                 clustered_rows: 800_000,
                 plain: 2,
                 plain_rows: 250_000,
+                probes: Probes {
+                    index: 1,
+                    ..Probes::default()
+                },
+            }
+        );
+    }
+
+    /// The clustered indexes of the segments held are counted by where
+    /// their probes come from: each band-0 curve by its source, and a
+    /// clustered segment with none as scanning by its index's own count.
+    #[test]
+    fn clustered_indexes_are_counted_by_where_their_probes_come_from() {
+        use vellev_index::curve::{Curve, Source};
+        use vellev_storage::format::{CollectionId, SegmentCurve};
+        let curve = |source, collection, band| SegmentCurve {
+            collection: CollectionId(collection),
+            band,
+            curve: Curve::of(source, 1, 10, vec![3]).unwrap(),
+        };
+        let mut segments = Segments::default();
+        let mut rows = meta(900_000, true);
+        rows.probes = vec![curve(Source::Rows, 1, 0), curve(Source::Rows, 1, 2)];
+        let mut queries = meta(700_000, true);
+        queries.probes = vec![curve(Source::Queries, 1, 0), curve(Source::Rows, 2, 0)];
+        let mut unknown = meta(600_000, true);
+        unknown.probes = vec![curve(Source::Unknown, 1, 0)];
+        for meta in [rows, queries, unknown, meta(500_000, true), meta(10_000, false)] {
+            segments.add(&meta);
+        }
+        assert_eq!(
+            segments.probes,
+            Probes {
+                rows: 2,
+                queries: 1,
+                unknown: 1,
+                index: 1,
             }
         );
     }
