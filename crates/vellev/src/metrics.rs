@@ -291,6 +291,22 @@ impl Collector for Counted {
                     .encode(family.encode_family(&[("index", index)])?)?;
             }
         }
+        let gauge = ConstGauge::new(0i64);
+        let mut family = encoder.encode_descriptor(
+            "segment_probes",
+            "Clustered indexes of the segments the tenants this node writes hold, by where their probes come from: a curve of the index's rows, one of questions asked, a curve of a source this version does not know (scanning by the index's own count), or no curve at all (a segment from before curves, scanning by its index's own count until its rows pass)",
+            None,
+            gauge.metric_type(),
+        )?;
+        for (source, value) in [
+            ("rows", held.probes.rows),
+            ("queries", held.probes.queries),
+            ("unknown", held.probes.unknown),
+            ("index", held.probes.index),
+        ] {
+            ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX))
+                .encode(family.encode_family(&[("source", source)])?)?;
+        }
         let keys = node.key_lookups();
         let counter = ConstCounter::new(0u64);
         let mut family = encoder.encode_descriptor(

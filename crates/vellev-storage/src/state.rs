@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
+use vellev_index::curve::Curve;
 
 use roaring::RoaringBitmap;
 use vellev_core::{
@@ -889,6 +890,28 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
     SegmentIndex {
         segment: segment.to_string(),
         vectors,
+    }
+}
+
+/// Say, once a process for each, that a segment's curve for a collection
+/// does not fit its index, so that the segment scans by its index's own
+/// count: corruption, or a bug, as no version writes such a curve.
+fn unfit_once(segment: &str, collection: CollectionId, curve: &Curve, clusters: usize) {
+    static SAID: std::sync::Mutex<Option<std::collections::HashSet<(String, CollectionId)>>> =
+        std::sync::Mutex::new(None);
+    let mut said = SAID.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if said
+        .get_or_insert_with(Default::default)
+        .insert((segment.to_string(), collection))
+    {
+        tracing::warn!(
+            segment,
+            collection = collection.0,
+            curve_clusters = curve.clusters,
+            ranks = curve.ranks.len(),
+            index_clusters = clusters,
+            "a segment's probe curve does not fit its index; it scans by the index's own count"
+        );
     }
 }
 
@@ -1793,11 +1816,25 @@ impl State {
                 let Some(Vectors::Clustered(clustered)) = &index.vectors else {
                     continue;
                 };
-                let has = segment
+                let curve = segment
                     .meta
                     .probes
                     .iter()
-                    .any(|entry| entry.collection == *collection && entry.band == 0);
+                    .find(|entry| entry.collection == *collection && entry.band == 0);
+                if let Some(entry) = curve {
+                    // One of a source this version knows that does not fit
+                    // its index is not what any version writes: said, once.
+                    let known = entry.curve.source != vellev_index::curve::Source::Unknown;
+                    if known && !entry.curve.fits(clustered.clusters()) {
+                        unfit_once(
+                            &segment.meta.key,
+                            *collection,
+                            &entry.curve,
+                            clustered.clusters(),
+                        );
+                    }
+                }
+                let has = curve.is_some();
                 if !has {
                     missing.push(Missing {
                         key: segment.meta.key.clone(),

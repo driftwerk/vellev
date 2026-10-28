@@ -1268,6 +1268,20 @@ pub struct Segments {
     pub clustered_rows: u64,
     pub plain: usize,
     pub plain_rows: u64,
+    /// Where the clustered indexes' probes come from.
+    pub probes: Probes,
+}
+
+/// The clustered indexes of the segments held, by where their probes come
+/// from (recall note, R7): each band-0 curve by its source, and a clustered
+/// segment with none, as one from before curves, as scanning by its
+/// index's own count until its rows pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Probes {
+    pub rows: u64,
+    pub queries: u64,
+    pub unknown: u64,
+    pub index: u64,
 }
 
 impl Segments {
@@ -1276,6 +1290,21 @@ impl Segments {
             true => {
                 self.clustered += 1;
                 self.clustered_rows += meta.rows;
+                let mut curves = meta
+                    .probes
+                    .iter()
+                    .filter(|entry| entry.band == 0)
+                    .peekable();
+                if curves.peek().is_none() {
+                    self.probes.index += 1;
+                }
+                for entry in curves {
+                    match entry.curve.source {
+                        vellev_storage::curve::Source::Rows => self.probes.rows += 1,
+                        vellev_storage::curve::Source::Queries => self.probes.queries += 1,
+                        vellev_storage::curve::Source::Unknown => self.probes.unknown += 1,
+                    }
+                }
             }
             false => {
                 self.plain += 1;
@@ -2240,7 +2269,7 @@ mod segment_tests {
     /// clustered segment with none as scanning by its index's own count.
     #[test]
     fn clustered_indexes_are_counted_by_where_their_probes_come_from() {
-        use vellev_index::curve::{Curve, Source};
+        use vellev_storage::curve::{Curve, Source};
         use vellev_storage::format::{CollectionId, SegmentCurve};
         let curve = |source, collection, band| SegmentCurve {
             collection: CollectionId(collection),
@@ -2254,7 +2283,13 @@ mod segment_tests {
         queries.probes = vec![curve(Source::Queries, 1, 0), curve(Source::Rows, 2, 0)];
         let mut unknown = meta(600_000, true);
         unknown.probes = vec![curve(Source::Unknown, 1, 0)];
-        for meta in [rows, queries, unknown, meta(500_000, true), meta(10_000, false)] {
+        for meta in [
+            rows,
+            queries,
+            unknown,
+            meta(500_000, true),
+            meta(10_000, false),
+        ] {
             segments.add(&meta);
         }
         assert_eq!(
