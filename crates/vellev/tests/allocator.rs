@@ -98,10 +98,14 @@ fn anon() -> u64 {
 #[cfg(target_os = "linux")]
 #[test]
 fn memory_freed_among_what_is_kept_is_given_back() {
-    let _alone = ALONE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     const MIB: u64 = 1024 * 1024;
+    // Scratch: another thread allocates and frees about 100 MiB of large
+    // blocks while this test runs, as a flush on another pool would.
+    let other = std::thread::spawn(|| {
+        let blocks: Vec<Vec<u8>> = (0..25).map(|n| vec![n as u8; 4 * 1024 * 1024]).collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(blocks);
+    });
     let before = anon();
     // About 900 MiB in 3 KiB pieces, as a flush's copies of its vectors.
     let pieces: Vec<Vec<u8>> = (0..300_000)
@@ -126,6 +130,8 @@ fn memory_freed_among_what_is_kept_is_given_back() {
     while anon() > bound && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    other.join().unwrap();
+    eprintln!("scratch: {} MiB anonymous at the end; {}", anon() / MIB, jemalloc());
     assert!(
         anon() <= bound,
         "{} MiB anonymous ({} MiB before, bound {} MiB) with {} MiB kept: what was freed was not given back; {}",
