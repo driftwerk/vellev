@@ -42,6 +42,19 @@ const MOST_CLUSTERS: usize = 4096;
 /// How many vectors per cluster k-means is trained on, at most.
 const TRAINING_PER_CLUSTER: usize = 64;
 
+/// A row's place where the row is not indexed.
+const NOWHERE: u32 = u32::MAX;
+
+/// Each row's place in `rows`, sorted, up to the last: see
+/// [`ClusteredIndex::positions`].
+fn positions_of(rows: &[u32]) -> Vec<u32> {
+    let mut positions = vec![NOWHERE; rows.last().map_or(0, |last| *last as usize + 1)];
+    for (place, row) in rows.iter().enumerate() {
+        positions[*row as usize] = place as u32;
+    }
+    positions
+}
+
 /// In what an index is not one of the vectors it is asked to stand for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Unfit {
@@ -67,6 +80,11 @@ pub struct ClusteredIndex {
     /// its place in it; both follow from the clusters.
     rows: Vec<u32>,
     at: Vec<(u32, u32)>,
+    /// For each row up to the last indexed, its place in `rows`, or
+    /// [`NOWHERE`] for a row not indexed: a lookup where a search of
+    /// `rows` took a score of cache misses a row. Four bytes for every row
+    /// up to the last; it follows from `rows`.
+    positions: Vec<u32>,
     /// The rows with no estimate, in ascending order; they follow from the
     /// clusters too.
     unmeasured: Vec<u32>,
@@ -216,7 +234,7 @@ impl TryFrom<Wire> for ClusteredIndex {
             })
             .collect();
         rows.sort_unstable();
-        let (rows, at) = rows.into_iter().unzip();
+        let (rows, at): (Vec<u32>, Vec<(u32, u32)>) = rows.into_iter().unzip();
         Ok(Self {
             metric: wire.metric,
             dimensions: wire.dimensions,
@@ -224,6 +242,7 @@ impl TryFrom<Wire> for ClusteredIndex {
             rotation: wire.rotation,
             centroids: wire.centroids,
             clusters: wire.clusters,
+            positions: positions_of(&rows),
             rows,
             at,
             probes: wire.probes,
@@ -804,6 +823,7 @@ impl ClusteredIndex {
             rotation,
             centroids,
             clusters,
+            positions: positions_of(&vectors.iter().map(|(row, _)| *row).collect::<Vec<_>>()),
             rows: vectors.iter().map(|(row, _)| *row).collect(),
             at,
             probes: 1,
@@ -917,7 +937,10 @@ impl ClusteredIndex {
     }
 
     fn position(&self, row: u32) -> Option<usize> {
-        self.rows.binary_search(&row).ok()
+        self.positions
+            .get(row as usize)
+            .filter(|place| **place != NOWHERE)
+            .map(|place| *place as usize)
     }
 
     fn centroid(&self, cluster: usize) -> &[f32] {
