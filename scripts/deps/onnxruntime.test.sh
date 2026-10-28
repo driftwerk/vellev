@@ -18,7 +18,8 @@ fail() {
   failed=1
 }
 
-# Run a command, expecting it to succeed, or to be refused saying `why`.
+# Run a command, expecting it to succeed, or to be refused saying `why`
+# last, so that it stopped at the first failure.
 expect() {
   local what=$1
   shift
@@ -33,7 +34,7 @@ refused() {
   shift 2
   if "$@" >"$work/out" 2>&1; then
     fail "$what: it succeeded: $(cat "$work/out")"
-  elif grep -q -- "$why" "$work/out"; then
+  elif tail -n 1 "$work/out" | grep -q -- "$why"; then
     pass "$what"
   else
     fail "$what: refused, but not as $why: $(cat "$work/out")"
@@ -79,6 +80,15 @@ grep -v "^$target	none	" "$dist" >"$work/dist.tsv"
 refused "a target the locked ort-sys does not build" "has no $target build" \
   env DIST="$work/dist.tsv" "$script" check
 
+for feature in cuda webgpu tensorrt; do
+  refused "ort-sys built with $feature, which downloads another ONNX Runtime" \
+    "ort-sys is built with $feature" env FEATURES="std api-17 $feature" "$script" check
+done
+expect "ort-sys built with features that do not change what it downloads" \
+  env FEATURES="std api-17 download-binaries tls-rustls" "$script" check
+refused "no locked ort-sys to check against" "no ort-sys in" \
+  env METADATA=/dev/null "$script" check
+
 ## Fetched, and taken only as pinned.
 mkdir -p "$work/served"
 # As the image gets it: our release first, the CDN after.
@@ -113,6 +123,10 @@ refused "an archive that unpacks to a library not pinned" "a library that is not
   env PINS="$(pinned_but 3 "${library_sha//0/1}")" SOURCES="$served/good.tar.lzma2" \
   "$script" fetch "$target" "$work/unpinned"
 gone "$work/unpinned"
+
+refused "a target with no pin" "no pin for aarch64-apple-darwin" \
+  "$script" fetch aarch64-apple-darwin "$work/unpinned-target"
+gone "$work/unpinned-target"
 
 # An archive, made here and pinned, holding more than the library.
 mkdir -p "$work/more"
