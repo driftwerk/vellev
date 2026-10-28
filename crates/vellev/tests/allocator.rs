@@ -33,30 +33,54 @@ fn the_background_thread_that_gives_memory_back_is_on() {
 /// The node binary itself carries the export, so that it is not only this
 /// test, which exports its own copy, that turns the background thread on:
 /// `_rjem_malloc_conf` is defined in the built `vellev`, as initialised
-/// data, which is where a static pointer jemalloc reads lives.
+/// data, which is where a static pointer jemalloc reads lives. A release
+/// profile with `strip = true` would remove the symbol table this reads,
+/// and fail this test though the export were there.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_node_binary_gives_jemalloc_its_options() {
     let _alone = ALONE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    use std::io::BufRead;
     let binary = env!("CARGO_BIN_EXE_vellev");
-    let listed = std::process::Command::new("nm")
+    // Read a line at a time, so that the listing is never held whole.
+    let mut nm = std::process::Command::new("nm")
         .arg("--defined-only")
         .arg(binary)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .spawn()
         .expect("nm, from binutils");
-    assert!(listed.status.success(), "nm {binary}");
-    let symbols = String::from_utf8_lossy(&listed.stdout);
-    let export = symbols
+    let listing = std::io::BufReader::new(nm.stdout.take().expect("nm's output"));
+    let export = listing
         .lines()
-        .find(|line| line.ends_with(" _rjem_malloc_conf"))
-        .unwrap_or_else(|| panic!("{binary} does not export _rjem_malloc_conf"));
+        .map_while(Result::ok)
+        .find(|line| line.ends_with(" _rjem_malloc_conf"));
+    let _ = nm.kill();
+    let _ = nm.wait();
+    let export = export.unwrap_or_else(|| panic!("{binary} does not export _rjem_malloc_conf"));
     let kind = export.split_whitespace().nth(1).unwrap_or_default();
     assert!(
         matches!(kind, "D" | "d" | "R" | "r"),
         "_rjem_malloc_conf is not initialised data in {binary}: {export}"
     );
+}
+
+/// What jemalloc says it holds, for a failure to show.
+#[cfg(target_os = "linux")]
+fn jemalloc() -> String {
+    use tikv_jemalloc_ctl::{arenas, epoch, raw, stats};
+    let _ = epoch::advance();
+    // SAFETY: the name is jemalloc's, of a size_t statistic.
+    let threads =
+        unsafe { raw::read::<usize>(b"stats.background_thread.num_threads\0") }.unwrap_or(0);
+    format!(
+        "jemalloc: allocated {} MiB, resident {} MiB, retained {} MiB, {threads} background threads, {} arenas",
+        stats::allocated::read().unwrap_or(0) >> 20,
+        stats::resident::read().unwrap_or(0) >> 20,
+        stats::retained::read().unwrap_or(0) >> 20,
+        arenas::narenas::read().unwrap_or(0),
+    )
 }
 
 /// The process's anonymous resident memory, in bytes.
@@ -104,9 +128,12 @@ fn memory_freed_among_what_is_kept_is_given_back() {
     }
     assert!(
         anon() <= bound,
-        "{} MiB anonymous with {} MiB kept: what was freed was not given back",
+        "{} MiB anonymous ({} MiB before, bound {} MiB) with {} MiB kept: what was freed was not given back; {}",
         anon() / MIB,
-        held / MIB
+        before / MIB,
+        bound / MIB,
+        held / MIB,
+        jemalloc()
     );
     drop(kept);
 }
