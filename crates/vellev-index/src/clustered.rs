@@ -768,6 +768,64 @@ impl ClusteredIndex {
         nearest.estimates()
     }
 
+    /// Scratch: each cluster's rank in the order a query probes them.
+    pub fn scratch_cluster_ranks(&self, query: &[f32]) -> Vec<u32> {
+        let mut ranks = vec![0u32; self.clusters.len()];
+        for (rank, (_, cluster)) in self.order(&self.prepared(query)).into_iter().enumerate() {
+            ranks[cluster] = rank as u32;
+        }
+        ranks
+    }
+
+    /// Scratch: the cluster a row is in.
+    pub fn scratch_cluster_of(&self, row: u32) -> Option<usize> {
+        self.position(row).map(|at| self.at[at].0 as usize)
+    }
+
+    /// Scratch: estimates scanning clusters in order until at least
+    /// `least` are scanned and the nearest `watch` estimates have not
+    /// changed for `patience` clusters; with the clusters scanned.
+    pub fn scratch_patience(
+        &self,
+        query: &[f32],
+        count: usize,
+        least: usize,
+        patience: usize,
+        watch: usize,
+    ) -> (Vec<(f32, u32)>, usize) {
+        let mut nearest = Nearest::new(count, &crate::vector::in_row_order);
+        let mut watched: std::collections::BinaryHeap<(u32, u32)> = Default::default();
+        let query = self.prepared(query);
+        let mut quiet = 0;
+        let mut probed = 0;
+        for (_, cluster) in self.order(&query) {
+            if probed >= least && quiet >= patience && nearest.is_full() {
+                break;
+            }
+            probed += 1;
+            let probe = Probe::new(&query, self.centroid(cluster));
+            let members = &self.clusters[cluster];
+            let mut changed = false;
+            for (index, row) in members.rows.iter().enumerate() {
+                let code = self.code(members, index);
+                let distance = probe.distance(self.metric, code, &members.factors[index]);
+                nearest.offer(distance, *row);
+                // f32 distances as ordered bits (non-negative for cosine/L2)
+                let key = distance.max(0.0).to_bits();
+                if watched.len() < watch {
+                    watched.push((key, *row));
+                    changed = true;
+                } else if watched.peek().is_some_and(|worst| key < worst.0) {
+                    watched.pop();
+                    watched.push((key, *row));
+                    changed = true;
+                }
+            }
+            quiet = if changed { 0 } else { quiet + 1 };
+        }
+        (nearest.estimates(), probed)
+    }
+
     /// Scratch: this index scanning `probes` clusters at least.
     pub fn with_probes(mut self, probes: usize) -> Self {
         self.probes = probes.clamp(1, self.clusters.len());

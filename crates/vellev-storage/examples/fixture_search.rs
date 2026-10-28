@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flush: usize = args.next().unwrap().parse()?;
     let d = 768;
     let all = shards(&dir.join("vectors/passages"));
-    let meta: Vec<(i64, bool)> =
+    let meta: Vec<(i64, i64, bool, String)> =
         std::io::BufReader::new(std::fs::File::open(dir.join("text/passages.jsonl"))?)
             .lines()
             .take(rows)
@@ -55,12 +55,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let v: serde_json::Value = serde_json::from_str(&l.unwrap()).unwrap();
                 (
                     v["bucket"].as_i64().unwrap(),
+                    v["owner"].as_i64().unwrap(),
                     v["deleted"].as_bool().unwrap(),
+                    v["title"].as_str().unwrap().to_string(),
                 )
             })
             .collect();
     let qall = shards(&dir.join("vectors/queries"));
     let queries: Vec<&[f32]> = qall.chunks_exact(d).collect();
+    let mut owners = std::collections::HashMap::new();
+    for m in &meta {
+        owners.entry(m.3.clone()).or_insert(m.1);
+    }
+    let query_owner: Vec<i64> =
+        std::io::BufReader::new(std::fs::File::open(dir.join("text/queries.jsonl"))?)
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(&l.unwrap()).unwrap();
+                owners[v["title"].as_str().unwrap()]
+            })
+            .collect();
+    // query, case -> true ids (top 10)
+    let mut truth = std::collections::HashMap::new();
+    if rows == 1_000_000 {
+        for l in
+            std::io::BufReader::new(std::fs::File::open(dir.join("truth/truth.jsonl"))?).lines()
+        {
+            let v: serde_json::Value = serde_json::from_str(&l?)?;
+            let ids: Vec<u64> = v["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(10)
+                .map(|i| i.as_u64().unwrap())
+                .collect();
+            truth.insert(
+                (
+                    v["query"].as_u64().unwrap() as usize,
+                    v["case"].as_str().unwrap().to_string(),
+                ),
+                ids,
+            );
+        }
+    }
 
     let key = PartitionKey {
         tenant: TenantId::new("bench")?,
@@ -68,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let coordinator = Arc::new(MemoryCoordinator::default());
     coordinator.register(&key).await?;
-    let tmp = tempfile::tempdir()?;
+    let tmp = tempfile::tempdir_in("/Volumes/T9/vellev-scratch/tmp")?;
     let local = object_store::local::LocalFileSystem::new_with_prefix(tmp.path())?;
     let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::on_disk(Arc::new(local), tmp.path()));
     let Acquired::Lease { lease, committed } = coordinator
@@ -84,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name: name.clone(),
             properties: vec![
                 Property::new("bucket", DataType::Int),
+                Property::new("owner", DataType::Int),
                 Property::new("deleted", DataType::Bool),
             ],
             embedding: Embedding {
@@ -105,10 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|n| Mutation::Upsert {
                 collection: name.clone(),
                 id: ObjectId(uuid::Uuid::from_u128(n as u128)),
-                properties: json!({ "bucket": meta[n].0, "deleted": meta[n].1 })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
+                properties:
+                    json!({ "bucket": meta[n].0, "owner": meta[n].1, "deleted": meta[n].2 })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
                 vector: Some(all[n * d..(n + 1) * d].to_vec()),
                 only_if_version: None,
             })
@@ -132,40 +171,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         property: "deleted".into(),
         value: json!(false),
     };
-    let mid = Filter::And(vec![
-        not_deleted.clone(),
-        Filter::Lt {
-            property: "bucket".into(),
-            value: json!(10),
-        },
-    ]);
-    for (label, filter) in [("broad", &not_deleted), ("mid", &mid)] {
+    let case_filter = |case: &str, q: usize| match case {
+        "broad" => Filter::And(vec![not_deleted.clone()]),
+        "mid" | "narrow" => Filter::And(vec![
+            not_deleted.clone(),
+            Filter::Lt {
+                property: "bucket".into(),
+                value: json!(if case == "mid" { 10 } else { 1 }),
+            },
+        ]),
+        _ => Filter::And(vec![
+            not_deleted.clone(),
+            Filter::Eq {
+                property: "owner".into(),
+                value: json!(query_owner[q]),
+            },
+        ]),
+    };
+    let only: Vec<String> = std::env::var("SCRATCH_CASES")
+        .unwrap_or("broad,mid,narrow,owner".into())
+        .split(',')
+        .map(String::from)
+        .collect();
+    for case in &only {
         let mut took = Vec::new();
-        for q in &queries {
-            let asked = Query::nearest(q, 10).filtered(filter);
+        let (mut found, mut asked) = (0usize, 0usize);
+        let mut allowed_owner = 0usize;
+        for (q, vector) in queries.iter().enumerate() {
+            let filter = case_filter(case, q);
+            let asked_query = Query::nearest(vector, 10).filtered(&filter);
             let at = Instant::now();
-            let hits = writer
-                .partition()
-                .read(|state| state.search(&name, &asked).map(|h| h.len()))?;
+            let ids: Vec<u64> = writer.partition().read(|state| {
+                state
+                    .search(&name, &asked_query)
+                    .map(|h| h.iter().map(|h| h.object.id.0.as_u128() as u64).collect())
+            })?;
             took.push(at.elapsed());
-            assert!(hits <= 10);
+            if case == "owner" && q < 1000 {
+                allowed_owner += meta
+                    .iter()
+                    .filter(|m| !m.2 && m.1 == query_owner[q])
+                    .count();
+            }
+            if let Some(want) = truth.get(&(q, case.clone())) {
+                asked += want.len();
+                found += want.iter().filter(|id| ids.contains(id)).count();
+            }
         }
         took.sort();
+        if case == "owner" {
+            println!(
+                "owner: {} allowed rows a query on average",
+                allowed_owner / queries.len()
+            );
+        }
         println!(
-            "{label}: p50 {:.2?} p99 {:.2?}",
+            "{case}: recall {:.4} p50 {:.2?} p99 {:.2?}",
+            found as f64 / asked.max(1) as f64,
             took[took.len() / 2],
             took[took.len() * 99 / 100]
         );
     }
-    if std::env::var("SCRATCH_LOOP").is_ok() {
-        eprintln!("looping mid for profiling");
-        loop {
-            for q in &queries {
-                let asked = Query::nearest(q, 10).filtered(&mid);
-                writer
-                    .partition()
-                    .read(|state| state.search(&name, &asked).map(|h| h.len()))?;
+    if let Ok(cases) = std::env::var("SCRATCH_LOOP") {
+        for case in cases.split(',') {
+            eprintln!("LOOP {case} start, pid {}", std::process::id());
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(25) {
+                for (q, vector) in queries.iter().enumerate() {
+                    let filter = case_filter(case, q);
+                    let asked_query = Query::nearest(vector, 10).filtered(&filter);
+                    writer
+                        .partition()
+                        .read(|state| state.search(&name, &asked_query).map(|h| h.len()))?;
+                }
             }
+            eprintln!("LOOP {case} end");
         }
     }
     Ok(())
