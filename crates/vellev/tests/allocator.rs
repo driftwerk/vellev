@@ -16,6 +16,12 @@ static GLOBAL: vellev::allocator::Allocator = vellev::allocator::Allocator::new(
 pub static OPTIONS: vellev::allocator::Options =
     vellev::allocator::Options(vellev::allocator::OPTIONS.as_ptr());
 
+/// One test at a time: the memory test reads the whole process's memory,
+/// which another test's allocations, such as the symbol list below, would
+/// count against it.
+#[cfg(target_os = "linux")]
+static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// What this test binary's own export of the options gives jemalloc: the
 /// background thread, which only the options turn on.
 #[cfg(target_os = "linux")]
@@ -31,6 +37,9 @@ fn the_background_thread_that_gives_memory_back_is_on() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_node_binary_gives_jemalloc_its_options() {
+    let _alone = ALONE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let binary = env!("CARGO_BIN_EXE_vellev");
     let listed = std::process::Command::new("nm")
         .arg("--defined-only")
@@ -65,6 +74,9 @@ fn anon() -> u64 {
 #[cfg(target_os = "linux")]
 #[test]
 fn memory_freed_among_what_is_kept_is_given_back() {
+    let _alone = ALONE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     const MIB: u64 = 1024 * 1024;
     let before = anon();
     // About 900 MiB in 3 KiB pieces, as a flush's copies of its vectors.
