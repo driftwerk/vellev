@@ -25,3 +25,20 @@ pub fn reads() -> &'static ThreadPool {
             .expect("the read pool's threads")
     })
 }
+
+/// The pool tuning runs on: one thread of its own (recall note, R2.6 and
+/// R9.5). Tuning is a pass over a segment's vectors for every sample,
+/// tens of seconds a million rows; on the global pool it took every core
+/// for that long, at each merge and, after an upgrade, segment after
+/// segment, and reads waited. On one thread it takes longer and leaves
+/// the rest to reads, flushes and merges.
+pub fn tuning() -> &'static ThreadPool {
+    static TUNING: OnceLock<ThreadPool> = OnceLock::new();
+    TUNING.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "vellev-tune".to_string())
+            .build()
+            .expect("the tuning pool's thread")
+    })
+}

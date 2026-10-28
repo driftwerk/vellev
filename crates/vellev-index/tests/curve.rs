@@ -97,3 +97,62 @@ fn a_curve_of_a_source_this_version_does_not_know_is_read_and_never_used() {
     assert_eq!(read.source, Source::Unknown);
     assert!(!read.fits(10));
 }
+
+/// A curve's source is written as a plain string, and read from whatever a
+/// later version writes there: a name this version does not know, or a
+/// value that is not a string at all, such as a source that carries data,
+/// is read as unknown, never as a failure that would keep the segment's
+/// manifest from being read.
+#[test]
+fn a_curves_source_is_a_string_and_anything_else_there_reads_as_unknown() {
+    let curve = Curve::of(Source::Queries, 400, 10, vec![3; 40]).unwrap();
+    let written = rmp_serde::to_vec_named(&curve).unwrap();
+    // The key "source", then the string "queries", as MessagePack writes
+    // short strings: a byte of 0xa0 plus the length, then the bytes.
+    let mut plain = vec![0xa0 + 6];
+    plain.extend_from_slice(b"source");
+    plain.push(0xa0 + 7);
+    plain.extend_from_slice(b"queries");
+    assert!(
+        written.windows(plain.len()).any(|w| w == plain.as_slice()),
+        "a plain string"
+    );
+
+    #[derive(serde::Serialize)]
+    enum LaterSource {
+        Mixed(u32),
+        Weighted { rows: f32, questions: f32 },
+    }
+    #[derive(serde::Serialize)]
+    struct Later<S> {
+        source: S,
+        samples: u32,
+        clusters: u32,
+        ranks: Vec<u16>,
+    }
+    let later = |source| Later {
+        source,
+        samples: 400,
+        clusters: 10,
+        ranks: vec![3; POINTS],
+    };
+    for bytes in [
+        rmp_serde::to_vec_named(&later(LaterSource::Mixed(7))).unwrap(),
+        rmp_serde::to_vec_named(&later(LaterSource::Weighted {
+            rows: 0.5,
+            questions: 0.5,
+        }))
+        .unwrap(),
+        rmp_serde::to_vec_named(&Later {
+            source: 12u32,
+            samples: 400,
+            clusters: 10,
+            ranks: vec![3; POINTS],
+        })
+        .unwrap(),
+    ] {
+        let read: Curve = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(read.source, Source::Unknown);
+        assert!(!read.fits(10));
+    }
+}
