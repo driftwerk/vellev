@@ -311,11 +311,7 @@ fn class_vector(given: &str) -> Result<(String, String)> {
 #[global_allocator]
 static GLOBAL: vellev::allocator::Allocator = vellev::allocator::Allocator::new();
 
-/// jemalloc's options for the node: see [`vellev::allocator::OPTIONS`].
-#[cfg(target_os = "linux")]
-#[unsafe(export_name = "_rjem_malloc_conf")]
-pub static OPTIONS: vellev::allocator::Options =
-    vellev::allocator::Options(vellev::allocator::OPTIONS.as_ptr());
+
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
