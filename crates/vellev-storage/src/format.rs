@@ -10,9 +10,9 @@
 //! may both ignore it and drop it when it rewrites the file; anything else,
 //! and any new enum variant, needs a new `FORMAT_VERSION`.
 
-use vellev_index::curve::Curve;
 use std::collections::HashMap;
 use std::sync::Arc;
+use vellev_index::curve::Curve;
 
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -1240,7 +1240,13 @@ mod tests {
         let mut tuned = plain.clone();
         tuned.probes = vec![(
             CollectionId(2),
-            Curve::of(Source::Queries, 400, 931, (0..4000).map(|n| n % 931).collect()).unwrap(),
+            Curve::of(
+                Source::Queries,
+                400,
+                931,
+                (0..4000).map(|n| n % 931).collect(),
+            )
+            .unwrap(),
         )];
         let bytes = rmp_serde::to_vec_named(&tuned).unwrap();
         assert_eq!(rmp_serde::from_slice::<SegmentMeta>(&bytes).unwrap(), tuned);
@@ -1256,9 +1262,12 @@ mod tests {
             meta: &'a SegmentMeta,
             shards: u32,
         }
-        let later = rmp_serde::to_vec_named(&Later { meta: &tuned, shards: 3 }).unwrap();
+        let later = rmp_serde::to_vec_named(&Later {
+            meta: &tuned,
+            shards: 3,
+        })
+        .unwrap();
         assert_eq!(rmp_serde::from_slice::<SegmentMeta>(&later).unwrap(), tuned);
-
     }
 
     fn segment(key: String, index: Option<String>, vectors: Option<String>) -> SegmentMeta {

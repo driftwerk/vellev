@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use vellev_index::curve::Curve;
 use std::ops::Bound;
 use std::sync::Arc;
+use vellev_index::curve::Curve;
 
 use roaring::RoaringBitmap;
 use vellev_core::{

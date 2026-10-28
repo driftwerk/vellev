@@ -2,7 +2,7 @@
 
 use rayon::prelude::*;
 use vellev_core::{CollectionName, Object};
-use vellev_index::clustered::ClusteredIndex;
+use vellev_index::clustered::{ClusteredIndex, Probing};
 use vellev_index::curve::Curve;
 use vellev_index::filter::{Filter, Predicate};
 use vellev_index::vector::{nearest, Scorer, VectorIndex};
@@ -288,8 +288,10 @@ fn candidates(
                 only.as_ref(),
                 layer.dead,
                 &ties,
-                split,
-                probes_for(layer.curves, collection, clustered),
+                Probing {
+                    probes: probes_for(layer.curves, collection, clustered),
+                    parts: split,
+                },
             )),
         },
         Vectors::Binary(binary) => Candidates {
@@ -306,7 +308,11 @@ fn candidates(
 /// How many clusters `collection`'s clustered index scans in a layer: as
 /// the layer's curve for it says, where it has one that fits the index,
 /// else as the index was built to.
-fn probes_for(curves: &[(CollectionId, Curve)], collection: CollectionId, index: &ClusteredIndex) -> usize {
+fn probes_for(
+    curves: &[(CollectionId, Curve)],
+    collection: CollectionId,
+    index: &ClusteredIndex,
+) -> usize {
     curves
         .iter()
         .find(|(of, _)| *of == collection)
@@ -368,17 +374,48 @@ mod tests {
     #[test]
     fn a_layers_curve_gives_its_probes_where_it_fits() {
         let vectors: Vec<Vec<f32>> = (0..3_000u32)
-            .map(|n| (0..8).map(|d| ((n * 31 + d * 7) % 97) as f32 - 48.0).collect())
+            .map(|n| {
+                (0..8)
+                    .map(|d| ((n * 31 + d * 7) % 97) as f32 - 48.0)
+                    .collect()
+            })
             .collect();
-        let rows: Vec<(u32, &[f32])> = vectors.iter().enumerate().map(|(n, v)| (n as u32, v.as_slice())).collect();
+        let rows: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(n, v)| (n as u32, v.as_slice()))
+            .collect();
         let index = ClusteredIndex::build(vellev_core::Distance::Cosine, &rows).unwrap();
         let clusters = index.clusters() as u32;
-        let deep = Curve::of(vellev_index::curve::Source::Rows, 1, clusters, vec![clusters - 1]).unwrap();
-        let other = Curve::of(vellev_index::curve::Source::Rows, 1, clusters + 1, vec![clusters]).unwrap();
+        let deep = Curve::of(
+            vellev_index::curve::Source::Rows,
+            1,
+            clusters,
+            vec![clusters - 1],
+        )
+        .unwrap();
+        let other = Curve::of(
+            vellev_index::curve::Source::Rows,
+            1,
+            clusters + 1,
+            vec![clusters],
+        )
+        .unwrap();
         let (mine, theirs) = (CollectionId(3), CollectionId(4));
-        assert_eq!(probes_for(&[(mine, deep.clone())], mine, &index), clusters as usize);
-        assert_eq!(probes_for(&[(theirs, deep)], mine, &index), index.probes(), "another collection's");
-        assert_eq!(probes_for(&[(mine, other)], mine, &index), index.probes(), "a curve of another index");
+        assert_eq!(
+            probes_for(&[(mine, deep.clone())], mine, &index),
+            clusters as usize
+        );
+        assert_eq!(
+            probes_for(&[(theirs, deep)], mine, &index),
+            index.probes(),
+            "another collection's"
+        );
+        assert_eq!(
+            probes_for(&[(mine, other)], mine, &index),
+            index.probes(),
+            "a curve of another index"
+        );
         assert_eq!(probes_for(&[], mine, &index), index.probes());
     }
 

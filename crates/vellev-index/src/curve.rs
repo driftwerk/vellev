@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 /// The least share a curve keeps a rank for.
 pub const FROM: f64 = 0.95;
-const _: () = assert!(POINTS == 101, "shares from 19,000 to 20,000 20,000ths in steps of 10");
+const _: () = assert!(
+    POINTS == 101,
+    "shares from 19,000 to 20,000 20,000ths in steps of 10"
+);
 /// The step between the shares a curve keeps.
 pub const STEP: f64 = 0.0005;
 /// How many shares a curve keeps: [`FROM`] to 1 in steps of [`STEP`].
@@ -50,7 +53,10 @@ impl Curve {
     /// nearest rows in an index of `clusters`, or `None` if there are none
     /// or one is past the last cluster.
     pub fn of(source: Source, samples: u32, clusters: u32, mut ranks: Vec<u32>) -> Option<Self> {
-        if ranks.is_empty() || ranks.iter().any(|rank| *rank >= clusters) || clusters > u32::from(u16::MAX) {
+        if ranks.is_empty()
+            || ranks.iter().any(|rank| *rank >= clusters)
+            || clusters > u32::from(u16::MAX)
+        {
             return None;
         }
         ranks.sort_unstable();
@@ -90,7 +96,10 @@ impl Curve {
     pub fn fits(&self, clusters: usize) -> bool {
         self.clusters as usize == clusters
             && self.ranks.len() == POINTS
-            && self.ranks.iter().all(|rank| u32::from(*rank) < self.clusters)
+            && self
+                .ranks
+                .iter()
+                .all(|rank| u32::from(*rank) < self.clusters)
             && self.ranks.windows(2).all(|pair| pair[0] <= pair[1])
     }
 }

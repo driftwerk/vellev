@@ -42,6 +42,17 @@ const MOST_CLUSTERS: usize = 4096;
 /// How many vectors per cluster k-means is trained on, at most.
 const TRAINING_PER_CLUSTER: usize = 64;
 
+/// How a scan of clusters goes: how many clusters it probes at least, and
+/// into how many runs it may be split on the read pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probing {
+    /// The clusters it scans at least: as a segment's probe curve says, or
+    /// as the index was built to ([`ClusteredIndex::probes`]).
+    pub probes: usize,
+    /// The runs it may be split into; 1 scans on the calling thread.
+    pub parts: usize,
+}
+
 /// In what an index is not one of the vectors it is asked to stand for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Unfit {
@@ -945,7 +956,11 @@ impl VectorIndex for ClusteredIndex {
         skipped: &[bool],
         ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
-        self.estimates_split(query, count, only, skipped, ties, 1, self.probes)
+        let probing = Probing {
+            probes: self.probes,
+            parts: 1,
+        };
+        self.estimates_split(query, count, only, skipped, ties, probing)
     }
 }
 
@@ -962,9 +977,9 @@ impl ClusteredIndex {
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
         ties: Ties<'_>,
-        parts: usize,
-        probes: usize,
+        probing: Probing,
     ) -> Vec<(f32, u32)> {
+        let Probing { probes, parts } = probing;
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
@@ -1000,7 +1015,14 @@ impl ClusteredIndex {
             Some(only) if (only.len() as usize) <= per_probe => {
                 self.visited(&query, count, only, skipped, ties)
             }
-            _ => self.scanned(&query, count, only, skipped, ties, parts, probes),
+            _ => self.scanned(
+                &query,
+                count,
+                only,
+                skipped,
+                ties,
+                Probing { probes, parts },
+            ),
         }
     }
 
@@ -1094,9 +1116,9 @@ impl ClusteredIndex {
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
         ties: Ties<'_>,
-        parts: usize,
-        probes: usize,
+        probing: Probing,
     ) -> Vec<(f32, u32)> {
+        let Probing { probes, parts } = probing;
         let order = self.order(query);
         let probes = probes.min(order.len());
         let mut scan = Scan::new(self, query, only, skipped);
@@ -1522,8 +1544,10 @@ mod tests {
             only,
             skipped,
             &in_row_order,
-            1,
-            index.probes,
+            Probing {
+                probes: index.probes,
+                parts: 1,
+            },
         )
     }
 
@@ -1558,7 +1582,7 @@ mod tests {
             let mut noise = Noise(seed.rotate_left(9) | 1);
             for _ in 0..4 {
                 let query = noise.vector(dimensions);
-                let given = index.estimates_split(&query, count, only.as_ref(), &[], &in_row_order, 1, probes);
+                let given = index.estimates_split(&query, count, only.as_ref(), &[], &in_row_order, Probing { probes, parts: 1 });
                 let as_built = built.estimates(&query, count, only.as_ref(), &[], &in_row_order);
                 proptest::prop_assert_eq!(cut(given, count), cut(as_built, count));
             }
@@ -1599,8 +1623,8 @@ mod tests {
             let skipped: Vec<bool> = (0..rows * 2).map(|row| row % 11 == 5).collect();
             for _ in 0..4 {
                 let query = index.prepared(&noise.vector(dimensions));
-                let one = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, 1, index.probes);
-                let split = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, parts, index.probes);
+                let one = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, Probing { probes: index.probes, parts: 1 });
+                let split = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, Probing { probes: index.probes, parts });
                 proptest::prop_assert_eq!(cut(split, count), cut(one, count));
             }
         }

@@ -20,7 +20,10 @@ fn a_curve_of_questions_scans_what_holds_the_target() {
     let curve = Curve::of(Source::Queries, 100, 1000, ranks).unwrap();
     assert_eq!(curve.probes(), 998);
     assert_eq!(curve.ranks.len(), POINTS);
-    assert_eq!(curve.ranks[0], 949, "0.95 of them are held by the first 950");
+    assert_eq!(
+        curve.ranks[0], 949,
+        "0.95 of them are held by the first 950"
+    );
     assert_eq!(*curve.ranks.last().unwrap(), 999);
 }
 
@@ -58,7 +61,13 @@ fn a_curve_is_made_and_used_only_where_it_fits() {
 /// A curve is written with its source by name, and read back whole.
 #[test]
 fn a_curve_reads_back_as_written() {
-    let curve = Curve::of(Source::Queries, 400, 931, (0..4000).map(|n| n % 931).collect()).unwrap();
+    let curve = Curve::of(
+        Source::Queries,
+        400,
+        931,
+        (0..4000).map(|n| n % 931).collect(),
+    )
+    .unwrap();
     let bytes = rmp_serde::to_vec_named(&curve).unwrap();
     assert!(bytes.windows(7).any(|w| w == b"queries"));
     let back: Curve = rmp_serde::from_slice(&bytes).unwrap();
