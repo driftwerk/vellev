@@ -76,6 +76,11 @@ struct Args {
     /// diagnosis, such as somewhere for a profile to be written.
     #[arg(long)]
     vellev_mount: Vec<String>,
+    /// Fail unless vellev holds at least one segment with a clustered
+    /// index once measured: for a gate meant to exercise that index, which
+    /// only a segment of more than 200,000 rows has.
+    #[arg(long)]
+    require_clustered: bool,
     /// Run one engine alone (`vellev` or `weaviate`), for a timing or a
     /// diagnosis: no comparison, no gate.
     #[arg(long)]
@@ -717,6 +722,8 @@ async fn gate_only(
     environment: Value,
 ) -> Result<()> {
     let run = vellev(args, fixture, truth, plan, pinning, queries, warmup).await?;
+    let segments = run.settings["segments"].clone();
+    eprintln!("vellev's segments once measured: {segments}");
     let gate = report::gate(
         &run.measured,
         cases,
@@ -736,16 +743,20 @@ async fn gate_only(
         args.out.join("results.json"),
         serde_json::to_string_pretty(&results)?,
     )?;
-    let summary = report::summary(
-        &[],
-        &[],
-        &[],
-        &gate,
-        args.rows,
-        "The pull-request gate: vellev at its defaults, limit 10.",
+    let header = format!(
+        "The pull-request gate: vellev at its defaults, limit 10. Segments once measured: {} clustered ({} rows), {} without a clustered index ({} rows).",
+        segments["clustered"], segments["clustered_rows"], segments["plain"], segments["plain_rows"]
     );
+    let summary = report::summary(&[], &[], &[], &gate, args.rows, &header);
     std::fs::write(args.out.join("summary.md"), &summary)?;
     println!("{summary}");
+    if args.require_clustered {
+        let clustered = segments["clustered"].as_f64();
+        ensure!(
+            clustered.is_some_and(|clustered| clustered >= 1.0),
+            "no segment with a clustered index was measured ({segments}): the gate did not exercise it"
+        );
+    }
     ensure!(gate.passed, "the hard gate failed: see summary.md");
     Ok(())
 }

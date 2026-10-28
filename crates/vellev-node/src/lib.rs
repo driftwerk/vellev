@@ -1243,6 +1243,31 @@ struct FlushCounts {
     backlogged: AtomicU64,
 }
 
+/// The segments the tenants this node writes hold: those with a clustered
+/// vector index and the rest, each with their rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Segments {
+    pub clustered: usize,
+    pub clustered_rows: u64,
+    pub plain: usize,
+    pub plain_rows: u64,
+}
+
+impl Segments {
+    fn add(&mut self, meta: &vellev_storage::format::SegmentMeta) {
+        match meta.index.is_some() {
+            true => {
+                self.clustered += 1;
+                self.clustered_rows += meta.rows;
+            }
+            false => {
+                self.plain += 1;
+                self.plain_rows += meta.rows;
+            }
+        }
+    }
+}
+
 /// What this node's tenants hold unflushed, and how their flushes went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flushing {
@@ -1468,6 +1493,18 @@ impl Node {
             .iter()
             .filter(|held| matches!(&held.kind, Kind::Writer(_, tenant) if !tenant.settled()))
             .count()
+    }
+
+    /// The segments the tenants this node writes hold, by whether they
+    /// have a clustered index.
+    pub fn segments(&self) -> Segments {
+        let mut segments = Segments::default();
+        for held in self.0.held_now() {
+            if let Kind::Writer(_, tenant) = &held.kind {
+                tenant.read(|state| state.segments().for_each(|meta| segments.add(meta)));
+            }
+        }
+        segments
     }
 
     /// How many tenants this node has opened since it started: as their
@@ -2140,6 +2177,39 @@ mod tests {
                 ModelFault::Setup,
                 "its collection's clients supply the vectors"
             ))
+        );
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+    use vellev_storage::format::SegmentMeta;
+
+    fn meta(rows: u64, clustered: bool) -> SegmentMeta {
+        SegmentMeta {
+            key: format!("segment-{rows}"),
+            rows,
+            tombstones: 0,
+            index: clustered.then(|| format!("index-{rows}")),
+            vectors: Some(format!("vectors-{rows}")),
+        }
+    }
+
+    #[test]
+    fn a_segment_with_an_index_file_is_counted_as_clustered() {
+        let mut segments = Segments::default();
+        for (rows, clustered) in [(800_000, true), (200_000, false), (50_000, false)] {
+            segments.add(&meta(rows, clustered));
+        }
+        assert_eq!(
+            segments,
+            Segments {
+                clustered: 1,
+                clustered_rows: 800_000,
+                plain: 2,
+                plain_rows: 250_000,
+            }
         );
     }
 }

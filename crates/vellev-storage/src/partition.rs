@@ -15,7 +15,7 @@ use vellev_core::{Embedding, ModelFault, ObjectError};
 use crate::backups::Held;
 use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Linked, Listed, Local, Transfers};
 use crate::catalog::Catalog;
-use crate::column::{self, Column};
+use crate::column::{self, Column, Gathering};
 use crate::coordinator::{
     Cleaned, Clock, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation,
     Lease, Lineage, LogPosition, ManifestRef, PartitionKey, Prior, Restore, SystemClock,
@@ -2152,14 +2152,18 @@ impl Writer {
         }
         let names = self.named(named_at, "");
         let rows = std::mem::take(&mut snapshot.rows);
+        let vectors = snapshot.gathered();
         let above = self.merging.clustered_above;
-        let shape = Shape::of(&snapshot.catalog, &rows, snapshot.tombstones.len(), above);
+        let tombstones = snapshot.tombstones.len();
+        let shape = Shape::of_gathered(&snapshot.catalog, &rows, &vectors, tombstones, above);
         let file = SegmentFile {
             position: snapshot.position,
             rows,
             tombstones: snapshot.tombstones.clone(),
         };
-        let built = self.built(file, snapshot.catalog.clone()).await?;
+        let built = self
+            .built(file, Some(vectors), snapshot.catalog.clone())
+            .await?;
         let prepared = Self::prepared(names.meta(shape), built, self.writes())?;
         self.upload(&prepared, staged).await?;
         Ok(Some(prepared))
@@ -2194,24 +2198,40 @@ impl Writer {
         }
     }
 
-    /// Index a segment's rows, which have their vectors with them, then
-    /// take the vectors into their column and encode both, off the async
-    /// threads and before anything is written, so that readers are not
-    /// held behind the write lock while a large segment is indexed.
-    async fn built(&self, mut file: SegmentFile, catalog: Catalog) -> Result<Built> {
+    /// Index the segment of `file`, its vectors gathered in `vectors` or,
+    /// without, still in its rows, to be taken from them into their column;
+    /// then encode both, sealing the gathered frame, off the async threads
+    /// and out of the state's lock, before anything is written, so that
+    /// neither readers nor commits wait while a large segment is indexed.
+    async fn built(
+        &self,
+        mut file: SegmentFile,
+        vectors: Option<Gathering>,
+        catalog: Catalog,
+    ) -> Result<Built> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
         blocking(move || {
-            let inline = |row: usize| file.rows[row].object.vector.as_deref();
-            let indexes = state::indexed(
-                &catalog,
-                &file.rows,
-                inline,
-                &Stored::default(),
-                |_, _| {},
-                above,
-            );
-            let vectors = Column::taken_from(&mut file.rows);
+            let vectors = vectors.map(|gathered| gathered.finish(format));
+            let indexes = match &vectors {
+                Some(column) => state::indexed(
+                    &catalog,
+                    &file.rows,
+                    |row: usize| column.get(row),
+                    &Stored::default(),
+                    |_, _| {},
+                    above,
+                ),
+                None => state::indexed(
+                    &catalog,
+                    &file.rows,
+                    |row: usize| file.rows[row].object.vector.as_deref(),
+                    &Stored::default(),
+                    |_, _| {},
+                    above,
+                ),
+            };
+            let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
             let segment = encode_as(Kind::Segment, format, &file)?;
             let column = vectors.encode_as(format);
             Ok(Built {
@@ -2298,16 +2318,18 @@ impl Writer {
             return Ok(None);
         };
         let above = self.merging.clustered_above;
-        let Some((file, shape, named_at)) = self.partition.read(|state| {
+        let Some((file, vectors, shape, named_at)) = self.partition.read(|state| {
             let named_at = state.position();
-            let file = state.merged(&merge, named_at)?;
-            let shape = Shape::of(state.catalog(), &file.rows, file.tombstones.len(), above);
-            Some((file, shape, named_at))
+            let (file, vectors) = state.merged(&merge, named_at)?;
+            let tombstones = file.tombstones.len();
+            let shape =
+                Shape::of_gathered(state.catalog(), &file.rows, &vectors, tombstones, above);
+            Some((file, vectors, shape, named_at))
         }) else {
             return Ok(None);
         };
         let catalog = self.partition.read(|state| state.catalog().clone());
-        let built = self.built(file, catalog.clone()).await?;
+        let built = self.built(file, Some(vectors), catalog.clone()).await?;
         // Both segments, however large, are uploaded without the writer,
         // under names of their own at the position each was built from;
         // see `clean` for why nothing deletes them first.

@@ -29,6 +29,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tikv-jemallocator = "0.6"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -37,6 +38,7 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 
 [dev-dependencies]
+tikv-jemalloc-ctl = "0.6"
 async-trait.workspace = true
 bytes.workspace = true
 ring.workspace = true
