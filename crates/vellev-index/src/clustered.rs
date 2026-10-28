@@ -896,8 +896,14 @@ impl ClusteredIndex {
     }
 
     /// The rank, in each sample's order of clusters, of the cluster each of
-    /// its nearest rows lies in.
+    /// its nearest rows lies in: worked out on the tuning pool, one thread
+    /// of its own ([`crate::pool::tuning`]).
     fn sample_ranks(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<u32> {
+        crate::pool::tuning().install(|| self.ranks_on_this_pool(vectors, samples))
+    }
+
+    /// As [`Self::sample_ranks`], on whatever pool the caller is on.
+    fn ranks_on_this_pool(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<u32> {
         let nearest = self.nearest_of_samples(vectors, samples);
         samples
             .par_iter()
@@ -1637,7 +1643,10 @@ mod tests {
         let samples: Vec<usize> = (0..3_000).step_by(11).collect();
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
-            scope.spawn(|| done.send(index.sample_ranks(&numbered, &samples).len()).unwrap());
+            scope.spawn(|| {
+                done.send(index.sample_ranks(&numbered, &samples).len())
+                    .unwrap()
+            });
             let answer = finished.recv_timeout(std::time::Duration::from_secs(30));
             for _ in 0..rayon::current_num_threads() {
                 release.send(()).unwrap();
