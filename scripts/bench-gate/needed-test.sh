@@ -28,4 +28,21 @@ expect "not needed" README.md
 expect "not needed" docs/design.md .github/workflows/ci.yml scripts/recall-fixture/make.py
 expect "not needed" Dockerfile.notes/x crates.md
 expect "not needed"
+# A file moved out of what the gate measures is a change to what it
+# measures: the paths are listed with renames split into their two sides.
+repo="$(mktemp -d)"
+git -C "$repo" init -q
+git -C "$repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+mkdir -p "$repo/crates/vellev-index/src" "$repo/docs"
+printf 'a\nb\nc\n' > "$repo/crates/vellev-index/src/x.rs"
+git -C "$repo" add -A
+git -C "$repo" -c user.name=t -c user.email=t@t commit -q -m add
+git -C "$repo" mv crates/vellev-index/src/x.rs docs/x.rs
+git -C "$repo" -c user.name=t -c user.email=t@t commit -q -m move
+got="$(cd "$repo" && "$here/changed.sh" HEAD^1 HEAD | "$here/needed.sh")"
+if [ "$got" != needed ]; then
+  echo "expected 'needed' for a file moved out of crates/, got '$got'" >&2
+  failed=1
+fi
+rm -rf "$repo"
 exit "$failed"
