@@ -870,6 +870,27 @@ mod tests {
     }
 
     #[test]
+    fn the_segments_measured_are_the_segments_settled() {
+        let settled = json!({"clustered": 2.0, "clustered_rows": 912500.0, "plain": 1.0, "plain_rows": 87500.0});
+        assert!(Vellev::same_segments(&settled, &settled.clone()).is_ok());
+        for changed in [
+            json!({"clustered": 2.0, "clustered_rows": 912500.0, "plain": 2.0, "plain_rows": 87500.0}),
+            json!({"clustered": 2.0, "clustered_rows": 943000.0, "plain": 1.0, "plain_rows": 87500.0}),
+            json!({"clustered": 3.0, "clustered_rows": 912500.0, "plain": 1.0, "plain_rows": 87500.0}),
+        ] {
+            assert!(
+                Vellev::same_segments(&settled, &changed).is_err(),
+                "{changed} is not the layout settled"
+            );
+        }
+        // A count the node did not report is not taken as unchanged, even
+        // when it is missing both times.
+        let unreported = json!({"clustered": null, "clustered_rows": null, "plain": null, "plain_rows": null});
+        assert!(Vellev::same_segments(&unreported, &unreported.clone()).is_err());
+        assert!(Vellev::same_segments(&settled, &unreported).is_err());
+    }
+
+    #[test]
     fn a_metric_is_read_by_its_whole_name() {
         let text = "vellev_tenants_unsettled_x 4\nvellev_tenants_unsettled 0\nvellev_threads{pool=\"rayon\"} 3\n";
         assert_eq!(Vellev::sample(text, "vellev_tenants_unsettled"), Some(0.0));
