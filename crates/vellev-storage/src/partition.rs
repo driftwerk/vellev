@@ -2246,8 +2246,13 @@ impl Writer {
     }
 
     /// A built segment as `meta` names it, with its index file's frame if
-    /// it has one.
-    fn prepared(meta: SegmentMeta, built: Built, format: u16) -> Result<Prepared> {
+    /// it has one, and its indexes' curves.
+    fn prepared(mut meta: SegmentMeta, built: Built, format: u16) -> Result<Prepared> {
+        // A clustered index built here scans as the curve of the rows it
+        // was tuned on says, and the segment keeps that curve.
+        if meta.index.is_some() {
+            meta.probes = state::curves(&built.indexes);
+        }
         let index = meta
             .index
             .is_some()
@@ -3788,6 +3793,7 @@ mod tests {
             tombstones: 1,
             index: index.then(|| file("index", name)),
             vectors: vectors.then(|| file("vectors", name)),
+            probes: vec![],
         }
     }
 
