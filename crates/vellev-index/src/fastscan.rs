@@ -111,7 +111,7 @@ impl Blocks {
 /// bits and one for its high four, each written twice over, as a 32-byte
 /// lookup reads it. An entry is the sum of at most four levels of at most
 /// 15, so a byte holds it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Tables {
     bytes: Vec<u8>,
     columns: usize,
@@ -120,9 +120,19 @@ pub(crate) struct Tables {
 impl Tables {
     /// The tables for `levels`, as many as a code has bits, each at most
     /// 15.
+    #[cfg(test)]
     pub(crate) fn new(levels: &[u8]) -> Self {
+        let mut tables = Self::default();
+        tables.fill(levels);
+        tables
+    }
+
+    /// These tables made over for `levels`, reusing their space.
+    pub(crate) fn fill(&mut self, levels: &[u8]) {
         let columns = levels.len() / 8;
-        let mut bytes = vec![0u8; columns * 64];
+        self.columns = columns;
+        self.bytes.resize(columns * 64, 0);
+        let bytes = &mut self.bytes;
         for (column, levels) in levels.chunks_exact(8).enumerate() {
             for (half, levels) in levels.chunks_exact(4).enumerate() {
                 let mut table = [0u8; 16];
@@ -135,7 +145,6 @@ impl Tables {
                 bytes[at + 16..at + 32].copy_from_slice(&table);
             }
         }
-        Self { bytes, columns }
     }
 }
 

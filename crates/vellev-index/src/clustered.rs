@@ -315,10 +315,9 @@ impl TryFrom<ClusterWire> for Cluster {
 /// A query made ready for one cluster: its difference from the centroid,
 /// quantized to [`QUERY_BITS`] bit planes, with what the estimate needs.
 struct Probe {
+    /// The levels bit by bit, a plane a bit; empty where a scan of blocks
+    /// weighs by tables instead.
     planes: Vec<u64>,
-    /// Each dimension's level, as the planes hold it bit by bit: what the
-    /// tables a scan of blocks weighs by are made from.
-    levels: Vec<u8>,
     words: usize,
     /// How this machine counts a code's bits against the planes: with its
     /// popcount instruction where it has one.
@@ -331,11 +330,30 @@ struct Probe {
     scale: f32,
 }
 
+/// What readying the query for one cluster after another reuses.
+#[derive(Default)]
+struct Readying {
+    residual: Vec<f32>,
+    levels: Vec<u8>,
+}
+
 impl Probe {
     fn new(query: &[f32], centroid: &[f32]) -> Self {
-        let residual: Vec<f32> = query.iter().zip(centroid).map(|(q, c)| q - c).collect();
+        Self::readied(query, centroid, &mut Readying::default(), true)
+    }
+
+    /// The query readied for the cluster whose centroid is `centroid`: each
+    /// dimension's level into `space.levels`, where a scan of blocks makes
+    /// its tables from them, and the levels as bit planes too if
+    /// `with_planes`, as a code counted on its own needs them.
+    fn readied(query: &[f32], centroid: &[f32], space: &mut Readying, with_planes: bool) -> Self {
+        space.residual.clear();
+        space
+            .residual
+            .extend(query.iter().zip(centroid).map(|(q, c)| q - c));
+        let residual = &space.residual;
         let (mut lower, mut upper) = (f32::INFINITY, f32::NEG_INFINITY);
-        for value in &residual {
+        for value in residual {
             lower = lower.min(*value);
             upper = upper.max(*value);
         }
@@ -343,17 +361,22 @@ impl Probe {
         let delta = (upper - lower) / levels;
         let words = residual.len() / 64;
         debug_assert_eq!(residual.len() % 64, 0, "a rotation's width is whole words");
-        let mut planes = vec![0u64; words * QUERY_BITS as usize];
-        let mut levels_of = vec![0u8; residual.len()];
-        // A word of each plane at a time, each value's level taken as
-        // before and its bits laid into the words without a branch: the
-        // same planes, readied several times as fast.
+        space.levels.clear();
+        space.levels.resize(residual.len(), 0);
         if delta > 0.0 {
-            for (word, chunk) in residual.chunks_exact(64).enumerate() {
+            for (level, value) in space.levels.iter_mut().zip(residual) {
+                *level = ((value - lower) / delta).round().clamp(0.0, levels) as u8;
+            }
+        }
+        let mut planes = Vec::new();
+        if with_planes {
+            planes = vec![0u64; words * QUERY_BITS as usize];
+            // A word of each plane at a time, each value's level laid into
+            // the words without a branch.
+            for (word, chunk) in space.levels.chunks_exact(64).enumerate() {
                 let mut bits = [0u64; QUERY_BITS as usize];
-                for (at, value) in chunk.iter().enumerate() {
-                    let level = ((value - lower) / delta).round().clamp(0.0, levels) as u64;
-                    levels_of[word * 64 + at] = level as u8;
+                for (at, level) in chunk.iter().enumerate() {
+                    let level = u64::from(*level);
                     for (bit, plane) in bits.iter_mut().enumerate() {
                         *plane |= (level >> bit & 1) << at;
                     }
@@ -365,13 +388,12 @@ impl Probe {
         }
         Self {
             planes,
-            levels: levels_of,
             words,
             counted: counter(),
             lower,
             delta,
             sum: residual.iter().sum(),
-            norm_squared: dot(&residual, &residual),
+            norm_squared: dot(residual, residual),
             centroid_dot: dot(query, centroid),
             scale: 1.0 / (residual.len() as f32).sqrt(),
         }
@@ -979,12 +1001,14 @@ impl ClusteredIndex {
         let (_, weigh) = chosen();
         let mut weighed = [0u32; BLOCK];
         let mut offered = [false; BLOCK];
+        let mut space = Readying::default();
+        let mut tables = Tables::default();
         for (probed, (_, cluster)) in self.order(query).into_iter().enumerate() {
             if probed >= self.probes && nearest.is_full() {
                 break;
             }
-            let probe = Probe::new(query, self.centroid(cluster));
-            let tables = Tables::new(&probe.levels);
+            let probe = Probe::readied(query, self.centroid(cluster), &mut space, false);
+            tables.fill(&space.levels);
             let members = &self.clusters[cluster];
             for block in 0..members.blocks.count() {
                 let rows =
