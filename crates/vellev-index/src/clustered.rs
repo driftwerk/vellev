@@ -330,6 +330,20 @@ struct Probe {
     scale: f32,
 }
 
+/// A residual's level from its distance above the lowest in steps, `x`:
+/// `x.round().clamp(0.0, 15.0)` as an integer, without a call to round
+/// where the machine has no instruction for it. `x` is never below zero,
+/// as the lowest is subtracted; for such an `x` rounding half away from
+/// zero is its whole part, plus one if what is left is a half or more,
+/// and both are exact in `f32`. Not a number gives 0 and infinity 15, as
+/// before.
+#[inline(always)]
+fn level_of(x: f32) -> u8 {
+    let whole = x as u32;
+    let up = u32::from(x - whole as f32 >= 0.5);
+    whole.saturating_add(up).min((1 << QUERY_BITS) - 1) as u8
+}
+
 /// What readying the query for one cluster after another reuses.
 #[derive(Default)]
 struct Readying {
@@ -365,7 +379,7 @@ impl Probe {
         space.levels.resize(residual.len(), 0);
         if delta > 0.0 {
             for (level, value) in space.levels.iter_mut().zip(residual) {
-                *level = ((value - lower) / delta).round().clamp(0.0, levels) as u8;
+                *level = level_of((value - lower) / delta);
             }
         }
         let mut planes = Vec::new();
@@ -1270,6 +1284,45 @@ mod tests {
             }
         }
         nearest.estimates()
+    }
+
+    /// A level is what rounding gave, for every distance a residual can be
+    /// above the lowest: each `f32` from 0 to past 16 near a half step, and
+    /// the edges.
+    #[test]
+    fn a_level_is_the_rounded_distance_as_first_written() {
+        let first = |x: f32| x.round().clamp(0.0, 15.0) as u8;
+        let mut x = 0.0f32;
+        while x < 17.0 {
+            assert_eq!(level_of(x), first(x), "{x}");
+            for near in [
+                x.next_down(),
+                x.next_up(),
+                x + 0.5,
+                (x + 0.5).next_down(),
+                (x + 0.5).next_up(),
+            ] {
+                if near >= 0.0 {
+                    assert_eq!(level_of(near), first(near), "{near}");
+                }
+            }
+            x += 1.0 / 64.0;
+        }
+        for edge in [
+            0.0,
+            f32::MIN_POSITIVE,
+            0.49999997,
+            0.5,
+            14.5,
+            15.0,
+            15.000001,
+            1e9,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            assert_eq!(level_of(edge), first(edge), "{edge}");
+        }
     }
 
     /// The visit of allowed rows as it was: each estimated from its code.
