@@ -23,6 +23,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use vellev_core::Distance;
 
+use crate::curve::{Curve, Source};
 use crate::fastscan::{chosen, Blocks, Tables, BLOCK};
 use crate::rotation::{Random, Rotation};
 use crate::vector::{
@@ -30,12 +31,16 @@ use crate::vector::{
     or_farthest, short_enough, squared_l2, Scorer, Ties, VectorIndex,
 };
 
-/// The share of the true nearest ten that the clusters scanned must hold,
-/// over sample queries, when the index is built.
-pub const RECALL_FLOOR: f64 = 0.97;
 /// How many bits the query is quantized to for the scan.
 const QUERY_BITS: u32 = 4;
-const TUNING_QUERIES: usize = 100;
+/// How many of its own rows an index is tuned on when built: each asks
+/// for its nearest [`TUNING_NEIGHBOURS`], and the clusters they lie in make
+/// the index's curve of its rows (recall note, R6.3 and R7).
+const TUNING_QUERIES: usize = 400;
+/// How many rows a block of the one pass tuning makes over the rows holds:
+/// small in tests, so that their rows span many blocks and the blocks'
+/// shortlists are merged.
+const TUNING_BLOCK: usize = if cfg!(test) { 64 } else { 4096 };
 const TUNING_NEIGHBOURS: usize = 10;
 const ITERATIONS: usize = 8;
 const MOST_CLUSTERS: usize = 4096;
@@ -83,6 +88,9 @@ pub struct ClusteredIndex {
     unmeasured: Vec<u32>,
     /// How many clusters a query scans.
     probes: usize,
+    /// The curve of the rows the index was tuned on when built: kept with
+    /// the segment by the storage layer, and not in the index's file.
+    curve: Option<Curve>,
 }
 
 impl fmt::Debug for ClusteredIndex {
@@ -238,6 +246,7 @@ impl TryFrom<Wire> for ClusteredIndex {
             rows,
             at,
             probes: wire.probes,
+            curve: None,
         })
     }
 }
@@ -783,8 +792,19 @@ impl ClusteredIndex {
             rows: vectors.iter().map(|(row, _)| *row).collect(),
             at,
             probes: 1,
+            curve: None,
         };
-        index.probes = index.tuned(&measured, &mut random);
+        let samples = random.sample(measured.len(), TUNING_QUERIES);
+        let ranks = index.sample_ranks(&measured, &samples);
+        index.curve = Curve::of(
+            Source::Rows,
+            samples.len() as u32,
+            index.clusters.len() as u32,
+            ranks,
+        );
+        // Every cluster a sample's nearest rows lay in, as the curve says;
+        // also what a node that knows nothing of curves scans.
+        index.probes = index.curve.as_ref().map_or(1, Curve::probes);
         Some(index)
     }
 
@@ -817,52 +837,92 @@ impl ClusteredIndex {
         self.clusters.len()
     }
 
-    /// The fewest clusters whose scan holds [`RECALL_FLOOR`] of the true
-    /// nearest [`TUNING_NEIGHBOURS`] of sample queries drawn at random from
-    /// `vectors` themselves, each left out of its own neighbours: the rows
-    /// that can be measured, as no other is ever offered.
-    fn tuned(&self, vectors: &[(u32, &[f32])], random: &mut Random) -> usize {
-        let ranks: Vec<usize> = random
-            .sample(vectors.len(), TUNING_QUERIES)
-            .into_par_iter()
-            .map(|at| &vectors[at])
-            .flat_map_iter(|(row, query)| {
-                let scorer = Scorer::new(self.metric, query);
-                let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
-                for (other, vector) in vectors {
-                    if other != row {
-                        nearest.offer(scorer.distance(vector), *other);
+    /// The curve of the rows the index was tuned on when it was built:
+    /// none for an index read back from a file, whose curve the segment
+    /// keeps.
+    pub fn rows_curve(&self) -> Option<Curve> {
+        self.curve.clone()
+    }
+
+    /// Each of `samples`' nearest [`TUNING_NEIGHBOURS`] of `vectors`, the
+    /// sample itself left out, ties in row order: in one pass over the
+    /// rows for all samples at once, block by block on the rayon pool, so
+    /// that the rows are read once however many samples there are.
+    fn nearest_of_samples(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<Vec<u32>> {
+        let asked: Vec<(u32, Scorer<'_>)> = samples
+            .iter()
+            .map(|at| (vectors[*at].0, Scorer::new(self.metric, vectors[*at].1)))
+            .collect();
+        let shortlists = |block: &[(u32, &[f32])]| -> Vec<Vec<(f32, u32)>> {
+            let mut nearest: Vec<Nearest<'_>> = asked
+                .iter()
+                .map(|_| Nearest::new(TUNING_NEIGHBOURS, &in_row_order))
+                .collect();
+            for (row, vector) in block {
+                for ((sample, scorer), nearest) in asked.iter().zip(&mut nearest) {
+                    if row != sample {
+                        let distance = scorer.distance(vector);
+                        if !nearest.turns_away(distance) {
+                            nearest.offer(distance, *row);
+                        }
                     }
                 }
-                let order = self.order(&self.prepared(query));
-                let rank_of = move |cluster: u32| {
-                    order
-                        .iter()
-                        .position(|(_, candidate)| *candidate == cluster as usize)
-                        .unwrap_or(order.len())
-                };
-                nearest
-                    .estimates()
-                    .into_iter()
-                    .map(move |(_, row)| rank_of(self.at[self.position(row).unwrap()].0))
-            })
-            .collect();
-        if ranks.is_empty() {
-            return 1;
-        }
-        let mut found = vec![0usize; self.clusters.len() + 1];
-        for rank in &ranks {
-            found[*rank] += 1;
-        }
-        let wanted = (ranks.len() as f64 * RECALL_FLOOR).ceil() as usize;
-        let mut seen = 0;
-        for (rank, count) in found.iter().enumerate().take(self.clusters.len()) {
-            seen += count;
-            if seen >= wanted {
-                return rank + 1;
             }
-        }
-        self.clusters.len()
+            nearest.into_iter().map(Nearest::estimates).collect()
+        };
+        let merged = vectors.par_chunks(TUNING_BLOCK).map(shortlists).reduce(
+            || vec![Vec::new(); asked.len()],
+            |a, b| {
+                a.into_iter()
+                    .zip(b)
+                    .map(|(a, b)| {
+                        let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
+                        for (distance, row) in a.into_iter().chain(b) {
+                            nearest.offer(distance, row);
+                        }
+                        nearest.estimates()
+                    })
+                    .collect()
+            },
+        );
+        merged
+            .into_iter()
+            .map(|mut found| {
+                found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                found.truncate(TUNING_NEIGHBOURS);
+                found.into_iter().map(|(_, row)| row).collect()
+            })
+            .collect()
+    }
+
+    /// The rank, in each sample's order of clusters, of the cluster each of
+    /// its nearest rows lies in: worked out on the tuning pool, one thread
+    /// of its own ([`crate::pool::tuning`]).
+    fn sample_ranks(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<u32> {
+        crate::pool::tuning().install(|| self.ranks_on_this_pool(vectors, samples))
+    }
+
+    /// As [`Self::sample_ranks`], on whatever pool the caller is on.
+    fn ranks_on_this_pool(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<u32> {
+        let nearest = self.nearest_of_samples(vectors, samples);
+        samples
+            .par_iter()
+            .zip(nearest)
+            .flat_map_iter(|(at, rows)| {
+                let mut rank = vec![0u32; self.clusters.len()];
+                for (place, (_, cluster)) in self
+                    .order(&self.prepared(vectors[*at].1))
+                    .into_iter()
+                    .enumerate()
+                {
+                    rank[cluster] = place as u32;
+                }
+                rows.into_iter()
+                    .filter_map(|row| self.position(row))
+                    .map(|position| rank[self.at[position].0 as usize])
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn prepared(&self, query: &[f32]) -> Vec<f32> {
@@ -1526,6 +1586,114 @@ mod tests {
                 parts: 1,
             },
         )
+    }
+
+    /// Each sample row's nearest rows, the row itself left out, found
+    /// sample by sample over every row as tuning first found them: what the
+    /// one pass over the rows for all samples at once must equal.
+    fn neighbours_sample_by_sample(
+        index: &ClusteredIndex,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+    ) -> Vec<Vec<u32>> {
+        samples
+            .iter()
+            .map(|at| {
+                let (row, query) = vectors[*at];
+                let scorer = Scorer::new(index.metric, query);
+                let mut all: Vec<(f32, u32)> = vectors
+                    .iter()
+                    .filter(|(other, _)| *other != row)
+                    .map(|(other, vector)| (scorer.distance(vector), *other))
+                    .collect();
+                all.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                all.truncate(TUNING_NEIGHBOURS);
+                all.into_iter().map(|(_, row)| row).collect()
+            })
+            .collect()
+    }
+
+    /// Tuning runs on a pool of one thread of its own, apart from rayon's
+    /// global pool, where flushes and merges build and where it would take
+    /// every core for tens of seconds a segment: it finishes while every
+    /// global thread is held busy (recall note, R2.6 and R9.5).
+    #[test]
+    fn tuning_runs_on_one_thread_of_its_own() {
+        assert_eq!(crate::pool::tuning().current_num_threads(), 1);
+        let vectors = grouped(5, 3_000, 16, 12, 0.3);
+        let index = indexed(Distance::Cosine, &vectors);
+        let numbered: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+            .collect();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Arc::new(std::sync::Mutex::new(held));
+        let (started, busy) = std::sync::mpsc::channel::<()>();
+        for _ in 0..rayon::current_num_threads() {
+            let (held, started) = (held.clone(), started.clone());
+            rayon::spawn(move || {
+                started.send(()).unwrap();
+                let _ = held.lock().unwrap().recv();
+            });
+        }
+        for _ in 0..rayon::current_num_threads() {
+            busy.recv().unwrap();
+        }
+        let samples: Vec<usize> = (0..3_000).step_by(11).collect();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                done.send(index.sample_ranks(&numbered, &samples).len())
+                    .unwrap()
+            });
+            let answer = finished.recv_timeout(std::time::Duration::from_secs(30));
+            for _ in 0..rayon::current_num_threads() {
+                release.send(()).unwrap();
+            }
+            assert_eq!(answer, Ok(samples.len() * TUNING_NEIGHBOURS));
+        });
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        /// Tuning finds each sample row's nearest rows in one pass over the
+        /// rows for all samples at once, as a pass for each sample finds
+        /// them, ties in row order; and a built index's curve is of their
+        /// clusters' ranks, from its rows, scanning every cluster any of
+        /// them lay in, as the index's own count does.
+        #[test]
+        fn one_pass_finds_every_samples_nearest_rows_and_the_curve_holds_them_all(
+            seed in 1u64..u64::MAX,
+            rows in 30usize..1500,
+            dimensions in 2usize..48,
+            copies in proptest::prop_oneof![3 => proptest::strategy::Just(1usize), 1 => 2usize..4],
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                let distinct: Vec<Vec<f32>> =
+                    (0..rows.div_ceil(copies)).map(|_| noise.vector(dimensions)).collect();
+                (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
+            };
+            let index = indexed(metric, &vectors);
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+                .collect();
+            let samples: Vec<usize> = (0..rows).step_by(7).collect();
+            let found = index.nearest_of_samples(&numbered, &samples);
+            proptest::prop_assert_eq!(found, neighbours_sample_by_sample(&index, &numbered, &samples));
+
+            let curve = index.rows_curve().expect("a built index has a curve of its rows");
+            proptest::prop_assert_eq!(curve.source, crate::curve::Source::Rows);
+            proptest::prop_assert_eq!(curve.clusters as usize, index.clusters.len());
+            proptest::prop_assert_eq!(curve.samples as usize, rows.min(TUNING_QUERIES));
+            proptest::prop_assert_eq!(curve.probes(), index.probes(), "the index scans as its curve says");
+            // Built twice from the same rows, the same curve.
+            proptest::prop_assert_eq!(indexed(metric, &vectors).rows_curve(), Some(curve));
+        }
     }
 
     proptest::proptest! {

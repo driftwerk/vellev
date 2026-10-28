@@ -441,3 +441,34 @@ async fn the_nearest_all_in_one_of_several_clustered_segments_are_all_found() {
         assert_eq!(found, nearest, "oversample {oversample}");
     }
 }
+
+/// A segment whose clustered index is built here keeps, in its manifest
+/// entry, the curve of the rows the index was tuned on, which scans as the
+/// index's own count does; and an index read back from its file scans by
+/// that curve too.
+#[tokio::test]
+async fn a_built_clustered_segment_keeps_the_curve_of_its_rows() {
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let segments = segments_of(&cluster).await;
+    let segment = &segments[0];
+    let index = segment.index.clone().expect("a clustered segment");
+    let frame = cluster.blobs.get(&index).await.unwrap();
+    let stored: SegmentIndex = format::decode(&index, Kind::Index, &frame).unwrap();
+    let (collection, clustered) = &stored.vectors[0];
+    let curves = &segment.probes;
+    assert_eq!(curves.len(), 1, "{curves:?}");
+    let (of, curve) = (&curves[0].collection, &curves[0].curve);
+    assert_eq!(curves[0].band, 0);
+    assert_eq!(of, collection);
+    assert_eq!(curve.source, vellev_index::curve::Source::Rows);
+    assert!(curve.fits(clustered.clusters()));
+    assert_eq!(curve.probes(), clustered.probes());
+    drop(writer);
+    let follower = cluster.open().await;
+    let opened: Vec<SegmentMeta> = follower
+        .partition()
+        .read(|state| state.segments().cloned().collect());
+    assert_eq!(&opened[0].probes, curves, "every node reads the same curve");
+}
