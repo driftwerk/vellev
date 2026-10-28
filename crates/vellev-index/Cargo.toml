@@ -24,7 +24,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 utoipa = { workspace = true, optional = true }
 
+# To lower the background pools' threads' priority, which Linux keeps a
+# thread at a time.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+libc = "0.2"
 proptest.workspace = true
 rmp-serde.workspace = true
 uuid.workspace = true

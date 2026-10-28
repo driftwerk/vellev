@@ -26,19 +26,59 @@ pub fn reads() -> &'static ThreadPool {
     })
 }
 
-/// The pool tuning runs on: one thread of its own (recall note, R2.6 and
-/// R9.5). Tuning is a pass over a segment's vectors for every sample,
-/// tens of seconds a million rows; on the global pool it took every core
-/// for that long, at each merge and, after an upgrade, segment after
-/// segment, and reads waited. On one thread it takes longer and leaves
-/// the rest to reads, flushes and merges.
+/// The pool a build's tuning runs on: one thread of its own (recall note,
+/// R2.6). Tuning is a pass over a segment's vectors for every sample, tens
+/// of seconds a million rows; on the global pool it took every core for
+/// that long at each merge, and reads waited. On one thread it takes
+/// longer and leaves the rest to reads, flushes and merges. A rows pass,
+/// the same work for a segment from before curves, has [`passes`].
 pub fn tuning() -> &'static ThreadPool {
     static TUNING: OnceLock<ThreadPool> = OnceLock::new();
     TUNING.get_or_init(|| {
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-tune".to_string())
+            .start_handler(|_| lowered())
             .build()
             .expect("the tuning pool's thread")
     })
+}
+
+/// The pool a rows pass makes its curve on (recall note, R9.5): one
+/// thread of its own, apart from the tuning pool, so that a merge's own
+/// tuning never waits behind the passes an upgrade makes, segment after
+/// segment, each tens of seconds a million rows. At most one pass runs on
+/// a node at a time, so tuning and passes take two threads at the most.
+pub fn passes() -> &'static ThreadPool {
+    static PASSES: OnceLock<ThreadPool> = OnceLock::new();
+    PASSES.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "vellev-pass".to_string())
+            .start_handler(|_| lowered())
+            .build()
+            .expect("the rows passes' pool's thread")
+    })
+}
+
+/// How far below the rest of the process the background pools' threads
+/// run, tuning's and the rows passes': on Linux, where a thread has a
+/// priority of its own, so that on a small box they yield the CPU to reads
+/// while reads want it and take it back when they do not (measured for
+/// builds in #150: reads during a build at nice 10 about twice as fast,
+/// the build no slower).
+pub const BACKGROUND_NICE: i32 = 10;
+
+/// Lower the calling thread's priority by [`BACKGROUND_NICE`], from where
+/// the process runs, to 19 at the most. Nothing elsewhere, nor if Linux
+/// refuses, as the thread then runs as it would have.
+fn lowered() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: gettid, getpriority and setpriority take and give plain
+    // numbers, and touch no memory of ours.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        let now = libc::getpriority(libc::PRIO_PROCESS, tid);
+        libc::setpriority(libc::PRIO_PROCESS, tid, (now + BACKGROUND_NICE).min(19));
+    }
 }

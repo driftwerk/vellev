@@ -856,7 +856,7 @@ impl ClusteredIndex {
             probes: 1,
             curve: None,
         };
-        index.curve = index.curve_of_measured(&measured);
+        index.curve = index.curve_of_measured(&measured, crate::pool::tuning());
         // Every cluster a sample's nearest rows lay in, as the curve says;
         // also what a node that knows nothing of curves scans.
         index.probes = index.curve.as_ref().map_or(1, Curve::probes);
@@ -909,18 +909,23 @@ impl ClusteredIndex {
             .copied()
             .filter(|(_, vector)| measurable(self.metric, vector))
             .collect();
-        self.curve_of_measured(&measured)
+        self.curve_of_measured(&measured, crate::pool::passes())
     }
 
     /// As [`Self::curve_of_rows`], of rows already found measurable: its
     /// samples drawn by a generator of their own, seeded by how many rows
-    /// there are and their dimensions alone.
-    fn curve_of_measured(&self, measured: &[(u32, &[f32])]) -> Option<Curve> {
+    /// there are and their dimensions alone, and worked out on `pool`: the
+    /// tuning pool for a build, the passes' for a rows pass.
+    fn curve_of_measured(
+        &self,
+        measured: &[(u32, &[f32])],
+        pool: &rayon::ThreadPool,
+    ) -> Option<Curve> {
         let mut random = Random(
             (measured.len() as u64 ^ ((self.dimensions as u64) << 32)) ^ 0x7465_6e65_645f_7631,
         );
         let samples = random.sample(measured.len(), TUNING_QUERIES);
-        let ranks = self.sample_ranks(measured, &samples);
+        let ranks = self.sample_ranks(measured, &samples, pool);
         Curve::of(
             Source::Rows,
             samples.len() as u32,
@@ -981,10 +986,15 @@ impl ClusteredIndex {
     }
 
     /// The rank, in each sample's order of clusters, of the cluster each of
-    /// its nearest rows lies in: worked out on the tuning pool, one thread
-    /// of its own ([`crate::pool::tuning`]).
-    fn sample_ranks(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<u32> {
-        crate::pool::tuning().install(|| self.ranks_on_this_pool(vectors, samples))
+    /// its nearest rows lies in: worked out on `pool`, the tuning pool or
+    /// the passes', each one thread of its own ([`crate::pool`]).
+    fn sample_ranks(
+        &self,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+        pool: &rayon::ThreadPool,
+    ) -> Vec<u32> {
+        pool.install(|| self.ranks_on_this_pool(vectors, samples))
     }
 
     /// As [`Self::sample_ranks`], on whatever pool the caller is on.
@@ -1827,8 +1837,12 @@ mod tests {
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                done.send(index.sample_ranks(&numbered, &samples).len())
-                    .unwrap()
+                done.send(
+                    index
+                        .sample_ranks(&numbered, &samples, crate::pool::tuning())
+                        .len(),
+                )
+                .unwrap()
             });
             let answer = finished.recv_timeout(std::time::Duration::from_secs(30));
             for _ in 0..rayon::current_num_threads() {
@@ -1836,6 +1850,79 @@ mod tests {
             }
             assert_eq!(answer, Ok(samples.len() * TUNING_NEIGHBOURS));
         });
+    }
+
+    /// A pool's threads, held until this is dropped.
+    struct Held(Vec<std::sync::mpsc::Sender<()>>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            for release in &self.0 {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    /// Hold `pool`'s every thread until what is given back is dropped.
+    fn held(pool: &'static rayon::ThreadPool) -> Held {
+        let (started, busy) = std::sync::mpsc::channel::<()>();
+        let mut releases = Vec::new();
+        for _ in 0..pool.current_num_threads() {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let started = started.clone();
+            pool.spawn(move || {
+                started.send(()).unwrap();
+                let _ = wait.recv();
+            });
+            releases.push(release);
+        }
+        for _ in 0..pool.current_num_threads() {
+            busy.recv().unwrap();
+        }
+        Held(releases)
+    }
+
+    /// `work`'s answer, if it finishes within half a minute while `held`
+    /// is held; else, once `held` is let go and the work done, a failure.
+    fn finishes<T: Send>(what: &str, held: Held, work: impl FnOnce() -> T + Send) -> T {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = done.send(work());
+            });
+            let answer = finished.recv_timeout(std::time::Duration::from_secs(30));
+            drop(held);
+            answer.unwrap_or_else(|_| {
+                let _ = finished.recv();
+                panic!("{what} waited")
+            })
+        })
+    }
+
+    /// A merge's own tuning and a rows pass, which after an upgrade may
+    /// run segment after segment for minutes, each have a queue of their
+    /// own: an index builds, tuned, while a pass holds its pool, and a pass
+    /// makes its curve while tuning holds the tuning pool (review of #147).
+    #[test]
+    fn a_merges_tuning_does_not_wait_behind_a_rows_pass() {
+        let vectors = grouped(5, 3_000, 16, 12, 0.3);
+        let numbered: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+            .collect();
+        let index = finishes(
+            "a build behind a rows pass",
+            held(crate::pool::passes()),
+            || ClusteredIndex::build(Distance::Cosine, &numbered).unwrap(),
+        );
+        assert!(index.rows_curve().is_some());
+        let curve = finishes(
+            "a rows pass behind tuning",
+            held(crate::pool::tuning()),
+            || index.curve_of_rows(&numbered),
+        );
+        assert_eq!(curve, index.rows_curve());
     }
 
     proptest::proptest! {
