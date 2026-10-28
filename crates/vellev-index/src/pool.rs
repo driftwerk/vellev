@@ -42,3 +42,9 @@ pub fn tuning() -> &'static ThreadPool {
             .expect("the tuning pool's thread")
     })
 }
+
+/// The pool a rows pass makes its curve on (recall note, R9.5): for now
+/// the tuning pool itself, so that a merge's tuning waits behind a pass.
+pub fn passes() -> &'static ThreadPool {
+    tuning()
+}

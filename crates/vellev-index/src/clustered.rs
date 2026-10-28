@@ -1838,6 +1838,76 @@ mod tests {
         });
     }
 
+    /// Hold `pool`'s every thread until the guard given back is dropped.
+    fn held(pool: &'static rayon::ThreadPool) -> impl Drop {
+        struct Release(Vec<std::sync::mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                for release in &self.0 {
+                    let _ = release.send(());
+                }
+            }
+        }
+        let (started, busy) = std::sync::mpsc::channel::<()>();
+        let mut releases = Vec::new();
+        for _ in 0..pool.current_num_threads() {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let started = started.clone();
+            pool.spawn(move || {
+                started.send(()).unwrap();
+                let _ = wait.recv();
+            });
+            releases.push(release);
+        }
+        for _ in 0..pool.current_num_threads() {
+            busy.recv().unwrap();
+        }
+        Release(releases)
+    }
+
+    /// `work`'s answer, if it finishes within half a minute while `held`
+    /// is held; else, once `held` is let go and the work done, a failure.
+    fn finishes<T: Send>(what: &str, held: impl Drop, work: impl FnOnce() -> T + Send) -> T {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = done.send(work());
+            });
+            let answer = finished.recv_timeout(std::time::Duration::from_secs(30));
+            drop(held);
+            answer.unwrap_or_else(|_| {
+                let _ = finished.recv();
+                panic!("{what} waited")
+            })
+        })
+    }
+
+    /// A merge's own tuning and a rows pass, which after an upgrade may
+    /// run segment after segment for minutes, each have a queue of their
+    /// own: an index builds, tuned, while a pass holds its pool, and a pass
+    /// makes its curve while tuning holds the tuning pool (review of #147).
+    #[test]
+    fn a_merges_tuning_does_not_wait_behind_a_rows_pass() {
+        let vectors = grouped(5, 3_000, 16, 12, 0.3);
+        let numbered: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+            .collect();
+        let index = finishes(
+            "a build behind a rows pass",
+            held(crate::pool::passes()),
+            || ClusteredIndex::build(Distance::Cosine, &numbered).unwrap(),
+        );
+        assert!(index.rows_curve().is_some());
+        let curve = finishes(
+            "a rows pass behind tuning",
+            held(crate::pool::tuning()),
+            || index.curve_of_rows(&numbered),
+        );
+        assert_eq!(curve, index.rows_curve());
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
         /// An index read back from its file has no curve of its rows, and a
