@@ -98,6 +98,49 @@ fn main() {
             index.probes()
         );
         let tuned = index.probes();
+        // A tenth of the rows allowed, as the mid case's bucket < 10 does,
+        // and the truth among them.
+        {
+            let only: roaring::RoaringBitmap = live
+                .iter()
+                .map(|(n, _)| *n)
+                .filter(|n| n % 100 < 10)
+                .collect();
+            let started = Instant::now();
+            let exact_mid: Vec<Vec<u32>> = queries
+                .iter()
+                .map(|q| {
+                    let mut best: Vec<(f32, u32)> = only
+                        .iter()
+                        .map(|n| (distance(Distance::Cosine, q, vectors[n as usize]), n))
+                        .collect();
+                    best.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    best.into_iter().take(10).map(|(_, n)| n).collect()
+                })
+                .collect();
+            println!("mid truth in {:.1?}", started.elapsed());
+            let (mut found, mut spent) = (0usize, std::time::Duration::ZERO);
+            for (q, truth) in queries.iter().zip(&exact_mid) {
+                let started = Instant::now();
+                let short = index.estimates(q, 1280, Some(&only), &skipped, &in_row_order);
+                let mut scored: Vec<(f32, u32)> = short
+                    .iter()
+                    .map(|(_, n)| (distance(Distance::Cosine, q, vectors[*n as usize]), *n))
+                    .collect();
+                scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                spent += started.elapsed();
+                found += scored
+                    .iter()
+                    .take(10)
+                    .filter(|(_, n)| truth.contains(n))
+                    .count();
+            }
+            println!(
+                "mid (a tenth allowed) at {tuned} probes: recall@10 {:.4} {:.2?} a query",
+                found as f64 / (queries.len() * 10) as f64,
+                spent / queries.len() as u32
+            );
+        }
         for margin in [0.25f32, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60, 0.70] {
             let (mut found, mut top1, mut probed) = (0usize, 0usize, 0usize);
             let started = Instant::now();

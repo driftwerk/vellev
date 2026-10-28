@@ -803,15 +803,32 @@ impl ClusteredIndex {
     /// `vectors` themselves, each left out of its own neighbours: the rows
     /// that can be measured, as no other is ever offered.
     fn tuned(&self, vectors: &[(u32, &[f32])], random: &mut Random) -> usize {
-        let samples = std::env::var("SCRATCH_TUNING_QUERIES").ok().and_then(|q| q.parse().ok()).unwrap_or(TUNING_QUERIES);
+        let samples = std::env::var("SCRATCH_TUNING_QUERIES")
+            .ok()
+            .and_then(|q| q.parse().ok())
+            .unwrap_or(TUNING_QUERIES);
         let midpoints = std::env::var("SCRATCH_MIDPOINTS").is_ok_and(|m| m == "1");
         // Scratch: queries are rows, or halfway between two random rows.
         let queries: Vec<(Option<u32>, Vec<f32>)> = match midpoints {
-            false => random.sample(vectors.len(), samples).into_iter().map(|at| (Some(vectors[at].0), vectors[at].1.to_vec())).collect(),
-            true => (0..samples).map(|_| {
-                let (a, b) = (random.below(vectors.len()), random.below(vectors.len()));
-                (None, vectors[a].1.iter().zip(vectors[b].1).map(|(x, y)| (x + y) / 2.0).collect())
-            }).collect(),
+            false => random
+                .sample(vectors.len(), samples)
+                .into_iter()
+                .map(|at| (Some(vectors[at].0), vectors[at].1.to_vec()))
+                .collect(),
+            true => (0..samples)
+                .map(|_| {
+                    let (a, b) = (random.below(vectors.len()), random.below(vectors.len()));
+                    (
+                        None,
+                        vectors[a]
+                            .1
+                            .iter()
+                            .zip(vectors[b].1)
+                            .map(|(x, y)| (x + y) / 2.0)
+                            .collect(),
+                    )
+                })
+                .collect(),
         };
         let ranks: Vec<usize> = queries
             .par_iter()
@@ -844,7 +861,10 @@ impl ClusteredIndex {
         for rank in &ranks {
             found[*rank] += 1;
         }
-        let floor: f64 = std::env::var("SCRATCH_RECALL_FLOOR").ok().and_then(|f| f.parse().ok()).unwrap_or(RECALL_FLOOR);
+        let floor: f64 = std::env::var("SCRATCH_RECALL_FLOOR")
+            .ok()
+            .and_then(|f| f.parse().ok())
+            .unwrap_or(RECALL_FLOOR);
         let wanted = (ranks.len() as f64 * floor).ceil() as usize;
         let mut seen = 0;
         for (rank, count) in found.iter().enumerate().take(self.clusters.len()) {
