@@ -13,10 +13,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { floor: '0.999', tuning: '100' }
-          - { floor: '1.0', tuning: '100' }
-          - { floor: '0.999', tuning: '400' }
-          - { floor: '1.0', tuning: '400' }
+          - { rows: '250000', floor: '0.999', tuning: '400' }
+          - { rows: '250000', floor: '1.0', tuning: '400' }
+          - { rows: '500000', floor: '0.999', tuning: '400' }
+          - { rows: '1000000', floor: '0.999', tuning: '400' }
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -39,4 +39,4 @@ jobs:
           sha256sum --check --strict w.sha256
           zstd -q -d --long=31 passages.jsonl.zst -o "$F/text/passages.jsonl"
           for p in vectors-*.tar.zst; do zstd -q -dc "$p" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword; rm "$p"; done
-      - run: target/release/examples/clustered_real "$RUNNER_TEMP/fixture" 800000
+      - run: target/release/examples/clustered_real "$RUNNER_TEMP/fixture" ${{ matrix.rows }}
