@@ -63,11 +63,20 @@ async fn heavy_sections_are_counted_as_builds_and_an_ordinary_flush_is_not() {
     assert!(begun() > before, "a merge that clusters is counted");
 
     // A reload of a segment of many rows: its indexing is a build.
-    written(&writer, 10_000, vellev_storage::HEAVY_ROWS as u32, &mut random).await;
+    written(
+        &writer,
+        10_000,
+        vellev_storage::HEAVY_ROWS as u32,
+        &mut random,
+    )
+    .await;
     writer.flush().await.unwrap();
     drop(writer);
     let before = begun();
     let opened = cluster.open().await;
-    assert!(begun() > before, "indexing a large segment on open is counted");
+    assert!(
+        begun() > before,
+        "indexing a large segment on open is counted"
+    );
     drop(opened);
 }

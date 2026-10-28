@@ -2212,8 +2212,6 @@ impl Writer {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
         blocking(move || {
-            // Counted, so that reads do not split while it runs.
-            let _building = vellev_index::pool::Building::begun();
             let vectors = vectors.map(|gathered| gathered.finish(format));
             let indexes = match &vectors {
                 Some(column) => state::indexed(

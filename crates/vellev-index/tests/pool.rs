@@ -20,7 +20,10 @@ fn the_read_pool_is_sized_as_the_global_pool_whoever_asks_first() {
 /// they change, as other tests may build meanwhile.
 #[test]
 fn builds_are_counted_while_they_run() {
-    let (running, begun) = (vellev_index::pool::builds(), vellev_index::pool::builds_begun());
+    let (running, begun) = (
+        vellev_index::pool::builds(),
+        vellev_index::pool::builds_begun(),
+    );
     let first = vellev_index::pool::Building::begun();
     let (tx, rx) = std::sync::mpsc::channel();
     let (go, wait) = std::sync::mpsc::channel::<()>();
