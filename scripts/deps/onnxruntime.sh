@@ -15,8 +15,8 @@
 # archive only if its SHA-256 is pinned, and the library only if what it
 # unpacks to is pinned too: two sources, one artifact.
 #
-# PINS, DIST, METADATA, FEATURES, SOURCES, RETRIES and REPOSITORY may be
-# set to test it.
+# PINS, DIST, METADATA, FEATURES, ONNXRUNTIME_CARGO, SOURCES, RETRIES and
+# REPOSITORY may be set to test it.
 set -euo pipefail
 # A failure in $(...) fails what it is in, not only the subshell.
 shopt -s inherit_errexit
@@ -117,13 +117,17 @@ fetch() {
 }
 
 # The workspace's metadata, as Cargo.lock resolves it, read once.
+# Kept only once whole: a failure leaves nothing for a later call to take
+# as the metadata.
 metadata() {
   if [ ! -f "$WORK/metadata.json" ]; then
     if [ -n "${METADATA:-}" ]; then
-      cat "$METADATA" >"$WORK/metadata.json"
+      cat "$METADATA" >"$WORK/metadata.partial" 2>/dev/null || die "could not read $METADATA"
     else
-      (cd "$here/../.." && cargo metadata --format-version 1 --locked) >"$WORK/metadata.json"
+      (cd "$here/../.." && "${ONNXRUNTIME_CARGO:-cargo}" metadata --format-version 1 --locked) \
+        >"$WORK/metadata.partial" || die "cargo metadata failed, as it says above"
     fi
+    mv "$WORK/metadata.partial" "$WORK/metadata.json"
   fi
   cat "$WORK/metadata.json"
 }
@@ -131,6 +135,7 @@ metadata() {
 # The locked ort-sys's package id.
 ort_sys() {
   local id
+  metadata >/dev/null
   id=$(metadata | jq -r '.packages[]? | select(.name == "ort-sys") | .id')
   [ -n "$id" ] || die "no ort-sys in the locked dependencies"
   [ "$(wc -l <<<"$id")" -eq 1 ] || die "more than one ort-sys is locked"
@@ -166,6 +171,8 @@ check() {
   local dist built feature target archive_sha library_sha url theirs checked=0
   built=$(features) || exit 1
   for feature in $built; do
+    [ "$feature" != pkg-config ] ||
+      die "ort-sys is built with pkg-config, which it tries before ORT_LIB_LOCATION, so it might link another ONNX Runtime than the pinned one"
     for other in $OTHER_BUILDS; do
       [ "$feature" != "$other" ] ||
         die "ort-sys is built with $feature, which downloads another ONNX Runtime than the pinned one"
