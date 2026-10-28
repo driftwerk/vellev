@@ -140,6 +140,49 @@ fn main() {
             took.push(started.elapsed().as_secs_f64() * 1e3);
         }
         took.sort_by(f64::total_cmp);
+        // Saturated: SCRATCH_THREADS threads asking at once, each query
+        // estimated and rescored as above.
+        let threads: usize = std::env::var("SCRATCH_THREADS")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(3);
+        let started = Instant::now();
+        let asked: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let (probing, queries, skipped, all) = (&probing, &queries, &skipped, &all);
+                    scope.spawn(move || {
+                        let mut n = 0;
+                        for q in queries.iter().cycle().skip(t * 97).take(queries.len()) {
+                            let short = probing.estimates(q, 1280, None, skipped, &in_row_order);
+                            let mut scored: Vec<(f32, u32)> = short
+                                .iter()
+                                .map(|(_, row)| {
+                                    (
+                                        distance(
+                                            Distance::Cosine,
+                                            q,
+                                            &all[*row as usize * d..][..d],
+                                        ),
+                                        *row,
+                                    )
+                                })
+                                .collect();
+                            let nth = 9.min(scored.len().saturating_sub(1));
+                            scored.select_nth_unstable_by(nth, |a, b| a.0.total_cmp(&b.0));
+                            std::hint::black_box(&scored);
+                            n += 1;
+                        }
+                        n
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        let saturated = asked as f64 / started.elapsed().as_secs_f64();
+        println!(
+            "n={n} target {target}: {threads} threads saturated, {saturated:.0} queries a second"
+        );
         println!(
             "n={n} target {target}: probes {probes} of {clusters} ({:.0}%), recall bound {:.4}, codes a query {}, mean {:.2} ms, p99 {:.2} ms",
             100.0 * probes as f64 / clusters as f64,
