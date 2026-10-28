@@ -21,10 +21,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked -p vellev --bin vellev && cargo test --locked -p vellev --test memory --test allocator --no-run
       - name: the node's options, three times (must pass)
-        run: for i in 1 2 3; do cargo test -q --locked -p vellev --test memory 2>&1 | grep -E "test result|at rest|panicked" || true; done
+        run: for i in 1 2 3; do cargo test -q --locked -p vellev --test memory -- --nocapture 2>&1 | grep -E "test result|at rest|panicked" || true; done
       - name: dirty_decay_ms:-1, never purged (must fail)
         run: _RJEM_MALLOC_CONF=dirty_decay_ms:-1 cargo test -q --locked -p vellev --test memory 2>&1 | grep -E "test result|at rest" || true
       - name: background_thread:false (must fail)
         run: _RJEM_MALLOC_CONF=background_thread:false cargo test -q --locked -p vellev --test memory 2>&1 | grep -E "test result|at rest" || true
       - name: RUST_BACKTRACE=1 with the export deleted, both binaries as CI runs them (nm test must fail, memory test must pass)
-        run: RUST_BACKTRACE=1 cargo test --locked -p vellev --test allocator --test memory 2>&1 | grep -E "^test |test result|at rest|Running" || true
+        run: RUST_BACKTRACE=1 cargo test --no-fail-fast --locked -p vellev --test allocator --test memory -- --nocapture 2>&1 | grep -E "^test |test result|at rest|Running" || true
