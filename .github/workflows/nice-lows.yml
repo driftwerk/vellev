@@ -13,4 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p vellev-index --lib pool:: ; cargo test --locked -p vellev-index --test pool_first --test pool
+      - run: cargo test --locked -p vellev-index --lib -- pool::tests
+      - if: always()
+        run: cargo test --locked -p vellev-index --test pool_first --test pool
