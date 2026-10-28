@@ -1,6 +1,7 @@
 //! Vector and keyword indexes, and the filter engine.
 
 pub mod clustered;
+mod fastscan;
 pub mod filter;
 pub mod fusion;
 mod rotation;
