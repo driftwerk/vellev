@@ -95,19 +95,48 @@ fn anon() -> u64 {
     kb * 1024
 }
 
+/// Scratch: jemalloc's dirty and muzzy pages, all arenas and the arena
+/// holding most, and the background threads' runs.
+#[cfg(target_os = "linux")]
+fn pages() -> String {
+    use tikv_jemalloc_ctl::{arenas, epoch, raw, stats};
+    let _ = epoch::advance();
+    let read = |name: String| -> usize {
+        let name = format!("{name}\0");
+        // SAFETY: the names are jemalloc's, of size_t statistics.
+        unsafe { raw::read::<usize>(name.as_bytes()) }.unwrap_or(0)
+    };
+    let narenas = arenas::narenas::read().unwrap_or(0);
+    let most = (0..narenas)
+        .map(|a| (read(format!("stats.arenas.{a}.pdirty")), a))
+        .max()
+        .unwrap_or((0, 0));
+    // SAFETY: as above, a u64 statistic.
+    let runs = unsafe { raw::read::<u64>(b"stats.background_thread.num_runs\0") }.unwrap_or(0);
+    format!(
+        "dirty {} MiB (arena {} holds {} MiB), muzzy {} MiB, resident {} MiB, active {} MiB, metadata {} MiB, bg runs {runs}",
+        read("stats.arenas.4096.pdirty".into()) * 4096 >> 20,
+        most.1,
+        most.0 * 4096 >> 20,
+        read("stats.arenas.4096.pmuzzy".into()) * 4096 >> 20,
+        stats::resident::read().unwrap_or(0) >> 20,
+        stats::active::read().unwrap_or(0) >> 20,
+        stats::metadata::read().unwrap_or(0) >> 20,
+    )
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn memory_freed_among_what_is_kept_is_given_back() {
     const MIB: u64 = 1024 * 1024;
-    // Scratch: another thread allocates and frees about 100 MiB of large
-    // blocks while this test runs, as a flush on another pool would.
-    let started = std::time::Instant::now();
-    let other = std::thread::spawn(|| {
+    let other_thread = std::env::var("SCRATCH_OTHER").is_ok_and(|o| o == "1");
+    let other = std::thread::spawn(move || {
+        if !other_thread {
+            return 0;
+        }
         let blocks: Vec<Vec<u8>> = (0..25).map(|n| vec![n as u8; 4 * 1024 * 1024]).collect();
         std::thread::sleep(std::time::Duration::from_millis(500));
         drop(blocks);
-        // And the original pattern: nm's whole listing taken at once, and
-        // copied into a string, on this other thread.
         let listed = std::process::Command::new("nm")
             .arg("--defined-only")
             .arg(env!("CARGO_BIN_EXE_vellev"))
@@ -119,48 +148,44 @@ fn memory_freed_among_what_is_kept_is_given_back() {
         size
     });
     let before = anon();
-    // About 900 MiB in 3 KiB pieces, as a flush's copies of its vectors.
     let pieces: Vec<Vec<u8>> = (0..300_000)
         .map(|n| vec![(n % 251) as u8; 3 * 1024])
         .collect();
     assert!(anon() > before + 800 * MIB, "the pieces are resident");
-    // One in sixteen kept, scattered among the rest, as a segment is.
     let kept: Vec<Vec<u8>> = pieces
         .into_iter()
         .enumerate()
         .filter(|(n, _)| n % 16 == 0)
         .map(|(_, piece)| piece)
         .collect();
+    let freed = std::time::Instant::now();
     let held = kept.iter().map(|piece| piece.len() as u64).sum::<u64>();
-    // An allocator that hands out small pieces from pages of several keeps
-    // a page any one of its pieces is still in: jemalloc's pages for 3 KiB
-    // pieces hold four, so one kept in sixteen keeps one page in four, four
-    // times what is kept (about 220 MiB here; 238 MiB measured with the
-    // rest of the process). glibc kept all 890 MiB.
     let bound = before + 4 * held + 64 * MIB;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while anon() > bound && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+    let mut crossed = None;
+    let mut series = String::new();
+    while freed.elapsed() < std::time::Duration::from_secs(32) {
+        let now = anon();
+        if crossed.is_none() && now <= bound {
+            crossed = Some((freed.elapsed().as_secs_f64(), now / MIB));
+        }
+        series += &format!(
+            "  {:5.2} s: anon {} MiB; {}\n",
+            freed.elapsed().as_secs_f64(),
+            now / MIB,
+            pages()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
     let listing = other.join().unwrap();
     panic!(
-        "scratch report ({}): nm's listing took {listing} MiB on the other thread; {} MiB anonymous ({} MiB before, bound {} MiB) {:.1} s in; {}",
+        "scratch series ({}, other thread {other_thread}, listing {listing} MiB): before {} MiB, held {} MiB, bound {} MiB, crossed {crossed:?}, at 32 s {} MiB; {}\n{series}",
         std::env::var("_RJEM_MALLOC_CONF").unwrap_or_default(),
-        anon() / MIB,
         before / MIB,
+        held / MIB,
         bound / MIB,
-        started.elapsed().as_secs_f64(),
+        anon() / MIB,
         jemalloc()
     );
     #[allow(unreachable_code)]
-    assert!(
-        anon() <= bound,
-        "{} MiB anonymous ({} MiB before, bound {} MiB) with {} MiB kept: what was freed was not given back; {}",
-        anon() / MIB,
-        before / MIB,
-        bound / MIB,
-        held / MIB,
-        jemalloc()
-    );
     drop(kept);
 }
