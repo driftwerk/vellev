@@ -72,4 +72,13 @@ pub const BACKGROUND_NICE: i32 = 10;
 /// Lower the calling thread's priority by [`BACKGROUND_NICE`], from where
 /// the process runs, to 19 at the most. Nothing elsewhere, nor if Linux
 /// refuses, as the thread then runs as it would have.
-fn lowered() {}
+fn lowered() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: gettid, getpriority and setpriority take and give plain
+    // numbers, and touch no memory of ours.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        let now = libc::getpriority(libc::PRIO_PROCESS, tid);
+        libc::setpriority(libc::PRIO_PROCESS, tid, (now + BACKGROUND_NICE).min(19));
+    }
+}
