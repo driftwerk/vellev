@@ -1,0 +1,43 @@
+name: Build priority (scratch)
+
+on:
+  push:
+    branches: [scratch-build-priority]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  FIXTURE: fixture-bench-wiki1m-bge-base-v1
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --locked -p vellev-index --test build_priority --no-run
+      - name: Fetch the fixture's vectors
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/download" "$F/vectors"
+          cd "$F/download"
+          for asset in vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+            grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> wanted.sha256
+          done
+          sha256sum --check --strict wanted.sha256
+          for part in vectors-*.tar.zst; do
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
+            rm "$part"
+          done
+      - name: CPU
+        run: lscpu | grep -E "Model name|^CPU\(s\)" | cut -c1-200
+      - name: Reads during a build, normal and niced
+        run: VELLEV_FIXTURE="$RUNNER_TEMP/fixture" READERS="2 4" RATE=15 NICE=10 ROUNDS=2 cargo test --release --locked -p vellev-index --test build_priority -- --ignored --nocapture
