@@ -1490,6 +1490,32 @@ mod tests {
         }
     }
 
+    /// What finds a row's place costs memory by the rows the index holds,
+    /// not by the highest row: an index of a few thousand rows spread over
+    /// ten million, as one collection's rows lie in a segment of many, takes
+    /// little more than one of the same rows packed together. And what an
+    /// index holds is counted: codes, factors, rows, places and centroids.
+    #[test]
+    fn an_index_costs_memory_by_its_rows_not_by_the_highest_row() {
+        let vectors = grouped(9, 3_000, 16, 12, 0.3);
+        let at = |spread: u32| -> ClusteredIndex {
+            let rows: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * spread, v.as_slice()))
+                .collect();
+            ClusteredIndex::build(Distance::Cosine, &rows).unwrap()
+        };
+        let (packed, spread) = (at(1), at(3_333));
+        assert!(packed.resident() > 3_000 * (16 + 12 + 4), "codes, factors and rows are counted: {}", packed.resident());
+        assert!(
+            spread.resident() < packed.resident() + 64 * 1024,
+            "{} spread against {} packed",
+            spread.resident(),
+            packed.resident()
+        );
+    }
+
     /// What a shortlist of `count` says, as every caller reads it: its
     /// nearest `count` by estimate, those alike in row order.
     fn cut(mut found: Vec<(f32, u32)>, count: usize) -> Vec<(u32, u32)> {
@@ -2179,7 +2205,7 @@ mod tests {
             rmp_serde::from_slice::<ClusteredIndex>(&bytes).map(|index| index.len())
         };
         assert_eq!(reread(|_| {}).unwrap(), 1000);
-        let corruptions: [(&str, Corrupt); 12] = [
+        let corruptions: [(&str, Corrupt); 13] = [
             ("no clusters to scan", |wire| wire.probes = 0),
             ("more clusters to scan than there are", |wire| {
                 wire.probes = usize::MAX
@@ -2217,6 +2243,11 @@ mod tests {
             ("a row without factors", |wire| {
                 wire.clusters[0].factors.pop();
             }),
+            ("a row in two clusters", |wire| {
+                let row = wire.clusters[0].rows[0];
+                wire.clusters[1].rows[0] = row;
+            }),
+
             ("no clusters", |wire| {
                 wire.clusters.clear();
                 wire.centroids.clear();
