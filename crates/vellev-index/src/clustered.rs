@@ -846,27 +846,6 @@ impl ClusteredIndex {
             .max(least)
     }
 
-    /// Scratch: estimates scanning `probes` clusters, unfiltered.
-    pub fn scratch_estimates(&self, query: &[f32], count: usize, probes: usize) -> Vec<(f32, u32)> {
-        let mut nearest = Nearest::new(count, &crate::vector::in_row_order);
-        let query = self.prepared(query);
-        for (probed, (_, cluster)) in self.order(&query).into_iter().enumerate() {
-            if probed >= probes && nearest.is_full() {
-                break;
-            }
-            let probe = Probe::new(&query, self.centroid(cluster));
-            let members = &self.clusters[cluster];
-            for (index, row) in members.rows.iter().enumerate() {
-                let code = self.code(members, index);
-                nearest.offer(
-                    probe.distance(self.metric, code, &members.factors[index]),
-                    *row,
-                );
-            }
-        }
-        nearest.estimates()
-    }
-
     /// Scratch: each cluster's rank in the order a query probes them.
     pub fn scratch_cluster_ranks(&self, query: &[f32]) -> Vec<u32> {
         let mut ranks = vec![0u32; self.clusters.len()];
@@ -937,48 +916,41 @@ impl ClusteredIndex {
         self.position(row).map(|at| self.at[at].0 as usize)
     }
 
-    /// Scratch: estimates scanning clusters in order until at least
-    /// `least` are scanned and the nearest `watch` estimates have not
-    /// changed for `patience` clusters; with the clusters scanned.
-    pub fn scratch_patience(
-        &self,
-        query: &[f32],
-        count: usize,
-        least: usize,
-        patience: usize,
-        watch: usize,
-    ) -> (Vec<(f32, u32)>, usize) {
-        let mut nearest = Nearest::new(count, &crate::vector::in_row_order);
-        let mut watched: std::collections::BinaryHeap<(u32, u32)> = Default::default();
+    /// Scratch: estimates scanning `probes` clusters, unfiltered.
+    pub fn scratch_estimates(&self, query: &[f32], count: usize, probes: usize) -> Vec<(f32, u32)> {
         let query = self.prepared(query);
-        let mut quiet = 0;
-        let mut probed = 0;
-        for (_, cluster) in self.order(&query) {
-            if probed >= least && quiet >= patience && nearest.is_full() {
+        let order = self.order(&query);
+        let mut nearest = Nearest::new(count, &crate::vector::in_row_order);
+        let mut space = Readying::default();
+        let mut tables = Tables::default();
+        let mut weighed = [0u32; BLOCK];
+        let weigh = chosen().1;
+        for (probed, (_, cluster)) in order.into_iter().enumerate() {
+            if probed >= probes && nearest.is_full() {
                 break;
             }
-            probed += 1;
-            let probe = Probe::new(&query, self.centroid(cluster));
+            let probe = Probe::readied(&query, self.centroid(cluster), &mut space);
+            tables.fill(&space.levels);
             let members = &self.clusters[cluster];
-            let mut changed = false;
-            for (index, row) in members.rows.iter().enumerate() {
-                let code = self.code(members, index);
-                let distance = probe.distance(self.metric, code, &members.factors[index]);
-                nearest.offer(distance, *row);
-                // f32 distances as ordered bits (non-negative for cosine/L2)
-                let key = distance.max(0.0).to_bits();
-                if watched.len() < watch {
-                    watched.push((key, *row));
-                    changed = true;
-                } else if watched.peek().is_some_and(|worst| key < worst.0) {
-                    watched.pop();
-                    watched.push((key, *row));
-                    changed = true;
+            for block in 0..members.blocks.count() {
+                weigh(members.blocks.block(block), &tables, &mut weighed);
+                let rows =
+                    &members.rows[block * BLOCK..members.rows.len().min((block + 1) * BLOCK)];
+                for (lane, row) in rows.iter().enumerate() {
+                    let at = block * BLOCK + lane;
+                    nearest.offer(
+                        probe.distance_of(
+                            self.metric,
+                            members.blocks.ones(at),
+                            weighed[lane],
+                            &members.factors[at],
+                        ),
+                        *row,
+                    );
                 }
             }
-            quiet = if changed { 0 } else { quiet + 1 };
         }
-        (nearest.estimates(), probed)
+        nearest.estimates()
     }
 
     /// Scratch: this index scanning `probes` clusters at least.

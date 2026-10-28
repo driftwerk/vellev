@@ -781,45 +781,6 @@ fn main() {
                 );
             }
         }
-        // Stopping by patience, one segment at a time: probes scanned and
-        // the recall of what is scanned, for the broad case.
-        if layout.len() == 1 && std::env::var("SCRATCH_PATIENCE").is_ok() {
-            let index = &segments[0].2;
-            for (least, patience) in [(16, 16), (32, 32), (64, 32), (64, 64), (100, 100)] {
-                let started = Instant::now();
-                let outcome: Vec<(usize, usize)> = queries
-                    .iter()
-                    .zip(&truth_q)
-                    .map(|(q, truth)| {
-                        let (short, probed) = index.scratch_patience(q, 1280, least, patience, 10);
-                        let mut scored: Vec<(f32, u32)> = short
-                            .iter()
-                            .map(|(_, n)| {
-                                (distance(Distance::Cosine, q, live_vector(&all, *n)), *n)
-                            })
-                            .collect();
-                        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                        let got: Vec<u32> = scored.iter().take(10).map(|(_, n)| *n).collect();
-                        // neighbours past the clustered rows count as found
-                        let found = truth
-                            .iter()
-                            .filter(|n| got.contains(n) || **n as usize >= clustered_rows)
-                            .count();
-                        (found, probed)
-                    })
-                    .collect();
-                let mut probed: Vec<usize> = outcome.iter().map(|o| o.1).collect();
-                probed.sort_unstable();
-                println!(
-                    "patience least {least} quiet {patience}: recall {:.4}, probes mean {:.0} p50 {} p99 {}, {:.2?} a query",
-                    outcome.iter().map(|o| o.0).sum::<usize>() as f64 / (queries.len() * 10) as f64,
-                    probed.iter().sum::<usize>() as f64 / probed.len() as f64,
-                    probed[probed.len() / 2],
-                    probed[probed.len() * 99 / 100],
-                    started.elapsed() / queries.len() as u32
-                );
-            }
-        }
     }
 }
 
