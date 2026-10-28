@@ -1,0 +1,24 @@
+name: Retention probe (scratch)
+
+on:
+  push:
+    branches: [scratch-retention]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p vellev --test allocator --no-run
+      - name: series
+        run: |
+          run() { cargo test -q --locked -p vellev --test allocator memory_freed 2>&1 | sed -n '/scratch series/,/^$/p' | head -80 || true; }
+          echo "== defaults, alone"; run; run
+          echo "== defaults, other thread"; SCRATCH_OTHER=1 run
+          echo "== dirty_decay_ms:1000"; _RJEM_MALLOC_CONF=dirty_decay_ms:1000 run
+          echo "== dirty_decay_ms:0"; _RJEM_MALLOC_CONF=dirty_decay_ms:0 run
