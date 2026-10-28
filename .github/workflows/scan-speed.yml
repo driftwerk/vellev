@@ -2,7 +2,7 @@ name: Scan speed (scratch)
 
 on:
   push:
-    branches: [scratch-speed-after, scratch-speed-before]
+    branches: [scratch-speed-after]
 
 permissions:
   contents: read
@@ -21,7 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked -p vellev-index --example scan_speed
+      - run: cargo build --release --locked -p vellev-index --example scan_speed && cp target/release/examples/scan_speed "$RUNNER_TEMP/after"
+      - uses: actions/checkout@v5
+        with:
+          ref: scratch-speed-before
+          path: before
+      - run: cd before && cargo build --release --locked -p vellev-index --example scan_speed && cp target/release/examples/scan_speed "$RUNNER_TEMP/before"
       - name: Fetch the fixture's vectors and the questions
         run: |
           set -euo pipefail
@@ -40,9 +45,9 @@ jobs:
           ls "$F/vectors/passages" | wc -l
       - name: CPU
         run: lscpu | grep -E "Model name|^CPU\(s\)|Flags" | cut -c1-200
-      - name: Speed, twice
+      - name: Speed, before and after on this one runner, alternately
         run: |
-          target/release/examples/scan_speed "$RUNNER_TEMP/fixture" 912500 100,300,560
+          for side in before after before after; do echo "== $side"; "$RUNNER_TEMP/$side" "$RUNNER_TEMP/fixture" 912500 300,560; done
       - name: The AVX2 way planted wrong must fail the rule (after only)
         if: github.ref_name == 'scratch-speed-after'
         run: |
