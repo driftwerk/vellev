@@ -892,6 +892,37 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
     }
 }
 
+/// A clustered index of a segment that has no curve for it: see
+/// [`State::curves_missing`].
+pub(crate) struct Missing {
+    pub key: String,
+    pub collection: CollectionId,
+    pub index: Arc<ClusteredIndex>,
+    file: Arc<SegmentFile>,
+    vectors: Arc<Column>,
+}
+
+impl Missing {
+    /// The curve the index's build would have given: of the rows it
+    /// indexes, the segment's rows of its collection with a vector, in row
+    /// order, as they were given to the build.
+    pub fn curve(&self) -> Option<SegmentCurve> {
+        let rows: Vec<(u32, &[f32])> = self
+            .file
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.collection == self.collection)
+            .filter_map(|(row, _)| Some((row as u32, self.vectors.get(row)?)))
+            .collect();
+        Some(SegmentCurve {
+            collection: self.collection,
+            band: 0,
+            curve: self.index.curve_of_rows(&rows)?,
+        })
+    }
+}
+
 /// `meta` holding the curves of `curves` named for it, each in place of any
 /// of the same collection and band, the curves in collection and band
 /// order.
@@ -1749,6 +1780,36 @@ impl State {
             with_curves(meta, curves);
         }
         Ok(Some(manifest))
+    }
+
+    /// Each clustered index of a segment whose entry has no curve of band 0
+    /// for its collection, as a segment written before curves has none: the
+    /// segment's key, the collection, the index, and the rows it indexes
+    /// with their vectors, to make the curve its build would have from.
+    pub(crate) fn curves_missing(&self) -> Vec<Missing> {
+        let mut missing = Vec::new();
+        for segment in &self.segments {
+            for (collection, index) in segment.indexes.iter() {
+                let Some(Vectors::Clustered(clustered)) = &index.vectors else {
+                    continue;
+                };
+                let has = segment
+                    .meta
+                    .probes
+                    .iter()
+                    .any(|entry| entry.collection == *collection && entry.band == 0);
+                if !has {
+                    missing.push(Missing {
+                        key: segment.meta.key.clone(),
+                        collection: *collection,
+                        index: clustered.clone(),
+                        file: segment.file.clone(),
+                        vectors: segment.vectors.clone(),
+                    });
+                }
+            }
+        }
+        missing
     }
 
     /// Carry out a committed commit of `curves`: the segments named hold

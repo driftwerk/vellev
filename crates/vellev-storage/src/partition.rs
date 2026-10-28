@@ -2317,6 +2317,29 @@ impl Writer {
     /// commits go on; a row that dies meanwhile is dead in the new segment
     /// too. Returns the checkpoint's position, or `None` when there was
     /// nothing to merge.
+    /// Make and commit the curve of its rows for every clustered index of a
+    /// segment that has none, as a segment written before curves (recall
+    /// note, R9.5): the curve its build would have given, made off the
+    /// async threads, then committed as [`Self::commit_curves`] commits.
+    /// What is missing is worked out afresh at each call, from the segments
+    /// there are, so a pass cut short, by the tenant being let go or the
+    /// lease lost, is made again by the next. Returns the position
+    /// committed, or None if nothing was missing.
+    pub async fn rows_pass(&self) -> Result<Option<LogPosition>> {
+        let missing = self.partition.read(State::curves_missing);
+        if missing.is_empty() {
+            return Ok(None);
+        }
+        let curves = blocking(move || {
+            missing
+                .into_iter()
+                .filter_map(|missing| Some((missing.key.clone(), missing.curve()?)))
+                .collect::<Vec<_>>()
+        })
+        .await?;
+        self.commit_curves(curves).await
+    }
+
     /// Commit `curves`, each for the segment its key names (recall note,
     /// R7 and R9.2): a checkpoint at the next position, as a merge commits
     /// one, the memtable flushed along, every segment as it is but those

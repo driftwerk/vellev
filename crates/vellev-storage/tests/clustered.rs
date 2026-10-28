@@ -548,10 +548,16 @@ impl Blobs for Older {
             return Ok(bytes);
         }
         let mut manifest: Manifest = format::decode(key, Kind::Manifest, &bytes)?;
-        manifest.segments.iter_mut().for_each(|segment| segment.probes.clear());
+        manifest
+            .segments
+            .iter_mut()
+            .for_each(|segment| segment.probes.clear());
         format::encode(Kind::Manifest, &manifest)
     }
-    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
@@ -579,11 +585,15 @@ async fn a_segment_from_before_curves_gets_the_curve_its_build_would_have_given(
     let successor = Writer::open(older, cluster.coordinator.clone(), lease, &committed)
         .await
         .unwrap();
-    let seen: Vec<SegmentMeta> = successor.partition().read(|state| state.segments().cloned().collect());
+    let seen: Vec<SegmentMeta> = successor
+        .partition()
+        .read(|state| state.segments().cloned().collect());
     assert!(seen[0].probes.is_empty(), "read as before curves");
     assert!(successor.rows_pass().await.unwrap().is_some());
     let after = segments_of(&cluster).await;
     assert_eq!(after[0].probes, built, "the curve its build gave");
-    let kept: Vec<SegmentMeta> = successor.partition().read(|state| state.segments().cloned().collect());
+    let kept: Vec<SegmentMeta> = successor
+        .partition()
+        .read(|state| state.segments().cloned().collect());
     assert_eq!(kept[0].probes, built);
 }
