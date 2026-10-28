@@ -957,6 +957,7 @@ async fn a_checkpoint_that_contradicts_itself_is_refused() {
                 tombstones: 0,
                 index: None,
                 vectors: None,
+                probes: vec![],
             }]),
         )
         .unwrap()

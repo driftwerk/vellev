@@ -42,6 +42,17 @@ const MOST_CLUSTERS: usize = 4096;
 /// How many vectors per cluster k-means is trained on, at most.
 const TRAINING_PER_CLUSTER: usize = 64;
 
+/// How a scan of clusters goes: how many clusters it probes at least, and
+/// into how many runs it may be split on the read pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probing {
+    /// The clusters it scans at least: as a segment's probe curve says, or
+    /// as the index was built to ([`ClusteredIndex::probes`]).
+    pub probes: usize,
+    /// The runs it may be split into; 1 scans on the calling thread.
+    pub parts: usize,
+}
+
 /// In what an index is not one of the vectors it is asked to stand for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Unfit {
@@ -910,14 +921,20 @@ impl VectorIndex for ClusteredIndex {
         skipped: &[bool],
         ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
-        self.estimates_split(query, count, only, skipped, ties, 1)
+        let probing = Probing {
+            probes: self.probes,
+            parts: 1,
+        };
+        self.estimates_split(query, count, only, skipped, ties, probing)
     }
 }
 
 impl ClusteredIndex {
-    /// As [`VectorIndex::estimates`], a scan of clusters split into up to
-    /// `parts` runs on the rayon pool: the same nearest `count`, whatever
-    /// `parts` is, as [`Self::scanned`] says.
+    /// As [`VectorIndex::estimates`], scanning at least `probes` clusters
+    /// rather than the count the index was built with (a segment's probe
+    /// curve says how many: see [`crate::curve`]), the scan split into up
+    /// to `parts` runs on the rayon pool: the same nearest `count`,
+    /// whatever `parts` is, as [`Self::scanned`] says.
     pub fn estimates_split(
         &self,
         query: &[f32],
@@ -925,8 +942,9 @@ impl ClusteredIndex {
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
         ties: Ties<'_>,
-        parts: usize,
+        probing: Probing,
     ) -> Vec<(f32, u32)> {
+        let Probing { probes, parts } = probing;
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
@@ -955,13 +973,21 @@ impl ClusteredIndex {
             return nearest.estimates();
         }
         let query = self.prepared(query);
-        let per_probe = self.rows.len().div_ceil(self.clusters.len()) * self.probes;
+        let probes = probes.clamp(1, self.clusters.len());
+        let per_probe = self.rows.len().div_ceil(self.clusters.len()) * probes;
         match only {
             // Fewer rows allowed than a scan would visit: visit just those.
             Some(only) if (only.len() as usize) <= per_probe => {
                 self.visited(&query, count, only, skipped, ties)
             }
-            _ => self.scanned(&query, count, only, skipped, ties, parts),
+            _ => self.scanned(
+                &query,
+                count,
+                only,
+                skipped,
+                ties,
+                Probing { probes, parts },
+            ),
         }
     }
 
@@ -1055,10 +1081,11 @@ impl ClusteredIndex {
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
         ties: Ties<'_>,
-        parts: usize,
+        probing: Probing,
     ) -> Vec<(f32, u32)> {
+        let Probing { probes, parts } = probing;
         let order = self.order(query);
-        let probes = self.probes.min(order.len());
+        let probes = probes.min(order.len());
         let mut scan = Scan::new(self, query, only, skipped);
         let mut nearest = Nearest::new(count, ties);
         let runs = parts.min(probes);
@@ -1494,8 +1521,49 @@ mod tests {
             only,
             skipped,
             &in_row_order,
-            1,
+            Probing {
+                probes: index.probes,
+                parts: 1,
+            },
         )
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        /// Probes given, as a segment's curve gives them, scan as an index
+        /// built to scan that many does, clamped to one and to every
+        /// cluster.
+        #[test]
+        fn probes_given_scan_as_an_index_built_with_them(
+            seed in 1u64..u64::MAX,
+            rows in 40usize..1200,
+            dimensions in 2usize..64,
+            count in 1usize..200,
+            probes in 0usize..80,
+            share in proptest::option::of(1u32..100),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let index = indexed(Distance::Cosine, &vectors);
+            let built = ClusteredIndex {
+                probes: probes.clamp(1, index.clusters.len()),
+                ..index.clone()
+            };
+            let only: Option<RoaringBitmap> = share.map(|share| {
+                (0..rows as u32 * 2)
+                    .filter(|row| (row.wrapping_mul(2_654_435_761) >> 7) % 100 < share)
+                    .collect()
+            });
+            let mut noise = Noise(seed.rotate_left(9) | 1);
+            for _ in 0..4 {
+                let query = noise.vector(dimensions);
+                let given = index.estimates_split(&query, count, only.as_ref(), &[], &in_row_order, Probing { probes, parts: 1 });
+                let as_built = built.estimates(&query, count, only.as_ref(), &[], &in_row_order);
+                proptest::prop_assert_eq!(cut(given, count), cut(as_built, count));
+            }
+        }
     }
 
     proptest::proptest! {
@@ -1532,8 +1600,8 @@ mod tests {
             let skipped: Vec<bool> = (0..rows * 2).map(|row| row % 11 == 5).collect();
             for _ in 0..4 {
                 let query = index.prepared(&noise.vector(dimensions));
-                let one = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, 1);
-                let split = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, parts);
+                let one = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, Probing { probes: index.probes, parts: 1 });
+                let split = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, Probing { probes: index.probes, parts });
                 proptest::prop_assert_eq!(cut(split, count), cut(one, count));
             }
         }
