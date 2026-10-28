@@ -1320,6 +1320,43 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        /// What a shortlist keeps, as every caller cuts it, does not depend
+        /// on the order rows are offered in: the nearest `count`, those
+        /// alike in row order, whether they come in row order, the reverse
+        /// or shuffled, and however many tie. The scan, the visit and a
+        /// split scan each offer rows in their own order and rely on it.
+        #[test]
+        fn a_shortlists_cut_is_the_same_whatever_order_rows_come_in(
+            seed in 1u64..u64::MAX,
+            rows in 1usize..400,
+            distinct in 1u64..12,
+            count in 1usize..60,
+        ) {
+            let mut noise = Noise(seed);
+            let offered: Vec<(f32, u32)> = (0..rows as u32)
+                .map(|row| (((noise.unit() + 0.5) * distinct as f32).floor(), row))
+                .collect();
+            let mut want = offered.clone();
+            want.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            want.truncate(count);
+            let want: Vec<(u32, u32)> = want.iter().map(|(d, row)| (d.to_bits(), *row)).collect();
+            let mut shuffled = offered.clone();
+            for at in (1..shuffled.len()).rev() {
+                let other = ((noise.unit() + 0.5) * (at + 1) as f32) as usize;
+                shuffled.swap(at, other.min(at));
+            }
+            let reversed: Vec<(f32, u32)> = offered.iter().rev().copied().collect();
+            for (how, order) in [("in row order", &offered), ("reversed", &reversed), ("shuffled", &shuffled)] {
+                let mut nearest = Nearest::new(count, &in_row_order);
+                for (distance, row) in order {
+                    nearest.offer(*distance, *row);
+                }
+                proptest::prop_assert_eq!(cut(nearest.estimates(), count), want.clone(), "{}", how);
+            }
+        }
+    }
+
     /// What a shortlist of `count` says, as every caller reads it: its
     /// nearest `count` by estimate, those alike in row order.
     fn cut(mut found: Vec<(f32, u32)>, count: usize) -> Vec<(u32, u32)> {
