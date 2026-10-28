@@ -629,7 +629,7 @@ async fn a_segment_from_before_curves_gets_the_curve_its_build_would_have_given(
 #[tokio::test]
 async fn clustered_indexes_are_counted_one_each_by_where_their_probes_come_from() {
     use vellev_index::curve::{Curve, Source};
-    use vellev_storage::format::{CollectionId, SegmentCurve};
+    use vellev_storage::format::SegmentCurve;
     use vellev_storage::{Probes, State};
     let cluster = Cluster::new().await;
     let vectors = vectors();
@@ -695,12 +695,9 @@ async fn clustered_indexes_are_counted_one_each_by_where_their_probes_come_from(
         assert_eq!(probes(&writer), counted, "a curve of {what}");
     }
 
-    // The rows curve back, with one of another band and one for a
-    // collection the segment has no index of: still one index, of rows.
-    let elsewhere = SegmentCurve {
-        collection: CollectionId(built.collection.0 + 1),
-        ..built.clone()
-    };
+    // The rows curve back, with one of another band: still one index, of
+    // rows. (A curve for a collection the segment has no index of is
+    // refused when committed, and would count for nothing.)
     let banded = SegmentCurve {
         band: 2,
         ..curve(Source::Queries, clusters)
@@ -708,7 +705,6 @@ async fn clustered_indexes_are_counted_one_each_by_where_their_probes_come_from(
     writer
         .commit_curves(vec![
             (segment.key.clone(), built.clone()),
-            (segment.key.clone(), elsewhere),
             (segment.key.clone(), banded),
         ])
         .await
@@ -720,7 +716,7 @@ async fn clustered_indexes_are_counted_one_each_by_where_their_probes_come_from(
             .iter()
             .map(|s| s.probes.len())
             .sum::<usize>(),
-        3
+        2
     );
     assert_eq!(probes(&writer), one(|p| &mut p.rows));
     drop(writer);
@@ -734,4 +730,55 @@ async fn clustered_indexes_are_counted_one_each_by_where_their_probes_come_from(
         .await
         .unwrap();
     assert_eq!(probes(&successor), one(|p| &mut p.index));
+}
+
+/// A curve is committed only for a clustered index the segment holds: one
+/// for a collection the segment has no index of, or for a segment with no
+/// index at all, is refused, and nothing is committed, not even the curves
+/// given with it that would fit.
+#[tokio::test]
+async fn a_curve_for_no_index_in_its_segment_is_refused() {
+    use vellev_storage::format::{CollectionId, SegmentCurve};
+    use vellev_storage::StorageError;
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    writer
+        .commit(vec![row("notes", ROWS, vectors[0].clone())])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let before = segments_of(&cluster).await;
+    let head = cluster.committed().await.manifest;
+    let clustered = before.iter().find(|s| s.index.is_some()).unwrap().clone();
+    let plain = before.iter().find(|s| s.index.is_none()).unwrap().clone();
+    let built = clustered.probes[0].clone();
+    let elsewhere = SegmentCurve {
+        collection: CollectionId(built.collection.0 + 1),
+        ..built.clone()
+    };
+    for (what, curves) in [
+        (
+            "a collection the segment has no index of",
+            vec![
+                (clustered.key.clone(), built.clone()),
+                (clustered.key.clone(), elsewhere),
+            ],
+        ),
+        (
+            "a segment with no index",
+            vec![
+                (clustered.key.clone(), built.clone()),
+                (plain.key.clone(), built.clone()),
+            ],
+        ),
+    ] {
+        let refused = writer.commit_curves(curves).await.unwrap_err();
+        assert!(
+            matches!(refused, StorageError::InvalidMutation(_)),
+            "{what}: {refused}"
+        );
+        assert_eq!(cluster.committed().await.manifest, head, "{what}");
+        assert_eq!(segments_of(&cluster).await, before, "{what}");
+    }
 }
