@@ -2,6 +2,8 @@
 
 use rayon::prelude::*;
 use vellev_core::{CollectionName, Object};
+use vellev_index::clustered::ClusteredIndex;
+use vellev_index::curve::Curve;
 use vellev_index::filter::{Filter, Predicate};
 use vellev_index::vector::{nearest, Scorer, VectorIndex};
 
@@ -280,6 +282,7 @@ fn candidates(
                 layer.dead,
                 &ties,
                 split,
+                probes_for(layer.curves, collection, clustered),
             )),
         },
         Vectors::Binary(binary) => Candidates {
@@ -291,6 +294,18 @@ fn candidates(
             estimated: None,
         },
     }
+}
+
+/// How many clusters `collection`'s clustered index scans in a layer: as
+/// the layer's curve for it says, where it has one that fits the index,
+/// else as the index was built to.
+fn probes_for(curves: &[(CollectionId, Curve)], collection: CollectionId, index: &ClusteredIndex) -> usize {
+    curves
+        .iter()
+        .find(|(of, _)| *of == collection)
+        .map(|(_, curve)| curve)
+        .filter(|curve| curve.fits(index.clusters()))
+        .map_or(index.probes(), Curve::probes)
 }
 
 /// The layer's live `row` scored exactly, if it has a vector.
@@ -341,6 +356,25 @@ mod tests {
             .collect()
     }
 
+    /// A layer's curve for a collection gives its probes where it fits
+    /// the index; otherwise, or without one, the index's own count.
+    #[test]
+    fn a_layers_curve_gives_its_probes_where_it_fits() {
+        let vectors: Vec<Vec<f32>> = (0..3_000u32)
+            .map(|n| (0..8).map(|d| ((n * 31 + d * 7) % 97) as f32 - 48.0).collect())
+            .collect();
+        let rows: Vec<(u32, &[f32])> = vectors.iter().enumerate().map(|(n, v)| (n as u32, v.as_slice())).collect();
+        let index = ClusteredIndex::build(vellev_core::Distance::Cosine, &rows).unwrap();
+        let clusters = index.clusters() as u32;
+        let deep = Curve::of(vellev_index::curve::Source::Rows, 1, clusters, vec![clusters - 1]).unwrap();
+        let other = Curve::of(vellev_index::curve::Source::Rows, 1, clusters + 1, vec![clusters]).unwrap();
+        let (mine, theirs) = (CollectionId(3), CollectionId(4));
+        assert_eq!(probes_for(&[(mine, deep.clone())], mine, &index), clusters as usize);
+        assert_eq!(probes_for(&[(theirs, deep)], mine, &index), index.probes(), "another collection's");
+        assert_eq!(probes_for(&[(mine, other)], mine, &index), index.probes(), "a curve of another index");
+        assert_eq!(probes_for(&[], mine, &index), index.probes());
+    }
+
     /// Rows estimated alike in two layers are cut in object id order
     /// across both, not layer by layer.
     #[test]
@@ -353,6 +387,7 @@ mod tests {
             deaths: 0,
             indexes: &indexes,
             vectors: None,
+            curves: &[],
         };
         let layers = [layer(&first), layer(&second)];
         let mut estimated: Vec<(f32, (usize, u32))> = [(0, 0), (0, 1), (1, 0), (1, 1)]
