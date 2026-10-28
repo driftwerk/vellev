@@ -23,9 +23,12 @@ pub const POINTS: usize = 101;
 /// asked must hold: recall's target (recall note, §10).
 pub const TARGET: f64 = 0.998;
 
-/// What a curve's samples were.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// What a curve's samples were. Written as a plain string, its name, and
+/// only ever a string: a later version that needs a source to carry more
+/// says it in named fields of [`Curve`], so that this one reads past them.
+/// Whatever is there that this version does not know, a name or a value
+/// that is not a string at all, is read as [`Source::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     /// Rows of the index itself, each asking for its nearest rows, as when
     /// the segment was built and before any question was asked: the
@@ -37,8 +40,43 @@ pub enum Source {
     /// A source this version does not know, written by a later one: read,
     /// so that the segment it belongs to is, but never used, so that the
     /// segment scans as its index was built to.
-    #[serde(other)]
     Unknown,
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Source::Rows => "rows",
+            Source::Queries => "queries",
+            Source::Unknown => "unknown",
+        }
+    }
+}
+
+impl Serialize for Source {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// A source as written: its name, or anything else, read past.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Name(String),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Written::deserialize(deserializer)? {
+            Written::Name(name) => match name.as_str() {
+                "rows" => Source::Rows,
+                "queries" => Source::Queries,
+                _ => Source::Unknown,
+            },
+            Written::Other(_) => Source::Unknown,
+        })
+    }
 }
 
 /// A segment's probe curve for one collection's clustered index.
