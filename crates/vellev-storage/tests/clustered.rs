@@ -459,7 +459,8 @@ async fn a_built_clustered_segment_keeps_the_curve_of_its_rows() {
     let (collection, clustered) = &stored.vectors[0];
     let curves = &segment.probes;
     assert_eq!(curves.len(), 1, "{curves:?}");
-    let (of, curve) = &curves[0];
+    let (of, curve) = (&curves[0].collection, &curves[0].curve);
+    assert_eq!(curves[0].band, 0);
     assert_eq!(of, collection);
     assert_eq!(curve.source, vellev_index::curve::Source::Rows);
     assert!(curve.fits(clustered.clusters()));
