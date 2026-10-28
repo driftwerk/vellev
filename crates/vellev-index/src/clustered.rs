@@ -1107,8 +1107,8 @@ impl ClusteredIndex {
                 }
                 nearest.estimates()
             };
-            let shortlists: Vec<Vec<(f32, u32)>> = crate::pool::reads()
-                .install(|| (0..runs).into_par_iter().map(scan_run).collect());
+            let shortlists: Vec<Vec<(f32, u32)>> =
+                crate::pool::reads().install(|| (0..runs).into_par_iter().map(scan_run).collect());
             for (distance, row) in shortlists.into_iter().flatten() {
                 if !nearest.turns_away(distance) {
                     nearest.offer(distance, row);

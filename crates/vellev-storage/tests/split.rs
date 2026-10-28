@@ -183,7 +183,9 @@ async fn a_split_search_finishes_while_the_build_pool_is_busy_and_counts_its_par
                 split: 4,
                 ..Query::nearest(&query, 10)
             };
-            state.search_counted(&name("notes"), &asked, &mut work).unwrap();
+            state
+                .search_counted(&name("notes"), &asked, &mut work)
+                .unwrap();
             work.split_parts
         });
         done.send(parts).unwrap();

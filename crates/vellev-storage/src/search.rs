@@ -124,21 +124,21 @@ impl State {
             true => {
                 let found: Vec<(Candidates, Work)> = vellev_index::pool::reads().install(|| {
                     layers
-                    .par_iter()
-                    .map(|layer| {
-                        let mut done = Work::default();
-                        let offered = candidates(
-                            layer,
-                            id,
-                            predicate.as_ref(),
-                            query.vector,
-                            budget,
-                            split,
-                            &mut done,
-                        );
-                        (offered, done)
-                    })
-                    .collect()
+                        .par_iter()
+                        .map(|layer| {
+                            let mut done = Work::default();
+                            let offered = candidates(
+                                layer,
+                                id,
+                                predicate.as_ref(),
+                                query.vector,
+                                budget,
+                                split,
+                                &mut done,
+                            );
+                            (offered, done)
+                        })
+                        .collect()
                 });
                 found
                     .into_iter()
