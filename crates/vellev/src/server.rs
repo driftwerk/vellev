@@ -62,6 +62,13 @@ pub struct Reading {
 }
 
 impl Reading {
+    /// How many parts this read may split its search into: see
+    /// [`crate::turns::split_for`].
+    #[doc(hidden)]
+    pub fn split(&self) -> usize {
+        self._turn.split()
+    }
+
     /// Run `work`, the read itself, off the async threads. The turn goes
     /// with it, to be kept until its thread is done with the read,
     /// whoever stops waiting for the answer first.
