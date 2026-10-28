@@ -1365,7 +1365,59 @@ mod tests {
         only: Option<&RoaringBitmap>,
         skipped: &[bool],
     ) -> Vec<(f32, u32)> {
-        index.scanned(&index.prepared(query), count, only, skipped, &in_row_order)
+        index.scanned(
+            &index.prepared(query),
+            count,
+            only,
+            skipped,
+            &in_row_order,
+            1,
+        )
+    }
+
+    /// What a shortlist of `count` says, as every caller reads it: its
+    /// nearest `count` by estimate, those alike in row order.
+    fn cut(mut found: Vec<(f32, u32)>, count: usize) -> Vec<(u32, u32)> {
+        found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        found.truncate(count);
+        found.iter().map(|(d, row)| (d.to_bits(), *row)).collect()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        /// A scan split into parts across threads finds what one scan
+        /// finds: the same nearest `count`, to the bit, for any number of
+        /// parts, filtered or not, and when too few rows are allowed in the
+        /// clusters it must probe and it scans on past them.
+        #[test]
+        fn a_scan_split_finds_what_one_scan_finds(
+            seed in 1u64..u64::MAX,
+            rows in 40usize..1500,
+            dimensions in 2usize..96,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+            count in 1usize..300,
+            share in proptest::option::of(proptest::prop_oneof![1u32..5, 5u32..100]),
+            parts in 2usize..9,
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let index = indexed(metric, &vectors);
+            let mut noise = Noise(seed.rotate_left(17) | 1);
+            let only: Option<RoaringBitmap> = share.map(|share| {
+                (0..rows as u32 * 2)
+                    .filter(|row| (row.wrapping_mul(2_654_435_761) >> 7) % 100 < share)
+                    .collect()
+            });
+            let skipped: Vec<bool> = (0..rows * 2).map(|row| row % 11 == 5).collect();
+            for _ in 0..4 {
+                let query = index.prepared(&noise.vector(dimensions));
+                let one = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, 1);
+                let split = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, parts);
+                proptest::prop_assert_eq!(cut(split, count), cut(one, count));
+            }
+        }
     }
 
     proptest::proptest! {
