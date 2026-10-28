@@ -597,3 +597,120 @@ async fn a_segment_from_before_curves_gets_the_curve_its_build_would_have_given(
         .read(|state| state.segments().cloned().collect());
     assert_eq!(kept[0].probes, built);
 }
+
+/// The clustered indexes a partition holds are counted one for each, by
+/// where their probes come from (recall note, R7): the curve of band 0 for
+/// the index's collection by its source, a curve of a source this version
+/// does not know as unknown, one of a known source that does not fit the
+/// index as unfit, and none at all as the index's own count. A curve of
+/// another band, or for a collection with no clustered index in the
+/// segment, counts for nothing, and neither does a segment with no index.
+#[tokio::test]
+async fn clustered_indexes_are_counted_one_each_by_where_their_probes_come_from() {
+    use vellev_index::curve::{Curve, Source};
+    use vellev_storage::format::{CollectionId, SegmentCurve};
+    use vellev_storage::{Probes, State};
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    writer
+        .commit(vec![row("notes", ROWS, vectors[0].clone())])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let segments = segments_of(&cluster).await;
+    assert_eq!(segments.len(), 2, "{segments:?}");
+    let segment = segments.iter().find(|s| s.index.is_some()).unwrap().clone();
+    assert!(segments.iter().any(|s| s.index.is_none()));
+    let built = segment.probes[0].clone();
+    let probes = |writer: &Writer| writer.partition().read(State::probes);
+    assert_eq!(
+        probes(&writer),
+        Probes {
+            rows: 1,
+            ..Probes::default()
+        }
+    );
+
+    let clusters = built.curve.clusters;
+    let curve = |source, clusters| SegmentCurve {
+        collection: built.collection,
+        band: 0,
+        curve: Curve::of(
+            source,
+            50,
+            clusters,
+            (0..500).map(|n| n % clusters).collect(),
+        )
+        .unwrap(),
+    };
+    let one = |field: fn(&mut Probes) -> &mut u64| {
+        let mut probes = Probes::default();
+        *field(&mut probes) = 1;
+        probes
+    };
+    for (what, given, counted) in [
+        (
+            "questions",
+            curve(Source::Queries, clusters),
+            one(|p| &mut p.queries),
+        ),
+        (
+            "unknown",
+            curve(Source::Unknown, clusters),
+            one(|p| &mut p.unknown),
+        ),
+        (
+            "unfit",
+            curve(Source::Rows, clusters + 1),
+            one(|p| &mut p.unfit),
+        ),
+    ] {
+        writer
+            .commit_curves(vec![(segment.key.clone(), given)])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(probes(&writer), counted, "a curve of {what}");
+    }
+
+    // The rows curve back, with one of another band and one for a
+    // collection the segment has no index of: still one index, of rows.
+    let elsewhere = SegmentCurve {
+        collection: CollectionId(built.collection.0 + 1),
+        ..built.clone()
+    };
+    let banded = SegmentCurve {
+        band: 2,
+        ..curve(Source::Queries, clusters)
+    };
+    writer
+        .commit_curves(vec![
+            (segment.key.clone(), built.clone()),
+            (segment.key.clone(), elsewhere),
+            (segment.key.clone(), banded),
+        ])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        segments_of(&cluster)
+            .await
+            .iter()
+            .map(|s| s.probes.len())
+            .sum::<usize>(),
+        3
+    );
+    assert_eq!(probes(&writer), one(|p| &mut p.rows));
+    drop(writer);
+
+    // Read as before curves: the index scans by its own count.
+    let (lease, committed) = cluster.lease().await;
+    let older: Arc<dyn Blobs> = Arc::new(Older {
+        inner: cluster.blobs.clone(),
+    });
+    let successor = Writer::open(older, cluster.coordinator.clone(), lease, &committed)
+        .await
+        .unwrap();
+    assert_eq!(probes(&successor), one(|p| &mut p.index));
+}

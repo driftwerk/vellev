@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
-use vellev_index::curve::Curve;
+use vellev_index::curve::{Curve, Source};
 
 use roaring::RoaringBitmap;
 use vellev_core::{
@@ -915,6 +915,35 @@ fn unfit_once(segment: &str, collection: CollectionId, curve: &Curve, clusters: 
     }
 }
 
+/// The clustered indexes of the segments held, one for each, by where
+/// their probes come from (recall note, R7): see [`State::probes`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Probes {
+    /// Scanning as the curve of the index's rows says.
+    pub rows: u64,
+    /// Scanning as the curve of questions asked of it says.
+    pub queries: u64,
+    /// With a curve of a source this version does not know, as a newer
+    /// version may write: scanning by the index's own count.
+    pub unknown: u64,
+    /// With a curve of a known source that does not fit the index, which
+    /// no version writes: scanning by the index's own count, and said.
+    pub unfit: u64,
+    /// With no curve, as a segment from before curves: scanning by the
+    /// index's own count until its rows pass.
+    pub index: u64,
+}
+
+impl std::ops::AddAssign for Probes {
+    fn add_assign(&mut self, other: Self) {
+        self.rows += other.rows;
+        self.queries += other.queries;
+        self.unknown += other.unknown;
+        self.unfit += other.unfit;
+        self.index += other.index;
+    }
+}
+
 /// A clustered index of a segment that has no curve for it: see
 /// [`State::curves_missing`].
 pub(crate) struct Missing {
@@ -1805,48 +1834,76 @@ impl State {
         Ok(Some(manifest))
     }
 
+    /// Each clustered index of the segments held, with the segment, its
+    /// collection, and the curve of band 0 its entry has for that
+    /// collection, if any.
+    fn clustered_curves(
+        &self,
+    ) -> impl Iterator<Item = (&Segment, CollectionId, &Arc<ClusteredIndex>, Option<&Curve>)> {
+        self.segments.iter().flat_map(|segment| {
+            segment
+                .indexes
+                .iter()
+                .filter_map(move |(collection, index)| match &index.vectors {
+                    Some(Vectors::Clustered(clustered)) => {
+                        let curve = segment
+                            .meta
+                            .probes
+                            .iter()
+                            .find(|entry| entry.collection == *collection && entry.band == 0)
+                            .map(|entry| &entry.curve);
+                        Some((segment, *collection, clustered, curve))
+                    }
+                    _ => None,
+                })
+        })
+    }
+
     /// Each clustered index of a segment whose entry has no curve of band 0
     /// for its collection, as a segment written before curves has none: the
     /// segment's key, the collection, the index, and the rows it indexes
     /// with their vectors, to make the curve its build would have from.
     pub(crate) fn curves_missing(&self) -> Vec<Missing> {
         let mut missing = Vec::new();
-        for segment in &self.segments {
-            for (collection, index) in segment.indexes.iter() {
-                let Some(Vectors::Clustered(clustered)) = &index.vectors else {
-                    continue;
-                };
-                let curve = segment
-                    .meta
-                    .probes
-                    .iter()
-                    .find(|entry| entry.collection == *collection && entry.band == 0);
-                if let Some(entry) = curve {
-                    // One of a source this version knows that does not fit
-                    // its index is not what any version writes: said, once.
-                    let known = entry.curve.source != vellev_index::curve::Source::Unknown;
-                    if known && !entry.curve.fits(clustered.clusters()) {
-                        unfit_once(
-                            &segment.meta.key,
-                            *collection,
-                            &entry.curve,
-                            clustered.clusters(),
-                        );
+        for (segment, collection, clustered, curve) in self.clustered_curves() {
+            match curve {
+                // One of a source this version knows that does not fit its
+                // index is not what any version writes: said, once.
+                Some(curve) => {
+                    if curve.source != Source::Unknown && !curve.fits(clustered.clusters()) {
+                        unfit_once(&segment.meta.key, collection, curve, clustered.clusters());
                     }
                 }
-                let has = curve.is_some();
-                if !has {
-                    missing.push(Missing {
-                        key: segment.meta.key.clone(),
-                        collection: *collection,
-                        index: clustered.clone(),
-                        file: segment.file.clone(),
-                        vectors: segment.vectors.clone(),
-                    });
-                }
+                None => missing.push(Missing {
+                    key: segment.meta.key.clone(),
+                    collection,
+                    index: clustered.clone(),
+                    file: segment.file.clone(),
+                    vectors: segment.vectors.clone(),
+                }),
             }
         }
         missing
+    }
+
+    /// The clustered indexes of the segments held, one for each, by where
+    /// their probes come from (recall note, R7), as a search finds them.
+    pub fn probes(&self) -> Probes {
+        let mut probes = Probes::default();
+        for (_, _, clustered, curve) in self.clustered_curves() {
+            let counted = match curve {
+                None => &mut probes.index,
+                Some(curve) if curve.source == Source::Unknown => &mut probes.unknown,
+                Some(curve) if !curve.fits(clustered.clusters()) => &mut probes.unfit,
+                Some(curve) => match curve.source {
+                    Source::Rows => &mut probes.rows,
+                    Source::Queries => &mut probes.queries,
+                    Source::Unknown => &mut probes.unknown,
+                },
+            };
+            *counted += 1;
+        }
+        probes
     }
 
     /// Carry out a committed commit of `curves`: the segments named hold

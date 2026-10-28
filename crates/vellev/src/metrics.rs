@@ -294,7 +294,7 @@ impl Collector for Counted {
         let gauge = ConstGauge::new(0i64);
         let mut family = encoder.encode_descriptor(
             "segment_probes",
-            "Clustered indexes of the segments the tenants this node writes hold, by where their probes come from: a curve of the index's rows, one of questions asked, a curve of a source this version does not know (scanning by the index's own count), or no curve at all (a segment from before curves, scanning by its index's own count until its rows pass)",
+            "Clustered indexes of the segments the tenants this node writes hold, one for each, by where their probes come from: a curve of the index's rows, one of questions asked, a curve of a source this version does not know (scanning by the index's own count), a curve of a known source that does not fit its index (corruption or a bug, scanning by the index's own count), or no curve at all (a segment from before curves, scanning by its index's own count until its rows pass)",
             None,
             gauge.metric_type(),
         )?;
@@ -302,6 +302,7 @@ impl Collector for Counted {
             ("rows", held.probes.rows),
             ("queries", held.probes.queries),
             ("unknown", held.probes.unknown),
+            ("unfit", held.probes.unfit),
             ("index", held.probes.index),
         ] {
             ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX))

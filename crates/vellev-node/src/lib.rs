@@ -1272,17 +1272,7 @@ pub struct Segments {
     pub probes: Probes,
 }
 
-/// The clustered indexes of the segments held, by where their probes come
-/// from (recall note, R7): each band-0 curve by its source, and a clustered
-/// segment with none, as one from before curves, as scanning by its
-/// index's own count until its rows pass.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Probes {
-    pub rows: u64,
-    pub queries: u64,
-    pub unknown: u64,
-    pub index: u64,
-}
+pub use vellev_storage::Probes;
 
 impl Segments {
     fn add(&mut self, meta: &vellev_storage::format::SegmentMeta) {
@@ -1290,21 +1280,6 @@ impl Segments {
             true => {
                 self.clustered += 1;
                 self.clustered_rows += meta.rows;
-                let mut curves = meta
-                    .probes
-                    .iter()
-                    .filter(|entry| entry.band == 0)
-                    .peekable();
-                if curves.peek().is_none() {
-                    self.probes.index += 1;
-                }
-                for entry in curves {
-                    match entry.curve.source {
-                        vellev_storage::curve::Source::Rows => self.probes.rows += 1,
-                        vellev_storage::curve::Source::Queries => self.probes.queries += 1,
-                        vellev_storage::curve::Source::Unknown => self.probes.unknown += 1,
-                    }
-                }
             }
             false => {
                 self.plain += 1;
@@ -1547,7 +1522,10 @@ impl Node {
         let mut segments = Segments::default();
         for held in self.0.held_now() {
             if let Kind::Writer(_, tenant) = &held.kind {
-                tenant.read(|state| state.segments().for_each(|meta| segments.add(meta)));
+                tenant.read(|state| {
+                    state.segments().for_each(|meta| segments.add(meta));
+                    segments.probes += state.probes();
+                });
             }
         }
         segments
@@ -2256,49 +2234,7 @@ mod segment_tests {
                 clustered_rows: 800_000,
                 plain: 2,
                 plain_rows: 250_000,
-                probes: Probes {
-                    index: 1,
-                    ..Probes::default()
-                },
-            }
-        );
-    }
-
-    /// The clustered indexes of the segments held are counted by where
-    /// their probes come from: each band-0 curve by its source, and a
-    /// clustered segment with none as scanning by its index's own count.
-    #[test]
-    fn clustered_indexes_are_counted_by_where_their_probes_come_from() {
-        use vellev_storage::curve::{Curve, Source};
-        use vellev_storage::format::{CollectionId, SegmentCurve};
-        let curve = |source, collection, band| SegmentCurve {
-            collection: CollectionId(collection),
-            band,
-            curve: Curve::of(source, 1, 10, vec![3]).unwrap(),
-        };
-        let mut segments = Segments::default();
-        let mut rows = meta(900_000, true);
-        rows.probes = vec![curve(Source::Rows, 1, 0), curve(Source::Rows, 1, 2)];
-        let mut queries = meta(700_000, true);
-        queries.probes = vec![curve(Source::Queries, 1, 0), curve(Source::Rows, 2, 0)];
-        let mut unknown = meta(600_000, true);
-        unknown.probes = vec![curve(Source::Unknown, 1, 0)];
-        for meta in [
-            rows,
-            queries,
-            unknown,
-            meta(500_000, true),
-            meta(10_000, false),
-        ] {
-            segments.add(&meta);
-        }
-        assert_eq!(
-            segments.probes,
-            Probes {
-                rows: 2,
-                queries: 1,
-                unknown: 1,
-                index: 1,
+                probes: Probes::default(),
             }
         );
     }
