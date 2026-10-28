@@ -7,7 +7,10 @@
 /// is set, else as many as the machine runs at once.
 #[test]
 fn the_read_pool_is_sized_as_the_global_pool_whoever_asks_first() {
-    let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let one = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
     let sized = one.install(|| vellev_index::pool::reads().current_num_threads());
     let global = std::env::var("RAYON_NUM_THREADS")
         .ok()
@@ -15,5 +18,9 @@ fn the_read_pool_is_sized_as_the_global_pool_whoever_asks_first() {
         .filter(|threads| *threads > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     assert_eq!(sized, global);
-    assert_eq!(rayon::current_num_threads(), global, "as rayon's own global pool");
+    assert_eq!(
+        rayon::current_num_threads(),
+        global,
+        "as rayon's own global pool"
+    );
 }
