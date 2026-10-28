@@ -275,7 +275,7 @@ pub(crate) fn as_far_from_every_vector(metric: Distance, query: &[f32]) -> bool 
 }
 
 /// How to order two rows whose estimated distances are equal.
-pub type Ties<'a> = &'a dyn Fn(u32, u32) -> Ordering;
+pub type Ties<'a> = &'a (dyn Fn(u32, u32) -> Ordering + Sync);
 
 /// Rows of equal estimate in row order, for a caller with no order of its
 /// own.
