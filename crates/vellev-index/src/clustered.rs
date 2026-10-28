@@ -1380,6 +1380,33 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        /// A row's place in the index is found by its table as a search of
+        /// the sorted rows finds it, for rows indexed, rows between them and
+        /// rows past the last, built or read back.
+        #[test]
+        fn a_rows_place_is_found_as_by_searching_the_rows(
+            seed in 1u64..u64::MAX,
+            rows in 1usize..900,
+            dimensions in 2usize..40,
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let built = indexed(Distance::Cosine, &vectors);
+            let read: ClusteredIndex =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
+            for index in [&built, &read] {
+                for row in 0..rows as u32 * 2 + 9 {
+                    proptest::prop_assert_eq!(index.position(row), index.rows.binary_search(&row).ok());
+                }
+                proptest::prop_assert_eq!(index.position(u32::MAX), None);
+            }
+        }
+    }
+
     /// What a shortlist of `count` says, as every caller reads it: its
     /// nearest `count` by estimate, those alike in row order.
     fn cut(mut found: Vec<(f32, u32)>, count: usize) -> Vec<(u32, u32)> {
