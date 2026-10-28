@@ -133,3 +133,64 @@ async fn a_search_split_across_threads_finds_what_one_search_finds() {
         }
     });
 }
+
+/// A split search runs its parts on the read pool, so that it finishes
+/// while every thread of rayon's global pool, where flushes and merges
+/// build indexes, is busy; and it says how many parts it was split into.
+#[tokio::test]
+async fn a_split_search_finishes_while_the_build_pool_is_busy_and_counts_its_parts() {
+    let cluster = Cluster::new().await;
+    let writer = cluster.writer().await.merging_with(Merging {
+        clustered_above: 4_000,
+        ..Merging::default()
+    });
+    writer.commit(vec![wide("notes")]).await.unwrap();
+    let mut random = Random(5);
+    let mut n = 0u32;
+    for _ in 0..4 {
+        for _ in 0..4 {
+            let writes = (0..300).map(|_| {
+                n += 1;
+                row(n, random.vector(DIMENSIONS))
+            });
+            writer.commit(writes.collect()).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+    }
+    writer.merge().await.unwrap().expect("four segments merge");
+    let partition = writer.partition().clone();
+    let query = Random(77).vector(DIMENSIONS);
+
+    // Every thread of the global pool held until let go.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Arc::new(std::sync::Mutex::new(held));
+    let (started, busy) = std::sync::mpsc::channel::<()>();
+    for _ in 0..rayon::current_num_threads() {
+        let (held, started) = (held.clone(), started.clone());
+        rayon::spawn(move || {
+            started.send(()).unwrap();
+            let _ = held.lock().unwrap().recv();
+        });
+    }
+    for _ in 0..rayon::current_num_threads() {
+        busy.recv().unwrap();
+    }
+    let (done, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let parts = partition.read(|state| {
+            let mut work = vellev_storage::Work::default();
+            let asked = Query {
+                split: 4,
+                ..Query::nearest(&query, 10)
+            };
+            state.search_counted(&name("notes"), &asked, &mut work).unwrap();
+            work.split_parts
+        });
+        done.send(parts).unwrap();
+    });
+    let answer = answered.recv_timeout(std::time::Duration::from_secs(20));
+    for _ in 0..rayon::current_num_threads() {
+        release.send(()).unwrap();
+    }
+    assert_eq!(answer, Ok(4), "the split search finished, in 4 parts");
+}
