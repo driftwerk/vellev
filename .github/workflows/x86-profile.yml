@@ -1,0 +1,73 @@
+name: IVF profile (scratch)
+
+on:
+  push:
+    branches: [scratch-x86-profile]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  FIXTURE: fixture-bench-wiki1m-bge-base-v1
+
+jobs:
+  profile:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.runner }}
+      - name: Build, baseline and native
+        run: |
+          cargo build --release --locked -p vellev-index --example ivf_profile
+          cp target/release/examples/ivf_profile "$RUNNER_TEMP/baseline"
+          RUSTFLAGS="-C target-cpu=native" cargo build --release --locked -p vellev-index --example ivf_profile --target-dir target-native
+          cp target-native/release/examples/ivf_profile "$RUNNER_TEMP/native"
+          cargo test --release --locked -p vellev-index --lib the_way_chosen -- --nocapture
+      - name: Fetch the fixture's vectors
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/download" "$F/vectors"
+          cd "$F/download"
+          for asset in vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+            grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> wanted.sha256
+          done
+          sha256sum --check --strict wanted.sha256
+          for part in vectors-*.tar.zst; do
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
+            rm "$part"
+          done
+      - name: CPU
+        run: lscpu | grep -E "Model name|^CPU\(s\)|L2 cache|L3 cache|Flags" | cut -c1-400
+      - name: Timings, baseline and native, twice
+        run: |
+          for side in baseline native baseline native; do echo "== $side"; "$RUNNER_TEMP/$side" "$RUNNER_TEMP/fixture" 912500 560; done
+      - name: Profile (perf, native build)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" > /dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure > /dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); [ -n "$PERF" ] || PERF=perf
+          $PERF --version || { echo "no perf"; exit 0; }
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          PROFILE_SECS=25 "$RUNNER_TEMP/native" "$RUNNER_TEMP/fixture" 912500 560 > run.log 2>&1 &
+          pid=$!
+          until grep -q profiling run.log; do sleep 1; done
+          $PERF record -F 2999 -g -p $pid -o perf.data -- sleep 20 2>&1 | tail -2
+          wait $pid; cat run.log | tail -2
+          echo "### by symbol"
+          $PERF report -i perf.data --no-children --sort symbol --stdio --percent-limit 0.5 2>/dev/null | grep -v "^$" | grep -v "^#" | grep "%" | head -40
+          echo "### by source line (top)"
+          $PERF report -i perf.data --no-children --sort srcline --stdio --percent-limit 0.8 2>/dev/null | grep "%" | head -60
