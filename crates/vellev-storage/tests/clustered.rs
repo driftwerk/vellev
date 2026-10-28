@@ -490,10 +490,19 @@ async fn curves_committed_for_a_segment_are_kept_and_a_replaced_one_gets_none() 
     let asked = SegmentCurve {
         collection: built.collection,
         band: 0,
-        curve: Curve::of(Source::Queries, 50, clusters, (0..500).map(|n| n % clusters).collect()).unwrap(),
+        curve: Curve::of(
+            Source::Queries,
+            50,
+            clusters,
+            (0..500).map(|n| n % clusters).collect(),
+        )
+        .unwrap(),
     };
     // One row more in the memtable, flushed along with the commit.
-    writer.commit(vec![row("notes", ROWS, vectors[0].clone())]).await.unwrap();
+    writer
+        .commit(vec![row("notes", ROWS, vectors[0].clone())])
+        .await
+        .unwrap();
     let committed = writer
         .commit_curves(vec![(segment.key.clone(), asked.clone())])
         .await
@@ -502,9 +511,15 @@ async fn curves_committed_for_a_segment_are_kept_and_a_replaced_one_gets_none() 
     let kept = segments_of(&cluster).await;
     assert_eq!(kept.len(), 2, "the memtable was flushed along: {kept:?}");
     assert_eq!(kept[0].key, segment.key);
-    assert_eq!(kept[0].probes, vec![asked.clone()], "the queries curve replaces the rows one");
+    assert_eq!(
+        kept[0].probes,
+        vec![asked.clone()],
+        "the queries curve replaces the rows one"
+    );
     let follower = cluster.open().await;
-    let read: Vec<SegmentMeta> = follower.partition().read(|state| state.segments().cloned().collect());
+    let read: Vec<SegmentMeta> = follower
+        .partition()
+        .read(|state| state.segments().cloned().collect());
     assert_eq!(read[0].probes, vec![asked.clone()], "every node reads it");
 
     // A curve for a segment no longer there: nothing committed.
@@ -513,4 +528,62 @@ async fn curves_committed_for_a_segment_are_kept_and_a_replaced_one_gets_none() 
         .await
         .unwrap();
     assert_eq!(gone, None);
+}
+
+/// Blobs as a node of a version before curves would leave them: every
+/// manifest read with its segments' curves left out.
+#[derive(Debug)]
+struct Older {
+    inner: Arc<dyn Blobs>,
+}
+
+#[async_trait::async_trait]
+impl Blobs for Older {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        let bytes = self.inner.get(key).await?;
+        if !key.ends_with(".manifest") {
+            return Ok(bytes);
+        }
+        let mut manifest: Manifest = format::decode(key, Kind::Manifest, &bytes)?;
+        manifest.segments.iter_mut().for_each(|segment| segment.probes.clear());
+        format::encode(Kind::Manifest, &manifest)
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A segment from before curves, its index read back from its file, gets
+/// the very curve its build would have given, by a pass over its rows; a
+/// segment that has its curve gets nothing.
+#[tokio::test]
+async fn a_segment_from_before_curves_gets_the_curve_its_build_would_have_given() {
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let built = segments_of(&cluster).await[0].probes.clone();
+    assert_eq!(built.len(), 1);
+    assert_eq!(writer.rows_pass().await.unwrap(), None, "nothing missing");
+    drop(writer);
+
+    let (lease, committed) = cluster.lease().await;
+    let older: Arc<dyn Blobs> = Arc::new(Older {
+        inner: cluster.blobs.clone(),
+    });
+    let successor = Writer::open(older, cluster.coordinator.clone(), lease, &committed)
+        .await
+        .unwrap();
+    let seen: Vec<SegmentMeta> = successor.partition().read(|state| state.segments().cloned().collect());
+    assert!(seen[0].probes.is_empty(), "read as before curves");
+    assert!(successor.rows_pass().await.unwrap().is_some());
+    let after = segments_of(&cluster).await;
+    assert_eq!(after[0].probes, built, "the curve its build gave");
+    let kept: Vec<SegmentMeta> = successor.partition().read(|state| state.segments().cloned().collect());
+    assert_eq!(kept[0].probes, built);
 }

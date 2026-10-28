@@ -23,7 +23,7 @@ use crate::coordinator::{
 use crate::draft::{Draft, Wanted};
 use crate::format::{
     decode, decode_head, encode, encode_as, rekeyed_index, Answer, Answered, Came, Coming, Framed,
-    Head, Kind, LogSegment, Manifest, Op, SegmentFile, SegmentIndex, SegmentMeta,
+    Head, Kind, LogSegment, Manifest, Op, SegmentCurve, SegmentFile, SegmentIndex, SegmentMeta,
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
@@ -2317,6 +2317,53 @@ impl Writer {
     /// commits go on; a row that dies meanwhile is dead in the new segment
     /// too. Returns the checkpoint's position, or `None` when there was
     /// nothing to merge.
+    /// Commit `curves`, each for the segment its key names (recall note,
+    /// R7 and R9.2): a checkpoint at the next position, as a merge commits
+    /// one, the memtable flushed along, every segment as it is but those
+    /// named, which hold their new curves. Only what holds the building
+    /// lock replaces segments, and this holds it too, so a curve made for a
+    /// segment that a merge has replaced since is not committed, and a
+    /// merge after keeps the curves of the segments it does not replace.
+    /// Returns the position committed, or None if no segment named is still
+    /// there.
+    pub async fn commit_curves(
+        &self,
+        curves: Vec<(String, SegmentCurve)>,
+    ) -> Result<Option<LogPosition>> {
+        let _building = self.building.lock().await;
+        let there: HashSet<String> = self
+            .partition
+            .read(|state| state.segments().map(|meta| meta.key.clone()).collect());
+        let curves: Vec<(String, SegmentCurve)> = curves
+            .into_iter()
+            .filter(|(key, _)| there.contains(key))
+            .collect();
+        if curves.is_empty() {
+            return Ok(None);
+        }
+        let mut staged = self.staging();
+        let snapshot = self.partition.read(State::taken);
+        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let turn = self.turn().await?;
+        let position = following(self.partition.read(State::position))?;
+        let key = Layout(&self.lease.key).manifest(position, &self.author);
+        let Some(manifest) = self
+            .partition
+            .read(|state| state.tuned_manifest(position, &snapshot, segment.as_ref(), &curves))?
+        else {
+            return Ok(None);
+        };
+        let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
+        staged.keep();
+        let kept = self.partition.read(|state| state.kept(&snapshot));
+        self.checkpoint(turn, &key, frame, position, |state| {
+            state.tuned(&curves);
+            state.flushed(&key, position, snapshot, segment, Some(kept))
+        })
+        .await?;
+        Ok(Some(position))
+    }
+
     pub async fn merge(&self) -> Result<Option<LogPosition>> {
         let _building = self.building.lock().await;
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {

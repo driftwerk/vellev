@@ -892,6 +892,22 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
     }
 }
 
+/// `meta` holding the curves of `curves` named for it, each in place of any
+/// of the same collection and band, the curves in collection and band
+/// order.
+fn with_curves(meta: &mut SegmentMeta, curves: &[(String, SegmentCurve)]) {
+    for (key, entry) in curves {
+        if *key != meta.key {
+            continue;
+        }
+        meta.probes
+            .retain(|kept| (kept.collection, kept.band) != (entry.collection, entry.band));
+        meta.probes.push(entry.clone());
+    }
+    meta.probes
+        .sort_by_key(|entry| (entry.collection, entry.band));
+}
+
 /// The curves of the rows each clustered index among `indexes` was tuned
 /// on when built, as the segment's manifest entry keeps them (recall note,
 /// R7): none for an index read back from a file.
@@ -1709,6 +1725,39 @@ impl State {
         let mut manifest = self.flushed_manifest(position, snapshot, flushed)?;
         manifest.segments.splice(merge.run.clone(), [merged]);
         Ok(Some(manifest))
+    }
+
+    /// The manifest a commit of `curves` makes at `position`: as a flush
+    /// built from `snapshot` commits (see [`Self::flushed_manifest`]), each
+    /// segment named in `curves` holding its curve in place of any of the
+    /// same collection and band. None if no segment named is still there,
+    /// as a merge may have replaced it since the curve was made: then there
+    /// is nothing to commit.
+    pub(crate) fn tuned_manifest(
+        &self,
+        position: LogPosition,
+        snapshot: &Snapshot,
+        flushed: Option<&Fit>,
+        curves: &[(String, SegmentCurve)],
+    ) -> Result<Option<Manifest>> {
+        let there = |key: &str| self.segments.iter().any(|segment| segment.meta.key == key);
+        if !curves.iter().any(|(key, _)| there(key)) {
+            return Ok(None);
+        }
+        let mut manifest = self.flushed_manifest(position, snapshot, flushed)?;
+        for meta in &mut manifest.segments {
+            with_curves(meta, curves);
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Carry out a committed commit of `curves`: the segments named hold
+    /// them. The flush committed with it is adopted after, by
+    /// [`Self::flushed`].
+    pub(crate) fn tuned(&mut self, curves: &[(String, SegmentCurve)]) {
+        for segment in &mut self.segments {
+            with_curves(&mut segment.meta, curves);
+        }
     }
 
     /// Carry out a committed merge: the run's segments go, and the merged
