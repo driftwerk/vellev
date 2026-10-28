@@ -46,7 +46,7 @@ jobs:
           scripts/bench-gate/needed-test.sh
           if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
             answer=needed
-          elif git rev-parse --verify -q HEAD^2 > /dev/null && changed="$(git diff --name-only HEAD^1 HEAD)"; then
+          elif git rev-parse --verify -q HEAD^2 > /dev/null && changed="$(scripts/bench-gate/changed.sh HEAD^1 HEAD)"; then
             answer="$(printf '%s\n' "$changed" | scripts/bench-gate/needed.sh)"
           else
             echo "the change's paths could not be listed: the gate runs"
@@ -131,7 +131,7 @@ jobs:
           scripts/bench-gate/needed-test.sh
           if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
             answer=needed
-          elif git rev-parse --verify -q HEAD^2 > /dev/null && changed="$(git diff --name-only HEAD^1 HEAD)"; then
+          elif git rev-parse --verify -q HEAD^2 > /dev/null && changed="$(scripts/bench-gate/changed.sh HEAD^1 HEAD)"; then
             answer="$(printf '%s\n' "$changed" | scripts/bench-gate/needed.sh)"
           else
             echo "the change's paths could not be listed: the gate runs"
