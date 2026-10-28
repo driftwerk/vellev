@@ -122,7 +122,21 @@ fn main() {
                 .map(|c| sizes[*c as usize])
                 .sum::<usize>();
             let started = Instant::now();
-            std::hint::black_box(probing.estimates(q, 1280, None, &skipped, &in_row_order));
+            let short = probing.estimates(q, 1280, None, &skipped, &in_row_order);
+            // Rescored exactly, as the storage layer does: every
+            // shortlisted row's vector read and scored, the nearest ten kept.
+            let mut scored: Vec<(f32, u32)> = short
+                .iter()
+                .map(|(_, row)| {
+                    (
+                        distance(Distance::Cosine, q, &all[*row as usize * d..][..d]),
+                        *row,
+                    )
+                })
+                .collect();
+            let nth = 9.min(scored.len().saturating_sub(1));
+            scored.select_nth_unstable_by(nth, |a, b| a.0.total_cmp(&b.0));
+            std::hint::black_box(&scored[..10.min(scored.len())]);
             took.push(started.elapsed().as_secs_f64() * 1e3);
         }
         took.sort_by(f64::total_cmp);
