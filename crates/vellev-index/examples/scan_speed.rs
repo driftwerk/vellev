@@ -84,6 +84,45 @@ fn main() {
             }
         }
         took.sort_by(f64::total_cmp);
+        // Saturated: `threads` threads each asking the questions in turn at
+        // once, so every core is busy: throughput, and each query's time
+        // while all compete for memory.
+        let threads: usize = std::env::var("SCRATCH_THREADS")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(3);
+        let started = Instant::now();
+        let mut busy: Vec<f64> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let index = &index;
+                    let queries = &queries;
+                    let skipped = &skipped;
+                    scope.spawn(move || {
+                        let mut took = Vec::new();
+                        for q in queries.iter().cycle().skip(t * 97).take(queries.len()) {
+                            let at = Instant::now();
+                            let found = index.estimates(q, 1280, None, skipped, &in_row_order);
+                            std::hint::black_box(found);
+                            took.push(at.elapsed().as_secs_f64() * 1e3);
+                        }
+                        took
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let wall = started.elapsed().as_secs_f64();
+        busy.sort_by(f64::total_cmp);
+        println!(
+            "probes {p}, {threads} threads saturated: {:.0} queries a second, each p50 {:.2} ms p99 {:.2} ms",
+            busy.len() as f64 / wall,
+            busy[busy.len() / 2],
+            busy[busy.len() * 99 / 100]
+        );
         let mean = took.iter().sum::<f64>() / took.len() as f64;
         println!(
             "probes {p}: mean {mean:.2} ms, p50 {:.2} ms, p99 {:.2} ms, {:.1} ns a code (checksum {sum:x})",
