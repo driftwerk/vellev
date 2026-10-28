@@ -580,6 +580,19 @@ impl<'a> Nearest<'a> {
         self.heap.len() >= self.count
     }
 
+    /// Whether [`Self::offer`] would turn `distance` away at a look: the
+    /// shortlist full and `distance` farther than the farthest kept. A long
+    /// scan asks this of most rows, inline, before offering any.
+    #[inline(always)]
+    fn turns_away(&self, distance: f32) -> bool {
+        let distance = or_farthest(distance);
+        self.heap.len() >= self.count
+            && self
+                .heap
+                .peek()
+                .is_some_and(|worst| distance.total_cmp(&worst.distance).is_gt())
+    }
+
     /// The nearest `count`, those as far as the farthest of them taken in
     /// `ties` order.
     fn estimates(self) -> Vec<(f32, u32)> {
@@ -1031,7 +1044,9 @@ impl ClusteredIndex {
                             weighed[lane],
                             &members.factors[index],
                         );
-                        nearest.offer(distance, *row);
+                        if !nearest.turns_away(distance) {
+                            nearest.offer(distance, *row);
+                        }
                     }
                 }
             }
