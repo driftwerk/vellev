@@ -70,6 +70,12 @@ and say what the caller then answers for.
 
 ### What a node answers
 
+- **A tenant's clustered vector indexes now count in what it is
+  reckoned to take in memory**, about 150 MB a million 768-dimension
+  rows indexed, where they were left out. With `VELLEV_MEMORY_MB`
+  unchanged, a node holding large tenants lets the least recently used
+  go sooner than before; raise it by that much for each million such
+  rows if the node has the memory to spare.
 - **A new code, `model_unavailable` (501)**, where a node used to answer
   `unavailable` (503): it cannot use the collection's embedding model as
   it is set up, and will not until someone puts that right. Nothing was

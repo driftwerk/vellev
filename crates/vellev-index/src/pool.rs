@@ -26,12 +26,12 @@ pub fn reads() -> &'static ThreadPool {
     })
 }
 
-/// The pool tuning runs on: one thread of its own (recall note, R2.6 and
-/// R9.5). Tuning is a pass over a segment's vectors for every sample,
-/// tens of seconds a million rows; on the global pool it took every core
-/// for that long, at each merge and, after an upgrade, segment after
-/// segment, and reads waited. On one thread it takes longer and leaves
-/// the rest to reads, flushes and merges.
+/// The pool a build's tuning runs on: one thread of its own (recall note,
+/// R2.6). Tuning is a pass over a segment's vectors for every sample, tens
+/// of seconds a million rows; on the global pool it took every core for
+/// that long at each merge, and reads waited. On one thread it takes
+/// longer and leaves the rest to reads, flushes and merges. A rows pass,
+/// the same work for a segment from before curves, has [`passes`].
 pub fn tuning() -> &'static ThreadPool {
     static TUNING: OnceLock<ThreadPool> = OnceLock::new();
     TUNING.get_or_init(|| {
@@ -43,8 +43,18 @@ pub fn tuning() -> &'static ThreadPool {
     })
 }
 
-/// The pool a rows pass makes its curve on (recall note, R9.5): for now
-/// the tuning pool itself, so that a merge's tuning waits behind a pass.
+/// The pool a rows pass makes its curve on (recall note, R9.5): one
+/// thread of its own, apart from the tuning pool, so that a merge's own
+/// tuning never waits behind the passes an upgrade makes, segment after
+/// segment, each tens of seconds a million rows. At most one pass runs on
+/// a node at a time, so tuning and passes take two threads at the most.
 pub fn passes() -> &'static ThreadPool {
-    tuning()
+    static PASSES: OnceLock<ThreadPool> = OnceLock::new();
+    PASSES.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "vellev-pass".to_string())
+            .build()
+            .expect("the rows passes' pool's thread")
+    })
 }

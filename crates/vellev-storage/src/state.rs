@@ -1040,10 +1040,6 @@ impl State {
         self.checkpoint.as_deref()
     }
 
-    /// About how many bytes the state takes in memory: its rows, what
-    /// indexes them, and whatever vectors are held in memory rather than
-    /// read in place from local files. Rough, and cheap to ask: each part
-    /// is counted as it is made.
     /// About how many bytes the segments' vector indexes take: counted in
     /// [`Self::resident`].
     pub fn indexes_resident(&self) -> usize {
@@ -1053,6 +1049,10 @@ impl State {
             .sum()
     }
 
+    /// About how many bytes the state takes in memory: its rows, what
+    /// indexes them, and whatever vectors are held in memory rather than
+    /// read in place from local files. Rough, and cheap to ask: each part
+    /// is counted as it is made.
     pub fn resident(&self) -> usize {
         let segments: usize = self.segments.iter().map(|segment| segment.resident).sum();
         let codes: usize = self
