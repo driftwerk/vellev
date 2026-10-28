@@ -74,11 +74,42 @@ pub const BACKGROUND_NICE: i32 = 10;
 /// refuses, as the thread then runs as it would have.
 fn lowered() {
     #[cfg(target_os = "linux")]
-    // SAFETY: gettid, getpriority and setpriority take and give plain
-    // numbers, and touch no memory of ours.
-    unsafe {
-        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-        let now = libc::getpriority(libc::PRIO_PROCESS, tid);
-        libc::setpriority(libc::PRIO_PROCESS, tid, (now + BACKGROUND_NICE).min(19));
+    {
+        let tid = this_thread();
+        if let Some(now) = priority_of(tid) {
+            // SAFETY: setpriority takes and gives plain numbers.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, tid, (now + BACKGROUND_NICE).min(19));
+            }
+        }
+    }
+}
+
+/// The calling thread's id, as Linux's priorities name it.
+#[cfg(target_os = "linux")]
+fn this_thread() -> libc::id_t {
+    // SAFETY: gettid takes nothing and gives a number.
+    unsafe { libc::syscall(libc::SYS_gettid) as libc::id_t }
+}
+
+/// The priority of thread `tid`, if Linux says.
+#[cfg(target_os = "linux")]
+fn priority_of(tid: libc::id_t) -> Option<i32> {
+    // SAFETY: getpriority takes and gives plain numbers.
+    Some(unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// A priority is told only when Linux tells one: -1 is a priority as
+    /// well as getpriority's answer when it fails, so a thread that is
+    /// not there has none, where it used to have -1.
+    #[test]
+    fn a_priority_is_told_only_when_linux_tells_one() {
+        assert!(priority_of(this_thread()).is_some());
+        let none = libc::id_t::try_from(i32::MAX).unwrap();
+        assert_eq!(priority_of(none), None);
     }
 }
