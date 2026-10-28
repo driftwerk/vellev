@@ -423,6 +423,28 @@ mod tests {
         }
     }
 
+    /// The widest code with every bit set, against a query at the top level
+    /// in every dimension, sums past what 16 bits hold: 8,192 × 15 =
+    /// 122,880 a row. Every way gives it whole, carrying its 16-bit sums
+    /// into 32 bits before they overflow. Random codes and levels, as
+    /// above, stay far below 2¹⁶ and never show a missing carry.
+    #[test]
+    fn every_way_carries_the_widest_codes_full_sums() {
+        let (words, rows) = (128, 40);
+        let codes = vec![u64::MAX; rows * words];
+        let levels = vec![15u8; words * 64];
+        let blocks = Blocks::new(&codes, words);
+        let tables = Tables::new(&levels);
+        for (name, weigh) in ways_here() {
+            for block in 0..blocks.count() {
+                let mut weighed = [0u32; BLOCK];
+                weigh(blocks.block(block), &tables, &mut weighed);
+                let lanes = (rows - block * BLOCK).min(BLOCK);
+                assert_eq!(&weighed[..lanes], &vec![122_880u32; lanes][..], "{name}");
+            }
+        }
+    }
+
     /// The way chosen for this machine is the widest it has.
     #[test]
     fn the_way_chosen_is_the_widest_this_machine_has() {
