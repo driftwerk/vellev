@@ -38,6 +38,7 @@ pub fn tuning() -> &'static ThreadPool {
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-tune".to_string())
+            .start_handler(|_| lowered())
             .build()
             .expect("the tuning pool's thread")
     })
@@ -54,7 +55,21 @@ pub fn passes() -> &'static ThreadPool {
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-pass".to_string())
+            .start_handler(|_| lowered())
             .build()
             .expect("the rows passes' pool's thread")
     })
 }
+
+/// How far below the rest of the process the background pools' threads
+/// run, tuning's and the rows passes': on Linux, where a thread has a
+/// priority of its own, so that on a small box they yield the CPU to reads
+/// while reads want it and take it back when they do not (measured for
+/// builds in #150: reads during a build at nice 10 about twice as fast,
+/// the build no slower).
+pub const BACKGROUND_NICE: i32 = 10;
+
+/// Lower the calling thread's priority by [`BACKGROUND_NICE`], from where
+/// the process runs, to 19 at the most. Nothing elsewhere, nor if Linux
+/// refuses, as the thread then runs as it would have.
+fn lowered() {}
