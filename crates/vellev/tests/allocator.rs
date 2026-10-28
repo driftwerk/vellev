@@ -124,3 +124,26 @@ fn memory_freed_among_what_is_kept_is_given_back() {
     );
     drop(kept);
 }
+
+/// Scratch: what printing one panic's backtrace keeps allocated once the
+/// backtrace itself is dropped.
+#[cfg(target_os = "linux")]
+#[test]
+fn scratch_backtrace_cost() {
+    let allocated = || {
+        let _ = tikv_jemalloc_ctl::epoch::advance();
+        tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) >> 20
+    };
+    let before = allocated();
+    let text = std::backtrace::Backtrace::force_capture().to_string();
+    let lines = text.lines().count();
+    let during = allocated();
+    drop(text);
+    let after = allocated();
+    let again = std::backtrace::Backtrace::force_capture().to_string();
+    let second = allocated();
+    drop(again);
+    println!(
+        "scratch backtrace: allocated {before} MiB before, {during} MiB with a {lines}-line backtrace printed, {after} MiB once it is dropped, {second} MiB after a second"
+    );
+}

@@ -32,3 +32,7 @@ jobs:
       - name: RUST_BACKTRACE=1, the nm test alone first in the same process is impossible; run with one thread (nm first)
         run: |
           RUST_BACKTRACE=1 cargo test --locked -p vellev --test allocator -- --nocapture --test-threads 1 2>&1 | grep -E "scratch:|^test |test result" || true
+      - name: what a printed backtrace keeps
+        run: |
+          cargo test --locked -p vellev --test allocator scratch_backtrace_cost -- --nocapture --exact 2>&1 | grep -E "scratch backtrace" || true
+          ls -la target/debug/deps/allocator-* | head -3; for f in target/debug/deps/allocator-*; do [ -x "$f" ] && [ ! -d "$f" ] && readelf -S -W "$f" | grep -E "debug_(line|info|str|ranges|abbrev|rnglists|aranges)" ; done
