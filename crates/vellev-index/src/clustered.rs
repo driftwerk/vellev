@@ -1113,12 +1113,37 @@ mod tests {
         (planes, scalars)
     }
 
+    /// Both ways of counting, called directly on the same words: CI's
+    /// machines all have popcount, so the portable count would otherwise
+    /// never be run there.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_portable_count_and_the_popcount_count_agree() {
+        if !std::is_x86_feature_detected!("popcnt") {
+            return;
+        }
+        let mut random = Random(91);
+        for words in [1usize, 7, 12, 16, 32, 48] {
+            for _ in 0..64 {
+                let code: Vec<u64> = (0..words).map(|_| random.next()).collect();
+                let planes: Vec<u64> = (0..words * 4).map(|_| random.next()).collect();
+                // SAFETY: the CPU has just said it has popcount.
+                let fast = unsafe { counted_with_popcount(&code, &planes, words) };
+                assert_eq!(
+                    counted_portably(&code, &planes, words),
+                    fast,
+                    "{words} words"
+                );
+            }
+        }
+    }
+
     proptest::proptest! {
         /// A query is readied for each cluster as it was, to the bit.
         #[test]
         fn a_query_is_readied_for_a_cluster_as_first_written(
             seed in 0u64..u64::MAX,
-            words in 1usize..20,
+            words in proptest::prop_oneof![1usize..20, 32usize..=48],
             flat in proptest::bool::weighted(0.1),
         ) {
             let mut random = Random(seed | 1);
@@ -1151,7 +1176,7 @@ mod tests {
         #[test]
         fn the_scan_estimates_every_code_as_first_written(
             seed in 0u64..u64::MAX,
-            words in 1usize..20,
+            words in proptest::prop_oneof![1usize..20, 32usize..=48],
             align in 0.05f32..1.0,
         ) {
             let mut random = Random(seed | 1);
