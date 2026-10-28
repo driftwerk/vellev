@@ -22,26 +22,27 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p vellev-index --example scan_speed
-      - name: Fetch a third of the fixture's vectors and the questions
+      - name: Fetch the fixture's vectors and the questions
         run: |
           set -euo pipefail
           F="$RUNNER_TEMP/fixture"
           mkdir -p "$F/download" "$F/vectors"
           cd "$F/download"
-          for asset in vectors-queries.tar.zst vectors-passages-0.tar.zst; do
+          for asset in vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst; do
             gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
             grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> wanted.sha256
           done
           sha256sum --check --strict wanted.sha256
           for part in vectors-*.tar.zst; do
             zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
+            rm "$part"
           done
           ls "$F/vectors/passages" | wc -l
       - name: CPU
         run: lscpu | grep -E "Model name|^CPU\(s\)|Flags" | cut -c1-200
       - name: Speed, twice
         run: |
-          for i in 1 2; do target/release/examples/scan_speed "$RUNNER_TEMP/fixture" 300000 60,180,330; done
+          target/release/examples/scan_speed "$RUNNER_TEMP/fixture" 912500 100,300,560
       - name: The AVX2 way planted wrong must fail the rule (after only)
         if: github.ref_name == 'scratch-speed-after'
         run: |
