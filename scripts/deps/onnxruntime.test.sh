@@ -88,6 +88,12 @@ expect "ort-sys built with features that do not change what it downloads" \
   env FEATURES="std api-17 download-binaries tls-rustls" "$script" check
 refused "no locked ort-sys to check against" "no ort-sys in" \
   env METADATA=/dev/null "$script" check
+refused "ort-sys built with pkg-config, which it tries first" \
+  "ort-sys is built with pkg-config" env FEATURES="std api-17 pkg-config" "$script" check
+refused "cargo failing to say what is locked" "cargo metadata failed" \
+  env ONNXRUNTIME_CARGO=false "$script" check
+refused "metadata that cannot be read" "could not read $work/missing.json" \
+  env METADATA="$work/missing.json" "$script" check
 
 ## Fetched, and taken only as pinned.
 mkdir -p "$work/served"
