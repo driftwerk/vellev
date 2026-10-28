@@ -58,6 +58,60 @@ pub struct Probing {
     pub parts: usize,
 }
 
+/// How far apart, at most, an index's rows may lie for a table to find
+/// their places: the table is SPREAD entries a row at most, 16 bytes.
+const SPREAD: u64 = 4;
+
+/// In a table of places, a row the index does not hold.
+const NOWHERE: u32 = u32::MAX;
+
+/// Where a row's place among an index's rows is found.
+#[derive(Debug, Clone)]
+enum Places {
+    /// A table from the first row to the last, of each row's place or
+    /// NOWHERE: one lookup, where a search of the rows takes a score of
+    /// cache misses a row. Kept when the rows span at most SPREAD times
+    /// their count, as a segment's rows of one collection mostly do, so
+    /// that it costs memory by the rows held, not by the highest.
+    Table { first: u32, places: Vec<u32> },
+    /// A search of the rows, for rows spread wider.
+    Search,
+}
+
+impl Places {
+    /// The places of `rows`, ascending and each once.
+    fn of(rows: &[u32]) -> Self {
+        let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
+            return Self::Search;
+        };
+        let span = u64::from(last.saturating_sub(first)) + 1;
+        if span > SPREAD * rows.len() as u64 {
+            return Self::Search;
+        }
+        let mut places = vec![NOWHERE; span as usize];
+        for (place, row) in rows.iter().enumerate() {
+            // Rows out of order would be found wrongly by a search too;
+            // here they are not put in the table.
+            match row
+                .checked_sub(first)
+                .and_then(|at| places.get_mut(at as usize))
+            {
+                Some(slot) => *slot = place as u32,
+                None => return Self::Search,
+            }
+        }
+        Self::Table { first, places }
+    }
+
+    /// About how many bytes the table takes in memory.
+    fn resident(&self) -> usize {
+        match self {
+            Self::Table { places, .. } => places.capacity() * std::mem::size_of::<u32>(),
+            Self::Search => 0,
+        }
+    }
+}
+
 /// In what an index is not one of the vectors it is asked to stand for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Unfit {
@@ -83,6 +137,8 @@ pub struct ClusteredIndex {
     /// its place in it; both follow from the clusters.
     rows: Vec<u32>,
     at: Vec<(u32, u32)>,
+    /// Where a row's place in `rows` is found; follows from `rows`.
+    places: Places,
     /// The rows with no estimate, in ascending order; they follow from the
     /// clusters too.
     unmeasured: Vec<u32>,
@@ -235,7 +291,10 @@ impl TryFrom<Wire> for ClusteredIndex {
             })
             .collect();
         rows.sort_unstable();
-        let (rows, at) = rows.into_iter().unzip();
+        if rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err("a row in two clusters".to_string());
+        }
+        let (rows, at): (Vec<u32>, Vec<(u32, u32)>) = rows.into_iter().unzip();
         Ok(Self {
             metric: wire.metric,
             dimensions: wire.dimensions,
@@ -243,6 +302,7 @@ impl TryFrom<Wire> for ClusteredIndex {
             rotation: wire.rotation,
             centroids: wire.centroids,
             clusters: wire.clusters,
+            places: Places::of(&rows),
             rows,
             at,
             probes: wire.probes,
@@ -782,6 +842,7 @@ impl ClusteredIndex {
                 factors,
             })
             .collect();
+        let rows: Vec<u32> = vectors.iter().map(|(row, _)| *row).collect();
         let mut index = Self {
             metric,
             dimensions,
@@ -789,19 +850,13 @@ impl ClusteredIndex {
             rotation,
             centroids,
             clusters,
-            rows: vectors.iter().map(|(row, _)| *row).collect(),
+            places: Places::of(&rows),
+            rows,
             at,
             probes: 1,
             curve: None,
         };
-        let samples = random.sample(measured.len(), TUNING_QUERIES);
-        let ranks = index.sample_ranks(&measured, &samples);
-        index.curve = Curve::of(
-            Source::Rows,
-            samples.len() as u32,
-            index.clusters.len() as u32,
-            ranks,
-        );
+        index.curve = index.curve_of_measured(&measured);
         // Every cluster a sample's nearest rows lay in, as the curve says;
         // also what a node that knows nothing of curves scans.
         index.probes = index.curve.as_ref().map_or(1, Curve::probes);
@@ -842,6 +897,36 @@ impl ClusteredIndex {
     /// keeps.
     pub fn rows_curve(&self) -> Option<Curve> {
         self.curve.clone()
+    }
+
+    /// The curve of the rows of `vectors`, as the build of an index of
+    /// them makes it: for an index read back from its file, whose curve is
+    /// not in it, from the vectors it indexes, in ascending row order. The
+    /// same rows give the same curve, whenever it is made.
+    pub fn curve_of_rows(&self, vectors: &[(u32, &[f32])]) -> Option<Curve> {
+        let measured: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .copied()
+            .filter(|(_, vector)| measurable(self.metric, vector))
+            .collect();
+        self.curve_of_measured(&measured)
+    }
+
+    /// As [`Self::curve_of_rows`], of rows already found measurable: its
+    /// samples drawn by a generator of their own, seeded by how many rows
+    /// there are and their dimensions alone.
+    fn curve_of_measured(&self, measured: &[(u32, &[f32])]) -> Option<Curve> {
+        let mut random = Random(
+            (measured.len() as u64 ^ ((self.dimensions as u64) << 32)) ^ 0x7465_6e65_645f_7631,
+        );
+        let samples = random.sample(measured.len(), TUNING_QUERIES);
+        let ranks = self.sample_ranks(measured, &samples);
+        Curve::of(
+            Source::Rows,
+            samples.len() as u32,
+            self.clusters.len() as u32,
+            ranks,
+        )
     }
 
     /// Each of `samples`' nearest [`TUNING_NEIGHBOURS`] of `vectors`, the
@@ -953,7 +1038,35 @@ impl ClusteredIndex {
     }
 
     fn position(&self, row: u32) -> Option<usize> {
-        self.rows.binary_search(&row).ok()
+        match &self.places {
+            Places::Table { first, places } => {
+                let place = *places.get(row.checked_sub(*first)? as usize)?;
+                (place != NOWHERE).then_some(place as usize)
+            }
+            Places::Search => self.rows.binary_search(&row).ok(),
+        }
+    }
+
+    /// About how many bytes the index takes in memory: its codes and
+    /// their counts, the factors, the rows and their places, the centroids
+    /// and the rows it has no estimate for.
+    pub fn resident(&self) -> usize {
+        use std::mem::size_of;
+        let clusters: usize = self
+            .clusters
+            .iter()
+            .map(|cluster| {
+                cluster.rows.capacity() * size_of::<u32>()
+                    + cluster.blocks.resident()
+                    + cluster.factors.capacity() * size_of::<Factor>()
+            })
+            .sum();
+        clusters
+            + self.rows.capacity() * size_of::<u32>()
+            + self.at.capacity() * size_of::<(u32, u32)>()
+            + self.places.resident()
+            + self.centroids.capacity() * size_of::<f32>()
+            + self.unmeasured.capacity() * size_of::<u32>()
     }
 
     fn centroid(&self, cluster: usize) -> &[f32] {
@@ -1491,6 +1604,46 @@ mod tests {
     }
 
     proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        /// A row's place in the index is found as a search of the sorted
+        /// rows finds it, for rows indexed, rows between them, before the
+        /// first and past the last, built or read back, whether the rows lie
+        /// close enough together for a table or not.
+        #[test]
+        fn a_rows_place_is_found_as_by_searching_the_rows(
+            seed in 1u64..u64::MAX,
+            rows in 1usize..900,
+            dimensions in 2usize..40,
+            spread in 1u32..9,
+            first in 0u32..100_000,
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(n, v)| (first + n as u32 * spread, v.as_slice()))
+                .collect();
+            let built = ClusteredIndex::build(Distance::Cosine, &numbered).unwrap();
+            let read: ClusteredIndex =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
+            let last = first + (rows as u32 - 1) * spread;
+            for index in [&built, &read] {
+                proptest::prop_assert_eq!(
+                    matches!(index.places, Places::Table { .. }),
+                    u64::from(last - first) < SPREAD * rows as u64
+                );
+                for row in first.saturating_sub(9)..last + 9 {
+                    proptest::prop_assert_eq!(index.position(row), index.rows.binary_search(&row).ok());
+                }
+                proptest::prop_assert_eq!(index.position(u32::MAX), None);
+            }
+        }
+    }
+
+    proptest::proptest! {
         /// What a shortlist keeps, as every caller cuts it, does not depend
         /// on the order rows are offered in: the nearest `count`, those
         /// alike in row order, whether they come in row order, the reverse
@@ -1525,6 +1678,36 @@ mod tests {
                 proptest::prop_assert_eq!(cut(nearest.estimates(), count), want.clone(), "{}", how);
             }
         }
+    }
+
+    /// What finds a row's place costs memory by the rows the index holds,
+    /// not by the highest row: an index of a few thousand rows spread over
+    /// ten million, as one collection's rows lie in a segment of many, takes
+    /// little more than one of the same rows packed together. And what an
+    /// index holds is counted: codes, factors, rows, places and centroids.
+    #[test]
+    fn an_index_costs_memory_by_its_rows_not_by_the_highest_row() {
+        let vectors = grouped(9, 3_000, 16, 12, 0.3);
+        let at = |spread: u32| -> ClusteredIndex {
+            let rows: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * spread, v.as_slice()))
+                .collect();
+            ClusteredIndex::build(Distance::Cosine, &rows).unwrap()
+        };
+        let (packed, spread) = (at(1), at(3_333));
+        assert!(
+            packed.resident() > 3_000 * (16 + 12 + 4),
+            "codes, factors and rows are counted: {}",
+            packed.resident()
+        );
+        assert!(
+            spread.resident() < packed.resident() + 64 * 1024,
+            "{} spread against {} packed",
+            spread.resident(),
+            packed.resident()
+        );
     }
 
     /// What a shortlist of `count` says, as every caller reads it: its
@@ -1653,6 +1836,35 @@ mod tests {
             }
             assert_eq!(answer, Ok(samples.len() * TUNING_NEIGHBOURS));
         });
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
+        /// An index read back from its file has no curve of its rows, and a
+        /// pass over the rows it indexes gives the very curve its build
+        /// gave: a segment built before curves gets the one it would have.
+        #[test]
+        fn a_rows_pass_over_an_index_read_back_gives_the_curve_its_build_gave(
+            seed in 1u64..u64::MAX,
+            rows in 30usize..1200,
+            dimensions in 2usize..40,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let built = indexed(metric, &vectors);
+            let read: ClusteredIndex =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
+            proptest::prop_assert_eq!(read.rows_curve(), None);
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+                .collect();
+            proptest::prop_assert_eq!(read.curve_of_rows(&numbered), built.rows_curve());
+        }
     }
 
     proptest::proptest! {
@@ -2365,7 +2577,7 @@ mod tests {
             rmp_serde::from_slice::<ClusteredIndex>(&bytes).map(|index| index.len())
         };
         assert_eq!(reread(|_| {}).unwrap(), 1000);
-        let corruptions: [(&str, Corrupt); 12] = [
+        let corruptions: [(&str, Corrupt); 13] = [
             ("no clusters to scan", |wire| wire.probes = 0),
             ("more clusters to scan than there are", |wire| {
                 wire.probes = usize::MAX
@@ -2402,6 +2614,10 @@ mod tests {
             }),
             ("a row without factors", |wire| {
                 wire.clusters[0].factors.pop();
+            }),
+            ("a row in two clusters", |wire| {
+                let row = wire.clusters[0].rows[0];
+                wire.clusters[1].rows[0] = row;
             }),
             ("no clusters", |wire| {
                 wire.clusters.clear();

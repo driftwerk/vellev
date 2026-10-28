@@ -336,5 +336,13 @@ async fn segments_are_reported_by_whether_they_are_clustered() {
             Some(0.0)
         );
     }
+    // And the clustered indexes by where their probes come from.
+    for source in ["rows", "queries", "unknown", "unfit", "index"] {
+        assert_eq!(
+            sample(&text, "vellev_segment_probes", &[("source", source)]),
+            Some(0.0),
+            "{text}"
+        );
+    }
     served.stop().await;
 }

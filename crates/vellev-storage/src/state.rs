@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
+use vellev_index::curve::{Curve, Source};
 
 use roaring::RoaringBitmap;
 use vellev_core::{
@@ -476,6 +477,20 @@ fn segment_bytes(rows: &[Row], vectors: &Column) -> usize {
     rows.iter().map(row_bytes).sum::<usize>() + vectors.resident()
 }
 
+/// About how many bytes a segment's vector indexes take in memory: its
+/// clustered indexes' codes, factors, rows and centroids, or its one-bit
+/// codes.
+fn indexes_bytes(indexes: &Indexes) -> usize {
+    indexes
+        .values()
+        .map(|index| match &index.vectors {
+            Some(Vectors::Clustered(clustered)) => clustered.resident(),
+            Some(Vectors::Binary(codes)) => codes.resident(),
+            None => 0,
+        })
+        .sum()
+}
+
 /// About how many bytes a row takes in memory, with its place among the
 /// live rows and what the filter and keyword indexes hold of it: about as
 /// much again as its text, and a little for each value.
@@ -892,6 +907,104 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
     }
 }
 
+/// Say, once a process for each, that a segment's curve for a collection
+/// does not fit its index, so that the segment scans by its index's own
+/// count: corruption, or a bug, as no version writes such a curve.
+fn unfit_once(segment: &str, collection: CollectionId, curve: &Curve, clusters: usize) {
+    static SAID: std::sync::Mutex<Option<std::collections::HashSet<(String, CollectionId)>>> =
+        std::sync::Mutex::new(None);
+    let mut said = SAID.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if said
+        .get_or_insert_with(Default::default)
+        .insert((segment.to_string(), collection))
+    {
+        tracing::warn!(
+            segment,
+            collection = collection.0,
+            curve_clusters = curve.clusters,
+            ranks = curve.ranks.len(),
+            index_clusters = clusters,
+            "a segment's probe curve does not fit its index; it scans by the index's own count"
+        );
+    }
+}
+
+/// The clustered indexes of the segments held, one for each, by where
+/// their probes come from (recall note, R7): see [`State::probes`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Probes {
+    /// Scanning as the curve of the index's rows says.
+    pub rows: u64,
+    /// Scanning as the curve of questions asked of it says.
+    pub queries: u64,
+    /// With a curve of a source this version does not know, as a newer
+    /// version may write: scanning by the index's own count.
+    pub unknown: u64,
+    /// With a curve of a known source that does not fit the index, which
+    /// no version writes: scanning by the index's own count, and said.
+    pub unfit: u64,
+    /// With no curve, as a segment from before curves: scanning by the
+    /// index's own count until its rows pass.
+    pub index: u64,
+}
+
+impl std::ops::AddAssign for Probes {
+    fn add_assign(&mut self, other: Self) {
+        self.rows += other.rows;
+        self.queries += other.queries;
+        self.unknown += other.unknown;
+        self.unfit += other.unfit;
+        self.index += other.index;
+    }
+}
+
+/// A clustered index of a segment that has no curve for it: see
+/// [`State::curves_missing`].
+pub(crate) struct Missing {
+    pub key: String,
+    pub collection: CollectionId,
+    pub index: Arc<ClusteredIndex>,
+    file: Arc<SegmentFile>,
+    vectors: Arc<Column>,
+}
+
+impl Missing {
+    /// The curve the index's build would have given: of the rows it
+    /// indexes, the segment's rows of its collection with a vector, in row
+    /// order, as they were given to the build.
+    pub fn curve(&self) -> Option<SegmentCurve> {
+        let rows: Vec<(u32, &[f32])> = self
+            .file
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.collection == self.collection)
+            .filter_map(|(row, _)| Some((row as u32, self.vectors.get(row)?)))
+            .collect();
+        Some(SegmentCurve {
+            collection: self.collection,
+            band: 0,
+            curve: self.index.curve_of_rows(&rows)?,
+        })
+    }
+}
+
+/// `meta` holding the curves of `curves` named for it, each in place of any
+/// of the same collection and band, the curves in collection and band
+/// order.
+fn with_curves(meta: &mut SegmentMeta, curves: &[(String, SegmentCurve)]) {
+    for (key, entry) in curves {
+        if *key != meta.key {
+            continue;
+        }
+        meta.probes
+            .retain(|kept| (kept.collection, kept.band) != (entry.collection, entry.band));
+        meta.probes.push(entry.clone());
+    }
+    meta.probes
+        .sort_by_key(|entry| (entry.collection, entry.band));
+}
+
 /// The curves of the rows each clustered index among `indexes` was tuned
 /// on when built, as the segment's manifest entry keeps them (recall note,
 /// R7): none for an index read back from a file.
@@ -931,6 +1044,15 @@ impl State {
     /// indexes them, and whatever vectors are held in memory rather than
     /// read in place from local files. Rough, and cheap to ask: each part
     /// is counted as it is made.
+    /// About how many bytes the segments' vector indexes take: counted in
+    /// [`Self::resident`].
+    pub fn indexes_resident(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| indexes_bytes(&segment.indexes))
+            .sum()
+    }
+
     pub fn resident(&self) -> usize {
         let segments: usize = self.segments.iter().map(|segment| segment.resident).sum();
         let codes: usize = self
@@ -1370,7 +1492,7 @@ impl State {
             })
             .collect();
         self.segments.push(Segment {
-            resident: segment_bytes(&file.rows, &vectors),
+            resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
             meta,
             file,
             vectors,
@@ -1711,6 +1833,111 @@ impl State {
         Ok(Some(manifest))
     }
 
+    /// The manifest a commit of `curves` makes at `position`: as a flush
+    /// built from `snapshot` commits (see [`Self::flushed_manifest`]), each
+    /// segment named in `curves` holding its curve in place of any of the
+    /// same collection and band. None if no segment named is still there,
+    /// as a merge may have replaced it since the curve was made: then there
+    /// is nothing to commit.
+    pub(crate) fn tuned_manifest(
+        &self,
+        position: LogPosition,
+        snapshot: &Snapshot,
+        flushed: Option<&Fit>,
+        curves: &[(String, SegmentCurve)],
+    ) -> Result<Option<Manifest>> {
+        let there = |key: &str| self.segments.iter().any(|segment| segment.meta.key == key);
+        if !curves.iter().any(|(key, _)| there(key)) {
+            return Ok(None);
+        }
+        let mut manifest = self.flushed_manifest(position, snapshot, flushed)?;
+        for meta in &mut manifest.segments {
+            with_curves(meta, curves);
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Each clustered index of the segments held, with the segment, its
+    /// collection, and the curve of band 0 its entry has for that
+    /// collection, if any.
+    fn clustered_curves(
+        &self,
+    ) -> impl Iterator<Item = (&Segment, CollectionId, &Arc<ClusteredIndex>, Option<&Curve>)> {
+        self.segments.iter().flat_map(|segment| {
+            segment
+                .indexes
+                .iter()
+                .filter_map(move |(collection, index)| match &index.vectors {
+                    Some(Vectors::Clustered(clustered)) => {
+                        let curve = segment
+                            .meta
+                            .probes
+                            .iter()
+                            .find(|entry| entry.collection == *collection && entry.band == 0)
+                            .map(|entry| &entry.curve);
+                        Some((segment, *collection, clustered, curve))
+                    }
+                    _ => None,
+                })
+        })
+    }
+
+    /// Each clustered index of a segment whose entry has no curve of band 0
+    /// for its collection, as a segment written before curves has none: the
+    /// segment's key, the collection, the index, and the rows it indexes
+    /// with their vectors, to make the curve its build would have from.
+    pub(crate) fn curves_missing(&self) -> Vec<Missing> {
+        let mut missing = Vec::new();
+        for (segment, collection, clustered, curve) in self.clustered_curves() {
+            match curve {
+                // One of a source this version knows that does not fit its
+                // index is not what any version writes: said, once.
+                Some(curve) => {
+                    if curve.source != Source::Unknown && !curve.fits(clustered.clusters()) {
+                        unfit_once(&segment.meta.key, collection, curve, clustered.clusters());
+                    }
+                }
+                None => missing.push(Missing {
+                    key: segment.meta.key.clone(),
+                    collection,
+                    index: clustered.clone(),
+                    file: segment.file.clone(),
+                    vectors: segment.vectors.clone(),
+                }),
+            }
+        }
+        missing
+    }
+
+    /// The clustered indexes of the segments held, one for each, by where
+    /// their probes come from (recall note, R7), as a search finds them.
+    pub fn probes(&self) -> Probes {
+        let mut probes = Probes::default();
+        for (_, _, clustered, curve) in self.clustered_curves() {
+            let counted = match curve {
+                None => &mut probes.index,
+                Some(curve) if curve.source == Source::Unknown => &mut probes.unknown,
+                Some(curve) if !curve.fits(clustered.clusters()) => &mut probes.unfit,
+                Some(curve) => match curve.source {
+                    Source::Rows => &mut probes.rows,
+                    Source::Queries => &mut probes.queries,
+                    Source::Unknown => &mut probes.unknown,
+                },
+            };
+            *counted += 1;
+        }
+        probes
+    }
+
+    /// Carry out a committed commit of `curves`: the segments named hold
+    /// them. The flush committed with it is adopted after, by
+    /// [`Self::flushed`].
+    pub(crate) fn tuned(&mut self, curves: &[(String, SegmentCurve)]) {
+        for segment in &mut self.segments {
+            with_curves(&mut segment.meta, curves);
+        }
+    }
+
     /// Carry out a committed merge: the run's segments go, and the merged
     /// one takes their place. A row of the run that died since the merged
     /// file was made is dead in it too. The flush committed with it is
@@ -1754,7 +1981,7 @@ impl State {
         self.segments.splice(
             run.clone(),
             [Segment {
-                resident: segment_bytes(&file.rows, &vectors),
+                resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
                 meta,
                 file,
                 vectors,
@@ -1963,7 +2190,7 @@ impl State {
                 })
                 .collect();
             self.segments.push(Segment {
-                resident: segment_bytes(&file.rows, &vectors),
+                resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
                 meta,
                 file,
                 vectors,

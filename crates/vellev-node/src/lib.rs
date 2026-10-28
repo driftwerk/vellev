@@ -983,7 +983,9 @@ impl Tenant {
 
     /// Forget the commits the tenant can no longer go back to, then merge
     /// its segments and delete the files no restore within its window
-    /// needs, kept `grace` longer. Returns how many files were deleted.
+    /// needs, kept `grace` longer; then give any segment from before
+    /// curves the curve of its rows (recall note, R9.5). Returns how many
+    /// files were deleted.
     async fn maintained(
         &self,
         coordinator: &dyn Coordinator,
@@ -992,7 +994,16 @@ impl Tenant {
     ) -> Result<usize> {
         let window = restore_window(coordinator, &self.id, default_window).await?;
         coordinator.forget_history(&key(&self.id), window).await?;
-        self.compact(window.saturating_add(grace)).await
+        let deleted = self.compact(window.saturating_add(grace)).await?;
+        // One pass at a time on the node: another tenant's next round
+        // takes its turn. What is missing is worked out afresh each time,
+        // so a pass skipped or cut short is made at a later round.
+        if let Ok(_one) = ROWS_PASSES.try_acquire() {
+            if let Err(error) = self.writer.rows_pass().await {
+                tracing::warn!(tenant = %self.id, %error, "the curves of segments' rows were not made");
+            }
+        }
+        Ok(deleted)
     }
 
     /// The generation of the lease this node writes the tenant under.
@@ -1243,6 +1254,10 @@ struct FlushCounts {
     backlogged: AtomicU64,
 }
 
+/// One pass making the curves of segments' rows at a time on this node:
+/// each is a pass over a segment's vectors, and after an upgrade every
+/// clustered segment of every tenant needs one.
+static ROWS_PASSES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// The segments the tenants this node writes hold: those with an index file
 /// (a clustered vector index for at least one of their collections) and the
 /// rest, each with their rows as written: rows since replaced or deleted
@@ -1253,7 +1268,11 @@ pub struct Segments {
     pub clustered_rows: u64,
     pub plain: usize,
     pub plain_rows: u64,
+    /// Where the clustered indexes' probes come from.
+    pub probes: Probes,
 }
+
+pub use vellev_storage::Probes;
 
 impl Segments {
     fn add(&mut self, meta: &vellev_storage::format::SegmentMeta) {
@@ -1503,7 +1522,10 @@ impl Node {
         let mut segments = Segments::default();
         for held in self.0.held_now() {
             if let Kind::Writer(_, tenant) = &held.kind {
-                tenant.read(|state| state.segments().for_each(|meta| segments.add(meta)));
+                tenant.read(|state| {
+                    state.segments().for_each(|meta| segments.add(meta));
+                    segments.probes += state.probes();
+                });
             }
         }
         segments
@@ -2212,6 +2234,7 @@ mod segment_tests {
                 clustered_rows: 800_000,
                 plain: 2,
                 plain_rows: 250_000,
+                probes: Probes::default(),
             }
         );
     }
