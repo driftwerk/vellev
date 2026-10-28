@@ -273,12 +273,12 @@ impl Collector for Counted {
         for (name, help, values) in [
             (
                 "segments",
-                "Segments the tenants this node writes hold, by whether they have a clustered vector index",
+                "Segments the tenants this node writes hold, by whether they have an index file: clustered counts those with one (a clustered vector index for at least one of their collections), plain the rest",
                 [("clustered", held.clustered as u64), ("plain", held.plain as u64)],
             ),
             (
                 "segment_rows",
-                "Rows in the segments the tenants this node writes hold, by whether the segment has a clustered vector index",
+                "Rows in the segments the tenants this node writes hold, by whether the segment has an index file, as the segments were written: rows since replaced or deleted are still counted, and rows of every collection in the segment, indexed or not",
                 [("clustered", held.clustered_rows), ("plain", held.plain_rows)],
             ),
         ] {
