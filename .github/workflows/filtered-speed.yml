@@ -1,0 +1,58 @@
+name: Filtered speed (scratch)
+
+on:
+  push:
+    branches: [scratch-speed-filtered]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  FIXTURE: fixture-bench-wiki1m-bge-base-v1
+
+jobs:
+  speed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p vellev-index --example scan_speed && cp target/release/examples/scan_speed "$RUNNER_TEMP/filtered"
+      - uses: actions/checkout@v5
+        with:
+          ref: scratch-speed-main
+          path: before
+      - run: cd before && cargo build --release --locked -p vellev-index --example scan_speed && cp target/release/examples/scan_speed "$RUNNER_TEMP/main"
+      - name: Fetch the fixture's vectors and the questions
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/download" "$F/vectors"
+          cd "$F/download"
+          for asset in vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+            grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> wanted.sha256
+          done
+          sha256sum --check --strict wanted.sha256
+          for part in vectors-*.tar.zst; do
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
+            rm "$part"
+          done
+          ls "$F/vectors/passages" | wc -l
+      - name: CPU
+        run: lscpu | grep -E "Model name|^CPU\(s\)|Flags" | cut -c1-200
+      - name: Filtered visits, before, gathered and after on this one runner, twice
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixture/text"
+          cd "$RUNNER_TEMP/fixture/download"
+          for asset in passages.jsonl.zst queries.jsonl; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+          done
+          grep -E "  (passages.jsonl.zst|queries.jsonl)\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" | sha256sum --check --strict
+          zstd -q -d --long=31 passages.jsonl.zst -o "$RUNNER_TEMP/fixture/text/passages.jsonl"
+          mv queries.jsonl "$RUNNER_TEMP/fixture/text/"
+          for side in main filtered main filtered main filtered; do echo "== $side"; SCRATCH_FILTERED=1 "$RUNNER_TEMP/$side" "$RUNNER_TEMP/fixture" 912500 560 | grep -E "allowed|probes 560:"; done
