@@ -1607,6 +1607,45 @@ mod tests {
             .collect()
     }
 
+    /// Tuning runs on a pool of one thread of its own, apart from rayon's
+    /// global pool, where flushes and merges build and where it would take
+    /// every core for tens of seconds a segment: it finishes while every
+    /// global thread is held busy (recall note, R2.6 and R9.5).
+    #[test]
+    fn tuning_runs_on_one_thread_of_its_own() {
+        assert_eq!(crate::pool::tuning().current_num_threads(), 1);
+        let vectors = grouped(5, 3_000, 16, 12, 0.3);
+        let index = indexed(Distance::Cosine, &vectors);
+        let numbered: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+            .collect();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Arc::new(std::sync::Mutex::new(held));
+        let (started, busy) = std::sync::mpsc::channel::<()>();
+        for _ in 0..rayon::current_num_threads() {
+            let (held, started) = (held.clone(), started.clone());
+            rayon::spawn(move || {
+                started.send(()).unwrap();
+                let _ = held.lock().unwrap().recv();
+            });
+        }
+        for _ in 0..rayon::current_num_threads() {
+            busy.recv().unwrap();
+        }
+        let samples: Vec<usize> = (0..3_000).step_by(11).collect();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| done.send(index.sample_ranks(&numbered, &samples).len()).unwrap());
+            let answer = finished.recv_timeout(std::time::Duration::from_secs(30));
+            for _ in 0..rayon::current_num_threads() {
+                release.send(()).unwrap();
+            }
+            assert_eq!(answer, Ok(samples.len() * TUNING_NEIGHBOURS));
+        });
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
         /// Tuning finds each sample row's nearest rows in one pass over the
