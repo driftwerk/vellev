@@ -1243,8 +1243,10 @@ struct FlushCounts {
     backlogged: AtomicU64,
 }
 
-/// The segments the tenants this node writes hold: those with a clustered
-/// vector index and the rest, each with their rows.
+/// The segments the tenants this node writes hold: those with an index file
+/// (a clustered vector index for at least one of their collections) and the
+/// rest, each with their rows as written: rows since replaced or deleted
+/// are still counted, as are the rows of every collection a segment holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Segments {
     pub clustered: usize,
