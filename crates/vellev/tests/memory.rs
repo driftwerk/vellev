@@ -103,6 +103,13 @@ fn memory_freed_among_what_is_kept_is_given_back() {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     let rest = anon();
+    eprintln!(
+        "{} MiB anonymous at rest, {:.1} s after the free (bound {} MiB); {}",
+        rest / MIB,
+        freed.elapsed().as_secs_f64(),
+        bound / MIB,
+        jemalloc()
+    );
     assert!(
         rest <= bound,
         "{} MiB anonymous at rest, {:.1} s after the free ({} MiB before, bound {} MiB) with {} MiB kept: what was freed was not given back; {}",
