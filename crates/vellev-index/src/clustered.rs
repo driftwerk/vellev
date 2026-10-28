@@ -337,9 +337,6 @@ struct Probe {
     planes: Vec<u64>,
     #[cfg(test)]
     words: usize,
-    /// How this machine counts a code's bits against the planes.
-    #[cfg(test)]
-    counted: Counted,
     lower: f32,
     delta: f32,
     sum: f32,
@@ -429,8 +426,6 @@ impl Probe {
             planes,
             #[cfg(test)]
             words,
-            #[cfg(test)]
-            counted: counter(),
             lower,
             delta,
             sum: residual.iter().sum(),
@@ -444,7 +439,7 @@ impl Probe {
     /// query's difference from the centroid.
     #[cfg(test)]
     fn inner(&self, code: &[u64], factor: &Factor) -> f32 {
-        let (ones, weighted) = (self.counted)(code, &self.planes, self.words);
+        let (ones, weighted) = counted_in_one_pass(code, &self.planes, self.words);
         self.inner_of(ones, weighted, factor)
     }
 
@@ -458,7 +453,7 @@ impl Probe {
 
     #[cfg(test)]
     fn distance(&self, metric: Distance, code: &[u64], factor: &Factor) -> f32 {
-        let (ones, weighted) = (self.counted)(code, &self.planes, self.words);
+        let (ones, weighted) = counted_in_one_pass(code, &self.planes, self.words);
         self.distance_of(metric, ones, weighted, factor)
     }
 
@@ -477,16 +472,14 @@ impl Probe {
     }
 }
 
-/// A code's set bits, and its bits set in each of the query's planes
-/// weighted by the plane's place: `(ones, weighted)`.
-#[cfg(test)]
-type Counted = fn(&[u64], &[u64], usize) -> (u32, u32);
-
 const _: () = assert!(QUERY_BITS == 4, "the scan counts four planes");
 
-/// Every count of a code in one pass over its words, rather than one pass
-/// for its bits and one for each plane: the same integers, so the same
-/// estimate to the bit.
+/// Every count of a code in one pass over its words: its set bits, and
+/// its bits set in each of the query's planes weighted by the plane's
+/// place, `(ones, weighted)`. How codes were counted before they were laid
+/// out in blocks, and what the tests hold the tables to; the scan itself
+/// no longer counts this way, so the popcount dispatch step E chose it by
+/// is gone.
 #[inline(always)]
 #[cfg(test)]
 fn counted_in_one_pass(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
@@ -505,34 +498,6 @@ fn counted_in_one_pass(code: &[u64], planes: &[u64], words: usize) -> (u32, u32)
         w3 += (c & p3[i]).count_ones();
     }
     (ones, w0 + (w1 << 1) + (w2 << 2) + (w3 << 3))
-}
-
-#[cfg(test)]
-fn counted_portably(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
-    counted_in_one_pass(code, planes, words)
-}
-
-/// As [`counted_portably`], compiled to use the popcount instruction.
-#[cfg(test)]
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "popcnt")]
-fn counted_with_popcount(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
-    counted_in_one_pass(code, planes, words)
-}
-
-/// The counter for this machine: decided once per process.
-#[cfg(test)]
-fn counter() -> Counted {
-    static COUNTER: std::sync::OnceLock<Counted> = std::sync::OnceLock::new();
-    *COUNTER.get_or_init(|| {
-        #[cfg(target_arch = "x86_64")]
-        if std::is_x86_feature_detected!("popcnt") {
-            // SAFETY: called only where the CPU has just said it has
-            // popcount, which is all the function asks.
-            return |code, planes, words| unsafe { counted_with_popcount(code, planes, words) };
-        }
-        counted_portably
-    })
 }
 
 #[derive(PartialEq)]
@@ -1381,31 +1346,6 @@ mod tests {
         (planes, scalars)
     }
 
-    /// Both ways of counting, called directly on the same words: CI's
-    /// machines all have popcount, so the portable count would otherwise
-    /// never be run there.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn the_portable_count_and_the_popcount_count_agree() {
-        if !std::is_x86_feature_detected!("popcnt") {
-            return;
-        }
-        let mut random = Random(91);
-        for words in [1usize, 7, 12, 16, 32, 48] {
-            for _ in 0..64 {
-                let code: Vec<u64> = (0..words).map(|_| random.next()).collect();
-                let planes: Vec<u64> = (0..words * 4).map(|_| random.next()).collect();
-                // SAFETY: the CPU has just said it has popcount.
-                let fast = unsafe { counted_with_popcount(&code, &planes, words) };
-                assert_eq!(
-                    counted_portably(&code, &planes, words),
-                    fast,
-                    "{words} words"
-                );
-            }
-        }
-    }
-
     proptest::proptest! {
         /// A query is readied for each cluster as it was, to the bit.
         #[test]
@@ -1537,6 +1477,43 @@ mod tests {
             f32::NAN,
         ] {
             assert_eq!(level_of(edge), first(edge), "{edge}");
+        }
+    }
+
+    proptest::proptest! {
+        /// What a shortlist keeps, as every caller cuts it, does not depend
+        /// on the order rows are offered in: the nearest `count`, those
+        /// alike in row order, whether they come in row order, the reverse
+        /// or shuffled, and however many tie. The scan, the visit and a
+        /// split scan each offer rows in their own order and rely on it.
+        #[test]
+        fn a_shortlists_cut_is_the_same_whatever_order_rows_come_in(
+            seed in 1u64..u64::MAX,
+            rows in 1usize..400,
+            distinct in 1u64..12,
+            count in 1usize..60,
+        ) {
+            let mut noise = Noise(seed);
+            let offered: Vec<(f32, u32)> = (0..rows as u32)
+                .map(|row| (((noise.unit() + 0.5) * distinct as f32).floor(), row))
+                .collect();
+            let mut want = offered.clone();
+            want.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            want.truncate(count);
+            let want: Vec<(u32, u32)> = want.iter().map(|(d, row)| (d.to_bits(), *row)).collect();
+            let mut shuffled = offered.clone();
+            for at in (1..shuffled.len()).rev() {
+                let other = ((noise.unit() + 0.5) * (at + 1) as f32) as usize;
+                shuffled.swap(at, other.min(at));
+            }
+            let reversed: Vec<(f32, u32)> = offered.iter().rev().copied().collect();
+            for (how, order) in [("in row order", &offered), ("reversed", &reversed), ("shuffled", &shuffled)] {
+                let mut nearest = Nearest::new(count, &in_row_order);
+                for (distance, row) in order {
+                    nearest.offer(*distance, *row);
+                }
+                proptest::prop_assert_eq!(cut(nearest.estimates(), count), want.clone(), "{}", how);
+            }
         }
     }
 
@@ -1751,7 +1728,8 @@ mod tests {
         /// Laying the codes out in blocks changes no estimate: a scan of
         /// every cluster it probes gives the estimates the code-by-code
         /// scan gives, to the bit and in the same order, filtered or not,
-        /// with rows skipped or not, for every metric.
+        /// with rows skipped or not, for every metric, and with rows of
+        /// one vector tied.
         #[test]
         fn the_scan_of_blocks_estimates_as_code_by_code(
             seed in 1u64..u64::MAX,
@@ -1761,10 +1739,16 @@ mod tests {
             count in 1usize..300,
             share in proptest::option::of(1u32..100),
             skip in proptest::bool::ANY,
+            copies in proptest::prop_oneof![3 => proptest::strategy::Just(1usize), 1 => 2usize..6],
         ) {
+            // With copies, rows of one vector are estimated alike, so that
+            // ties at the shortlist's cut go through the visit's order of
+            // offers, by cluster, against the code-by-code row order.
             let vectors: Vec<Vec<f32>> = {
                 let mut noise = Noise(seed);
-                (0..rows).map(|_| noise.vector(dimensions)).collect()
+                let distinct: Vec<Vec<f32>> =
+                    (0..rows.div_ceil(copies)).map(|_| noise.vector(dimensions)).collect();
+                (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
             };
             let index = indexed(metric, &vectors);
             let mut noise = Noise(seed.rotate_left(17) | 1);

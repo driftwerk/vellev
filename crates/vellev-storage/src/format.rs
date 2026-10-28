@@ -182,7 +182,20 @@ pub struct SegmentMeta {
     /// index was built with. Not written when there are none, so that a
     /// manifest is as it was before there were curves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub probes: Vec<(CollectionId, Curve)>,
+    pub probes: Vec<SegmentCurve>,
+}
+
+/// One of a segment's probe curves: for a collection, in a band of filter
+/// selectivity. Written as a map, so that a node reads past fields a later
+/// one adds to an entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentCurve {
+    pub collection: CollectionId,
+    /// The band of filter selectivity it is for: 0, searches however
+    /// filtered, is the only one yet (recall note, R9.1).
+    #[serde(default)]
+    pub band: u8,
+    pub curve: Curve,
 }
 
 /// The vector indexes of a segment that took long enough to build to be
@@ -1238,16 +1251,17 @@ mod tests {
         );
 
         let mut tuned = plain.clone();
-        tuned.probes = vec![(
-            CollectionId(2),
-            Curve::of(
+        tuned.probes = vec![SegmentCurve {
+            collection: CollectionId(2),
+            band: 0,
+            curve: Curve::of(
                 Source::Queries,
                 400,
                 931,
                 (0..4000).map(|n| n % 931).collect(),
             )
             .unwrap(),
-        )];
+        }];
         let bytes = rmp_serde::to_vec_named(&tuned).unwrap();
         assert_eq!(rmp_serde::from_slice::<SegmentMeta>(&bytes).unwrap(), tuned);
         assert_eq!(
@@ -1268,6 +1282,68 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rmp_serde::from_slice::<SegmentMeta>(&later).unwrap(), tuned);
+    }
+
+    /// A curve entry is a map: a node reads past fields a later one adds to
+    /// it, and an entry without a band is for band 0.
+    #[test]
+    fn a_curve_entry_is_read_past_fields_a_later_node_adds() {
+        use vellev_index::curve::{Curve, Source};
+        let curve = Curve::of(Source::Rows, 400, 50, (0..4000).map(|n| n % 50).collect()).unwrap();
+        #[derive(Serialize)]
+        struct Later<'a> {
+            collection: CollectionId,
+            band: u8,
+            curve: &'a Curve,
+            weight: f32,
+            nodes: Vec<String>,
+        }
+        #[derive(Serialize)]
+        struct Earlier<'a> {
+            collection: CollectionId,
+            curve: &'a Curve,
+        }
+        #[derive(Serialize)]
+        struct Meta<E> {
+            key: String,
+            rows: u64,
+            tombstones: u64,
+            probes: Vec<E>,
+        }
+        let later = rmp_serde::to_vec_named(&Meta {
+            key: "s".into(),
+            rows: 4,
+            tombstones: 1,
+            probes: vec![Later {
+                collection: CollectionId(7),
+                band: 2,
+                curve: &curve,
+                weight: 0.5,
+                nodes: vec!["n".into()],
+            }],
+        })
+        .unwrap();
+        let read: SegmentMeta = rmp_serde::from_slice(&later).unwrap();
+        assert_eq!(
+            read.probes,
+            vec![SegmentCurve {
+                collection: CollectionId(7),
+                band: 2,
+                curve: curve.clone()
+            }]
+        );
+        let earlier = rmp_serde::to_vec_named(&Meta {
+            key: "s".into(),
+            rows: 4,
+            tombstones: 1,
+            probes: vec![Earlier {
+                collection: CollectionId(7),
+                curve: &curve,
+            }],
+        })
+        .unwrap();
+        let read: SegmentMeta = rmp_serde::from_slice(&earlier).unwrap();
+        assert_eq!(read.probes[0].band, 0);
     }
 
     fn segment(key: String, index: Option<String>, vectors: Option<String>) -> SegmentMeta {
@@ -1300,16 +1376,17 @@ mod tests {
         ];
         let (mut large, large_names) = all("00000000000000000011-w-1f");
         // A tuned segment: its curve goes wherever the segment goes.
-        large.probes = vec![(
-            CollectionId(1),
-            vellev_index::curve::Curve::of(
+        large.probes = vec![SegmentCurve {
+            collection: CollectionId(1),
+            band: 0,
+            curve: vellev_index::curve::Curve::of(
                 vellev_index::curve::Source::Queries,
                 400,
                 40,
                 (0..4000).map(|n| n % 40).collect(),
             )
             .unwrap(),
-        )];
+        }];
         let (merged, merged_names) = all("00000000000000000016-w-2e-merged");
         let (kept, kept_names) = all("00000000000000000009-w-3d");
         let unindexed = old("segment", "00000000000000000014-w-4c");
