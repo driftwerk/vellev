@@ -806,6 +806,12 @@ impl ClusteredIndex {
         self.probes
     }
 
+    /// Scratch: this index scanning `probes` clusters at least.
+    pub fn with_probes(mut self, probes: usize) -> Self {
+        self.probes = probes.clamp(1, self.clusters.len());
+        self
+    }
+
     /// Whether this is an index of just these vectors' rows, of their
     /// dimensions, measured by `metric`, or else in what it is not: what
     /// one read back from a file must be before it is trusted with them.
@@ -922,7 +928,10 @@ impl ClusteredIndex {
     /// its nearest rows lies in: worked out on the tuning pool, one thread
     /// of its own ([`crate::pool::tuning`]).
     fn sample_ranks(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<u32> {
-        crate::pool::tuning().install(|| self.ranks_on_this_pool(vectors, samples))
+        match std::env::var("SCRATCH_GLOBAL_TUNING").is_ok() {
+            true => self.ranks_on_this_pool(vectors, samples),
+            false => crate::pool::tuning().install(|| self.ranks_on_this_pool(vectors, samples)),
+        }
     }
 
     /// As [`Self::sample_ranks`], on whatever pool the caller is on.
