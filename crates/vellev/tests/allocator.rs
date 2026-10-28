@@ -144,7 +144,8 @@ fn memory_freed_among_what_is_kept_is_given_back() {
     }
     let listing = other.join().unwrap();
     panic!(
-        "scratch report: nm's listing took {listing} MiB on the other thread; {} MiB anonymous ({} MiB before, bound {} MiB) {:.1} s in; {}",
+        "scratch report ({}): nm's listing took {listing} MiB on the other thread; {} MiB anonymous ({} MiB before, bound {} MiB) {:.1} s in; {}",
+        std::env::var("_RJEM_MALLOC_CONF").unwrap_or_default(),
         anon() / MIB,
         before / MIB,
         bound / MIB,

@@ -1,0 +1,29 @@
+name: Retention probe (scratch)
+
+on:
+  push:
+    branches: [scratch-retention]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p vellev --test allocator --no-run
+      - name: jemalloc's defaults beside background_thread, three times
+        run: |
+          for i in 1 2 3; do
+            cargo test -q --locked -p vellev --test allocator memory_freed 2>&1 | grep -E "scratch report|MiB anonymous" || true
+          done
+      - name: muzzy_decay_ms:0, three times
+        env:
+          _RJEM_MALLOC_CONF: muzzy_decay_ms:0
+        run: |
+          for i in 1 2 3; do
+            cargo test -q --locked -p vellev --test allocator memory_freed 2>&1 | grep -E "scratch report|MiB anonymous" || true
+          done
