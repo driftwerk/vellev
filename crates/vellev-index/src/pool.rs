@@ -15,17 +15,10 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 
 /// The read pool: as many threads as rayon's global pool has, sized as
 /// rayon sizes that (RAYON_NUM_THREADS, and so on), whichever pool first
-/// asks for it, made when first asked for. It is made before either
-/// background pool is, as a thread takes the priority of the thread that
-/// makes it, so that its threads run at the process's own priority, never
-/// at a background thread's lower one.
+/// asks for it, made when first asked for.
 pub fn reads() -> &'static ThreadPool {
     static READS: OnceLock<ThreadPool> = OnceLock::new();
     READS.get_or_init(|| {
-        debug_assert!(
-            !LOWERED.with(std::cell::Cell::get),
-            "the read pool made from a background thread"
-        );
         ThreadPoolBuilder::new()
             .thread_name(|n| format!("vellev-read-{n}"))
             .build()
@@ -42,7 +35,6 @@ pub fn reads() -> &'static ThreadPool {
 pub fn tuning() -> &'static ThreadPool {
     static TUNING: OnceLock<ThreadPool> = OnceLock::new();
     TUNING.get_or_init(|| {
-        reads();
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-tune".to_string())
@@ -60,7 +52,6 @@ pub fn tuning() -> &'static ThreadPool {
 pub fn passes() -> &'static ThreadPool {
     static PASSES: OnceLock<ThreadPool> = OnceLock::new();
     PASSES.get_or_init(|| {
-        reads();
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-pass".to_string())
@@ -78,22 +69,10 @@ pub fn passes() -> &'static ThreadPool {
 /// the build no slower).
 pub const BACKGROUND_NICE: i32 = 10;
 
-std::thread_local! {
-    /// Whether this thread is one of a background pool's, run lower.
-    static LOWERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Lower the calling thread's priority by [`BACKGROUND_NICE`], from where
 /// the process runs, to 19 at the most. Nothing elsewhere, nor if Linux
 /// refuses, as the thread then runs as it would have.
-///
-/// A thread such a thread makes would run lower too, for good, and do
-/// whatever work it is given: so the read pool is made before the
-/// background pools, and is said never to be made from one of their
-/// threads. A background thread has no async runtime to start a blocking
-/// thread on.
 fn lowered() {
-    LOWERED.with(|lowered| lowered.set(true));
     #[cfg(target_os = "linux")]
     {
         let tid = this_thread();
@@ -113,18 +92,11 @@ fn this_thread() -> libc::id_t {
     unsafe { libc::syscall(libc::SYS_gettid) as libc::id_t }
 }
 
-/// The priority of thread `tid`, if Linux says. getpriority answers -1
-/// both when it fails and for a priority of -1, so errno, cleared first,
-/// tells them apart.
+/// The priority of thread `tid`, if Linux says.
 #[cfg(target_os = "linux")]
 fn priority_of(tid: libc::id_t) -> Option<i32> {
-    // SAFETY: errno is this thread's own, and getpriority takes and gives
-    // plain numbers.
-    unsafe {
-        *libc::__errno_location() = 0;
-        let priority = libc::getpriority(libc::PRIO_PROCESS, tid);
-        (priority != -1 || *libc::__errno_location() == 0).then_some(priority)
-    }
+    // SAFETY: getpriority takes and gives plain numbers.
+    Some(unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) })
 }
 
 #[cfg(all(test, target_os = "linux"))]
