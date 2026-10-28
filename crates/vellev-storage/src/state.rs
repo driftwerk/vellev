@@ -775,10 +775,6 @@ pub(crate) fn indexed_on<'a>(
     clustered_above: Option<usize>,
 ) -> (Indexes, usize) {
     use rayon::prelude::*;
-    // Counted as a build, so that reads do not split while it runs, where
-    // it is heavy: see [`HEAVY_ROWS`]. A clustered index's build, heavier
-    // still, is counted by the index itself.
-    let _building = (rows.len() >= HEAVY_ROWS).then(vellev_index::pool::Building::begun);
     let threads = Threads::default();
     let tokenized: Vec<Option<Tokenized>> = rows
         .par_iter()
@@ -2396,8 +2392,6 @@ impl State {
     /// threads, and how many made them at once, at the most.
     pub(crate) fn prepared_together(&self, run: &[(String, LogSegment)]) -> (Vec<Prepared>, usize) {
         use rayon::prelude::*;
-        let ops: usize = run.iter().map(|(_, log)| log.ops.len()).sum();
-        let _building = (ops >= HEAVY_ROWS).then(vellev_index::pool::Building::begun);
         let threads = Threads::default();
         let prepared = run
             .par_iter()
@@ -2406,15 +2400,6 @@ impl State {
         (prepared, threads.most())
     }
 }
-
-/// The fewest rows whose indexing, or whose logs' preparing, counts as a
-/// build, during which reads do not split their searches
-/// (`vellev_index::pool`): twice a default flush (50,000 rows), so that
-/// ordinary flushes, about a second of every core, do not turn splitting
-/// off node-wide at each one, while merges, reloads and replays of large
-/// segments, tens of seconds of every core, do. A clustered index's build
-/// is counted whatever its size.
-pub const HEAVY_ROWS: usize = 100_000;
 
 /// How many logs a replay prepares together before applying them.
 pub(crate) const REPLAYED_TOGETHER: usize = 16;

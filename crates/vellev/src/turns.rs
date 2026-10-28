@@ -70,28 +70,25 @@ impl Turn {
     /// busy the node is now: see [`split_for`].
     pub fn split(&self) -> usize {
         let (taken, waiting) = self.turns.counts();
-        split_for(
-            rayon::current_num_threads(),
-            taken,
-            waiting,
-            vellev_index::pool::builds(),
-        )
+        split_for(rayon::current_num_threads(), taken, waiting)
     }
 }
 
 /// How many parts a read may split its search into on `threads` threads
-/// while `taken` turns are held, its own among them, `waiting` reads wait
-/// for one, and `building` index builds run: the threads the other reads
-/// leave it, one at least, and one whenever a read waits or an index is
-/// being built. Split, a search is faster alone but costs more in all, so
-/// a node that is busy answers more by not splitting. During a build, not
-/// splitting favours the build over the read: measured on 4-thread runners
-/// (the `split_during_build` bench, runs 40669806629 and 40676350644), a
-/// read's search took p50 13 ms split against 20 ms unsplit at 30 reads a
-/// second (9 against 14 back to back), and the build about 5% longer.
-/// Whether that is the trade to make is open (#146).
-pub(crate) fn split_for(threads: usize, taken: usize, waiting: usize, building: usize) -> usize {
-    if waiting > 0 || building > 0 {
+/// while `taken` turns are held, its own among them, and `waiting` reads
+/// wait for one: the threads the other reads leave it, one at least, and
+/// one whenever a read waits. Split, a search is faster alone but costs
+/// more in all, so a node that is busy answers more by not splitting.
+///
+/// An index build does not stop a read splitting (#146). Measured on
+/// 4-thread runners during a 300,000-row build (the `split_during_build`
+/// bench, runs 40669806629 and 40676350644), a read's search took p50 13
+/// ms split against 20 ms unsplit at 30 reads a second, and 9 against 14
+/// back to back. The build took longer: about 5% at 30 reads a second,
+/// where both read alike, and 27% back to back, where the split reader
+/// read twice as much.
+pub(crate) fn split_for(threads: usize, taken: usize, waiting: usize) -> usize {
+    if waiting > 0 {
         return 1;
     }
     (threads / taken.max(1)).max(1)
@@ -200,27 +197,23 @@ mod tests {
     use super::*;
 
     /// A read splits its search over the threads no other read is using,
-    /// and never when every thread is busy, reads wait, or an index is
-    /// being built: split, a search is faster alone and slower among
-    /// others (#141's measurements), and no faster during a build, which
-    /// it slows (the review's).
+    /// and never when every thread is busy or reads wait: split, a search
+    /// is faster alone and slower among others (see #141's measurements).
     #[test]
     fn a_read_splits_only_over_threads_others_leave_idle() {
         // Alone on three threads: all three.
-        assert_eq!(split_for(3, 1, 0, 0), 3);
+        assert_eq!(split_for(3, 1, 0), 3);
         // Two reads on four threads: two each.
-        assert_eq!(split_for(4, 2, 0, 0), 2);
+        assert_eq!(split_for(4, 2, 0), 2);
         // As many reads as threads, or more: one each.
-        assert_eq!(split_for(3, 3, 0, 0), 1);
-        assert_eq!(split_for(3, 8, 0, 0), 1);
+        assert_eq!(split_for(3, 3, 0), 1);
+        assert_eq!(split_for(3, 8, 0), 1);
         // Reads waiting for a turn: one, whatever is free.
-        assert_eq!(split_for(8, 1, 1, 0), 1);
-        // An index being built: one, whatever is free.
-        assert_eq!(split_for(8, 1, 0, 1), 1);
+        assert_eq!(split_for(8, 1, 1), 1);
         // One thread: one.
-        assert_eq!(split_for(1, 1, 0, 0), 1);
+        assert_eq!(split_for(1, 1, 0), 1);
         // Never none, even counted oddly.
-        assert_eq!(split_for(0, 0, 0, 0), 1);
+        assert_eq!(split_for(0, 0, 0), 1);
     }
 
     fn tenant(name: &str) -> TenantId {

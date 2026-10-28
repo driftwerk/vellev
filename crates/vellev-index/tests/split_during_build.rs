@@ -1,8 +1,8 @@
 //! A bench, not a check, run by hand or by a scratch workflow: a lone
 //! reader's reads during an index build on rayon's global pool, unsplit
 //! and split on the read pool, and the build's time, against the build's
-//! time alone; the arms' order alternating from round to round. What
-//! `split_for` declining to split during builds rests on (#146).
+//! time alone; the arms' order alternating from round to round. Why
+//! a read splits during a build as at any other time (#146).
 //!
 //! With `RATE` unset or 0 the reader reads back to back, so a faster arm
 //! also reads more during the build; with `RATE` reads a second, it reads
