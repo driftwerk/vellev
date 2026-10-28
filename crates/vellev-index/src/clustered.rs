@@ -1551,6 +1551,72 @@ mod tests {
         )
     }
 
+    /// Each sample row's nearest rows, the row itself left out, found
+    /// sample by sample over every row as tuning first found them: what the
+    /// one pass over the rows for all samples at once must equal.
+    fn neighbours_sample_by_sample(
+        index: &ClusteredIndex,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+    ) -> Vec<Vec<u32>> {
+        samples
+            .iter()
+            .map(|at| {
+                let (row, query) = vectors[*at];
+                let scorer = Scorer::new(index.metric, query);
+                let mut all: Vec<(f32, u32)> = vectors
+                    .iter()
+                    .filter(|(other, _)| *other != row)
+                    .map(|(other, vector)| (scorer.distance(vector), *other))
+                    .collect();
+                all.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                all.truncate(TUNING_NEIGHBOURS);
+                all.into_iter().map(|(_, row)| row).collect()
+            })
+            .collect()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        /// Tuning finds each sample row's nearest rows in one pass over the
+        /// rows for all samples at once, as a pass for each sample finds
+        /// them, ties in row order; and a built index's curve is of their
+        /// clusters' ranks, from its rows, scanning every cluster any of
+        /// them lay in, as the index's own count does.
+        #[test]
+        fn one_pass_finds_every_samples_nearest_rows_and_the_curve_holds_them_all(
+            seed in 1u64..u64::MAX,
+            rows in 30usize..1500,
+            dimensions in 2usize..48,
+            copies in proptest::prop_oneof![3 => proptest::strategy::Just(1usize), 1 => 2usize..4],
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                let distinct: Vec<Vec<f32>> =
+                    (0..rows.div_ceil(copies)).map(|_| noise.vector(dimensions)).collect();
+                (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
+            };
+            let index = indexed(metric, &vectors);
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+                .collect();
+            let samples: Vec<usize> = (0..rows).step_by(7).collect();
+            let found = index.nearest_of_samples(&numbered, &samples);
+            proptest::prop_assert_eq!(found, neighbours_sample_by_sample(&index, &numbered, &samples));
+
+            let curve = index.rows_curve().expect("a built index has a curve of its rows");
+            proptest::prop_assert_eq!(curve.source, crate::curve::Source::Rows);
+            proptest::prop_assert_eq!(curve.clusters as usize, index.clusters.len());
+            proptest::prop_assert_eq!(curve.samples as usize, rows.min(TUNING_QUERIES));
+            proptest::prop_assert_eq!(curve.probes(), index.probes(), "the index scans as its curve says");
+            // Built twice from the same rows, the same curve.
+            proptest::prop_assert_eq!(indexed(metric, &vectors).rows_curve(), Some(curve));
+        }
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
         /// Probes given, as a segment's curve gives them, scan as an index
