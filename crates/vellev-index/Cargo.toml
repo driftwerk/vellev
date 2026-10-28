@@ -25,6 +25,7 @@ thiserror.workspace = true
 utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
+libc = "0.2"
 proptest.workspace = true
 rmp-serde.workspace = true
 uuid.workspace = true
