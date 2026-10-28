@@ -84,6 +84,11 @@ pub trait Engine: Send + Sync {
     async fn floor(&self, vector: &[f32]) -> Result<()>;
     /// The engine's settings in effect, read back from it.
     async fn settings(&self) -> Result<Value>;
+    /// How the engine holds the rows, where it reports that: read once the
+    /// writes settle, and in the settings after measuring.
+    async fn layout(&self) -> Result<Value> {
+        Ok(Value::Null)
+    }
 }
 
 /// At most `n` bytes of `text`, cut at a character.
@@ -315,6 +320,39 @@ impl Vellev {
         Ok(())
     }
 
+    /// The segments the node's tenants hold, as /metrics reports them: how
+    /// many, and their rows, with a clustered index and without.
+    pub fn segments(metrics: &str) -> Value {
+        let read = |name: &str, index: &str| {
+            Vellev::sample(metrics, &format!("{name}{{index=\"{index}\"}}"))
+        };
+        json!({
+            "clustered": read("vellev_segments", "clustered"),
+            "clustered_rows": read("vellev_segment_rows", "clustered"),
+            "plain": read("vellev_segments", "plain"),
+            "plain_rows": read("vellev_segment_rows", "plain"),
+        })
+    }
+
+    /// Fail unless the segments read after measuring are those read once
+    /// the writes settled: a flush or merge in between would have the
+    /// answers come from more than one layout, and the layout reported
+    /// would not be the one measured. Counts the node did not report fail
+    /// too: missing both times is not unchanged.
+    pub fn same_segments(settled: &Value, measured: &Value) -> Result<()> {
+        for count in ["clustered", "clustered_rows", "plain", "plain_rows"] {
+            ensure!(
+                settled[count].is_number() && measured[count].is_number(),
+                "vellev did not report its segments' {count} (settled {settled}, measured {measured})"
+            );
+        }
+        ensure!(
+            settled == measured,
+            "vellev's segments changed while it was measured: {settled} once settled, {measured} after"
+        );
+        Ok(())
+    }
+
     /// A sample of the metrics, as `name{labels} value`.
     pub fn sample(text: &str, name: &str) -> Option<f64> {
         text.lines()
@@ -457,6 +495,10 @@ impl Engine for Vellev {
         Ok(())
     }
 
+    async fn layout(&self) -> Result<Value> {
+        Ok(Vellev::segments(&self.metrics().await?))
+    }
+
     async fn settings(&self) -> Result<Value> {
         let path = format!("/v1/tenants/{}/collections/{COLLECTION}", self.tenant);
         let schema = self.call(reqwest::Method::GET, &path, None).await?;
@@ -473,6 +515,7 @@ impl Engine for Vellev {
                 "reads_at_once": Vellev::sample(&metrics, "vellev_reads_at_once"),
             },
             "default_oversample": "the node's own, no oversample asked",
+            "segments": Vellev::segments(&metrics),
         }))
     }
 }
@@ -838,6 +881,42 @@ mod tests {
     fn an_error_body_is_cut_at_a_character() {
         assert_eq!(cut("aé", 2), "a");
         assert_eq!(cut("abc", 10), "abc");
+    }
+
+    #[test]
+    fn segments_are_read_by_their_index() {
+        let text = "vellev_segments{index=\"clustered\"} 1\nvellev_segments{index=\"plain\"} 2\nvellev_segment_rows{index=\"clustered\"} 760000\nvellev_segment_rows{index=\"plain\"} 240000\n";
+        assert_eq!(
+            Vellev::segments(text),
+            json!({"clustered": 1.0, "clustered_rows": 760000.0, "plain": 2.0, "plain_rows": 240000.0})
+        );
+        assert_eq!(
+            Vellev::segments("")["clustered"],
+            Value::Null,
+            "unreported is not none"
+        );
+    }
+
+    #[test]
+    fn the_segments_measured_are_the_segments_settled() {
+        let settled = json!({"clustered": 2.0, "clustered_rows": 912500.0, "plain": 1.0, "plain_rows": 87500.0});
+        assert!(Vellev::same_segments(&settled, &settled.clone()).is_ok());
+        for changed in [
+            json!({"clustered": 2.0, "clustered_rows": 912500.0, "plain": 2.0, "plain_rows": 87500.0}),
+            json!({"clustered": 2.0, "clustered_rows": 943000.0, "plain": 1.0, "plain_rows": 87500.0}),
+            json!({"clustered": 3.0, "clustered_rows": 912500.0, "plain": 1.0, "plain_rows": 87500.0}),
+        ] {
+            assert!(
+                Vellev::same_segments(&settled, &changed).is_err(),
+                "{changed} is not the layout settled"
+            );
+        }
+        // A count the node did not report is not taken as unchanged, even
+        // when it is missing both times.
+        let unreported =
+            json!({"clustered": null, "clustered_rows": null, "plain": null, "plain_rows": null});
+        assert!(Vellev::same_segments(&unreported, &unreported.clone()).is_err());
+        assert!(Vellev::same_segments(&settled, &unreported).is_err());
     }
 
     #[test]

@@ -76,6 +76,11 @@ struct Args {
     /// diagnosis, such as somewhere for a profile to be written.
     #[arg(long)]
     vellev_mount: Vec<String>,
+    /// Fail unless vellev holds at least one segment with a clustered
+    /// index once measured: for a gate meant to exercise that index, which
+    /// only a segment of more than 200,000 rows has.
+    #[arg(long)]
+    require_clustered: bool,
     /// Run one engine alone (`vellev` or `weaviate`), for a timing or a
     /// diagnosis: no comparison, no gate.
     #[arg(long)]
@@ -158,7 +163,7 @@ async fn measured(
     plan: &Plan,
     queries: &[Query],
     warmup: &[Query],
-) -> Result<(Phases, Vec<Measured>, run::Floor)> {
+) -> Result<(Phases, Vec<Measured>, run::Floor, Value)> {
     engine.create().await?;
     sampler.phase("load");
     let load_seconds = run::load(engine.clone(), fixture, plan).await?;
@@ -168,6 +173,7 @@ async fn measured(
         "{}: loaded in {load_seconds:.0} s, settled {settle_seconds:.0} s later",
         engine.name()
     );
+    let settled = engine.layout().await?;
     sampler.phase("warmup");
     let (warmup_seconds, warmup_refused) = run::warm(engine.as_ref(), warmup).await?;
     sampler.phase("measure");
@@ -191,6 +197,7 @@ async fn measured(
         },
         measured,
         floor,
+        settled,
     ))
 }
 
@@ -297,13 +304,16 @@ async fn vellev(
             "create",
             Some(format!("http://127.0.0.1:{}/metrics", docker::VELLEV_METRICS_PORT)),
         );
-        let (phases, measured, floor) =
+        let (phases, measured, floor, settled) =
             measured(engine.clone(), &sampler, fixture, truth, plan, queries, warmup).await?;
         let at_rest = steady(&cgroups, &args.data).await?;
         sampler.phase("hybrid");
         let reference = run::vellev_reference(&engine, queries, truth).await?;
         let hybrid = run::hybrid(engine.as_ref(), queries, &reference, plan.reps, plan.defaults_only).await?;
-        let settings = engine.settings().await?;
+        let mut settings = engine.settings().await?;
+        // The segments once the writes settled, beside those after
+        // measuring: the gate holds them to be the same.
+        settings["segments_settled"] = settled;
         std::fs::write(args.out.join("vellev-metrics.txt"), engine.metrics().await?)?;
         sampler.phase("open");
         let cold = || {
@@ -368,7 +378,7 @@ async fn weaviate(
         let engine = Arc::new(Weaviate::new(&url, index)?);
         let cgroups = vec![container.cgroup()?];
         let sampler = Sampler::start(cgroups.clone(), args.data.clone(), "create", None);
-        let (phases, measured, floor) =
+        let (phases, measured, floor, _) =
             measured(engine.clone(), &sampler, fixture, truth, plan, queries, warmup).await?;
         let at_rest = steady(&cgroups, &args.data).await?;
         sampler.phase("hybrid");
@@ -717,6 +727,9 @@ async fn gate_only(
     environment: Value,
 ) -> Result<()> {
     let run = vellev(args, fixture, truth, plan, pinning, queries, warmup).await?;
+    let segments = run.settings["segments"].clone();
+    let settled = run.settings["segments_settled"].clone();
+    eprintln!("vellev's segments once settled: {settled}; once measured: {segments}");
     let gate = report::gate(
         &run.measured,
         cases,
@@ -736,16 +749,21 @@ async fn gate_only(
         args.out.join("results.json"),
         serde_json::to_string_pretty(&results)?,
     )?;
-    let summary = report::summary(
-        &[],
-        &[],
-        &[],
-        &gate,
-        args.rows,
-        "The pull-request gate: vellev at its defaults, limit 10.",
+    let header = format!(
+        "The pull-request gate: vellev at its defaults, limit 10. Segments once measured: {} clustered ({} rows), {} without a clustered index ({} rows).",
+        segments["clustered"], segments["clustered_rows"], segments["plain"], segments["plain_rows"]
     );
+    let summary = report::summary(&[], &[], &[], &gate, args.rows, &header);
     std::fs::write(args.out.join("summary.md"), &summary)?;
     println!("{summary}");
+    Vellev::same_segments(&settled, &segments)?;
+    if args.require_clustered {
+        let clustered = segments["clustered"].as_f64();
+        ensure!(
+            clustered.is_some_and(|clustered| clustered >= 1.0),
+            "no segment with a clustered index was measured ({segments}): the gate did not exercise it"
+        );
+    }
     ensure!(gate.passed, "the hard gate failed: see summary.md");
     Ok(())
 }
