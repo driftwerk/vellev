@@ -1083,7 +1083,8 @@ impl ClusteredIndex {
     /// at least [`Self::probes`] of them and more while too few are found,
     /// a block of rows weighed at a time. `query` is prepared. With more
     /// than one of `parts`, the clusters it must probe are split into as
-    /// many runs, scanned on the rayon pool each with its own shortlist,
+    /// many runs, scanned on the read pool ([`crate::pool::reads`]) each
+    /// with its own shortlist,
     /// and the shortlists merged; what it finds is the same nearest
     /// `count`, as the rows offered are, and only offers' order differs.
     fn scanned(
@@ -1102,18 +1103,17 @@ impl ClusteredIndex {
         let mut nearest = Nearest::new(count, ties);
         let runs = parts.min(probes);
         if runs > 1 {
-            let shortlists: Vec<Vec<(f32, u32)>> = (0..runs)
-                .into_par_iter()
-                .map(|run| {
-                    let clusters = &order[probes * run / runs..probes * (run + 1) / runs];
-                    let mut scan = Scan::new(self, query, only, skipped);
-                    let mut nearest = Nearest::new(count, ties);
-                    for (_, cluster) in clusters {
-                        scan.cluster(*cluster, &mut nearest);
-                    }
-                    nearest.estimates()
-                })
-                .collect();
+            let scan_run = |run: usize| {
+                let clusters = &order[probes * run / runs..probes * (run + 1) / runs];
+                let mut scan = Scan::new(self, query, only, skipped);
+                let mut nearest = Nearest::new(count, ties);
+                for (_, cluster) in clusters {
+                    scan.cluster(*cluster, &mut nearest);
+                }
+                nearest.estimates()
+            };
+            let shortlists: Vec<Vec<(f32, u32)>> =
+                crate::pool::reads().install(|| (0..runs).into_par_iter().map(scan_run).collect());
             for (distance, row) in shortlists.into_iter().flatten() {
                 if !nearest.turns_away(distance) {
                     nearest.offer(distance, row);
@@ -1580,10 +1580,14 @@ mod tests {
             count in 1usize..300,
             share in proptest::option::of(proptest::prop_oneof![1u32..5, 5u32..100]),
             parts in 2usize..9,
+            copies in proptest::prop_oneof![3 => proptest::strategy::Just(1usize), 1 => 2usize..6],
         ) {
+            // With copies, rows of one vector tie, across the runs' merge.
             let vectors: Vec<Vec<f32>> = {
                 let mut noise = Noise(seed);
-                (0..rows).map(|_| noise.vector(dimensions)).collect()
+                let distinct: Vec<Vec<f32>> =
+                    (0..rows.div_ceil(copies)).map(|_| noise.vector(dimensions)).collect();
+                (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
             };
             let index = indexed(metric, &vectors);
             let mut noise = Noise(seed.rotate_left(17) | 1);

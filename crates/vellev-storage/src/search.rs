@@ -24,10 +24,14 @@ pub struct Query<'a> {
     /// Only rows passing this are considered, exactly.
     pub filter: Option<&'a Filter>,
     pub oversample: usize,
-    /// How many parts the search may be split into on the rayon pool: its
-    /// layers searched at once, and each clustered scan split as
-    /// [`ClusteredIndex::estimates_split`] splits it. 1 searches on the
-    /// calling thread alone. What is found is the same whatever it is.
+    /// How many parts the search may be split into on the read pool
+    /// ([`vellev_index::pool::reads`]): its layers searched at once, and
+    /// each clustered scan split as [`ClusteredIndex::estimates_split`]
+    /// splits it. 1 searches on the calling thread alone. What is found is
+    /// the same whatever it is. The read pool has as many threads as
+    /// rayon's global pool, so while a flush or merge builds an index
+    /// there, threads briefly outnumber cores; the node splits a read only
+    /// over the threads other reads leave idle.
     pub split: usize,
 }
 
@@ -103,6 +107,7 @@ impl State {
         budget: usize,
         work: &mut Work,
     ) -> Result<Vec<Hit<'_>>> {
+        work.split_parts = work.split_parts.max(query.split.max(1) as u64);
         let (id, schema) = self.catalog().known(collection)?;
         schema.embedding.check(query.vector)?;
         let predicate = query
@@ -119,22 +124,24 @@ impl State {
             // Each layer's candidates on the rayon pool, taken in layer
             // order: the same as one after another.
             true => {
-                let found: Vec<(Candidates, Work)> = layers
-                    .par_iter()
-                    .map(|layer| {
-                        let mut done = Work::default();
-                        let offered = candidates(
-                            layer,
-                            id,
-                            predicate.as_ref(),
-                            query.vector,
-                            budget,
-                            split,
-                            &mut done,
-                        );
-                        (offered, done)
-                    })
-                    .collect();
+                let found: Vec<(Candidates, Work)> = vellev_index::pool::reads().install(|| {
+                    layers
+                        .par_iter()
+                        .map(|layer| {
+                            let mut done = Work::default();
+                            let offered = candidates(
+                                layer,
+                                id,
+                                predicate.as_ref(),
+                                query.vector,
+                                budget,
+                                split,
+                                &mut done,
+                            );
+                            (offered, done)
+                        })
+                        .collect()
+                });
                 found
                     .into_iter()
                     .map(|(offered, done)| {

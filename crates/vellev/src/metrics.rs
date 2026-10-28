@@ -202,6 +202,8 @@ impl Metrics {
             ("estimated", work.estimated),
             ("postings", work.postings),
             ("keyword_rows", work.keyword_rows),
+            // A vector search's parts: more than 1 where it was split.
+            ("split_parts", work.split_parts),
         ];
         for (kind, count) in kinds {
             self.work

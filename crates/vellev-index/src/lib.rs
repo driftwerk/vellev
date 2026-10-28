@@ -5,6 +5,7 @@ pub mod curve;
 mod fastscan;
 pub mod filter;
 pub mod fusion;
+pub mod pool;
 mod rotation;
 pub mod text;
 pub mod vector;
