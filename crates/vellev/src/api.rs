@@ -384,7 +384,7 @@ async fn read<T: Send + 'static>(
     app: &App,
     tenant: &TenantId,
     reader: Reader,
-    f: impl FnOnce(&State, &mut Work) -> Result<T, ApiError> + Send + 'static,
+    f: impl FnOnce(&State, &mut Work, usize) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
     let turn = match app.reading(tenant).await {
         Ok(turn) => turn,
@@ -393,10 +393,13 @@ async fn read<T: Send + 'static>(
             return Err(turned_away);
         }
     };
+    // How many parts the search may be split into, by how busy the node
+    // is as the read begins.
+    let split = turn.split();
     let (read, work) = turn
         .run(move || {
             let mut work = Work::default();
-            let read = reader.read(|state| f(state, &mut work));
+            let read = reader.read(|state| f(state, &mut work, split));
             (read, work)
         })
         .await?;
@@ -1047,16 +1050,14 @@ pub async fn nearest(
             })?,
         _ => return Err(ApiError::invalid("send either a vector or a text")),
     };
-    let results = read(&app, &tenant, reader, move |state, work| {
+    let results = read(&app, &tenant, reader, move |state, work, split| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = VectorQuery {
             vector: &vector,
             limit,
             filter: filter.as_ref(),
             oversample,
-            // One part: whether to split a search by how busy the node is
-            // comes next.
-            split: 1,
+            split,
         };
         let hits = state.search_counted(&collection, &query, work)?;
         Ok(hits
@@ -1087,7 +1088,7 @@ pub async fn keyword(
 ) -> Answer<Results> {
     let limit = app.limit(asked.limit)?;
     let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
-    let results = read(&app, &tenant, reader, move |state, work| {
+    let results = read(&app, &tenant, reader, move |state, work, _split| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = Keywords {
             text: &asked.text,
@@ -1157,7 +1158,7 @@ pub async fn hybrid(
             Err(error) => return Err(error.into()),
         },
     };
-    let results = read(&app, &tenant, reader, move |state, work| {
+    let results = read(&app, &tenant, reader, move |state, work, split| {
         let filter = viewer.narrowed(&schema(state, &collection)?, asked.filter);
         let query = HybridQuery {
             text: &asked.text,
@@ -1169,7 +1170,7 @@ pub async fn hybrid(
             candidates,
             filter: filter.as_ref(),
             oversample,
-            split: 1,
+            split,
         };
         let found = state.hybrid_counted(&collection, &query, work)?;
         Ok(found
@@ -1203,7 +1204,7 @@ pub async fn list(
 ) -> Answer<Objects> {
     let limit = app.limit(page.limit)?;
     let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
-    read(&app, &tenant, reader, move |state, _work| {
+    read(&app, &tenant, reader, move |state, _work, _split| {
         let filter = viewer.narrowed(&schema(state, &collection)?, page.filter);
         let found = state.list(&collection, filter.as_ref(), page.after, limit + 1)?;
         let next = (found.len() > limit).then(|| found[limit - 1].id());
@@ -1235,7 +1236,7 @@ pub async fn count(
     Body(counting): Body<Counting>,
 ) -> Answer<Counted> {
     let reader = metrics::timed(Stage::Reader, app.node()?.reader(&tenant, fresh)).await?;
-    read(&app, &tenant, reader, move |state, _work| {
+    read(&app, &tenant, reader, move |state, _work, _split| {
         let filter = viewer.narrowed(&schema(state, &collection)?, counting.filter);
         let count = match &filter {
             Some(filter) => state.select(&collection, filter)?.len(),
