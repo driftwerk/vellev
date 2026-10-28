@@ -13,13 +13,13 @@ use std::sync::OnceLock;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
-/// The read pool: as many threads as rayon's global pool has, as the node
-/// sets it, made when first asked for.
+/// The read pool: as many threads as rayon's global pool has, sized as
+/// rayon sizes that (RAYON_NUM_THREADS, and so on), whichever pool first
+/// asks for it, made when first asked for.
 pub fn reads() -> &'static ThreadPool {
     static READS: OnceLock<ThreadPool> = OnceLock::new();
     READS.get_or_init(|| {
         ThreadPoolBuilder::new()
-            .num_threads(rayon::current_num_threads())
             .thread_name(|n| format!("vellev-read-{n}"))
             .build()
             .expect("the read pool's threads")

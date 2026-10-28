@@ -79,6 +79,14 @@ impl Turn {
 /// wait for one: the threads the other reads leave it, one at least, and
 /// one whenever a read waits. Split, a search is faster alone but costs
 /// more in all, so a node that is busy answers more by not splitting.
+///
+/// An index build does not stop a read splitting (#146). Measured on
+/// 4-thread runners during a 300,000-row build (the `split_during_build`
+/// bench, runs 40669806629 and 40676350644), a read's search took p50 13
+/// ms split against 20 ms unsplit at 30 reads a second, and 9 against 14
+/// back to back. The build took longer: about 5% at 30 reads a second,
+/// where both read alike, and 27% back to back, where the split reader
+/// read twice as much.
 pub(crate) fn split_for(threads: usize, taken: usize, waiting: usize) -> usize {
     if waiting > 0 {
         return 1;
