@@ -472,3 +472,45 @@ async fn a_built_clustered_segment_keeps_the_curve_of_its_rows() {
         .read(|state| state.segments().cloned().collect());
     assert_eq!(&opened[0].probes, curves, "every node reads the same curve");
 }
+
+/// Curves committed for a segment are kept in its entry and read by every
+/// node, the memtable flushed along; a curve for a segment a merge has
+/// replaced is not committed; and a later merge's segment keeps none of
+/// its run's.
+#[tokio::test]
+async fn curves_committed_for_a_segment_are_kept_and_a_replaced_one_gets_none() {
+    use vellev_index::curve::{Curve, Source};
+    use vellev_storage::format::SegmentCurve;
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let segment = segments_of(&cluster).await[0].clone();
+    let built = segment.probes[0].clone();
+    let clusters = built.curve.clusters;
+    let asked = SegmentCurve {
+        collection: built.collection,
+        band: 0,
+        curve: Curve::of(Source::Queries, 50, clusters, (0..500).map(|n| n % clusters).collect()).unwrap(),
+    };
+    // One row more in the memtable, flushed along with the commit.
+    writer.commit(vec![row("notes", ROWS, vectors[0].clone())]).await.unwrap();
+    let committed = writer
+        .commit_curves(vec![(segment.key.clone(), asked.clone())])
+        .await
+        .unwrap();
+    assert!(committed.is_some(), "a curve for a segment that is there");
+    let kept = segments_of(&cluster).await;
+    assert_eq!(kept.len(), 2, "the memtable was flushed along: {kept:?}");
+    assert_eq!(kept[0].key, segment.key);
+    assert_eq!(kept[0].probes, vec![asked.clone()], "the queries curve replaces the rows one");
+    let follower = cluster.open().await;
+    let read: Vec<SegmentMeta> = follower.partition().read(|state| state.segments().cloned().collect());
+    assert_eq!(read[0].probes, vec![asked.clone()], "every node reads it");
+
+    // A curve for a segment no longer there: nothing committed.
+    let gone = writer
+        .commit_curves(vec![("tenant-a/0/segment/not-there.segment".into(), asked)])
+        .await
+        .unwrap();
+    assert_eq!(gone, None);
+}

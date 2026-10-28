@@ -1608,6 +1608,35 @@ mod tests {
     }
 
     proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
+        /// An index read back from its file has no curve of its rows, and a
+        /// pass over the rows it indexes gives the very curve its build
+        /// gave: a segment built before curves gets the one it would have.
+        #[test]
+        fn a_rows_pass_over_an_index_read_back_gives_the_curve_its_build_gave(
+            seed in 1u64..u64::MAX,
+            rows in 30usize..1200,
+            dimensions in 2usize..40,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let built = indexed(metric, &vectors);
+            let read: ClusteredIndex =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
+            proptest::prop_assert_eq!(read.rows_curve(), None);
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+                .collect();
+            proptest::prop_assert_eq!(read.curve_of_rows(&numbered), built.rows_curve());
+        }
+    }
+
+    proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
         /// Tuning finds each sample row's nearest rows in one pass over the
         /// rows for all samples at once, as a pass for each sample finds
