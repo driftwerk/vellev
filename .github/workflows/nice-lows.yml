@@ -1,0 +1,16 @@
+name: Nice lows (scratch)
+
+on:
+  push:
+    branches: [scratch-nice-lows]
+
+permissions:
+  contents: read
+
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p vellev-index --lib pool:: ; cargo test --locked -p vellev-index --test pool_first --test pool
