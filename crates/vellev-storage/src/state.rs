@@ -477,6 +477,20 @@ fn segment_bytes(rows: &[Row], vectors: &Column) -> usize {
     rows.iter().map(row_bytes).sum::<usize>() + vectors.resident()
 }
 
+/// About how many bytes a segment's vector indexes take in memory: its
+/// clustered indexes' codes, factors, rows and centroids, or its one-bit
+/// codes.
+fn indexes_bytes(indexes: &Indexes) -> usize {
+    indexes
+        .values()
+        .map(|index| match &index.vectors {
+            Some(Vectors::Clustered(clustered)) => clustered.resident(),
+            Some(Vectors::Binary(codes)) => codes.resident(),
+            None => 0,
+        })
+        .sum()
+}
+
 /// About how many bytes a row takes in memory, with its place among the
 /// live rows and what the filter and keyword indexes hold of it: about as
 /// much again as its text, and a little for each value.
@@ -1030,6 +1044,15 @@ impl State {
     /// indexes them, and whatever vectors are held in memory rather than
     /// read in place from local files. Rough, and cheap to ask: each part
     /// is counted as it is made.
+    /// About how many bytes the segments' vector indexes take: counted in
+    /// [`Self::resident`].
+    pub fn indexes_resident(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| indexes_bytes(&segment.indexes))
+            .sum()
+    }
+
     pub fn resident(&self) -> usize {
         let segments: usize = self.segments.iter().map(|segment| segment.resident).sum();
         let codes: usize = self
@@ -1469,7 +1492,7 @@ impl State {
             })
             .collect();
         self.segments.push(Segment {
-            resident: segment_bytes(&file.rows, &vectors),
+            resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
             meta,
             file,
             vectors,
@@ -1958,7 +1981,7 @@ impl State {
         self.segments.splice(
             run.clone(),
             [Segment {
-                resident: segment_bytes(&file.rows, &vectors),
+                resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
                 meta,
                 file,
                 vectors,
@@ -2167,7 +2190,7 @@ impl State {
                 })
                 .collect();
             self.segments.push(Segment {
-                resident: segment_bytes(&file.rows, &vectors),
+                resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
                 meta,
                 file,
                 vectors,
