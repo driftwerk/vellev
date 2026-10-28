@@ -2364,6 +2364,20 @@ impl Writer {
         if curves.is_empty() {
             return Ok(None);
         }
+        // A curve is of a clustered index: one for a collection its segment
+        // has none of is a caller's mistake, and none of what was given is
+        // committed.
+        if let Some((key, curve)) = self.partition.read(|state| {
+            curves
+                .iter()
+                .find(|(key, curve)| !state.clustered_in(key, curve.collection))
+                .cloned()
+        }) {
+            return Err(StorageError::InvalidMutation(format!(
+                "a curve for collection {} of segment {key}, which has no clustered index of it",
+                curve.collection.0
+            )));
+        }
         let mut staged = self.staging();
         let snapshot = self.partition.read(State::taken);
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;

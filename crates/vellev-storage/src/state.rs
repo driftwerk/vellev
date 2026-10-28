@@ -1857,6 +1857,12 @@ impl State {
         Ok(Some(manifest))
     }
 
+    /// Whether the segment `key` holds a clustered index of `collection`.
+    pub(crate) fn clustered_in(&self, key: &str, collection: CollectionId) -> bool {
+        self.clustered_curves()
+            .any(|(segment, of, _, _)| segment.meta.key == key && of == collection)
+    }
+
     /// Each clustered index of the segments held, with the segment, its
     /// collection, and the curve of band 0 its entry has for that
     /// collection, if any.
