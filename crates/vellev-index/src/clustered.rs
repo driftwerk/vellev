@@ -23,6 +23,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use vellev_core::Distance;
 
+use crate::fastscan::{chosen, Blocks, Tables, BLOCK};
 use crate::rotation::{Random, Rotation};
 use crate::vector::{
     allowed, as_far_from_every_vector, dot, in_row_order, measurable, nearest, normalised,
@@ -89,7 +90,8 @@ impl fmt::Debug for ClusteredIndex {
 #[serde(try_from = "ClusterWire", into = "ClusterWire")]
 struct Cluster {
     rows: Vec<u32>,
-    codes: Vec<u64>,
+    /// The rows' codes, laid out in blocks for the scan.
+    blocks: Blocks,
     factors: Vec<Factor>,
 }
 
@@ -189,7 +191,7 @@ impl Wire {
         }
         self.clusters
             .iter()
-            .position(|cluster| cluster.codes.len() != cluster.rows.len() * (width / 64))
+            .position(|cluster| !cluster.rows.is_empty() && cluster.blocks.words() != width / 64)
             .map(|cluster| format!("cluster {cluster}'s codes are not {width} bits a row"))
     }
 }
@@ -270,8 +272,8 @@ struct ClusterWire {
 impl From<Cluster> for ClusterWire {
     fn from(cluster: Cluster) -> Self {
         Self {
+            codes: cluster.blocks.codes(),
             rows: cluster.rows,
-            codes: cluster.codes,
             norms: cluster.factors.iter().map(|f| f.norm).collect(),
             aligns: cluster.factors.iter().map(|f| f.align).collect(),
             alongs: cluster.factors.iter().map(|f| f.along).collect(),
@@ -288,6 +290,13 @@ impl TryFrom<ClusterWire> for Cluster {
         if [wire.norms.len(), wire.aligns.len(), wire.alongs.len()] != [rows; 3] {
             return Err(format!("a cluster of {rows} rows without factors for each"));
         }
+        let words = wire.codes.len().checked_div(rows).unwrap_or(0);
+        if words * rows != wire.codes.len() {
+            return Err(format!(
+                "a cluster of {rows} rows with {} code words, not whole codes",
+                wire.codes.len()
+            ));
+        }
         let factors = wire
             .norms
             .into_iter()
@@ -296,8 +305,8 @@ impl TryFrom<ClusterWire> for Cluster {
             .map(|((norm, align), along)| Factor { norm, align, along })
             .collect();
         Ok(Self {
+            blocks: Blocks::new(&wire.codes, words),
             rows: wire.rows,
-            codes: wire.codes,
             factors,
         })
     }
@@ -307,6 +316,9 @@ impl TryFrom<ClusterWire> for Cluster {
 /// quantized to [`QUERY_BITS`] bit planes, with what the estimate needs.
 struct Probe {
     planes: Vec<u64>,
+    /// Each dimension's level, as the planes hold it bit by bit: what the
+    /// tables a scan of blocks weighs by are made from.
+    levels: Vec<u8>,
     words: usize,
     /// How this machine counts a code's bits against the planes: with its
     /// popcount instruction where it has one.
@@ -332,6 +344,7 @@ impl Probe {
         let words = residual.len() / 64;
         debug_assert_eq!(residual.len() % 64, 0, "a rotation's width is whole words");
         let mut planes = vec![0u64; words * QUERY_BITS as usize];
+        let mut levels_of = vec![0u8; residual.len()];
         // A word of each plane at a time, each value's level taken as
         // before and its bits laid into the words without a branch: the
         // same planes, readied several times as fast.
@@ -340,6 +353,7 @@ impl Probe {
                 let mut bits = [0u64; QUERY_BITS as usize];
                 for (at, value) in chunk.iter().enumerate() {
                     let level = ((value - lower) / delta).round().clamp(0.0, levels) as u64;
+                    levels_of[word * 64 + at] = level as u8;
                     for (bit, plane) in bits.iter_mut().enumerate() {
                         *plane |= (level >> bit & 1) << at;
                     }
@@ -351,6 +365,7 @@ impl Probe {
         }
         Self {
             planes,
+            levels: levels_of,
             words,
             counted: counter(),
             lower,
@@ -364,14 +379,29 @@ impl Probe {
 
     /// The inner product of the direction a code stands for with the
     /// query's difference from the centroid.
+    #[cfg(test)]
     fn inner(&self, code: &[u64], factor: &Factor) -> f32 {
         let (ones, weighted) = (self.counted)(code, &self.planes, self.words);
+        self.inner_of(ones, weighted, factor)
+    }
+
+    /// As [`Self::inner`], from a code's counts: its set bits, and the sum
+    /// of the query's levels over them.
+    #[inline(always)]
+    fn inner_of(&self, ones: u32, weighted: u32, factor: &Factor) -> f32 {
         let set = self.lower * ones as f32 + self.delta * weighted as f32;
         (2.0 * set - self.sum) * self.scale / factor.align
     }
 
     fn distance(&self, metric: Distance, code: &[u64], factor: &Factor) -> f32 {
-        let inner = self.inner(code, factor);
+        let (ones, weighted) = (self.counted)(code, &self.planes, self.words);
+        self.distance_of(metric, ones, weighted, factor)
+    }
+
+    /// As [`Self::distance`], from a code's counts.
+    #[inline(always)]
+    fn distance_of(&self, metric: Distance, ones: u32, weighted: u32, factor: &Factor) -> f32 {
+        let inner = self.inner_of(ones, weighted, factor);
         match metric {
             Distance::L2 => {
                 factor.norm * factor.norm + self.norm_squared - 2.0 * factor.norm * inner
@@ -683,21 +713,24 @@ impl ClusteredIndex {
             })
             .collect();
 
-        let mut clusters: Vec<Cluster> = (0..k)
-            .map(|_| Cluster {
-                rows: Vec::new(),
-                codes: Vec::new(),
-                factors: Vec::new(),
-            })
-            .collect();
+        let mut members: Vec<(Vec<u32>, Vec<u64>, Vec<Factor>)> =
+            (0..k).map(|_| Default::default()).collect();
         let mut at = Vec::with_capacity(vectors.len());
         for ((row, _), (cluster, code, factor)) in vectors.iter().zip(coded) {
-            let members = &mut clusters[cluster];
-            at.push((cluster as u32, members.rows.len() as u32));
-            members.rows.push(*row);
-            members.codes.extend(code);
-            members.factors.push(factor);
+            let (rows, codes, factors) = &mut members[cluster];
+            at.push((cluster as u32, rows.len() as u32));
+            rows.push(*row);
+            codes.extend(code);
+            factors.push(factor);
         }
+        let clusters: Vec<Cluster> = members
+            .into_iter()
+            .map(|(rows, codes, factors)| Cluster {
+                rows,
+                blocks: Blocks::new(&codes, width / 64),
+                factors,
+            })
+            .collect();
         let mut index = Self {
             metric,
             dimensions,
@@ -824,11 +857,6 @@ impl ClusteredIndex {
     fn centroid(&self, cluster: usize) -> &[f32] {
         &self.centroids[cluster * self.rotation.width..][..self.rotation.width]
     }
-
-    fn code<'a>(&self, cluster: &'a Cluster, index: usize) -> &'a [u64] {
-        let words = self.rotation.width / 64;
-        &cluster.codes[index * words..][..words]
-    }
 }
 
 impl VectorIndex for ClusteredIndex {
@@ -881,41 +909,99 @@ impl VectorIndex for ClusteredIndex {
         let query = self.prepared(query);
         let per_probe = self.rows.len().div_ceil(self.clusters.len()) * self.probes;
         match only {
-            // Fewer rows allowed than a scan would visit: visit just those,
-            // readying the query for each cluster met.
+            // Fewer rows allowed than a scan would visit: visit just those.
             Some(only) if (only.len() as usize) <= per_probe => {
-                let mut probes: Vec<Option<Probe>> = std::iter::repeat_with(|| None)
-                    .take(self.clusters.len())
-                    .collect();
-                for row in only.iter().filter(|row| kept(*row)) {
-                    let Some(position) = self.position(row) else {
-                        continue;
-                    };
-                    let (cluster, index) = self.at[position];
-                    let probe = probes[cluster as usize]
-                        .get_or_insert_with(|| Probe::new(&query, self.centroid(cluster as usize)));
-                    let members = &self.clusters[cluster as usize];
-                    let code = self.code(members, index as usize);
-                    let distance =
-                        probe.distance(self.metric, code, &members.factors[index as usize]);
-                    nearest.offer(distance, row);
-                }
+                self.visited(&query, count, only, skipped, ties)
             }
-            _ => {
-                let allowed = |row: u32| kept(row) && only.is_none_or(|only| only.contains(row));
-                for (probed, (_, cluster)) in self.order(&query).into_iter().enumerate() {
-                    if probed >= self.probes && nearest.is_full() {
-                        break;
-                    }
-                    let probe = Probe::new(&query, self.centroid(cluster));
-                    let members = &self.clusters[cluster];
-                    for (index, row) in members.rows.iter().enumerate() {
-                        if allowed(*row) {
-                            let code = self.code(members, index);
-                            let distance =
-                                probe.distance(self.metric, code, &members.factors[index]);
-                            nearest.offer(distance, *row);
-                        }
+            _ => self.scanned(&query, count, only, skipped, ties),
+        }
+    }
+}
+
+impl ClusteredIndex {
+    /// Whether `row` may be offered: not skipped, and with an estimate.
+    fn kept(&self, row: u32, skipped: &[bool]) -> bool {
+        !skipped.get(row as usize).copied().unwrap_or(false)
+            && self.unmeasured.binary_search(&row).is_err()
+    }
+
+    /// The `count` nearest of the rows `only` allows, each estimated from
+    /// its code, the query readied once for each cluster met. `query` is
+    /// prepared.
+    fn visited(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: &RoaringBitmap,
+        skipped: &[bool],
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)> {
+        let mut nearest = Nearest::new(count, ties);
+        let mut probes: Vec<Option<Probe>> = std::iter::repeat_with(|| None)
+            .take(self.clusters.len())
+            .collect();
+        let mut code = vec![0u64; self.rotation.width / 64];
+        for row in only.iter().filter(|row| self.kept(*row, skipped)) {
+            let Some(position) = self.position(row) else {
+                continue;
+            };
+            let (cluster, index) = self.at[position];
+            let probe = probes[cluster as usize]
+                .get_or_insert_with(|| Probe::new(query, self.centroid(cluster as usize)));
+            let members = &self.clusters[cluster as usize];
+            members.blocks.code(index as usize, &mut code);
+            let distance = probe.distance(self.metric, &code, &members.factors[index as usize]);
+            nearest.offer(distance, row);
+        }
+        nearest.estimates()
+    }
+
+    /// The `count` nearest allowed rows of the clusters nearest the query,
+    /// at least [`Self::probes`] of them and more while too few are found,
+    /// a block of rows weighed at a time. `query` is prepared.
+    fn scanned(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)> {
+        let mut nearest = Nearest::new(count, ties);
+        let allowed =
+            |row: u32| self.kept(row, skipped) && only.is_none_or(|only| only.contains(row));
+        let (_, weigh) = chosen();
+        let mut weighed = [0u32; BLOCK];
+        let mut offered = [false; BLOCK];
+        for (probed, (_, cluster)) in self.order(query).into_iter().enumerate() {
+            if probed >= self.probes && nearest.is_full() {
+                break;
+            }
+            let probe = Probe::new(query, self.centroid(cluster));
+            let tables = Tables::new(&probe.levels);
+            let members = &self.clusters[cluster];
+            for block in 0..members.blocks.count() {
+                let rows =
+                    &members.rows[block * BLOCK..members.rows.len().min((block + 1) * BLOCK)];
+                let mut any = false;
+                for (offer, row) in offered.iter_mut().zip(rows) {
+                    *offer = allowed(*row);
+                    any |= *offer;
+                }
+                if !any {
+                    continue;
+                }
+                weigh(members.blocks.block(block), &tables, &mut weighed);
+                for (lane, row) in rows.iter().enumerate() {
+                    if offered[lane] {
+                        let index = block * BLOCK + lane;
+                        let distance = probe.distance_of(
+                            self.metric,
+                            members.blocks.ones(index),
+                            weighed[lane],
+                            &members.factors[index],
+                        );
+                        nearest.offer(distance, *row);
                     }
                 }
             }
@@ -1386,7 +1472,9 @@ mod tests {
                     continue;
                 }
                 let exact = f64::from(dot(&from, &residual) / norm);
-                let estimated = f64::from(probe.inner(index.code(members, i), &members.factors[i]));
+                let mut code = vec![0u64; members.blocks.words()];
+                members.blocks.code(i, &mut code);
+                let estimated = f64::from(probe.inner(&code, &members.factors[i]));
                 cross += estimated * exact;
                 square += exact * exact;
                 error += (estimated - exact) * (estimated - exact);
@@ -1769,7 +1857,7 @@ mod tests {
             rmp_serde::from_slice::<ClusteredIndex>(&bytes).map(|index| index.len())
         };
         assert_eq!(reread(|_| {}).unwrap(), 1000);
-        let corruptions: [(&str, Corrupt); 11] = [
+        let corruptions: [(&str, Corrupt); 12] = [
             ("no clusters to scan", |wire| wire.probes = 0),
             ("more clusters to scan than there are", |wire| {
                 wire.probes = usize::MAX
@@ -1790,8 +1878,19 @@ mod tests {
             ("a centroid cut short", |wire| {
                 wire.centroids.pop();
             }),
-            ("a code cut short", |wire| {
-                wire.clusters[0].codes.pop();
+            ("codes cut short", |wire| {
+                let blocks = &wire.clusters[0].blocks;
+                let words = blocks.words();
+                let shorter: Vec<u64> = blocks
+                    .codes()
+                    .chunks_exact(words)
+                    .flat_map(|code| code[..words - 1].to_vec())
+                    .collect();
+                wire.clusters[0].blocks = Blocks::new(&shorter, words - 1);
+            }),
+            ("codes that are not whole rows", |wire| {
+                wire.clusters[0].rows.pop();
+                wire.clusters[0].factors.pop();
             }),
             ("a row without factors", |wire| {
                 wire.clusters[0].factors.pop();
