@@ -1,5 +1,6 @@
 //! Nearest-vector search over a partition's layers.
 
+use rayon::prelude::*;
 use vellev_core::{CollectionName, Object};
 use vellev_index::filter::{Filter, Predicate};
 use vellev_index::vector::{nearest, Scorer, VectorIndex};
@@ -21,6 +22,11 @@ pub struct Query<'a> {
     /// Only rows passing this are considered, exactly.
     pub filter: Option<&'a Filter>,
     pub oversample: usize,
+    /// How many parts the search may be split into on the rayon pool: its
+    /// layers searched at once, and each clustered scan split as
+    /// [`ClusteredIndex::estimates_split`] splits it. 1 searches on the
+    /// calling thread alone. What is found is the same whatever it is.
+    pub split: usize,
 }
 
 impl<'a> Query<'a> {
@@ -30,6 +36,7 @@ impl<'a> Query<'a> {
             limit,
             filter: None,
             oversample: DEFAULT_OVERSAMPLE,
+            split: 1,
         }
     }
 
@@ -105,8 +112,51 @@ impl State {
         let mut exact = Vec::new();
         let mut estimated = Vec::new();
         let mut floors = 0;
-        for (at, layer) in layers.iter().enumerate() {
-            let offered = candidates(layer, id, predicate.as_ref(), query.vector, budget, work);
+        let split = query.split.max(1);
+        let offers: Vec<Candidates> = match split > 1 && layers.len() > 1 {
+            // Each layer's candidates on the rayon pool, taken in layer
+            // order: the same as one after another.
+            true => {
+                let found: Vec<(Candidates, Work)> = layers
+                    .par_iter()
+                    .map(|layer| {
+                        let mut done = Work::default();
+                        let offered = candidates(
+                            layer,
+                            id,
+                            predicate.as_ref(),
+                            query.vector,
+                            budget,
+                            split,
+                            &mut done,
+                        );
+                        (offered, done)
+                    })
+                    .collect();
+                found
+                    .into_iter()
+                    .map(|(offered, done)| {
+                        work.add(&done);
+                        offered
+                    })
+                    .collect()
+            }
+            false => layers
+                .iter()
+                .map(|layer| {
+                    candidates(
+                        layer,
+                        id,
+                        predicate.as_ref(),
+                        query.vector,
+                        budget,
+                        split,
+                        work,
+                    )
+                })
+                .collect(),
+        };
+        for ((at, layer), offered) in layers.iter().enumerate().zip(offers) {
             exact.extend(offered.exact.into_iter().map(|row| (at, row)));
             // Each layer's own nearest few are always scored: one whose
             // estimates err more than others' would otherwise crowd them
@@ -190,6 +240,7 @@ fn candidates(
     predicate: Option<&Predicate>,
     vector: &[f32],
     count: usize,
+    split: usize,
     work: &mut Work,
 ) -> Candidates {
     let Some(index) = layer.indexes.get(&collection) else {
@@ -222,7 +273,14 @@ fn candidates(
     match vectors {
         Vectors::Clustered(clustered) => Candidates {
             exact: unmeasured,
-            estimated: Some(clustered.estimates(vector, count, only.as_ref(), layer.dead, &ties)),
+            estimated: Some(clustered.estimates_split(
+                vector,
+                count,
+                only.as_ref(),
+                layer.dead,
+                &ties,
+                split,
+            )),
         },
         Vectors::Binary(binary) => Candidates {
             exact: binary

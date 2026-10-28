@@ -1054,6 +1054,9 @@ pub async fn nearest(
             limit,
             filter: filter.as_ref(),
             oversample,
+            // One part: whether to split a search by how busy the node is
+            // comes next.
+            split: 1,
         };
         let hits = state.search_counted(&collection, &query, work)?;
         Ok(hits
@@ -1166,6 +1169,7 @@ pub async fn hybrid(
             candidates,
             filter: filter.as_ref(),
             oversample,
+            split: 1,
         };
         let found = state.hybrid_counted(&collection, &query, work)?;
         Ok(found
