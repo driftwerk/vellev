@@ -892,6 +892,21 @@ pub(crate) fn stored(segment: &str, indexes: &Indexes) -> SegmentIndex {
     }
 }
 
+/// The curves of the rows each clustered index among `indexes` was tuned
+/// on when built, as the segment's manifest entry keeps them (recall note,
+/// R7): none for an index read back from a file.
+pub(crate) fn curves(indexes: &Indexes) -> Vec<(CollectionId, Curve)> {
+    let mut curves: Vec<(CollectionId, Curve)> = indexes
+        .iter()
+        .filter_map(|(collection, index)| match &index.vectors {
+            Some(Vectors::Clustered(clustered)) => Some((*collection, clustered.rows_curve()?)),
+            _ => None,
+        })
+        .collect();
+    curves.sort_by_key(|(collection, _)| *collection);
+    curves
+}
+
 impl State {
     /// How the text of the upserts this state applied was split into
     /// tokens: see [`TextsApplied`].
