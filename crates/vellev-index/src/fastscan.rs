@@ -135,11 +135,18 @@ impl Tables {
         let bytes = &mut self.bytes;
         for (column, levels) in levels.chunks_exact(8).enumerate() {
             for (half, levels) in levels.chunks_exact(4).enumerate() {
-                let mut table = [0u8; 16];
-                for nibble in 1..16usize {
-                    let lowest = nibble.trailing_zeros() as usize;
-                    table[nibble] = table[nibble & (nibble - 1)] + levels[lowest];
-                }
+                // Entry n adds the levels of n's set bits: all 16 entries
+                // at once as the bytes of one 128-bit integer, each level
+                // copied into every byte and kept in the entries with its
+                // bit set. No byte reaches 256, so none carries into the
+                // next.
+                let table = levels
+                    .iter()
+                    .zip(WITH_BIT)
+                    .fold(0u128, |table, (level, with)| {
+                        table + ((u128::from(*level) * EVERY_BYTE) & with)
+                    })
+                    .to_le_bytes();
                 let at = column * 64 + half * 32;
                 bytes[at..at + 16].copy_from_slice(&table);
                 bytes[at + 16..at + 32].copy_from_slice(&table);
@@ -147,6 +154,27 @@ impl Tables {
         }
     }
 }
+
+/// A one in every byte of a 128-bit integer.
+const EVERY_BYTE: u128 = u128::MAX / 255;
+
+/// For each of a nibble's four bits, the bytes of a 16-entry table whose
+/// entry's nibble has that bit set, all ones, the rest zero.
+const WITH_BIT: [u128; 4] = {
+    let mut masks = [0u128; 4];
+    let mut bit = 0;
+    while bit < 4 {
+        let mut nibble = 0;
+        while nibble < 16 {
+            if nibble >> bit & 1 == 1 {
+                masks[bit] |= 0xff << (8 * nibble);
+            }
+            nibble += 1;
+        }
+        bit += 1;
+    }
+    masks
+};
 
 /// Weighs a block against a query's tables: for each row of the block, the
 /// sum of the levels of its set bits.
