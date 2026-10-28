@@ -15,8 +15,11 @@
 # archive only if its SHA-256 is pinned, and the library only if what it
 # unpacks to is pinned too: two sources, one artifact.
 #
-# PINS, DIST, SOURCES, RETRIES and REPOSITORY may be set to test it.
+# PINS, DIST, METADATA, FEATURES, SOURCES, RETRIES and REPOSITORY may be
+# set to test it.
 set -euo pipefail
+# A failure in $(...) fails what it is in, not only the subshell.
+shopt -s inherit_errexit
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PINS=${PINS:-$here/onnxruntime.tsv}
@@ -73,7 +76,9 @@ sources() {
 # pinned library into DIR.
 fetch() {
   local target=$1 dir=$2 archive_sha library_sha url work source got
-  read -r archive_sha library_sha url <<<"$(pin "$target")"
+  local pinned
+  pinned=$(pin "$target") || exit 1
+  read -r archive_sha library_sha url <<<"$pinned"
   work=$WORK/$target
   rm -rf "$work"
   mkdir -p "$work"
@@ -111,17 +116,66 @@ fetch() {
   echo "onnxruntime.sh: $target's pinned ONNX Runtime $(version_of "$url"), from $got, in $dir"
 }
 
+# The workspace's metadata, as Cargo.lock resolves it, read once.
+metadata() {
+  if [ ! -f "$WORK/metadata.json" ]; then
+    if [ -n "${METADATA:-}" ]; then
+      cat "$METADATA" >"$WORK/metadata.json"
+    else
+      (cd "$here/../.." && cargo metadata --format-version 1 --locked) >"$WORK/metadata.json"
+    fi
+  fi
+  cat "$WORK/metadata.json"
+}
+
+# The locked ort-sys's package id.
+ort_sys() {
+  local id
+  id=$(metadata | jq -r '.packages[]? | select(.name == "ort-sys") | .id')
+  [ -n "$id" ] || die "no ort-sys in the locked dependencies"
+  [ "$(wc -l <<<"$id")" -eq 1 ] || die "more than one ort-sys is locked"
+  echo "$id"
+}
+
 # ort-sys's dist.tsv, of the version Cargo.lock holds.
 locked_dist() {
-  local manifest
-  manifest=$(cd "$here/../.." && cargo metadata --format-version 1 --locked |
-    jq -er '.packages[] | select(.name == "ort-sys") | .manifest_path')
-  [ "$(wc -l <<<"$manifest")" -eq 1 ] || die "more than one ort-sys is locked"
+  local id manifest
+  id=$(ort_sys) || exit 1
+  manifest=$(metadata | jq -er --arg id "$id" '.packages[] | select(.id == $id) | .manifest_path')
   echo "$(dirname "$manifest")/build/download/dist.tsv"
 }
 
+# The features ort-sys is built with, across the workspace.
+features() {
+  local id
+  if [ -n "${FEATURES:-}" ]; then
+    echo "$FEATURES"
+  else
+    id=$(ort_sys) || exit 1
+    metadata | jq -r --arg id "$id" '.resolve.nodes[] | select(.id == $id) | .features[]'
+  fi
+}
+
+# ort-sys's features that make it download an ONNX Runtime other than the
+# one of feature set "none" (its build/download/resolve.rs), which is all
+# that is pinned.
+OTHER_BUILDS="training cuda tensorrt openvino onednn directml nnapi coreml xnnpack rocm acl armnn
+tvm migraphx rknpu vitis cann qnn webgpu azure nvrtx vsinpu"
+
 check() {
-  local dist=${DIST:-$(locked_dist)} target archive_sha library_sha url theirs checked=0
+  local dist built feature target archive_sha library_sha url theirs checked=0
+  built=$(features) || exit 1
+  for feature in $built; do
+    for other in $OTHER_BUILDS; do
+      [ "$feature" != "$other" ] ||
+        die "ort-sys is built with $feature, which downloads another ONNX Runtime than the pinned one"
+    done
+  done
+  if [ -n "${DIST:-}" ]; then
+    dist=$DIST
+  else
+    dist=$(locked_dist) || exit 1
+  fi
   [ -f "$dist" ] || die "no $dist"
   while IFS=$'\t' read -r target archive_sha library_sha url; do
     [[ -z $target || $target == \#* ]] && continue
