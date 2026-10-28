@@ -25,3 +25,12 @@ pub fn reads() -> &'static ThreadPool {
             .expect("the read pool's threads")
     })
 }
+
+/// Scratch: `op` on the read pool, or, with SCRATCH_GLOBAL_READS set, on
+/// the caller and so rayon's global pool, as before the read pool.
+pub fn install<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    match std::env::var("SCRATCH_GLOBAL_READS").is_ok() {
+        true => op(),
+        false => reads().install(op),
+    }
+}

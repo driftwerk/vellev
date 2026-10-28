@@ -122,7 +122,7 @@ impl State {
             // Each layer's candidates on the rayon pool, taken in layer
             // order: the same as one after another.
             true => {
-                let found: Vec<(Candidates, Work)> = vellev_index::pool::reads().install(|| {
+                let found: Vec<(Candidates, Work)> = vellev_index::pool::install(|| {
                     layers
                         .par_iter()
                         .map(|layer| {

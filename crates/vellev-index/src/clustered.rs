@@ -817,6 +817,12 @@ impl ClusteredIndex {
         self.probes
     }
 
+    /// Scratch: this index scanning `probes` clusters at least.
+    pub fn with_probes(mut self, probes: usize) -> Self {
+        self.probes = probes.clamp(1, self.clusters.len());
+        self
+    }
+
     /// Whether this is an index of just these vectors' rows, of their
     /// dimensions, measured by `metric`, or else in what it is not: what
     /// one read back from a file must be before it is trusted with them.
@@ -1108,7 +1114,7 @@ impl ClusteredIndex {
                 nearest.estimates()
             };
             let shortlists: Vec<Vec<(f32, u32)>> =
-                crate::pool::reads().install(|| (0..runs).into_par_iter().map(scan_run).collect());
+                crate::pool::install(|| (0..runs).into_par_iter().map(scan_run).collect());
             for (distance, row) in shortlists.into_iter().flatten() {
                 if !nearest.turns_away(distance) {
                     nearest.offer(distance, row);
