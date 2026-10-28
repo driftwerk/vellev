@@ -78,8 +78,10 @@ fetch() {
   got=
   for source in $(sources "$target" "$url"); do
     rm -f "$work/archive"
-    if ! curl -fsSL --retry "${RETRIES:-5}" --retry-connrefused --connect-timeout 20 --max-time 900 \
-      -o "$work/archive" "$source"; then
+    # A transfer that stalls, as pyke's CDN's have from CI runners, is cut
+    # off and tried again rather than waited out.
+    if ! curl -fsSL --retry "${RETRIES:-5}" --retry-connrefused --connect-timeout 20 --max-time 300 \
+      --speed-limit 50000 --speed-time 30 -o "$work/archive" "$source"; then
       echo "onnxruntime.sh: could not fetch $source" >&2
       continue
     fi
