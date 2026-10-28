@@ -6,8 +6,8 @@
 //!
 //! With `RATE` unset or 0 the reader reads back to back, so a faster arm
 //! also reads more during the build; with `RATE` reads a second, it reads
-//! on that schedule, each read's time taken from when it was due, so both
-//! arms read alike.
+//! on that schedule, so both arms read alike, each read timed both from
+//! when it was due and from when it began.
 //!
 //! ```sh
 //! VELLEV_FIXTURE=/path/to/fixture RATE=30 cargo test --release -p vellev-index \
@@ -103,14 +103,14 @@ fn a_lone_read_during_a_build_unsplit_and_split() {
         }
         for parts in order {
             let done = AtomicBool::new(false);
-            let (took, mut during, late) = std::thread::scope(|scope| {
+            let (took, (mut during, mut served), late) = std::thread::scope(|scope| {
                 let builder = scope.spawn(|| {
                     let at = Instant::now();
                     std::hint::black_box(ClusteredIndex::build(Distance::Cosine, &built));
                     done.store(true, Ordering::Relaxed);
                     at.elapsed().as_secs_f64()
                 });
-                let (mut times, mut late) = (Vec::new(), 0usize);
+                let (mut times, mut served, mut late) = (Vec::new(), Vec::new(), 0usize);
                 let start = Instant::now();
                 for (n, q) in queries.iter().cycle().enumerate() {
                     if parts == 0 || done.load(Ordering::Relaxed) {
@@ -126,22 +126,28 @@ fn a_lone_read_during_a_build_unsplit_and_split() {
                     } else {
                         Instant::now()
                     };
+                    let began = Instant::now();
                     search(q, parts);
+                    served.push(began.elapsed().as_secs_f64() * 1e3);
                     times.push(due.elapsed().as_secs_f64() * 1e3);
                 }
-                (builder.join().unwrap(), times, late)
+                (builder.join().unwrap(), (times, served), late)
             });
             if parts == 0 {
                 println!("round {round}, build alone: the build took {took:.1} s");
                 continue;
             }
             during.sort_by(f64::total_cmp);
+            served.sort_by(f64::total_cmp);
             println!(
-                "round {round}, {}: {} reads during the build ({late} late), p50 {:.2} ms p99 {:.2} ms; the build took {took:.1} s",
+                "round {round}, {}: {} reads during the build ({late} late), p50 {:.2} ms p99 {:.2} ms from when due, \
+                 p50 {:.2} ms p99 {:.2} ms from when begun; the build took {took:.1} s",
                 if parts == 1 { "unsplit" } else { "split" },
                 during.len(),
                 percentile(&during, 0.5),
                 percentile(&during, 0.99),
+                percentile(&served, 0.5),
+                percentile(&served, 0.99),
             );
         }
     }
