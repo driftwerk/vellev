@@ -37,6 +37,10 @@ const QUERY_BITS: u32 = 4;
 /// for its nearest [`TUNING_NEIGHBOURS`], and the clusters they lie in make
 /// the index's curve of its rows (recall note, R6.3 and R7).
 const TUNING_QUERIES: usize = 400;
+/// How many rows a block of the one pass tuning makes over the rows holds:
+/// small in tests, so that their rows span many blocks and the blocks'
+/// shortlists are merged.
+const TUNING_BLOCK: usize = if cfg!(test) { 64 } else { 4096 };
 const TUNING_NEIGHBOURS: usize = 10;
 const ITERATIONS: usize = 8;
 const MOST_CLUSTERS: usize = 4096;
@@ -866,7 +870,7 @@ impl ClusteredIndex {
             }
             nearest.into_iter().map(Nearest::estimates).collect()
         };
-        let merged = vectors.par_chunks(4096).map(shortlists).reduce(
+        let merged = vectors.par_chunks(TUNING_BLOCK).map(shortlists).reduce(
             || vec![Vec::new(); asked.len()],
             |a, b| {
                 a.into_iter()
