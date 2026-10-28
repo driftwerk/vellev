@@ -27,6 +27,11 @@ jobs:
           ref: scratch-speed-before
           path: before
       - run: cd before && cargo build --release --locked -p vellev-index --example scan_speed && cp target/release/examples/scan_speed "$RUNNER_TEMP/before"
+      - uses: actions/checkout@v5
+        with:
+          ref: scratch-speed-gather
+          path: gather
+      - run: cd gather && cargo build --release --locked -p vellev-index --example scan_speed && cp target/release/examples/scan_speed "$RUNNER_TEMP/gather"
       - name: Fetch the fixture's vectors and the questions
         run: |
           set -euo pipefail
@@ -45,9 +50,17 @@ jobs:
           ls "$F/vectors/passages" | wc -l
       - name: CPU
         run: lscpu | grep -E "Model name|^CPU\(s\)|Flags" | cut -c1-200
-      - name: Speed, before and after on this one runner, alternately
+      - name: Filtered visits, before, gathered and after on this one runner, twice
         run: |
-          for side in before after before after; do echo "== $side"; "$RUNNER_TEMP/$side" "$RUNNER_TEMP/fixture" 912500 300,560; done
+          mkdir -p "$RUNNER_TEMP/fixture/text"
+          cd "$RUNNER_TEMP/fixture/download"
+          for asset in passages.jsonl.zst queries.jsonl; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+          done
+          grep -E "  (passages.jsonl.zst|queries.jsonl)\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" | sha256sum --check --strict
+          zstd -q -d --long=31 passages.jsonl.zst -o "$RUNNER_TEMP/fixture/text/passages.jsonl"
+          mv queries.jsonl "$RUNNER_TEMP/fixture/text/"
+          for side in before gather after before gather after; do echo "== $side"; SCRATCH_FILTERED=1 "$RUNNER_TEMP/$side" "$RUNNER_TEMP/fixture" 912500 560 | grep -E "allowed|probes 560:"; done
       - name: The AVX2 way planted wrong must fail the rule (after only)
         if: github.ref_name == 'scratch-speed-after'
         run: |
