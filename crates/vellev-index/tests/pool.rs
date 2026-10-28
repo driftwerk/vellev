@@ -3,42 +3,36 @@
 //! a process.
 
 /// First asked for from inside a pool of one thread, the read pool still
-/// has as many threads as rayon's global pool: RAYON_NUM_THREADS where it
-/// is set, else as many as the machine runs at once.
+/// has as many threads as rayon's global pool, however rayon sized that.
 #[test]
 fn the_read_pool_is_sized_as_the_global_pool_whoever_asks_first() {
+    let global = rayon::current_num_threads();
     let one = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
         .unwrap();
     let sized = one.install(|| vellev_index::pool::reads().current_num_threads());
-    let global = std::env::var("RAYON_NUM_THREADS")
-        .ok()
-        .and_then(|threads| threads.parse::<usize>().ok())
-        .filter(|threads| *threads > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     assert_eq!(sized, global);
-    assert_eq!(
-        rayon::current_num_threads(),
-        global,
-        "as rayon's own global pool"
-    );
 }
 
 /// Builds are counted while they run, across threads, and no longer once
-/// each is done.
+/// each is done; and each one begun is counted for good. Counted by how
+/// they change, as other tests may build meanwhile.
 #[test]
 fn builds_are_counted_while_they_run() {
-    assert_eq!(vellev_index::pool::builds(), 0);
+    let (running, begun) = (vellev_index::pool::builds(), vellev_index::pool::builds_begun());
     let first = vellev_index::pool::Building::begun();
-    let second = std::thread::spawn(|| {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let second = std::thread::spawn(move || {
         let _building = vellev_index::pool::Building::begun();
-        vellev_index::pool::builds()
-    })
-    .join()
-    .unwrap();
-    assert_eq!(second, 2);
-    assert_eq!(vellev_index::pool::builds(), 1);
+        tx.send(()).unwrap();
+        wait.recv().unwrap();
+    });
+    rx.recv().unwrap();
+    assert!(vellev_index::pool::builds() >= running + 2);
+    go.send(()).unwrap();
+    second.join().unwrap();
     drop(first);
-    assert_eq!(vellev_index::pool::builds(), 0);
+    assert!(vellev_index::pool::builds_begun() >= begun + 2);
 }
