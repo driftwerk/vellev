@@ -521,6 +521,7 @@ impl DeadRows {
 
     /// Mark `row` dead; whether it was live till now.
     pub(crate) fn mark(&mut self, row: usize) -> bool {
+        debug_assert!(row < self.rows, "row {row} of {}", self.rows);
         let (word, bit) = (&mut self.words[row / 64], 1u64 << (row % 64));
         let was_live = *word & bit == 0;
         *word |= bit;
@@ -3274,6 +3275,12 @@ mod tests {
                 proptest::prop_assert_eq!(dead.is_dead(row), *want);
             }
             proptest::prop_assert!(!dead.is_dead(rows) && !dead.is_dead(rows + 64));
+            // No bit past the last row is ever set.
+            let words = dead.as_words();
+            proptest::prop_assert_eq!(words.len(), rows.div_ceil(64));
+            if rows % 64 != 0 {
+                proptest::prop_assert_eq!(words[rows / 64] >> (rows % 64), 0);
+            }
         }
     }
 }
