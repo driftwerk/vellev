@@ -14,6 +14,10 @@ env:
 
 jobs:
   speed:
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2, 3]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:

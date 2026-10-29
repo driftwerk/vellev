@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use vellev_core::Distance;
 use vellev_index::clustered::{ClusteredIndex, Probing};
-use vellev_index::vector::in_row_order;
+use vellev_index::vector::{in_row_order, Skipped};
 
 fn shards(dir: &std::path::Path, most: usize) -> Vec<f32> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)
@@ -63,27 +63,45 @@ fn main() {
     };
     let bits_of = |dead: &[bool]| -> Vec<u64> {
         dead.chunks(64)
-            .map(|c| c.iter().enumerate().fold(0u64, |w, (at, d)| w | (u64::from(*d) << at)))
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u64, |w, (at, d)| w | (u64::from(*d) << at))
+            })
             .collect()
     };
     let (one, thirty) = (dead_at(0.01), dead_at(0.30));
     let (one_bits, thirty_bits) = (bits_of(&one), bits_of(&thirty));
     for round in 0..3 {
-        for (what, bytes, bits) in [
-            ("1% dead, bytes (#157)", &one[..], &[][..]),
-            ("1% dead, bits", &one[..], &one_bits[..]),
-            ("30% dead, bytes (#157)", &thirty[..], &[][..]),
-            ("30% dead, bits", &thirty[..], &thirty_bits[..]),
+        for (what, skipped) in [
+            ("1% dead, bytes (#157)", Skipped::Bytes(&one)),
+            ("1% dead, bits", Skipped::Bits(&one_bits)),
+            ("30% dead, bytes (#157)", Skipped::Bytes(&thirty)),
+            ("30% dead, bits", Skipped::Bits(&thirty_bits)),
         ] {
             for parts in [1, 4] {
                 let probing = Probing { probes, parts };
                 for q in &queries[..50] {
-                    std::hint::black_box(index.estimates_marked(q, 1280, None, bytes, bits, &in_row_order, probing));
+                    std::hint::black_box(index.estimates_marked(
+                        q,
+                        1280,
+                        None,
+                        skipped,
+                        &in_row_order,
+                        probing,
+                    ));
                 }
                 let mut took = Vec::new();
                 for q in &queries {
                     let at = Instant::now();
-                    std::hint::black_box(index.estimates_marked(q, 1280, None, bytes, bits, &in_row_order, probing));
+                    std::hint::black_box(index.estimates_marked(
+                        q,
+                        1280,
+                        None,
+                        skipped,
+                        &in_row_order,
+                        probing,
+                    ));
                     took.push(at.elapsed().as_secs_f64() * 1e3);
                 }
                 took.sort_by(f64::total_cmp);
