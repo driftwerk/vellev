@@ -977,3 +977,85 @@ async fn a_writer_whose_lease_was_taken_since_cleans_nothing_up() {
     );
     assert_eq!(files(&cluster).await, before);
 }
+
+/// A writer whose merges fold two segments, with two segments of notes
+/// flushed: a merge to be had.
+async fn two_segments(cluster: &Cluster) -> Writer {
+    let writer = cluster.writer().await.merging_with(Merging {
+        fanout: 2,
+        ..Merging::default()
+    });
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+    writer.flush().await.unwrap();
+    writer
+}
+
+/// A merge's commit moves the writer's epoch on; a flush, a commit of
+/// curves and writes do not, as none of them can leave a merge planned
+/// before it describing rows that are not there.
+#[tokio::test]
+async fn a_merge_moves_the_epoch_on_and_flushes_curves_and_writes_do_not() {
+    let cluster = Cluster::new().await;
+    let writer = two_segments(&cluster).await;
+    let at = writer.epoch();
+    writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
+    writer.commit(vec![delete("notes", 1)]).await.unwrap();
+    writer.flush().await.unwrap();
+    let key = segments_of(&cluster).await[0].key.clone();
+    assert!(
+        writer
+            .commit_curves(vec![(key, curve_for(0))])
+            .await
+            .is_err(),
+        "a curve for no index is refused, and moves nothing"
+    );
+    assert_eq!(writer.epoch(), at, "writes, flushes and curves");
+    assert!(writer.merge().await.unwrap().is_some());
+    assert_eq!(writer.epoch(), at + 1, "a merge");
+}
+
+/// A curve for a collection with no clustered index in the segment, for
+/// the commit above to refuse.
+fn curve_for(collection: u64) -> vellev_storage::format::SegmentCurve {
+    use vellev_storage::curve::{Curve, Source};
+    vellev_storage::format::SegmentCurve {
+        collection: vellev_storage::format::CollectionId(collection),
+        band: 0,
+        curve: Curve::of(Source::Rows, 1, 10, vec![3]).unwrap(),
+    }
+}
+
+/// A merge is committed only at the epoch it was planned at: one planned
+/// at another commits nothing, and leaves the partition as it was for a
+/// merge planned now.
+#[tokio::test]
+async fn a_merge_planned_at_another_epoch_commits_nothing() {
+    let cluster = Cluster::new().await;
+    let writer = two_segments(&cluster).await;
+    let head = cluster.committed().await;
+    let segments = segments_of(&cluster).await;
+    let stale = writer.epoch() + 1;
+    assert_eq!(writer.merge_planned_at(Some(stale)).await.unwrap(), None);
+    assert_eq!(cluster.committed().await.manifest, head.manifest);
+    assert_eq!(segments_of(&cluster).await, segments);
+    assert_eq!(writer.epoch(), stale - 1);
+    assert!(
+        writer.merge().await.unwrap().is_some(),
+        "planned now, it is"
+    );
+    let ids = writer
+        .partition()
+        .read(|state| ids(state.list(&name("notes"), None, None, 10).unwrap()));
+    assert_eq!(
+        ids,
+        [
+            ObjectId(uuid::Uuid::from_u128(1)),
+            ObjectId(uuid::Uuid::from_u128(2))
+        ]
+    );
+}

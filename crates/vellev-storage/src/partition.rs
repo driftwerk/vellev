@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -942,6 +942,9 @@ pub struct Writer {
     /// The file format the cluster writes, as far as this release writes
     /// it: what every file this writer puts is stamped as.
     format: Arc<AtomicU16>,
+    /// How many times this writer's state has been put back wholesale or
+    /// merged: see [`Self::epoch`].
+    epoch: AtomicU64,
 }
 
 /// A turn being held: since when, how long it may be in all, since when
@@ -1037,6 +1040,7 @@ impl Writer {
             restoring: AtomicBool::new(false),
             held: Arc::default(),
             format: Arc::new(AtomicU16::new(DEFAULT_MAX_FORMAT)),
+            epoch: AtomicU64::new(0),
         })
     }
 
@@ -1738,10 +1742,12 @@ impl Writer {
             .attempt(async {
                 self.publish(&turn, &key, frame, restored, restore, adopting)
                     .await?;
-                Ok(std::mem::replace(
+                let replaced = std::mem::replace(
                     &mut *self.partition.state.write().expect("partition lock"),
                     state,
-                ))
+                );
+                self.epoch.fetch_add(1, Ordering::SeqCst);
+                Ok(replaced)
             })
             .await?;
         drop(turn);
@@ -2402,7 +2408,28 @@ impl Writer {
     }
 
     pub async fn merge(&self) -> Result<Option<LogPosition>> {
+        self.merge_planned_at(None).await
+    }
+
+    /// How many times this writer has put its state back wholesale (a
+    /// restore in place, or from another store) or committed a merge. A
+    /// merge is committed only at the epoch it was planned at: one
+    /// planned before a restore that brought back the same segments, with
+    /// other rows live in them, would otherwise describe rows that are
+    /// not there. Flushes, curves and writes leave it as it is: they add
+    /// segments after a run, or change entries, or kill rows, which a
+    /// merge's commit already takes as it finds them.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// As [`Self::merge`], committed only if the epoch is still `planned`
+    /// (the one read at planning if `None`): how a test shows that a
+    /// merge planned at another epoch commits nothing. Not for use.
+    #[doc(hidden)]
+    pub async fn merge_planned_at(&self, planned: Option<u64>) -> Result<Option<LogPosition>> {
         let _building = self.building.lock().await;
+        let planned = planned.unwrap_or_else(|| self.epoch());
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
@@ -2439,6 +2466,24 @@ impl Writer {
         // is as it was planned over. Were it not, the merged segment would
         // describe nothing there is: nothing is committed, and what was
         // uploaded is deleted.
+        // Nor at another epoch than it was planned at, nor with a row the
+        // run holds live missing from the merged file, which carrying it
+        // out could not place: neither should be, and both are refused
+        // here rather than found later.
+        if self.epoch() != planned {
+            tracing::warn!(
+                planned,
+                now = self.epoch(),
+                "a merge planned before the partition was put back is dropped"
+            );
+            return Ok(None);
+        }
+        if !self.partition.read(|state| state.covers(&merge, &merged)) {
+            tracing::error!(
+                "a merged segment lacks a row its run holds live; the merge is dropped"
+            );
+            return Ok(None);
+        }
         let Some(manifest) = self.partition.read(|state| {
             let flushed = segment.as_ref();
             state.merged_manifest(position, &snapshot, flushed, &merge, merged.meta.clone())
@@ -2454,6 +2499,7 @@ impl Writer {
             state.flushed(&key, position, snapshot, segment, Some(kept))
         })
         .await?;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         Ok(Some(position))
     }
 
@@ -3214,10 +3260,12 @@ impl RestoreFrom<'_> {
                 writer
                     .publish(&turn, &key, frame, restored, Some(restore), adopting)
                     .await?;
-                Ok(std::mem::replace(
+                let replaced = std::mem::replace(
                     &mut *writer.partition.state.write().expect("partition lock"),
                     state,
-                ))
+                );
+                writer.epoch.fetch_add(1, Ordering::SeqCst);
+                Ok(replaced)
             })
             .await?;
         drop(turn);
