@@ -71,7 +71,10 @@ fn a_build_asks_its_stop_in_each_long_pass() {
         .expect("rows to index");
     assert!(index.rows_curve().is_some());
     for stage in CLUSTERED {
-        assert!(stop.checks(stage) > 0, "a clustered build never asked in {stage:?}");
+        assert!(
+            stop.checks(stage) > 0,
+            "a clustered build never asked in {stage:?}"
+        );
     }
     assert!(stop.checks(Stage::Coding) >= ROWS, "coding asks once a row");
     assert!(
@@ -84,7 +87,10 @@ fn a_build_asks_its_stop_in_each_long_pass() {
         .expect("never stopped")
         .expect("rows to index");
     for stage in BINARY {
-        assert!(stop.checks(stage) > 0, "a binary build never asked in {stage:?}");
+        assert!(
+            stop.checks(stage) > 0,
+            "a binary build never asked in {stage:?}"
+        );
     }
     assert!(stop.checks(Stage::Coding) >= ROWS, "coding asks once a row");
 }
@@ -98,17 +104,33 @@ fn a_build_stopped_in_any_pass_gives_up_there() {
     for (at, stage) in CLUSTERED.iter().enumerate() {
         let stop = Stop::at_first(*stage);
         let built = ClusteredIndex::build_stopping(Distance::Cosine, &rows, &stop);
-        assert_eq!(built.err(), Some(Stopped), "a clustered build stopped in {stage:?}");
+        assert_eq!(
+            built.err(),
+            Some(Stopped),
+            "a clustered build stopped in {stage:?}"
+        );
         for later in &CLUSTERED[at + 1..] {
-            assert_eq!(stop.checks(*later), 0, "stopped in {stage:?}, it went on to {later:?}");
+            assert_eq!(
+                stop.checks(*later),
+                0,
+                "stopped in {stage:?}, it went on to {later:?}"
+            );
         }
     }
     for (at, stage) in BINARY.iter().enumerate() {
         let stop = Stop::at_first(*stage);
         let built = BinaryIndex::build_stopping(Distance::Cosine, &rows, &stop);
-        assert_eq!(built.err(), Some(Stopped), "a binary build stopped in {stage:?}");
+        assert_eq!(
+            built.err(),
+            Some(Stopped),
+            "a binary build stopped in {stage:?}"
+        );
         for later in &BINARY[at + 1..] {
-            assert_eq!(stop.checks(*later), 0, "stopped in {stage:?}, it went on to {later:?}");
+            assert_eq!(
+                stop.checks(*later),
+                0,
+                "stopped in {stage:?}, it went on to {later:?}"
+            );
         }
     }
 }
@@ -178,15 +200,17 @@ fn a_stopped_build_waiting_its_turn_to_tune_gives_up() {
         held.recv().unwrap();
         let stop = Stop::counting();
         let stopper = stop.clone();
-        let building = scope.spawn(move || {
-            ClusteredIndex::build_stopping(Distance::Cosine, &rows, &stop)
-        });
+        let building =
+            scope.spawn(move || ClusteredIndex::build_stopping(Distance::Cosine, &rows, &stop));
         // Until the build waits for its turn, having coded every row.
         let began = Instant::now();
         while stopper.checks(Stage::Waiting) == 0 && began.elapsed() < Duration::from_secs(300) {
             std::thread::park_timeout(Duration::from_millis(10));
         }
-        assert!(stopper.checks(Stage::Waiting) > 0, "the build never waited to tune");
+        assert!(
+            stopper.checks(Stage::Waiting) > 0,
+            "the build never waited to tune"
+        );
         stopper.stop();
         let asked = Instant::now();
         let (done, finished) = mpsc::channel();
@@ -241,6 +265,9 @@ fn a_turn_given_up_is_passed_over() {
         let answer = finished.recv_timeout(Duration::from_secs(60));
         // Let a waiter stuck behind the turn that left go, for the scope.
         waiter.stop();
-        assert_eq!(answer.expect("the turn after one given up never came"), Ok("tuned"));
+        assert_eq!(
+            answer.expect("the turn after one given up never came"),
+            Ok("tuned")
+        );
     });
 }

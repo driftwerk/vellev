@@ -747,3 +747,10 @@ or a bit a row, with `holds`; and the methods that take it,
 `BinaryIndex::{unmeasured_skipping, estimates_skipping}` and
 `ClusteredIndex::{unmeasured_skipping, estimates_marked}`. The methods
 taking `&[bool]` are unchanged.
+
+New, additive: `stop::{Stop, Stopped}`, a way to ask a long build to give
+up, and the builds that take one, `ClusteredIndex::build_stopping` and
+`BinaryIndex::build_stopping`, which give back `Err(Stopped)` once their
+`Stop` is stopped. `pool::tune` does work on the tuning pool in turn,
+giving up while it waits if its `Stop` is stopped; a clustered build takes
+its turn to tune through it. `build` is unchanged.

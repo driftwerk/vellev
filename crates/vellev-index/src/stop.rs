@@ -131,10 +131,9 @@ impl Stop {
     /// How often `stage` asked this stop, if it counts. For tests.
     #[doc(hidden)]
     pub fn checks(&self, stage: Stage) -> usize {
-        self.0
-            .counted
-            .as_ref()
-            .map_or(0, |counts| counts.checks[stage.at()].load(Ordering::Relaxed))
+        self.0.counted.as_ref().map_or(0, |counts| {
+            counts.checks[stage.at()].load(Ordering::Relaxed)
+        })
     }
 
     /// Asked by `stage`: [`Stopped`] if the build is to give up.

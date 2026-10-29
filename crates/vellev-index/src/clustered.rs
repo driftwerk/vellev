@@ -1117,9 +1117,9 @@ impl ClusteredIndex {
         );
         let samples = random.sample(measured.len(), TUNING_QUERIES);
         let ranks = match tuned {
-            Tuned::Building(stop) => crate::pool::tune(stop, || {
-                self.ranks_on_this_pool(measured, &samples, stop)
-            })??,
+            Tuned::Building(stop) => {
+                crate::pool::tune(stop, || self.ranks_on_this_pool(measured, &samples, stop))??
+            }
             Tuned::Passing => crate::pool::passes()
                 .install(|| self.ranks_on_this_pool(measured, &samples, &Stop::new()))?,
         };
@@ -1170,20 +1170,20 @@ impl ClusteredIndex {
                 Ok(shortlists(block))
             })
             .try_reduce(
-            || vec![Vec::new(); asked.len()],
-            |a, b| {
-                Ok(a.into_iter()
-                    .zip(b)
-                    .map(|(a, b)| {
-                        let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
-                        for (distance, row) in a.into_iter().chain(b) {
-                            nearest.offer(distance, row);
-                        }
-                        nearest.estimates()
-                    })
-                    .collect())
-            },
-        )?;
+                || vec![Vec::new(); asked.len()],
+                |a, b| {
+                    Ok(a.into_iter()
+                        .zip(b)
+                        .map(|(a, b)| {
+                            let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
+                            for (distance, row) in a.into_iter().chain(b) {
+                                nearest.offer(distance, row);
+                            }
+                            nearest.estimates()
+                        })
+                        .collect())
+                },
+            )?;
         Ok(merged
             .into_iter()
             .map(|mut found| {
