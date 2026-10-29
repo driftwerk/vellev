@@ -484,14 +484,29 @@ impl Sum<'_> {
     /// Whether `body` sums to what the frame says, telling `summed` of
     /// each piece of it as it is done, so that whoever waits on a body of
     /// gigabytes on a slow disk can tell slow from stopped.
-    pub fn holds(&self, body: &[u8], mut summed: impl FnMut(usize)) -> bool {
+    pub fn holds(&self, body: &[u8], summed: impl FnMut(usize)) -> bool {
+        self.holds_unless(body, summed, || false)
+            .expect("a sum nothing gives up is never given up")
+    }
+
+    /// As [`Self::holds`], giving up, `None`, as soon as `given_up` says
+    /// so, asked before each piece: when nobody waits for the answer.
+    pub fn holds_unless(
+        &self,
+        body: &[u8],
+        mut summed: impl FnMut(usize),
+        given_up: impl Fn() -> bool,
+    ) -> Option<bool> {
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(self.described);
         for piece in body.chunks(SUMMED_AT_ONCE) {
+            if given_up() {
+                return None;
+            }
             hasher.update(piece);
             summed(piece.len());
         }
-        hasher.finalize() == self.expected
+        Some(hasher.finalize() == self.expected)
     }
 }
 

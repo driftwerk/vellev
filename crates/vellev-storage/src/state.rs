@@ -20,6 +20,7 @@ use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
     SegmentMeta,
 };
+use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
@@ -842,8 +843,18 @@ pub(crate) fn indexed<'a>(
     stored: &Stored,
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
-) -> Indexes {
-    indexed_on(catalog, rows, vector_of, stored, unused, clustered_above).0
+    stopping: &Stopping,
+) -> Option<Indexes> {
+    indexed_stopping(
+        catalog,
+        rows,
+        vector_of,
+        stored,
+        unused,
+        clustered_above,
+        stopping,
+    )
+    .map(|(indexes, _)| indexes)
 }
 
 /// As [`indexed`], with how many threads split the rows' text at once, at
@@ -858,15 +869,57 @@ pub(crate) fn indexed_on<'a>(
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
 ) -> (Indexes, usize) {
+    let never = Stopping::never();
+    match indexed_stopping(
+        catalog,
+        rows,
+        vector_of,
+        stored,
+        unused,
+        clustered_above,
+        &never,
+    ) {
+        Some(indexed) => indexed,
+        None => unreachable!("indexing nothing stops is never stopped"),
+    }
+}
+
+/// How many rows the indexing of filterable values and text goes through
+/// between askings of its stop.
+const ROWS_BETWEEN_ASKING: usize = 4_096;
+
+/// As [`indexed_on`], giving up, `None`, once `stopping` is stopped: asked
+/// as each row's text is split, at every [`ROWS_BETWEEN_ASKING`] rows
+/// of the values and text indexed in row order, and by the vector indexes'
+/// builds in their own passes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn indexed_stopping<'a>(
+    catalog: &Catalog,
+    rows: &'a [Row],
+    vector_of: impl Fn(usize) -> Option<&'a [f32]> + Sync,
+    stored: &Stored,
+    unused: impl Fn(CollectionId, Unfit),
+    clustered_above: Option<usize>,
+    stopping: &Stopping,
+) -> Option<(Indexes, usize)> {
     use rayon::prelude::*;
     let threads = Threads::default();
+    let asked = |row: usize| {
+        row.is_multiple_of(ROWS_BETWEEN_ASKING) && stopping.stopped(MergeStage::Indexing)
+    };
     let tokenized: Vec<Option<Tokenized>> = rows
         .par_iter()
         .map(|Row { collection, object }| {
+            if stopping.stopped(MergeStage::Indexing) {
+                return None;
+            }
             let schema = catalog.schema(*collection)?;
             Some(threads.on(|| TextIndex::tokenize(schema, object)))
         })
         .collect();
+    if stopping.is_stopped() {
+        return None;
+    }
     // The filterable values and vectors on one thread, the text on
     // another: each in row order, as indexing each row in turn makes them.
     let ((mut indexes, vectors), texts) = rayon::join(
@@ -874,6 +927,9 @@ pub(crate) fn indexed_on<'a>(
             let mut indexes = Indexes::new();
             let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
             for (row, Row { collection, object }) in rows.iter().enumerate() {
+                if asked(row) {
+                    break;
+                }
                 if let Some(schema) = catalog.schema(*collection) {
                     let index = indexes.entry(*collection).or_default();
                     index.rows.insert(schema, row as u32, object);
@@ -891,6 +947,9 @@ pub(crate) fn indexed_on<'a>(
             let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
             for ((row, Row { collection, .. }), tokenized) in rows.iter().enumerate().zip(tokenized)
             {
+                if asked(row) {
+                    break;
+                }
                 if let Some(tokenized) = tokenized {
                     texts
                         .entry(*collection)
@@ -901,9 +960,13 @@ pub(crate) fn indexed_on<'a>(
             texts
         },
     );
+    if stopping.is_stopped() {
+        return None;
+    }
     for (collection, text) in texts {
         indexes.entry(collection).or_default().text = text;
     }
+    let stop = stopping.stop();
     for (collection, vectors) in vectors.iter().filter(|(_, v)| v.len() > SHORTLIST_ABOVE) {
         let Some((index, schema)) = indexes.get_mut(collection).zip(catalog.schema(*collection))
         else {
@@ -920,16 +983,22 @@ pub(crate) fn indexed_on<'a>(
             None if clustered_above
                 .is_some_and(|above| vectors.len() > above.max(SHORTLIST_ABOVE)) =>
             {
-                ClusteredIndex::build(schema.distance, vectors)
+                ClusteredIndex::build_stopping(schema.distance, vectors, stop)
+                    .ok()?
                     .map(|clustered| Vectors::Clustered(Arc::new(clustered)))
             }
-            None => BinaryIndex::build(schema.distance, vectors).map(Vectors::Binary),
+            None => BinaryIndex::build_stopping(schema.distance, vectors, stop)
+                .ok()?
+                .map(Vectors::Binary),
         };
     }
     for index in indexes.values_mut() {
+        if stopping.stopped(MergeStage::Indexing) {
+            return None;
+        }
         index.rows.summarise();
     }
-    (indexes, threads.most())
+    Some((indexes, threads.most()))
 }
 
 /// How many threads were at some work at once, at the most.
@@ -1828,11 +1897,13 @@ impl State {
     /// The live rows of the run `merge` was planned over, without their
     /// vectors, and those vectors gathered once into the merged segment's
     /// column, sized exactly beforehand: not copied into each row and then
-    /// gathered again.
+    /// gathered again. None too if `stopping` is stopped, asked before
+    /// each segment of the run is copied out.
     pub(crate) fn merged(
         &self,
         merge: &Merge,
         position: LogPosition,
+        stopping: &Stopping,
     ) -> Option<(SegmentFile, Gathering)> {
         if !self.unchanged(merge) {
             return None;
@@ -1852,6 +1923,9 @@ impl State {
         let mut rows: Vec<Row> = Vec::with_capacity(count);
         let mut vectors = Gathering::with_capacity(values, count);
         for segment in run {
+            if stopping.stopped(MergeStage::Gathering) {
+                return None;
+            }
             for row in live(segment) {
                 let Row { collection, object } = &segment.file.rows[row];
                 vectors.push(segment.vectors.get(row));
@@ -2735,7 +2809,10 @@ mod tests {
             let Some(plan) = self.state.merge_plan(&merging) else {
                 return false;
             };
-            let (mut file, gathered) = self.state.merged(&plan, self.state.position()).unwrap();
+            let (mut file, gathered) = self
+                .state
+                .merged(&plan, self.state.position(), &Stopping::never())
+                .unwrap();
             for (row, at) in file.rows.iter_mut().zip(0..) {
                 row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
             }
@@ -2752,7 +2829,10 @@ mod tests {
                 ..Merging::default()
             };
             let plan = self.state.merge_plan(&merging).unwrap();
-            let (mut file, gathered) = self.state.merged(&plan, self.state.position()).unwrap();
+            let (mut file, gathered) = self
+                .state
+                .merged(&plan, self.state.position(), &Stopping::never())
+                .unwrap();
             for (row, at) in file.rows.iter_mut().zip(0..) {
                 row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
             }

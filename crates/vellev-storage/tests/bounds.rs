@@ -86,6 +86,9 @@ struct Faulty {
     /// Every file put whole fails, as a store that answers 403 or 500 does,
     /// and nothing is put.
     failing_puts: AtomicBool,
+    /// Starts of uploads in parts wait, once armed, until let go.
+    held_starts: AtomicBool,
+    starts: Arc<tokio::sync::Notify>,
 }
 
 impl Faulty {
@@ -107,6 +110,8 @@ impl Faulty {
             silent_deletes: AtomicBool::new(false),
             silent_heads: AtomicBool::new(false),
             failing_puts: AtomicBool::new(false),
+            held_starts: AtomicBool::new(false),
+            starts: Arc::default(),
         }
     }
 
@@ -191,6 +196,9 @@ impl ObjectStore for Faulty {
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.in_parts.fetch_add(1, Ordering::SeqCst);
+        if self.held_starts.load(Ordering::SeqCst) {
+            self.starts.notified().await;
+        }
         Ok(Box::new(Parts {
             inner: self.inner.put_multipart_opts(location, opts).await?,
             stalls: self.stalls(location),
@@ -2778,4 +2786,168 @@ async fn a_fetch_into_the_cache_given_up_part_way_leaves_nothing_part_written() 
         assert!(soon(&|| part_written() == 0), "nothing of it is left");
     }
     assert!(!dir.path().join(&key).exists());
+}
+
+/// An upload in parts whose caller stops waiting while the store has yet
+/// to say it has begun is aborted once the store does: never left begun,
+/// with no parts and nothing to abort it.
+#[tokio::test]
+async fn an_upload_dropped_while_it_starts_is_aborted_once_it_has() {
+    let store = Arc::new(Faulty::new("nothing"));
+    store.held_starts.store(true, Ordering::SeqCst);
+    let aborts = Aborts::default();
+    let blobs = ObjectBlobs::new(store.clone())
+        .transferring(Transfers {
+            request_within: Duration::from_secs(60),
+            ..SMALL_PARTS
+        })
+        .aborting(aborts.clone());
+    let blobs = Arc::new(blobs);
+    let putting = tokio::spawn({
+        let blobs = blobs.clone();
+        async move { blobs.put("large", Bytes::from(vec![7u8; 100])).await }
+    });
+    let asked = async {
+        while store.in_parts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), asked)
+        .await
+        .expect("the upload is started");
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+    assert_eq!(aborts.pending(), 1, "the abort is on its way");
+    store.starts.notify_one();
+    let aborted = async {
+        while store.aborts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), aborted)
+        .await
+        .expect("the upload begun for nobody is aborted");
+    assert_eq!(aborts.finished(Duration::from_secs(10)).await, 0);
+}
+
+/// A merge stopped while a file of its own goes up in parts aborts the
+/// upload at the store and lets go of it at once, rather than sending the
+/// rest of the file for nothing, and leaves nothing behind: none of the
+/// uploads it began waits out the store's bound.
+#[tokio::test]
+async fn a_stopped_merges_upload_is_aborted_and_nothing_is_left() {
+    let mut cluster = Cluster::new().await;
+    let store = Arc::new(Faulty::new("-merged.vectors"));
+    let aborts = Aborts::default();
+    let blobs = ObjectBlobs::new(store.clone())
+        .transferring(Transfers {
+            request_within: Duration::from_secs(60),
+            ..SMALL_PARTS
+        })
+        .aborting(aborts.clone());
+    cluster.blobs = Arc::new(blobs);
+    let writer = Arc::new(cluster.writer().await);
+    mergeable(&writer).await;
+    let before = cluster.committed().await;
+    let sent = store.parts.load(Ordering::SeqCst);
+    store.armed.store(true, Ordering::SeqCst);
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    // Its vectors' first part has gone; every part after it stalls.
+    let begun = async {
+        while store.parts.load(Ordering::SeqCst) == sent {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), begun)
+        .await
+        .expect("the merged vectors go up");
+    writer.stop_merges();
+    let merged = tokio::time::timeout(Duration::from_secs(5), merging)
+        .await
+        .expect("the merge gives up at once")
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged, None);
+    assert_eq!(writer.kept_while_merging(), 0);
+    let gone = async {
+        while store.aborts.load(Ordering::SeqCst) == 0
+            || !stored(&cluster, "-merged").await.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), gone)
+        .await
+        .expect("the upload is aborted, and nothing is left, well within the store's bound");
+    assert_eq!(aborts.finished(Duration::from_secs(5)).await, 0);
+    assert_eq!(cluster.committed().await.manifest, before.manifest);
+}
+
+/// On a disk too slow for the pace a load asks, a partition of several
+/// large segments fails to open; but the checks of the segments' vectors
+/// that were under way, the one that missed its pace and those dropped
+/// beside it, run on to their end and are remembered: opened again, it
+/// sums nothing and opens, rather than needing an attempt for each file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_a_slow_disk_every_check_under_way_when_a_load_fails_is_remembered() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new().await;
+    let inner = cluster.blobs.clone();
+    let quick = Disk::new(Duration::from_secs(10), 64 * 1024 * 1024, 4);
+    cluster.blobs = Arc::new(CachedBlobs::new(inner.clone(), dir.path()).on(quick));
+    let writer = cluster.writer().await;
+    let mut wide = schema("notes");
+    wide.embedding.dimensions = 1024;
+    writer
+        .commit(vec![Mutation::CreateCollection(Box::new(wide))])
+        .await
+        .unwrap();
+    let mut random = Random(23);
+    for segment in 0..3u32 {
+        for start in (0..3_900u32).step_by(500) {
+            let notes = (start..3_900.min(start + 500)).map(|n| Mutation::Upsert {
+                collection: name("notes"),
+                id: ObjectId(uuid::Uuid::from_u128(u128::from(segment * 10_000 + n) + 1)),
+                properties: json!({ "n": n }).as_object().unwrap().clone(),
+                vector: Some(random.vector(1024)),
+                only_if_version: None,
+            });
+            writer.commit(notes.collect()).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+    }
+    // Each copy as nobody has summed it, as after a restart.
+    let vectors = stored(&cluster, "/vectors/").await;
+    assert_eq!(vectors.len(), 3, "{vectors:?}");
+    let earlier = std::time::SystemTime::now() - Duration::from_secs(60);
+    for key in &vectors {
+        let copy = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(key))
+            .unwrap();
+        copy.set_modified(earlier).unwrap();
+    }
+    // A disk that must give far more than any does: every check misses
+    // its pace, and the first to be given up fails the load.
+    let slow = Disk::new(Duration::from_millis(10), 1_000_000_000_000, 4)
+        .loading_at_once(4)
+        .unwrap();
+    let slowly: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(inner.clone(), dir.path()).on(slow));
+    assert!(
+        cluster.open_on(slowly.clone()).await.is_err(),
+        "too slow to open"
+    );
+    // The checks under way run on to their end meanwhile.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let opened = tokio::time::timeout(Duration::from_secs(30), cluster.open_on(slowly)).await;
+    let opened = opened.expect("opened in time");
+    assert!(
+        opened.is_ok(),
+        "opened again, it summed again: {:?}",
+        opened.err()
+    );
 }

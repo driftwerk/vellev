@@ -948,20 +948,18 @@ impl Disk {
             let (had, shifts) = self.loads.now();
             let (beside, most) = (had.max(1), self.turns as u64);
             pace.owe(owing, shifts, beside, most, least);
-            match stepped {
-                Ok(stepped) => return stepped.map_err(std::io::Error::other)?,
-                Err(_) if progress.so_far() == seen => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("local disk got no further within {within:?}"),
-                    ))
-                }
+            let ended = match stepped {
+                Ok(stepped) => stepped.map_err(std::io::Error::other).and_then(|done| done),
+                Err(_) if progress.so_far() == seen => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("local disk got no further within {within:?}"),
+                )),
                 Err(_) if pace.behind(progress.so_far()) => {
                     let slowest = least / beside;
-                    return Err(std::io::Error::new(
+                    Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!("local disk is slower than {slowest} bytes a second"),
-                    ));
+                    ))
                 }
                 Err(_) => {
                     seen = progress.so_far();
@@ -969,8 +967,10 @@ impl Disk {
                     if let Some(due) = due.get_mut(&number) {
                         *due = tokio::time::Instant::now() + within;
                     }
+                    continue;
                 }
-            }
+            };
+            return ended;
         }
     }
 
@@ -1057,12 +1057,38 @@ impl ObjectBlobs {
         Self { aborts, ..self }
     }
 
+    /// Start an upload in parts under `path`, on a task of its own: one
+    /// whose caller stops waiting before the store answers is aborted once
+    /// the store does, never left begun with no parts and nothing to abort
+    /// it.
+    async fn started(&self, key: &str, path: &ObjectPath) -> Result<Box<dyn MultipartUpload>> {
+        let within = self.transfers.request_within;
+        let (store, path, named) = (self.store.clone(), path.clone(), key.to_string());
+        let mut starting = Starting {
+            start: Some(tokio::spawn(async move {
+                bounded(&named, within, store.put_multipart(&path)).await
+            })),
+            within,
+            aborts: self.aborts.clone(),
+        };
+        let started = starting.start.as_mut().expect("just begun").await;
+        starting.start = None;
+        match started {
+            Ok(started) => started,
+            Err(failed) => match failed.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                // Cancelled, as the runtime shuts down.
+                Err(failed) => Err(StorageError::Background(failed.to_string())),
+            },
+        }
+    }
+
     /// Upload `bytes` under `key` in parts, each its own request, and abort
     /// the upload if any of it fails or it is dropped unfinished.
     async fn put_in_parts(&self, key: &str, path: &ObjectPath, bytes: Bytes) -> Result<()> {
         let within = self.transfers.request_within;
         let mut upload = Unfinished {
-            upload: Some(bounded(key, within, self.store.put_multipart(path)).await?),
+            upload: Some(self.started(key, path).await?),
             within,
             aborts: self.aborts.clone(),
         };
@@ -1241,7 +1267,8 @@ impl Reading {
     }
 }
 
-/// The aborts of uploads dropped unfinished that are on their way: each is
+/// The aborts of uploads dropped unfinished that are on their way, and the
+/// deletes of files a build given up uploaded: each is
 /// sent on a task of its own, which nothing waits for, and a process that
 /// exits at once may never send it, leaving the upload's parts in the
 /// store, where no listing shows them. A process that stops waits for
@@ -1293,7 +1320,7 @@ impl Aborts {
     }
 
     /// One more on its way, until what this gives is dropped.
-    fn begun(&self) -> Aborting {
+    pub(crate) fn begun(&self) -> Aborting {
         self.0.pending.fetch_add(1, Ordering::SeqCst);
         Aborting(self.clone())
     }
@@ -1301,7 +1328,7 @@ impl Aborts {
 
 /// An abort on its way, counted in its [`Aborts`] until this is dropped:
 /// once it is answered or given up, or the task that sends it goes.
-struct Aborting(Aborts);
+pub(crate) struct Aborting(Aborts);
 
 impl Drop for Aborting {
     fn drop(&mut self) {
@@ -1333,6 +1360,32 @@ impl Unfinished {
             }
         }
         self.upload = None;
+    }
+}
+
+/// An upload in parts being started, aborted once the store answers if
+/// whoever started it stopped waiting first.
+struct Starting {
+    start: Option<tokio::task::JoinHandle<Result<Box<dyn MultipartUpload>>>>,
+    within: Duration,
+    aborts: Aborts,
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        let (Some(start), Ok(runtime)) = (self.start.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let (within, aborting) = (self.within, self.aborts.begun());
+        runtime.spawn(async move {
+            let _aborting = aborting;
+            if let Ok(Ok(mut upload)) = start.await {
+                if let Err(error) = bounded("an upload", within, upload.abort()).await {
+                    tracing::warn!(%error, "an upload started for nobody could not be aborted");
+                }
+            }
+        });
     }
 }
 
@@ -1495,8 +1548,7 @@ impl Blobs for ObjectBlobs {
                 while holding + came.len() > part {
                     held.push(came.split_to(part - holding));
                     if upload.upload.is_none() {
-                        let started = bounded(key, within, self.store.put_multipart(&path));
-                        upload.upload = Some(started.await?);
+                        upload.upload = Some(self.started(key, &path).await?);
                     }
                     if sent == MOST_PARTS {
                         return Err(too_many());
@@ -2136,6 +2188,7 @@ impl Blobs for CachedBlobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use object_store::memory::InMemory;
 
     #[test]
