@@ -286,7 +286,9 @@ fn candidates(
                 vector,
                 count,
                 only.as_ref(),
-                layer.dead,
+                // Nothing to skip where no row has died: the scan then
+                // reads no marks at all.
+                if layer.deaths == 0 { &[] } else { layer.dead },
                 &ties,
                 Probing {
                     probes: probes_for(layer.curves, collection, clustered),
