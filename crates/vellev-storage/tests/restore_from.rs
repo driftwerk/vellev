@@ -2216,3 +2216,15 @@ async fn a_restore_of_an_unstored_property_into_format_1_is_refused() {
         "nothing built is kept"
     );
 }
+
+/// A restore from another store moves the writer's epoch on, as one in
+/// place does.
+#[tokio::test]
+async fn a_restore_from_a_source_moves_the_epoch_on() {
+    let cluster = Cluster::new().await;
+    let writer = lived_in(&cluster).await;
+    let frozen = frozen(&cluster).await;
+    let at = writer.epoch();
+    restored_from(&cluster, &writer, &frozen).await.unwrap();
+    assert_eq!(writer.epoch(), at + 1);
+}
