@@ -741,3 +741,9 @@ Breaking:
 
 New: `ClusteredIndex::fit`, which says whether an index is fit for the
 vectors it is given, and `Unfit`, why it is not.
+
+New, additive: `vector::Skipped`, the rows a search skips as a byte a row
+or a bit a row, with `holds`; and the methods that take it,
+`BinaryIndex::{unmeasured_skipping, estimates_skipping}` and
+`ClusteredIndex::{unmeasured_skipping, estimates_marked}`. The methods
+taking `&[bool]` are unchanged.

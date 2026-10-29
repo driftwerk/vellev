@@ -10,7 +10,7 @@ use vellev_core::{
 use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
 use vellev_index::text::{TextIndex, Tokenized};
-use vellev_index::vector::{BinaryIndex, Coded, Ties, VectorIndex};
+use vellev_index::vector::{BinaryIndex, Coded, Skipped, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
@@ -131,6 +131,21 @@ impl VectorIndex for Vectors {
         match self {
             Vectors::Binary(index) => index.estimates(query, count, only, skipped, ties),
             Vectors::Clustered(index) => index.estimates(query, count, only, skipped, ties),
+        }
+    }
+}
+
+impl Vectors {
+    /// As [`VectorIndex::unmeasured`], the dead rows given as either kind
+    /// of [`Skipped`].
+    pub(crate) fn unmeasured_skipping(
+        &self,
+        only: Option<&RoaringBitmap>,
+        skipped: Skipped<'_>,
+    ) -> Vec<u32> {
+        match self {
+            Vectors::Binary(index) => index.unmeasured_skipping(only, skipped),
+            Vectors::Clustered(index) => index.unmeasured_skipping(only, skipped),
         }
     }
 }
@@ -302,7 +317,9 @@ impl Live<'_> {
 /// vectors; its column does.
 pub(crate) struct Layer<'a> {
     pub rows: &'a [Row],
-    pub dead: &'a [bool],
+    /// Which rows are dead: a byte a row for the memtable, a bit a row for
+    /// a segment.
+    pub dead: Skipped<'a>,
     /// How many of the rows are dead.
     pub deaths: usize,
     pub indexes: &'a Indexes,
@@ -464,10 +481,77 @@ struct Segment {
     file: Arc<SegmentFile>,
     vectors: Arc<Column>,
     indexes: Arc<Indexes>,
-    dead: Vec<bool>,
-    deaths: usize,
+    dead: DeadRows,
     /// About how many bytes the segment takes in memory.
     resident: usize,
+}
+
+/// Which of a segment's rows are dead, a bit a row (row `n` bit `n % 64`
+/// of word `n / 64`), and how many: the one record of it, an eighth of a
+/// byte a row, which a clustered scan reads a word at a time (x86 profile).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DeadRows {
+    words: Vec<u64>,
+    rows: usize,
+    count: usize,
+}
+
+impl DeadRows {
+    /// Of `rows` rows, those `dead` says.
+    fn of(dead: impl ExactSizeIterator<Item = bool>) -> Self {
+        let rows = dead.len();
+        let mut words = vec![0u64; rows.div_ceil(64)];
+        let mut count = 0;
+        for (row, dead) in dead.enumerate() {
+            if dead {
+                words[row / 64] |= 1 << (row % 64);
+                count += 1;
+            }
+        }
+        Self { words, rows, count }
+    }
+
+    /// Whether `row` is dead; a row past the last is not.
+    #[inline(always)]
+    pub(crate) fn is_dead(&self, row: usize) -> bool {
+        self.words
+            .get(row / 64)
+            .is_some_and(|word| word >> (row % 64) & 1 == 1)
+    }
+
+    /// Mark `row` dead; whether it was live till now.
+    pub(crate) fn mark(&mut self, row: usize) -> bool {
+        debug_assert!(row < self.rows, "row {row} of {}", self.rows);
+        let (word, bit) = (&mut self.words[row / 64], 1u64 << (row % 64));
+        let was_live = *word & bit == 0;
+        *word |= bit;
+        self.count += usize::from(was_live);
+        was_live
+    }
+
+    /// How many rows are dead.
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// How many rows, dead or not.
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The marks as words, for a scan to read.
+    pub(crate) fn as_words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Mark `row` live again, as only a test simulating a restore would.
+    #[cfg(test)]
+    fn revive(&mut self, row: usize) {
+        if self.is_dead(row) {
+            self.words[row / 64] &= !(1u64 << (row % 64));
+            self.count -= 1;
+        }
+    }
 }
 
 /// About how many bytes a segment of `rows` with `vectors` takes in memory:
@@ -1209,7 +1293,9 @@ impl State {
         let wanted = self.catalog.get(collection).map(|(id, _)| id);
         self.layers().flat_map(move |layer| {
             (0..layer.rows.len())
-                .filter(move |row| !layer.dead[*row] && Some(layer.rows[*row].collection) == wanted)
+                .filter(move |row| {
+                    !layer.dead.holds(*row as u32) && Some(layer.rows[*row].collection) == wanted
+                })
                 .map(move |row| layer.live(row))
         })
     }
@@ -1276,7 +1362,7 @@ impl State {
                     passing
                         .iter()
                         .map(|row| row as usize)
-                        .filter(move |row| !layer.dead[*row])
+                        .filter(move |row| !layer.dead.holds(*row as u32))
                         .map(move |row| layer.live(row))
                 })
                 .filter(|found| after.is_none_or(|after| found.id() > after))
@@ -1303,7 +1389,7 @@ impl State {
     pub(crate) fn layers(&self) -> impl Iterator<Item = Layer<'_>> {
         let memtable = Layer {
             rows: &self.memtable.rows,
-            dead: &self.memtable.dead,
+            dead: Skipped::Bytes(&self.memtable.dead),
             deaths: self.memtable.deaths,
             indexes: &self.memtable.indexes,
             vectors: None,
@@ -1313,8 +1399,8 @@ impl State {
             .iter()
             .map(|segment| Layer {
                 rows: &segment.file.rows,
-                dead: &segment.dead,
-                deaths: segment.deaths,
+                dead: Skipped::Bits(segment.dead.as_words()),
+                deaths: segment.dead.count(),
                 indexes: &segment.indexes,
                 vectors: Some(&segment.vectors),
                 curves: &segment.meta.probes,
@@ -1338,7 +1424,7 @@ impl State {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|row| row as usize)
-                .filter(move |row| !layer.dead[*row])
+                .filter(move |row| !layer.dead.holds(*row as u32))
                 .map(move |row| layer.live(row))
         })
     }
@@ -1376,7 +1462,7 @@ impl State {
     }
 
     fn mark_dead(&mut self, location: Location) {
-        let (rows, dead, deaths, indexes, row) = match location {
+        let (rows, indexes, row) = match location {
             Location::Memtable(row) => {
                 let Memtable {
                     rows,
@@ -1385,23 +1471,18 @@ impl State {
                     indexes,
                     ..
                 } = &mut self.memtable;
-                (rows.as_slice(), dead, deaths, &*indexes, row)
+                if !dead[row] {
+                    *deaths += 1;
+                }
+                dead[row] = true;
+                (rows.as_slice(), &*indexes, row)
             }
             Location::Segment(segment, row) => {
                 let segment = &mut self.segments[segment];
-                (
-                    segment.file.rows.as_slice(),
-                    &mut segment.dead,
-                    &mut segment.deaths,
-                    &*segment.indexes,
-                    row,
-                )
+                segment.dead.mark(row);
+                (segment.file.rows.as_slice(), &*segment.indexes, row)
             }
         };
-        if !dead[row] {
-            *deaths += 1;
-        }
-        dead[row] = true;
         let collection = rows[row].collection;
         if let Some(corpus) = self.corpora.get_mut(&collection) {
             corpus.count(indexes.get(&collection), row as u32, false);
@@ -1497,8 +1578,7 @@ impl State {
             file,
             vectors,
             indexes,
-            deaths: dead.iter().filter(|dead| **dead).count(),
-            dead,
+            dead: DeadRows::of(dead.into_iter()),
         });
         Ok(())
     }
@@ -1703,7 +1783,7 @@ impl State {
         let live: Vec<usize> = self
             .segments
             .iter()
-            .map(|segment| segment.dead.iter().filter(|dead| !**dead).count())
+            .map(|segment| segment.dead.rows() - segment.dead.count())
             .collect();
         let plan = |run: std::ops::Range<usize>| Merge {
             keys: self.segments[run.clone()]
@@ -1759,7 +1839,7 @@ impl State {
         }
         let run = &self.segments[merge.run.clone()];
         fn live(segment: &Segment) -> impl Iterator<Item = usize> + '_ {
-            (0..segment.file.rows.len()).filter(|row| !segment.dead[*row])
+            (0..segment.file.rows.len()).filter(|row| !segment.dead.is_dead(*row))
         }
         let (count, values) = run.iter().fold((0, 0), |(count, values), segment| {
             live(segment).fold((count, values), |(count, values), row| {
@@ -1944,6 +2024,29 @@ impl State {
         }
     }
 
+    /// Whether every segment's dead rows are just those the live map does
+    /// not lead to, and counted as many: what a segment's [`DeadRows`] must
+    /// always be. For tests.
+    #[doc(hidden)]
+    pub fn dead_rows_agree(&self) -> bool {
+        self.segments.iter().enumerate().all(|(at, segment)| {
+            let dead = &segment.dead;
+            let marked = (0..dead.rows()).filter(|row| dead.is_dead(*row)).count();
+            dead.rows() == segment.file.rows.len()
+                && marked == dead.count()
+                && segment
+                    .file
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .all(|(row, Row { collection, object })| {
+                        let led = self.live.get(&(*collection, object.id))
+                            == Some(&Location::Segment(at, row));
+                        dead.is_dead(row) != led
+                    })
+        })
+    }
+
     /// Which rows of `merge`'s run are live now, segment by segment: taken
     /// when a merge is planned, as what its merged segment is made of.
     /// Which rows of each segment are dead, segment by segment. For tests
@@ -1959,7 +2062,11 @@ impl State {
     pub(crate) fn alive(&self, merge: &Merge) -> Vec<Vec<bool>> {
         self.segments[merge.run.clone()]
             .iter()
-            .map(|segment| segment.dead.iter().map(|dead| !dead).collect())
+            .map(|segment| {
+                (0..segment.dead.rows())
+                    .map(|row| !segment.dead.is_dead(row))
+                    .collect()
+            })
             .collect()
     }
 
@@ -1981,11 +2088,11 @@ impl State {
         }
         let mut gathered = merged.file.rows.iter();
         for (segment, alive) in run.iter().zip(alive) {
-            if segment.dead.len() != alive.len() || segment.file.rows.len() != alive.len() {
+            if segment.dead.rows() != alive.len() || segment.file.rows.len() != alive.len() {
                 return false;
             }
-            for ((row, dead), was) in segment.file.rows.iter().zip(&segment.dead).zip(alive) {
-                if !*dead && !*was {
+            for ((at, row), was) in segment.file.rows.iter().enumerate().zip(alive) {
+                if !segment.dead.is_dead(at) && !*was {
                     return false;
                 }
                 if *was {
@@ -2049,8 +2156,7 @@ impl State {
                 file,
                 vectors,
                 indexes,
-                deaths: dead.iter().filter(|dead| **dead).count(),
-                dead,
+                dead: DeadRows::of(dead.into_iter()),
             }],
         );
     }
@@ -2258,8 +2364,7 @@ impl State {
                 file,
                 vectors,
                 indexes,
-                deaths: dead.iter().filter(|dead| **dead).count(),
-                dead,
+                dead: DeadRows::of(dead.into_iter()),
             });
         }
         let flushed: HashSet<RowKey> = snapshot.tombstones.into_iter().collect();
@@ -3109,14 +3214,13 @@ mod tests {
         let (plan, fit) = built.planned();
         let alive = built.state.alive(&plan);
         let segment = plan.run.start;
-        let dead = built.state.segments[segment]
-            .dead
-            .iter()
-            .position(|dead| *dead)
+        let marks = &built.state.segments[segment].dead;
+        let dead = (0..marks.rows())
+            .find(|row| marks.is_dead(*row))
             .expect("the row deleted above");
-        built.state.segments[segment].dead[dead] = false;
+        built.state.segments[segment].dead.revive(dead);
         assert!(!built.state.covers(&plan, &alive, &fit));
-        built.state.segments[segment].dead[dead] = true;
+        built.state.segments[segment].dead.mark(dead);
         // A merged file that lacks a row the run held live: not.
         let mut file = (*fit.file).clone();
         file.rows.retain(|row| row.object.id != oid(6));
@@ -3134,5 +3238,59 @@ mod tests {
         let wrong = built.fit(file, &catalog);
         assert!(!built.state.covers(&plan, &alive, &wrong));
         assert!(built.state.covers(&plan, &alive, &fit));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        /// A segment's dead rows are just those the live map does not lead
+        /// to, and counted as many, after any run of writes, deletes,
+        /// flushes and merges: what a scan and a walk read them by.
+        #[test]
+        fn a_segments_dead_rows_are_what_the_live_map_leaves_after_anything(
+            steps in proptest::collection::vec((0u8..4, 0u128..90), 1..120),
+        ) {
+            let mut built = Built::new(&["notes"]);
+            for (step, id) in steps {
+                match step {
+                    0 => built.commit(vec![upsert(0, id, id as i64)]),
+                    1 => built.commit(vec![delete(0, id)]),
+                    2 => built.flush(),
+                    _ => {
+                        built.merge();
+                    }
+                }
+                proptest::prop_assert!(built.state.dead_rows_agree());
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// Dead rows kept a bit a row answer as a mark a row does: whether
+        /// each is dead, how many are, and whether a mark found one live.
+        #[test]
+        fn dead_rows_answer_as_a_mark_a_row_does(
+            rows in 0usize..300,
+            first in proptest::collection::vec(proptest::bool::ANY, 0..300),
+            marks in proptest::collection::vec(0usize..300, 0..200),
+        ) {
+            let mut model: Vec<bool> = (0..rows).map(|row| first.get(row).copied().unwrap_or(false)).collect();
+            let mut dead = DeadRows::of(model.clone().into_iter());
+            for row in marks.into_iter().filter(|row| *row < rows) {
+                proptest::prop_assert_eq!(dead.mark(row), !model[row]);
+                model[row] = true;
+            }
+            proptest::prop_assert_eq!(dead.rows(), rows);
+            proptest::prop_assert_eq!(dead.count(), model.iter().filter(|d| **d).count());
+            for (row, want) in model.iter().enumerate() {
+                proptest::prop_assert_eq!(dead.is_dead(row), *want);
+            }
+            proptest::prop_assert!(!dead.is_dead(rows) && !dead.is_dead(rows + 64));
+            // No bit past the last row is ever set.
+            let words = dead.as_words();
+            proptest::prop_assert_eq!(words.len(), rows.div_ceil(64));
+            if rows % 64 != 0 {
+                proptest::prop_assert_eq!(words[rows / 64] >> (rows % 64), 0);
+            }
+        }
     }
 }

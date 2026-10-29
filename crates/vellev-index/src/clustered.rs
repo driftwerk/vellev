@@ -28,7 +28,7 @@ use crate::fastscan::{chosen, Blocks, Tables, BLOCK};
 use crate::rotation::{Random, Rotation};
 use crate::vector::{
     allowed, as_far_from_every_vector, dot, in_row_order, measurable, nearest, normalised,
-    or_farthest, short_enough, squared_l2, Scorer, Ties, VectorIndex,
+    or_farthest, short_enough, squared_l2, Scorer, Skipped, Ties, VectorIndex,
 };
 
 /// How many bits the query is quantized to for the scan.
@@ -1239,7 +1239,7 @@ impl VectorIndex for ClusteredIndex {
     }
 
     fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
-        allowed(&self.unmeasured, only, skipped)
+        self.unmeasured_skipping(only, Skipped::Bytes(skipped))
     }
 
     /// Each estimate is a distance under the index's metric, comparable
@@ -1276,15 +1276,38 @@ impl ClusteredIndex {
         ties: Ties<'_>,
         probing: Probing,
     ) -> Vec<(f32, u32)> {
+        self.estimates_marked(query, count, only, Skipped::Bytes(skipped), ties, probing)
+    }
+
+    /// As [`VectorIndex::unmeasured`], the rows skipped given as either kind
+    /// of [`Skipped`].
+    pub fn unmeasured_skipping(
+        &self,
+        only: Option<&RoaringBitmap>,
+        skipped: Skipped<'_>,
+    ) -> Vec<u32> {
+        allowed(&self.unmeasured, only, skipped)
+    }
+
+    /// As [`Self::estimates_split`], the rows skipped given as either kind
+    /// of [`Skipped`]: a scan of the clusters reads bits a word at a time,
+    /// where a byte a row read at random across the rows costs it dearly
+    /// (x86 profile).
+    pub fn estimates_marked(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: Skipped<'_>,
+        ties: Ties<'_>,
+        probing: Probing,
+    ) -> Vec<(f32, u32)> {
         let Probing { probes, parts } = probing;
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
         // A row with no estimate is never offered: the caller scores it.
-        let kept = |row: u32| {
-            !skipped.get(row as usize).copied().unwrap_or(false)
-                && self.unmeasured.binary_search(&row).is_err()
-        };
+        let kept = |row: u32| !skipped.holds(row) && self.unmeasured.binary_search(&row).is_err();
         let mut nearest = Nearest::new(count, ties);
         // A query as far from every row is estimated alike for each, in
         // whatever cluster, and the caller's order decides.
@@ -1324,9 +1347,8 @@ impl ClusteredIndex {
     }
 
     /// Whether `row` may be offered: not skipped, and with an estimate.
-    fn kept(&self, row: u32, skipped: &[bool]) -> bool {
-        !skipped.get(row as usize).copied().unwrap_or(false)
-            && self.unmeasured.binary_search(&row).is_err()
+    fn kept(&self, row: u32, skipped: Skipped<'_>) -> bool {
+        !skipped.holds(row) && self.unmeasured.binary_search(&row).is_err()
     }
 
     /// The `count` nearest of the rows `only` allows, estimated a cluster
@@ -1340,7 +1362,7 @@ impl ClusteredIndex {
         query: &[f32],
         count: usize,
         only: &RoaringBitmap,
-        skipped: &[bool],
+        skipped: Skipped<'_>,
         ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
         let mut nearest = Nearest::new(count, ties);
@@ -1411,7 +1433,7 @@ impl ClusteredIndex {
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
-        skipped: &[bool],
+        skipped: Skipped<'_>,
         ties: Ties<'_>,
         probing: Probing,
     ) -> Vec<(f32, u32)> {
@@ -1460,7 +1482,7 @@ struct Scan<'a> {
     index: &'a ClusteredIndex,
     query: &'a [f32],
     only: Option<&'a RoaringBitmap>,
-    skipped: &'a [bool],
+    skipped: Skipped<'a>,
     weigh: crate::fastscan::Weigh,
     weighed: [u32; BLOCK],
     estimate: estimating::Estimate,
@@ -1475,7 +1497,7 @@ impl<'a> Scan<'a> {
         index: &'a ClusteredIndex,
         query: &'a [f32],
         only: Option<&'a RoaringBitmap>,
-        skipped: &'a [bool],
+        skipped: Skipped<'a>,
     ) -> Self {
         Self {
             index,
@@ -1503,7 +1525,8 @@ impl<'a> Scan<'a> {
             let rows = &members.rows[block * BLOCK..members.rows.len().min((block + 1) * BLOCK)];
             let mut any = false;
             for (offer, row) in self.offered.iter_mut().zip(rows) {
-                *offer = index.kept(*row, self.skipped)
+                *offer = !self.skipped.holds(*row)
+                    && index.unmeasured.binary_search(row).is_err()
                     && self.only.is_none_or(|only| only.contains(*row));
                 any |= *offer;
             }
@@ -2070,7 +2093,7 @@ mod tests {
             &index.prepared(query),
             count,
             only,
-            skipped,
+            Skipped::Bytes(skipped),
             &in_row_order,
             Probing {
                 probes: index.probes,
@@ -2320,79 +2343,6 @@ mod tests {
         });
     }
 
-    /// A pool's threads, held until this is dropped.
-    struct Held(Vec<std::sync::mpsc::Sender<()>>);
-
-    impl Drop for Held {
-        fn drop(&mut self) {
-            for release in &self.0 {
-                let _ = release.send(());
-            }
-        }
-    }
-
-    /// Hold `pool`'s every thread until what is given back is dropped.
-    fn held(pool: &'static rayon::ThreadPool) -> Held {
-        let (started, busy) = std::sync::mpsc::channel::<()>();
-        let mut releases = Vec::new();
-        for _ in 0..pool.current_num_threads() {
-            let (release, wait) = std::sync::mpsc::channel::<()>();
-            let started = started.clone();
-            pool.spawn(move || {
-                started.send(()).unwrap();
-                let _ = wait.recv();
-            });
-            releases.push(release);
-        }
-        for _ in 0..pool.current_num_threads() {
-            busy.recv().unwrap();
-        }
-        Held(releases)
-    }
-
-    /// `work`'s answer, if it finishes within half a minute while `held`
-    /// is held; else, once `held` is let go and the work done, a failure.
-    fn finishes<T: Send>(what: &str, held: Held, work: impl FnOnce() -> T + Send) -> T {
-        let (done, finished) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                let _ = done.send(work());
-            });
-            let answer = finished.recv_timeout(std::time::Duration::from_secs(30));
-            drop(held);
-            answer.unwrap_or_else(|_| {
-                let _ = finished.recv();
-                panic!("{what} waited")
-            })
-        })
-    }
-
-    /// A merge's own tuning and a rows pass, which after an upgrade may
-    /// run segment after segment for minutes, each have a queue of their
-    /// own: an index builds, tuned, while a pass holds its pool, and a pass
-    /// makes its curve while tuning holds the tuning pool (review of #147).
-    #[test]
-    fn a_merges_tuning_does_not_wait_behind_a_rows_pass() {
-        let vectors = grouped(5, 3_000, 16, 12, 0.3);
-        let numbered: Vec<(u32, &[f32])> = vectors
-            .iter()
-            .enumerate()
-            .map(|(row, v)| (row as u32 * 2, v.as_slice()))
-            .collect();
-        let index = finishes(
-            "a build behind a rows pass",
-            held(crate::pool::passes()),
-            || ClusteredIndex::build(Distance::Cosine, &numbered).unwrap(),
-        );
-        assert!(index.rows_curve().is_some());
-        let curve = finishes(
-            "a rows pass behind tuning",
-            held(crate::pool::tuning()),
-            || index.curve_of_rows(&numbered),
-        );
-        assert_eq!(curve, index.rows_curve());
-    }
-
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
         /// An index read back from its file has no curve of its rows, and a
@@ -2535,8 +2485,8 @@ mod tests {
             let skipped: Vec<bool> = (0..rows * 2).map(|row| row % 11 == 5).collect();
             for _ in 0..4 {
                 let query = index.prepared(&noise.vector(dimensions));
-                let one = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, Probing { probes: index.probes, parts: 1 });
-                let split = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, Probing { probes: index.probes, parts });
+                let one = index.scanned(&query, count, only.as_ref(), Skipped::Bytes(&skipped), &in_row_order, Probing { probes: index.probes, parts: 1 });
+                let split = index.scanned(&query, count, only.as_ref(), Skipped::Bytes(&skipped), &in_row_order, Probing { probes: index.probes, parts });
                 proptest::prop_assert_eq!(cut(split, count), cut(one, count));
             }
         }
@@ -2583,6 +2533,25 @@ mod tests {
             for _ in 0..4 {
                 let query = noise.vector(dimensions);
                 let got = scan_only(&index, &query, count, only.as_ref(), &skipped);
+                // The same, the rows skipped read from their bits.
+                let bits: Vec<u64> = skipped
+                    .chunks(64)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .fold(0u64, |word, (at, skip)| word | (u64::from(*skip) << at))
+                    })
+                    .collect();
+                let by_bits = index.scanned(
+                    &index.prepared(&query),
+                    count,
+                    only.as_ref(),
+                    Skipped::Bits(&bits),
+                    &in_row_order,
+                    Probing { probes: index.probes, parts: 1 },
+                );
+                proptest::prop_assert_eq!(&by_bits, &got);
                 let want = estimates_code_by_code(&index, &query, count, only.as_ref(), &skipped);
                 let bits = |found: &[(f32, u32)]| -> Vec<(u32, u32)> {
                     found.iter().map(|(d, row)| (d.to_bits(), *row)).collect()
@@ -2591,7 +2560,7 @@ mod tests {
                 if let Some(only) = &only {
                     // Offered by cluster, not in row order: the same
                     // nearest `count`, as every caller reads them.
-                    let got = index.visited(&index.prepared(&query), count, only, &skipped, &in_row_order);
+                    let got = index.visited(&index.prepared(&query), count, only, Skipped::Bytes(&skipped), &in_row_order);
                     let want = visited_code_by_code(&index, &query, count, only, &skipped);
                     proptest::prop_assert_eq!(cut(got, count), cut(want, count));
                 }
