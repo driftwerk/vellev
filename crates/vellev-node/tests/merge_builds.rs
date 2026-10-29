@@ -466,3 +466,47 @@ async fn over_its_budget_a_node_stops_no_merge_when_letting_others_go_is_enough(
     builds.hold(None);
     until(60, "the merge was never made", || builds.under_way() == 0).await;
 }
+
+/// Losing its hold on a tenant stops a merge that a request makes, which
+/// none of the hold's own tasks runs and losing the hold aborts nothing of:
+/// the request has its answer at once, not once the build would have ended,
+/// and the build's turn is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn losing_a_tenant_stops_a_merge_a_request_makes() {
+    let node = node(|settings| {
+        // Flushed only as the request asks.
+        settings.flush_rows = 1_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    // A build that runs on until its merge is stopped.
+    builds.hold(Some(Holding::UntilStopped));
+    node.create_tenant(&tenant("asked")).await.unwrap();
+    let held = node.tenant(&tenant("asked")).await.unwrap();
+    held.write(vec![notes()]).await.unwrap();
+    for flush in 0..4 {
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(flush * NOTES + n)).collect();
+        held.write(batch).await.unwrap();
+        held.flush().await.unwrap();
+    }
+    let request = tokio::spawn(async move {
+        // Whatever it answers once the tenant is gone: it answers.
+        let _ = held.compact(Duration::from_secs(60 * 60)).await;
+    });
+    until(30, "the request's merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    node.drop_tenant(&tenant("asked")).await.unwrap();
+    within(
+        5,
+        "a merge a request makes ran on once its tenant was lost",
+        request,
+    )
+    .await
+    .unwrap();
+    until(5, "the stopped build's turn was never free", || {
+        builds.under_way() == 0 && builds.turns_free() == MERGE_BUILDS
+    })
+    .await;
+}

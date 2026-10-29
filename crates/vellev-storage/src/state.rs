@@ -2065,8 +2065,8 @@ impl State {
     /// What a merge of `merge`'s run is reckoned to hold at its peak, as it
     /// is planned, before any row is gathered: the live rows' share of what
     /// the run's segments hold of each part, their vectors wherever they
-    /// lie, and the training of a clustered index for each collection of
-    /// more than `clustered_above` vectors. A walk over every live row, and
+    /// lie, and the training of a clustered index for each collection
+    /// whose vectors are clustered, more than `clustered_above` of them. A walk over every live row, and
     /// every token and value the run's indexes hold, as the gather after it
     /// is over every row. Refined by [`Reckoning::gathered`] once the rows are gathered.
     pub(crate) fn merge_reckoning(&self, merge: &Merge, clustered_above: usize) -> Reckoning {
@@ -2100,7 +2100,8 @@ impl State {
                 .catalog
                 .schema(collection)
                 .map_or(0, |schema| schema.embedding.dimensions as usize);
-            if rows > clustered_above as f64 && dimensions > 0 {
+            // Clustered as `clustered` says a merged segment's vectors are.
+            if rows > clustered_above.max(SHORTLIST_ABOVE) as f64 && dimensions > 0 {
                 reckoning.training += training_bytes(rows, dimensions);
             }
         }

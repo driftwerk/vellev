@@ -95,6 +95,9 @@ const FEWER: usize = 10_000;
 const MORE: usize = 20_000;
 /// Rows merged where each holds long text: fewer, as each holds far more.
 const TEXTS: usize = 4_000;
+/// Rows merged just past where their vectors are given an index, so that
+/// a clustered index's training is much of what the merge holds.
+const TRAINED: usize = 6_000;
 /// The width measured, and one so narrow that its vectors cost next to
 /// nothing: the difference between their peaks is what the vectors cost,
 /// whatever each row costs besides.
@@ -297,6 +300,8 @@ async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
         (TEXTS, WIDE, Text::Unique, false),
         (TEXTS, NARROW, Text::Wide, false),
         (TEXTS, NARROW, Text::Few, false),
+        // Few enough rows that training is much of the peak.
+        (TRAINED, WIDE, Text::Short, true),
         (FEWER, WIDE, Text::Short, true),
         (MORE, WIDE, Text::Short, true),
         (FEWER, NARROW, Text::Short, true),
