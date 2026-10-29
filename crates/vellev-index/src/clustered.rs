@@ -1269,6 +1269,9 @@ impl ClusteredIndex {
         let Probing { probes, parts } = probing;
         let order = self.order(query);
         let probes = probes.min(order.len());
+        // Made once a query, and shared by every part of a split scan.
+        let skipped = bits_of(skipped);
+        let skipped = skipped.as_deref();
         let mut scan = Scan::new(self, query, only, skipped);
         let mut nearest = Nearest::new(count, ties);
         let runs = parts.min(probes);
@@ -1314,7 +1317,7 @@ struct Scan<'a> {
     /// The rows skipped, a bit a row, or `None` where none is: read a word
     /// at a time from a few kilobytes, where the slice it is made from is
     /// a byte a row read at random across the segment (x86 profile, fix 2).
-    skipped: Option<Vec<u64>>,
+    skipped: Option<&'a [u64]>,
     weigh: crate::fastscan::Weigh,
     weighed: [u32; BLOCK],
     offered: [bool; BLOCK],
@@ -1327,13 +1330,13 @@ impl<'a> Scan<'a> {
         index: &'a ClusteredIndex,
         query: &'a [f32],
         only: Option<&'a RoaringBitmap>,
-        skipped: &'a [bool],
+        skipped: Option<&'a [u64]>,
     ) -> Self {
         Self {
             index,
             query,
             only,
-            skipped: bits_of(skipped),
+            skipped,
             weigh: chosen().1,
             weighed: [0; BLOCK],
             offered: [false; BLOCK],
@@ -1358,10 +1361,7 @@ impl<'a> Scan<'a> {
                 any = !rows.is_empty();
             } else {
                 for (offer, row) in self.offered.iter_mut().zip(rows) {
-                    *offer = !self
-                        .skipped
-                        .as_deref()
-                        .is_some_and(|bits| set_in(bits, *row))
+                    *offer = !self.skipped.is_some_and(|bits| set_in(bits, *row))
                         && index.unmeasured.binary_search(row).is_err()
                         && self.only.is_none_or(|only| only.contains(*row));
                     any |= *offer;
