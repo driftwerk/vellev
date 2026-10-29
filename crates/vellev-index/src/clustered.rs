@@ -1996,6 +1996,47 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+        /// So too where a residual lies exactly half a step between two
+        /// levels, or within a few units in the last place of that, where
+        /// any other rounding than the portable way's, a step multiplied
+        /// by its reciprocal or a half rounded to even, would give another
+        /// level. The step is an odd multiple of a power of two, so its
+        /// reciprocal is not exact, and the lowest and highest residuals
+        /// are set so that the step comes out exact.
+        #[test]
+        fn readying_rounds_as_the_portable_way_at_half_steps(
+            seed in 1u64..u64::MAX,
+            odd in 0u32..64,
+            power in -20i32..20,
+        ) {
+            let step = (2 * odd + 3) as f32 * 2f32.powi(power);
+            let lower = -8.0 * step;
+            let mut noise = Noise(seed);
+            let mut query: Vec<f32> = (0..256)
+                .map(|_| {
+                    let k = (noise.unit() * 15.0) as u32 as f32;
+                    let at = lower + (k + 0.5) * step;
+                    let nudge = (noise.unit() * 7.0) as i32 - 3;
+                    f32::from_bits((at.to_bits() as i32 + nudge) as u32)
+                })
+                .collect();
+            query[0] = lower;
+            query[1] = lower + 15.0 * step;
+            let centroid = vec![0.0f32; query.len()];
+            let mut want = Readying::default();
+            let (lower, delta) = readying::portably(&query, &centroid, &mut want);
+            for (name, ready) in readying::ways_here() {
+                let mut got = Readying::default();
+                let (l, d) = ready(&query, &centroid, &mut got);
+                proptest::prop_assert_eq!(l.to_bits(), lower.to_bits(), "{} lowest", name);
+                proptest::prop_assert_eq!(d.to_bits(), delta.to_bits(), "{} step", name);
+                proptest::prop_assert_eq!(&got.levels, &want.levels, "{} levels", name);
+            }
+        }
+    }
+
     /// A query is readied the widest way this machine has.
     #[test]
     fn the_way_of_readying_chosen_is_the_widest_this_machine_has() {
