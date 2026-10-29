@@ -65,6 +65,14 @@ async fn settled<F: std::future::Future<Output = bool>>(what: &str, holds: impl 
     waited.await.unwrap_or_else(|_| panic!("{what}"));
 }
 
+/// What `work` comes to within `limit`: a merge that never gives up, or a
+/// flush held behind one, fails the rule in seconds rather than hanging it.
+async fn within<T>(limit: u64, what: &str, work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(limit), work)
+        .await
+        .unwrap_or_else(|_| panic!("{what} within {limit} s"))
+}
+
 /// Every note, read by a copy loaded afresh.
 async fn all_there(cluster: &Cluster) {
     let count = |state: &State| state.count(&name("notes"));
@@ -96,8 +104,8 @@ async fn a_merge_stopped_in_any_stage_gives_up_there_and_leaves_nothing() {
         let writer = two_large(&cluster).await;
         let before = cluster.committed().await;
         writer.stop_merges_at(Some(stage));
-        let merged = writer.merge().await.unwrap();
-        assert_eq!(merged, None, "a merge stopped in {stage:?} committed");
+        let merged = within(120, "the merge never gave up", writer.merge()).await;
+        assert_eq!(merged.unwrap(), None, "a merge stopped in {stage:?} committed");
         assert_eq!(cluster.committed().await.manifest, before.manifest, "{stage:?}");
         assert_eq!(writer.kept_while_merging(), 0, "{stage:?}");
         settled(&format!("files of a merge stopped in {stage:?} stay"), || async {
@@ -107,8 +115,9 @@ async fn a_merge_stopped_in_any_stage_gives_up_there_and_leaves_nothing() {
         all_there(&cluster).await;
 
         writer.stop_merges_at(None);
+        let next = within(120, "the next merge never ended", writer.merge()).await;
         assert!(
-            writer.merge().await.unwrap().is_some(),
+            next.unwrap().is_some(),
             "after a merge stopped in {stage:?}, the next one commits"
         );
         all_there(&cluster).await;
@@ -170,9 +179,10 @@ async fn stopping_a_merge_stops_no_flush() {
     writer.stop_merges();
     let mut random = Random(11);
     let more: Vec<Mutation> = (0..NOTES).map(|n| note(2 * NOTES + n, &mut random)).collect();
-    writer.commit(more).await.unwrap();
-    writer.flush().await.expect("the flush commits");
-    assert_eq!(merging.await.unwrap().unwrap(), None);
+    within(30, "the commit was held", writer.commit(more)).await.unwrap();
+    within(60, "the flush was held", writer.flush()).await.expect("the flush commits");
+    let merged = within(10, "the merge never gave up", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None);
     let count = |state: &State| state.count(&name("notes"));
     assert_eq!(cluster.open().await.partition().read(count), 3 * NOTES as usize);
 }
@@ -197,7 +207,7 @@ async fn a_merge_whose_lease_is_taken_mid_build_never_commits() {
     let taken = cluster.committed().await;
     paused.armed.store(false, Ordering::SeqCst);
     paused.release.notify_waiters();
-    let merged = merging.await.unwrap();
+    let merged = within(120, "the merge never ended", merging).await.unwrap();
     assert!(!matches!(merged, Ok(Some(_))), "{merged:?}");
     let now = cluster.committed().await;
     assert_eq!(now.manifest, taken.manifest, "the head is the new owner's");
