@@ -5,7 +5,7 @@ use vellev_core::{CollectionName, Object};
 use vellev_index::clustered::{ClusteredIndex, Probing};
 use vellev_index::curve::Curve;
 use vellev_index::filter::{Filter, Predicate};
-use vellev_index::vector::{nearest, Scorer, VectorIndex};
+use vellev_index::vector::{nearest, Scorer, Skipped};
 
 use crate::format::{CollectionId, SegmentCurve};
 use crate::state::{Layer, State, Vectors, SHORTLIST_ABOVE};
@@ -261,7 +261,7 @@ fn candidates(
         work.filtered += index.rows.rows().len();
         work.allowed += allowed.len();
     }
-    let live = || allowed.iter().filter(|row| !layer.dead[*row as usize]);
+    let live = || allowed.iter().filter(|row| !layer.dead.holds(*row));
     let shortlist = index
         .vectors
         .as_ref()
@@ -273,7 +273,7 @@ fn candidates(
         };
     };
     let ties = |a, b| layer.id(a).cmp(&layer.id(b));
-    let unmeasured = vectors.unmeasured(only.as_ref(), layer.dead);
+    let unmeasured = vectors.unmeasured_skipping(only.as_ref(), layer.dead);
     // The memtable's live allowed rows ranked by their codes: every one but
     // those scored exactly anyway.
     if layer.vectors.is_none() {
@@ -282,13 +282,16 @@ fn candidates(
     match vectors {
         Vectors::Clustered(clustered) => Candidates {
             exact: unmeasured,
-            estimated: Some(clustered.estimates_split(
+            estimated: Some(clustered.estimates_marked(
                 vector,
                 count,
                 only.as_ref(),
                 // Nothing to skip where no row has died: the scan then
-                // reads no marks at all.
-                if layer.deaths == 0 { &[] } else { layer.dead },
+                // reads no marks at all; else their bits.
+                match layer.deaths {
+                    0 => Skipped::Bytes(&[]),
+                    _ => layer.dead,
+                },
                 &ties,
                 Probing {
                     probes: probes_for(layer.curves, collection, clustered),
@@ -298,8 +301,9 @@ fn candidates(
         },
         Vectors::Binary(binary) => Candidates {
             exact: binary
-                .shortlist(vector, count, only.as_ref(), layer.dead, &ties)
+                .estimates_skipping(vector, count, only.as_ref(), layer.dead, &ties)
                 .into_iter()
+                .map(|(_, row)| row)
                 .chain(unmeasured)
                 .collect(),
             estimated: None,
@@ -442,7 +446,7 @@ mod tests {
         let indexes = Indexes::new();
         let layer = |rows| Layer {
             rows,
-            dead: &[false, false],
+            dead: Skipped::Bytes(&[false, false]),
             deaths: 0,
             indexes: &indexes,
             vectors: None,
