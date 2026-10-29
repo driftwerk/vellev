@@ -1959,18 +1959,18 @@ mod tests {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
         /// Every way of readying a query for a cluster this machine runs
         /// gives the portable way's residual, lowest, step and levels to
-        /// the last bit: widths whole words or not, values of every size,
+        /// the last bit: widths of one to nineteen words, as a rotation's
+        /// width is whole words, values of every size,
         /// zeros and a lowest or highest of zero, and now and then a value
         /// not finite.
         #[test]
         fn every_way_of_readying_gives_the_portable_way_to_the_last_bit(
             seed in 1u64..u64::MAX,
             words in 1usize..20,
-            ragged in 0usize..2,
             scale in -40i32..40,
             odd in 0u8..30,
         ) {
-            let width = words * 64 - ragged * 3;
+            let width = words * 64;
             let mut noise = Noise(seed);
             let value = |noise: &mut Noise| match (noise.unit() * 1000.0) as i32 {
                 0 if odd == 0 => f32::NAN,
