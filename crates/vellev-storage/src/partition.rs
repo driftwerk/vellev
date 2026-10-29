@@ -2411,6 +2411,20 @@ impl Writer {
         self.merge_planned_at(None).await
     }
 
+    /// Whether a merge planned at epoch `planned` is stale now, and so is
+    /// to be dropped; said if so.
+    fn stale(&self, planned: u64) -> bool {
+        let now = self.epoch();
+        if now != planned {
+            tracing::warn!(
+                planned,
+                now,
+                "a merge planned before the partition was put back is dropped"
+            );
+        }
+        now != planned
+    }
+
     /// How many times this writer has put its state back wholesale (a
     /// restore in place, or from another store) or committed a merge. A
     /// merge is committed only at the epoch it was planned at: one
@@ -2434,16 +2448,21 @@ impl Writer {
             return Ok(None);
         };
         let above = self.merging.clustered_above;
-        let Some((file, vectors, shape, named_at)) = self.partition.read(|state| {
+        let Some((file, vectors, shape, named_at, alive)) = self.partition.read(|state| {
             let named_at = state.position();
             let (file, vectors) = state.merged(&merge, named_at)?;
             let tombstones = file.tombstones.len();
             let shape =
                 Shape::of_gathered(state.catalog(), &file.rows, &vectors, tombstones, above);
-            Some((file, vectors, shape, named_at))
+            Some((file, vectors, shape, named_at, state.alive(&merge)))
         }) else {
             return Ok(None);
         };
+        // A merge planned at another epoch than this is dropped before any
+        // work is spent on it, and again at its commit below.
+        if self.stale(planned) {
+            return Ok(None);
+        }
         let catalog = self.partition.read(|state| state.catalog().clone());
         let built = self.built(file, Some(vectors), catalog.clone()).await?;
         // Both segments, however large, are uploaded without the writer,
@@ -2457,6 +2476,19 @@ impl Writer {
         )?;
         self.upload(&merged, &mut staged).await?;
         let merged = self.fit(merged, &catalog).await?;
+        // Nor with a row the run holds live missing from the merged file,
+        // which carrying it out could not place: checked before the turn
+        // is taken, as no row comes back to life without a restore, which
+        // holds the building lock this does.
+        if !self
+            .partition
+            .read(|state| state.covers(&merge, &alive, &merged))
+        {
+            tracing::error!(
+                "a merged segment lacks a row its run holds live; the merge is dropped"
+            );
+            return Ok(None);
+        }
         let snapshot = self.partition.read(State::taken);
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
         let turn = self.turn().await?;
@@ -2466,22 +2498,8 @@ impl Writer {
         // is as it was planned over. Were it not, the merged segment would
         // describe nothing there is: nothing is committed, and what was
         // uploaded is deleted.
-        // Nor at another epoch than it was planned at, nor with a row the
-        // run holds live missing from the merged file, which carrying it
-        // out could not place: neither should be, and both are refused
-        // here rather than found later.
-        if self.epoch() != planned {
-            tracing::warn!(
-                planned,
-                now = self.epoch(),
-                "a merge planned before the partition was put back is dropped"
-            );
-            return Ok(None);
-        }
-        if !self.partition.read(|state| state.covers(&merge, &merged)) {
-            tracing::error!(
-                "a merged segment lacks a row its run holds live; the merge is dropped"
-            );
+        // Nor at another epoch than it was planned at.
+        if self.stale(planned) {
             return Ok(None);
         }
         let Some(manifest) = self.partition.read(|state| {

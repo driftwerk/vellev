@@ -1944,21 +1944,41 @@ impl State {
         }
     }
 
-    /// Whether `merged`, made for `merge`, holds every row the run holds live
-    /// now, so that carrying the merge out can place each: a merge is
-    /// committed only then. Rows of the run that died since are no matter,
-    /// being dead in the merged segment too.
-    pub(crate) fn covers(&self, merge: &Merge, merged: &Fit) -> bool {
-        let rows: HashSet<RowKey> = merged
-            .file
-            .rows
+    /// Which rows of `merge`'s run are live now, segment by segment: taken
+    /// when a merge is planned, as what its merged segment is made of.
+    pub(crate) fn alive(&self, merge: &Merge) -> Vec<Vec<bool>> {
+        self.segments[merge.run.clone()]
             .iter()
-            .map(|Row { collection, object }| (*collection, object.id))
-            .collect();
-        self.live.iter().all(|(key, location)| match location {
-            Location::Segment(segment, _) if merge.run.contains(segment) => rows.contains(key),
-            _ => true,
-        })
+            .map(|segment| segment.dead.iter().map(|dead| !dead).collect())
+            .collect()
+    }
+
+    /// Whether `merged`, made for `merge` of the rows `alive` when it was
+    /// planned, holds every row the run holds live now, so that carrying
+    /// the merge out can place each: a merge is committed only then. It
+    /// does if it holds as many rows as were alive, and no row of the run
+    /// is live now that was not then; rows of the run that died since are
+    /// no matter, being dead in the merged segment too. Only a restore
+    /// brings a row back to life. One pass over the run's marks: nothing
+    /// is hashed or looked up.
+    pub(crate) fn covers(&self, merge: &Merge, alive: &[Vec<bool>], merged: &Fit) -> bool {
+        let Some(run) = self.segments.get(merge.run.clone()) else {
+            return false;
+        };
+        let were: usize = alive
+            .iter()
+            .map(|rows| rows.iter().filter(|alive| **alive).count())
+            .sum();
+        run.len() == alive.len()
+            && merged.file.rows.len() == were
+            && run.iter().zip(alive).all(|(segment, alive)| {
+                segment.dead.len() == alive.len()
+                    && segment
+                        .dead
+                        .iter()
+                        .zip(alive)
+                        .all(|(dead, alive)| *dead || *alive)
+            })
     }
 
     /// Carry out a committed merge: the run's segments go, and the merged
@@ -3059,16 +3079,30 @@ mod tests {
         built.commit((5..=8).map(|n| upsert(0, n, n as i64)).collect());
         built.flush();
         let (plan, fit) = built.planned();
-        assert!(built.state.covers(&plan, &fit));
+        let alive = built.state.alive(&plan);
+        assert!(built.state.covers(&plan, &alive, &fit));
         // A row of the run dies after the merge was made: still covered.
         built.commit(vec![delete(0, 3)]);
-        assert!(built.state.covers(&plan, &fit));
-        // A merged file that lacks a row the run holds live: not.
+        assert!(built.state.covers(&plan, &alive, &fit));
+        // A row of the run live again that was not when the merge was made,
+        // as only a restore could make one: not.
         let (plan, fit) = built.planned();
+        let alive = built.state.alive(&plan);
+        let segment = plan.run.start;
+        let dead = built.state.segments[segment]
+            .dead
+            .iter()
+            .position(|dead| *dead)
+            .expect("the row deleted above");
+        built.state.segments[segment].dead[dead] = false;
+        assert!(!built.state.covers(&plan, &alive, &fit));
+        built.state.segments[segment].dead[dead] = true;
+        // A merged file that lacks a row the run held live: not.
         let mut file = (*fit.file).clone();
         file.rows.retain(|row| row.object.id != oid(6));
         let catalog = built.state.catalog().clone();
         let short = built.fit(file, &catalog);
-        assert!(!built.state.covers(&plan, &short));
+        assert!(!built.state.covers(&plan, &alive, &short));
+        assert!(built.state.covers(&plan, &alive, &fit));
     }
 }
