@@ -1956,29 +1956,39 @@ impl State {
     /// Whether `merged`, made for `merge` of the rows `alive` when it was
     /// planned, holds every row the run holds live now, so that carrying
     /// the merge out can place each: a merge is committed only then. It
-    /// does if it holds as many rows as were alive, and no row of the run
-    /// is live now that was not then; rows of the run that died since are
-    /// no matter, being dead in the merged segment too. Only a restore
-    /// brings a row back to life. One pass over the run's marks: nothing
-    /// is hashed or looked up.
+    /// does if it holds the rows that were alive, the same rows in the same
+    /// order, as `merged()` gathers them, and no row of the run is live now
+    /// that was not then; rows of the run that died since are no matter,
+    /// being dead in the merged segment too. Only a restore brings a row
+    /// back to life. One pass over the run's marks and the merged rows,
+    /// side by side: nothing is hashed or looked up.
     pub(crate) fn covers(&self, merge: &Merge, alive: &[Vec<bool>], merged: &Fit) -> bool {
         let Some(run) = self.segments.get(merge.run.clone()) else {
             return false;
         };
-        let were: usize = alive
-            .iter()
-            .map(|rows| rows.iter().filter(|alive| **alive).count())
-            .sum();
-        run.len() == alive.len()
-            && merged.file.rows.len() == were
-            && run.iter().zip(alive).all(|(segment, alive)| {
-                segment.dead.len() == alive.len()
-                    && segment
-                        .dead
-                        .iter()
-                        .zip(alive)
-                        .all(|(dead, alive)| *dead || *alive)
-            })
+        if run.len() != alive.len() {
+            return false;
+        }
+        let mut gathered = merged.file.rows.iter();
+        for (segment, alive) in run.iter().zip(alive) {
+            if segment.dead.len() != alive.len() || segment.file.rows.len() != alive.len() {
+                return false;
+            }
+            for ((row, dead), was) in segment.file.rows.iter().zip(&segment.dead).zip(alive) {
+                if !*dead && !*was {
+                    return false;
+                }
+                if *was {
+                    let same = gathered.next().is_some_and(|got| {
+                        (got.collection, got.object.id) == (row.collection, row.object.id)
+                    });
+                    if !same {
+                        return false;
+                    }
+                }
+            }
+        }
+        gathered.next().is_none()
     }
 
     /// Carry out a committed merge: the run's segments go, and the merged
@@ -3103,6 +3113,16 @@ mod tests {
         let catalog = built.state.catalog().clone();
         let short = built.fit(file, &catalog);
         assert!(!built.state.covers(&plan, &alive, &short));
+        // One with as many rows, one of them not the run's: not.
+        let mut file = (*fit.file).clone();
+        let wrong = file
+            .rows
+            .iter_mut()
+            .find(|row| row.object.id == oid(6))
+            .expect("row 6 in the merged file");
+        wrong.object.id = oid(99);
+        let wrong = built.fit(file, &catalog);
+        assert!(!built.state.covers(&plan, &alive, &wrong));
         assert!(built.state.covers(&plan, &alive, &fit));
     }
 }
