@@ -2055,7 +2055,11 @@ impl State {
     pub fn dead_rows(&self) -> Vec<Vec<bool>> {
         self.segments
             .iter()
-            .map(|segment| segment.dead.clone())
+            .map(|segment| {
+                (0..segment.dead.rows())
+                    .map(|row| segment.dead.is_dead(row))
+                    .collect()
+            })
             .collect()
     }
 
