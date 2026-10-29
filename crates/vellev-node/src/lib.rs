@@ -1240,10 +1240,43 @@ enum Kind {
 struct Taken {
     /// The tenants written for, taken out and still to be let go.
     going: Vec<Arc<Tenant>>,
-    /// The tenants written for that something else held, left as they are.
-    kept: Vec<Arc<Tenant>>,
+    /// The tenants written for that something else held, left as they are,
+    /// with what each holds, in the order they were chosen.
+    kept: Vec<(Arc<Tenant>, usize)>,
     /// About how many bytes what was taken out held.
     freed: usize,
+}
+
+impl Taken {
+    /// Take `held` out of `open` if it is still the one held and nobody but
+    /// the node and this sweep has it, nor is opening it; else keep it.
+    fn take(&mut self, open: &mut Open, held: &Held) {
+        match &held.kind {
+            Kind::Writer(opening, tenant) => {
+                let same = open
+                    .tenants
+                    .get(&held.id)
+                    .is_some_and(|now| Arc::ptr_eq(now, opening));
+                if same && Arc::strong_count(opening) == 2 && Arc::strong_count(tenant) == 2 {
+                    open.tenants.remove(&held.id);
+                    self.going.push(tenant.clone());
+                    self.freed += held.size;
+                } else if same {
+                    self.kept.push((tenant.clone(), held.size));
+                }
+            }
+            Kind::Copy(following, copy) => {
+                let same = open
+                    .followers
+                    .get(&held.id)
+                    .is_some_and(|now| Arc::ptr_eq(now, following));
+                if same && Arc::strong_count(following) == 2 && Arc::strong_count(copy) == 2 {
+                    open.followers.remove(&held.id);
+                    self.freed += held.size;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1862,42 +1895,41 @@ impl Inner {
         let (idle, recent) = (self.settings.tenant_idle, RESIDENT_AT_LEAST);
         let draining = self.merge_builds.draining();
         let total = held.iter().map(|held| held.size).sum::<usize>() + draining;
-        let over = self.settings.memory.is_some_and(|budget| total > budget);
-        let mut chosen: Vec<&Held> = held
+        let idle: Vec<&Held> = held
             .iter()
             .filter(|held| matches!(held.kind, Kind::Writer(..)) && held.unused >= idle)
             .collect();
-        if let Some(budget) = self.settings.memory {
-            // What would be left, were each chosen taken out.
-            let mut left = total - chosen.iter().map(|held| held.size).sum::<usize>();
-            let mut older: Vec<&Held> = held
+        let mut older: Vec<&Held> = match self.settings.memory {
+            Some(_) => held
                 .iter()
                 .filter(|held| {
-                    held.unused >= recent && !chosen.iter().any(|c| std::ptr::eq(*c, *held))
+                    held.unused >= recent && !idle.iter().any(|c| std::ptr::eq(*c, *held))
                 })
-                .collect();
-            // Copies warming opened that nobody has read go first.
-            older.sort_by_key(|held| (!held.warmed, std::cmp::Reverse(held.unused)));
-            for held in older {
-                if left <= budget {
-                    break;
-                }
-                left -= held.size;
-                chosen.push(held);
-            }
-        }
-        let taken = self.taken_out(&chosen);
-        if over {
-            for tenant in &taken.kept {
-                tracing::debug!(tenant = %tenant.id, "over the memory budget: a merge is stopped so that the tenant can be let go");
-                tenant.writer.stop_merges();
-            }
-        }
+                .collect(),
+            None => Vec::new(),
+        };
+        // Copies warming opened that nobody has read go first.
+        older.sort_by_key(|held| (!held.warmed, std::cmp::Reverse(held.unused)));
+        let taken = self.taken_out(&idle, &older, total);
         if let Some(budget) = self.settings.memory {
             // Only what was taken out comes off: what something else held
             // is held still.
             let left = total - taken.freed;
             if left > budget {
+                // Still over with all that could go taken out: the merges of
+                // tenants chosen that something else holds are stopped, the
+                // least recently used first, as many as cover what is over,
+                // so that each can be let go at a later round. None is
+                // stopped while letting others go is enough.
+                let mut over = left - budget;
+                for (tenant, size) in &taken.kept {
+                    if over == 0 {
+                        break;
+                    }
+                    tracing::debug!(tenant = %tenant.id, "over the memory budget: a merge is stopped so that the tenant can be let go");
+                    tenant.writer.stop_merges();
+                    over = over.saturating_sub(*size);
+                }
                 tracing::warn!(
                     budget,
                     held = left,
@@ -1949,37 +1981,23 @@ impl Inner {
             .collect()
     }
 
-    /// Take `chosen` out of what the node holds, each only if it is still
-    /// the one held and nobody but the node and this sweep has it, nor is
-    /// opening it.
-    fn taken_out(&self, chosen: &[&Held]) -> Taken {
+    /// Take out of what the node holds each of `idle`, and then, while what
+    /// is left of `total` is over the budget, each of `older` in turn: each
+    /// only if it is still the one held and nobody but the node and this
+    /// sweep has it, nor is opening it. Those something else holds are kept,
+    /// and the next is tried, so that what can go goes first.
+    fn taken_out(&self, idle: &[&Held], older: &[&Held], total: usize) -> Taken {
         let mut open = self.opened();
         let mut taken = Taken::default();
-        for held in chosen {
-            match &held.kind {
-                Kind::Writer(opening, tenant) => {
-                    let same = open
-                        .tenants
-                        .get(&held.id)
-                        .is_some_and(|now| Arc::ptr_eq(now, opening));
-                    if same && Arc::strong_count(opening) == 2 && Arc::strong_count(tenant) == 2 {
-                        open.tenants.remove(&held.id);
-                        taken.going.push(tenant.clone());
-                        taken.freed += held.size;
-                    } else if same {
-                        taken.kept.push(tenant.clone());
-                    }
+        for held in idle {
+            taken.take(&mut open, held);
+        }
+        if let Some(budget) = self.settings.memory {
+            for held in older {
+                if total - taken.freed <= budget {
+                    break;
                 }
-                Kind::Copy(following, copy) => {
-                    let same = open
-                        .followers
-                        .get(&held.id)
-                        .is_some_and(|now| Arc::ptr_eq(now, following));
-                    if same && Arc::strong_count(following) == 2 && Arc::strong_count(copy) == 2 {
-                        open.followers.remove(&held.id);
-                        taken.freed += held.size;
-                    }
-                }
+                taken.take(&mut open, held);
             }
         }
         taken
@@ -2076,6 +2094,12 @@ impl Inner {
         hold.commits
             .set(commits.clone())
             .expect("a tenant's writes are queued once");
+        // Lost meanwhile, before its writer and writes were where losing it
+        // finds them: lost again, now that they are, so that its writes and
+        // merges are stopped too. Losing is the same however often.
+        if hold.is_lost() {
+            hold.lose();
+        }
         let opened = Arc::new(Tenant {
             id: tenant.clone(),
             commits,

@@ -115,7 +115,12 @@ impl Drop for Probe {
 
 impl MergeBuilds {
     /// Builds of merges `at_once` at a time.
+    ///
+    /// # Panics
+    ///
+    /// If `at_once` is 0: no merge would ever be built.
     pub fn new(at_once: usize) -> Arc<Self> {
+        assert!(at_once >= 1, "merges are built at least one at a time");
         Arc::new(Self {
             turns: Arc::new(Semaphore::new(at_once)),
             under_way: Mutex::default(),
@@ -231,28 +236,45 @@ impl MergeBuilds {
         });
         lock(&self.under_way).push(reckoned.clone());
         Ok(Some(MergeBuild {
-            _turn: turn,
             counted: Counted {
                 builds: self.clone(),
                 reckoned,
             },
+            _turn: turn,
         }))
     }
 }
 
-/// One merge's build: its turn, and its count among the builds under way.
+/// One merge's build: its count among the builds under way, and its turn.
 /// Shared, as an `Arc`, by every piece of work that holds what the merge
-/// gathered or built, and let go with the last.
+/// gathered or built, and let go with the last: its count first, then its
+/// turn, as fields drop in order, so that the builds under way never
+/// count one more than there are turns.
 #[derive(Debug)]
 pub(crate) struct MergeBuild {
-    _turn: OwnedSemaphorePermit,
     counted: Counted,
+    _turn: OwnedSemaphorePermit,
 }
 
 impl MergeBuild {
+    /// Reckon the build, as it is planned, to hold `bytes` at its peak.
+    pub(crate) fn reckon_planned(&self, bytes: usize) {
+        self.counted.reckoned.planned.store(bytes, Ordering::SeqCst);
+        self.reckon(bytes);
+    }
+
     /// Reckon the build to hold `bytes` at its peak, from now on.
     pub(crate) fn reckon(&self, bytes: usize) {
         self.counted.reckoned.bytes.store(bytes, Ordering::SeqCst);
+    }
+
+    /// A probe for what the build makes to carry, if a test asks: see
+    /// [`MergeBuilds::probe`].
+    pub(crate) fn probe(&self) -> Option<Probe> {
+        let builds = &self.counted.builds;
+        builds.probing.load(Ordering::SeqCst).then(|| Probe {
+            builds: builds.clone(),
+        })
     }
 
     /// Note the merge past where a stop ends it: what it holds is
@@ -264,12 +286,18 @@ impl MergeBuild {
             .store(true, Ordering::SeqCst);
     }
 
-    /// Wait here, off the async threads, while a test holds builds: see
-    /// [`MergeBuilds::hold`]. At most [`HELD_AT_MOST`].
-    pub(crate) fn held_here(&self, stopping: &Stopping) {
+    /// Wait here, off the async threads, while a test holds builds at
+    /// their start, or once `built`: see [`MergeBuilds::hold`]. At most
+    /// [`HELD_AT_MOST`].
+    pub(crate) fn held_here(&self, stopping: &Stopping, built: bool) {
         let builds = &self.counted.builds;
         let mut holding = lock(&builds.holding);
-        if holding.is_none() {
+        let here = match *holding {
+            None => false,
+            Some(Holding::BuiltUntilLetGo) => built,
+            Some(Holding::UntilLetGo | Holding::UntilStopped) => !built,
+        };
+        if !here {
             return;
         }
         builds.held.fetch_add(1, Ordering::SeqCst);
@@ -277,9 +305,8 @@ impl MergeBuild {
         loop {
             let goes_on = match *holding {
                 None => true,
-                Some(Holding::UntilLetGo) => false,
+                Some(Holding::UntilLetGo | Holding::BuiltUntilLetGo) => false,
                 Some(Holding::UntilStopped) => stopping.is_stopped(),
-                Some(Holding::BuiltUntilLetGo) => true,
             };
             if goes_on || Instant::now() >= until {
                 break;
