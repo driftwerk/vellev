@@ -1,0 +1,29 @@
+name: Merge stop timed (scratch)
+
+on:
+  push:
+    branches: [scratch-merge-stop]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  timed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: CPU and memory
+        run: lscpu | grep -E "Model name|^CPU\(s\)"; free -g
+      - name: Rule 4a, in release, twice
+        run: |
+          set -o pipefail
+          for run in 1 2; do
+            echo "== run $run"
+            cargo test --release --locked -p vellev-storage --test merge_stop -- --ignored --nocapture a_merge_stopped_at_any_moment 2>&1 | grep -E "stopped at|merged unstopped|stops, the slowest|test result|panicked|FAILED"
+          done
