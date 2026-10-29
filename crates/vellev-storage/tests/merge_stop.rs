@@ -439,11 +439,11 @@ impl Blobs for Late {
     }
 }
 
-/// A file a stopped merge was uploading that lands after the merge gave up
-/// is deleted once it lands, on a local store: never deleted first and then
-/// left behind.
+/// A file a stopped merge was uploading that lands after the merge gave up,
+/// as a local store's write on a blocking thread may, is referenced by
+/// nothing and kept by nothing: cleaning up deletes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stopped_upload_that_lands_late_is_deleted_once_it_lands() {
+async fn a_stopped_upload_that_lands_late_is_left_to_cleaning_up() {
     let dir = tempfile::tempdir().unwrap();
     let mut cluster = Cluster::new().await;
     let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
@@ -457,6 +457,7 @@ async fn a_stopped_upload_that_lands_late_is_deleted_once_it_lands() {
     });
     cluster.blobs = late.clone();
     let writer = two_large(&cluster).await;
+    let before = cluster.committed().await;
     late.armed.store(true, Ordering::SeqCst);
     let merging = tokio::spawn({
         let writer = writer.clone();
@@ -467,17 +468,32 @@ async fn a_stopped_upload_that_lands_late_is_deleted_once_it_lands() {
     let merged = within(10, "the merge never gave up", merging).await;
     assert_eq!(merged.unwrap().unwrap(), None);
     assert_eq!(writer.kept_while_merging(), 0);
-    // The index lands only now, after the merge has given up.
+    // The index lands only now, after the merge has given up and deleted
+    // what it had put.
     tokio::time::sleep(Duration::from_millis(200)).await;
     late.land.notify_one();
-    settled("a file that landed late is left behind", || async {
-        stored(&cluster, "-merged").await.is_empty()
+    settled("the late file lands", || async {
+        !stored(&cluster, "-merged.index").await.is_empty()
     })
     .await;
-    // And stays gone: nothing is still to land.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cluster.committed().await.manifest, before.manifest);
+    // Once the partition has moved past where the merge named its files,
+    // cleaning up deletes what landed late.
+    let mut random = Random(17);
+    for round in 0..3 {
+        writer
+            .commit(vec![note(9_000 + round, &mut random)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    writer.clean(Duration::ZERO).await.unwrap();
     assert!(stored(&cluster, "-merged").await.is_empty());
-    all_there(&cluster).await;
+    let count = |state: &State| state.count(&name("notes"));
+    assert_eq!(
+        cluster.open().await.partition().read(count),
+        2 * NOTES as usize + 3
+    );
 }
 
 /// A stop that comes once what was built is loaded back is too late: the

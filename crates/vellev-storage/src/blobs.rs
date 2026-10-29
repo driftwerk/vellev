@@ -689,10 +689,11 @@ impl Progress {
         self.1.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Whether nobody waits for the step any more: given up on at its
-    /// bound, or dropped by a caller that stopped, as a merge does. A step
-    /// asks between pieces, and gives up too, so that the disk's turn and
-    /// thread go to work someone waits for.
+    /// Whether nobody waits for the step any more: its caller stopped
+    /// waiting, as a stopped merge does. A step asks between pieces, and
+    /// gives up too, so that the disk's turn and thread go to work someone
+    /// waits for. A step whose wait ended at its bound is not told so: it
+    /// runs on, as what it does may be kept for the next attempt.
     pub fn given_up(&self) -> bool {
         self.2.load(Ordering::Relaxed)
     }
@@ -702,12 +703,19 @@ impl Progress {
     }
 }
 
-/// Tells a step its waiting is over, as it is dropped.
-struct GivenUp(Progress);
+/// Tells a step nobody waits for it any more, if it is dropped while its
+/// caller still waits: not once the wait has ended, answered or given up
+/// at its bound.
+struct GivenUp {
+    progress: Progress,
+    dropped: bool,
+}
 
 impl Drop for GivenUp {
     fn drop(&mut self) {
-        self.0 .2.store(true, Ordering::Relaxed);
+        if self.dropped {
+            self.progress.2.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -934,9 +942,15 @@ impl Disk {
         let thread = self.thread(within).await?;
         let (threads, number) = (self.threads.clone(), thread.step);
         let progress = self.progress();
-        // However the wait ends, the step is told it is no longer waited
-        // for: if it is still at work, it gives up at its next piece.
-        let _waited = GivenUp(progress.clone());
+        // Dropped unfinished, by a caller that stops waiting, as a stopped
+        // merge does, the step is told so, and gives up at its next piece.
+        // Not when the wait ends at its bound: a check of a file on a slow
+        // disk runs on to its end, and is remembered, so that the next
+        // load need not begin it again from nothing (see `column::Summed`).
+        let mut waiting = GivenUp {
+            progress: progress.clone(),
+            dropped: true,
+        };
         let (done, mut waited) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("vellev-disk".into())
@@ -968,20 +982,18 @@ impl Disk {
             let (had, shifts) = self.loads.now();
             let (beside, most) = (had.max(1), self.turns as u64);
             pace.owe(owing, shifts, beside, most, least);
-            match stepped {
-                Ok(stepped) => return stepped.map_err(std::io::Error::other)?,
-                Err(_) if progress.so_far() == seen => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("local disk got no further within {within:?}"),
-                    ))
-                }
+            let ended = match stepped {
+                Ok(stepped) => stepped.map_err(std::io::Error::other).and_then(|done| done),
+                Err(_) if progress.so_far() == seen => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("local disk got no further within {within:?}"),
+                )),
                 Err(_) if pace.behind(progress.so_far()) => {
                     let slowest = least / beside;
-                    return Err(std::io::Error::new(
+                    Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!("local disk is slower than {slowest} bytes a second"),
-                    ));
+                    ))
                 }
                 Err(_) => {
                     seen = progress.so_far();
@@ -989,8 +1001,11 @@ impl Disk {
                     if let Some(due) = due.get_mut(&number) {
                         *due = tokio::time::Instant::now() + within;
                     }
+                    continue;
                 }
-            }
+            };
+            waiting.dropped = false;
+            return ended;
         }
     }
 
@@ -1097,7 +1112,8 @@ impl ObjectBlobs {
             Ok(started) => started,
             Err(failed) => match failed.try_into_panic() {
                 Ok(panic) => std::panic::resume_unwind(panic),
-                Err(_) => unreachable!("an upload's start is never aborted"),
+                // Cancelled, as the runtime shuts down.
+                Err(failed) => Err(StorageError::Background(failed.to_string())),
             },
         }
     }
@@ -2207,6 +2223,43 @@ impl Blobs for CachedBlobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step whose wait is given up at its bound, as one too slow for
+    /// the disk is, is not told nobody waits: it runs on to its end, so that
+    /// a check of a large file on a slow disk is finished and remembered,
+    /// and the next load does not begin it again from nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_given_up_at_its_bound_is_not_told_to_give_up() {
+        let disk = slow_disk();
+        let (say, told) = std::sync::mpsc::channel::<usize>();
+        let (tell, said) = std::sync::mpsc::channel();
+        let (seen, heard) = std::sync::mpsc::channel();
+        let step = move |progress: &Progress| {
+            for bytes in told {
+                progress.made(bytes);
+                tell.send(()).unwrap();
+            }
+            seen.send(progress.given_up()).unwrap();
+            Ok("done")
+        };
+        let waited = tokio::spawn({
+            let disk = disk.clone();
+            async move { disk.run_while_it_gets_on(1, step).await }
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // A hundred bytes a second: slower than the disk may be.
+        for _ in 0..14 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            say.send(1).unwrap();
+            said.recv().unwrap();
+        }
+        assert!(waited.is_finished(), "given up for its pace");
+        let too_slow = waited.await.unwrap().unwrap_err();
+        assert!(too_slow.to_string().contains("slower than"), "{too_slow}");
+        drop(say);
+        let told_so = heard.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!told_so, "a step given up for its pace was told to give up");
+    }
 
     /// A step on local disk whose caller stops waiting is told so, and
     /// can give up, rather than holding the disk's thread and turn to the
