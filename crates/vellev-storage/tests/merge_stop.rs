@@ -257,3 +257,83 @@ async fn a_merge_on_a_lease_already_taken_uploads_nothing() {
     }
     assert!(stored(&cluster, "-merged").await.is_empty());
 }
+
+/// Rule 4a, timed: a merge of a size where each of its stages takes
+/// seconds, stopped at moments spread from its start to its end, gives up
+/// within 2 s of each stop. Run in release, on CI, as
+/// `cargo test --release -p vellev-storage --test merge_stop -- --ignored`;
+/// `VELLEV_STOP_ROWS` sets the rows in each of the two segments merged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "timed, in release, at a size where each stage takes seconds"]
+async fn a_merge_stopped_at_any_moment_gives_up_within_two_seconds() {
+    let rows: u32 = std::env::var("VELLEV_STOP_ROWS")
+        .ok()
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or(250_000);
+    let cluster = Cluster::new().await;
+    let merging = Merging {
+        fanout: 2,
+        ..Merging::default()
+    };
+    let writer = Arc::new(cluster.writer().await.merging_with(merging));
+    let mut big = schema("notes");
+    big.embedding.dimensions = 384;
+    writer
+        .commit(vec![Mutation::CreateCollection(Box::new(big))])
+        .await
+        .unwrap();
+    let mut random = Random(13);
+    for round in 0..2 {
+        for start in (0..rows).step_by(10_000) {
+            let notes = (start..rows.min(start + 10_000)).map(|n| {
+                let mut note = note(round * rows + n, &mut random);
+                if let Mutation::Upsert { vector, .. } = &mut note {
+                    *vector = Some(random.vector(384));
+                }
+                note
+            });
+            writer.commit(notes.collect()).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+    }
+    let before = cluster.committed().await;
+
+    let mut worst = Duration::ZERO;
+    let mut stopped = 0;
+    let mut at = Duration::from_millis(500);
+    loop {
+        let begun = std::time::Instant::now();
+        let merging = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        tokio::time::sleep(at).await;
+        if merging.is_finished() {
+            let merged = merging.await.unwrap().unwrap();
+            assert!(merged.is_some(), "the merge unstopped commits");
+            println!("merged unstopped in {:.1} s", begun.elapsed().as_secs_f64());
+            break;
+        }
+        writer.stop_merges();
+        let asked = std::time::Instant::now();
+        let merged = within(60, "the merge never gave up", merging).await;
+        let took = asked.elapsed();
+        assert_eq!(merged.unwrap().unwrap(), None, "a merge stopped at {at:?}");
+        assert_eq!(cluster.committed().await.manifest, before.manifest);
+        assert_eq!(writer.kept_while_merging(), 0);
+        println!(
+            "stopped at {:.1} s: gave up in {:.3} s",
+            at.as_secs_f64(),
+            took.as_secs_f64()
+        );
+        worst = worst.max(took);
+        stopped += 1;
+        at = at.mul_f64(1.6);
+    }
+    println!(
+        "{stopped} stops, the slowest given up in {:.3} s",
+        worst.as_secs_f64()
+    );
+    assert!(stopped >= 5, "too few stops to say: {stopped}");
+    assert!(worst <= Duration::from_secs(2), "a stop took {worst:?}");
+}
