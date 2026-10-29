@@ -86,6 +86,9 @@ struct Faulty {
     /// Every file put whole fails, as a store that answers 403 or 500 does,
     /// and nothing is put.
     failing_puts: AtomicBool,
+    /// Starts of uploads in parts wait, once armed, until let go.
+    held_starts: AtomicBool,
+    starts: Arc<tokio::sync::Notify>,
 }
 
 impl Faulty {
@@ -107,6 +110,8 @@ impl Faulty {
             silent_deletes: AtomicBool::new(false),
             silent_heads: AtomicBool::new(false),
             failing_puts: AtomicBool::new(false),
+            held_starts: AtomicBool::new(false),
+            starts: Arc::default(),
         }
     }
 
@@ -191,6 +196,9 @@ impl ObjectStore for Faulty {
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.in_parts.fetch_add(1, Ordering::SeqCst);
+        if self.held_starts.load(Ordering::SeqCst) {
+            self.starts.notified().await;
+        }
         Ok(Box::new(Parts {
             inner: self.inner.put_multipart_opts(location, opts).await?,
             stalls: self.stalls(location),
@@ -2778,4 +2786,46 @@ async fn a_fetch_into_the_cache_given_up_part_way_leaves_nothing_part_written() 
         assert!(soon(&|| part_written() == 0), "nothing of it is left");
     }
     assert!(!dir.path().join(&key).exists());
+}
+
+/// An upload in parts whose caller stops waiting while the store has yet
+/// to say it has begun is aborted once the store does: never left begun,
+/// with no parts and nothing to abort it.
+#[tokio::test]
+async fn an_upload_dropped_while_it_starts_is_aborted_once_it_has() {
+    let store = Arc::new(Faulty::new("nothing"));
+    store.held_starts.store(true, Ordering::SeqCst);
+    let aborts = Aborts::default();
+    let blobs = ObjectBlobs::new(store.clone())
+        .transferring(Transfers {
+            request_within: Duration::from_secs(60),
+            ..SMALL_PARTS
+        })
+        .aborting(aborts.clone());
+    let blobs = Arc::new(blobs);
+    let putting = tokio::spawn({
+        let blobs = blobs.clone();
+        async move { blobs.put("large", Bytes::from(vec![7u8; 100])).await }
+    });
+    let asked = async {
+        while store.in_parts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), asked)
+        .await
+        .expect("the upload is started");
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+    assert_eq!(aborts.pending(), 1, "the abort is on its way");
+    store.starts.notify_one();
+    let aborted = async {
+        while store.aborts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), aborted)
+        .await
+        .expect("the upload begun for nobody is aborted");
+    assert_eq!(aborts.finished(Duration::from_secs(10)).await, 0);
 }

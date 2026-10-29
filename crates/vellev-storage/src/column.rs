@@ -467,22 +467,49 @@ impl Unsummed {
 
     /// As [`Self::summed`], remembering the file as it lay when it was
     /// opened to be summed.
+    #[cfg(test)]
     pub fn summed_as(self, key: &str, file: Seen, told: impl FnMut(usize)) -> Result<Column> {
-        let column = self.summed(key, told)?;
+        self.summed_as_unless(key, file, told, || false)
+    }
+
+    /// As [`Self::summed_as`], giving up as soon as `given_up` says so,
+    /// asked before each piece: when nobody waits for the column any more.
+    pub fn summed_as_unless(
+        self,
+        key: &str,
+        file: Seen,
+        told: impl FnMut(usize),
+        given_up: impl Fn() -> bool,
+    ) -> Result<Column> {
+        let column = self.summed_unless(key, told, given_up)?;
         summed().remember(file);
         Ok(column)
     }
 
     /// The column, once its whole file is seen to sum to what it says,
     /// telling `summed` of each piece of the file as it is read.
+    #[cfg(test)]
     pub fn summed(self, key: &str, summed: impl FnMut(usize)) -> Result<Column> {
+        self.summed_unless(key, summed, || false)
+    }
+
+    /// As [`Self::summed`], giving up as soon as `given_up` says so.
+    fn summed_unless(
+        self,
+        key: &str,
+        summed: impl FnMut(usize),
+        given_up: impl Fn() -> bool,
+    ) -> Result<Column> {
         let Values::Mapped(map, _) = &self.0.values else {
             return Ok(self.0);
         };
         let (_, body, sum) = format::open_unsummed(key, map)?;
-        match sum.holds(body, summed) {
-            true => Ok(self.0),
-            false => Err(StorageError::corrupt(key, "checksum mismatch")),
+        match sum.holds_unless(body, summed, given_up) {
+            Some(true) => Ok(self.0),
+            Some(false) => Err(StorageError::corrupt(key, "checksum mismatch")),
+            None => Err(StorageError::Background(format!(
+                "summing {key} was given up: nobody waits for it"
+            ))),
         }
     }
 }
@@ -490,6 +517,22 @@ impl Unsummed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Summing a file in place gives up, before the next piece, once
+    /// nobody waits for it.
+    #[test]
+    fn summing_gives_up_once_nobody_waits() {
+        let column = Column::taken_from(&mut [row(Some(vec![1.0, 2.0])), row(Some(vec![3.0]))]);
+        let frame = column.encode();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k");
+        std::fs::write(&path, &frame).unwrap();
+        let mapped = Column::map("k", &path).unwrap();
+        let mut read = 0;
+        let given_up = mapped.summed_unless("k", |bytes| read += bytes, || true);
+        assert!(given_up.is_err(), "summed though given up");
+        assert_eq!(read, 0, "it read on");
+    }
     use crate::format::CollectionId;
     use vellev_core::{Object, ObjectId};
 

@@ -83,9 +83,10 @@ async fn all_there(cluster: &Cluster) {
 }
 
 /// The stages of a merge, each stopped in on its own.
-const STAGES: [MergeStage; 11] = [
+const STAGES: [MergeStage; 12] = [
     MergeStage::Planning,
     MergeStage::Gathering,
+    MergeStage::Turn,
     MergeStage::Indexing,
     MergeStage::Vectors(Stage::Sampling),
     MergeStage::Vectors(Stage::Clustering),
@@ -163,12 +164,14 @@ async fn a_merge_stopped_while_it_uploads_gives_up_and_deletes_what_it_put() {
     assert_eq!(merged, None);
     assert_eq!(cluster.committed().await.manifest, before.manifest);
     assert_eq!(writer.kept_while_merging(), 0);
+    // The upload given up on settles, and only then is what it put
+    // deleted.
+    paused.armed.store(false, Ordering::SeqCst);
+    paused.release.notify_waiters();
     settled("the stopped merge's files stay", || async {
         stored(&cluster, "-merged").await.is_empty()
     })
     .await;
-    paused.armed.store(false, Ordering::SeqCst);
-    paused.release.notify_waiters();
     all_there(&cluster).await;
 }
 
@@ -318,7 +321,23 @@ async fn a_merge_stopped_at_any_moment_gives_up_within_two_seconds() {
         let asked = std::time::Instant::now();
         let merged = within(60, "the merge never gave up", merging).await;
         let took = asked.elapsed();
-        assert_eq!(merged.unwrap().unwrap(), None, "a merge stopped at {at:?}");
+        // A stop that lands once what was built is loaded back is past the
+        // point of no return: the merge commits, by design, and the sweep
+        // ends there. Only then: a commit after a stop it was told of in
+        // time would be a stop not heeded.
+        if merged.as_ref().unwrap().as_ref().unwrap().is_some() {
+            assert_eq!(
+                writer.stops_past_loading(),
+                1,
+                "a merge stopped at {at:?} committed before it had loaded back"
+            );
+            println!(
+                "stopped at {:.1} s, past loading back: committed in {:.3} s",
+                at.as_secs_f64(),
+                took.as_secs_f64()
+            );
+            break;
+        }
         assert_eq!(cluster.committed().await.manifest, before.manifest);
         assert_eq!(writer.kept_while_merging(), 0);
         println!(
@@ -336,4 +355,253 @@ async fn a_merge_stopped_at_any_moment_gives_up_within_two_seconds() {
     );
     assert!(stopped >= 5, "too few stops to say: {stopped}");
     assert!(worst <= Duration::from_secs(2), "a stop took {worst:?}");
+}
+
+/// A merge waiting its turn behind another when merges are stopped is
+/// stopped too: once its turn comes it gives up before it gathers a row,
+/// and uploads nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_waiting_its_turn_when_merges_are_stopped_is_stopped_too() {
+    let mut cluster = Cluster::new().await;
+    let (paused, mut seen) = Paused::new(&mut cluster, "-merged.index");
+    let writer = two_large(&cluster).await;
+    let before = cluster.committed().await;
+    paused.armed.store(true, Ordering::SeqCst);
+    let first = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    let stored_one = async { while seen.recv().await.expect("the store is there") != "stored" {} };
+    within(120, "the first merge's index went up", stored_one).await;
+    let queued = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    // Waiting its turn, behind the first.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!queued.is_finished());
+    writer.stop_merges();
+    let first = within(10, "the first merge never gave up", first).await;
+    assert_eq!(first.unwrap().unwrap(), None);
+    // Were it to build, its index's upload would be held, and it would
+    // never end.
+    let queued = within(30, "the merge waiting its turn never gave up", queued).await;
+    assert_eq!(queued.unwrap().unwrap(), None);
+    assert_eq!(cluster.committed().await.manifest, before.manifest);
+    assert_eq!(writer.kept_while_merging(), 0);
+    paused.armed.store(false, Ordering::SeqCst);
+    paused.release.notify_waiters();
+    settled("the stopped merges' files stay", || async {
+        stored(&cluster, "-merged").await.is_empty()
+    })
+    .await;
+    assert!(within(120, "the next merge", writer.merge())
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// A store whose uploads of one kind, once armed, are written only when
+/// let land, on a task of their own that goes on if whoever uploads stops
+/// waiting: as a local store writes on a blocking thread, or a store
+/// answers the last request of an upload in parts after it was sent.
+#[derive(Debug)]
+struct Late {
+    inner: Arc<dyn Blobs>,
+    kind: &'static str,
+    armed: AtomicBool,
+    putting: tokio::sync::mpsc::UnboundedSender<()>,
+    land: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Blobs for Late {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if !(self.armed.load(Ordering::SeqCst) && key.contains(self.kind)) {
+            return self.inner.put(key, bytes).await;
+        }
+        let (inner, land, key) = (self.inner.clone(), self.land.clone(), key.to_string());
+        let landing = tokio::spawn(async move {
+            land.notified().await;
+            inner.put(&key, bytes).await
+        });
+        self.putting.send(()).unwrap();
+        landing.await.expect("the write lands")
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A file a stopped merge was uploading that lands after the merge gave up
+/// is deleted once it lands, on a local store: never deleted first and then
+/// left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_upload_that_lands_late_is_deleted_once_it_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new().await;
+    let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+    let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
+    let late = Arc::new(Late {
+        inner: Arc::new(ObjectBlobs::new(Arc::new(local))),
+        kind: "-merged.index",
+        armed: AtomicBool::new(false),
+        putting,
+        land: Arc::default(),
+    });
+    cluster.blobs = late.clone();
+    let writer = two_large(&cluster).await;
+    late.armed.store(true, Ordering::SeqCst);
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    within(120, "the merge's index began to go up", put.recv()).await;
+    writer.stop_merges();
+    let merged = within(10, "the merge never gave up", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None);
+    assert_eq!(writer.kept_while_merging(), 0);
+    // The index lands only now, after the merge has given up.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    late.land.notify_one();
+    settled("a file that landed late is left behind", || async {
+        stored(&cluster, "-merged").await.is_empty()
+    })
+    .await;
+    // And stays gone: nothing is still to land.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(stored(&cluster, "-merged").await.is_empty());
+    all_there(&cluster).await;
+}
+
+/// A stop that comes once what was built is loaded back is too late: the
+/// merge commits, as it would have, and keeps nothing after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_once_loaded_back_is_too_late_and_the_merge_commits() {
+    let cluster = Cluster::new().await;
+    let writer = two_large(&cluster).await;
+    let gate = writer.hold_merges_before_commit();
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    within(120, "the merge was built", gate.reached.notified()).await;
+    writer.stop_merges();
+    gate.release.notify_one();
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(
+        merged.unwrap().unwrap().is_some(),
+        "past loading back, it commits"
+    );
+    assert_eq!(
+        writer.stops_past_loading(),
+        1,
+        "the stop was seen, too late"
+    );
+    assert_eq!(writer.kept_while_merging(), 0);
+    assert!(!writer.merge_under_way());
+    all_there(&cluster).await;
+}
+
+/// A store whose local copies of merged vectors, once armed, are not said
+/// to be anywhere until let go: a merge's load-back held where it waits
+/// on the disk.
+#[derive(Debug)]
+struct HeldLoad {
+    inner: CachedBlobs,
+    armed: AtomicBool,
+    loading: tokio::sync::mpsc::UnboundedSender<()>,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Blobs for HeldLoad {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn local(&self, key: &str) -> vellev_storage::Result<Option<Local>> {
+        if self.armed.load(Ordering::SeqCst) && key.contains("-merged.vectors") {
+            self.loading.send(()).unwrap();
+            self.release.notified().await;
+        }
+        self.inner.local(key).await
+    }
+}
+
+/// A merge stopped while it loads what it built back from local disk gives
+/// up without waiting for the disk, and leaves nothing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_stopped_while_it_loads_back_gives_up_and_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new().await;
+    let disk = vellev_storage::Disk::new(Duration::from_secs(10), 64 * 1024 * 1024, 4);
+    let (loading, mut loads) = tokio::sync::mpsc::unbounded_channel();
+    let held = Arc::new(HeldLoad {
+        inner: CachedBlobs::new(cluster.blobs.clone(), dir.path()).on(disk),
+        armed: AtomicBool::new(false),
+        loading,
+        release: tokio::sync::Notify::new(),
+    });
+    cluster.blobs = held.clone();
+    let writer = two_large(&cluster).await;
+    let before = cluster.committed().await;
+    held.armed.store(true, Ordering::SeqCst);
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    within(120, "the merge came to load back", loads.recv()).await;
+    writer.stop_merges();
+    let merged = within(10, "the merge never gave up", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None);
+    assert_eq!(cluster.committed().await.manifest, before.manifest);
+    assert_eq!(writer.kept_while_merging(), 0);
+    held.armed.store(false, Ordering::SeqCst);
+    held.release.notify_waiters();
+    settled("the stopped merge's files stay", || async {
+        stored(&cluster, "-merged").await.is_empty()
+    })
+    .await;
+    all_there(&cluster).await;
+}
+
+/// A merge whose build panics leaves no stop behind: nothing says a merge
+/// is under way, and the next merge commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_whose_build_panics_leaves_no_stop_behind() {
+    let cluster = Cluster::new().await;
+    let writer = two_large(&cluster).await;
+    writer.panic_merges_in_build(true);
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    let ended = within(120, "the merge that panics never ended", merging).await;
+    assert!(
+        matches!(ended, Err(_) | Ok(Err(_))),
+        "a build that panics is no merge: {ended:?}"
+    );
+    assert!(!writer.merge_under_way(), "its stop is left behind");
+    assert_eq!(writer.kept_while_merging(), 0);
+    writer.panic_merges_in_build(false);
+    assert!(within(120, "the next merge", writer.merge())
+        .await
+        .unwrap()
+        .is_some());
 }
