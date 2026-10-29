@@ -1803,14 +1803,14 @@ mod tests {
         let local = Local::spawn_timed("stand-in", load, alone(), clock.clone());
         let local = Arc::new(local.unwrap());
         let embedder = Arc::new(giving(&local, ms(200)));
-        let ahead: Vec<_> = (0..200)
-            .map(|_| {
-                let texts = (0..4)
-                    .map(|n| format!("{n}{}", "x".repeat(READS)))
-                    .collect();
-                start(&local, texts, Purpose::Document)
-            })
-            .collect();
+        // Each sent, not only on its way, before the write behind them.
+        let mut ahead = Vec::new();
+        for _ in 0..200 {
+            let texts = (0..4)
+                .map(|n| format!("{n}{}", "x".repeat(READS)))
+                .collect();
+            ahead.push(sent(&local, texts, Purpose::Document).await);
+        }
         let loaded = || loads.load(std::sync::atomic::Ordering::SeqCst);
         until(|| loaded() == 1).await;
         let began = clock.now();
@@ -1841,9 +1841,8 @@ mod tests {
         let stopped = failed("the model has made nothing for anyone in 400ms");
         assert_eq!(behind.await.unwrap(), Err(stopped));
         assert_eq!(took, ms(700));
-        for write in ahead {
-            write.abort();
-        }
+        // Their callers leave.
+        drop(ahead);
     }
 
     /// A load longer than a write is given to wait, that then fails: the
