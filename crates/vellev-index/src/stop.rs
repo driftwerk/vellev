@@ -42,8 +42,11 @@ pub enum Stage {
     Clustering,
     /// Coding each row.
     Coding,
-    /// Tuning how many clusters a query scans: waiting for the turn on the
-    /// tuning pool, and each block of rows of the pass over them.
+    /// Waiting for a turn on the tuning pool, which one build tunes on at
+    /// a time.
+    Waiting,
+    /// Tuning how many clusters a query scans: once the turn is taken, and
+    /// at each block of rows of the pass over them.
     Tuning,
     /// Ranking, for each tuning sample, the clusters its nearest rows lie
     /// in.
@@ -51,10 +54,11 @@ pub enum Stage {
 }
 
 impl Stage {
-    const ALL: [Stage; 5] = [
+    const ALL: [Stage; 6] = [
         Stage::Sampling,
         Stage::Clustering,
         Stage::Coding,
+        Stage::Waiting,
         Stage::Tuning,
         Stage::Ranking,
     ];

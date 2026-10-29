@@ -76,7 +76,7 @@ fn a_build_asks_its_stop_in_each_long_pass() {
     assert!(stop.checks(Stage::Coding) >= ROWS, "coding asks once a row");
     assert!(
         stop.checks(Stage::Tuning) > ROWS.div_ceil(4_096),
-        "tuning asks for its turn, and once a block of rows"
+        "tuning asks once its turn is taken, and once a block of rows"
     );
 
     let stop = Stop::counting();
@@ -181,12 +181,12 @@ fn a_stopped_build_waiting_its_turn_to_tune_gives_up() {
         let building = scope.spawn(move || {
             ClusteredIndex::build_stopping(Distance::Cosine, &rows, &stop)
         });
-        // Until the build waits on the turn, having coded every row.
+        // Until the build waits for its turn, having coded every row.
         let began = Instant::now();
-        while stopper.checks(Stage::Tuning) == 0 && began.elapsed() < Duration::from_secs(300) {
+        while stopper.checks(Stage::Waiting) == 0 && began.elapsed() < Duration::from_secs(300) {
             std::thread::park_timeout(Duration::from_millis(10));
         }
-        assert!(stopper.checks(Stage::Tuning) > 0, "the build never came to tune");
+        assert!(stopper.checks(Stage::Waiting) > 0, "the build never waited to tune");
         stopper.stop();
         let asked = Instant::now();
         let (done, finished) = mpsc::channel();

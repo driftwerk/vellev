@@ -126,7 +126,7 @@ pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, 
     let ticket = now.next;
     now.next += 1;
     while now.serving != ticket {
-        if stop.check(Stage::Tuning).is_err() {
+        if stop.check(Stage::Waiting).is_err() {
             now.left.insert(ticket);
             return Err(Stopped);
         }
