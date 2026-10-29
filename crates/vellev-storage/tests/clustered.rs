@@ -782,3 +782,69 @@ async fn a_curve_for_no_index_in_its_segment_is_refused() {
         assert_eq!(segments_of(&cluster).await, before, "{what}");
     }
 }
+
+/// A clustered segment's dead rows take no place in what its scan
+/// shortlists: with the 400 rows nearest the question deleted, more than
+/// the 320 the shortlist holds, the nearest live rows are still found, as
+/// far as a search this approximate finds them.
+/// A segment with no row dead is scanned without its marks; one with any
+/// is scanned with them.
+#[tokio::test]
+async fn a_clustered_segments_dead_rows_take_no_place_in_its_shortlist() {
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = merged(&cluster, &vectors).await;
+    let query = vectors[7].clone();
+    let mut by_distance: Vec<(f32, u32)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(n, v)| {
+            (
+                vellev_index::vector::distance(Distance::Cosine, &query, v),
+                n as u32,
+            )
+        })
+        .collect();
+    by_distance.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    // Enough left live (4,100) that the segment is still shortlisted.
+    let (dead, live) = by_distance.split_at(400);
+    for rows in dead.chunks(250) {
+        let deletes = rows
+            .iter()
+            .map(|(_, n)| Mutation::Delete {
+                collection: name("notes"),
+                id: ObjectId(uuid::Uuid::from_u128(u128::from(*n))),
+                only_if_version: None,
+            })
+            .collect();
+        writer.commit(deletes).await.unwrap();
+    }
+    let mut nearest: Vec<ObjectId> = live[..10]
+        .iter()
+        .map(|(_, n)| ObjectId(uuid::Uuid::from_u128(u128::from(*n))))
+        .collect();
+    nearest.sort();
+    let asked = Query {
+        oversample: 32,
+        ..Query::nearest(&query, 10)
+    };
+    let found: Vec<ObjectId> = writer.partition().read(|state| {
+        state
+            .search(&name("notes"), &asked)
+            .unwrap()
+            .iter()
+            .map(|hit| hit.object.id)
+            .collect()
+    });
+    // Ten found, none of them dead, and most of the ten nearest live: a
+    // search this approximate finds eight of them here, and with the dead
+    // rows' marks left out of the scan, none.
+    let dead_ids: Vec<ObjectId> = dead
+        .iter()
+        .map(|(_, n)| ObjectId(uuid::Uuid::from_u128(u128::from(*n))))
+        .collect();
+    assert_eq!(found.len(), 10);
+    assert!(found.iter().all(|id| !dead_ids.contains(id)));
+    let shared = found.iter().filter(|id| nearest.contains(id)).count();
+    assert!(shared >= 8, "{shared} of the ten nearest live rows found");
+}
