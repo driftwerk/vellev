@@ -15,6 +15,7 @@ mod group;
 mod hybrid;
 mod keyword;
 pub mod link;
+mod merge_builds;
 mod mutation;
 mod partition;
 pub mod prefix;
@@ -32,6 +33,7 @@ pub use hybrid::{
     default_oversample, Fused, Hybrid, DEFAULT_ALPHA, DEFAULT_CANDIDATES, HYBRID_DEFAULT_RESCORE,
 };
 pub use keyword::{Keywords, Scored, MAX_WEIGHT};
+pub use merge_builds::{Holding, MergeBuilds, MERGE_BUILDS};
 pub use mutation::{
     Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
 };

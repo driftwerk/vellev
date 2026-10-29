@@ -30,6 +30,7 @@ use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
     self, Discarded, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
 };
+use crate::merge_builds::{MergeBuilds, MERGE_BUILDS};
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Refusal, Result, StorageError};
 use vellev_index::stop::Stop;
@@ -975,6 +976,9 @@ pub struct Writer {
     /// How many merges were stopped only once they had loaded back what
     /// they built, past where a stop ends them.
     stops_past_loading: AtomicU64,
+    /// The merge builds this writer's merges take turns among: the node's,
+    /// or, on its own, its own.
+    merge_builds: Arc<MergeBuilds>,
 }
 
 /// The stop of the merge under way, there until the merge ends, however it
@@ -1124,6 +1128,7 @@ impl Writer {
             merges_stopped: AtomicU64::new(0),
             merge_panics: AtomicBool::new(false),
             stops_past_loading: AtomicU64::new(0),
+            merge_builds: MergeBuilds::new(MERGE_BUILDS),
         })
     }
 
@@ -1158,6 +1163,15 @@ impl Writer {
     /// Merge and index segments as `merging` says, instead of as by default.
     pub fn merging_with(self, merging: Merging) -> Self {
         Self { merging, ..self }
+    }
+
+    /// Build merges in turns among `builds`, shared with the other writers
+    /// of the node, instead of among this writer's own.
+    pub fn merging_among(self, builds: Arc<MergeBuilds>) -> Self {
+        Self {
+            merge_builds: builds,
+            ..self
+        }
     }
 
     /// Take requests to the store to be given up as `transfers` says, the

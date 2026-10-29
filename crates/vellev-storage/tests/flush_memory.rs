@@ -156,12 +156,21 @@ async fn flush_peak(rows: usize, dimensions: usize) -> usize {
 /// What a merge of four flushed segments of `rows` rows in all, of
 /// `dimensions`, holds at its peak beyond what was held before it.
 async fn merge_peak(rows: usize, dimensions: usize) -> usize {
+    merge_measured(rows, dimensions).await.0
+}
+
+/// What a merge as [`merge_peak`] makes holds at its peak, and what it
+/// reckoned it would.
+async fn merge_measured(rows: usize, dimensions: usize) -> (usize, usize) {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
-    let writer = writer.merging_with(vellev_storage::Merging {
-        fanout: 4,
-        ..vellev_storage::Merging::default()
-    });
+    let builds = vellev_storage::MergeBuilds::new(1);
+    let writer = writer
+        .merging_with(vellev_storage::Merging {
+            fanout: 4,
+            ..vellev_storage::Merging::default()
+        })
+        .merging_among(builds.clone());
     writer.commit(vec![collection(dimensions)]).await.unwrap();
     let mut random = Random(11);
     for segment in 0..4 {
@@ -171,7 +180,7 @@ async fn merge_peak(rows: usize, dimensions: usize) -> usize {
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.merge().await.unwrap().expect("the segments merge");
-    COUNTING.peak() - before
+    (COUNTING.peak() - before, builds.last_reckoned())
 }
 
 /// Hold what a further row's vector costs at the peak against `copies`
@@ -211,4 +220,27 @@ async fn a_merge_holds_its_vectors_once() {
     let _alone = ALONE.lock().await;
     // The merged segment's column, which is its encoded frame too.
     held_to("a merge", merge_peak, 1).await;
+}
+
+/// A merge reckons what it holds at its peak to within 30% of what it is
+/// measured to hold (merge note, §7.6): the node counts what a stopped
+/// merge was reckoned to hold as draining, until it has ended.
+#[tokio::test(flavor = "current_thread")]
+async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
+    let _alone = ALONE.lock().await;
+    for (rows, dimensions) in [(MORE, WIDE), (MORE, NARROW)] {
+        let (peak, reckoned) = merge_measured(rows, dimensions).await;
+        let off = (reckoned as f64 - peak as f64) / peak as f64;
+        eprintln!(
+            "a merge of {rows} rows of {dimensions} held {peak} bytes at its peak, \
+             reckoned {reckoned} ({:+.0}%)",
+            off * 100.0
+        );
+        assert!(
+            off.abs() <= 0.3,
+            "a merge of {rows} rows of {dimensions} reckoned {reckoned} bytes, \
+             held {peak} at its peak: {:+.0}%",
+            off * 100.0
+        );
+    }
 }

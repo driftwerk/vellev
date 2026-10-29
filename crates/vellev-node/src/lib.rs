@@ -25,8 +25,8 @@ use vellev_storage::coordinator::{
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::{
-    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Transfers, Unembedded,
-    Vectorize, Writer,
+    Batch, Embedded, GroupCommitter, MergeBuilds, Mutation, Receipt, State, StorageError,
+    Transfers, Unembedded, Vectorize, Writer, MERGE_BUILDS,
 };
 
 mod backing;
@@ -1245,6 +1245,9 @@ struct Inner {
     flushing: Arc<FlushCounts>,
     /// The warm list, and the warming that reads it.
     warm: warm::Warm,
+    /// The merge builds of every tenant this node writes for, taken in
+    /// turns, at most [`MERGE_BUILDS`] at once.
+    merge_builds: Arc<MergeBuilds>,
 }
 
 /// Flushes that failed, and writes refused while they did.
@@ -1338,6 +1341,7 @@ impl Node {
             writes_format: Arc::new(AtomicU16::new(0)),
             flushing: Arc::default(),
             warm: warm::Warm::default(),
+            merge_builds: MergeBuilds::new(MERGE_BUILDS),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -1428,6 +1432,12 @@ impl Node {
     /// in memory together.
     pub fn resident(&self) -> usize {
         self.0.held_now().iter().map(|held| held.size).sum()
+    }
+
+    /// The merge builds of the tenants this node writes for. For tests.
+    #[doc(hidden)]
+    pub fn merge_builds(&self) -> &Arc<MergeBuilds> {
+        &self.0.merge_builds
     }
 
     /// Whether this node serves `tenant`: see [`Settings::served`].
