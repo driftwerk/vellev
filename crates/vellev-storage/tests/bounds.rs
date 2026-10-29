@@ -2829,3 +2829,59 @@ async fn an_upload_dropped_while_it_starts_is_aborted_once_it_has() {
         .expect("the upload begun for nobody is aborted");
     assert_eq!(aborts.finished(Duration::from_secs(10)).await, 0);
 }
+
+/// A merge stopped while a file of its own goes up in parts aborts the
+/// upload at the store and lets go of it at once, rather than sending the
+/// rest of the file for nothing, and leaves nothing behind: none of the
+/// uploads it began waits out the store's bound.
+#[tokio::test]
+async fn a_stopped_merges_upload_is_aborted_and_nothing_is_left() {
+    let mut cluster = Cluster::new().await;
+    let store = Arc::new(Faulty::new("-merged.vectors"));
+    let aborts = Aborts::default();
+    let blobs = ObjectBlobs::new(store.clone())
+        .transferring(Transfers {
+            request_within: Duration::from_secs(60),
+            ..SMALL_PARTS
+        })
+        .aborting(aborts.clone());
+    cluster.blobs = Arc::new(blobs);
+    let writer = Arc::new(cluster.writer().await);
+    mergeable(&writer).await;
+    let before = cluster.committed().await;
+    let sent = store.parts.load(Ordering::SeqCst);
+    store.armed.store(true, Ordering::SeqCst);
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    // Its vectors' first part has gone; every part after it stalls.
+    let begun = async {
+        while store.parts.load(Ordering::SeqCst) == sent {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), begun)
+        .await
+        .expect("the merged vectors go up");
+    writer.stop_merges();
+    let merged = tokio::time::timeout(Duration::from_secs(5), merging)
+        .await
+        .expect("the merge gives up at once")
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged, None);
+    assert_eq!(writer.kept_while_merging(), 0);
+    let gone = async {
+        while store.aborts.load(Ordering::SeqCst) == 0
+            || !stored(&cluster, "-merged").await.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), gone)
+        .await
+        .expect("the upload is aborted, and nothing is left, well within the store's bound");
+    assert_eq!(aborts.finished(Duration::from_secs(5)).await, 0);
+    assert_eq!(cluster.committed().await.manifest, before.manifest);
+}

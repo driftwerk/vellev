@@ -1097,7 +1097,8 @@ impl ObjectBlobs {
             Ok(started) => started,
             Err(failed) => match failed.try_into_panic() {
                 Ok(panic) => std::panic::resume_unwind(panic),
-                Err(_) => unreachable!("an upload's start is never aborted"),
+                // Cancelled, as the runtime shuts down.
+                Err(failed) => Err(StorageError::Background(failed.to_string())),
             },
         }
     }
