@@ -1276,6 +1276,26 @@ impl ClusteredIndex {
         ties: Ties<'_>,
         probing: Probing,
     ) -> Vec<(f32, u32)> {
+        self.estimates_marked(query, count, only, skipped, &[], ties, probing)
+    }
+
+    /// As [`Self::estimates_split`], with the rows skipped also given a bit
+    /// a row, `skipped_bits` (row `n` bit `n % 64` of word `n / 64`), the
+    /// same rows as `skipped`: what a scan of the clusters reads instead
+    /// of `skipped`, a word at a time, where a byte a row read at random
+    /// across the rows costs it dearly (x86 profile). Empty, `skipped` is
+    /// read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimates_marked(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+        skipped_bits: &[u64],
+        ties: Ties<'_>,
+        probing: Probing,
+    ) -> Vec<(f32, u32)> {
         let Probing { probes, parts } = probing;
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
@@ -1316,7 +1336,10 @@ impl ClusteredIndex {
                 &query,
                 count,
                 only,
-                skipped,
+                Marks {
+                    bytes: skipped,
+                    bits: skipped_bits,
+                },
                 ties,
                 Probing { probes, parts },
             ),
@@ -1411,7 +1434,7 @@ impl ClusteredIndex {
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
-        skipped: &[bool],
+        skipped: Marks<'_>,
         ties: Ties<'_>,
         probing: Probing,
     ) -> Vec<(f32, u32)> {
@@ -1455,12 +1478,35 @@ impl ClusteredIndex {
     }
 }
 
+/// The rows a scan skips: a byte a row, and the same a bit a row where the
+/// caller keeps them so (else empty).
+#[derive(Clone, Copy)]
+struct Marks<'a> {
+    bytes: &'a [bool],
+    bits: &'a [u64],
+}
+
+impl Marks<'_> {
+    /// Whether `row` is skipped: by its bit where there are bits, else by
+    /// its byte. A row past either is not.
+    #[inline(always)]
+    fn holds(&self, row: u32) -> bool {
+        if self.bits.is_empty() {
+            self.bytes.get(row as usize).copied().unwrap_or(false)
+        } else {
+            self.bits
+                .get(row as usize / 64)
+                .is_some_and(|word| word >> (row % 64) & 1 == 1)
+        }
+    }
+}
+
 /// One scan's way through clusters: what it reuses from one to the next.
 struct Scan<'a> {
     index: &'a ClusteredIndex,
     query: &'a [f32],
     only: Option<&'a RoaringBitmap>,
-    skipped: &'a [bool],
+    skipped: Marks<'a>,
     weigh: crate::fastscan::Weigh,
     weighed: [u32; BLOCK],
     offered: [bool; BLOCK],
@@ -1473,7 +1519,7 @@ impl<'a> Scan<'a> {
         index: &'a ClusteredIndex,
         query: &'a [f32],
         only: Option<&'a RoaringBitmap>,
-        skipped: &'a [bool],
+        skipped: Marks<'a>,
     ) -> Self {
         Self {
             index,
@@ -1499,7 +1545,8 @@ impl<'a> Scan<'a> {
             let rows = &members.rows[block * BLOCK..members.rows.len().min((block + 1) * BLOCK)];
             let mut any = false;
             for (offer, row) in self.offered.iter_mut().zip(rows) {
-                *offer = index.kept(*row, self.skipped)
+                *offer = !self.skipped.holds(*row)
+                    && index.unmeasured.binary_search(row).is_err()
                     && self.only.is_none_or(|only| only.contains(*row));
                 any |= *offer;
             }
@@ -1921,7 +1968,10 @@ mod tests {
             &index.prepared(query),
             count,
             only,
-            skipped,
+            Marks {
+                bytes: skipped,
+                bits: &[],
+            },
             &in_row_order,
             Probing {
                 probes: index.probes,
@@ -2316,8 +2366,8 @@ mod tests {
             let skipped: Vec<bool> = (0..rows * 2).map(|row| row % 11 == 5).collect();
             for _ in 0..4 {
                 let query = index.prepared(&noise.vector(dimensions));
-                let one = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, Probing { probes: index.probes, parts: 1 });
-                let split = index.scanned(&query, count, only.as_ref(), &skipped, &in_row_order, Probing { probes: index.probes, parts });
+                let one = index.scanned(&query, count, only.as_ref(), Marks { bytes: &skipped, bits: &[] }, &in_row_order, Probing { probes: index.probes, parts: 1 });
+                let split = index.scanned(&query, count, only.as_ref(), Marks { bytes: &skipped, bits: &[] }, &in_row_order, Probing { probes: index.probes, parts });
                 proptest::prop_assert_eq!(cut(split, count), cut(one, count));
             }
         }

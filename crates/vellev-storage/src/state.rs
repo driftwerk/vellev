@@ -303,6 +303,8 @@ impl Live<'_> {
 pub(crate) struct Layer<'a> {
     pub rows: &'a [Row],
     pub dead: &'a [bool],
+    /// `dead` a bit a row, where the layer keeps it: none for the memtable.
+    pub dead_bits: &'a [u64],
     /// How many of the rows are dead.
     pub deaths: usize,
     pub indexes: &'a Indexes,
@@ -465,6 +467,9 @@ struct Segment {
     vectors: Arc<Column>,
     indexes: Arc<Indexes>,
     dead: Vec<bool>,
+    /// `dead` a bit a row, kept with it, for a clustered scan to read a
+    /// word at a time instead of a byte a row at random (x86 profile).
+    dead_bits: Vec<u64>,
     deaths: usize,
     /// About how many bytes the segment takes in memory.
     resident: usize,
@@ -473,6 +478,18 @@ struct Segment {
 /// About how many bytes a segment of `rows` with `vectors` takes in memory:
 /// its rows and what indexes them, and its vectors if they are held in
 /// memory rather than read in place.
+/// `dead` a bit a row: row `n` is bit `n % 64` of word `n / 64`.
+fn bits_of(dead: &[bool]) -> Vec<u64> {
+    dead.chunks(64)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .fold(0u64, |word, (at, dead)| word | (u64::from(*dead) << at))
+        })
+        .collect()
+}
+
 fn segment_bytes(rows: &[Row], vectors: &Column) -> usize {
     rows.iter().map(row_bytes).sum::<usize>() + vectors.resident()
 }
@@ -1304,6 +1321,7 @@ impl State {
         let memtable = Layer {
             rows: &self.memtable.rows,
             dead: &self.memtable.dead,
+            dead_bits: &[],
             deaths: self.memtable.deaths,
             indexes: &self.memtable.indexes,
             vectors: None,
@@ -1314,6 +1332,7 @@ impl State {
             .map(|segment| Layer {
                 rows: &segment.file.rows,
                 dead: &segment.dead,
+                dead_bits: &segment.dead_bits,
                 deaths: segment.deaths,
                 indexes: &segment.indexes,
                 vectors: Some(&segment.vectors),
@@ -1389,6 +1408,7 @@ impl State {
             }
             Location::Segment(segment, row) => {
                 let segment = &mut self.segments[segment];
+                segment.dead_bits[row / 64] |= 1 << (row % 64);
                 (
                     segment.file.rows.as_slice(),
                     &mut segment.dead,
@@ -1498,6 +1518,7 @@ impl State {
             vectors,
             indexes,
             deaths: dead.iter().filter(|dead| **dead).count(),
+            dead_bits: bits_of(&dead),
             dead,
         });
         Ok(())
@@ -1946,6 +1967,15 @@ impl State {
 
     /// Which rows of `merge`'s run are live now, segment by segment: taken
     /// when a merge is planned, as what its merged segment is made of.
+    /// Whether every segment's dead-row bits are its dead-row marks, a bit
+    /// a row. For tests.
+    #[doc(hidden)]
+    pub fn dead_marks_agree(&self) -> bool {
+        self.segments
+            .iter()
+            .all(|segment| segment.dead_bits == bits_of(&segment.dead))
+    }
+
     pub(crate) fn alive(&self, merge: &Merge) -> Vec<Vec<bool>> {
         self.segments[merge.run.clone()]
             .iter()
@@ -2040,6 +2070,7 @@ impl State {
                 vectors,
                 indexes,
                 deaths: dead.iter().filter(|dead| **dead).count(),
+                dead_bits: bits_of(&dead),
                 dead,
             }],
         );
@@ -2249,6 +2280,7 @@ impl State {
                 vectors,
                 indexes,
                 deaths: dead.iter().filter(|dead| **dead).count(),
+                dead_bits: bits_of(&dead),
                 dead,
             });
         }
@@ -3124,5 +3156,29 @@ mod tests {
         let wrong = built.fit(file, &catalog);
         assert!(!built.state.covers(&plan, &alive, &wrong));
         assert!(built.state.covers(&plan, &alive, &fit));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        /// A segment's dead-row bits are its dead-row marks, a bit a row,
+        /// after any run of writes, deletes, flushes and merges: what a
+        /// clustered scan reads in their place.
+        #[test]
+        fn a_segments_dead_bits_are_its_dead_marks_after_anything(
+            steps in proptest::collection::vec((0u8..4, 0u128..90), 1..120),
+        ) {
+            let mut built = Built::new(&["notes"]);
+            for (step, id) in steps {
+                match step {
+                    0 => built.commit(vec![upsert(0, id, id as i64)]),
+                    1 => built.commit(vec![delete(0, id)]),
+                    2 => built.flush(),
+                    _ => {
+                        built.merge();
+                    }
+                }
+                proptest::prop_assert!(built.state.dead_marks_agree());
+            }
+        }
     }
 }

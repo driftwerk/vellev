@@ -282,13 +282,18 @@ fn candidates(
     match vectors {
         Vectors::Clustered(clustered) => Candidates {
             exact: unmeasured,
-            estimated: Some(clustered.estimates_split(
+            estimated: Some(clustered.estimates_marked(
                 vector,
                 count,
                 only.as_ref(),
                 // Nothing to skip where no row has died: the scan then
-                // reads no marks at all.
+                // reads no marks at all; else their bits.
                 if layer.deaths == 0 { &[] } else { layer.dead },
+                if layer.deaths == 0 {
+                    &[]
+                } else {
+                    layer.dead_bits
+                },
                 &ties,
                 Probing {
                     probes: probes_for(layer.curves, collection, clustered),
@@ -443,6 +448,7 @@ mod tests {
         let layer = |rows| Layer {
             rows,
             dead: &[false, false],
+            dead_bits: &[],
             deaths: 0,
             indexes: &indexes,
             vectors: None,
