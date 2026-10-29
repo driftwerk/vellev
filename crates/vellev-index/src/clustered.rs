@@ -559,9 +559,15 @@ mod readying {
                     // SAFETY: `at + 8 <= width`, the residual's length.
                     let value = unsafe { _mm256_loadu_ps(space.residual.as_ptr().add(at)) };
                     // As `level_of`: the whole part, plus one for a half or
-                    // more, at most the top level. `x` is never below zero
-                    // nor above the top level by more than rounding, so the
-                    // conversion truncates as `as u32` does.
+                    // more, at most the top level. `x` is never below zero.
+                    // It can pass the top level: with a subnormal step,
+                    // rounded, up to about 22, which the clamp below takes
+                    // back to 15, as `level_of`'s does. An infinite residual
+                    // makes `x` not a number, which converts to `i32::MIN`,
+                    // is clamped and cast to 0, as `level_of` gives 0. The
+                    // conversion truncates whatever the rounding mode
+                    // (MXCSR) is set to, as `as u32` does, so no setting of
+                    // it can change a level.
                     let x = _mm256_div_ps(_mm256_sub_ps(value, lowest), step);
                     let whole = _mm256_cvttps_epi32(x);
                     let up = _mm256_cmp_ps::<_CMP_GE_OQ>(
