@@ -306,12 +306,13 @@ async fn what_a_stopped_merge_drains_counts_against_the_budget() {
     let one = sizing.resident();
     assert!(one > 0);
 
-    // Just within the budget with that tenant alone. Swept every two
-    // seconds; let go for being idle only well after the rule is done.
+    // Just within the budget with that tenant alone. Swept every five
+    // seconds; let go for being idle only after twenty, well after the
+    // rule is done.
     let node = node(|settings| {
         settings.flush_rows = NOTES as usize;
         settings.memory = Some(one);
-        settings.tenant_idle = Duration::from_secs(8);
+        settings.tenant_idle = Duration::from_secs(20);
     });
     let builds = node.merge_builds().clone();
     builds.hold(Some(Holding::UntilLetGo));
@@ -334,7 +335,7 @@ async fn what_a_stopped_merge_drains_counts_against_the_budget() {
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     node.sweeping();
     until(
-        3,
+        8,
         "a tenant was not let go for what a stopped merge drains",
         || node.resident() == 0,
     )

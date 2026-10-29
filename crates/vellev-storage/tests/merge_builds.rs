@@ -142,24 +142,39 @@ async fn a_merge_with_nothing_to_do_waits_for_no_turn() {
 }
 
 /// A store whose uploads of merged vectors, once armed, wait, holding what
-/// they were given, until let go: an upload a stopped merge leaves to
-/// settle. Whether the one held has ended, gone up or dropped where it
-/// waited, is noted.
+/// they were given, until let go or dropped: an upload a stopped merge
+/// leaves to settle, or aborts. What the merge builds stood at as the one
+/// held ended is noted.
 #[derive(Debug)]
 struct HeldUpload {
     inner: Arc<dyn Blobs>,
+    builds: Arc<MergeBuilds>,
     armed: AtomicBool,
     putting: tokio::sync::mpsc::UnboundedSender<()>,
     let_go: tokio::sync::Notify,
-    ended: Arc<AtomicBool>,
+    ended: Arc<Mutex<Option<Seen>>>,
 }
 
-/// Notes, as it is dropped, that an upload has ended.
-struct Ends(Arc<AtomicBool>);
+/// The builds under way and the turns free, as an upload ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seen {
+    under_way: usize,
+    turns_free: usize,
+}
+
+/// Notes, as it is dropped, how the builds stood as an upload ended,
+/// gone up or dropped where it waited.
+struct Ends {
+    builds: Arc<MergeBuilds>,
+    ended: Arc<Mutex<Option<Seen>>>,
+}
 
 impl Drop for Ends {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        *self.ended.lock().unwrap() = Some(Seen {
+            under_way: self.builds.under_way(),
+            turns_free: self.builds.turns_free(),
+        });
     }
 }
 
@@ -169,7 +184,10 @@ impl Blobs for HeldUpload {
         if !(self.armed.load(Ordering::SeqCst) && key.contains("-merged.vectors")) {
             return self.inner.put(key, bytes).await;
         }
-        let _ends = Ends(self.ended.clone());
+        let _ends = Ends {
+            builds: self.builds.clone(),
+            ended: self.ended.clone(),
+        };
         self.putting.send(()).unwrap();
         self.let_go.notified().await;
         self.inner.put(key, bytes).await
@@ -185,10 +203,11 @@ impl Blobs for HeldUpload {
     }
 }
 
-/// A merge stopped while its vectors go up gives up at once, but the
-/// upload it leaves to settle holds the merged vectors: until it ends, the
-/// build is counted under way, holds its turn, and drains what it was
-/// reckoned to hold. Then all three are let go.
+/// A merge stopped while its vectors go up gives up at once. The upload
+/// holds the merged vectors until it ends, aborted or let land: until
+/// then the build is counted under way, holds its turn, and drains what
+/// it was reckoned to hold, even once the merge itself has returned. Then
+/// all three are let go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upload_ends() {
     let builds = MergeBuilds::new(1);
@@ -196,6 +215,7 @@ async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upl
     let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
     let held = Arc::new(HeldUpload {
         inner: cluster.blobs.clone(),
+        builds: builds.clone(),
         armed: AtomicBool::new(false),
         putting,
         let_go: tokio::sync::Notify::new(),
@@ -212,7 +232,7 @@ async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upl
     writer.stop_merges();
     let merged = within(10, "the merge never gave up", merging).await;
     assert_eq!(merged.unwrap().unwrap(), None);
-    if !held.ended.load(Ordering::SeqCst) {
+    if held.ended.lock().unwrap().is_none() {
         assert_eq!(
             builds.under_way(),
             1,
@@ -230,9 +250,14 @@ async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upl
     }
     held.let_go.notify_one();
     until(30, "the build was never let go", || builds.under_way() == 0).await;
-    assert!(
-        held.ended.load(Ordering::SeqCst),
-        "the build was let go before its upload ended"
+    let seen = held.ended.lock().unwrap().expect("the upload ended");
+    assert_eq!(
+        seen,
+        Seen {
+            under_way: 1,
+            turns_free: 0
+        },
+        "as its upload ended, its build was no longer counted, or its turn was free"
     );
     assert_eq!(builds.draining(), 0);
     assert_eq!(builds.turns_free(), 1);
