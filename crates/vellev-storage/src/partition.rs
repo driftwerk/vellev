@@ -945,6 +945,41 @@ pub struct Writer {
     /// How many times this writer's state has been put back wholesale or
     /// merged: see [`Self::epoch`].
     epoch: AtomicU64,
+    /// Held while a merge plans, builds and commits, so that a partition
+    /// builds one merge at a time, as it did when merges held `building`
+    /// throughout: what bounds the memory merges take in it.
+    merge_build: Mutex<()>,
+    /// The files a merge under way has uploaded and not yet committed or
+    /// dropped: [`Self::clean`] leaves them, however old.
+    keeping: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// A gate a merge waits at between its build and its commit, if a test
+    /// has set one: see [`Self::hold_merges_before_commit`].
+    merge_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
+}
+
+/// Where a test holds a merge between its build and its commit: `reached`
+/// is told when a merge arrives, and the merge waits for `release`.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct MergeGate {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+/// A merge's uploads kept from [`Writer::clean`] while it is under way,
+/// and let go of however it ends, a panic included.
+struct Keeping {
+    keeping: Arc<std::sync::Mutex<HashSet<String>>>,
+    keys: Vec<String>,
+}
+
+impl Drop for Keeping {
+    fn drop(&mut self) {
+        let mut keeping = self.keeping.lock().unwrap_or_else(|held| held.into_inner());
+        for key in &self.keys {
+            keeping.remove(key);
+        }
+    }
 }
 
 /// A turn being held: since when, how long it may be in all, since when
@@ -1041,6 +1076,9 @@ impl Writer {
             held: Arc::default(),
             format: Arc::new(AtomicU16::new(DEFAULT_MAX_FORMAT)),
             epoch: AtomicU64::new(0),
+            merge_build: Mutex::new(()),
+            keeping: Arc::default(),
+            merge_gate: std::sync::Mutex::new(None),
         })
     }
 
@@ -2442,7 +2480,12 @@ impl Writer {
     /// merge planned at another epoch commits nothing. Not for use.
     #[doc(hidden)]
     pub async fn merge_planned_at(&self, planned: Option<u64>) -> Result<Option<LogPosition>> {
-        let _building = self.building.lock().await;
+        let _merging = self.merge_build.lock().await;
+        // Planned, and its rows gathered, under the building lock; built,
+        // uploaded and loaded without it, so that flushes go on meanwhile;
+        // committed under it again, only if nothing put the partition back
+        // since and the run is as it was (merge note, step 2).
+        let planning = self.building.lock().await;
         let planned = planned.unwrap_or_else(|| self.epoch());
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
@@ -2458,28 +2501,41 @@ impl Writer {
         }) else {
             return Ok(None);
         };
+        let catalog = self.partition.read(|state| state.catalog().clone());
+        drop(planning);
         // A merge planned at another epoch than this is dropped before any
         // work is spent on it, and again at its commit below.
         if self.stale(planned) {
             return Ok(None);
         }
-        let catalog = self.partition.read(|state| state.catalog().clone());
         let built = self.built(file, Some(vectors), catalog.clone()).await?;
         // Both segments, however large, are uploaded without the writer,
         // under names of their own at the position each was built from;
-        // see `clean` for why nothing deletes them first.
+        // `clean` leaves the merge's while it is under way.
         let mut staged = self.staging();
         let merged = Self::prepared(
             self.named(named_at, "-merged").meta(shape),
             built,
             self.writes(),
         )?;
+        let _keeping = self.keep(&merged.meta);
         self.upload(&merged, &mut staged).await?;
         let merged = self.fit(merged, &catalog).await?;
+        let gate = self.merge_gate.lock().expect("gate lock").clone();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        let _building = self.building.lock().await;
+        // Not at another epoch than it was planned at: a restore since may
+        // have brought the same segments back with other rows live.
+        if self.stale(planned) {
+            return Ok(None);
+        }
         // Nor with a row the run holds live missing from the merged file,
         // which carrying it out could not place: checked before the turn
         // is taken, as no row comes back to life without a restore, which
-        // holds the building lock this does.
+        // moves the epoch, and the building lock is held.
         if !self
             .partition
             .read(|state| state.covers(&merge, &alive, &merged))
@@ -2494,14 +2550,10 @@ impl Writer {
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
-        // Only what holds the building lock replaces segments, so the run
-        // is as it was planned over. Were it not, the merged segment would
-        // describe nothing there is: nothing is committed, and what was
-        // uploaded is deleted.
-        // Nor at another epoch than it was planned at.
-        if self.stale(planned) {
-            return Ok(None);
-        }
+        // Only what holds the building lock replaces segments: a flush
+        // since the plan adds segments after the run, and the run is as it
+        // was. Were it not, the merged segment would describe nothing there
+        // is: nothing is committed, and what was uploaded is deleted.
         let Some(manifest) = self.partition.read(|state| {
             let flushed = segment.as_ref();
             state.merged_manifest(position, &snapshot, flushed, &merge, merged.meta.clone())
@@ -2519,6 +2571,41 @@ impl Writer {
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
         Ok(Some(position))
+    }
+
+    /// Keep `meta`'s files from [`Self::clean`] until what is given back is
+    /// dropped.
+    fn keep(&self, meta: &SegmentMeta) -> Keeping {
+        let keys: Vec<String> = [Some(&meta.key), meta.index.as_ref(), meta.vectors.as_ref()]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        self.keeping
+            .lock()
+            .expect("keeping lock")
+            .extend(keys.iter().cloned());
+        Keeping {
+            keeping: self.keeping.clone(),
+            keys,
+        }
+    }
+
+    /// How many files merges under way keep from [`Self::clean`] now. For
+    /// tests.
+    #[doc(hidden)]
+    pub fn kept_while_merging(&self) -> usize {
+        self.keeping.lock().expect("keeping lock").len()
+    }
+
+    /// Hold every merge from now on between its build and its commit, at
+    /// the gate given back, until it is released. For tests that make
+    /// things happen meanwhile.
+    #[doc(hidden)]
+    pub fn hold_merges_before_commit(&self) -> Arc<MergeGate> {
+        let gate = Arc::new(MergeGate::default());
+        *self.merge_gate.lock().expect("gate lock") = Some(gate.clone());
+        gate
     }
 
     /// Delete the partition's files that nothing needs any more: a stale
@@ -2824,10 +2911,14 @@ impl Writer {
             .chain([&base])
             .flat_map(listed_by)
             .collect();
+        let merging = self.keeping.lock().expect("keeping lock").clone();
         let orphans = files
             .iter()
             .filter(|(file, at)| {
-                *at < base.position && file.modified < cutoff && !kept.contains(file.key.as_str())
+                *at < base.position
+                    && file.modified < cutoff
+                    && !kept.contains(file.key.as_str())
+                    && !merging.contains(&file.key)
             })
             .map(|(file, _)| file.key.clone())
             .take(Self::CLEANED_AT_ONCE)
