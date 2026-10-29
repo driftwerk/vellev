@@ -232,6 +232,9 @@ async fn a_node_builds_at_most_merge_builds_at_once_a_stopped_one_among_them_unt
         let (builds, most, counting) = (builds.clone(), most.clone(), counting.clone());
         async move {
             while counting.load(Ordering::SeqCst) {
+                // Builds running in their closures, held or not, and those
+                // counted under way.
+                most.fetch_max(builds.held(), Ordering::SeqCst);
                 most.fetch_max(builds.under_way(), Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -332,6 +335,9 @@ async fn what_a_stopped_merge_drains_counts_against_the_budget() {
     })
     .await;
     assert_eq!(node.resident(), one, "the tenant kept holds what it held");
+    // Used now, however long the rule took to come here: let go for being
+    // idle only well after the rule is done.
+    node.tenant(&tenant("kept")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     node.sweeping();
     until(
@@ -398,4 +404,65 @@ async fn a_tenant_s_flushes_never_wait_behind_other_tenants_merges() {
         builds.under_way() == 0
     })
     .await;
+}
+
+/// Over its budget, a node lets go of what it can take out before it stops
+/// any merge: a tenant mid-merge that cannot be taken out, the least
+/// recently used, keeps its merge when letting another go is enough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn over_its_budget_a_node_stops_no_merge_when_letting_others_go_is_enough() {
+    let few = || -> Vec<Mutation> {
+        std::iter::once(notes())
+            .chain((0..NOTES / 2).map(|n| note(10_000 + n)))
+            .collect()
+    };
+    // What the two hold together: one mid-merge, one with a few notes.
+    let sizing = node(|settings| settings.flush_rows = NOTES as usize);
+    sizing.merge_builds().hold(Some(Holding::UntilLetGo));
+    four_flushes(&sizing, "merging").await;
+    sizing.create_tenant(&tenant("idle")).await.unwrap();
+    let idle = sizing.tenant(&tenant("idle")).await.unwrap();
+    idle.write(few()).await.unwrap();
+    drop(idle);
+    let both = sizing.resident();
+    sizing.merge_builds().hold(None);
+
+    // Over the budget with both, within it with either.
+    let node = node(|settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.memory = Some(both - 1);
+        // Swept every two seconds; let go for being idle only well after
+        // the rule is done.
+        settings.tenant_idle = Duration::from_secs(8);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilStopped));
+    four_flushes(&node, "merging").await;
+    until(30, "the merge never came to build", || builds.held() == 1).await;
+    node.create_tenant(&tenant("idle")).await.unwrap();
+    node.tenant(&tenant("idle"))
+        .await
+        .unwrap()
+        .write(few())
+        .await
+        .unwrap();
+    assert_eq!(node.resident(), both);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweeping();
+    until(4, "the tenant that could go was never let go", || {
+        node.resident() < both
+    })
+    .await;
+    // A round more: the merge goes on.
+    for _ in 0..250 {
+        assert_eq!(
+            builds.held(),
+            1,
+            "a merge was stopped though letting another tenant go was enough"
+        );
+        assert_eq!(builds.draining(), 0);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    builds.hold(None);
+    until(60, "the merge was never made", || builds.under_way() == 0).await;
 }

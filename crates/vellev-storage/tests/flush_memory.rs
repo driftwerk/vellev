@@ -160,8 +160,8 @@ async fn merge_peak(rows: usize, dimensions: usize) -> usize {
 }
 
 /// What a merge as [`merge_peak`] makes holds at its peak, and what it
-/// reckoned it would.
-async fn merge_measured(rows: usize, dimensions: usize) -> (usize, usize) {
+/// reckoned it would once its rows were gathered, and as it was planned.
+async fn merge_measured(rows: usize, dimensions: usize) -> (usize, usize, usize) {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
     let builds = vellev_storage::MergeBuilds::new(1);
@@ -180,7 +180,11 @@ async fn merge_measured(rows: usize, dimensions: usize) -> (usize, usize) {
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.merge().await.unwrap().expect("the segments merge");
-    (COUNTING.peak() - before, builds.last_reckoned())
+    (
+        COUNTING.peak() - before,
+        builds.last_reckoned(),
+        builds.last_planned(),
+    )
 }
 
 /// Hold what a further row's vector costs at the peak against `copies`
@@ -223,28 +227,38 @@ async fn a_merge_holds_its_vectors_once() {
 }
 
 /// A merge reckons what it holds at its peak to within 30% of what it is
-/// measured to hold (merge note, §7.6): the node counts what a stopped
-/// merge was reckoned to hold as draining, until it has ended.
+/// measured to hold once its rows are gathered, and to within half as it
+/// is planned, from what its run's segments hold (merge note, §7.6): the
+/// node counts what a stopped merge was reckoned to hold as draining,
+/// until it has ended.
 #[tokio::test(flavor = "current_thread")]
 async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
     let _alone = ALONE.lock().await;
     let mut measured = Vec::new();
     for (rows, dimensions) in [(FEWER, WIDE), (MORE, WIDE), (FEWER, NARROW), (MORE, NARROW)] {
-        let (peak, reckoned) = merge_measured(rows, dimensions).await;
-        let off = (reckoned as f64 - peak as f64) / peak as f64;
+        let (peak, reckoned, planned) = merge_measured(rows, dimensions).await;
+        let off = |by: usize| (by as f64 - peak as f64) / peak as f64;
         eprintln!(
             "a merge of {rows} rows of {dimensions} held {peak} bytes at its peak, \
-             reckoned {reckoned} ({:+.0}%)",
-            off * 100.0
+             reckoned {reckoned} ({:+.0}%), planned {planned} ({:+.0}%)",
+            off(reckoned) * 100.0,
+            off(planned) * 100.0
         );
-        measured.push((rows, dimensions, peak, reckoned, off));
+        measured.push((rows, dimensions, peak, reckoned, planned));
     }
-    for (rows, dimensions, peak, reckoned, off) in measured {
+    for (rows, dimensions, peak, reckoned, planned) in measured {
+        let off = |by: usize| (by as f64 - peak as f64) / peak as f64;
         assert!(
-            off.abs() <= 0.3,
+            off(reckoned).abs() <= 0.3,
             "a merge of {rows} rows of {dimensions} reckoned {reckoned} bytes, \
              held {peak} at its peak: {:+.0}%",
-            off * 100.0
+            off(reckoned) * 100.0
+        );
+        assert!(
+            off(planned).abs() <= 0.5,
+            "a merge of {rows} rows of {dimensions} was planned at {planned} bytes, \
+             held {peak} at its peak: {:+.0}%",
+            off(planned) * 100.0
         );
     }
 }

@@ -47,8 +47,14 @@ pub struct MergeBuilds {
     let_go: Condvar,
     /// How many builds wait where a test holds them now.
     held: AtomicUsize,
-    /// What the last build to end was reckoned to hold.
+    /// What the last build to end was reckoned to hold, as it was planned
+    /// and once its rows were gathered.
+    last_planned: AtomicUsize,
     last_reckoned: AtomicUsize,
+    /// Whether each build's output carries a [`Probe`], as a test asks.
+    probing: AtomicBool,
+    /// How the builds stood as the last probe was dropped.
+    probed: Mutex<Option<Probed>>,
 }
 
 /// What one build under way is reckoned to hold, and the stop of its merge.
@@ -56,21 +62,55 @@ pub struct MergeBuilds {
 struct Reckoned {
     stop: Stop,
     bytes: AtomicUsize,
+    /// What it was reckoned to hold as it was planned.
+    planned: AtomicUsize,
     /// Whether its merge is past where a stop ends it: one stopped after
     /// commits what it holds, and drains nothing.
     committing: AtomicBool,
 }
 
-/// How a test holds each merge's build, at its start off the async
-/// threads, with its turn taken and its rows gathered. Not for use.
+/// How a test holds each merge's build off the async threads, with its
+/// turn taken and its rows gathered. Not for use.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Holding {
-    /// Until [`MergeBuilds::hold`] lets it go, stopped or not: a build
-    /// slow to come to where it asks its stop.
+    /// At its start, until [`MergeBuilds::hold`] lets it go, stopped or
+    /// not: a build slow to come to where it asks its stop.
     UntilLetGo,
-    /// Until its merge is stopped: a build that would otherwise run on.
+    /// At its start, until its merge is stopped: a build that would
+    /// otherwise run on.
     UntilStopped,
+    /// Once built, past the last place it asks its stop, until let go: a
+    /// build that ends with what it built, whether or not it is awaited.
+    BuiltUntilLetGo,
+}
+
+/// How the builds stood as a [`Probe`] was dropped. Not for use.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Probed {
+    pub under_way: usize,
+    pub turns_free: usize,
+    pub draining: usize,
+}
+
+/// Carried by what a build makes, as a test asks: notes how the builds
+/// stood as it is dropped, with the last of what the build made.
+#[derive(Debug)]
+pub(crate) struct Probe {
+    builds: Arc<MergeBuilds>,
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let builds = &self.builds;
+        let probed = Probed {
+            under_way: builds.under_way(),
+            turns_free: builds.turns_free(),
+            draining: builds.draining(),
+        };
+        *lock(&builds.probed) = Some(probed);
+    }
 }
 
 impl MergeBuilds {
@@ -82,7 +122,10 @@ impl MergeBuilds {
             holding: Mutex::default(),
             let_go: Condvar::new(),
             held: AtomicUsize::new(0),
+            last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
+            probing: AtomicBool::new(false),
+            probed: Mutex::default(),
         })
     }
 
@@ -133,6 +176,27 @@ impl MergeBuilds {
         self.last_reckoned.load(Ordering::SeqCst)
     }
 
+    /// What the last build to end was reckoned to hold at its peak as it
+    /// was planned, before its rows were gathered. For tests.
+    #[doc(hidden)]
+    pub fn last_planned(&self) -> usize {
+        self.last_planned.load(Ordering::SeqCst)
+    }
+
+    /// Have what each build makes from now on carry a probe, or not. For
+    /// tests that see how the builds stand as the last of it is dropped.
+    #[doc(hidden)]
+    pub fn probe(&self, probing: bool) {
+        self.probing.store(probing, Ordering::SeqCst);
+    }
+
+    /// How the builds stood as the last probe was dropped, if one was. For
+    /// tests.
+    #[doc(hidden)]
+    pub fn probed(&self) -> Option<Probed> {
+        *lock(&self.probed)
+    }
+
     /// A turn to build the merge `stopping` stops, once one is free; `None`
     /// if the merge is stopped first, or `flush_due` says its writer's flush
     /// is due first, when it never builds. A turn free at once is taken,
@@ -162,6 +226,7 @@ impl MergeBuilds {
         let reckoned = Arc::new(Reckoned {
             stop: stopping.stop().clone(),
             bytes: AtomicUsize::new(0),
+            planned: AtomicUsize::new(0),
             committing: AtomicBool::new(false),
         });
         lock(&self.under_way).push(reckoned.clone());
@@ -214,6 +279,7 @@ impl MergeBuild {
                 None => true,
                 Some(Holding::UntilLetGo) => false,
                 Some(Holding::UntilStopped) => stopping.is_stopped(),
+                Some(Holding::BuiltUntilLetGo) => true,
             };
             if goes_on || Instant::now() >= until {
                 break;
@@ -237,7 +303,9 @@ struct Counted {
 
 impl Drop for Counted {
     fn drop(&mut self) {
+        let planned = self.reckoned.planned.load(Ordering::SeqCst);
         let bytes = self.reckoned.bytes.load(Ordering::SeqCst);
+        self.builds.last_planned.store(planned, Ordering::SeqCst);
         self.builds.last_reckoned.store(bytes, Ordering::SeqCst);
         lock(&self.builds.under_way).retain(|build| !Arc::ptr_eq(build, &self.reckoned));
     }

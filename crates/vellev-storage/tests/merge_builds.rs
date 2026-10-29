@@ -141,13 +141,14 @@ async fn a_merge_with_nothing_to_do_waits_for_no_turn() {
     assert!(built.unwrap().unwrap().is_some());
 }
 
-/// A store whose uploads of merged vectors, once armed, wait, holding what
-/// they were given, until let go or dropped: an upload a stopped merge
-/// leaves to settle, or aborts. What the merge builds stood at as the one
-/// held ended is noted.
+/// A store whose uploads of the files `kind` says, once armed, wait,
+/// holding what they were given, until let go or dropped: an upload a
+/// stopped merge leaves to settle, or aborts, or a flush held part way.
+/// What the merge builds stood at as the one held ended is noted.
 #[derive(Debug)]
 struct HeldUpload {
     inner: Arc<dyn Blobs>,
+    kind: fn(&str) -> bool,
     builds: Arc<MergeBuilds>,
     armed: AtomicBool,
     putting: tokio::sync::mpsc::UnboundedSender<()>,
@@ -155,11 +156,13 @@ struct HeldUpload {
     ended: Arc<Mutex<Option<Seen>>>,
 }
 
-/// The builds under way and the turns free, as an upload ended.
+/// The builds under way, the turns free and whether anything drained, as
+/// an upload ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Seen {
     under_way: usize,
     turns_free: usize,
+    draining: bool,
 }
 
 /// Notes, as it is dropped, how the builds stood as an upload ended,
@@ -174,6 +177,7 @@ impl Drop for Ends {
         *self.ended.lock().unwrap() = Some(Seen {
             under_way: self.builds.under_way(),
             turns_free: self.builds.turns_free(),
+            draining: self.builds.draining() > 0,
         });
     }
 }
@@ -181,7 +185,7 @@ impl Drop for Ends {
 #[async_trait]
 impl Blobs for HeldUpload {
     async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
-        if !(self.armed.load(Ordering::SeqCst) && key.contains("-merged.vectors")) {
+        if !(self.armed.load(Ordering::SeqCst) && (self.kind)(key)) {
             return self.inner.put(key, bytes).await;
         }
         let _ends = Ends {
@@ -215,6 +219,7 @@ async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upl
     let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
     let held = Arc::new(HeldUpload {
         inner: cluster.blobs.clone(),
+        kind: |key| key.contains("-merged.vectors"),
         builds: builds.clone(),
         armed: AtomicBool::new(false),
         putting,
@@ -255,9 +260,11 @@ async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upl
         seen,
         Seen {
             under_way: 1,
-            turns_free: 0
+            turns_free: 0,
+            draining: true,
         },
-        "as its upload ended, its build was no longer counted, or its turn was free"
+        "as its upload ended, its build was no longer counted, its turn was free, \
+         or it no longer drained"
     );
     assert_eq!(builds.draining(), 0);
     assert_eq!(builds.turns_free(), 1);
@@ -292,4 +299,123 @@ async fn a_merge_stopped_past_loading_back_drains_nothing() {
     );
     assert_eq!(builds.under_way(), 0);
     assert_eq!(builds.draining(), 0);
+}
+
+/// A merge dropped where it waits for its build, its build past the last
+/// place it asks its stop, leaves the build to end with what it built,
+/// unawaited: the build holds its turn, and its count, until what it built
+/// is dropped, never only until its work returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_nobody_awaits_holds_its_turn_until_what_it_built_is_dropped() {
+    let builds = MergeBuilds::new(1);
+    builds.probe(true);
+    builds.hold(Some(Holding::BuiltUntilLetGo));
+    let cluster = Cluster::new().await;
+    let writer = flushed(&cluster, &builds, 2).await;
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    until(60, "the merge was never built", || builds.held() == 1).await;
+    merging.abort();
+    assert!(merging.await.unwrap_err().is_cancelled());
+    builds.hold(None);
+    until(30, "the build was never let go", || builds.under_way() == 0).await;
+    let probed = builds
+        .probed()
+        .expect("what the build made was never dropped");
+    assert_eq!(
+        probed.under_way, 1,
+        "the build's count was let go before what it built"
+    );
+    assert_eq!(
+        probed.turns_free, 0,
+        "the build's turn was free before what it built was dropped"
+    );
+    assert_eq!(builds.turns_free(), 1);
+}
+
+/// A merge dropped without being stopped, as when the task that runs it
+/// is aborted, stops its build: the build gives up, and its turn is free,
+/// at once rather than once the build would have ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_dropped_unstopped_stops_its_build() {
+    let builds = MergeBuilds::new(1);
+    builds.hold(Some(Holding::UntilStopped));
+    let cluster = Cluster::new().await;
+    let writer = flushed(&cluster, &builds, 2).await;
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    until(60, "the merge never came to build", || builds.held() == 1).await;
+    merging.abort();
+    assert!(merging.await.unwrap_err().is_cancelled());
+    until(
+        5,
+        "the build of a merge dropped unstopped ran on, holding its turn",
+        || builds.under_way() == 0,
+    )
+    .await;
+    assert_eq!(builds.turns_free(), 1);
+    assert!(!writer.merge_under_way());
+    builds.hold(None);
+    let next = within(60, "the next merge never ended", writer.merge()).await;
+    assert!(next.unwrap().is_some());
+}
+
+/// A merge never holds a turn while it waits for its partition's building
+/// lock, as a flush or a restore holds it for long: it gives the turn back
+/// meanwhile, and another tenant's merge takes it. Once the lock is free,
+/// it takes a turn again and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_is_not_held_while_its_partition_s_building_lock_is() {
+    let builds = MergeBuilds::new(1);
+    let (mut one, other) = (Cluster::new().await, Cluster::new().await);
+    let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
+    let held = Arc::new(HeldUpload {
+        inner: one.blobs.clone(),
+        kind: |key| key.ends_with(".vectors") && !key.contains("-merged"),
+        builds: builds.clone(),
+        armed: AtomicBool::new(false),
+        putting,
+        let_go: tokio::sync::Notify::new(),
+        ended: Arc::default(),
+    });
+    one.blobs = held.clone();
+    let first = flushed(&one, &builds, 2).await;
+    let mut random = Random(11);
+    let more = (0..NOTES).map(|n| note(10 * NOTES + n, &mut random));
+    first.commit(more.collect()).await.unwrap();
+    // A flush held part way, holding the partition's building lock.
+    held.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let first = first.clone();
+        async move { first.flush().await }
+    });
+    within(60, "the flush's vectors never began to go up", put.recv()).await;
+    let waiting = tokio::spawn({
+        let first = first.clone();
+        async move { first.merge().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished());
+    let second = flushed(&other, &builds, 2).await;
+    let merged = within(
+        10,
+        "a merge waited for a turn another held while waiting for its own building lock",
+        second.merge(),
+    )
+    .await;
+    assert!(merged.unwrap().is_some());
+    held.armed.store(false, Ordering::SeqCst);
+    held.let_go.notify_one();
+    within(60, "the held flush never ended", flushing)
+        .await
+        .unwrap()
+        .unwrap();
+    let merged = within(60, "the waiting merge never ended", waiting).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    assert_eq!(builds.under_way(), 0);
+    assert_eq!(builds.turns_free(), 1);
 }
