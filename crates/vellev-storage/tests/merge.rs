@@ -1193,5 +1193,12 @@ async fn rows_deleted_and_changed_during_a_merge_stay_so_after_it() {
         assert_eq!(writer.partition().read(both), want, "flushed {flushed}");
         let fresh = cluster.open().await;
         assert_eq!(fresh.partition().read(both), want, "flushed {flushed}");
+        // And the writer's segments have the very rows dead a copy loaded
+        // afresh works out from what was committed.
+        assert_eq!(
+            writer.partition().read(State::dead_rows),
+            fresh.partition().read(State::dead_rows),
+            "flushed {flushed}"
+        );
     }
 }

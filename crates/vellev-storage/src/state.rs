@@ -1946,6 +1946,16 @@ impl State {
 
     /// Which rows of `merge`'s run are live now, segment by segment: taken
     /// when a merge is planned, as what its merged segment is made of.
+    /// Which rows of each segment are dead, segment by segment. For tests
+    /// that hold a writer's state to a copy loaded afresh.
+    #[doc(hidden)]
+    pub fn dead_rows(&self) -> Vec<Vec<bool>> {
+        self.segments
+            .iter()
+            .map(|segment| segment.dead.clone())
+            .collect()
+    }
+
     pub(crate) fn alive(&self, merge: &Merge) -> Vec<Vec<bool>> {
         self.segments[merge.run.clone()]
             .iter()
