@@ -282,3 +282,67 @@ async fn a_node_builds_at_most_merge_builds_at_once_a_stopped_one_among_them_unt
         most.load(Ordering::SeqCst)
     );
 }
+
+/// What a stopped merge still drains counts against the budget: a node
+/// within it by what its tenants hold lets another go while a tenant it
+/// gave up has a build that runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_stopped_merge_drains_counts_against_the_budget() {
+    let few = || -> Vec<Mutation> {
+        std::iter::once(notes())
+            .chain((0..NOTES / 2).map(|n| note(10_000 + n)))
+            .collect()
+    };
+    // What a tenant of a few notes, unflushed, holds.
+    let sizing = node(|settings| settings.flush_rows = NOTES as usize);
+    sizing.create_tenant(&tenant("kept")).await.unwrap();
+    sizing
+        .tenant(&tenant("kept"))
+        .await
+        .unwrap()
+        .write(few())
+        .await
+        .unwrap();
+    let one = sizing.resident();
+    assert!(one > 0);
+
+    // Just within the budget with that tenant alone. Swept every two
+    // seconds; let go for being idle only well after the rule is done.
+    let node = node(|settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.memory = Some(one);
+        settings.tenant_idle = Duration::from_secs(8);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    node.create_tenant(&tenant("kept")).await.unwrap();
+    node.tenant(&tenant("kept"))
+        .await
+        .unwrap()
+        .write(few())
+        .await
+        .unwrap();
+    four_flushes(&node, "dropped").await;
+    until(30, "the merge never came to build", || builds.held() == 1).await;
+    // Given up: no longer held, its build runs on, draining.
+    node.drop_tenant(&tenant("dropped")).await.unwrap();
+    until(5, "the stopped merge was never counted as draining", || {
+        builds.draining() > 0
+    })
+    .await;
+    assert_eq!(node.resident(), one, "the tenant kept holds what it held");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweeping();
+    until(
+        3,
+        "a tenant was not let go for what a stopped merge drains",
+        || node.resident() == 0,
+    )
+    .await;
+    builds.hold(None);
+    until(30, "the stopped build was never let go", || {
+        builds.under_way() == 0
+    })
+    .await;
+    assert_eq!(builds.draining(), 0);
+}

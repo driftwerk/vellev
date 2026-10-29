@@ -237,3 +237,34 @@ async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upl
     assert_eq!(builds.draining(), 0);
     assert_eq!(builds.turns_free(), 1);
 }
+
+/// A merge stopped once it has loaded back what it built commits, as it
+/// would have: what it holds is committed, not drained, so none of it
+/// counts as draining while it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_stopped_past_loading_back_drains_nothing() {
+    let builds = MergeBuilds::new(1);
+    let cluster = Cluster::new().await;
+    let writer = flushed(&cluster, &builds, 2).await;
+    let gate = writer.hold_merges_before_commit();
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    within(60, "the merge was never built", gate.reached.notified()).await;
+    assert_eq!(builds.under_way(), 1);
+    writer.stop_merges();
+    assert_eq!(
+        builds.draining(),
+        0,
+        "a merge past where a stop ends it counted as draining"
+    );
+    gate.release.notify_one();
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(
+        merged.unwrap().unwrap().is_some(),
+        "past loading back, it commits"
+    );
+    assert_eq!(builds.under_way(), 0);
+    assert_eq!(builds.draining(), 0);
+}
