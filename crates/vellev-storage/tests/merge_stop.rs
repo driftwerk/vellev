@@ -83,9 +83,10 @@ async fn all_there(cluster: &Cluster) {
 }
 
 /// The stages of a merge, each stopped in on its own.
-const STAGES: [MergeStage; 11] = [
+const STAGES: [MergeStage; 12] = [
     MergeStage::Planning,
     MergeStage::Gathering,
+    MergeStage::Turn,
     MergeStage::Indexing,
     MergeStage::Vectors(Stage::Sampling),
     MergeStage::Vectors(Stage::Clustering),
@@ -322,8 +323,14 @@ async fn a_merge_stopped_at_any_moment_gives_up_within_two_seconds() {
         let took = asked.elapsed();
         // A stop that lands once what was built is loaded back is past the
         // point of no return: the merge commits, by design, and the sweep
-        // ends there.
+        // ends there. Only then: a commit after a stop it was told of in
+        // time would be a stop not heeded.
         if merged.as_ref().unwrap().as_ref().unwrap().is_some() {
+            assert_eq!(
+                writer.stops_past_loading(),
+                1,
+                "a merge stopped at {at:?} committed before it had loaded back"
+            );
             println!(
                 "stopped at {:.1} s, past loading back: committed in {:.3} s",
                 at.as_secs_f64(),
@@ -491,6 +498,11 @@ async fn a_stop_once_loaded_back_is_too_late_and_the_merge_commits() {
     assert!(
         merged.unwrap().unwrap().is_some(),
         "past loading back, it commits"
+    );
+    assert_eq!(
+        writer.stops_past_loading(),
+        1,
+        "the stop was seen, too late"
     );
     assert_eq!(writer.kept_while_merging(), 0);
     assert!(!writer.merge_under_way());

@@ -16,6 +16,8 @@ pub enum MergeStage {
     Planning,
     /// Copying the run's live rows out, between its segments.
     Gathering,
+    /// Waiting for a turn among the work done off the async threads.
+    Turn,
     /// Indexing the rows' filterable values and text.
     Indexing,
     /// Indexing the vectors, in the index build's own stage.

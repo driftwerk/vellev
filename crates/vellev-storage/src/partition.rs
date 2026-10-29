@@ -546,7 +546,9 @@ impl Partition {
                     let _loading = loading;
                     let column = Column::map(&name, &path);
                     let told = |bytes| progress.made(bytes);
-                    Ok(column.and_then(|column| column.summed_as(&name, file, told)))
+                    let given_up = || progress.given_up();
+                    Ok(column
+                        .and_then(|column| column.summed_as_unless(&name, file, told, given_up)))
                 });
                 read.await
             }
@@ -970,6 +972,9 @@ pub struct Writer {
     /// Whether each merge's build panics, as a test asks: see
     /// [`Self::panic_merges_in_build`].
     merge_panics: AtomicBool,
+    /// How many merges were stopped only once they had loaded back what
+    /// they built, past where a stop ends them.
+    stops_past_loading: AtomicU64,
 }
 
 /// The stop of the merge under way, there until the merge ends, however it
@@ -1118,6 +1123,7 @@ impl Writer {
             merge_stop_at: std::sync::Mutex::new(None),
             merges_stopped: AtomicU64::new(0),
             merge_panics: AtomicBool::new(false),
+            stops_past_loading: AtomicU64::new(0),
         })
     }
 
@@ -2314,8 +2320,11 @@ impl Writer {
     ) -> Result<Option<Built>> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
-        let stopping = stopping.clone();
-        blocking(move || {
+        let (waiting, stopping) = (stopping.clone(), stopping.clone());
+        // Its turn among the work off the async threads waited for as the
+        // merge's stop is: dropped before it begins, the work never runs,
+        // and begun, it asks the stop itself.
+        let built = blocking(move || {
             assert!(!stopping.panics(), "a merge's build panics, as a test asks");
             let vectors = vectors.map(|gathered| gathered.finish(format));
             let indexes = match &vectors {
@@ -2357,8 +2366,11 @@ impl Writer {
                 segment,
                 column,
             }))
-        })
-        .await?
+        });
+        match waiting.unless_stopped(MergeStage::Turn, built).await {
+            Some(built) => built?,
+            None => Ok(None),
+        }
     }
 
     /// A built segment as `meta` names it, with its index file's frame if
@@ -2728,6 +2740,12 @@ impl Writer {
         })
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        // A stop that came once what was built was loaded back, too late
+        // to end the merge, is counted: for tests that tell a stop too late
+        // from one not heeded.
+        if stopping.is_stopped() {
+            self.stops_past_loading.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Some(position))
     }
 
@@ -2748,6 +2766,14 @@ impl Writer {
     #[doc(hidden)]
     pub fn panic_merges_in_build(&self, panics: bool) {
         self.merge_panics.store(panics, Ordering::SeqCst);
+    }
+
+    /// How many merges were stopped too late: only once they had loaded
+    /// back what they built, from where they commit whatever comes. For
+    /// tests.
+    #[doc(hidden)]
+    pub fn stops_past_loading(&self) -> u64 {
+        self.stops_past_loading.load(Ordering::SeqCst)
     }
 
     /// Whether a merge is under way, its stop where [`Self::stop_merges`]
@@ -3364,10 +3390,11 @@ impl Drop for Turn<'_> {
 struct Staged {
     blobs: Arc<dyn Blobs>,
     keys: Vec<String>,
-    /// Uploads under way, each on a task of its own: one given up on is
-    /// let settle before its file is deleted, as it may yet land (a local
-    /// store writes on a blocking thread, and a store's last request of an
-    /// upload in parts may be answered after it was sent).
+    /// Uploads under way, each on a task of its own: the files of one given
+    /// up on are deleted at once and again once it has settled, as it may
+    /// yet land (a local store writes on a blocking thread, and a store's
+    /// last request of an upload in parts may be answered after it was
+    /// sent).
     putting: Vec<tokio::task::JoinHandle<Result<()>>>,
 }
 
@@ -3392,13 +3419,25 @@ impl Drop for Staged {
         let deleting = crate::blobs::Aborts::process().begun();
         runtime.spawn(async move {
             let _deleting = deleting;
-            for put in putting {
-                let _ = put.await;
-            }
-            for key in keys {
-                if let Err(error) = blobs.delete(&key).await {
-                    tracing::warn!(key, %error, "a file never published could not be deleted");
+            let delete = |keys: Vec<String>| {
+                let blobs = blobs.clone();
+                async move {
+                    for key in keys {
+                        if let Err(error) = blobs.delete(&key).await {
+                            tracing::warn!(key, %error, "a file never published could not be deleted");
+                        }
+                    }
                 }
+            };
+            // At once, so that what went up goes as soon as it can; and
+            // again once each upload under way has settled, at its bound
+            // at the latest, as one may land after the first delete.
+            delete(keys.clone()).await;
+            if !putting.is_empty() {
+                for put in putting {
+                    let _ = put.await;
+                }
+                delete(keys).await;
             }
         });
     }

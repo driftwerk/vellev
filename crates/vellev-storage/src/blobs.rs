@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -680,7 +680,7 @@ const LOADING_STILL_BEYOND: Duration = Duration::from_secs(30);
 /// and with it how far everything reading or writing large files on its
 /// disk has.
 #[derive(Debug, Clone, Default)]
-pub struct Progress(Arc<AtomicU64>, Arc<AtomicU64>);
+pub struct Progress(Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicBool>);
 
 impl Progress {
     /// Tell of `bytes` more done.
@@ -689,8 +689,25 @@ impl Progress {
         self.1.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Whether nobody waits for the step any more: given up on at its
+    /// bound, or dropped by a caller that stopped, as a merge does. A step
+    /// asks between pieces, and gives up too, so that the disk's turn and
+    /// thread go to work someone waits for.
+    pub fn given_up(&self) -> bool {
+        self.2.load(Ordering::Relaxed)
+    }
+
     fn so_far(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Tells a step its waiting is over, as it is dropped.
+struct GivenUp(Progress);
+
+impl Drop for GivenUp {
+    fn drop(&mut self) {
+        self.0 .2.store(true, Ordering::Relaxed);
     }
 }
 
@@ -893,7 +910,7 @@ impl Disk {
 
     /// Word of how far a step with a turn at a large file has got.
     pub(crate) fn progress(&self) -> Progress {
-        Progress(Arc::default(), self.moved.clone())
+        Progress(Arc::default(), self.moved.clone(), Arc::default())
     }
 
     /// How many whole large files this disk reads or writes at once.
@@ -917,6 +934,9 @@ impl Disk {
         let thread = self.thread(within).await?;
         let (threads, number) = (self.threads.clone(), thread.step);
         let progress = self.progress();
+        // However the wait ends, the step is told it is no longer waited
+        // for: if it is still at work, it gives up at its next piece.
+        let _waited = GivenUp(progress.clone());
         let (done, mut waited) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("vellev-disk".into())
@@ -1057,12 +1077,37 @@ impl ObjectBlobs {
         Self { aborts, ..self }
     }
 
+    /// Start an upload in parts under `path`, on a task of its own: one
+    /// whose caller stops waiting before the store answers is aborted once
+    /// the store does, never left begun with no parts and nothing to abort
+    /// it.
+    async fn started(&self, key: &str, path: &ObjectPath) -> Result<Box<dyn MultipartUpload>> {
+        let within = self.transfers.request_within;
+        let (store, path, named) = (self.store.clone(), path.clone(), key.to_string());
+        let mut starting = Starting {
+            start: Some(tokio::spawn(async move {
+                bounded(&named, within, store.put_multipart(&path)).await
+            })),
+            within,
+            aborts: self.aborts.clone(),
+        };
+        let started = starting.start.as_mut().expect("just begun").await;
+        starting.start = None;
+        match started {
+            Ok(started) => started,
+            Err(failed) => match failed.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(_) => unreachable!("an upload's start is never aborted"),
+            },
+        }
+    }
+
     /// Upload `bytes` under `key` in parts, each its own request, and abort
     /// the upload if any of it fails or it is dropped unfinished.
     async fn put_in_parts(&self, key: &str, path: &ObjectPath, bytes: Bytes) -> Result<()> {
         let within = self.transfers.request_within;
         let mut upload = Unfinished {
-            upload: Some(bounded(key, within, self.store.put_multipart(path)).await?),
+            upload: Some(self.started(key, path).await?),
             within,
             aborts: self.aborts.clone(),
         };
@@ -1337,6 +1382,32 @@ impl Unfinished {
     }
 }
 
+/// An upload in parts being started, aborted once the store answers if
+/// whoever started it stopped waiting first.
+struct Starting {
+    start: Option<tokio::task::JoinHandle<Result<Box<dyn MultipartUpload>>>>,
+    within: Duration,
+    aborts: Aborts,
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        let (Some(start), Ok(runtime)) = (self.start.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let (within, aborting) = (self.within, self.aborts.begun());
+        runtime.spawn(async move {
+            let _aborting = aborting;
+            if let Ok(Ok(mut upload)) = start.await {
+                if let Err(error) = bounded("an upload", within, upload.abort()).await {
+                    tracing::warn!(%error, "an upload started for nobody could not be aborted");
+                }
+            }
+        });
+    }
+}
+
 impl Drop for Unfinished {
     /// An upload dropped unfinished, by a caller that stopped waiting, is
     /// aborted on a task of its own.
@@ -1496,8 +1567,7 @@ impl Blobs for ObjectBlobs {
                 while holding + came.len() > part {
                     held.push(came.split_to(part - holding));
                     if upload.upload.is_none() {
-                        let started = bounded(key, within, self.store.put_multipart(&path));
-                        upload.upload = Some(started.await?);
+                        upload.upload = Some(self.started(key, &path).await?);
                     }
                     if sent == MOST_PARTS {
                         return Err(too_many());
@@ -2137,6 +2207,29 @@ impl Blobs for CachedBlobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step on local disk whose caller stops waiting is told so, and
+    /// can give up, rather than holding the disk's thread and turn to the
+    /// end of work nobody wants.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_step_nobody_waits_for_is_told_so() {
+        let disk = Disk::new(Duration::from_secs(10), 1024 * 1024, 2);
+        let (told, heard) = std::sync::mpsc::channel();
+        let step = disk.run_while_it_gets_on(1, move |progress| {
+            let begun = std::time::Instant::now();
+            while !progress.given_up() && begun.elapsed() < Duration::from_secs(30) {
+                progress.made(1);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = told.send(progress.given_up());
+            Ok(())
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(100), step)
+            .await
+            .is_err());
+        let heard = tokio::task::spawn_blocking(move || heard.recv_timeout(Duration::from_secs(5)));
+        assert_eq!(heard.await.unwrap(), Ok(true), "the step was never told");
+    }
     use object_store::memory::InMemory;
 
     #[test]

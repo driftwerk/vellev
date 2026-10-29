@@ -993,6 +993,9 @@ pub(crate) fn indexed_stopping<'a>(
         };
     }
     for index in indexes.values_mut() {
+        if stopping.stopped(MergeStage::Indexing) {
+            return None;
+        }
         index.rows.summarise();
     }
     Some((indexes, threads.most()))
