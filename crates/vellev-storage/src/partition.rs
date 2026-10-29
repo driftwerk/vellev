@@ -26,7 +26,7 @@ use crate::format::{
     Head, Kind, LogSegment, Manifest, Op, SegmentCurve, SegmentFile, SegmentIndex, SegmentMeta,
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
-use crate::merge_builds::{MergeBuild, MergeBuilds, Probe, MERGE_BUILDS};
+use crate::merge_builds::{MergeBuild, MergeBuilds, Probe, Uploading, MERGE_BUILDS};
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
     self, Discarded, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
@@ -2541,14 +2541,14 @@ impl Writer {
     /// stopped: asked before each file, and while each goes up. A file
     /// given up part way is aborted as its upload is dropped, its parts
     /// discarded ([`crate::Transfers`]); those that went up are deleted
-    /// as `staged` is dropped. A merge's `build` is held by each upload
-    /// until it ends, as each holds a share of what was built.
+    /// as `staged` is dropped. A merge's bytes go up `carrying` its share
+    /// of its build, held by every copy of them.
     async fn upload_stopping(
         &self,
         prepared: &Prepared,
         staged: &mut Staged,
         stopping: &Stopping,
-        build: Option<&Arc<MergeBuild>>,
+        carrying: Option<&Arc<Uploading>>,
     ) -> Result<bool> {
         let Prepared { meta, built, index } = prepared;
         let files = [
@@ -2564,13 +2564,14 @@ impl Writer {
             // this ends, given up, stopped or dropped, the file is deleted
             // once the upload has settled, never before.
             staged.keys.push(key.to_string());
-            let (blobs, owned, bytes) =
-                (self.partition.blobs.clone(), key.to_string(), bytes.clone());
-            let build = build.cloned();
-            staged.putting.push(tokio::spawn(async move {
-                let _build = build;
-                blobs.put(&owned, bytes).await
-            }));
+            let bytes = match carrying {
+                Some(carrying) => carrying.carried_by(bytes),
+                None => bytes.clone(),
+            };
+            let (blobs, owned) = (self.partition.blobs.clone(), key.to_string());
+            staged
+                .putting
+                .push(tokio::spawn(async move { blobs.put(&owned, bytes).await }));
             let put = staged.putting.last_mut().expect("just pushed");
             match stopping.unless_stopped(MergeStage::Uploading, put).await {
                 Some(Ok(put)) => {
@@ -2877,8 +2878,9 @@ impl Writer {
             return Ok(None);
         }
         let _keeping = self.keep(&merged.meta);
+        let uploading = Uploading::new(build.clone());
         if !self
-            .upload_stopping(&merged, &mut staged, &stopping, Some(&build))
+            .upload_stopping(&merged, &mut staged, &stopping, Some(&uploading))
             .await?
         {
             return Ok(None);
@@ -2955,6 +2957,7 @@ impl Writer {
         })
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        uploading.committed();
         Ok(Some(position))
     }
 

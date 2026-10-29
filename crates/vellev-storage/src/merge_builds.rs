@@ -2,18 +2,19 @@
 //!
 //! A merge takes a turn among at most [`MERGE_BUILDS`] before it gathers a
 //! row, and reckons what its build holds at its peak. Both are held by
-//! every piece of work that holds what the merge gathered or built: the
-//! merge itself, its build off the async threads, and each of its uploads.
-//! They are let go with the last of those to end, not when the merge is
-//! dropped: a stopped build that runs on, or an upload that has yet to
-//! settle, still holds its turn, so that no further merge gathers beside
-//! it. What a stopped merge is reckoned to hold counts as draining until
-//! then.
+//! everything that holds what the merge gathered or built: the merge
+//! itself, its build off the async threads, and every copy of the bytes it
+//! uploads, wherever it is. They are let go with the last of those, not
+//! when the merge is dropped: a stopped build that runs on, or a store's
+//! thread still writing what it uploaded, holds its turn, so that no
+//! further merge gathers beside it. What a stopped merge is reckoned to
+//! hold counts as draining until then.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vellev_index::stop::Stop;
 
@@ -318,6 +319,47 @@ impl MergeBuild {
                 .0;
         }
         builds.held.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A merge's share of its build carried by the bytes it uploads: held by
+/// every copy of them, wherever it goes, a store's own threads included,
+/// and let go with the last, so that what a store still holds of a stopped
+/// merge's files holds its turn. Once the merge commits, what it built is
+/// the partition's, counted as what the partition holds, and the share is
+/// let go: a store that keeps what it is given, as one in memory does,
+/// would otherwise hold the turn for as long as it keeps the file.
+#[derive(Debug)]
+pub(crate) struct Uploading(Mutex<Option<Arc<MergeBuild>>>);
+
+impl Uploading {
+    pub(crate) fn new(build: Arc<MergeBuild>) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(Some(build))))
+    }
+
+    /// `bytes`, carrying the share: the same bytes, not a copy.
+    pub(crate) fn carried_by(self: &Arc<Self>, bytes: &Bytes) -> Bytes {
+        Bytes::from_owner(Carried {
+            bytes: bytes.clone(),
+            _uploading: self.clone(),
+        })
+    }
+
+    /// The merge committed: what it uploaded holds its build no longer.
+    pub(crate) fn committed(&self) {
+        lock(&self.0).take();
+    }
+}
+
+/// Bytes uploaded, and the share they carry.
+struct Carried {
+    bytes: Bytes,
+    _uploading: Arc<Uploading>,
+}
+
+impl AsRef<[u8]> for Carried {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
