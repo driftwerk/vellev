@@ -1241,7 +1241,8 @@ impl Reading {
     }
 }
 
-/// The aborts of uploads dropped unfinished that are on their way: each is
+/// The aborts of uploads dropped unfinished that are on their way, and the
+/// deletes of files a build given up uploaded: each is
 /// sent on a task of its own, which nothing waits for, and a process that
 /// exits at once may never send it, leaving the upload's parts in the
 /// store, where no listing shows them. A process that stops waits for
@@ -1293,7 +1294,7 @@ impl Aborts {
     }
 
     /// One more on its way, until what this gives is dropped.
-    fn begun(&self) -> Aborting {
+    pub(crate) fn begun(&self) -> Aborting {
         self.0.pending.fetch_add(1, Ordering::SeqCst);
         Aborting(self.clone())
     }
@@ -1301,7 +1302,7 @@ impl Aborts {
 
 /// An abort on its way, counted in its [`Aborts`] until this is dropped:
 /// once it is answered or given up, or the task that sends it goes.
-struct Aborting(Aborts);
+pub(crate) struct Aborting(Aborts);
 
 impl Drop for Aborting {
     fn drop(&mut self) {

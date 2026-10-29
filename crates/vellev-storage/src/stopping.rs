@@ -36,17 +36,19 @@ const ASKS_EVERY: Duration = Duration::from_millis(20);
 pub(crate) struct Stopping {
     stop: Stop,
     at: Option<MergeStage>,
+    /// Whether the build panics, as a test asks.
+    panics: bool,
 }
 
 impl Stopping {
     /// For a merge, stopped by whoever holds a clone of [`Self::stop`], or
     /// by itself at the first asking in `at`.
-    pub(crate) fn merge(at: Option<MergeStage>) -> Self {
+    pub(crate) fn merge(at: Option<MergeStage>, panics: bool) -> Self {
         let stop = match at {
             Some(MergeStage::Vectors(stage)) => Stop::at_first(stage),
             _ => Stop::new(),
         };
-        Self { stop, at }
+        Self { stop, at, panics }
     }
 
     /// For a flush or a restore, which nothing stops.
@@ -54,6 +56,7 @@ impl Stopping {
         Self {
             stop: Stop::new(),
             at: None,
+            panics: false,
         }
     }
 
@@ -68,6 +71,11 @@ impl Stopping {
             self.stop.stop();
         }
         self.stop.is_stopped()
+    }
+
+    /// Whether the build is to panic, as a test asks.
+    pub(crate) fn panics(&self) -> bool {
+        self.panics
     }
 
     /// Whether it was stopped, asked by no stage.
@@ -90,6 +98,10 @@ impl Stopping {
                 tokio::time::sleep(ASKS_EVERY).await;
             }
         };
+        // Unbiased: should both be ready at once, either way is sound. Work
+        // that came to an end unseen, as an upload that landed, is let go
+        // of only once whoever began it has noted it to be undone, as each
+        // file is noted before it goes up.
         tokio::select! {
             done = work => Some(done),
             () = stopped => None,
