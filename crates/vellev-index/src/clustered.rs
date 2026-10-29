@@ -1194,10 +1194,10 @@ impl ClusteredIndex {
             .collect())
     }
 
-    #[cfg(test)]
     /// The rank, in each sample's order of clusters, of the cluster each of
     /// its nearest rows lies in: worked out on `pool`, the tuning pool or
     /// the passes', each one thread of its own ([`crate::pool`]).
+    #[cfg(test)]
     fn sample_ranks(
         &self,
         vectors: &[(u32, &[f32])],
@@ -1223,7 +1223,7 @@ impl ClusteredIndex {
             .par_iter()
             .zip(nearest)
             .map(|(at, rows)| {
-                stop.check(Stage::Tuning)?;
+                stop.check(Stage::Ranking)?;
                 let mut rank = vec![0u32; self.clusters.len()];
                 for (place, (_, cluster)) in self
                     .order(&self.prepared(vectors[*at].1))

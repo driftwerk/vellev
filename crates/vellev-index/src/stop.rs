@@ -43,17 +43,20 @@ pub enum Stage {
     /// Coding each row.
     Coding,
     /// Tuning how many clusters a query scans: waiting for the turn on the
-    /// tuning pool, each block of rows of the pass over them, and each
-    /// sample ranked.
+    /// tuning pool, and each block of rows of the pass over them.
     Tuning,
+    /// Ranking, for each tuning sample, the clusters its nearest rows lie
+    /// in.
+    Ranking,
 }
 
 impl Stage {
-    const ALL: [Stage; 4] = [
+    const ALL: [Stage; 5] = [
         Stage::Sampling,
         Stage::Clustering,
         Stage::Coding,
         Stage::Tuning,
+        Stage::Ranking,
     ];
 
     fn at(self) -> usize {

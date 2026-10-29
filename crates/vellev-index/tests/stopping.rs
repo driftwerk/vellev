@@ -43,7 +43,13 @@ fn numbered(vectors: &[Vec<f32>]) -> Vec<(u32, &[f32])> {
 }
 
 /// The passes of a clustered build, in the order it makes them.
-const CLUSTERED: [Stage; 4] = [Stage::Sampling, Stage::Clustering, Stage::Coding, Stage::Tuning];
+const CLUSTERED: [Stage; 5] = [
+    Stage::Sampling,
+    Stage::Clustering,
+    Stage::Coding,
+    Stage::Tuning,
+    Stage::Ranking,
+];
 
 /// The passes of a binary build, in the order it makes them.
 const BINARY: [Stage; 2] = [Stage::Sampling, Stage::Coding];
@@ -69,8 +75,8 @@ fn a_build_asks_its_stop_in_each_long_pass() {
     }
     assert!(stop.checks(Stage::Coding) >= ROWS, "coding asks once a row");
     assert!(
-        stop.checks(Stage::Tuning) >= ROWS.div_ceil(4_096),
-        "tuning asks once a block of rows"
+        stop.checks(Stage::Tuning) > ROWS.div_ceil(4_096),
+        "tuning asks for its turn, and once a block of rows"
     );
 
     let stop = Stop::counting();
