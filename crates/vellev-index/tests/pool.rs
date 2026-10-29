@@ -15,24 +15,31 @@ fn the_read_pool_is_sized_as_the_global_pool_whoever_asks_first() {
     assert_eq!(sized, global);
 }
 
-/// Tuning's and the rows passes' threads run below the rest of the
-/// process, as far as Linux lets a thread lower itself, so that on a small
-/// box they yield the CPU to reads.
+/// A build's tuning runs at the process's own priority: a merge or a large
+/// flush holds the partition's building lock while it tunes, and a flush
+/// waits on that lock, so tuning run lower would hold flushes back behind
+/// a thread the scheduler starves under load. Only the rows passes, which
+/// nobody waits on, run below the rest of the process, as far as Linux
+/// lets a thread lower itself.
 #[cfg(target_os = "linux")]
 #[test]
-fn the_background_pools_run_at_a_lower_priority() {
+fn only_the_rows_passes_run_at_a_lower_priority() {
     let of_this_thread = || unsafe {
         let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
         libc::getpriority(libc::PRIO_PROCESS, tid)
     };
     let here = of_this_thread();
     let lower = (here + vellev_index::pool::BACKGROUND_NICE).min(19);
-    for (what, pool) in [
-        ("tuning", vellev_index::pool::tuning()),
-        ("passes", vellev_index::pool::passes()),
-    ] {
-        assert_eq!(pool.install(of_this_thread), lower, "{what}");
-    }
+    assert_eq!(
+        vellev_index::pool::tuning().install(of_this_thread),
+        here,
+        "a build's tuning"
+    );
+    assert_eq!(
+        vellev_index::pool::passes().install(of_this_thread),
+        lower,
+        "the rows passes"
+    );
     assert_eq!(
         vellev_index::pool::reads().install(of_this_thread),
         here,
