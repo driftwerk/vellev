@@ -29,7 +29,8 @@ pub const MERGE_BUILDS: usize = 2;
 /// let it go.
 const HELD_AT_MOST: Duration = Duration::from_secs(60);
 
-/// How often a build a test holds asks whether to go on.
+/// How often a build a test holds asks whether to go on, and a merge
+/// waiting for its turn whether a flush is due.
 const ASKS_EVERY: Duration = Duration::from_millis(20);
 
 /// A node's merge builds: their turns, and what each under way is reckoned
@@ -133,10 +134,28 @@ impl MergeBuilds {
     }
 
     /// A turn to build the merge `stopping` stops, once one is free; `None`
-    /// if the merge is stopped first, when it never builds.
-    pub(crate) async fn turn(self: &Arc<Self>, stopping: &Stopping) -> Result<Option<MergeBuild>> {
-        let turn = self.turns.clone().acquire_owned();
-        let Some(turn) = stopping.unless_stopped(MergeStage::Queued, turn).await else {
+    /// if the merge is stopped first, or `flush_due` says its writer's flush
+    /// is due first, when it never builds. A turn free at once is taken,
+    /// whatever is due: what then holds the flush is the merge's own build,
+    /// not other merges'.
+    pub(crate) async fn turn(
+        self: &Arc<Self>,
+        stopping: &Stopping,
+        flush_due: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<MergeBuild>> {
+        let flush_first = async {
+            while !flush_due() {
+                tokio::time::sleep(ASKS_EVERY).await;
+            }
+        };
+        let turn = async {
+            tokio::select! {
+                biased;
+                turn = self.turns.clone().acquire_owned() => Some(turn),
+                () = flush_first => None,
+            }
+        };
+        let Some(Some(turn)) = stopping.unless_stopped(MergeStage::Queued, turn).await else {
             return Ok(None);
         };
         let turn = turn.map_err(|error| StorageError::Background(error.to_string()))?;

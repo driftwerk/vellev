@@ -920,6 +920,12 @@ impl Tenant {
         })
     }
 
+    /// Whether the tenant's maintenance would flush it now: it holds a
+    /// flush's worth of rows, and no failed flush puts the next off.
+    fn flush_due(&self) -> bool {
+        self.read(State::unflushed) >= self.flush_rows && self.flush_may_be_tried()
+    }
+
     /// Whether a flush may be tried now, none having failed lately.
     fn flush_may_be_tried(&self) -> bool {
         let next = self.backoff.lock().expect("backoff lock").1;
@@ -970,9 +976,22 @@ impl Tenant {
     /// of that window names, and that is the caller's breach. What that
     /// floor does not cover is said at [`LEAST_GRACE`].
     pub async fn compact(&self, grace: Duration) -> Result<usize> {
+        self.compacted(grace, &|| false).await
+    }
+
+    /// As [`Self::compact`], each merge giving way to a flush that falls due
+    /// while it waits for a turn among the node's merge builds
+    /// ([`Writer::merge_giving_way`]): so that the tenant's maintenance,
+    /// which flushes it, is never held behind other tenants' merges, and
+    /// its writes are never refused for a backlog those let pile up.
+    async fn compacted(
+        &self,
+        grace: Duration,
+        flush_due: &(dyn Fn() -> bool + Sync),
+    ) -> Result<usize> {
         while self
             .writer
-            .merge()
+            .merge_giving_way(flush_due)
             .await
             .map_err(|error| self.failed(error))?
             .is_some()
@@ -1001,7 +1020,10 @@ impl Tenant {
     ) -> Result<usize> {
         let window = restore_window(coordinator, &self.id, default_window).await?;
         coordinator.forget_history(&key(&self.id), window).await?;
-        let deleted = self.compact(window.saturating_add(grace)).await?;
+        let flush_due = || self.flush_due();
+        let deleted = self
+            .compacted(window.saturating_add(grace), &flush_due)
+            .await?;
         // One pass at a time on the node: another tenant's next round
         // takes its turn. What is missing is worked out afresh each time,
         // so a pass skipped or cut short is made at a later round.

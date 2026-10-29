@@ -2676,6 +2676,19 @@ impl Writer {
         self.merge_planned_at(None).await
     }
 
+    /// As [`Self::merge`], giving way to a flush: while it waits for a turn
+    /// among the node's merge builds, having gathered and built nothing, it
+    /// gives the wait up, `None`, once `flush_due` says a flush of this
+    /// writer is due, so that the flush is not held behind other tenants'
+    /// merges. Planned afresh when next asked. Once its turn has come it
+    /// goes on, as [`Self::merge`] does.
+    pub async fn merge_giving_way(
+        &self,
+        flush_due: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<LogPosition>> {
+        self.merging(None, flush_due).await
+    }
+
     /// Whether a merge planned at epoch `planned` is stale now, and so is
     /// to be dropped; said if so.
     fn stale(&self, planned: u64) -> bool {
@@ -2707,6 +2720,16 @@ impl Writer {
     /// merge planned at another epoch commits nothing. Not for use.
     #[doc(hidden)]
     pub async fn merge_planned_at(&self, planned: Option<u64>) -> Result<Option<LogPosition>> {
+        self.merging(planned, &|| false).await
+    }
+
+    /// As [`Self::merge_planned_at`], giving way to a flush as
+    /// [`Self::merge_giving_way`] says.
+    async fn merging(
+        &self,
+        planned: Option<u64>,
+        flush_due: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<LogPosition>> {
         let asked = self.merges_stopped.load(Ordering::SeqCst);
         let _merging = self.merge_build.lock().await;
         // Stopped by whoever lets the tenant go, or finds the lease lost,
@@ -2751,8 +2774,8 @@ impl Writer {
         // its stop. It is held, with what the build is reckoned to hold, by
         // every piece of work that holds what the merge gathers or builds,
         // and let go with the last of them, not when the merge is dropped
-        // (merge note, §7.7).
-        let Some(build) = self.merge_builds.turn(&stopping).await? else {
+        // (merge note, §7.7). A flush that falls due meanwhile goes first.
+        let Some(build) = self.merge_builds.turn(&stopping, flush_due).await? else {
             return Ok(None);
         };
         let build = Arc::new(build);
