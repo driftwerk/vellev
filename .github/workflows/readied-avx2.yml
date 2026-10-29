@@ -1,0 +1,71 @@
+name: Readied AVX2 (scratch)
+
+on:
+  push:
+    branches: [scratch-readied-avx2]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  FIXTURE: fixture-bench-wiki1m-bge-base-v1
+
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: The rules, on x86 with AVX2
+        run: |
+          grep -o -m1 avx2 /proc/cpuinfo
+          cargo test --release --locked -p vellev-index --lib -- readying --nocapture
+      - name: Planted, each must fail
+        run: |
+          for plant in reciprocal nan nearest; do
+            git checkout -- crates/vellev-index/src/clustered.rs
+            python3 scripts/plant-readied.py $plant
+            if cargo test --release --locked -p vellev-index --lib -- every_way_of_readying 2>&1 | tee plant.log | grep -q "test result: ok"; then
+              echo "PLANT $plant DID NOT FAIL"; exit 1
+            fi
+            echo "plant $plant: $(grep -E 'test result|dot' plant.log | head -3)"
+          done
+          git checkout -- crates/vellev-index/src/clustered.rs
+  speed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build after, and before (main)
+        run: |
+          cargo build --release --locked -p vellev-index --example ivf_profile && cp target/release/examples/ivf_profile "$RUNNER_TEMP/after"
+          git worktree add "$RUNNER_TEMP/before-src" origin/main
+          cp crates/vellev-index/examples/ivf_profile.rs "$RUNNER_TEMP/before-src/crates/vellev-index/examples/"
+          (cd "$RUNNER_TEMP/before-src" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --locked -p vellev-index --example ivf_profile) && cp target/release/examples/ivf_profile "$RUNNER_TEMP/before"
+      - name: Fetch the fixture's vectors
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/download" "$F/vectors"
+          cd "$F/download"
+          for asset in vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+            grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> wanted.sha256
+          done
+          sha256sum --check --strict wanted.sha256
+          for part in vectors-*.tar.zst; do
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
+            rm "$part"
+          done
+      - name: CPU
+        run: lscpu | grep -E "Model name|^CPU\(s\)"
+      - name: Before and after, alternately, three times
+        run: |
+          for side in before after before after before after; do echo "== $side"; "$RUNNER_TEMP/$side" "$RUNNER_TEMP/fixture" 912500 560 | grep -v bandwidth; done
