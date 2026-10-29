@@ -1,0 +1,31 @@
+name: Embed race (scratch)
+
+on:
+  push:
+    branches: [scratch-embed-race]
+
+permissions:
+  contents: read
+
+jobs:
+  loop:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [fixed, old]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+      - if: matrix.side == 'old'
+        run: git show origin/main:crates/vellev-embed/src/local.rs > crates/vellev-embed/src/local.rs
+      - run: cargo test --locked -p vellev-embed --lib --no-run 2>&1 | tail -1
+      - name: The test 600 times, and the local suite 100 times
+        run: |
+          BIN=$(cargo test --locked -p vellev-embed --lib --no-run 2>&1 | grep -o '(/[^)]*)' | tr -d '()')
+          f=0; for i in $(seq 1 600); do "$BIN" -q local::tests::searches_however_many_leave_a_write_every_third_run > /dev/null 2>&1 || f=$((f+1)); done
+          echo "${{ matrix.side }}: the test, 600 runs, $f failed"
+          g=0; for i in $(seq 1 100); do "$BIN" -q local::tests > /dev/null 2>&1 || g=$((g+1)); done
+          echo "${{ matrix.side }}: local suite, 100 runs, $g failed"
