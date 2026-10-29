@@ -713,3 +713,16 @@ async fn a_restore_overtaken_by_another_writer_of_its_lease_is_refused_by_the_co
         [Some(1), Some(2), None, None]
     );
 }
+
+/// A restore in place moves the writer's epoch on, so that no merge
+/// planned before it is committed after it, though the same segments may
+/// be back with other rows live in them.
+#[tokio::test]
+async fn a_restore_in_place_moves_the_epoch_on() {
+    let cluster = Cluster::new().await;
+    let writer = writer(&cluster).await;
+    let (head, position) = history(&cluster, &writer).await;
+    let at = writer.epoch();
+    writer.restore(Some(&head), position).await.unwrap();
+    assert_eq!(writer.epoch(), at + 1);
+}

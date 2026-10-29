@@ -1944,6 +1944,53 @@ impl State {
         }
     }
 
+    /// Which rows of `merge`'s run are live now, segment by segment: taken
+    /// when a merge is planned, as what its merged segment is made of.
+    pub(crate) fn alive(&self, merge: &Merge) -> Vec<Vec<bool>> {
+        self.segments[merge.run.clone()]
+            .iter()
+            .map(|segment| segment.dead.iter().map(|dead| !dead).collect())
+            .collect()
+    }
+
+    /// Whether `merged`, made for `merge` of the rows `alive` when it was
+    /// planned, holds every row the run holds live now, so that carrying
+    /// the merge out can place each: a merge is committed only then. It
+    /// does if it holds the rows that were alive, the same rows in the same
+    /// order, as `merged()` gathers them, and no row of the run is live now
+    /// that was not then; rows of the run that died since are no matter,
+    /// being dead in the merged segment too. Only a restore brings a row
+    /// back to life. One pass over the run's marks and the merged rows,
+    /// side by side: nothing is hashed or looked up.
+    pub(crate) fn covers(&self, merge: &Merge, alive: &[Vec<bool>], merged: &Fit) -> bool {
+        let Some(run) = self.segments.get(merge.run.clone()) else {
+            return false;
+        };
+        if run.len() != alive.len() {
+            return false;
+        }
+        let mut gathered = merged.file.rows.iter();
+        for (segment, alive) in run.iter().zip(alive) {
+            if segment.dead.len() != alive.len() || segment.file.rows.len() != alive.len() {
+                return false;
+            }
+            for ((row, dead), was) in segment.file.rows.iter().zip(&segment.dead).zip(alive) {
+                if !*dead && !*was {
+                    return false;
+                }
+                if *was {
+                    let same = gathered.next().is_some_and(|got| {
+                        (got.collection, got.object.id) == (row.collection, row.object.id)
+                    });
+                    if !same {
+                        return false;
+                    }
+                }
+            }
+        }
+        gathered.next().is_none()
+    }
+
     /// Carry out a committed merge: the run's segments go, and the merged
     /// one takes their place. A row of the run that died since the merged
     /// file was made is dead in it too. The flush committed with it is
@@ -2579,6 +2626,22 @@ mod tests {
             true
         }
 
+        /// The plan and the merged segment a merge would commit, made now.
+        fn planned(&mut self) -> (Merge, Fit) {
+            let merging = Merging {
+                fanout: 2,
+                ..Merging::default()
+            };
+            let plan = self.state.merge_plan(&merging).unwrap();
+            let (mut file, gathered) = self.state.merged(&plan, self.state.position()).unwrap();
+            for (row, at) in file.rows.iter_mut().zip(0..) {
+                row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
+            }
+            let catalog = self.state.catalog().clone();
+            let fit = self.fit(file, &catalog);
+            (plan, fit)
+        }
+
         fn walk(&self, collection: &str, filter: Option<&Filter>, page: usize) -> Vec<ObjectId> {
             let name = CollectionName::new(collection).unwrap();
             let mut walked = Vec::new();
@@ -3012,5 +3075,54 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(ranked(&index(&other)), ranked(&index(&plain)));
+    }
+
+    /// A merged segment is taken to cover its run only if it holds every
+    /// row the run holds live: one that lacks a live row, as a merge made
+    /// before a restore that brought it back would, is not, so it is never
+    /// carried out; rows of the run that died since are no matter.
+    #[test]
+    fn a_merged_segment_covers_its_run_only_if_it_holds_every_live_row() {
+        let mut built = Built::new(&["notes"]);
+        built.commit((1..=4).map(|n| upsert(0, n, n as i64)).collect());
+        built.flush();
+        built.commit((5..=8).map(|n| upsert(0, n, n as i64)).collect());
+        built.flush();
+        let (plan, fit) = built.planned();
+        let alive = built.state.alive(&plan);
+        assert!(built.state.covers(&plan, &alive, &fit));
+        // A row of the run dies after the merge was made: still covered.
+        built.commit(vec![delete(0, 3)]);
+        assert!(built.state.covers(&plan, &alive, &fit));
+        // A row of the run live again that was not when the merge was made,
+        // as only a restore could make one: not.
+        let (plan, fit) = built.planned();
+        let alive = built.state.alive(&plan);
+        let segment = plan.run.start;
+        let dead = built.state.segments[segment]
+            .dead
+            .iter()
+            .position(|dead| *dead)
+            .expect("the row deleted above");
+        built.state.segments[segment].dead[dead] = false;
+        assert!(!built.state.covers(&plan, &alive, &fit));
+        built.state.segments[segment].dead[dead] = true;
+        // A merged file that lacks a row the run held live: not.
+        let mut file = (*fit.file).clone();
+        file.rows.retain(|row| row.object.id != oid(6));
+        let catalog = built.state.catalog().clone();
+        let short = built.fit(file, &catalog);
+        assert!(!built.state.covers(&plan, &alive, &short));
+        // One with as many rows, one of them not the run's: not.
+        let mut file = (*fit.file).clone();
+        let wrong = file
+            .rows
+            .iter_mut()
+            .find(|row| row.object.id == oid(6))
+            .expect("row 6 in the merged file");
+        wrong.object.id = oid(99);
+        let wrong = built.fit(file, &catalog);
+        assert!(!built.state.covers(&plan, &alive, &wrong));
+        assert!(built.state.covers(&plan, &alive, &fit));
     }
 }
