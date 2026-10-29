@@ -405,12 +405,15 @@ async fn crashed(crash: Crash, later_run: bool) {
     if crash == Crash::AfterMerged {
         merge.abort();
         let _ = merge.await;
+        // The upload held when the merge was dropped settles, and only
+        // then is what the merge put deleted: never before it lands.
+        paused.armed.store(false, Ordering::SeqCst);
+        paused.release.notify_one();
         settle().await;
         assert!(!writer.is_closed());
         let left = cluster.blobs.list(&Layout(&cluster.key).prefix()).await;
         let left: Vec<_> = left.unwrap().into_iter().map(|file| file.key).collect();
         assert!(!left.iter().any(|key| key.contains("-merged")), "{left:?}");
-        paused.armed.store(false, Ordering::SeqCst);
         model.step(&writer, &[Op::Up("notes", 130, 1)]).await;
         same_everywhere(&cluster, &writer, &model, "dropped after merged").await;
         writer.merge().await.unwrap().expect("a merge");
@@ -426,9 +429,11 @@ async fn crashed(crash: Crash, later_run: bool) {
     if crash == Crash::AfterFlushed {
         merge.abort();
         let _ = merge.await;
+        // As above: the held upload settles before what was put is deleted.
+        paused.armed.store(false, Ordering::SeqCst);
+        paused.release.notify_one();
         settle().await;
         assert!(!writer.is_closed());
-        paused.armed.store(false, Ordering::SeqCst);
         let left = cluster.blobs.list(&Layout(&cluster.key).prefix()).await;
         let left: BTreeSet<String> = left.unwrap().into_iter().map(|file| file.key).collect();
         assert!(!left.iter().any(|key| key.contains("-merged")), "{left:?}");
