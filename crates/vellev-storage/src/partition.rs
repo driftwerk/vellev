@@ -410,7 +410,7 @@ impl Partition {
         self.own(key)?;
         let in_place = cfg!(unix);
         let copy = match self.blobs.local(key).await? {
-            Some(local) if in_place => self.mapped(key, local).await,
+            Some(local) if in_place => self.mapped(key, local, None).await,
             _ => Ok(None),
         };
         match (copy, held) {
@@ -428,7 +428,7 @@ impl Partition {
             false => None,
         };
         match fetched {
-            Some(local) => self.mapped(key, local).await?.ok_or_else(|| {
+            Some(local) => self.mapped(key, local, None).await?.ok_or_else(|| {
                 StorageError::corrupt(key, "as fetched to local disk it is no vectors file")
             }),
             None => {
@@ -478,22 +478,31 @@ impl Partition {
     /// wait on for as long as that step hangs. Held instead, the vectors
     /// would be in memory until the partition is next loaded, unseen under
     /// a cap on memory that counts on their being read in place.
-    async fn column_built(&self, key: &str, held: Column) -> Result<Column> {
+    async fn column_built(
+        &self,
+        key: &str,
+        held: Column,
+        stopping: Option<&Stopping>,
+    ) -> Result<Column> {
         self.own(key)?;
         if !cfg!(unix) {
             return Ok(held);
         }
         let read = async {
             if let Some(local) = self.blobs.local(key).await? {
-                if let Some(column) = self.mapped(key, local).await? {
+                if let Some(column) = self.mapped(key, local, stopping).await? {
                     return Ok(Some(column));
                 }
             }
             match self.blobs.fetch_local(key).await? {
                 None => Ok(None),
-                Some(local) => self.mapped(key, local).await?.map(Some).ok_or_else(|| {
-                    StorageError::corrupt(key, "as fetched to local disk it is no vectors file")
-                }),
+                Some(local) => self
+                    .mapped(key, local, stopping)
+                    .await?
+                    .map(Some)
+                    .ok_or_else(|| {
+                        StorageError::corrupt(key, "as fetched to local disk it is no vectors file")
+                    }),
             }
         };
         match read.await {
@@ -512,7 +521,18 @@ impl Partition {
     /// long as that takes while it gets on, unless this process has summed
     /// the file before as it lies now. None if the copy is not a whole
     /// vectors file, and a failure if its disk gets nowhere with it.
-    async fn mapped(&self, key: &str, local: Local) -> Result<Option<Column>> {
+    /// A merge's own `stopping`, if given, is asked before each piece of
+    /// the file is summed: a stopped merge gives the disk's thread and turn
+    /// back at once. Nothing else stops the summing: a load whose wait is
+    /// given up at its bound, or dropped beside another that failed, sums
+    /// on to the end, and the file is remembered as summed for the next.
+    async fn mapped(
+        &self,
+        key: &str,
+        local: Local,
+        stopping: Option<&Stopping>,
+    ) -> Result<Option<Column>> {
+        let stopping = stopping.cloned();
         let Local { path, disk } = local;
         let unreached = |error: std::io::Error| StorageError::Blob {
             key: key.to_string(),
@@ -546,7 +566,11 @@ impl Partition {
                     let _loading = loading;
                     let column = Column::map(&name, &path);
                     let told = |bytes| progress.made(bytes);
-                    let given_up = || progress.given_up();
+                    let given_up = || {
+                        stopping
+                            .as_ref()
+                            .is_some_and(|stopping| stopping.stopped(MergeStage::Summing))
+                    };
                     Ok(column
                         .and_then(|column| column.summed_as_unless(&name, file, told, given_up)))
                 });
@@ -1714,7 +1738,7 @@ impl Writer {
         }
         let named_at = snapshot.position;
         let segment = match self.uploaded(&mut snapshot, named_at, staged).await? {
-            Some(prepared) => Some(self.fit(prepared, &snapshot.catalog).await?),
+            Some(prepared) => Some(self.fit(prepared, &snapshot.catalog, None).await?),
             None => None,
         };
         Ok((snapshot, segment))
@@ -1800,7 +1824,7 @@ impl Writer {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
                 match self.uploaded(&mut snapshot, restored, &mut staged).await? {
                     Some(prepared) => {
-                        let (meta, loaded) = self.loaded(prepared).await?;
+                        let (meta, loaded) = self.loaded(prepared, None).await?;
                         held.insert(meta.key.clone(), loaded);
                         Some(meta)
                     }
@@ -2469,10 +2493,18 @@ impl Writer {
 
     /// An uploaded segment as the state holds it, with its vectors read
     /// from local disk where the store keeps a copy.
-    async fn loaded(&self, prepared: Prepared) -> Result<(SegmentMeta, Loaded)> {
+    async fn loaded(
+        &self,
+        prepared: Prepared,
+        stopping: Option<&Stopping>,
+    ) -> Result<(SegmentMeta, Loaded)> {
         let Prepared { meta, built, .. } = prepared;
         let vectors = match &meta.vectors {
-            Some(key) => self.partition.column_built(key, built.vectors).await?,
+            Some(key) => {
+                self.partition
+                    .column_built(key, built.vectors, stopping)
+                    .await?
+            }
             None => built.vectors,
         };
         let loaded = Loaded {
@@ -2488,8 +2520,13 @@ impl Writer {
     /// As [`Self::loaded`], and seen to be fit to adopt under the
     /// collections of `catalog`: here, before the writer is held, so that
     /// a segment that is not fails with nothing committed or changed.
-    async fn fit(&self, prepared: Prepared, catalog: &Catalog) -> Result<Fit> {
-        let (meta, loaded) = self.loaded(prepared).await?;
+    async fn fit(
+        &self,
+        prepared: Prepared,
+        catalog: &Catalog,
+        stopping: Option<&Stopping>,
+    ) -> Result<Fit> {
+        let (meta, loaded) = self.loaded(prepared, stopping).await?;
         loaded.fit(meta, catalog)
     }
 
@@ -2698,11 +2735,10 @@ impl Writer {
         {
             return Ok(None);
         }
-        let fit = self.fit(merged, &catalog);
+        let fit = self.fit(merged, &catalog, Some(&stopping));
         let Some(merged) = stopping.unless_stopped(MergeStage::Loading, fit).await else {
             return Ok(None);
         };
-        let merged = merged?;
         // From here the merge commits, or is dropped by what it finds under
         // the building lock: a stop no longer ends it. Marked so under the
         // lock a stop is asked under, so that every stop is either heeded
@@ -2715,9 +2751,12 @@ impl Writer {
             }
             heeded
         };
+        // A stop heeded here wins over what loading back came to: a load
+        // given up as it was stopped fails, and is no failure of the merge.
         if heeded {
             return Ok(None);
         }
+        let merged = merged?;
         let gate = self.merge_gate.lock().expect("gate lock").clone();
         if let Some(gate) = gate {
             gate.reached.notify_one();
@@ -3645,7 +3684,7 @@ impl RestoreFrom<'_> {
                         let named = [meta.index.as_ref(), meta.vectors.as_ref()];
                         put.extend(named.into_iter().flatten().cloned());
                         put.insert(meta.key.clone());
-                        let (meta, loaded) = writer.loaded(prepared).await?;
+                        let (meta, loaded) = writer.loaded(prepared, None).await?;
                         held.insert(meta.key.clone(), loaded);
                         Some(meta)
                     }

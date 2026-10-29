@@ -2885,3 +2885,69 @@ async fn a_stopped_merges_upload_is_aborted_and_nothing_is_left() {
     assert_eq!(aborts.finished(Duration::from_secs(5)).await, 0);
     assert_eq!(cluster.committed().await.manifest, before.manifest);
 }
+
+/// On a disk too slow for the pace a load asks, a partition of several
+/// large segments fails to open; but the checks of the segments' vectors
+/// that were under way, the one that missed its pace and those dropped
+/// beside it, run on to their end and are remembered: opened again, it
+/// sums nothing and opens, rather than needing an attempt for each file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_a_slow_disk_every_check_under_way_when_a_load_fails_is_remembered() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new().await;
+    let inner = cluster.blobs.clone();
+    let quick = Disk::new(Duration::from_secs(10), 64 * 1024 * 1024, 4);
+    cluster.blobs = Arc::new(CachedBlobs::new(inner.clone(), dir.path()).on(quick));
+    let writer = cluster.writer().await;
+    let mut wide = schema("notes");
+    wide.embedding.dimensions = 1024;
+    writer
+        .commit(vec![Mutation::CreateCollection(Box::new(wide))])
+        .await
+        .unwrap();
+    let mut random = Random(23);
+    for segment in 0..3u32 {
+        for start in (0..3_900u32).step_by(500) {
+            let notes = (start..3_900.min(start + 500)).map(|n| Mutation::Upsert {
+                collection: name("notes"),
+                id: ObjectId(uuid::Uuid::from_u128(u128::from(segment * 10_000 + n) + 1)),
+                properties: json!({ "n": n }).as_object().unwrap().clone(),
+                vector: Some(random.vector(1024)),
+                only_if_version: None,
+            });
+            writer.commit(notes.collect()).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+    }
+    // Each copy as nobody has summed it, as after a restart.
+    let vectors = stored(&cluster, "/vectors/").await;
+    assert_eq!(vectors.len(), 3, "{vectors:?}");
+    let earlier = std::time::SystemTime::now() - Duration::from_secs(60);
+    for key in &vectors {
+        let copy = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(key))
+            .unwrap();
+        copy.set_modified(earlier).unwrap();
+    }
+    // A disk that must give far more than any does: every check misses
+    // its pace, and the first to be given up fails the load.
+    let slow = Disk::new(Duration::from_millis(10), 1_000_000_000_000, 4)
+        .loading_at_once(4)
+        .unwrap();
+    let slowly: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(inner.clone(), dir.path()).on(slow));
+    assert!(
+        cluster.open_on(slowly.clone()).await.is_err(),
+        "too slow to open"
+    );
+    // The checks under way run on to their end meanwhile.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let opened = tokio::time::timeout(Duration::from_secs(30), cluster.open_on(slowly)).await;
+    let opened = opened.expect("opened in time");
+    assert!(
+        opened.is_ok(),
+        "opened again, it summed again: {:?}",
+        opened.err()
+    );
+}

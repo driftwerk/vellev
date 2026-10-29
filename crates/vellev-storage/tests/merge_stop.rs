@@ -621,3 +621,35 @@ async fn a_merge_whose_build_panics_leaves_no_stop_behind() {
         .unwrap()
         .is_some());
 }
+
+/// A merge stopped while it sums what it built, read back in place from
+/// local disk, gives up at the next piece, and leaves nothing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_stopped_while_it_sums_what_it_built_gives_up_and_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new().await;
+    let disk = vellev_storage::Disk::new(Duration::from_secs(10), 64 * 1024 * 1024, 4);
+    cluster.blobs = Arc::new(CachedBlobs::new(cluster.blobs.clone(), dir.path()).on(disk));
+    let writer = two_large(&cluster).await;
+    let before = cluster.committed().await;
+    writer.stop_merges_at(Some(MergeStage::Summing));
+    let merged = within(120, "the merge never gave up", writer.merge()).await;
+    assert_eq!(
+        merged.unwrap(),
+        None,
+        "a merge stopped as it sums committed"
+    );
+    assert_eq!(cluster.committed().await.manifest, before.manifest);
+    assert_eq!(writer.kept_while_merging(), 0);
+    settled("the stopped merge's files stay", || async {
+        stored(&cluster, "-merged").await.is_empty()
+    })
+    .await;
+    writer.stop_merges_at(None);
+    assert!(within(120, "the next merge", writer.merge())
+        .await
+        .unwrap()
+        .is_some());
+    all_there(&cluster).await;
+}
