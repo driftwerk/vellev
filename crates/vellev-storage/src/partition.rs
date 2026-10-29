@@ -410,7 +410,7 @@ impl Partition {
         self.own(key)?;
         let in_place = cfg!(unix);
         let copy = match self.blobs.local(key).await? {
-            Some(local) if in_place => self.mapped(key, local, None).await,
+            Some(local) if in_place => self.mapped(key, local, None).await.map(Mapped::read),
             _ => Ok(None),
         };
         match (copy, held) {
@@ -428,7 +428,7 @@ impl Partition {
             false => None,
         };
         match fetched {
-            Some(local) => self.mapped(key, local, None).await?.ok_or_else(|| {
+            Some(local) => self.mapped(key, local, None).await?.read().ok_or_else(|| {
                 StorageError::corrupt(key, "as fetched to local disk it is no vectors file")
             }),
             None => {
@@ -488,26 +488,33 @@ impl Partition {
         if !cfg!(unix) {
             return Ok(held);
         }
+        // A merge stopped as it sums the copy gives up at once: no warning,
+        // and no copy fetched afresh, as the copy is whole for all it knows.
+        let stopped = || StorageError::Background(format!("loading {key} back was stopped"));
         let read = async {
             if let Some(local) = self.blobs.local(key).await? {
-                if let Some(column) = self.mapped(key, local, stopping).await? {
-                    return Ok(Some(column));
+                match self.mapped(key, local, stopping).await? {
+                    Mapped::Read(column) => return Ok(Some(column)),
+                    Mapped::Stopped => return Err(stopped()),
+                    Mapped::NotWhole => {}
                 }
             }
             match self.blobs.fetch_local(key).await? {
                 None => Ok(None),
-                Some(local) => self
-                    .mapped(key, local, stopping)
-                    .await?
-                    .map(Some)
-                    .ok_or_else(|| {
-                        StorageError::corrupt(key, "as fetched to local disk it is no vectors file")
-                    }),
+                Some(local) => match self.mapped(key, local, stopping).await? {
+                    Mapped::Read(column) => Ok(Some(column)),
+                    Mapped::Stopped => Err(stopped()),
+                    Mapped::NotWhole => Err(StorageError::corrupt(
+                        key,
+                        "as fetched to local disk it is no vectors file",
+                    )),
+                },
             }
         };
         match read.await {
             Ok(Some(column)) => Ok(column),
             Ok(None) => Ok(held),
+            Err(error) if stopping.is_some_and(Stopping::is_stopped) => Err(error),
             Err(error) => {
                 tracing::error!(key, %error, "a segment just built is not kept: its vectors could not be read from local disk");
                 Err(error)
@@ -526,12 +533,8 @@ impl Partition {
     /// back at once. Nothing else stops the summing: a load whose wait is
     /// given up at its bound, or dropped beside another that failed, sums
     /// on to the end, and the file is remembered as summed for the next.
-    async fn mapped(
-        &self,
-        key: &str,
-        local: Local,
-        stopping: Option<&Stopping>,
-    ) -> Result<Option<Column>> {
+    async fn mapped(&self, key: &str, local: Local, stopping: Option<&Stopping>) -> Result<Mapped> {
+        let asked = stopping.cloned();
         let stopping = stopping.cloned();
         let Local { path, disk } = local;
         let unreached = |error: std::io::Error| StorageError::Blob {
@@ -547,7 +550,9 @@ impl Partition {
         });
         let file = match looked_at.await {
             Ok(file) => file,
-            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Mapped::NotWhole)
+            }
             Err(error) => return Err(unreached(error)),
         };
         let name = key.to_string();
@@ -578,10 +583,13 @@ impl Partition {
             }
         };
         match summed {
-            Ok(Ok(column)) => Ok(Some(column)),
+            Ok(Ok(column)) => Ok(Mapped::Read(column)),
+            // Given up as the merge it was summed for was stopped: the copy
+            // is not found wanting.
+            Ok(Err(_)) if asked.as_ref().is_some_and(Stopping::is_stopped) => Ok(Mapped::Stopped),
             Ok(Err(error)) => {
                 tracing::warn!(key, %error, "a vectors file on local disk is not read in place");
-                Ok(None)
+                Ok(Mapped::NotWhole)
             }
             Err(error) => Err(unreached(error)),
         }
@@ -880,6 +888,26 @@ async fn at_once<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| StorageError::Background(error.to_string()))
+}
+
+/// What reading a vectors file's local copy in place came to.
+enum Mapped {
+    Read(Column),
+    /// Not a whole vectors file, or not there: to be fetched afresh.
+    NotWhole,
+    /// Given up, its summing cut short by the stop of the merge it was read
+    /// back for.
+    Stopped,
+}
+
+impl Mapped {
+    /// The column, if it was read: for a load no merge stops.
+    fn read(self) -> Option<Column> {
+        match self {
+            Mapped::Read(column) => Some(column),
+            Mapped::NotWhole | Mapped::Stopped => None,
+        }
+    }
 }
 
 /// A read-only copy of a partition that follows what the writer commits.

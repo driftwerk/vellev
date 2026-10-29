@@ -653,3 +653,81 @@ async fn a_merge_stopped_while_it_sums_what_it_built_gives_up_and_leaves_nothing
         .is_some());
     all_there(&cluster).await;
 }
+
+/// A store that counts the reads of merged vectors made of it.
+#[derive(Debug)]
+struct ReadsCounted {
+    inner: Arc<dyn Blobs>,
+    merged_reads: AtomicUsize,
+}
+
+#[async_trait]
+impl Blobs for ReadsCounted {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        if key.contains("-merged.vectors") {
+            self.merged_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// What is logged, kept to be looked at.
+#[derive(Clone, Default)]
+struct Logged(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logged {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A merge stopped as it sums what it built is not taken for a copy found
+/// wanting: nothing says the copy is not read in place, and nothing is
+/// fetched from the store afresh in its stead.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_merge_stopped_while_it_sums_fetches_nothing_and_warns_of_nothing() {
+    let logged = Logged::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer({
+            let logged = logged.clone();
+            move || logged.clone()
+        })
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new().await;
+    let counted = Arc::new(ReadsCounted {
+        inner: cluster.blobs.clone(),
+        merged_reads: AtomicUsize::new(0),
+    });
+    let disk = vellev_storage::Disk::new(Duration::from_secs(10), 64 * 1024 * 1024, 4);
+    cluster.blobs = Arc::new(CachedBlobs::new(counted.clone(), dir.path()).on(disk));
+    let writer = two_large(&cluster).await;
+    writer.stop_merges_at(Some(MergeStage::Summing));
+    let merged = within(120, "the merge never gave up", writer.merge()).await;
+    assert_eq!(merged.unwrap(), None);
+    assert_eq!(
+        counted.merged_reads.load(Ordering::SeqCst),
+        0,
+        "the merged vectors were fetched afresh"
+    );
+    let logged = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+    assert!(!logged.contains("not read in place"), "{logged}");
+    assert!(!logged.contains("is not kept"), "{logged}");
+}
