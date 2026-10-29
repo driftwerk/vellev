@@ -1463,6 +1463,8 @@ struct Scan<'a> {
     skipped: &'a [bool],
     weigh: crate::fastscan::Weigh,
     weighed: [u32; BLOCK],
+    estimate: estimating::Estimate,
+    estimated: [f32; BLOCK],
     offered: [bool; BLOCK],
     space: Readying,
     tables: Tables,
@@ -1482,6 +1484,8 @@ impl<'a> Scan<'a> {
             skipped,
             weigh: chosen().1,
             weighed: [0; BLOCK],
+            estimate: estimating::chosen(),
+            estimated: [0.0; BLOCK],
             offered: [false; BLOCK],
             space: Readying::default(),
             tables: Tables::default(),
@@ -1507,20 +1511,165 @@ impl<'a> Scan<'a> {
                 continue;
             }
             (self.weigh)(members.blocks.block(block), &self.tables, &mut self.weighed);
+            // The block's estimates at once, then offered in lane order as
+            // before (x86 profile, fix 4).
+            let lanes = rows.len();
+            (self.estimate)(
+                &probe,
+                index.metric,
+                members.blocks.ones_of_block(block),
+                &self.weighed[..lanes],
+                &members.factors[block * BLOCK..][..lanes],
+                &mut self.estimated[..lanes],
+            );
             for (lane, row) in rows.iter().enumerate() {
                 if self.offered[lane] {
-                    let at = block * BLOCK + lane;
-                    let distance = probe.distance_of(
-                        index.metric,
-                        members.blocks.ones(at),
-                        self.weighed[lane],
-                        &members.factors[at],
-                    );
+                    let distance = self.estimated[lane];
                     if !nearest.turns_away(distance) {
                         nearest.offer(distance, *row);
                     }
                 }
             }
+        }
+    }
+}
+
+/// A block's estimates at once, in each way this machine can run them,
+/// every way giving the portable way's estimates to the last bit: each
+/// lane the same operations as [`Probe::distance_of`], in the same order,
+/// rounding after each, and no fused multiply-adds.
+mod estimating {
+    use super::{Distance, Factor, Probe};
+
+    /// Estimate each row of a block from its set bits, its weighed sum and
+    /// its factor, into `into`.
+    pub(super) type Estimate = fn(&Probe, Distance, &[u16], &[u32], &[Factor], &mut [f32]);
+
+    /// The portable way, which every other is held to.
+    pub(super) fn portably(
+        probe: &Probe,
+        metric: Distance,
+        ones: &[u16],
+        weighed: &[u32],
+        factors: &[Factor],
+        into: &mut [f32],
+    ) {
+        for (((into, ones), weighed), factor) in into.iter_mut().zip(ones).zip(weighed).zip(factors)
+        {
+            *into = probe.distance_of(metric, u32::from(*ones), *weighed, factor);
+        }
+    }
+
+    /// Every way this machine can run, by name, the portable first.
+    pub(super) fn ways_here() -> Vec<(&'static str, Estimate)> {
+        #[allow(unused_mut)]
+        let mut ways: Vec<(&'static str, Estimate)> = vec![("portable", portably)];
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: handed out only where the CPU has just said it has
+            // AVX2, which is all it asks.
+            ways.push((
+                "avx2",
+                |probe, metric, ones, weighed, factors, into| unsafe {
+                    avx2::estimate(probe, metric, ones, weighed, factors, into)
+                },
+            ));
+        }
+        ways
+    }
+
+    /// The way chosen for this machine: the widest. Decided once a
+    /// process.
+    pub(super) fn chosen() -> Estimate {
+        static CHOSEN: std::sync::OnceLock<Estimate> = std::sync::OnceLock::new();
+        *CHOSEN.get_or_init(|| {
+            ways_here()
+                .last()
+                .expect("the portable way is always here")
+                .1
+        })
+    }
+
+    /// In AVX2, eight rows at a time; the rows past the last eight as the
+    /// portable way estimates them.
+    #[cfg(target_arch = "x86_64")]
+    mod avx2 {
+        use std::arch::x86_64::*;
+
+        use super::{portably, Distance, Factor, Probe};
+
+        #[target_feature(enable = "avx2")]
+        pub(super) fn estimate(
+            probe: &Probe,
+            metric: Distance,
+            ones: &[u16],
+            weighed: &[u32],
+            factors: &[Factor],
+            into: &mut [f32],
+        ) {
+            let lanes = into
+                .len()
+                .min(ones.len())
+                .min(weighed.len())
+                .min(factors.len());
+            let whole = lanes / 8 * 8;
+            let lower = _mm256_set1_ps(probe.lower);
+            let delta = _mm256_set1_ps(probe.delta);
+            let sum = _mm256_set1_ps(probe.sum);
+            let scale = _mm256_set1_ps(probe.scale);
+            let two = _mm256_set1_ps(2.0);
+            let (mut norm, mut align, mut along) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+            let mut counts = [0i32; 8];
+            for at in (0..whole).step_by(8) {
+                for lane in 0..8 {
+                    let factor = &factors[at + lane];
+                    (norm[lane], align[lane], along[lane]) =
+                        (factor.norm, factor.align, factor.along);
+                    counts[lane] = i32::from(ones[at + lane]);
+                }
+                // SAFETY: each array holds eight values, and `weighed` at
+                // least `at + 8`; nothing asks alignment.
+                let (n, a, l, o, w) = unsafe {
+                    (
+                        _mm256_loadu_ps(norm.as_ptr()),
+                        _mm256_loadu_ps(align.as_ptr()),
+                        _mm256_loadu_ps(along.as_ptr()),
+                        _mm256_cvtepi32_ps(_mm256_loadu_si256(counts.as_ptr().cast())),
+                        _mm256_cvtepi32_ps(_mm256_loadu_si256(weighed.as_ptr().add(at).cast())),
+                    )
+                };
+                // As `inner_of`: ((2 (lower ones + delta weighed) - sum)
+                // scale) / align.
+                let set = _mm256_add_ps(_mm256_mul_ps(lower, o), _mm256_mul_ps(delta, w));
+                let inner = _mm256_div_ps(
+                    _mm256_mul_ps(_mm256_sub_ps(_mm256_mul_ps(two, set), sum), scale),
+                    a,
+                );
+                // As `distance_of`.
+                let distance = match metric {
+                    Distance::L2 => _mm256_sub_ps(
+                        _mm256_add_ps(_mm256_mul_ps(n, n), _mm256_set1_ps(probe.norm_squared)),
+                        _mm256_mul_ps(_mm256_mul_ps(two, n), inner),
+                    ),
+                    Distance::Dot | Distance::Cosine => _mm256_xor_ps(
+                        _mm256_add_ps(
+                            _mm256_set1_ps(probe.centroid_dot),
+                            _mm256_mul_ps(n, _mm256_add_ps(inner, l)),
+                        ),
+                        _mm256_set1_ps(-0.0),
+                    ),
+                };
+                // SAFETY: `into` holds at least `at + 8`.
+                unsafe { _mm256_storeu_ps(into.as_mut_ptr().add(at), distance) };
+            }
+            portably(
+                probe,
+                metric,
+                &ones[whole..lanes],
+                &weighed[whole..lanes],
+                &factors[whole..lanes],
+                &mut into[whole..lanes],
+            );
         }
     }
 }
@@ -2040,6 +2189,76 @@ mod tests {
                 proptest::prop_assert_eq!(d.to_bits(), delta.to_bits(), "{} step", name);
                 proptest::prop_assert_eq!(&got.levels, &want.levels, "{} levels", name);
             }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+        /// Every way of estimating a block's rows at once gives what each
+        /// row's estimate is alone to the last bit, or not a number for
+        /// both: for every metric, blocks of one to thirty-two rows, and
+        /// probes and factors of every size, zero, negative zero, and now
+        /// and then not finite. A way that fused a multiply-add, or took
+        /// the sums in another order, would not.
+        #[test]
+        fn every_way_of_estimating_a_block_gives_each_rows_estimate_to_the_last_bit(
+            seed in 1u64..u64::MAX,
+            lanes in 1usize..=32,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+            scale in -30i32..30,
+            odd in 0u8..20,
+        ) {
+            let mut noise = Noise(seed);
+            let value = |noise: &mut Noise| match (noise.unit() * 500.0) as i32 {
+                0 if odd == 0 => f32::NAN,
+                1 if odd == 1 => f32::INFINITY,
+                2 => 0.0,
+                3 => -0.0,
+                _ => (noise.unit() * 2.0 - 1.0) * 2f32.powi(scale),
+            };
+            let probe = Probe {
+                planes: Vec::new(),
+                words: 0,
+                lower: value(&mut noise),
+                delta: value(&mut noise).abs(),
+                sum: value(&mut noise),
+                norm_squared: value(&mut noise).abs(),
+                centroid_dot: value(&mut noise),
+                scale: value(&mut noise).abs(),
+            };
+            let ones: Vec<u16> = (0..lanes).map(|_| (noise.unit() * 1025.0) as u16).collect();
+            let weighed: Vec<u32> = (0..lanes).map(|_| (noise.unit() * 15_361.0) as u32).collect();
+            let factors: Vec<Factor> = (0..lanes)
+                .map(|_| Factor {
+                    norm: value(&mut noise).abs(),
+                    align: value(&mut noise),
+                    along: value(&mut noise),
+                })
+                .collect();
+            let want: Vec<f32> = (0..lanes)
+                .map(|lane| probe.distance_of(metric, u32::from(ones[lane]), weighed[lane], &factors[lane]))
+                .collect();
+            for (name, estimate) in estimating::ways_here() {
+                let mut got = vec![0.0f32; lanes];
+                estimate(&probe, metric, &ones, &weighed, &factors, &mut got);
+                for (lane, (g, w)) in got.iter().zip(&want).enumerate() {
+                    proptest::prop_assert!(
+                        g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan()),
+                        "{} lane {}: {} against {}", name, lane, g, w
+                    );
+                }
+            }
+        }
+    }
+
+    /// A block is estimated the widest way this machine has.
+    #[test]
+    fn the_way_of_estimating_chosen_is_the_widest_this_machine_has() {
+        let chosen = estimating::chosen() as usize;
+        assert_eq!(chosen, estimating::ways_here().last().unwrap().1 as usize);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            assert_eq!(estimating::ways_here().last().unwrap().0, "avx2");
         }
     }
 
