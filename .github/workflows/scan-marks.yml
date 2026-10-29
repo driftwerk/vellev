@@ -1,0 +1,47 @@
+name: Scan marks (scratch)
+
+on:
+  push:
+    branches: [scratch-scan-marks]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  FIXTURE: fixture-bench-wiki1m-bge-base-v1
+
+jobs:
+  speed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p vellev-index --example scan_marks && cp target/release/examples/scan_marks "$RUNNER_TEMP/marks"
+      - name: Fetch the fixture's vectors
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/download" "$F/vectors"
+          cd "$F/download"
+          for asset in vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+            grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> wanted.sha256
+          done
+          sha256sum --check --strict wanted.sha256
+          for part in vectors-*.tar.zst; do
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
+            rm "$part"
+          done
+      - name: CPU
+        run: lscpu | grep -E "Model name|^CPU\(s\)"
+      - name: Marks given or not, alternately, three rounds
+        run: "$RUNNER_TEMP/marks" "$RUNNER_TEMP/fixture" 912500 560
+
