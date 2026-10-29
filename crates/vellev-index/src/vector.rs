@@ -590,7 +590,10 @@ impl BinaryIndex {
         vectors: &[(u32, &[f32])],
         centre: Vec<f32>,
     ) -> Option<Self> {
-        Self::build_about_stopping(metric, vectors, centre, &Stop::new()).unwrap_or(None)
+        match Self::build_about_stopping(metric, vectors, centre, &Stop::new()) {
+            Ok(index) => index,
+            Err(Stopped) => unreachable!("a build without a stop is never stopped"),
+        }
     }
 
     /// As [`Self::build_about`], asking `stop` as each row is coded.
@@ -616,7 +619,11 @@ impl BinaryIndex {
             .par_chunks_mut(words)
             .zip(measured.par_iter())
             .map(|(code, (_, vector))| {
-                stop.check(Stage::Coding)?;
+                // Given up: the rows left are not coded, and the build
+                // gives up once the pass is through them.
+                if stop.check(Stage::Coding).is_err() {
+                    return (0.0, 0.0);
+                }
                 let vector = rotation.apply(&normalised(metric, vector));
                 code.iter_mut()
                     .zip(encode(centre, &vector))
@@ -626,9 +633,10 @@ impl BinaryIndex {
                     Distance::L2 => squared,
                     Distance::Dot | Distance::Cosine => -along,
                 };
-                Ok((term, squared.sqrt()))
+                (term, squared.sqrt())
             })
-            .collect::<Result<_, Stopped>>()?;
+            .collect();
+        stop.passed()?;
         index.rows = measured.iter().map(|(row, _)| *row).collect();
         index.codes = codes;
         index.factors = factors;
@@ -662,7 +670,10 @@ impl BinaryIndex {
     /// length, for search under `metric`. Returns `None` when there is
     /// nothing to index.
     pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
-        Self::build_stopping(metric, vectors, &Stop::new()).unwrap_or(None)
+        match Self::build_stopping(metric, vectors, &Stop::new()) {
+            Ok(index) => index,
+            Err(Stopped) => unreachable!("a build without a stop is never stopped"),
+        }
     }
 
     /// As [`Self::build`], giving up with [`Stopped`] once `stop` is
@@ -685,11 +696,12 @@ impl BinaryIndex {
         let sampled: Vec<Vec<f32>> = Random(ROTATION_SEED)
             .sample(measured.len(), CENTRE_SAMPLE)
             .into_par_iter()
-            .map(|at| {
-                stop.check(Stage::Sampling)?;
-                Ok(rotation.apply(&normalised(metric, measured[at])))
+            .map(|at| match stop.check(Stage::Sampling) {
+                Ok(()) => rotation.apply(&normalised(metric, measured[at])),
+                Err(Stopped) => Vec::new(),
             })
-            .collect::<Result<_, Stopped>>()?;
+            .collect();
+        stop.passed()?;
         let centre = median(rotation.width, sampled.iter().map(Vec::as_slice));
         Self::build_about_stopping(metric, vectors, centre, stop)
     }

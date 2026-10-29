@@ -137,6 +137,18 @@ impl Stop {
         })
     }
 
+    /// [`Stopped`] if stopped: asked once a pass whose rows each asked
+    /// [`Self::check`] is through them. A pass collects its rows in place,
+    /// as many as it was given, whether stopped or not: collected into a
+    /// `Result`, rayon would not know how many to expect, and would gather
+    /// them in pieces and copy them once more (review of #161).
+    pub(crate) fn passed(&self) -> Result<(), Stopped> {
+        match self.is_stopped() {
+            true => Err(Stopped),
+            false => Ok(()),
+        }
+    }
+
     /// Asked by `stage`: [`Stopped`] if the build is to give up.
     pub(crate) fn check(&self, stage: Stage) -> Result<(), Stopped> {
         if let Some(counts) = &self.0.counted {

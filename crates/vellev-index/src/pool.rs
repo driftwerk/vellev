@@ -120,6 +120,9 @@ impl Drop for Turn {
 /// behind another tenant's tuning of a million rows would otherwise hold
 /// its memory for as long. Once the work has begun it asks the stop as it
 /// goes, if it was given it.
+///
+/// Never called from the tuning pool's own thread, nor from work done in
+/// a turn: that would wait for a turn its own caller holds, for ever.
 pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, Stopped> {
     let (turns, turned) = turns();
     let mut now = taken(turns);

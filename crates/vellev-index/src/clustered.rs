@@ -888,11 +888,12 @@ fn kmeans(
         stop.check(Stage::Clustering)?;
         let next: Vec<usize> = training
             .par_iter()
-            .map(|vector| {
-                stop.check(Stage::Clustering)?;
-                Ok(nearest_centroid(&centroids, width, vector))
+            .map(|vector| match stop.check(Stage::Clustering) {
+                Ok(()) => nearest_centroid(&centroids, width, vector),
+                Err(Stopped) => 0,
             })
-            .collect::<Result<_, Stopped>>()?;
+            .collect();
+        stop.passed()?;
         if next == assigned {
             break;
         }
@@ -927,7 +928,10 @@ impl ClusteredIndex {
     /// settles how many clusters a query scans; it takes a while for many
     /// vectors and is meant for a background thread.
     pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
-        Self::build_stopping(metric, vectors, &Stop::new()).unwrap_or(None)
+        match Self::build_stopping(metric, vectors, &Stop::new()) {
+            Ok(index) => index,
+            Err(Stopped) => unreachable!("a build without a stop is never stopped"),
+        }
     }
 
     /// As [`Self::build`], giving up with [`Stopped`] once `stop` is
@@ -963,11 +967,12 @@ impl ClusteredIndex {
         let training: Vec<Vec<f32>> = random
             .sample(measured.len(), k * TRAINING_PER_CLUSTER)
             .into_par_iter()
-            .map(|at| {
-                stop.check(Stage::Sampling)?;
-                Ok(rotated(measured[at].1))
+            .map(|at| match stop.check(Stage::Sampling) {
+                Ok(()) => rotated(measured[at].1),
+                Err(Stopped) => Vec::new(),
             })
-            .collect::<Result<_, Stopped>>()?;
+            .collect();
+        stop.passed()?;
         let centroids = match training.is_empty() {
             true => vec![0.0; k * width],
             false => kmeans(&training, k, width, &mut random, stop)?,
@@ -977,11 +982,15 @@ impl ClusteredIndex {
         let coded: Vec<(usize, Vec<u64>, Factor)> = vectors
             .par_iter()
             .map(|(_, vector)| {
-                stop.check(Stage::Coding)?;
+                // Given up: nothing is made of the rows left, and the build
+                // gives up once the pass is through them.
+                if stop.check(Stage::Coding).is_err() {
+                    return (0, Vec::new(), Factor::UNMEASURED);
+                }
                 // Defence in depth: its length, worked out again from its
                 // factors, would set such a row apart even if it were coded.
                 if !measurable(metric, vector) {
-                    return Ok((0, vec![0; width / 64], Factor::UNMEASURED));
+                    return (0, vec![0; width / 64], Factor::UNMEASURED);
                 }
                 let rotated = rotated(vector);
                 let cluster = nearest_centroid(&centroids, width, &rotated);
@@ -1008,9 +1017,10 @@ impl ClusteredIndex {
                         along: 0.0,
                     },
                 };
-                Ok((cluster, code, factor))
+                (cluster, code, factor)
             })
-            .collect::<Result<_, Stopped>>()?;
+            .collect();
+        stop.passed()?;
 
         let mut members: Vec<(Vec<u32>, Vec<u64>, Vec<Factor>)> =
             (0..k).map(|_| Default::default()).collect();
@@ -1219,11 +1229,13 @@ impl ClusteredIndex {
         stop: &Stop,
     ) -> Result<Vec<u32>, Stopped> {
         let nearest = self.nearest_of_samples(vectors, samples, stop)?;
-        let ranked: Vec<Vec<u32>> = samples
+        let ranks = samples
             .par_iter()
             .zip(nearest)
-            .map(|(at, rows)| {
-                stop.check(Stage::Ranking)?;
+            .flat_map_iter(|(at, rows)| {
+                if stop.check(Stage::Ranking).is_err() {
+                    return Vec::new();
+                }
                 let mut rank = vec![0u32; self.clusters.len()];
                 for (place, (_, cluster)) in self
                     .order(&self.prepared(vectors[*at].1))
@@ -1232,14 +1244,14 @@ impl ClusteredIndex {
                 {
                     rank[cluster] = place as u32;
                 }
-                Ok(rows
-                    .into_iter()
+                rows.into_iter()
                     .filter_map(|row| self.position(row))
                     .map(|position| rank[self.at[position].0 as usize])
-                    .collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
             })
-            .collect::<Result<_, Stopped>>()?;
-        Ok(ranked.into_iter().flatten().collect())
+            .collect();
+        stop.passed()?;
+        Ok(ranks)
     }
 
     fn prepared(&self, query: &[f32]) -> Vec<f32> {
