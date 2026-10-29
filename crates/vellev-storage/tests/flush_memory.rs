@@ -310,7 +310,12 @@ async fn a_merge_holds_its_vectors_once() {
 /// draining, until it has ended. Over short text and long, text of words
 /// each in one row, over a large vocabulary and a small one, and vectors
 /// clustered or not.
+///
+/// A dozen merges and more, too slow built for debugging: run optimised,
+/// in CI's Test job, as
+/// `cargo test --release -p vellev-storage --test flush_memory -- --ignored`.
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "measured optimised, in CI's Test job"]
 async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
     let _alone = ALONE.lock().await;
     let shapes = [

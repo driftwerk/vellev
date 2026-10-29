@@ -85,6 +85,11 @@ jobs:
       # it depends on, built without debug info, and its timings printed.
       - name: Index tests, optimised
         run: cargo test --release --locked -p vellev-index --lib -- --nocapture
+      # What a merge reckons it holds, held to what a counting allocator
+      # measures over a dozen merges and more: built for debugging, the
+      # merges take minutes, so the rule is left out above and run here.
+      - name: Merge reckoning, optimised
+        run: cargo test --release --locked -p vellev-storage --test flush_memory -- --ignored --nocapture
 
   # The benchmark fixture's tools, on tiny hand-made data.
   fixture-scripts:
