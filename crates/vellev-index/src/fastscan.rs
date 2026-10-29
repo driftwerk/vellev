@@ -109,6 +109,51 @@ impl Blocks {
     pub(crate) fn ones(&self, row: usize) -> u32 {
         u32::from(self.ones[row])
     }
+
+    /// Ask the CPU to bring block `block`'s bytes and counts towards it,
+    /// if there is such a block: what a scan is about to read, so that it
+    /// waits less on memory (x86 profile, fix 1). Nothing is read here, and
+    /// nothing a scan finds depends on it.
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, block: usize) {
+        if block < self.count() {
+            ahead(self.block(block));
+            let rows = block * BLOCK..self.rows.min((block + 1) * BLOCK);
+            ahead(as_bytes(&self.ones[rows]));
+        }
+    }
+}
+
+/// `values` as the bytes they take, to be fetched ahead.
+fn as_bytes<T>(values: &[T]) -> &[u8] {
+    // SAFETY: any bytes of any `T` are bytes; the length is the slice's
+    // in bytes; nothing is written.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+/// Ask the CPU to bring `bytes` towards it, a cache line at a time: a hint
+/// only, which reads nothing and can fault nowhere.
+#[inline(always)]
+pub(crate) fn ahead(bytes: &[u8]) {
+    for line in bytes.chunks(64) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch is a hint; the address is in `bytes`.
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(line.as_ptr().cast());
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: a prefetch is a hint; the address is in `bytes`.
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1keep, [{0}]",
+                in(reg) line.as_ptr(),
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = line;
+    }
 }
 
 /// A query's levels, one a dimension, as tables of what each four bits of

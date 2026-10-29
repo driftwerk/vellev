@@ -1277,7 +1277,10 @@ impl ClusteredIndex {
                 let clusters = &order[probes * run / runs..probes * (run + 1) / runs];
                 let mut scan = Scan::new(self, query, only, skipped);
                 let mut nearest = Nearest::new(count, ties);
-                for (_, cluster) in clusters {
+                for (at, (_, cluster)) in clusters.iter().enumerate() {
+                    if let Some((_, next)) = clusters.get(at + 1) {
+                        self.prefetch_start(*next);
+                    }
                     scan.cluster(*cluster, &mut nearest);
                 }
                 nearest.estimates()
@@ -1290,7 +1293,10 @@ impl ClusteredIndex {
                 }
             }
         } else {
-            for (_, cluster) in &order[..probes] {
+            for (at, (_, cluster)) in order[..probes].iter().enumerate() {
+                if let Some((_, next)) = order.get(at + 1) {
+                    self.prefetch_start(*next);
+                }
                 scan.cluster(*cluster, &mut nearest);
             }
         }
@@ -1303,6 +1309,30 @@ impl ClusteredIndex {
             scan.cluster(*cluster, &mut nearest);
         }
         nearest.estimates()
+    }
+}
+
+/// How many blocks ahead of the one it weighs a scan has the CPU fetch.
+const AHEAD: usize = 2;
+
+/// A cluster's factors as the bytes they take, to be fetched ahead.
+fn factor_bytes(factors: &[Factor]) -> &[u8] {
+    // SAFETY: a factor is three `f32`s, every byte of which is a byte; the
+    // length is the slice's in bytes; nothing is written.
+    unsafe { std::slice::from_raw_parts(factors.as_ptr().cast(), std::mem::size_of_val(factors)) }
+}
+
+impl ClusteredIndex {
+    /// Have the CPU fetch the first blocks of `cluster`, while the scan
+    /// readies for and weighs the one before it.
+    fn prefetch_start(&self, cluster: usize) {
+        let members = &self.clusters[cluster];
+        for block in 0..AHEAD {
+            members.blocks.prefetch(block);
+        }
+        crate::fastscan::ahead(factor_bytes(
+            &members.factors[..members.factors.len().min(AHEAD * BLOCK)],
+        ));
     }
 }
 
@@ -1347,6 +1377,10 @@ impl<'a> Scan<'a> {
         self.tables.fill(&self.space.levels);
         let members = &index.clusters[cluster];
         for block in 0..members.blocks.count() {
+            members.blocks.prefetch(block + AHEAD);
+            if let Some(factors) = members.factors.get((block + AHEAD) * BLOCK..) {
+                crate::fastscan::ahead(factor_bytes(&factors[..factors.len().min(BLOCK)]));
+            }
             let rows = &members.rows[block * BLOCK..members.rows.len().min((block + 1) * BLOCK)];
             let mut any = false;
             for (offer, row) in self.offered.iter_mut().zip(rows) {
