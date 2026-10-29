@@ -24,7 +24,7 @@ jobs:
           cargo test --release --locked -p vellev-index --lib -- readying --nocapture
       - name: Planted, each must fail
         run: |
-          for plant in reciprocal nan nearest; do
+          for plant in reciprocal nan; do
             git checkout -- crates/vellev-index/src/clustered.rs
             python3 scripts/plant-readied.py $plant
             if cargo test --release --locked -p vellev-index --lib -- readying 2>&1 | tee plant.log | grep -q "test result: ok"; then
@@ -32,6 +32,11 @@ jobs:
             fi
             echo "plant $plant: $(grep -E 'test result|dot' plant.log | head -3)"
           done
+          git checkout -- crates/vellev-index/src/clustered.rs
+      - name: Rounding to nearest-even is the same function, and must pass
+        run: |
+          python3 scripts/plant-readied.py nearest
+          cargo test --release --locked -p vellev-index --lib -- readying 2>&1 | grep "test result: ok"
           git checkout -- crates/vellev-index/src/clustered.rs
   speed:
     runs-on: ubuntu-latest
