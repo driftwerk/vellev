@@ -1158,3 +1158,43 @@ async fn cleaning_up_during_a_merge_deletes_nothing_it_has_uploaded() {
         .read(|s| (1..6u8).map(|n| n_of(s, "notes", n)).collect::<Vec<_>>());
     assert_eq!(read, (1..6).map(Some).collect::<Vec<_>>());
 }
+
+/// Rows of a merge's run deleted and changed while the merge waits between
+/// its build and its commit are dead and changed after it, with a flush
+/// between and without one, in the writer and in a copy loaded afresh.
+#[tokio::test]
+async fn rows_deleted_and_changed_during_a_merge_stay_so_after_it() {
+    for flushed in [false, true] {
+        let cluster = Cluster::new().await;
+        let writer = Arc::new(two_segments(&cluster).await);
+        let gate = writer.hold_merges_before_commit();
+        let merging = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        gate.reached.notified().await;
+        writer.commit(vec![delete("notes", 1)]).await.unwrap();
+        writer.commit(vec![upsert("notes", 2, 20)]).await.unwrap();
+        if flushed {
+            writer.flush().await.unwrap();
+        }
+        writer.stop_holding_merges();
+        gate.release.notify_one();
+        assert!(
+            merging.await.unwrap().unwrap().is_some(),
+            "flushed {flushed}"
+        );
+        let both = |s: &State| (n_of(s, "notes", 1), n_of(s, "notes", 2));
+        assert_eq!(
+            writer.partition().read(both),
+            (None, Some(20)),
+            "flushed {flushed}"
+        );
+        let fresh = cluster.open().await;
+        assert_eq!(
+            fresh.partition().read(both),
+            (None, Some(20)),
+            "flushed {flushed}"
+        );
+    }
+}

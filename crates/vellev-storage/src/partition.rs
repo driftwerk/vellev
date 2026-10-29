@@ -2608,6 +2608,13 @@ impl Writer {
         gate
     }
 
+    /// Hold merges no more: a merge from now on goes straight from its
+    /// build to its commit. For tests.
+    #[doc(hidden)]
+    pub fn stop_holding_merges(&self) {
+        *self.merge_gate.lock().expect("gate lock") = None;
+    }
+
     /// Delete the partition's files that nothing needs any more: a stale
     /// writer's uploads, and the segments and manifests that merges and
     /// checkpoints have replaced. Everything reached from any head written
@@ -2692,15 +2699,31 @@ impl Writer {
     /// A flush, a merge and a restore upload their segments' files without
     /// the writer, under a name of their own: a flush's and a merge's under
     /// the position of the partition they were built from, a restore's
-    /// under the position it commits, which is past that. All of them, like
-    /// this, hold the building lock from before they read the partition
-    /// until they commit or fail. Only they commit checkpoints, so none is
-    /// committed past the partition's position while such files wait to be
-    /// published, and log commits do not move the checkpoint this deletes
-    /// below. Those files therefore sit at or past the latest checkpoint,
-    /// never below it, and are not deleted until a checkpoint after them
-    /// has been committed and, if they were never published, until they
-    /// are older than `grace`.
+    /// under the position it commits, which is past that.
+    /// - A flush and a restore hold the building lock from before they read
+    ///   the partition until they commit or fail. Only what holds it commits
+    ///   checkpoints, so none is committed past the partition's position
+    ///   while their files wait to be published, and log commits do not move
+    ///   the checkpoint this deletes below: their files sit at or past the
+    ///   latest checkpoint, never below it.
+    /// - A merge does not: it plans under the building lock, builds,
+    ///   uploads and loads its segment without it, and takes it again only to
+    ///   commit (merge note, step 2). Meanwhile flushes commit checkpoints
+    ///   past the position its files are named at, so they can sit below the
+    ///   latest checkpoint, and this could reach them. Two things keep them:
+    ///   while the merge is under way its files are in the writer's
+    ///   keep-set, which this never deletes from, however old; and the
+    ///   young-file floor, a file younger than `grace` holding what this
+    ///   deletes below to under its position (the merge's planned position,
+    ///   less one). A writer that takes over from another has its own,
+    ///   empty, keep-set and may delete the other's merge files once they
+    ///   are older than `grace`: safe only because the old writer's commit
+    ///   is fenced (`publish` refuses a commit of the old lease), so no head
+    ///   ever names them.
+    ///
+    /// None of these files is deleted until a checkpoint after them has
+    /// been committed and, if they were never published, until they are
+    /// older than `grace` and kept by no merge under way.
     ///
     /// The building lock is held until the last file is deleted, not only
     /// while what to delete is worked out. Let go before, a restore could
