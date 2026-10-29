@@ -26,6 +26,7 @@ use vellev_core::Distance;
 use crate::curve::{Curve, Source};
 use crate::fastscan::{chosen, Blocks, Tables, BLOCK};
 use crate::rotation::{Random, Rotation};
+use crate::stop::{Stage, Stop, Stopped};
 use crate::vector::{
     allowed, as_far_from_every_vector, dot, in_row_order, measurable, nearest, normalised,
     or_farthest, short_enough, squared_l2, Scorer, Skipped, Ties, VectorIndex,
@@ -842,6 +843,14 @@ impl<'a> Nearest<'a> {
     }
 }
 
+/// Where a curve is worked out: on the tuning pool, in turn, for a build
+/// that may be stopped, or on the passes' pool for a rows pass.
+#[derive(Clone, Copy)]
+enum Tuned<'a> {
+    Building(&'a Stop),
+    Passing,
+}
+
 fn clusters_for(count: usize) -> usize {
     ((count as f64).sqrt() as usize).clamp(1, MOST_CLUSTERS.min(count))
 }
@@ -859,7 +868,15 @@ fn nearest_centroid(centroids: &[f32], width: usize, vector: &[f32]) -> usize {
 
 /// Lloyd's k-means over `training`, seeded with `k` of them spread evenly
 /// through the sample, which is in row order.
-fn kmeans(training: &[Vec<f32>], k: usize, width: usize, random: &mut Random) -> Vec<f32> {
+/// Asks `stop` at each iteration, and as each row of the sample is
+/// assigned: one iteration at a million rows is seconds on a small box.
+fn kmeans(
+    training: &[Vec<f32>],
+    k: usize,
+    width: usize,
+    random: &mut Random,
+    stop: &Stop,
+) -> Result<Vec<f32>, Stopped> {
     let mut centroids: Vec<f32> = training
         .iter()
         .step_by(training.len() / k)
@@ -868,10 +885,15 @@ fn kmeans(training: &[Vec<f32>], k: usize, width: usize, random: &mut Random) ->
         .collect();
     let mut assigned = vec![usize::MAX; training.len()];
     for _ in 0..ITERATIONS {
+        stop.check(Stage::Clustering)?;
         let next: Vec<usize> = training
             .par_iter()
-            .map(|vector| nearest_centroid(&centroids, width, vector))
+            .map(|vector| match stop.check(Stage::Clustering) {
+                Ok(()) => nearest_centroid(&centroids, width, vector),
+                Err(Stopped) => 0,
+            })
             .collect();
+        stop.passed()?;
         if next == assigned {
             break;
         }
@@ -896,7 +918,7 @@ fn kmeans(training: &[Vec<f32>], k: usize, width: usize, random: &mut Random) ->
             }
         }
     }
-    centroids
+    Ok(centroids)
 }
 
 impl ClusteredIndex {
@@ -906,7 +928,24 @@ impl ClusteredIndex {
     /// settles how many clusters a query scans; it takes a while for many
     /// vectors and is meant for a background thread.
     pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
-        let dimensions = vectors.first()?.1.len();
+        match Self::build_stopping(metric, vectors, &Stop::new()) {
+            Ok(index) => index,
+            Err(Stopped) => unreachable!("a build without a stop is never stopped"),
+        }
+    }
+
+    /// As [`Self::build`], giving up with [`Stopped`] once `stop` is
+    /// stopped: asked as each row is sampled, clustered and coded, at each
+    /// clustering iteration, while the build waits its turn to tune, and at
+    /// each block of rows tuning goes through.
+    pub fn build_stopping(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        stop: &Stop,
+    ) -> Result<Option<Self>, Stopped> {
+        let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
+            return Ok(None);
+        };
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
         // Clusters, and how many a query scans, are drawn from the rows that
@@ -928,17 +967,26 @@ impl ClusteredIndex {
         let training: Vec<Vec<f32>> = random
             .sample(measured.len(), k * TRAINING_PER_CLUSTER)
             .into_par_iter()
-            .map(|at| rotated(measured[at].1))
+            .map(|at| match stop.check(Stage::Sampling) {
+                Ok(()) => rotated(measured[at].1),
+                Err(Stopped) => Vec::new(),
+            })
             .collect();
+        stop.passed()?;
         let centroids = match training.is_empty() {
             true => vec![0.0; k * width],
-            false => kmeans(&training, k, width, &mut random),
+            false => kmeans(&training, k, width, &mut random, stop)?,
         };
 
         let scale = 1.0 / (width as f32).sqrt();
         let coded: Vec<(usize, Vec<u64>, Factor)> = vectors
             .par_iter()
             .map(|(_, vector)| {
+                // Given up: nothing is made of the rows left, and the build
+                // gives up once the pass is through them.
+                if stop.check(Stage::Coding).is_err() {
+                    return (0, Vec::new(), Factor::UNMEASURED);
+                }
                 // Defence in depth: its length, worked out again from its
                 // factors, would set such a row apart even if it were coded.
                 if !measurable(metric, vector) {
@@ -972,6 +1020,7 @@ impl ClusteredIndex {
                 (cluster, code, factor)
             })
             .collect();
+        stop.passed()?;
 
         let mut members: Vec<(Vec<u32>, Vec<u64>, Vec<Factor>)> =
             (0..k).map(|_| Default::default()).collect();
@@ -1005,11 +1054,11 @@ impl ClusteredIndex {
             probes: 1,
             curve: None,
         };
-        index.curve = index.curve_of_measured(&measured, crate::pool::tuning());
+        index.curve = index.curve_of_measured(&measured, Tuned::Building(stop))?;
         // Every cluster a sample's nearest rows lay in, as the curve says;
         // also what a node that knows nothing of curves scans.
         index.probes = index.curve.as_ref().map_or(1, Curve::probes);
-        Some(index)
+        Ok(Some(index))
     }
 
     /// How many clusters a query scans.
@@ -1058,36 +1107,51 @@ impl ClusteredIndex {
             .copied()
             .filter(|(_, vector)| measurable(self.metric, vector))
             .collect();
-        self.curve_of_measured(&measured, crate::pool::passes())
+        match self.curve_of_measured(&measured, Tuned::Passing) {
+            Ok(curve) => curve,
+            Err(Stopped) => unreachable!("a rows pass has no stop"),
+        }
     }
 
     /// As [`Self::curve_of_rows`], of rows already found measurable: its
     /// samples drawn by a generator of their own, seeded by how many rows
-    /// there are and their dimensions alone, and worked out on `pool`: the
-    /// tuning pool for a build, the passes' for a rows pass.
+    /// there are and their dimensions alone, and worked out on the tuning
+    /// pool, in turn, for a build, or the passes' pool for a rows pass.
     fn curve_of_measured(
         &self,
         measured: &[(u32, &[f32])],
-        pool: &rayon::ThreadPool,
-    ) -> Option<Curve> {
+        tuned: Tuned<'_>,
+    ) -> Result<Option<Curve>, Stopped> {
         let mut random = Random(
             (measured.len() as u64 ^ ((self.dimensions as u64) << 32)) ^ 0x7465_6e65_645f_7631,
         );
         let samples = random.sample(measured.len(), TUNING_QUERIES);
-        let ranks = self.sample_ranks(measured, &samples, pool);
-        Curve::of(
+        let ranks = match tuned {
+            Tuned::Building(stop) => {
+                crate::pool::tune(stop, || self.ranks_on_this_pool(measured, &samples, stop))??
+            }
+            Tuned::Passing => crate::pool::passes()
+                .install(|| self.ranks_on_this_pool(measured, &samples, &Stop::new()))?,
+        };
+        Ok(Curve::of(
             Source::Rows,
             samples.len() as u32,
             self.clusters.len() as u32,
             ranks,
-        )
+        ))
     }
 
     /// Each of `samples`' nearest [`TUNING_NEIGHBOURS`] of `vectors`, the
     /// sample itself left out, ties in row order: in one pass over the
     /// rows for all samples at once, block by block on the rayon pool, so
     /// that the rows are read once however many samples there are.
-    fn nearest_of_samples(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<Vec<u32>> {
+    /// `stop` is asked at each block.
+    fn nearest_of_samples(
+        &self,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+        stop: &Stop,
+    ) -> Result<Vec<Vec<u32>>, Stopped> {
         let asked: Vec<(u32, Scorer<'_>)> = samples
             .iter()
             .map(|at| (vectors[*at].0, Scorer::new(self.metric, vectors[*at].1)))
@@ -1109,50 +1173,69 @@ impl ClusteredIndex {
             }
             nearest.into_iter().map(Nearest::estimates).collect()
         };
-        let merged = vectors.par_chunks(TUNING_BLOCK).map(shortlists).reduce(
-            || vec![Vec::new(); asked.len()],
-            |a, b| {
-                a.into_iter()
-                    .zip(b)
-                    .map(|(a, b)| {
-                        let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
-                        for (distance, row) in a.into_iter().chain(b) {
-                            nearest.offer(distance, row);
-                        }
-                        nearest.estimates()
-                    })
-                    .collect()
-            },
-        );
-        merged
+        let merged = vectors
+            .par_chunks(TUNING_BLOCK)
+            .map(|block| {
+                stop.check(Stage::Tuning)?;
+                Ok(shortlists(block))
+            })
+            .try_reduce(
+                || vec![Vec::new(); asked.len()],
+                |a, b| {
+                    Ok(a.into_iter()
+                        .zip(b)
+                        .map(|(a, b)| {
+                            let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
+                            for (distance, row) in a.into_iter().chain(b) {
+                                nearest.offer(distance, row);
+                            }
+                            nearest.estimates()
+                        })
+                        .collect())
+                },
+            )?;
+        Ok(merged
             .into_iter()
             .map(|mut found| {
                 found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
                 found.truncate(TUNING_NEIGHBOURS);
                 found.into_iter().map(|(_, row)| row).collect()
             })
-            .collect()
+            .collect())
     }
 
     /// The rank, in each sample's order of clusters, of the cluster each of
     /// its nearest rows lies in: worked out on `pool`, the tuning pool or
     /// the passes', each one thread of its own ([`crate::pool`]).
+    #[cfg(test)]
     fn sample_ranks(
         &self,
         vectors: &[(u32, &[f32])],
         samples: &[usize],
         pool: &rayon::ThreadPool,
     ) -> Vec<u32> {
-        pool.install(|| self.ranks_on_this_pool(vectors, samples))
+        match pool.install(|| self.ranks_on_this_pool(vectors, samples, &Stop::new())) {
+            Ok(ranks) => ranks,
+            Err(Stopped) => unreachable!("never stopped"),
+        }
     }
 
-    /// As [`Self::sample_ranks`], on whatever pool the caller is on.
-    fn ranks_on_this_pool(&self, vectors: &[(u32, &[f32])], samples: &[usize]) -> Vec<u32> {
-        let nearest = self.nearest_of_samples(vectors, samples);
-        samples
+    /// As [`Self::sample_ranks`], on whatever pool the caller is on,
+    /// asking `stop` at each block of rows and each sample.
+    fn ranks_on_this_pool(
+        &self,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+        stop: &Stop,
+    ) -> Result<Vec<u32>, Stopped> {
+        let nearest = self.nearest_of_samples(vectors, samples, stop)?;
+        let ranks = samples
             .par_iter()
             .zip(nearest)
             .flat_map_iter(|(at, rows)| {
+                if stop.check(Stage::Ranking).is_err() {
+                    return Vec::new();
+                }
                 let mut rank = vec![0u32; self.clusters.len()];
                 for (place, (_, cluster)) in self
                     .order(&self.prepared(vectors[*at].1))
@@ -1166,7 +1249,9 @@ impl ClusteredIndex {
                     .map(|position| rank[self.at[position].0 as usize])
                     .collect::<Vec<_>>()
             })
-            .collect()
+            .collect();
+        stop.passed()?;
+        Ok(ranks)
     }
 
     fn prepared(&self, query: &[f32]) -> Vec<f32> {
@@ -2400,7 +2485,7 @@ mod tests {
                 .map(|(row, v)| (row as u32 * 2, v.as_slice()))
                 .collect();
             let samples: Vec<usize> = (0..rows).step_by(7).collect();
-            let found = index.nearest_of_samples(&numbered, &samples);
+            let found = index.nearest_of_samples(&numbered, &samples, &Stop::new()).unwrap();
             proptest::prop_assert_eq!(found, neighbours_sample_by_sample(&index, &numbered, &samples));
 
             let curve = index.rows_curve().expect("a built index has a curve of its rows");

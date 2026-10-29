@@ -9,9 +9,13 @@
 //! a read splits only over the threads other reads leave idle, so that
 //! lasts no longer than a build overlaps a lull in reads.
 
-use std::sync::OnceLock;
+use std::collections::BTreeSet;
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
+
+use crate::stop::{Stage, Stop, Stopped};
 
 /// The read pool: as many threads as rayon's global pool has, sized as
 /// rayon sizes that (RAYON_NUM_THREADS, and so on), whichever pool first
@@ -40,11 +44,16 @@ pub fn reads() -> &'static ThreadPool {
 /// longer and leaves the rest to reads, flushes and merges. A rows pass,
 /// the same work for a segment from before curves, has [`passes`].
 ///
-/// It runs at the process's own priority, never lower: a merge, or a flush
-/// large enough to cluster, holds its partition's building lock while it
-/// tunes, and flushes wait on that lock. Run lower, a tuning the scheduler
-/// starved under load would hold them back for as long (build-priority
-/// review). So it is made, like the read pool, before the passes' pool.
+/// It runs at the process's own priority, never lower: a flush large
+/// enough to cluster holds its partition's building lock while it tunes,
+/// and other flushes wait on that lock; a merge, built without the lock,
+/// still holds its memory until it is done. Run lower, a tuning the
+/// scheduler starved under load would hold them back for as long
+/// (build-priority review). So it is made, like the read pool, before the
+/// passes' pool.
+///
+/// A build takes its turn on it with [`tune`], so that one stopped while
+/// it waits gives up rather than waiting the turns before it out.
 pub fn tuning() -> &'static ThreadPool {
     static TUNING: OnceLock<ThreadPool> = OnceLock::new();
     TUNING.get_or_init(|| {
@@ -59,6 +68,80 @@ pub fn tuning() -> &'static ThreadPool {
             .build()
             .expect("the tuning pool's thread")
     })
+}
+
+/// The turns taken on the tuning pool: tickets handed out in the order
+/// asked for, the one being served, and those whose holders gave up
+/// waiting, stopped, to be passed over.
+#[derive(Default)]
+struct Turns {
+    next: u64,
+    serving: u64,
+    left: BTreeSet<u64>,
+}
+
+fn turns() -> &'static (Mutex<Turns>, Condvar) {
+    static TURNS: OnceLock<(Mutex<Turns>, Condvar)> = OnceLock::new();
+    TURNS.get_or_init(Default::default)
+}
+
+fn taken(turns: &Mutex<Turns>) -> MutexGuard<'_, Turns> {
+    turns.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How often a build waiting its turn to tune asks its stop.
+const WAITING_ASKS_EVERY: Duration = Duration::from_millis(20);
+
+/// A turn on the tuning pool, handed on as it is dropped, the work done or
+/// given up, or panicked.
+struct Turn(u64);
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let (turns, turned) = turns();
+        let mut now = taken(turns);
+        debug_assert_eq!(now.serving, self.0);
+        now.serving += 1;
+        loop {
+            let serving = now.serving;
+            if !now.left.remove(&serving) {
+                break;
+            }
+            now.serving += 1;
+        }
+        turned.notify_all();
+    }
+}
+
+/// Do `work` on the tuning pool once it is this caller's turn, turns
+/// taken in the order asked for: one at a time, as the pool has one
+/// thread. A caller whose `stop` is stopped while it waits gives up,
+/// [`Stopped`], without waiting the turns before it out: a merge let go
+/// behind another tenant's tuning of a million rows would otherwise hold
+/// its memory for as long. Once the work has begun it asks the stop as it
+/// goes, if it was given it.
+///
+/// Never called from the tuning pool's own thread, nor from work done in
+/// a turn: that would wait for a turn its own caller holds, for ever.
+pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, Stopped> {
+    let (turns, turned) = turns();
+    let mut now = taken(turns);
+    let ticket = now.next;
+    now.next += 1;
+    while now.serving != ticket {
+        if stop.check(Stage::Waiting).is_err() {
+            now.left.insert(ticket);
+            return Err(Stopped);
+        }
+        now = turned
+            .wait_timeout(now, WAITING_ASKS_EVERY)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+    drop(now);
+    let _turn = Turn(ticket);
+    stop.check(Stage::Tuning)?;
+    Ok(tuning().install(work))
 }
 
 /// The pool a rows pass makes its curve on (recall note, R9.5): one
