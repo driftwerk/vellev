@@ -26,7 +26,9 @@ use crate::format::{
     Head, Kind, LogSegment, Manifest, Op, SegmentCurve, SegmentFile, SegmentIndex, SegmentMeta,
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
-use crate::merge_builds::{MergeBuild, MergeBuilds, Probe, Uploading, MERGE_BUILDS};
+use crate::merge_builds::{
+    MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
+};
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
     self, Discarded, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
@@ -78,7 +80,7 @@ struct Built {
 #[allow(clippy::too_many_arguments)]
 fn segment_built(
     turn: tokio::sync::OwnedSemaphorePermit,
-    mut file: SegmentFile,
+    file: SegmentFile,
     vectors: Option<Gathering>,
     catalog: &Catalog,
     stopping: &Stopping,
@@ -87,8 +89,11 @@ fn segment_built(
     format: u16,
 ) -> Result<Option<Built>> {
     let _turn = turn;
-    // First, so that it is dropped with the last of what the build made.
+    // Before the rows it was given are bound below it, as parameters are
+    // dropped after locals: so that it is dropped last of all the build
+    // holds, the rows gathered among them, however the build ends.
     let probe = build.and_then(MergeBuild::probe);
+    let mut file = file;
     if let Some(build) = build {
         build.held_here(stopping, false);
     }
@@ -1105,6 +1110,9 @@ pub struct Writer {
     /// The merge builds this writer's merges take turns among: the node's,
     /// or, on its own, its own.
     merge_builds: Arc<MergeBuilds>,
+    /// Its place among the merges waiting for a turn, kept while a merge
+    /// gives way to a flush: see [`Reservation`].
+    merge_place: std::sync::Mutex<Option<Reservation>>,
 }
 
 /// The stop of the merge under way, there until the merge ends, however it
@@ -1261,6 +1269,7 @@ impl Writer {
             stops_past_loading: AtomicU64::new(0),
             merge_past_loading: AtomicBool::new(false),
             merge_builds: MergeBuilds::new(MERGE_BUILDS),
+            merge_place: std::sync::Mutex::new(None),
         })
     }
 
@@ -2411,6 +2420,7 @@ impl Writer {
             blobs: self.partition.blobs.clone(),
             keys: Vec::new(),
             putting: Vec::new(),
+            carrying: None,
         }
     }
 
@@ -2883,6 +2893,7 @@ impl Writer {
         }
         let _keeping = self.keep(&merged.meta);
         let uploading = Uploading::new(build.clone());
+        staged.carrying = Some(uploading.clone());
         if !self
             .upload_stopping(&merged, &mut staged, &stopping, Some(&uploading))
             .await?
@@ -2957,7 +2968,7 @@ impl Writer {
         // Kept from here: committed, or left for cleaning up should the
         // commit fail, the partition's either way, and no longer what the
         // merge holds.
-        uploading.committed();
+        uploading.let_go();
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, |state| {
             state.compacted(&merge, merged);
@@ -2983,11 +2994,13 @@ impl Writer {
     ) -> Result<Option<(MergeBuild, tokio::sync::MutexGuard<'_, ()>)>> {
         loop {
             if self.restoring.load(Ordering::SeqCst) {
+                // Its place, or a turn kept for it, is given up too.
+                lock(&self.merge_place).take();
                 return Ok(None);
             }
             let Some(build) = self
                 .merge_builds
-                .turn(&self.lease.key, stopping, flush_due)
+                .turn(&self.lease.key, stopping, flush_due, &self.merge_place)
                 .await?
             else {
                 return Ok(None);
@@ -3014,6 +3027,9 @@ impl Writer {
     /// this is not stopped.
     pub fn stop_merges(&self) {
         self.merges_stopped.fetch_add(1, Ordering::SeqCst);
+        // A place kept among those waiting for a turn, or a turn kept for
+        // the next merge, is given up.
+        lock(&self.merge_place).take();
         if let Some(stop) = &*lock(&self.merge_stop) {
             // Too late for one past loading back: counted, for tests that
             // tell a stop too late from one not heeded.
@@ -3655,6 +3671,8 @@ struct Staged {
     /// Uploads under way, each on a task of its own: one given up on is
     /// aborted, and its files deleted once it has ended.
     putting: Vec<tokio::task::JoinHandle<Result<()>>>,
+    /// A merge's share in what it uploads: see [`UnlessDeleted`].
+    carrying: Option<Arc<Uploading>>,
 }
 
 impl Staged {
@@ -3672,6 +3690,8 @@ impl Drop for Staged {
         // going up for nothing.
         let putting = std::mem::take(&mut self.putting);
         putting.iter().for_each(tokio::task::JoinHandle::abort);
+        // Let go here, should nothing be left to delete what went up.
+        let carrying = self.carrying.take().map(UnlessDeleted::new);
         let (false, Ok(runtime)) = (self.keys.is_empty(), tokio::runtime::Handle::try_current())
         else {
             return;
@@ -3683,6 +3703,8 @@ impl Drop for Staged {
         let deleting = crate::blobs::Aborts::process().begun();
         runtime.spawn(async move {
             let _deleting = deleting;
+            // Dropped unrun, as the runtime goes, it lets the share go.
+            let carrying = carrying;
             let delete = |keys: Vec<String>| {
                 let blobs = blobs.clone();
                 async move {
@@ -3704,6 +3726,9 @@ impl Drop for Staged {
                 let _ = put.await;
             }
             delete(keys).await;
+            if let Some(carrying) = carrying {
+                carrying.deleted();
+            }
         });
     }
 }

@@ -20,7 +20,7 @@ use vellev_index::stop::Stop;
 
 use crate::coordinator::PartitionKey;
 use crate::stopping::{MergeStage, Stopping};
-use crate::{Result, StorageError};
+use crate::Result;
 
 /// How many merges a node builds at once. What a merge gathers, a copy of
 /// its run's live rows and their vectors, is the bulk of what it holds, so
@@ -241,33 +241,47 @@ impl MergeBuilds {
         *lock(&self.probed)
     }
 
-    /// A turn to build the merge `stopping` stops, once one is free; `None`
-    /// if the merge is stopped first, or `flush_due` says its writer's flush
-    /// is due first, when it never builds. A turn free at once is taken,
-    /// whatever is due: what then holds the flush is the merge's own build,
-    /// not other merges'.
+    /// A turn to build the merge of `key`'s partition that `stopping`
+    /// stops, once one is free; `None` if the merge is stopped first, or
+    /// `flush_due` says its writer's flush is due first, when it never
+    /// builds. Its place among those waiting is kept in `kept` should it
+    /// give way to a flush: the turn that comes to it meanwhile waits there
+    /// for the writer's next attempt, as [`Reservation`] says, and a merge
+    /// that queued behind it doesn't take it.
     pub(crate) async fn turn(
         self: &Arc<Self>,
         key: &PartitionKey,
         stopping: &Stopping,
         flush_due: &(dyn Fn() -> bool + Sync),
+        kept: &Mutex<Option<Reservation>>,
     ) -> Result<Option<MergeBuild>> {
-        let flush_first = async {
-            while !flush_due() {
-                tokio::time::sleep(ASKS_EVERY).await;
+        let turn = loop {
+            let reservation = lock(kept).take().unwrap_or_else(|| Reservation::new(self));
+            let flush_first = async {
+                while !flush_due() {
+                    tokio::time::sleep(ASKS_EVERY).await;
+                }
+            };
+            let waited = async {
+                tokio::select! {
+                    biased;
+                    turn = reservation.granted() => Some(turn),
+                    () = flush_first => None,
+                }
+            };
+            match stopping.unless_stopped(MergeStage::Queued, waited).await {
+                // Stopped: its place, or the turn granted it, is given up.
+                None => return Ok(None),
+                // A flush first: its place is kept for its next attempt.
+                Some(None) => {
+                    *lock(kept) = Some(reservation);
+                    return Ok(None);
+                }
+                Some(Some(Some(turn))) => break turn,
+                // Kept past the park time and let go: asked for afresh.
+                Some(Some(None)) => continue,
             }
         };
-        let turn = async {
-            tokio::select! {
-                biased;
-                turn = self.turns.clone().acquire_owned() => Some(turn),
-                () = flush_first => None,
-            }
-        };
-        let Some(Some(turn)) = stopping.unless_stopped(MergeStage::Queued, turn).await else {
-            return Ok(None);
-        };
-        let turn = turn.map_err(|error| StorageError::Background(error.to_string()))?;
         let reckoned = Arc::new(Reckoned {
             key: key.clone(),
             stop: stopping.stop().clone(),
@@ -283,6 +297,88 @@ impl MergeBuilds {
             },
             _turn: turn,
         }))
+    }
+}
+
+/// A writer's place among the merges waiting for a turn, asked for on a
+/// task of its own, so that a merge that gives way to a flush keeps it:
+/// the turn granted to it while the writer flushes waits for the writer's
+/// next attempt, idling at most for a flush, which takes seconds where a
+/// build takes minutes. A turn granted and not taken up within the park
+/// time ([`MergeBuilds::park_for`]) is let go; and the place, or the turn
+/// granted it, is given up as this is dropped, as when the writer's
+/// merges are stopped, it restores, or it goes. Nothing is left behind.
+#[derive(Debug)]
+pub(crate) struct Reservation {
+    kept: Arc<Kept>,
+    asking: tokio::task::JoinHandle<()>,
+}
+
+/// Where a [`Reservation`]'s turn waits once granted.
+#[derive(Debug, Default)]
+struct Kept {
+    turn: Mutex<Granted>,
+    told: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+enum Granted {
+    #[default]
+    Asking,
+    Turn(OwnedSemaphorePermit),
+    Gone,
+}
+
+impl Reservation {
+    /// A place at the back of `builds`' queue.
+    fn new(builds: &Arc<MergeBuilds>) -> Self {
+        let kept = Arc::new(Kept::default());
+        let parked = *lock(&builds.parked_at_most);
+        let (turns, granted) = (builds.turns.clone(), kept.clone());
+        let asking = tokio::spawn(async move {
+            match turns.acquire_owned().await {
+                Ok(turn) => *lock(&granted.turn) = Granted::Turn(turn),
+                Err(_) => *lock(&granted.turn) = Granted::Gone,
+            }
+            granted.told.notify_one();
+            tokio::time::sleep(parked).await;
+            let mut turn = lock(&granted.turn);
+            if matches!(*turn, Granted::Turn(_)) {
+                // Never taken up: let go.
+                *turn = Granted::Gone;
+            }
+            drop(turn);
+            granted.told.notify_one();
+        });
+        Self { kept, asking }
+    }
+
+    /// The turn, once granted; `None` if it was let go first.
+    async fn granted(&self) -> Option<OwnedSemaphorePermit> {
+        loop {
+            {
+                let mut turn = lock(&self.kept.turn);
+                match std::mem::take(&mut *turn) {
+                    Granted::Turn(granted) => {
+                        *turn = Granted::Gone;
+                        return Some(granted);
+                    }
+                    Granted::Gone => {
+                        *turn = Granted::Gone;
+                        return None;
+                    }
+                    Granted::Asking => *turn = Granted::Asking,
+                }
+            }
+            self.kept.told.notified().await;
+        }
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.asking.abort();
+        *lock(&self.kept.turn) = Granted::Gone;
     }
 }
 
@@ -377,27 +473,103 @@ impl MergeBuild {
 /// fail, left for cleaning up, and the share is let go: a store that keeps
 /// what it is given, as one in memory does, would otherwise hold the turn
 /// for as long as it keeps the file.
+///
+/// A copy a store's thread keeps for as long as that thread is stuck, as on
+/// a local disk that has stopped answering, keeps the turn as long: what it
+/// holds is held, and letting the turn go would let another merge gather
+/// beside it. Said in the log, a minute on and each minute after, once the
+/// merge has given up and only such copies are left.
 #[derive(Debug)]
-pub(crate) struct Uploading(Mutex<Option<Arc<MergeBuild>>>);
+pub(crate) struct Uploading {
+    share: Mutex<Option<Arc<MergeBuild>>>,
+    /// How many bytes were handed to the store carrying the share.
+    bytes: AtomicUsize,
+}
 
 impl Uploading {
     pub(crate) fn new(build: Arc<MergeBuild>) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(Some(build))))
+        Arc::new(Self {
+            share: Mutex::new(Some(build)),
+            bytes: AtomicUsize::new(0),
+        })
     }
 
     /// `bytes`, carrying the share: the same bytes, not a copy.
     pub(crate) fn carried_by(self: &Arc<Self>, bytes: &Bytes) -> Bytes {
+        self.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
         Bytes::from_owner(Carried {
             bytes: bytes.clone(),
             _uploading: self.clone(),
         })
     }
 
-    /// The merge keeps what it uploaded, to commit it: what it uploaded is
-    /// the partition's from here, committed or left for cleaning up, and
-    /// holds its build no longer.
-    pub(crate) fn committed(&self) {
-        lock(&self.0).take();
+    /// Let the share go, whatever still holds the bytes: the merge keeps
+    /// them to commit, when they are the partition's from there, committed
+    /// or left for cleaning up; or nothing is left to delete them from a
+    /// store that keeps what it is given.
+    pub(crate) fn let_go(&self) {
+        lock(&self.share).take();
+    }
+
+    /// Say in the log, a minute on and each minute after, while a store
+    /// still holds the bytes, and with them the turn, once the merge that
+    /// uploaded them has given up and its deletes are done.
+    pub(crate) fn watched(self: Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let watching = Arc::downgrade(&self);
+        drop(self);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(STILL_HELD_EVERY).await;
+                let Some(uploading) = watching.upgrade() else {
+                    return;
+                };
+                if lock(&uploading.share).is_none() {
+                    return;
+                }
+                tracing::warn!(
+                    bytes = uploading.bytes.load(Ordering::SeqCst),
+                    "a store still holds what a stopped merge uploaded, and with it one of \
+                     the node's merge turns: a write stuck, as on a local disk that has \
+                     stopped answering"
+                );
+            }
+        });
+    }
+}
+
+/// How often a store still holding what a stopped merge uploaded is said
+/// in the log.
+const STILL_HELD_EVERY: Duration = Duration::from_secs(60);
+
+/// A stopped merge's share in what it uploaded, let go as this is dropped
+/// unless the deletes it waits for were done: should nothing be left to do
+/// them, as when the runtime goes, a store that keeps what it is given
+/// would otherwise hold the turn for good.
+#[derive(Debug)]
+pub(crate) struct UnlessDeleted(Option<Arc<Uploading>>);
+
+impl UnlessDeleted {
+    pub(crate) fn new(uploading: Arc<Uploading>) -> Self {
+        Self(Some(uploading))
+    }
+
+    /// The deletes are done: what is left of the bytes is a store's own,
+    /// watched from now on.
+    pub(crate) fn deleted(mut self) {
+        if let Some(uploading) = self.0.take() {
+            uploading.watched();
+        }
+    }
+}
+
+impl Drop for UnlessDeleted {
+    fn drop(&mut self) {
+        if let Some(uploading) = self.0.take() {
+            uploading.let_go();
+        }
     }
 }
 

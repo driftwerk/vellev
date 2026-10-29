@@ -609,8 +609,11 @@ impl Hold {
     /// writes, a commit under way being answered as unknown, and whatever
     /// maintains or restores it. A merge under way is stopped first: its
     /// build, which an aborted task would leave running, gives up and lets
-    /// go of what it holds (merge note, step 3).
+    /// go of what it holds (merge note, step 3). All of it under the tasks'
+    /// lock, which [`Self::opened`] takes too, so that writes and a writer
+    /// set as the tenant opens are stopped whichever comes first.
     fn lose(&self) {
+        let mut tasks = self.tasks.lock().expect("tasks lock");
         self.lost.store(true, Ordering::SeqCst);
         if let Some(commits) = self.commits.get() {
             commits.stop();
@@ -618,8 +621,26 @@ impl Hold {
         if let Some(writer) = self.writer.get().and_then(Weak::upgrade) {
             writer.stop_merges();
         }
-        let stopped = std::mem::take(&mut *self.tasks.lock().expect("tasks lock"));
-        stopped.iter().for_each(AbortHandle::abort);
+        std::mem::take(&mut *tasks)
+            .iter()
+            .for_each(AbortHandle::abort);
+    }
+
+    /// Note the tenant's `writer` and queue of `commits` as it opens:
+    /// stopped at once if the hold was lost meanwhile, as losing it would
+    /// have stopped them.
+    fn opened(&self, writer: &Arc<Writer>, commits: &GroupCommitter) {
+        let _tasks = self.tasks.lock().expect("tasks lock");
+        self.writer
+            .set(Arc::downgrade(writer))
+            .expect("a tenant's writer is opened once");
+        self.commits
+            .set(commits.clone())
+            .expect("a tenant's writes are queued once");
+        if self.lost.load(Ordering::SeqCst) {
+            commits.stop();
+            writer.stop_merges();
+        }
     }
 
     /// Have `task` stopped when the hold is lost, at once if it is already.
@@ -996,6 +1017,11 @@ impl Tenant {
             .map_err(|error| self.failed(error))?
             .is_some()
         {}
+        // Given way to a flush, or one is due: cleaning up, which waits on
+        // the store, waits for a later round, and the flush goes first.
+        if flush_due() {
+            return Ok(0);
+        }
         let mut deleted = 0;
         loop {
             let cleaned = self.writer.clean(grace).await;
@@ -1024,6 +1050,11 @@ impl Tenant {
         let deleted = self
             .compacted(window.saturating_add(grace), &flush_due)
             .await?;
+        // The round ends here once a flush is due: the flush goes first,
+        // and the rest is done at a later round.
+        if flush_due() {
+            return Ok(deleted);
+        }
         // One pass at a time on the node: another tenant's next round
         // takes its turn. What is missing is worked out afresh each time,
         // so a pass skipped or cut short is made at a later round.
@@ -2089,20 +2120,9 @@ impl Inner {
                 return Err(error.into());
             }
         };
-        hold.writer
-            .set(Arc::downgrade(&writer))
-            .expect("a tenant's writer is opened once");
         let (flushes, wanted) = mpsc::channel(1);
         let commits = GroupCommitter::spawn(writer.clone(), *group, *queue);
-        hold.commits
-            .set(commits.clone())
-            .expect("a tenant's writes are queued once");
-        // Lost meanwhile, before its writer and writes were where losing it
-        // finds them: lost again, now that they are, so that its writes and
-        // merges are stopped too. Losing is the same however often.
-        if hold.is_lost() {
-            hold.lose();
-        }
+        hold.opened(&writer, &commits);
         let opened = Arc::new(Tenant {
             id: tenant.clone(),
             commits,
