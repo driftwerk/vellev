@@ -24,7 +24,7 @@ jobs:
       - run: cargo test --locked -p vellev-embed --lib --no-run 2>&1 | tail -1
       - name: The test 600 times, and the local suite 100 times
         run: |
-          BIN=$(cargo test --locked -p vellev-embed --lib --no-run 2>&1 | grep -o '(/[^)]*)' | tr -d '()')
+          BIN=$(cargo test --locked -p vellev-embed --lib --no-run 2>&1 | grep -o '([^)]*deps/vellev_embed-[^)]*)' | tr -d '()'); echo "binary $BIN"; "$BIN" -q local::tests::searches_however_many_leave_a_write_every_third_run | tail -1
           f=0; for i in $(seq 1 600); do "$BIN" -q local::tests::searches_however_many_leave_a_write_every_third_run > /dev/null 2>&1 || f=$((f+1)); done
           echo "${{ matrix.side }}: the test, 600 runs, $f failed"
           g=0; for i in $(seq 1 100); do "$BIN" -q local::tests > /dev/null 2>&1 || g=$((g+1)); done
