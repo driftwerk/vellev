@@ -34,6 +34,7 @@ struct Counts {
 /// that show each one asks; not for use.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Stage {
     /// Drawing and rotating the sample that clusters or a centre are
     /// taken from.
