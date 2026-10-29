@@ -2414,6 +2414,25 @@ mod tests {
             for _ in 0..4 {
                 let query = noise.vector(dimensions);
                 let got = scan_only(&index, &query, count, only.as_ref(), &skipped);
+                // The same, the rows skipped read from their bits.
+                let bits: Vec<u64> = skipped
+                    .chunks(64)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .fold(0u64, |word, (at, skip)| word | (u64::from(*skip) << at))
+                    })
+                    .collect();
+                let by_bits = index.scanned(
+                    &index.prepared(&query),
+                    count,
+                    only.as_ref(),
+                    Marks { bytes: &[], bits: &bits },
+                    &in_row_order,
+                    Probing { probes: index.probes, parts: 1 },
+                );
+                proptest::prop_assert_eq!(&by_bits, &got);
                 let want = estimates_code_by_code(&index, &query, count, only.as_ref(), &skipped);
                 let bits = |found: &[(f32, u32)]| -> Vec<(u32, u32)> {
                     found.iter().map(|(d, row)| (d.to_bits(), *row)).collect()
