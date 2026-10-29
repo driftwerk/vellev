@@ -423,6 +423,173 @@ fn level_of(x: f32) -> u8 {
     whole.saturating_add(up).min((1 << QUERY_BITS) - 1) as u8
 }
 
+/// Readying a query for a cluster: its difference from the centroid, the
+/// lowest and the step between levels, and each dimension's level, in
+/// each way this machine can run it, every way giving the portable way's
+/// result to the last bit.
+mod readying {
+    use super::{level_of, Readying, QUERY_BITS};
+
+    /// Fill `space` with the residual of `query` from `centroid` and its
+    /// levels; give the lowest residual and the step between levels.
+    pub(super) type Ready = fn(&[f32], &[f32], &mut Readying) -> (f32, f32);
+
+    /// The portable way, which every other is held to.
+    pub(super) fn portably(query: &[f32], centroid: &[f32], space: &mut Readying) -> (f32, f32) {
+        space.residual.clear();
+        space
+            .residual
+            .extend(query.iter().zip(centroid).map(|(q, c)| q - c));
+        let residual = &space.residual;
+        let (mut lower, mut upper) = (f32::INFINITY, f32::NEG_INFINITY);
+        for value in residual {
+            lower = lower.min(*value);
+            upper = upper.max(*value);
+        }
+        levelled(space, lower, upper)
+    }
+
+    /// The step between levels from `lower` and `upper`, and the levels.
+    fn levelled(space: &mut Readying, lower: f32, upper: f32) -> (f32, f32) {
+        let levels = ((1u32 << QUERY_BITS) - 1) as f32;
+        let delta = (upper - lower) / levels;
+        debug_assert_eq!(
+            space.residual.len() % 64,
+            0,
+            "a rotation's width is whole words"
+        );
+        space.levels.clear();
+        space.levels.resize(space.residual.len(), 0);
+        if delta > 0.0 {
+            for (level, value) in space.levels.iter_mut().zip(&space.residual) {
+                *level = level_of((value - lower) / delta);
+            }
+        }
+        (lower, delta)
+    }
+
+    /// Every way this machine can run, by name, the portable first.
+    pub(super) fn ways_here() -> Vec<(&'static str, Ready)> {
+        #[allow(unused_mut)]
+        let mut ways: Vec<(&'static str, Ready)> = vec![("portable", portably)];
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: handed out only where the CPU has just said it has
+            // AVX2, which is all it asks.
+            ways.push(("avx2", |query, centroid, space| unsafe {
+                avx2::ready(query, centroid, space)
+            }));
+        }
+        ways
+    }
+
+    /// The way chosen for this machine: the widest. Decided once a
+    /// process.
+    pub(super) fn chosen() -> Ready {
+        static CHOSEN: std::sync::OnceLock<Ready> = std::sync::OnceLock::new();
+        *CHOSEN.get_or_init(|| {
+            ways_here()
+                .last()
+                .expect("the portable way is always here")
+                .1
+        })
+    }
+
+    /// In AVX2: the residual and its bounds eight dimensions at a time,
+    /// and the levels so too. The bounds are taken this way only where
+    /// they are the portable way's beyond doubt: with no residual not a
+    /// number, and neither bound a zero, whose sign the two ways might
+    /// tell apart; else the portable way is used whole.
+    #[cfg(target_arch = "x86_64")]
+    mod avx2 {
+        use std::arch::x86_64::*;
+
+        use super::{portably, Readying, QUERY_BITS};
+
+        #[target_feature(enable = "avx2")]
+        pub(super) fn ready(query: &[f32], centroid: &[f32], space: &mut Readying) -> (f32, f32) {
+            let width = query.len().min(centroid.len());
+            if !width.is_multiple_of(8) {
+                return portably(query, centroid, space);
+            }
+            space.residual.clear();
+            space.residual.resize(width, 0.0);
+            let (mut low, mut high) = (
+                _mm256_set1_ps(f32::INFINITY),
+                _mm256_set1_ps(f32::NEG_INFINITY),
+            );
+            let mut odd = _mm256_setzero_ps();
+            let out = space.residual.as_mut_ptr();
+            for at in (0..width).step_by(8) {
+                // SAFETY: `at + 8 <= width`, which no slice here is
+                // shorter than; nothing asks alignment.
+                let residual = unsafe {
+                    let residual = _mm256_sub_ps(
+                        _mm256_loadu_ps(query.as_ptr().add(at)),
+                        _mm256_loadu_ps(centroid.as_ptr().add(at)),
+                    );
+                    _mm256_storeu_ps(out.add(at), residual);
+                    residual
+                };
+                low = _mm256_min_ps(low, residual);
+                high = _mm256_max_ps(high, residual);
+                odd = _mm256_or_ps(odd, _mm256_cmp_ps::<_CMP_UNORD_Q>(residual, residual));
+            }
+            let (mut lows, mut highs) = ([0.0f32; 8], [0.0f32; 8]);
+            // SAFETY: each holds eight values.
+            unsafe {
+                _mm256_storeu_ps(lows.as_mut_ptr(), low);
+                _mm256_storeu_ps(highs.as_mut_ptr(), high);
+            }
+            let lower = lows.iter().fold(f32::INFINITY, |a, b| a.min(*b));
+            let upper = highs.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b));
+            if _mm256_movemask_ps(odd) != 0 || lower == 0.0 || upper == 0.0 {
+                return portably(query, centroid, space);
+            }
+            let levels = ((1u32 << QUERY_BITS) - 1) as f32;
+            let delta = (upper - lower) / levels;
+            space.levels.clear();
+            space.levels.resize(width, 0);
+            if delta > 0.0 {
+                let (lowest, step) = (_mm256_set1_ps(lower), _mm256_set1_ps(delta));
+                let (half, most) = (_mm256_set1_ps(0.5), _mm256_set1_epi32(levels as i32));
+                let one = _mm256_set1_epi32(1);
+                let mut got = [0i32; 8];
+                for at in (0..width).step_by(8) {
+                    // SAFETY: `at + 8 <= width`, the residual's length.
+                    let value = unsafe { _mm256_loadu_ps(space.residual.as_ptr().add(at)) };
+                    // As `level_of`: the whole part, plus one for a half or
+                    // more, at most the top level. `x` is never below zero.
+                    // It can pass the top level: with a subnormal step,
+                    // rounded, up to about 22, which the clamp below takes
+                    // back to 15, as `level_of`'s does. An infinite residual
+                    // makes `x` not a number, which converts to `i32::MIN`,
+                    // is clamped and cast to 0, as `level_of` gives 0. The
+                    // conversion truncates whatever the rounding mode
+                    // (MXCSR) is set to, as `as u32` does, so no setting of
+                    // it can change a level.
+                    let x = _mm256_div_ps(_mm256_sub_ps(value, lowest), step);
+                    let whole = _mm256_cvttps_epi32(x);
+                    let up = _mm256_cmp_ps::<_CMP_GE_OQ>(
+                        _mm256_sub_ps(x, _mm256_cvtepi32_ps(whole)),
+                        half,
+                    );
+                    let level = _mm256_min_epi32(
+                        _mm256_add_epi32(whole, _mm256_and_si256(_mm256_castps_si256(up), one)),
+                        most,
+                    );
+                    // SAFETY: `got` holds eight values.
+                    unsafe { _mm256_storeu_si256(got.as_mut_ptr().cast(), level) };
+                    for (into, level) in space.levels[at..at + 8].iter_mut().zip(got) {
+                        *into = level as u8;
+                    }
+                }
+            }
+            (lower, delta)
+        }
+    }
+}
+
 /// The levels bit by bit, a plane a bit, `words` words a plane: as a code
 /// was first counted against the query.
 #[cfg(test)]
@@ -460,26 +627,8 @@ impl Probe {
     /// dimension's level into `space.levels`, where a scan of blocks makes
     /// its tables from them.
     fn readied(query: &[f32], centroid: &[f32], space: &mut Readying) -> Self {
-        space.residual.clear();
-        space
-            .residual
-            .extend(query.iter().zip(centroid).map(|(q, c)| q - c));
+        let (lower, delta) = (readying::chosen())(query, centroid, space);
         let residual = &space.residual;
-        let (mut lower, mut upper) = (f32::INFINITY, f32::NEG_INFINITY);
-        for value in residual {
-            lower = lower.min(*value);
-            upper = upper.max(*value);
-        }
-        let levels = ((1u32 << QUERY_BITS) - 1) as f32;
-        let delta = (upper - lower) / levels;
-        debug_assert_eq!(residual.len() % 64, 0, "a rotation's width is whole words");
-        space.levels.clear();
-        space.levels.resize(residual.len(), 0);
-        if delta > 0.0 {
-            for (level, value) in space.levels.iter_mut().zip(residual) {
-                *level = level_of((value - lower) / delta);
-            }
-        }
         #[cfg(test)]
         let (planes, words) = (
             planes_of(&space.levels, residual.len() / 64),
@@ -1804,6 +1953,106 @@ mod tests {
                 all.into_iter().map(|(_, row)| row).collect()
             })
             .collect()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+        /// Every way of readying a query for a cluster this machine runs
+        /// gives the portable way's residual, lowest, step and levels to
+        /// the last bit: widths of one to nineteen words, as a rotation's
+        /// width is whole words, values of every size,
+        /// zeros and a lowest or highest of zero, and now and then a value
+        /// not finite.
+        #[test]
+        fn every_way_of_readying_gives_the_portable_way_to_the_last_bit(
+            seed in 1u64..u64::MAX,
+            words in 1usize..20,
+            scale in -40i32..40,
+            odd in 0u8..30,
+        ) {
+            let width = words * 64;
+            let mut noise = Noise(seed);
+            let value = |noise: &mut Noise| match (noise.unit() * 1000.0) as i32 {
+                0 if odd == 0 => f32::NAN,
+                1 if odd == 1 => f32::INFINITY,
+                2 if odd == 2 => f32::NEG_INFINITY,
+                3..=6 => 0.0,
+                7 => -0.0,
+                8 => f32::MIN_POSITIVE / 3.0,
+                _ => (noise.unit() * 2.0 - 1.0) * 2f32.powi(scale),
+            };
+            let query: Vec<f32> = (0..width).map(|_| value(&mut noise)).collect();
+            let mut centroid: Vec<f32> = (0..width).map(|_| value(&mut noise)).collect();
+            if odd == 3 {
+                // Every residual at or above zero, so the lowest is zero.
+                centroid.clone_from(&query);
+                centroid[0] = query[0] + 1.0;
+            }
+            let mut want = Readying::default();
+            let (lower, delta) = readying::portably(&query, &centroid, &mut want);
+            for (name, ready) in readying::ways_here() {
+                let mut got = Readying::default();
+                let (l, d) = ready(&query, &centroid, &mut got);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                proptest::prop_assert_eq!(bits(&got.residual), bits(&want.residual), "{} residual", name);
+                proptest::prop_assert_eq!(l.to_bits(), lower.to_bits(), "{} lowest", name);
+                proptest::prop_assert_eq!(d.to_bits(), delta.to_bits(), "{} step", name);
+                proptest::prop_assert_eq!(&got.levels, &want.levels, "{} levels", name);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+        /// So too where a residual lies exactly half a step between two
+        /// levels, or within a few units in the last place of that, where
+        /// any other rounding than the portable way's, a step multiplied
+        /// by its reciprocal or a half rounded to even, would give another
+        /// level. The step is an odd multiple of a power of two, so its
+        /// reciprocal is not exact, and the lowest and highest residuals
+        /// are set so that the step comes out exact.
+        #[test]
+        fn readying_rounds_as_the_portable_way_at_half_steps(
+            seed in 1u64..u64::MAX,
+            odd in 0u32..64,
+            power in -20i32..20,
+        ) {
+            let step = (2 * odd + 3) as f32 * 2f32.powi(power);
+            let lower = -8.0 * step;
+            let mut noise = Noise(seed);
+            let mut query: Vec<f32> = (0..256)
+                .map(|_| {
+                    let k = (noise.unit() * 15.0) as u32 as f32;
+                    let at = lower + (k + 0.5) * step;
+                    let nudge = (noise.unit() * 7.0) as i32 - 3;
+                    f32::from_bits((at.to_bits() as i32 + nudge) as u32)
+                })
+                .collect();
+            query[0] = lower;
+            query[1] = lower + 15.0 * step;
+            let centroid = vec![0.0f32; query.len()];
+            let mut want = Readying::default();
+            let (lower, delta) = readying::portably(&query, &centroid, &mut want);
+            for (name, ready) in readying::ways_here() {
+                let mut got = Readying::default();
+                let (l, d) = ready(&query, &centroid, &mut got);
+                proptest::prop_assert_eq!(l.to_bits(), lower.to_bits(), "{} lowest", name);
+                proptest::prop_assert_eq!(d.to_bits(), delta.to_bits(), "{} step", name);
+                proptest::prop_assert_eq!(&got.levels, &want.levels, "{} levels", name);
+            }
+        }
+    }
+
+    /// A query is readied the widest way this machine has.
+    #[test]
+    fn the_way_of_readying_chosen_is_the_widest_this_machine_has() {
+        let chosen = readying::chosen() as usize;
+        let widest = readying::ways_here().last().unwrap().1 as usize;
+        assert_eq!(chosen, widest);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            assert_eq!(readying::ways_here().last().unwrap().0, "avx2");
+        }
     }
 
     /// Tuning runs on a pool of one thread of its own, apart from rayon's
