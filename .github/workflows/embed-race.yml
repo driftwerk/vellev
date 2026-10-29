@@ -29,3 +29,5 @@ jobs:
           echo "${{ matrix.side }}: the test, 600 runs, $f failed"
           g=0; for i in $(seq 1 100); do "$BIN" -q local::tests > /dev/null 2>&1 || g=$((g+1)); done
           echo "${{ matrix.side }}: local suite, 100 runs, $g failed"
+          h=0; for i in $(seq 1 300); do "$BIN" -q local::tests::a_write_is_given_up_on_behind_loads_that_keep_failing > /dev/null 2>&1 || h=$((h+1)); done
+          echo "${{ matrix.side }}: loads-failing test, 300 runs, $h failed"
