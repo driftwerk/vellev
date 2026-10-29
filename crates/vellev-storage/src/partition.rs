@@ -15,6 +15,8 @@ use vellev_core::{Embedding, ModelFault, ObjectError};
 use crate::backups::Held;
 use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Linked, Listed, Local, Transfers};
 use crate::catalog::Catalog;
+use crate::stopping::{MergeStage, Stopping};
+use vellev_index::stop::Stop;
 use crate::column::{self, Column, Gathering};
 use crate::coordinator::{
     Cleaned, Clock, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation,
@@ -955,6 +957,24 @@ pub struct Writer {
     /// A gate a merge waits at between its build and its commit, if a test
     /// has set one: see [`Self::hold_merges_before_commit`].
     merge_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
+    /// The stop of the merge under way, if one is: see
+    /// [`Self::stop_merges`].
+    merge_stop: Arc<std::sync::Mutex<Option<Stop>>>,
+    /// The stage a test has each merge stop itself in, if any: see
+    /// [`Self::stop_merges_at`].
+    merge_stop_at: std::sync::Mutex<Option<MergeStage>>,
+}
+
+/// The stop of the merge under way, there until the merge ends, however it
+/// ends.
+struct MergeStopped {
+    under_way: Arc<std::sync::Mutex<Option<Stop>>>,
+}
+
+impl Drop for MergeStopped {
+    fn drop(&mut self) {
+        *self.under_way.lock().expect("merge stop lock") = None;
+    }
 }
 
 /// Where a test holds a merge between its build and its commit: `reached`
@@ -1079,6 +1099,8 @@ impl Writer {
             merge_build: Mutex::new(()),
             keeping: Arc::default(),
             merge_gate: std::sync::Mutex::new(None),
+            merge_stop: Arc::default(),
+            merge_stop_at: std::sync::Mutex::new(None),
         })
     }
 
@@ -2249,12 +2271,29 @@ impl Writer {
     /// neither readers nor commits wait while a large segment is indexed.
     async fn built(
         &self,
-        mut file: SegmentFile,
+        file: SegmentFile,
         vectors: Option<Gathering>,
         catalog: Catalog,
     ) -> Result<Built> {
+        match self.built_stopping(file, vectors, catalog, &Stopping::never()).await? {
+            Some(built) => Ok(built),
+            None => unreachable!("a build nothing stops is never stopped"),
+        }
+    }
+
+    /// As [`Self::built`], giving up, `None`, once `stopping` is stopped:
+    /// asked as the rows are indexed, and before and after they are
+    /// encoded.
+    async fn built_stopping(
+        &self,
+        mut file: SegmentFile,
+        vectors: Option<Gathering>,
+        catalog: Catalog,
+        stopping: &Stopping,
+    ) -> Result<Option<Built>> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
+        let stopping = stopping.clone();
         blocking(move || {
             let vectors = vectors.map(|gathered| gathered.finish(format));
             let indexes = match &vectors {
@@ -2265,6 +2304,7 @@ impl Writer {
                     &Stored::default(),
                     |_, _| {},
                     above,
+                    &stopping,
                 ),
                 None => state::indexed(
                     &catalog,
@@ -2273,18 +2313,28 @@ impl Writer {
                     &Stored::default(),
                     |_, _| {},
                     above,
+                    &stopping,
                 ),
             };
+            let Some(indexes) = indexes else {
+                return Ok(None);
+            };
+            if stopping.stopped(MergeStage::Encoding) {
+                return Ok(None);
+            }
             let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
             let segment = encode_as(Kind::Segment, format, &file)?;
+            if stopping.stopped(MergeStage::Encoding) {
+                return Ok(None);
+            }
             let column = vectors.encode_as(format);
-            Ok(Built {
+            Ok(Some(Built {
                 file,
                 vectors,
                 indexes,
                 segment,
                 column,
-            })
+            }))
         })
         .await?
     }
@@ -2315,6 +2365,23 @@ impl Writer {
     /// sits in the store without its companions, noting each in `staged`
     /// before it goes up.
     async fn upload(&self, prepared: &Prepared, staged: &mut Staged) -> Result<()> {
+        match self.upload_stopping(prepared, staged, &Stopping::never()).await? {
+            true => Ok(()),
+            false => unreachable!("an upload nothing stops is never stopped"),
+        }
+    }
+
+    /// As [`Self::upload`], giving up, `false`, once `stopping` is
+    /// stopped: asked before each file, and while each goes up. A file
+    /// given up part way is aborted as its upload is dropped, its parts
+    /// discarded ([`crate::Transfers`]); those that went up are deleted
+    /// as `staged` is dropped.
+    async fn upload_stopping(
+        &self,
+        prepared: &Prepared,
+        staged: &mut Staged,
+        stopping: &Stopping,
+    ) -> Result<bool> {
         let Prepared { meta, built, index } = prepared;
         let files = [
             meta.vectors.as_deref().map(|key| (key, &built.column)),
@@ -2323,9 +2390,13 @@ impl Writer {
         ];
         for (key, bytes) in files.into_iter().flatten() {
             staged.keys.push(key.to_string());
-            self.partition.blobs.put(key, bytes.clone()).await?;
+            let put = self.partition.blobs.put(key, bytes.clone());
+            match stopping.unless_stopped(MergeStage::Uploading, put).await {
+                Some(put) => put?,
+                None => return Ok(false),
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// An uploaded segment as the state holds it, with its vectors read
@@ -2481,6 +2552,23 @@ impl Writer {
     #[doc(hidden)]
     pub async fn merge_planned_at(&self, planned: Option<u64>) -> Result<Option<LogPosition>> {
         let _merging = self.merge_build.lock().await;
+        // Stopped by whoever lets the tenant go, or finds the lease lost,
+        // from here to the end of loading back what it built: it then gives
+        // up where it is, and leaves nothing (merge note, step 3).
+        let stopping = Stopping::merge(*self.merge_stop_at.lock().expect("merge stop lock"));
+        *self.merge_stop.lock().expect("merge stop lock") = Some(stopping.stop().clone());
+        let _stopped = MergeStopped {
+            under_way: self.merge_stop.clone(),
+        };
+        if stopping.stopped(MergeStage::Planning) {
+            return Ok(None);
+        }
+        // A lease another writer holds now: the merge could never commit,
+        // and is not built for nothing.
+        if !self.still_leased().await? {
+            tracing::warn!("a merge is not made on a lease another writer has taken");
+            return Ok(None);
+        }
         // Planned, and its rows gathered, under the building lock; built,
         // uploaded and loaded without it, so that flushes go on meanwhile;
         // committed under it again, only if nothing put the partition back
@@ -2493,7 +2581,7 @@ impl Writer {
         let above = self.merging.clustered_above;
         let Some((file, vectors, shape, named_at, alive)) = self.partition.read(|state| {
             let named_at = state.position();
-            let (file, vectors) = state.merged(&merge, named_at)?;
+            let (file, vectors) = state.merged(&merge, named_at, &stopping)?;
             let tombstones = file.tombstones.len();
             let shape =
                 Shape::of_gathered(state.catalog(), &file.rows, &vectors, tombstones, above);
@@ -2508,7 +2596,10 @@ impl Writer {
         if self.stale(planned) {
             return Ok(None);
         }
-        let built = self.built(file, Some(vectors), catalog.clone()).await?;
+        let built = self.built_stopping(file, Some(vectors), catalog.clone(), &stopping);
+        let Some(built) = built.await? else {
+            return Ok(None);
+        };
         // Both segments, however large, are uploaded without the writer,
         // under names of their own at the position each was built from;
         // `clean` leaves the merge's while it is under way.
@@ -2518,9 +2609,20 @@ impl Writer {
             built,
             self.writes(),
         )?;
+        if stopping.stopped(MergeStage::Encoding) {
+            return Ok(None);
+        }
         let _keeping = self.keep(&merged.meta);
-        self.upload(&merged, &mut staged).await?;
-        let merged = self.fit(merged, &catalog).await?;
+        if !self.upload_stopping(&merged, &mut staged, &stopping).await? {
+            return Ok(None);
+        }
+        let fit = self.fit(merged, &catalog);
+        let Some(merged) = stopping.unless_stopped(MergeStage::Loading, fit).await else {
+            return Ok(None);
+        };
+        let merged = merged?;
+        // From here the merge commits, or is dropped by what it finds under
+        // the building lock: a stop no longer ends it.
         let gate = self.merge_gate.lock().expect("gate lock").clone();
         if let Some(gate) = gate {
             gate.reached.notify_one();
@@ -2571,6 +2673,37 @@ impl Writer {
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
         Ok(Some(position))
+    }
+
+    /// Stop the merge under way, if one is: it gives up at the next row or
+    /// block of rows it comes to, or at once if it waits on the store or the
+    /// disk, and leaves nothing behind. One past loading back what it built
+    /// commits, or is dropped, as it would have been. A merge begun after
+    /// this is not stopped.
+    pub fn stop_merges(&self) {
+        if let Some(stop) = &*self.merge_stop.lock().expect("merge stop lock") {
+            stop.stop();
+        }
+    }
+
+    /// Have each merge from now on stop itself the first time it asks in
+    /// `stage`, or none if `None`. For tests that show each stage asks.
+    #[doc(hidden)]
+    pub fn stop_merges_at(&self, stage: Option<MergeStage>) {
+        *self.merge_stop_at.lock().expect("merge stop lock") = stage;
+    }
+
+    /// Whether the coordinator says this writer's lease is the one
+    /// committed under still. Only the generation is compared: commits
+    /// under way may have moved the position meanwhile.
+    async fn still_leased(&self) -> Result<bool> {
+        let within = self.commit_within();
+        let asked = self.coordinator.committed(&self.lease.key);
+        let committed = tokio::time::timeout(within, asked).await.map_err(|_| {
+            let reason = format!("the coordinator did not say what is committed within {within:?}");
+            CoordinatorError::backend(std::io::Error::new(std::io::ErrorKind::TimedOut, reason))
+        })??;
+        Ok(committed.is_some_and(|committed| committed.generation == self.lease.generation))
     }
 
     /// Keep `meta`'s files from [`Self::clean`] until what is given back is

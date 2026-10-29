@@ -21,6 +21,7 @@ pub mod prefix;
 mod search;
 pub mod shipper;
 mod state;
+mod stopping;
 mod work;
 
 pub use answers::KEPT_FOR as ANSWERS_KEPT_FOR;
@@ -36,6 +37,7 @@ pub use mutation::{
 };
 pub use partition::{Embedded, Follower, MergeGate, Partition, RestoreFrom, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
+pub use stopping::MergeStage;
 pub use state::{Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM};
 pub use vellev_index::curve;
 pub use vellev_index::filter::{Filter, FilterError};
