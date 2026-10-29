@@ -18,6 +18,7 @@ use roaring::RoaringBitmap;
 use vellev_core::{Distance, SQUARED_LENGTH_UNDER};
 
 use crate::rotation::{Random, Rotation};
+use crate::stop::{Stage, Stop, Stopped};
 
 const LANES: usize = 16;
 
@@ -582,9 +583,6 @@ pub struct Coded {
 }
 
 impl BinaryIndex {
-    /// Index `vectors`, which must be in ascending row order and all of one
-    /// length, for search under `metric`. Returns `None` when there is
-    /// nothing to index.
     /// As [`Self::build`], with codes taken about `centre` (in the rotated
     /// space) rather than about the vectors' own median.
     pub fn build_about(
@@ -592,7 +590,19 @@ impl BinaryIndex {
         vectors: &[(u32, &[f32])],
         centre: Vec<f32>,
     ) -> Option<Self> {
-        let dimensions = vectors.first()?.1.len();
+        Self::build_about_stopping(metric, vectors, centre, &Stop::new()).unwrap_or(None)
+    }
+
+    /// As [`Self::build_about`], asking `stop` as each row is coded.
+    fn build_about_stopping(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        centre: Vec<f32>,
+        stop: &Stop,
+    ) -> Result<Option<Self>, Stopped> {
+        let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
+            return Ok(None);
+        };
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
         let mut index = Self::empty(metric, dimensions, centre);
@@ -606,6 +616,7 @@ impl BinaryIndex {
             .par_chunks_mut(words)
             .zip(measured.par_iter())
             .map(|(code, (_, vector))| {
+                stop.check(Stage::Coding)?;
                 let vector = rotation.apply(&normalised(metric, vector));
                 code.iter_mut()
                     .zip(encode(centre, &vector))
@@ -615,14 +626,14 @@ impl BinaryIndex {
                     Distance::L2 => squared,
                     Distance::Dot | Distance::Cosine => -along,
                 };
-                (term, squared.sqrt())
+                Ok((term, squared.sqrt()))
             })
-            .collect();
+            .collect::<Result<_, Stopped>>()?;
         index.rows = measured.iter().map(|(row, _)| *row).collect();
         index.codes = codes;
         index.factors = factors;
         index.unmeasured = unmeasured.iter().map(|(row, _)| *row).collect();
-        Some(index)
+        Ok(Some(index))
     }
 
     /// An index of `dimensions`, of no rows yet, its codes taken about
@@ -647,8 +658,24 @@ impl BinaryIndex {
         }
     }
 
+    /// Index `vectors`, which must be in ascending row order and all of one
+    /// length, for search under `metric`. Returns `None` when there is
+    /// nothing to index.
     pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
-        let dimensions = vectors.first()?.1.len();
+        Self::build_stopping(metric, vectors, &Stop::new()).unwrap_or(None)
+    }
+
+    /// As [`Self::build`], giving up with [`Stopped`] once `stop` is
+    /// stopped: asked as each row is sampled for the centre, and as each
+    /// is coded.
+    pub fn build_stopping(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        stop: &Stop,
+    ) -> Result<Option<Self>, Stopped> {
+        let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
+            return Ok(None);
+        };
         let rotation = Rotation::new(dimensions, ROTATION_SEED);
         let measured: Vec<&[f32]> = vectors
             .iter()
@@ -658,10 +685,13 @@ impl BinaryIndex {
         let sampled: Vec<Vec<f32>> = Random(ROTATION_SEED)
             .sample(measured.len(), CENTRE_SAMPLE)
             .into_par_iter()
-            .map(|at| rotation.apply(&normalised(metric, measured[at])))
-            .collect();
+            .map(|at| {
+                stop.check(Stage::Sampling)?;
+                Ok(rotation.apply(&normalised(metric, measured[at])))
+            })
+            .collect::<Result<_, Stopped>>()?;
         let centre = median(rotation.width, sampled.iter().map(Vec::as_slice));
-        Self::build_about(metric, vectors, centre)
+        Self::build_about_stopping(metric, vectors, centre, stop)
     }
 
     /// An index of no rows yet, its codes to be taken about the mean of
