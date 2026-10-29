@@ -25,10 +25,14 @@ const LANES: usize = 16;
 /// wide vector instructions without any being named; on x86-64 with AVX2,
 /// in those instructions, to the same result bit for bit (see [`f32s`]).
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    // Of other lengths the ways would pair other elements in the tail.
+    debug_assert_eq!(a.len(), b.len());
     (f32s::chosen().dot)(a, b)
 }
 
 pub fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
+    // Of other lengths the ways would pair other elements in the tail.
+    debug_assert_eq!(a.len(), b.len());
     (f32s::chosen().squared_l2)(a, b)
 }
 
@@ -39,6 +43,8 @@ pub fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
 /// times slower, so a squared length to set beside these must be taken
 /// from here too.
 fn dot_and_norm(a: &[f32], b: &[f32]) -> (f32, f32) {
+    // Of other lengths the ways would pair other elements in the tail.
+    debug_assert_eq!(a.len(), b.len());
     (f32s::chosen().dot_and_norm)(a, b)
 }
 
