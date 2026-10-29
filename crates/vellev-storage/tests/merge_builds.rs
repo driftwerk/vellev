@@ -586,3 +586,57 @@ async fn a_merge_while_its_writer_restores_takes_no_turn() {
     let next = within(60, "the next merge never ended", writer.merge()).await;
     assert!(next.unwrap().is_some());
 }
+
+/// A store that, once armed, fails every write of a manifest.
+#[derive(Debug)]
+struct NoManifests {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+}
+
+#[async_trait]
+impl Blobs for NoManifests {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if self.armed.load(Ordering::SeqCst) && key.contains("/manifest/") {
+            return Err(StorageError::Blob {
+                key: key.into(),
+                source: "connection reset".into(),
+            });
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A merge whose commit fails once it has kept its files gives its turn
+/// back, though its store keeps them, as one in memory does: from there
+/// they are the partition's to clean up, not the merge's to delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_whose_commit_fails_once_its_files_are_kept_gives_its_turn_back() {
+    let builds = MergeBuilds::new(1);
+    let mut cluster = Cluster::new().await;
+    let failing = Arc::new(NoManifests {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+    });
+    cluster.blobs = failing.clone();
+    let writer = flushed(&cluster, &builds, 2).await;
+    failing.armed.store(true, Ordering::SeqCst);
+    let merged = within(60, "the merge never ended", writer.merge()).await;
+    assert!(
+        merged.is_err(),
+        "a merge whose manifest is refused committed"
+    );
+    until(5, "a merge whose commit failed kept its turn", || {
+        builds.under_way() == 0 && builds.turns_free() == 1
+    })
+    .await;
+}
