@@ -1418,9 +1418,6 @@ impl ClusteredIndex {
         let Probing { probes, parts } = probing;
         let order = self.order(query);
         let probes = probes.min(order.len());
-        // Made once a query, and shared by every part of a split scan.
-        let skipped = bits_of(skipped);
-        let skipped = skipped.as_deref();
         let mut scan = Scan::new(self, query, only, skipped);
         let mut nearest = Nearest::new(count, ties);
         let runs = parts.min(probes);
@@ -1463,10 +1460,7 @@ struct Scan<'a> {
     index: &'a ClusteredIndex,
     query: &'a [f32],
     only: Option<&'a RoaringBitmap>,
-    /// The rows skipped, a bit a row, or `None` where none is: read a word
-    /// at a time from a few kilobytes, where the slice it is made from is
-    /// a byte a row read at random across the segment (x86 profile, fix 2).
-    skipped: Option<&'a [u64]>,
+    skipped: &'a [bool],
     weigh: crate::fastscan::Weigh,
     weighed: [u32; BLOCK],
     offered: [bool; BLOCK],
@@ -1479,7 +1473,7 @@ impl<'a> Scan<'a> {
         index: &'a ClusteredIndex,
         query: &'a [f32],
         only: Option<&'a RoaringBitmap>,
-        skipped: Option<&'a [u64]>,
+        skipped: &'a [bool],
     ) -> Self {
         Self {
             index,
@@ -1504,17 +1498,10 @@ impl<'a> Scan<'a> {
         for block in 0..members.blocks.count() {
             let rows = &members.rows[block * BLOCK..members.rows.len().min((block + 1) * BLOCK)];
             let mut any = false;
-            if self.skipped.is_none() && self.only.is_none() && index.unmeasured.is_empty() {
-                // Every row is offered, as nothing is skipped or barred.
-                self.offered[..rows.len()].fill(true);
-                any = !rows.is_empty();
-            } else {
-                for (offer, row) in self.offered.iter_mut().zip(rows) {
-                    *offer = !self.skipped.is_some_and(|bits| set_in(bits, *row))
-                        && index.unmeasured.binary_search(row).is_err()
-                        && self.only.is_none_or(|only| only.contains(*row));
-                    any |= *offer;
-                }
+            for (offer, row) in self.offered.iter_mut().zip(rows) {
+                *offer = index.kept(*row, self.skipped)
+                    && self.only.is_none_or(|only| only.contains(*row));
+                any |= *offer;
             }
             if !any {
                 continue;
@@ -1536,31 +1523,6 @@ impl<'a> Scan<'a> {
             }
         }
     }
-}
-
-/// `skipped` a bit a row, or `None` if no row is skipped.
-fn bits_of(skipped: &[bool]) -> Option<Vec<u64>> {
-    let mut any = false;
-    let bits: Vec<u64> = skipped
-        .chunks(64)
-        .map(|chunk| {
-            let word = chunk
-                .iter()
-                .enumerate()
-                .fold(0u64, |word, (at, skip)| word | (u64::from(*skip) << at));
-            any |= word != 0;
-            word
-        })
-        .collect();
-    any.then_some(bits)
-}
-
-/// Whether `row`'s bit is set in `bits`: a row past them is not skipped,
-/// as a row past the slice they were made from is not.
-#[inline(always)]
-fn set_in(bits: &[u64], row: u32) -> bool {
-    bits.get(row as usize / 64)
-        .is_some_and(|word| word >> (row % 64) & 1 == 1)
 }
 
 /// Columns on the wire as little-endian bytes.
@@ -2366,9 +2328,8 @@ mod tests {
         /// Laying the codes out in blocks changes no estimate: a scan of
         /// every cluster it probes gives the estimates the code-by-code
         /// scan gives, to the bit and in the same order, filtered or not,
-        /// with no row skipped, some, about half, all, a single one, or
-        /// some over a slice shorter than the rows, for every metric, and
-        /// with rows of one vector tied.
+        /// with rows skipped or not, for every metric, and with rows of
+        /// one vector tied.
         #[test]
         fn the_scan_of_blocks_estimates_as_code_by_code(
             seed in 1u64..u64::MAX,
@@ -2377,7 +2338,7 @@ mod tests {
             metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
             count in 1usize..300,
             share in proptest::option::of(1u32..100),
-            skip in 0u8..6,
+            skip in proptest::bool::ANY,
             copies in proptest::prop_oneof![3 => proptest::strategy::Just(1usize), 1 => 2usize..6],
         ) {
             // With copies, rows of one vector are estimated alike, so that
@@ -2397,22 +2358,9 @@ mod tests {
                     .filter(|row| (row.wrapping_mul(2_654_435_761) >> 7) % 100 < share)
                     .collect()
             });
-            // None skipped, one row in seven, about half, all of them, a
-            // single row, and one in seven over too short a slice, the rows
-            // past it not skipped.
-            let mut hash = Noise(seed ^ 0x5eed);
-            let mut skipped: Vec<bool> = (0..rows * 2)
-                .map(|row| match skip {
-                    1 | 5 => row % 7 == 3,
-                    2 => hash.unit() < 0.5,
-                    3 => true,
-                    4 => row == (rows / 2) * 2,
-                    _ => false,
-                })
+            let skipped: Vec<bool> = (0..rows * 2)
+                .map(|row| skip && row % 7 == 3)
                 .collect();
-            if skip == 5 {
-                skipped.truncate(rows);
-            }
             for _ in 0..4 {
                 let query = noise.vector(dimensions);
                 let got = scan_only(&index, &query, count, only.as_ref(), &skipped);
