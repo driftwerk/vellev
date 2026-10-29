@@ -68,6 +68,8 @@ struct Built {
     indexes: Indexes,
     segment: Bytes,
     column: Bytes,
+    /// What its rows and indexes come to, for a later merge's reckoning.
+    parts: state::Parts,
     /// Carried as a test asks: see [`MergeBuilds::probe`].
     _probe: Option<Probe>,
 }
@@ -131,6 +133,8 @@ fn segment_built(
         return Ok(None);
     }
     let column = vectors.encode_as(format);
+    // Here, off the async threads and the state's lock, once.
+    let parts = state::Parts::of(&file, &indexes);
     if let Some(build) = build {
         build.held_here(stopping, true);
     }
@@ -140,6 +144,7 @@ fn segment_built(
         indexes,
         segment,
         column,
+        parts,
         _probe: probe,
     }))
 }
@@ -2624,6 +2629,7 @@ impl Writer {
             indexes: Some(Arc::new(built.indexes)),
             stored: Stored::default(),
             tokenized_on: 0,
+            parts: Some(built.parts),
         };
         Ok((meta, loaded))
     }
@@ -2850,19 +2856,19 @@ impl Writer {
             .partition
             .read(|state| state.merge_reckoning(&merge, above));
         build.reckon_planned(reckoning.peak());
-        let Some((file, vectors, shape, named_at, alive)) = self.partition.read(|state| {
+        let Some((file, vectors, copied, shape, named_at, alive)) = self.partition.read(|state| {
             let named_at = state.position();
-            let (file, vectors) = state.merged(&merge, named_at, &stopping)?;
+            let (file, vectors, copied) = state.merged(&merge, named_at, &stopping)?;
             let tombstones = file.tombstones.len();
             let shape =
                 Shape::of_gathered(state.catalog(), &file.rows, &vectors, tombstones, above);
-            Some((file, vectors, shape, named_at, state.alive(&merge)))
+            Some((file, vectors, copied, shape, named_at, state.alive(&merge)))
         }) else {
             return Ok(None);
         };
         let catalog = self.partition.read(|state| state.catalog().clone());
         drop(planning);
-        let reckoning = reckoning.gathered(&file, &vectors);
+        let reckoning = reckoning.gathered(file.rows.len(), copied, &vectors);
         build.reckon(reckoning.peak());
         // A merge planned at another epoch than this is dropped before any
         // work is spent on it, and again at its commit below.
