@@ -224,9 +224,7 @@ async fn a_merge_on_a_lease_already_taken_uploads_nothing() {
     let writer = two_large(&cluster).await;
     let _owner = cluster.writer().await;
     paused.armed.store(true, Ordering::SeqCst);
-    let merged = tokio::time::timeout(Duration::from_secs(120), writer.merge())
-        .await
-        .expect("the merge ends without anything going up");
+    let merged = within(30, "a merge on a lost lease went on to upload", writer.merge()).await;
     assert!(!matches!(merged, Ok(Some(_))), "{merged:?}");
     while let Ok(event) = seen.try_recv() {
         assert_ne!(event, "stored", "a merge on a lost lease uploaded a file");
