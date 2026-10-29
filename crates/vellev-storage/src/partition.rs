@@ -2320,11 +2320,19 @@ impl Writer {
     ) -> Result<Option<Built>> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
-        let (waiting, stopping) = (stopping.clone(), stopping.clone());
-        // Its turn among the work off the async threads waited for as the
-        // merge's stop is: dropped before it begins, the work never runs,
-        // and begun, it asks the stop itself.
-        let built = blocking(move || {
+        // Its turn among the work off the async threads is waited for as
+        // the merge's stop is: given up before it begins, the work never
+        // runs. Once begun it is waited for to its end, which comes at the
+        // stop as it asks it: so that the merge gives up only once what the
+        // work holds is let go, not while it runs on unseen.
+        let turn = working().acquire_owned();
+        let turn = match stopping.unless_stopped(MergeStage::Turn, turn).await {
+            Some(turn) => turn.map_err(|error| StorageError::Background(error.to_string()))?,
+            None => return Ok(None),
+        };
+        let stopping = stopping.clone();
+        at_once(move || {
+            let _turn = turn;
             assert!(!stopping.panics(), "a merge's build panics, as a test asks");
             let vectors = vectors.map(|gathered| gathered.finish(format));
             let indexes = match &vectors {
@@ -2366,11 +2374,8 @@ impl Writer {
                 segment,
                 column,
             }))
-        });
-        match waiting.unless_stopped(MergeStage::Turn, built).await {
-            Some(built) => built?,
-            None => Ok(None),
-        }
+        })
+        .await?
     }
 
     /// A built segment as `meta` names it, with its index file's frame if
