@@ -850,10 +850,10 @@ mod tests {
         let (local, runs) = local(0);
         let long = start(&local, texts("d", 70), Purpose::Document);
         assert_eq!(runs.next(), texts("d", 70)[..32]);
-        let short: Vec<_> = (0..3)
-            .map(|n| start(&local, vec![format!("s{n}")], Purpose::Document))
-            .collect();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut short = Vec::new();
+        for n in 0..3 {
+            short.push(sent(&local, vec![format!("s{n}")], Purpose::Document).await);
+        }
         runs.let_through(4);
         assert_eq!(runs.next(), texts("d", 70)[32..64]);
         let last = runs.next();
@@ -879,11 +879,10 @@ mod tests {
         let (local, runs) = local(0);
         let documents = start(&local, texts("d", 64), Purpose::Document);
         assert_eq!(runs.next(), texts("d", 64)[..32]);
-        let abandoned = start(&local, texts("gone", 5), Purpose::Document);
-        let query = start(&local, vec!["q".into()], Purpose::Query);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        abandoned.abort();
-        let _ = abandoned.await;
+        let abandoned = sent(&local, texts("gone", 5), Purpose::Document).await;
+        let query = sent(&local, vec!["q".into()], Purpose::Query).await;
+        // Its caller leaves, as one whose request is dropped does.
+        drop(abandoned);
 
         runs.let_through(3);
         assert_eq!(runs.next(), ["q"]);
@@ -900,10 +899,8 @@ mod tests {
         let (local, runs) = local(0);
         let first = start(&local, texts("d", 32), Purpose::Document);
         assert_eq!(runs.next().len(), 32);
-        let abandoned = start(&local, texts("gone", 5), Purpose::Query);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        abandoned.abort();
-        let _ = abandoned.await;
+        let abandoned = sent(&local, texts("gone", 5), Purpose::Query).await;
+        drop(abandoned);
 
         runs.let_through(2);
         assert_eq!(first.await.unwrap().unwrap().len(), 32);
@@ -922,11 +919,11 @@ mod tests {
         // Ten runs of documents from one caller, and more from others.
         let long = start(&local, texts("d", 320), Purpose::Document);
         assert_eq!(runs.next(), texts("d", 320)[..32]);
-        let others: Vec<_> = (0..5)
-            .map(|n| start(&local, texts(&format!("o{n}-"), 40), Purpose::Document))
-            .collect();
-        let query = start(&local, vec!["q".into()], Purpose::Query);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut others = Vec::new();
+        for n in 0..5 {
+            others.push(sent(&local, texts(&format!("o{n}-"), 40), Purpose::Document).await);
+        }
+        let query = sent(&local, vec!["q".into()], Purpose::Query).await;
 
         // The run under way cannot be stopped. The next is the query's,
         // and the query's alone.
@@ -938,8 +935,7 @@ mod tests {
 
         // So is each query that comes while documents are run.
         for n in 0..3 {
-            let query = start(&local, vec![format!("again{n}")], Purpose::Query);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let query = sent(&local, vec![format!("again{n}")], Purpose::Query).await;
             runs.let_through(2);
             assert_eq!(runs.next(), [format!("again{n}")]);
             assert_eq!(query.await.unwrap().unwrap(), [vec![6.0]]);
@@ -977,13 +973,10 @@ mod tests {
         let (local, runs) = local(0);
         let first = start(&local, texts("d", 32), Purpose::Document);
         assert_eq!(runs.next().len(), 32);
-        let failing = start(&local, vec!["fail".into()], Purpose::Document);
-        let beside = start(&local, vec!["beside".into()], Purpose::Document);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let after = start(&local, texts("e", 40), Purpose::Document);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let behind = start(&local, texts("f", 5), Purpose::Document);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let failing = sent(&local, vec!["fail".into()], Purpose::Document).await;
+        let beside = sent(&local, vec!["beside".into()], Purpose::Document).await;
+        let after = sent(&local, texts("e", 40), Purpose::Document).await;
+        let behind = sent(&local, texts("f", 5), Purpose::Document).await;
         runs.let_through(4);
         assert_eq!(first.await.unwrap().unwrap().len(), 32);
         assert_eq!(failing.await.unwrap(), Err(failed("told to")));
@@ -1536,11 +1529,14 @@ mod tests {
         assert_eq!(runs.next(), ["hold"]);
         // While the model is held: seventy texts to write, and three
         // hundred searches.
-        let write = start(&local, texts("d", 70), Purpose::Document);
+        // The write is sent, not only on its way, before the searches and
+        // before the model is let go: else it may come after the first
+        // run of searches, and wait through three (CI run 40773229531).
+        let write = sent(&local, texts("d", 70), Purpose::Document).await;
         let searches: Vec<_> = (0..300)
             .map(|n| start(&local, vec![format!("q{n}")], Purpose::Query))
             .collect();
-        until(|| WAITING - local.jobs.capacity() >= 200).await;
+        until(|| WAITING - local.jobs.capacity() >= 201).await;
         runs.let_through(1);
         hold.await.unwrap().unwrap();
         // Two runs of searches, then one of the write, and so on: the
@@ -1714,13 +1710,13 @@ mod tests {
         let (local, runs) = local_timed("stand-in", 0, alone(), clock.clone());
         let embedder = Arc::new(giving(&local, ms(200)));
         // Each a run by itself: a text that fails and three that fill it.
-        let failing: Vec<_> = (0..200)
-            .map(|_| {
-                let mut texts = vec!["fail".to_string()];
-                texts.extend((0..3).map(|n| format!("{n}{}", "x".repeat(READS))));
-                start(&local, texts, Purpose::Document)
-            })
-            .collect();
+        // Each sent, not only on its way, before the write behind them.
+        let mut failing = Vec::new();
+        for _ in 0..200 {
+            let mut texts = vec!["fail".to_string()];
+            texts.extend((0..3).map(|n| format!("{n}{}", "x".repeat(READS))));
+            failing.push(sent(&local, texts, Purpose::Document).await);
+        }
         assert_eq!(runs.next().len(), 4);
         let behind = {
             let embedder = embedder.clone();
@@ -1807,14 +1803,14 @@ mod tests {
         let local = Local::spawn_timed("stand-in", load, alone(), clock.clone());
         let local = Arc::new(local.unwrap());
         let embedder = Arc::new(giving(&local, ms(200)));
-        let ahead: Vec<_> = (0..200)
-            .map(|_| {
-                let texts = (0..4)
-                    .map(|n| format!("{n}{}", "x".repeat(READS)))
-                    .collect();
-                start(&local, texts, Purpose::Document)
-            })
-            .collect();
+        // Each sent, not only on its way, before the write behind them.
+        let mut ahead = Vec::new();
+        for _ in 0..200 {
+            let texts = (0..4)
+                .map(|n| format!("{n}{}", "x".repeat(READS)))
+                .collect();
+            ahead.push(sent(&local, texts, Purpose::Document).await);
+        }
         let loaded = || loads.load(std::sync::atomic::Ordering::SeqCst);
         until(|| loaded() == 1).await;
         let began = clock.now();
@@ -1845,9 +1841,8 @@ mod tests {
         let stopped = failed("the model has made nothing for anyone in 400ms");
         assert_eq!(behind.await.unwrap(), Err(stopped));
         assert_eq!(took, ms(700));
-        for write in ahead {
-            write.abort();
-        }
+        // Their callers leave.
+        drop(ahead);
     }
 
     /// A load longer than a write is given to wait, that then fails: the
@@ -1906,13 +1901,13 @@ mod tests {
         let clock = crate::clock::Manual::new();
         let (local, runs) = local_timed("stand-in", 0, alone(), clock.clone());
         let embedder = Arc::new(giving(&local, ms(200)));
-        let panicking: Vec<_> = (0..200)
-            .map(|_| {
-                let mut texts = vec!["panic".to_string()];
-                texts.extend((0..3).map(|n| format!("{n}{}", "x".repeat(READS))));
-                start(&local, texts, Purpose::Document)
-            })
-            .collect();
+        // Each sent, not only on its way, before the write behind them.
+        let mut panicking = Vec::new();
+        for _ in 0..200 {
+            let mut texts = vec!["panic".to_string()];
+            texts.extend((0..3).map(|n| format!("{n}{}", "x".repeat(READS))));
+            panicking.push(sent(&local, texts, Purpose::Document).await);
+        }
         assert_eq!(runs.next().len(), 4);
         let behind = {
             let embedder = embedder.clone();
@@ -1935,9 +1930,8 @@ mod tests {
         let stopped = failed("the model has made nothing for anyone in 400ms");
         assert_eq!(behind.await.unwrap(), Err(stopped));
         assert_eq!(took, ms(400));
-        for write in panicking {
-            write.abort();
-        }
+        // Their callers leave.
+        drop(panicking);
     }
 
     /// A model that has loaded was at work until then: a write that
