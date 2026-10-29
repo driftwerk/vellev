@@ -43,5 +43,6 @@ jobs:
       - name: CPU
         run: lscpu | grep -E "Model name|^CPU\(s\)"
       - name: Marks given or not, alternately, three rounds
-        run: "$RUNNER_TEMP/marks" "$RUNNER_TEMP/fixture" 912500 560
+        run: |
+          "$RUNNER_TEMP/marks" "$RUNNER_TEMP/fixture" 912500 560
 
