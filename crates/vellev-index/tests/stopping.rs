@@ -109,6 +109,16 @@ fn a_build_stopped_in_any_pass_gives_up_there() {
             Some(Stopped),
             "a clustered build stopped in {stage:?}"
         );
+        // Waiting for the turn to tune, which only a build that has to wait
+        // asks in, comes before tuning: a build stopped before it never
+        // comes to wait either.
+        if CLUSTERED[at] != Stage::Tuning && CLUSTERED[at] != Stage::Ranking {
+            assert_eq!(
+                stop.checks(Stage::Waiting),
+                0,
+                "stopped in {stage:?}, it went on to wait to tune"
+            );
+        }
         for later in &CLUSTERED[at + 1..] {
             assert_eq!(
                 stop.checks(*later),
