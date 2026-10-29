@@ -975,6 +975,9 @@ pub struct Writer {
     /// How many merges were stopped only once they had loaded back what
     /// they built, past where a stop ends them.
     stops_past_loading: AtomicU64,
+    /// Whether the merge under way is past loading back what it built,
+    /// from where a stop no longer ends it.
+    merge_past_loading: AtomicBool,
 }
 
 /// The stop of the merge under way, there until the merge ends, however it
@@ -1124,6 +1127,7 @@ impl Writer {
             merges_stopped: AtomicU64::new(0),
             merge_panics: AtomicBool::new(false),
             stops_past_loading: AtomicU64::new(0),
+            merge_past_loading: AtomicBool::new(false),
         })
     }
 
@@ -2453,7 +2457,8 @@ impl Writer {
                     staged.putting.pop();
                     match failed.try_into_panic() {
                         Ok(panic) => std::panic::resume_unwind(panic),
-                        Err(_) => unreachable!("an upload's task is never aborted"),
+                        // Cancelled, as the runtime shuts down.
+                        Err(failed) => return Err(StorageError::Background(failed.to_string())),
                     }
                 }
                 None => return Ok(false),
@@ -2621,7 +2626,11 @@ impl Writer {
         // up where it is, and leaves nothing (merge note, step 3).
         let panics = self.merge_panics.load(Ordering::SeqCst);
         let stopping = Stopping::merge(*lock(&self.merge_stop_at), panics);
-        *lock(&self.merge_stop) = Some(stopping.stop().clone());
+        {
+            let mut under_way = lock(&self.merge_stop);
+            self.merge_past_loading.store(false, Ordering::SeqCst);
+            *under_way = Some(stopping.stop().clone());
+        }
         let _stopped = MergeStopped {
             under_way: self.merge_stop.clone(),
         };
@@ -2695,7 +2704,20 @@ impl Writer {
         };
         let merged = merged?;
         // From here the merge commits, or is dropped by what it finds under
-        // the building lock: a stop no longer ends it.
+        // the building lock: a stop no longer ends it. Marked so under the
+        // lock a stop is asked under, so that every stop is either heeded
+        // here or found too late by whoever asked it.
+        let heeded = {
+            let _under_way = lock(&self.merge_stop);
+            let heeded = stopping.is_stopped();
+            if !heeded {
+                self.merge_past_loading.store(true, Ordering::SeqCst);
+            }
+            heeded
+        };
+        if heeded {
+            return Ok(None);
+        }
         let gate = self.merge_gate.lock().expect("gate lock").clone();
         if let Some(gate) = gate {
             gate.reached.notify_one();
@@ -2745,12 +2767,6 @@ impl Writer {
         })
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        // A stop that came once what was built was loaded back, too late
-        // to end the merge, is counted: for tests that tell a stop too late
-        // from one not heeded.
-        if stopping.is_stopped() {
-            self.stops_past_loading.fetch_add(1, Ordering::SeqCst);
-        }
         Ok(Some(position))
     }
 
@@ -2762,6 +2778,11 @@ impl Writer {
     pub fn stop_merges(&self) {
         self.merges_stopped.fetch_add(1, Ordering::SeqCst);
         if let Some(stop) = &*lock(&self.merge_stop) {
+            // Too late for one past loading back: counted, for tests that
+            // tell a stop too late from one not heeded.
+            if self.merge_past_loading.load(Ordering::SeqCst) {
+                self.stops_past_loading.fetch_add(1, Ordering::SeqCst);
+            }
             stop.stop();
         }
     }
@@ -2773,9 +2794,8 @@ impl Writer {
         self.merge_panics.store(panics, Ordering::SeqCst);
     }
 
-    /// How many merges were stopped too late: only once they had loaded
-    /// back what they built, from where they commit whatever comes. For
-    /// tests.
+    /// How many stops came too late: to a merge already past loading back
+    /// what it built, from where it commits whatever comes. For tests.
     #[doc(hidden)]
     pub fn stops_past_loading(&self) -> u64 {
         self.stops_past_loading.load(Ordering::SeqCst)
@@ -3395,11 +3415,8 @@ impl Drop for Turn<'_> {
 struct Staged {
     blobs: Arc<dyn Blobs>,
     keys: Vec<String>,
-    /// Uploads under way, each on a task of its own: the files of one given
-    /// up on are deleted at once and again once it has settled, as it may
-    /// yet land (a local store writes on a blocking thread, and a store's
-    /// last request of an upload in parts may be answered after it was
-    /// sent).
+    /// Uploads under way, each on a task of its own: one given up on is
+    /// aborted, and its files deleted once it has ended.
     putting: Vec<tokio::task::JoinHandle<Result<()>>>,
 }
 
@@ -3412,15 +3429,20 @@ impl Staged {
 
 impl Drop for Staged {
     fn drop(&mut self) {
+        // Uploads under way are aborted, whatever else: an upload in parts
+        // is then aborted at the store, as its guards are dropped with it,
+        // and the bytes it holds are let go, rather than the whole file
+        // going up for nothing.
+        let putting = std::mem::take(&mut self.putting);
+        putting.iter().for_each(tokio::task::JoinHandle::abort);
         let (false, Ok(runtime)) = (self.keys.is_empty(), tokio::runtime::Handle::try_current())
         else {
             return;
         };
         let (blobs, keys) = (self.blobs.clone(), std::mem::take(&mut self.keys));
-        let putting = std::mem::take(&mut self.putting);
         // Counted as on its way, as an upload's abort is, so that a
-        // process that stops waits for the deletes, and for the uploads
-        // they wait on, for as long as it gives them.
+        // process that stops waits for the deletes for as long as it gives
+        // them.
         let deleting = crate::blobs::Aborts::process().begun();
         runtime.spawn(async move {
             let _deleting = deleting;
@@ -3434,16 +3456,17 @@ impl Drop for Staged {
                     }
                 }
             };
-            // At once, so that what went up goes as soon as it can; and
-            // again once each upload under way has settled, at its bound
-            // at the latest, as one may land after the first delete.
-            delete(keys.clone()).await;
-            if !putting.is_empty() {
-                for put in putting {
-                    let _ = put.await;
-                }
-                delete(keys).await;
+            // Once each upload aborted has ended. A file a store was
+            // already writing may land after this all the same: a local
+            // store writes and renames on a blocking thread that an abort
+            // does not stop, and a store may answer the last request of an
+            // upload in parts after it was sent. Such a file is referenced
+            // by nothing and kept by nothing, and cleaning up deletes it
+            // once it is older than the grace.
+            for put in putting {
+                let _ = put.await;
             }
+            delete(keys).await;
         });
     }
 }
