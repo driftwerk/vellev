@@ -109,6 +109,11 @@ impl Blocks {
     pub(crate) fn ones(&self, row: usize) -> u32 {
         u32::from(self.ones[row])
     }
+
+    /// The set-bit counts of block `block`'s rows.
+    pub(crate) fn ones_of_block(&self, block: usize) -> &[u16] {
+        &self.ones[block * BLOCK..self.rows.min((block + 1) * BLOCK)]
+    }
 }
 
 /// A query's levels, one a dimension, as tables of what each four bits of
