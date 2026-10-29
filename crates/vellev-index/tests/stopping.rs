@@ -201,3 +201,46 @@ fn a_stopped_build_waiting_its_turn_to_tune_gives_up() {
         assert!(asked.elapsed() < Duration::from_secs(60));
     });
 }
+
+/// A turn given up by a stopped waiter is passed over: whoever waits after
+/// it tunes once the turn before is done, never waiting on the one that
+/// left.
+#[test]
+fn a_turn_given_up_is_passed_over() {
+    let (holding, held) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let holder = scope.spawn(move || {
+            vellev_index::pool::tune(&Stop::new(), move || {
+                holding.send(()).unwrap();
+                let _ = released.recv_timeout(Duration::from_secs(300));
+            })
+        });
+        held.recv().unwrap();
+        let leaving = Stop::counting();
+        let leaver = leaving.clone();
+        let left = scope.spawn(move || vellev_index::pool::tune(&leaving, || ()));
+        let began = Instant::now();
+        while leaver.checks(Stage::Waiting) == 0 && began.elapsed() < Duration::from_secs(60) {
+            std::thread::park_timeout(Duration::from_millis(5));
+        }
+        let waiting = Stop::counting();
+        let waiter = waiting.clone();
+        let after = scope.spawn(move || vellev_index::pool::tune(&waiting, || "tuned"));
+        while waiter.checks(Stage::Waiting) == 0 && began.elapsed() < Duration::from_secs(60) {
+            std::thread::park_timeout(Duration::from_millis(5));
+        }
+        leaver.stop();
+        assert_eq!(left.join().unwrap(), Err(Stopped));
+        release.send(()).unwrap();
+        holder.join().unwrap().expect("the holder never stopped");
+        let (done, finished) = mpsc::channel();
+        scope.spawn(move || {
+            let _ = done.send(after.join().unwrap());
+        });
+        let answer = finished.recv_timeout(Duration::from_secs(60));
+        // Let a waiter stuck behind the turn that left go, for the scope.
+        waiter.stop();
+        assert_eq!(answer.expect("the turn after one given up never came"), Ok("tuned"));
+    });
+}
