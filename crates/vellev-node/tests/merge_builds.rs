@@ -347,3 +347,55 @@ async fn what_a_stopped_merge_drains_counts_against_the_budget() {
     .await;
     assert_eq!(builds.draining(), 0);
 }
+
+/// A tenant's flushes never wait behind other tenants' merges: with every
+/// turn held by other tenants' builds, a tenant written to steadily, whose
+/// own merge waits for a turn, goes on flushing, and none of its writes is
+/// refused for its backlog. Its merge is made once a turn is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_s_flushes_never_wait_behind_other_tenants_merges() {
+    let node = node(|settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    four_flushes(&node, "first").await;
+    four_flushes(&node, "second").await;
+    until(30, "two merges never came to build", || builds.held() == 2).await;
+    // Four flushes: its merge is due, and waits for a turn.
+    four_flushes(&node, "written").await;
+    let written = node.tenant(&tenant("written")).await.unwrap();
+    let segments = || written.read(|state| state.segments().count());
+    let before = segments();
+    // Fifteen flushes' worth over three seconds, steadily: the backlog,
+    // four flushes' worth, is reached in under a second if none is made.
+    for round in 0..30 {
+        let batch: Vec<Mutation> = (0..NOTES / 2)
+            .map(|n| note(1_000 + round * NOTES + n))
+            .collect();
+        let wrote = written.write(batch).await;
+        assert!(
+            wrote.is_ok(),
+            "a write was refused while other tenants' merges held every turn: {wrote:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        segments() >= before + 10,
+        "the tenant flushed {} times while other tenants' merges held every turn",
+        segments() - before
+    );
+    assert_eq!(builds.held(), 2, "the tenant's merge built without a turn");
+    builds.hold(None);
+    until(
+        60,
+        "the tenant's merge was never made once a turn was free",
+        || segments() == 1,
+    )
+    .await;
+    until(30, "a build was left counted under way", || {
+        builds.under_way() == 0
+    })
+    .await;
+}
