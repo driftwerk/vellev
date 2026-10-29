@@ -1,8 +1,8 @@
-name: Merge stop timed (scratch)
+name: Merge stop timed, planted (scratch)
 
 on:
   push:
-    branches: [scratch-merge-stop]
+    branches: [scratch-merge-stop-plant]
 
 permissions:
   contents: read

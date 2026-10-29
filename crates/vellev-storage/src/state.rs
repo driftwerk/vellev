@@ -983,8 +983,7 @@ pub(crate) fn indexed_stopping<'a>(
             None if clustered_above
                 .is_some_and(|above| vectors.len() > above.max(SHORTLIST_ABOVE)) =>
             {
-                ClusteredIndex::build_stopping(schema.distance, vectors, stop)
-                    .ok()?
+                ClusteredIndex::build(schema.distance, vectors)
                     .map(|clustered| Vectors::Clustered(Arc::new(clustered)))
             }
             None => BinaryIndex::build_stopping(schema.distance, vectors, stop)
