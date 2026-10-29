@@ -8,10 +8,14 @@ if w=='fma':
         pub(super) fn estimate(''','''        #[target_feature(enable = "avx2,fma")]
         pub(super) fn estimate(''',1)
 elif w=='order':
-    old='''                        _mm256_add_ps(_mm256_mul_ps(n, n), _mm256_set1_ps(probe.norm_squared)),
-                        _mm256_mul_ps(_mm256_mul_ps(two, n), inner),'''
-    new='''                        _mm256_add_ps(_mm256_mul_ps(n, n), _mm256_set1_ps(probe.norm_squared)),
-                        _mm256_mul_ps(two, _mm256_mul_ps(n, inner)),'''
+    old='''                    Distance::L2 => _mm256_sub_ps(
+                        _mm256_add_ps(_mm256_mul_ps(n, n), _mm256_set1_ps(probe.norm_squared)),
+                        _mm256_mul_ps(_mm256_mul_ps(two, n), inner),
+                    ),'''
+    new='''                    Distance::L2 => _mm256_add_ps(
+                        _mm256_mul_ps(n, n),
+                        _mm256_sub_ps(_mm256_set1_ps(probe.norm_squared), _mm256_mul_ps(_mm256_mul_ps(two, n), inner)),
+                    ),'''
 elif w=='reciprocal':
     old='''                let inner = _mm256_div_ps(
                     _mm256_mul_ps(_mm256_sub_ps(_mm256_mul_ps(two, set), sum), scale),
