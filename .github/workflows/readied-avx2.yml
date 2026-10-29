@@ -27,7 +27,7 @@ jobs:
           for plant in reciprocal nan nearest; do
             git checkout -- crates/vellev-index/src/clustered.rs
             python3 scripts/plant-readied.py $plant
-            if cargo test --release --locked -p vellev-index --lib -- every_way_of_readying 2>&1 | tee plant.log | grep -q "test result: ok"; then
+            if cargo test --release --locked -p vellev-index --lib -- readying 2>&1 | tee plant.log | grep -q "test result: ok"; then
               echo "PLANT $plant DID NOT FAIL"; exit 1
             fi
             echo "plant $plant: $(grep -E 'test result|dot' plant.log | head -3)"
