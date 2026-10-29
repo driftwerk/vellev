@@ -28,6 +28,8 @@ pub enum MergeStage {
     Uploading,
     /// Loading what it built back from local disk.
     Loading,
+    /// Summing what it built, read back in place, before each piece.
+    Summing,
 }
 
 /// How often a merge waiting on the store or the disk asks its stop.
