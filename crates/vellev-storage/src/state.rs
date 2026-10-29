@@ -14,13 +14,13 @@ use vellev_index::vector::{BinaryIndex, Coded, Skipped, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
-use crate::stopping::{MergeStage, Stopping};
 use crate::column::{Column, Gathering};
 use crate::coordinator::LogPosition;
 use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
     SegmentMeta,
 };
+use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
 
 type RowKey = (CollectionId, ObjectId);
@@ -845,8 +845,16 @@ pub(crate) fn indexed<'a>(
     clustered_above: Option<usize>,
     stopping: &Stopping,
 ) -> Option<Indexes> {
-    indexed_stopping(catalog, rows, vector_of, stored, unused, clustered_above, stopping)
-        .map(|(indexes, _)| indexes)
+    indexed_stopping(
+        catalog,
+        rows,
+        vector_of,
+        stored,
+        unused,
+        clustered_above,
+        stopping,
+    )
+    .map(|(indexes, _)| indexes)
 }
 
 /// As [`indexed`], with how many threads split the rows' text at once, at
@@ -862,7 +870,15 @@ pub(crate) fn indexed_on<'a>(
     clustered_above: Option<usize>,
 ) -> (Indexes, usize) {
     let never = Stopping::never();
-    match indexed_stopping(catalog, rows, vector_of, stored, unused, clustered_above, &never) {
+    match indexed_stopping(
+        catalog,
+        rows,
+        vector_of,
+        stored,
+        unused,
+        clustered_above,
+        &never,
+    ) {
         Some(indexed) => indexed,
         None => unreachable!("indexing nothing stops is never stopped"),
     }
@@ -888,7 +904,9 @@ pub(crate) fn indexed_stopping<'a>(
 ) -> Option<(Indexes, usize)> {
     use rayon::prelude::*;
     let threads = Threads::default();
-    let asked = |row: usize| row % ROWS_BETWEEN_ASKING == 0 && stopping.stopped(MergeStage::Indexing);
+    let asked = |row: usize| {
+        row.is_multiple_of(ROWS_BETWEEN_ASKING) && stopping.stopped(MergeStage::Indexing)
+    };
     let tokenized: Vec<Option<Tokenized>> = rows
         .par_iter()
         .map(|Row { collection, object }| {
@@ -2788,7 +2806,10 @@ mod tests {
             let Some(plan) = self.state.merge_plan(&merging) else {
                 return false;
             };
-            let (mut file, gathered) = self.state.merged(&plan, self.state.position(), &Stopping::never()).unwrap();
+            let (mut file, gathered) = self
+                .state
+                .merged(&plan, self.state.position(), &Stopping::never())
+                .unwrap();
             for (row, at) in file.rows.iter_mut().zip(0..) {
                 row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
             }
@@ -2805,7 +2826,10 @@ mod tests {
                 ..Merging::default()
             };
             let plan = self.state.merge_plan(&merging).unwrap();
-            let (mut file, gathered) = self.state.merged(&plan, self.state.position(), &Stopping::never()).unwrap();
+            let (mut file, gathered) = self
+                .state
+                .merged(&plan, self.state.position(), &Stopping::never())
+                .unwrap();
             for (row, at) in file.rows.iter_mut().zip(0..) {
                 row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
             }

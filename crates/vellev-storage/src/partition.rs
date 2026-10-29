@@ -15,8 +15,6 @@ use vellev_core::{Embedding, ModelFault, ObjectError};
 use crate::backups::Held;
 use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Linked, Listed, Local, Transfers};
 use crate::catalog::Catalog;
-use crate::stopping::{MergeStage, Stopping};
-use vellev_index::stop::Stop;
 use crate::column::{self, Column, Gathering};
 use crate::coordinator::{
     Cleaned, Clock, Commit, Committed, Coordinator, CoordinatorError, Generation, Incarnation,
@@ -32,7 +30,9 @@ use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
     self, Discarded, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
 };
+use crate::stopping::{MergeStage, Stopping};
 use crate::{Refusal, Result, StorageError};
+use vellev_index::stop::Stop;
 
 /// How many times a commit whose outcome is unknown is tried. Repeating is
 /// safe because the coordinator accepts an identical commit twice.
@@ -2275,7 +2275,10 @@ impl Writer {
         vectors: Option<Gathering>,
         catalog: Catalog,
     ) -> Result<Built> {
-        match self.built_stopping(file, vectors, catalog, &Stopping::never()).await? {
+        match self
+            .built_stopping(file, vectors, catalog, &Stopping::never())
+            .await?
+        {
             Some(built) => Ok(built),
             None => unreachable!("a build nothing stops is never stopped"),
         }
@@ -2365,7 +2368,10 @@ impl Writer {
     /// sits in the store without its companions, noting each in `staged`
     /// before it goes up.
     async fn upload(&self, prepared: &Prepared, staged: &mut Staged) -> Result<()> {
-        match self.upload_stopping(prepared, staged, &Stopping::never()).await? {
+        match self
+            .upload_stopping(prepared, staged, &Stopping::never())
+            .await?
+        {
             true => Ok(()),
             false => unreachable!("an upload nothing stops is never stopped"),
         }
@@ -2613,7 +2619,10 @@ impl Writer {
             return Ok(None);
         }
         let _keeping = self.keep(&merged.meta);
-        if !self.upload_stopping(&merged, &mut staged, &stopping).await? {
+        if !self
+            .upload_stopping(&merged, &mut staged, &stopping)
+            .await?
+        {
             return Ok(None);
         }
         let fit = self.fit(merged, &catalog);

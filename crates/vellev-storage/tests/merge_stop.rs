@@ -76,7 +76,10 @@ async fn within<T>(limit: u64, what: &str, work: impl std::future::Future<Output
 /// Every note, read by a copy loaded afresh.
 async fn all_there(cluster: &Cluster) {
     let count = |state: &State| state.count(&name("notes"));
-    assert_eq!(cluster.open().await.partition().read(count), 2 * NOTES as usize);
+    assert_eq!(
+        cluster.open().await.partition().read(count),
+        2 * NOTES as usize
+    );
 }
 
 /// The stages of a merge, each stopped in on its own.
@@ -105,12 +108,21 @@ async fn a_merge_stopped_in_any_stage_gives_up_there_and_leaves_nothing() {
         let before = cluster.committed().await;
         writer.stop_merges_at(Some(stage));
         let merged = within(120, "the merge never gave up", writer.merge()).await;
-        assert_eq!(merged.unwrap(), None, "a merge stopped in {stage:?} committed");
-        assert_eq!(cluster.committed().await.manifest, before.manifest, "{stage:?}");
+        assert_eq!(
+            merged.unwrap(),
+            None,
+            "a merge stopped in {stage:?} committed"
+        );
+        assert_eq!(
+            cluster.committed().await.manifest,
+            before.manifest,
+            "{stage:?}"
+        );
         assert_eq!(writer.kept_while_merging(), 0, "{stage:?}");
-        settled(&format!("files of a merge stopped in {stage:?} stay"), || async {
-            stored(&cluster, "-merged").await.is_empty()
-        })
+        settled(
+            &format!("files of a merge stopped in {stage:?} stay"),
+            || async { stored(&cluster, "-merged").await.is_empty() },
+        )
         .await;
         all_there(&cluster).await;
 
@@ -178,13 +190,22 @@ async fn stopping_a_merge_stops_no_flush() {
         .expect("the merge's index goes up");
     writer.stop_merges();
     let mut random = Random(11);
-    let more: Vec<Mutation> = (0..NOTES).map(|n| note(2 * NOTES + n, &mut random)).collect();
-    within(30, "the commit was held", writer.commit(more)).await.unwrap();
-    within(60, "the flush was held", writer.flush()).await.expect("the flush commits");
+    let more: Vec<Mutation> = (0..NOTES)
+        .map(|n| note(2 * NOTES + n, &mut random))
+        .collect();
+    within(30, "the commit was held", writer.commit(more))
+        .await
+        .unwrap();
+    within(60, "the flush was held", writer.flush())
+        .await
+        .expect("the flush commits");
     let merged = within(10, "the merge never gave up", merging).await;
     assert_eq!(merged.unwrap().unwrap(), None);
     let count = |state: &State| state.count(&name("notes"));
-    assert_eq!(cluster.open().await.partition().read(count), 3 * NOTES as usize);
+    assert_eq!(
+        cluster.open().await.partition().read(count),
+        3 * NOTES as usize
+    );
 }
 
 /// A merge whose lease is taken by another writer while it builds never
@@ -224,7 +245,12 @@ async fn a_merge_on_a_lease_already_taken_uploads_nothing() {
     let writer = two_large(&cluster).await;
     let _owner = cluster.writer().await;
     paused.armed.store(true, Ordering::SeqCst);
-    let merged = within(30, "a merge on a lost lease went on to upload", writer.merge()).await;
+    let merged = within(
+        30,
+        "a merge on a lost lease went on to upload",
+        writer.merge(),
+    )
+    .await;
     assert!(!matches!(merged, Ok(Some(_))), "{merged:?}");
     while let Ok(event) = seen.try_recv() {
         assert_ne!(event, "stored", "a merge on a lost lease uploaded a file");

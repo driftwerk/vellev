@@ -37,8 +37,8 @@ pub use mutation::{
 };
 pub use partition::{Embedded, Follower, MergeGate, Partition, RestoreFrom, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
-pub use stopping::MergeStage;
 pub use state::{Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM};
+pub use stopping::MergeStage;
 pub use vellev_index::curve;
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;
