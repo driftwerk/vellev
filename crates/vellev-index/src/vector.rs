@@ -815,12 +815,38 @@ pub(crate) fn short_enough(squared: f64) -> bool {
     squared < f64::from(MEASURABLE_UNDER)
 }
 
+/// The rows a search skips, by row: a byte a row, or a bit a row (row `n`
+/// bit `n % 64` of word `n / 64`), as the caller keeps them. A row past
+/// either is not skipped.
+#[derive(Debug, Clone, Copy)]
+pub enum Skipped<'a> {
+    Bytes(&'a [bool]),
+    Bits(&'a [u64]),
+}
+
+impl Skipped<'_> {
+    /// Whether `row` is skipped.
+    #[inline(always)]
+    pub fn holds(&self, row: u32) -> bool {
+        match self {
+            Self::Bytes(bytes) => bytes.get(row as usize).copied().unwrap_or(false),
+            Self::Bits(bits) => bits
+                .get(row as usize / 64)
+                .is_some_and(|word| word >> (row % 64) & 1 == 1),
+        }
+    }
+}
+
 /// Of `rows`, in ascending order, those in `only` when it is given and not
 /// flagged in `skipped`.
-pub(crate) fn allowed(rows: &[u32], only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+pub(crate) fn allowed(
+    rows: &[u32],
+    only: Option<&RoaringBitmap>,
+    skipped: Skipped<'_>,
+) -> Vec<u32> {
     rows.iter()
         .copied()
-        .filter(|row| !skipped.get(*row as usize).copied().unwrap_or(false))
+        .filter(|row| !skipped.holds(*row))
         .filter(|row| only.is_none_or(|only| only.contains(*row)))
         .collect()
 }
@@ -886,21 +912,25 @@ fn encode<'a>(centre: &'a [f32], vector: &'a [f32]) -> impl Iterator<Item = u64>
         })
 }
 
-impl VectorIndex for BinaryIndex {
-    fn len(&self) -> usize {
-        self.rows.len() + self.unmeasured.len()
-    }
-
-    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+impl BinaryIndex {
+    /// As [`VectorIndex::unmeasured`], the rows skipped given as either
+    /// kind of [`Skipped`].
+    pub fn unmeasured_skipping(
+        &self,
+        only: Option<&RoaringBitmap>,
+        skipped: Skipped<'_>,
+    ) -> Vec<u32> {
         allowed(&self.unmeasured, only, skipped)
     }
 
-    fn estimates(
+    /// As [`VectorIndex::estimates`], the rows skipped given as either kind
+    /// of [`Skipped`].
+    pub fn estimates_skipping(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
-        skipped: &[bool],
+        skipped: Skipped<'_>,
         ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
         if count == 0 || query.len() != self.dimensions {
@@ -916,7 +946,7 @@ impl VectorIndex for BinaryIndex {
                 Distance::L2 => 2.0,
                 Distance::Dot | Distance::Cosine => 1.0,
             };
-        let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
+        let kept = |row: u32| !skipped.holds(row);
         let estimated = |position: usize| {
             let estimate = match as_far_from_every_row {
                 true => 0.0,
@@ -948,6 +978,27 @@ impl VectorIndex for BinaryIndex {
         };
         nearest(&mut estimates, count, |a, b| ties(*a, *b));
         estimates
+    }
+}
+
+impl VectorIndex for BinaryIndex {
+    fn len(&self) -> usize {
+        self.rows.len() + self.unmeasured.len()
+    }
+
+    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+        self.unmeasured_skipping(only, Skipped::Bytes(skipped))
+    }
+
+    fn estimates(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)> {
+        self.estimates_skipping(query, count, only, Skipped::Bytes(skipped), ties)
     }
 }
 
