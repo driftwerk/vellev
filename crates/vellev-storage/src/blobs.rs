@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -680,7 +680,7 @@ const LOADING_STILL_BEYOND: Duration = Duration::from_secs(30);
 /// and with it how far everything reading or writing large files on its
 /// disk has.
 #[derive(Debug, Clone, Default)]
-pub struct Progress(Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicBool>);
+pub struct Progress(Arc<AtomicU64>, Arc<AtomicU64>);
 
 impl Progress {
     /// Tell of `bytes` more done.
@@ -689,33 +689,8 @@ impl Progress {
         self.1.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Whether nobody waits for the step any more: its caller stopped
-    /// waiting, as a stopped merge does. A step asks between pieces, and
-    /// gives up too, so that the disk's turn and thread go to work someone
-    /// waits for. A step whose wait ended at its bound is not told so: it
-    /// runs on, as what it does may be kept for the next attempt.
-    pub fn given_up(&self) -> bool {
-        self.2.load(Ordering::Relaxed)
-    }
-
     fn so_far(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
-    }
-}
-
-/// Tells a step nobody waits for it any more, if it is dropped while its
-/// caller still waits: not once the wait has ended, answered or given up
-/// at its bound.
-struct GivenUp {
-    progress: Progress,
-    dropped: bool,
-}
-
-impl Drop for GivenUp {
-    fn drop(&mut self) {
-        if self.dropped {
-            self.progress.2.store(true, Ordering::Relaxed);
-        }
     }
 }
 
@@ -918,7 +893,7 @@ impl Disk {
 
     /// Word of how far a step with a turn at a large file has got.
     pub(crate) fn progress(&self) -> Progress {
-        Progress(Arc::default(), self.moved.clone(), Arc::default())
+        Progress(Arc::default(), self.moved.clone())
     }
 
     /// How many whole large files this disk reads or writes at once.
@@ -942,15 +917,6 @@ impl Disk {
         let thread = self.thread(within).await?;
         let (threads, number) = (self.threads.clone(), thread.step);
         let progress = self.progress();
-        // Dropped unfinished, by a caller that stops waiting, as a stopped
-        // merge does, the step is told so, and gives up at its next piece.
-        // Not when the wait ends at its bound: a check of a file on a slow
-        // disk runs on to its end, and is remembered, so that the next
-        // load need not begin it again from nothing (see `column::Summed`).
-        let mut waiting = GivenUp {
-            progress: progress.clone(),
-            dropped: true,
-        };
         let (done, mut waited) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("vellev-disk".into())
@@ -1004,7 +970,6 @@ impl Disk {
                     continue;
                 }
             };
-            waiting.dropped = false;
             return ended;
         }
     }
@@ -2224,65 +2189,6 @@ impl Blobs for CachedBlobs {
 mod tests {
     use super::*;
 
-    /// A step whose wait is given up at its bound, as one too slow for
-    /// the disk is, is not told nobody waits: it runs on to its end, so that
-    /// a check of a large file on a slow disk is finished and remembered,
-    /// and the next load does not begin it again from nothing.
-    #[tokio::test(start_paused = true)]
-    async fn a_step_given_up_at_its_bound_is_not_told_to_give_up() {
-        let disk = slow_disk();
-        let (say, told) = std::sync::mpsc::channel::<usize>();
-        let (tell, said) = std::sync::mpsc::channel();
-        let (seen, heard) = std::sync::mpsc::channel();
-        let step = move |progress: &Progress| {
-            for bytes in told {
-                progress.made(bytes);
-                tell.send(()).unwrap();
-            }
-            seen.send(progress.given_up()).unwrap();
-            Ok("done")
-        };
-        let waited = tokio::spawn({
-            let disk = disk.clone();
-            async move { disk.run_while_it_gets_on(1, step).await }
-        });
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        // A hundred bytes a second: slower than the disk may be.
-        for _ in 0..14 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            say.send(1).unwrap();
-            said.recv().unwrap();
-        }
-        assert!(waited.is_finished(), "given up for its pace");
-        let too_slow = waited.await.unwrap().unwrap_err();
-        assert!(too_slow.to_string().contains("slower than"), "{too_slow}");
-        drop(say);
-        let told_so = heard.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(!told_so, "a step given up for its pace was told to give up");
-    }
-
-    /// A step on local disk whose caller stops waiting is told so, and
-    /// can give up, rather than holding the disk's thread and turn to the
-    /// end of work nobody wants.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_step_nobody_waits_for_is_told_so() {
-        let disk = Disk::new(Duration::from_secs(10), 1024 * 1024, 2);
-        let (told, heard) = std::sync::mpsc::channel();
-        let step = disk.run_while_it_gets_on(1, move |progress| {
-            let begun = std::time::Instant::now();
-            while !progress.given_up() && begun.elapsed() < Duration::from_secs(30) {
-                progress.made(1);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let _ = told.send(progress.given_up());
-            Ok(())
-        });
-        assert!(tokio::time::timeout(Duration::from_millis(100), step)
-            .await
-            .is_err());
-        let heard = tokio::task::spawn_blocking(move || heard.recv_timeout(Duration::from_secs(5)));
-        assert_eq!(heard.await.unwrap(), Ok(true), "the step was never told");
-    }
     use object_store::memory::InMemory;
 
     #[test]
