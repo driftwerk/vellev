@@ -727,17 +727,17 @@ async fn a_restore_in_place_moves_the_epoch_on() {
     assert_eq!(writer.epoch(), at + 1);
 }
 
-/// A segment's dead-row bits are its dead-row marks after a restore, and in
-/// a copy opened fresh.
+/// A segment's dead rows are just those the live map does not lead to
+/// after a restore, and in a copy opened fresh.
 #[tokio::test]
-async fn dead_row_bits_are_the_dead_marks_after_a_restore_and_a_reload() {
+async fn dead_rows_are_what_the_live_map_leaves_after_a_restore_and_a_reload() {
     let cluster = Cluster::new().await;
     let writer = writer(&cluster).await;
     let (head, position) = history(&cluster, &writer).await;
-    assert!(writer.partition().read(State::dead_marks_agree));
+    assert!(writer.partition().read(State::dead_rows_agree));
     writer.restore(Some(&head), position).await.unwrap();
     writer.commit(vec![delete("notes", 2)]).await.unwrap();
-    assert!(writer.partition().read(State::dead_marks_agree));
+    assert!(writer.partition().read(State::dead_rows_agree));
     let follower = cluster.open().await;
-    assert!(follower.partition().read(State::dead_marks_agree));
+    assert!(follower.partition().read(State::dead_rows_agree));
 }
