@@ -81,14 +81,21 @@ async fn a_merge_waiting_for_a_turn_gives_up_at_its_stop() {
         let first = first.clone();
         async move { first.merge().await }
     });
-    until(60, "the first merge never came to build", || builds.held() == 1).await;
+    until(60, "the first merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
     let waiting = tokio::spawn({
         let second = second.clone();
         async move { second.merge().await }
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!waiting.is_finished(), "a merge gave up unstopped");
-    assert_eq!(builds.under_way(), 1, "a merge took a turn none was free for");
+    assert_eq!(
+        builds.under_way(),
+        1,
+        "a merge took a turn none was free for"
+    );
     second.stop_merges();
     let given_up = within(10, "a merge waiting for a turn never gave up", waiting).await;
     assert_eq!(given_up.unwrap().unwrap(), None);
@@ -97,7 +104,10 @@ async fn a_merge_waiting_for_a_turn_gives_up_at_its_stop() {
     let built = within(60, "the first merge never ended", building).await;
     assert!(built.unwrap().unwrap().is_some());
     let next = within(60, "the next merge never ended", second.merge()).await;
-    assert!(next.unwrap().is_some(), "after one stopped waiting, the next commits");
+    assert!(
+        next.unwrap().is_some(),
+        "after one stopped waiting, the next commits"
+    );
     assert_eq!(builds.under_way(), 0);
     assert_eq!(builds.turns_free(), 1);
 }
@@ -115,8 +125,16 @@ async fn a_merge_with_nothing_to_do_waits_for_no_turn() {
         let first = first.clone();
         async move { first.merge().await }
     });
-    until(60, "the first merge never came to build", || builds.held() == 1).await;
-    let merged = within(5, "a merge with nothing to do waited for a turn", alone.merge()).await;
+    until(60, "the first merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    let merged = within(
+        5,
+        "a merge with nothing to do waited for a turn",
+        alone.merge(),
+    )
+    .await;
     assert_eq!(merged.unwrap(), None);
     builds.hold(None);
     let built = within(60, "the first merge never ended", building).await;
@@ -200,8 +218,15 @@ async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upl
             1,
             "a build was let go while its upload held what it built"
         );
-        assert_eq!(builds.turns_free(), 0, "a build's turn was given back early");
-        assert!(builds.draining() > 0, "a stopped build stopped draining early");
+        assert_eq!(
+            builds.turns_free(),
+            0,
+            "a build's turn was given back early"
+        );
+        assert!(
+            builds.draining() > 0,
+            "a stopped build stopped draining early"
+        );
     }
     held.let_go.notify_one();
     until(30, "the build was never let go", || builds.under_way() == 0).await;

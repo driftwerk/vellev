@@ -10,7 +10,7 @@
 //! it. What a stopped merge is reckoned to hold counts as draining until
 //! then.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,9 @@ pub struct MergeBuilds {
 struct Reckoned {
     stop: Stop,
     bytes: AtomicUsize,
+    /// Whether its merge is past where a stop ends it: one stopped after
+    /// commits what it holds, and drains nothing.
+    committing: AtomicBool,
 }
 
 /// How a test holds each merge's build, at its start off the async
@@ -84,11 +87,12 @@ impl MergeBuilds {
 
     /// About how many bytes the merges stopped and not yet ended hold:
     /// what each was reckoned to hold at its peak, until the last of its
-    /// work has ended. Merges running unstopped are not counted.
+    /// work has ended. Merges running unstopped are not counted, nor any
+    /// stopped once past where a stop ends it, which commits instead.
     pub fn draining(&self) -> usize {
         lock(&self.under_way)
             .iter()
-            .filter(|build| build.stop.is_stopped())
+            .filter(|build| build.stop.is_stopped() && !build.committing.load(Ordering::SeqCst))
             .map(|build| build.bytes.load(Ordering::SeqCst))
             .sum()
     }
@@ -139,6 +143,7 @@ impl MergeBuilds {
         let reckoned = Arc::new(Reckoned {
             stop: stopping.stop().clone(),
             bytes: AtomicUsize::new(0),
+            committing: AtomicBool::new(false),
         });
         lock(&self.under_way).push(reckoned.clone());
         Ok(Some(MergeBuild {
@@ -164,6 +169,15 @@ impl MergeBuild {
     /// Reckon the build to hold `bytes` at its peak, from now on.
     pub(crate) fn reckon(&self, bytes: usize) {
         self.counted.reckoned.bytes.store(bytes, Ordering::SeqCst);
+    }
+
+    /// Note the merge past where a stop ends it: what it holds is
+    /// committed, not drained, however it is stopped from now on.
+    pub(crate) fn past_stopping(&self) {
+        self.counted
+            .reckoned
+            .committing
+            .store(true, Ordering::SeqCst);
     }
 
     /// Wait here, off the async threads, while a test holds builds: see

@@ -562,6 +562,38 @@ fn segment_bytes(rows: &[Row], vectors: &Column) -> usize {
     rows.iter().map(row_bytes).sum::<usize>() + vectors.resident()
 }
 
+/// What a merge holds at its peak for each byte of its gathered rows, as
+/// [`row_bytes`] counts them: their copy, the segment encoded from them,
+/// and their filter and keyword indexes as they are built. Measured by the
+/// counting allocator, with [`VECTORS_AT_PEAK`], over merges of 10,000 and
+/// 20,000 rows of 8 and 768 dimensions (`flush_memory`'s
+/// `a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent`,
+/// which holds the reckoning to within 30%).
+const ROWS_AT_PEAK: f64 = 4.0;
+
+/// What a merge holds at its peak for each byte of its gathered vectors:
+/// the frame they are gathered into, which is the column and the file
+/// uploaded too, and what the vector index builds beside it. Each further
+/// row's vector costs once (`a_merge_holds_its_vectors_once`); the rest is
+/// what the clustered index trains on, much the same whatever the rows. So
+/// a merge far larger than those measured holds nearer once its vectors,
+/// and is reckoned at most about a fifth over (a million rows of 768
+/// dimensions): more counted as draining than there is, not less.
+const VECTORS_AT_PEAK: f64 = 1.3;
+
+/// About how many bytes a merge of `rows` bytes of rows, as [`row_bytes`]
+/// counts them, and `vectors` bytes of vectors holds at its peak.
+fn at_peak(rows: f64, vectors: f64) -> usize {
+    (rows * ROWS_AT_PEAK + vectors * VECTORS_AT_PEAK) as usize
+}
+
+/// About how many bytes a merge that gathered `file`'s rows and `vectors`
+/// holds at its peak.
+pub(crate) fn gathered_reckoned(file: &SegmentFile, vectors: &Gathering) -> usize {
+    let rows: usize = file.rows.iter().map(row_bytes).sum();
+    at_peak(rows as f64, vectors.bytes() as f64)
+}
+
 /// About how many bytes a segment's vector indexes take in memory: its
 /// clustered indexes' codes, factors, rows and centroids, or its one-bit
 /// codes.
@@ -1955,6 +1987,36 @@ impl State {
             tombstones,
         };
         Some((file, vectors))
+    }
+
+    /// About how many bytes a merge of `merge`'s run holds at its peak,
+    /// reckoned as it is planned, before any row is gathered: from the
+    /// live rows' share of the run's rows, as `resident` counts them, and
+    /// of its vectors, wherever they lie. Refined by [`gathered_reckoned`]
+    /// once the rows are gathered.
+    pub(crate) fn merge_reckoned(&self, merge: &Merge) -> usize {
+        let Some(run) = self.segments.get(merge.run.clone()) else {
+            return 0;
+        };
+        let (rows, vectors) = run.iter().fold((0.0, 0.0), |(rows, vectors), segment| {
+            let all = segment.file.rows.len();
+            if all == 0 {
+                return (rows, vectors);
+            }
+            let live = (all - segment.dead.count()) as f64 / all as f64;
+            // What `resident` counts of the rows, without the vectors held
+            // in memory and the vector indexes, neither of which a merge
+            // copies.
+            let held = segment
+                .resident
+                .saturating_sub(segment.vectors.resident())
+                .saturating_sub(indexes_bytes(&segment.indexes));
+            (
+                rows + held as f64 * live,
+                vectors + segment.vectors.bytes() as f64 * live,
+            )
+        });
+        at_peak(rows, vectors)
     }
 
     /// Whether the run `merge` was planned over is still the same

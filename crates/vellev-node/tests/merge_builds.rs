@@ -200,11 +200,15 @@ async fn a_tenant_a_request_holds_is_not_let_go_while_its_merge_is_stopped() {
         "a tenant was let go while a request held it"
     );
     go_on.notify_one();
-    let written = within(10, "the request never ended", request).await.unwrap();
+    let written = within(10, "the request never ended", request)
+        .await
+        .unwrap();
     written.expect("the request lost its tenant part way");
-    until(10, "the tenant was never let go once the request ended", || {
-        node.resident() == 0
-    })
+    until(
+        10,
+        "the tenant was never let go once the request ended",
+        || node.resident() == 0,
+    )
     .await;
 }
 
@@ -255,7 +259,10 @@ async fn a_node_builds_at_most_merge_builds_at_once_a_stopped_one_among_them_unt
             builds.held() <= 2 && builds.under_way() <= 2,
             "a third merge built while a stopped one still ran"
         );
-        assert!(builds.draining() > 0, "a stopped build that runs on stopped draining");
+        assert!(
+            builds.draining() > 0,
+            "a stopped build that runs on stopped draining"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     builds.hold(None);

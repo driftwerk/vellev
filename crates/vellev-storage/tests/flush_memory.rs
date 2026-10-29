@@ -228,7 +228,8 @@ async fn a_merge_holds_its_vectors_once() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
     let _alone = ALONE.lock().await;
-    for (rows, dimensions) in [(MORE, WIDE), (MORE, NARROW)] {
+    let mut measured = Vec::new();
+    for (rows, dimensions) in [(FEWER, WIDE), (MORE, WIDE), (FEWER, NARROW), (MORE, NARROW)] {
         let (peak, reckoned) = merge_measured(rows, dimensions).await;
         let off = (reckoned as f64 - peak as f64) / peak as f64;
         eprintln!(
@@ -236,6 +237,9 @@ async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
              reckoned {reckoned} ({:+.0}%)",
             off * 100.0
         );
+        measured.push((rows, dimensions, peak, reckoned, off));
+    }
+    for (rows, dimensions, peak, reckoned, off) in measured {
         assert!(
             off.abs() <= 0.3,
             "a merge of {rows} rows of {dimensions} reckoned {reckoned} bytes, \

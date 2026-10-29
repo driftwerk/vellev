@@ -595,6 +595,8 @@ struct Hold {
     lost: AtomicBool,
     /// The tenant's queue of writes, once it is open.
     commits: OnceLock<GroupCommitter>,
+    /// The tenant's writer, once it is open.
+    writer: OnceLock<Weak<Writer>>,
     tasks: Mutex<Vec<AbortHandle>>,
 }
 
@@ -605,11 +607,16 @@ impl Hold {
 
     /// Lose the hold, stopping every task working on the tenant: its
     /// writes, a commit under way being answered as unknown, and whatever
-    /// maintains or restores it.
+    /// maintains or restores it. A merge under way is stopped first: its
+    /// build, which an aborted task would leave running, gives up and lets
+    /// go of what it holds (merge note, step 3).
     fn lose(&self) {
         self.lost.store(true, Ordering::SeqCst);
         if let Some(commits) = self.commits.get() {
             commits.stop();
+        }
+        if let Some(writer) = self.writer.get().and_then(Weak::upgrade) {
+            writer.stop_merges();
         }
         let stopped = std::mem::take(&mut *self.tasks.lock().expect("tasks lock"));
         stopped.iter().for_each(AbortHandle::abort);
@@ -1203,6 +1210,18 @@ struct Held {
 enum Kind {
     Writer(Opening, Arc<Tenant>),
     Copy(reading::Following, Arc<reading::Followed>),
+}
+
+/// What a sweep took out of what the node holds, and what it chose and
+/// could not.
+#[derive(Default)]
+struct Taken {
+    /// The tenants written for, taken out and still to be let go.
+    going: Vec<Arc<Tenant>>,
+    /// The tenants written for that something else held, left as they are.
+    kept: Vec<Arc<Tenant>>,
+    /// About how many bytes what was taken out held.
+    freed: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1809,16 +1828,26 @@ impl Inner {
     /// release its lease. None used within [`RESIDENT_AT_LEAST`] is let go,
     /// so that tenants in use are not opened over and over, and none a
     /// request holds or is opening.
+    ///
+    /// Over the budget, a tenant chosen that something else holds, as its
+    /// maintenance does while it merges, has its merge stopped, and is let
+    /// go at a later round, once its build has ended and nothing else
+    /// holds it: the sweep cannot tell maintenance from a request, so it
+    /// waits on neither. What a stopped merge was reckoned to hold counts
+    /// against the budget until its work has ended (merge note, §7.7).
     async fn sweep(&self) {
         let held = self.held_now();
         let (idle, recent) = (self.settings.tenant_idle, RESIDENT_AT_LEAST);
-        let mut total: usize = held.iter().map(|held| held.size).sum();
+        let draining = self.merge_builds.draining();
+        let total = held.iter().map(|held| held.size).sum::<usize>() + draining;
+        let over = self.settings.memory.is_some_and(|budget| total > budget);
         let mut chosen: Vec<&Held> = held
             .iter()
             .filter(|held| matches!(held.kind, Kind::Writer(..)) && held.unused >= idle)
             .collect();
-        total -= chosen.iter().map(|held| held.size).sum::<usize>();
         if let Some(budget) = self.settings.memory {
+            // What would be left, were each chosen taken out.
+            let mut left = total - chosen.iter().map(|held| held.size).sum::<usize>();
             let mut older: Vec<&Held> = held
                 .iter()
                 .filter(|held| {
@@ -1828,21 +1857,34 @@ impl Inner {
             // Copies warming opened that nobody has read go first.
             older.sort_by_key(|held| (!held.warmed, std::cmp::Reverse(held.unused)));
             for held in older {
-                if total <= budget {
+                if left <= budget {
                     break;
                 }
-                total -= held.size;
+                left -= held.size;
                 chosen.push(held);
             }
-            if total > budget {
+        }
+        let taken = self.taken_out(&chosen);
+        if over {
+            for tenant in &taken.kept {
+                tracing::debug!(tenant = %tenant.id, "over the memory budget: a merge is stopped so that the tenant can be let go");
+                tenant.writer.stop_merges();
+            }
+        }
+        if let Some(budget) = self.settings.memory {
+            // Only what was taken out comes off: what something else held
+            // is held still.
+            let left = total - taken.freed;
+            if left > budget {
                 tracing::warn!(
                     budget,
-                    held = total,
-                    "over the memory budget with nothing unused to let go"
+                    held = left,
+                    draining,
+                    "over the memory budget with nothing more that can be let go now"
                 );
             }
         }
-        for tenant in self.taken_out(&chosen) {
+        for tenant in taken.going {
             if tenant.read(State::unflushed) > 0 {
                 if let Err(error) = tenant.flush().await {
                     tracing::warn!(tenant = %tenant.id, %error, "flush before letting go failed");
@@ -1887,10 +1929,10 @@ impl Inner {
 
     /// Take `chosen` out of what the node holds, each only if it is still
     /// the one held and nobody but the node and this sweep has it, nor is
-    /// opening it. Returns the tenants written for, still to be let go.
-    fn taken_out(&self, chosen: &[&Held]) -> Vec<Arc<Tenant>> {
+    /// opening it.
+    fn taken_out(&self, chosen: &[&Held]) -> Taken {
         let mut open = self.opened();
-        let mut going = Vec::new();
+        let mut taken = Taken::default();
         for held in chosen {
             match &held.kind {
                 Kind::Writer(opening, tenant) => {
@@ -1900,7 +1942,10 @@ impl Inner {
                         .is_some_and(|now| Arc::ptr_eq(now, opening));
                     if same && Arc::strong_count(opening) == 2 && Arc::strong_count(tenant) == 2 {
                         open.tenants.remove(&held.id);
-                        going.push(tenant.clone());
+                        taken.going.push(tenant.clone());
+                        taken.freed += held.size;
+                    } else if same {
+                        taken.kept.push(tenant.clone());
                     }
                 }
                 Kind::Copy(following, copy) => {
@@ -1910,11 +1955,12 @@ impl Inner {
                         .is_some_and(|now| Arc::ptr_eq(now, following));
                     if same && Arc::strong_count(following) == 2 && Arc::strong_count(copy) == 2 {
                         open.followers.remove(&held.id);
+                        taken.freed += held.size;
                     }
                 }
             }
         }
-        going
+        taken
     }
 
     /// Refuse `tenant` if this node does not serve it, before anything is
@@ -1964,13 +2010,7 @@ impl Inner {
         };
         let hold = Arc::new(Hold::default());
         let deadline = Arc::new(Mutex::new(lease.deadline()));
-        let opened_writer = Arc::new(OnceLock::new());
-        self.renewing(
-            lease.clone(),
-            hold.clone(),
-            &deadline,
-            opened_writer.clone(),
-        );
+        self.renewing(lease.clone(), hold.clone(), &deadline);
         let opened = Writer::open(
             self.blobs.clone(),
             self.coordinator.clone(),
@@ -1987,6 +2027,7 @@ impl Inner {
                 Arc::new(
                     writer
                         .writing_format(self.writes_format.clone())
+                        .merging_among(self.merge_builds.clone())
                         .embedding_with(documents)
                         .transferring(self.settings.transfers)
                         .timed_by(self.settings.clock.clone()),
@@ -2005,7 +2046,7 @@ impl Inner {
                 return Err(error.into());
             }
         };
-        opened_writer
+        hold.writer
             .set(Arc::downgrade(&writer))
             .expect("a tenant's writer is opened once");
         let (flushes, wanted) = mpsc::channel(1);
@@ -2119,18 +2160,12 @@ impl Inner {
     /// renewal is timed from when the one before was asked for, so a slow
     /// answer does not let the hold run out.
     ///
-    /// The hold is given up once `writer`, when it is open, is closed, as
+    /// The hold is given up once its writer, when it is open, is closed, as
     /// by an attempt that failed or a caller that stopped waiting part way,
     /// or has been publishing a commit for longer than its bounds allow:
     /// a writer that can write no more would otherwise keep the tenant
     /// from every other node.
-    fn renewing(
-        &self,
-        lease: Lease,
-        hold: Arc<Hold>,
-        deadline: &Arc<Mutex<Instant>>,
-        writer: Arc<OnceLock<Weak<Writer>>>,
-    ) {
+    fn renewing(&self, lease: Lease, hold: Arc<Hold>, deadline: &Arc<Mutex<Instant>>) {
         let coordinator = self.coordinator.clone();
         let ttl = self.settings.lease;
         let every = ttl / 3;
@@ -2145,7 +2180,8 @@ impl Inner {
                 if hold.is_lost() {
                     return;
                 }
-                let unusable = writer
+                let unusable = hold
+                    .writer
                     .get()
                     .and_then(Weak::upgrade)
                     .is_some_and(|writer| writer.is_closed() || writer.stalled());

@@ -26,11 +26,11 @@ use crate::format::{
     Head, Kind, LogSegment, Manifest, Op, SegmentCurve, SegmentFile, SegmentIndex, SegmentMeta,
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
+use crate::merge_builds::{MergeBuild, MergeBuilds, MERGE_BUILDS};
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
     self, Discarded, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
 };
-use crate::merge_builds::{MergeBuilds, MERGE_BUILDS};
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Refusal, Result, StorageError};
 use vellev_index::stop::Stop;
@@ -2318,7 +2318,7 @@ impl Writer {
         catalog: Catalog,
     ) -> Result<Built> {
         match self
-            .built_stopping(file, vectors, catalog, &Stopping::never())
+            .built_stopping(file, vectors, catalog, &Stopping::never(), None)
             .await?
         {
             Some(built) => Ok(built),
@@ -2328,13 +2328,15 @@ impl Writer {
 
     /// As [`Self::built`], giving up, `None`, once `stopping` is stopped:
     /// asked as the rows are indexed, and before and after they are
-    /// encoded.
+    /// encoded. A merge's `build` is held by the work until it ends,
+    /// whoever stops waiting for it.
     async fn built_stopping(
         &self,
         mut file: SegmentFile,
         vectors: Option<Gathering>,
         catalog: Catalog,
         stopping: &Stopping,
+        build: Option<Arc<MergeBuild>>,
     ) -> Result<Option<Built>> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
@@ -2351,6 +2353,9 @@ impl Writer {
         let stopping = stopping.clone();
         at_once(move || {
             let _turn = turn;
+            if let Some(build) = &build {
+                build.held_here(&stopping);
+            }
             assert!(!stopping.panics(), "a merge's build panics, as a test asks");
             let vectors = vectors.map(|gathered| gathered.finish(format));
             let indexes = match &vectors {
@@ -2423,7 +2428,7 @@ impl Writer {
     /// before it goes up.
     async fn upload(&self, prepared: &Prepared, staged: &mut Staged) -> Result<()> {
         match self
-            .upload_stopping(prepared, staged, &Stopping::never())
+            .upload_stopping(prepared, staged, &Stopping::never(), None)
             .await?
         {
             true => Ok(()),
@@ -2435,12 +2440,14 @@ impl Writer {
     /// stopped: asked before each file, and while each goes up. A file
     /// given up part way is aborted as its upload is dropped, its parts
     /// discarded ([`crate::Transfers`]); those that went up are deleted
-    /// as `staged` is dropped.
+    /// as `staged` is dropped. A merge's `build` is held by each upload
+    /// until it ends, as each holds a share of what was built.
     async fn upload_stopping(
         &self,
         prepared: &Prepared,
         staged: &mut Staged,
         stopping: &Stopping,
+        build: Option<&Arc<MergeBuild>>,
     ) -> Result<bool> {
         let Prepared { meta, built, index } = prepared;
         let files = [
@@ -2458,9 +2465,11 @@ impl Writer {
             staged.keys.push(key.to_string());
             let (blobs, owned, bytes) =
                 (self.partition.blobs.clone(), key.to_string(), bytes.clone());
-            staged
-                .putting
-                .push(tokio::spawn(async move { blobs.put(&owned, bytes).await }));
+            let build = build.cloned();
+            staged.putting.push(tokio::spawn(async move {
+                let _build = build;
+                blobs.put(&owned, bytes).await
+            }));
             let put = staged.putting.last_mut().expect("just pushed");
             match stopping.unless_stopped(MergeStage::Uploading, put).await {
                 Some(Ok(put)) => {
@@ -2662,6 +2671,26 @@ impl Writer {
             tracing::warn!("a merge is not made on a lease another writer has taken");
             return Ok(None);
         }
+        // A merge with nothing to do waits for no turn among the node's
+        // merge builds. One that finds work plans it again under the
+        // building lock, as the partition may have changed meanwhile.
+        if self
+            .partition
+            .read(|state| state.merge_plan(&self.merging))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        // Its turn among the node's merge builds, taken before it gathers a
+        // row, never waited for under the building lock, and given up at
+        // its stop. It is held, with what the build is reckoned to hold, by
+        // every piece of work that holds what the merge gathers or builds,
+        // and let go with the last of them, not when the merge is dropped
+        // (merge note, §7.7).
+        let Some(build) = self.merge_builds.turn(&stopping).await? else {
+            return Ok(None);
+        };
+        let build = Arc::new(build);
         // Planned, and its rows gathered, under the building lock; built,
         // uploaded and loaded without it, so that flushes go on meanwhile;
         // committed under it again, only if nothing put the partition back
@@ -2671,6 +2700,7 @@ impl Writer {
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
+        build.reckon(self.partition.read(|state| state.merge_reckoned(&merge)));
         let above = self.merging.clustered_above;
         let Some((file, vectors, shape, named_at, alive)) = self.partition.read(|state| {
             let named_at = state.position();
@@ -2684,12 +2714,19 @@ impl Writer {
         };
         let catalog = self.partition.read(|state| state.catalog().clone());
         drop(planning);
+        build.reckon(state::gathered_reckoned(&file, &vectors));
         // A merge planned at another epoch than this is dropped before any
         // work is spent on it, and again at its commit below.
         if self.stale(planned) {
             return Ok(None);
         }
-        let built = self.built_stopping(file, Some(vectors), catalog.clone(), &stopping);
+        let built = self.built_stopping(
+            file,
+            Some(vectors),
+            catalog.clone(),
+            &stopping,
+            Some(build.clone()),
+        );
         let Some(built) = built.await? else {
             return Ok(None);
         };
@@ -2707,7 +2744,7 @@ impl Writer {
         }
         let _keeping = self.keep(&merged.meta);
         if !self
-            .upload_stopping(&merged, &mut staged, &stopping)
+            .upload_stopping(&merged, &mut staged, &stopping, Some(&build))
             .await?
         {
             return Ok(None);
@@ -2726,6 +2763,7 @@ impl Writer {
             let heeded = stopping.is_stopped();
             if !heeded {
                 self.merge_past_loading.store(true, Ordering::SeqCst);
+                build.past_stopping();
             }
             heeded
         };
