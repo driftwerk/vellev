@@ -1184,17 +1184,14 @@ async fn rows_deleted_and_changed_during_a_merge_stay_so_after_it() {
             merging.await.unwrap().unwrap().is_some(),
             "flushed {flushed}"
         );
-        let both = |s: &State| (n_of(s, "notes", 1), n_of(s, "notes", 2));
-        assert_eq!(
-            writer.partition().read(both),
-            (None, Some(20)),
-            "flushed {flushed}"
-        );
+        // Read by id, and as a walk over the collection finds them.
+        let both = |s: &State| {
+            let listed = ids(s.list(&name("notes"), None, None, 10).unwrap());
+            (n_of(s, "notes", 1), n_of(s, "notes", 2), listed)
+        };
+        let want = (None, Some(20), vec![id(2)]);
+        assert_eq!(writer.partition().read(both), want, "flushed {flushed}");
         let fresh = cluster.open().await;
-        assert_eq!(
-            fresh.partition().read(both),
-            (None, Some(20)),
-            "flushed {flushed}"
-        );
+        assert_eq!(fresh.partition().read(both), want, "flushed {flushed}");
     }
 }
