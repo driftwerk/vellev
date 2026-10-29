@@ -1895,10 +1895,13 @@ impl Inner {
         let (idle, recent) = (self.settings.tenant_idle, RESIDENT_AT_LEAST);
         let draining = self.merge_builds.draining();
         let total = held.iter().map(|held| held.size).sum::<usize>() + draining;
-        let idle: Vec<&Held> = held
+        let mut idle: Vec<&Held> = held
             .iter()
             .filter(|held| matches!(held.kind, Kind::Writer(..)) && held.unused >= idle)
             .collect();
+        // The least recently used first, as the merges of those kept are
+        // stopped in this order.
+        idle.sort_by_key(|held| std::cmp::Reverse(held.unused));
         let mut older: Vec<&Held> = match self.settings.memory {
             Some(_) => held
                 .iter()

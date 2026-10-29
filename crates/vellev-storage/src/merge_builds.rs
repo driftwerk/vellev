@@ -325,10 +325,11 @@ impl MergeBuild {
 /// A merge's share of its build carried by the bytes it uploads: held by
 /// every copy of them, wherever it goes, a store's own threads included,
 /// and let go with the last, so that what a store still holds of a stopped
-/// merge's files holds its turn. Once the merge commits, what it built is
-/// the partition's, counted as what the partition holds, and the share is
-/// let go: a store that keeps what it is given, as one in memory does,
-/// would otherwise hold the turn for as long as it keeps the file.
+/// merge's files holds its turn. Once the merge keeps its files to commit
+/// them, what it built is the partition's, committed or, should the commit
+/// fail, left for cleaning up, and the share is let go: a store that keeps
+/// what it is given, as one in memory does, would otherwise hold the turn
+/// for as long as it keeps the file.
 #[derive(Debug)]
 pub(crate) struct Uploading(Mutex<Option<Arc<MergeBuild>>>);
 
@@ -345,7 +346,9 @@ impl Uploading {
         })
     }
 
-    /// The merge committed: what it uploaded holds its build no longer.
+    /// The merge keeps what it uploaded, to commit it: what it uploaded is
+    /// the partition's from here, committed or left for cleaning up, and
+    /// holds its build no longer.
     pub(crate) fn committed(&self) {
         lock(&self.0).take();
     }

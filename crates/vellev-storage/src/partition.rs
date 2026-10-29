@@ -2954,6 +2954,10 @@ impl Writer {
         };
         let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
         staged.keep();
+        // Kept from here: committed, or left for cleaning up should the
+        // commit fail, the partition's either way, and no longer what the
+        // merge holds.
+        uploading.committed();
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, |state| {
             state.compacted(&merge, merged);
@@ -2961,7 +2965,6 @@ impl Writer {
         })
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        uploading.committed();
         Ok(Some(position))
     }
 
