@@ -16,7 +16,7 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{Node, Settings};
-use vellev_storage::blobs::{Blobs, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
 use vellev_storage::{Holding, Mutation, State, MERGE_BUILDS};
 
@@ -60,10 +60,15 @@ fn note(n: u128) -> Mutation {
 
 /// A node, as `set` sets it up, on a coordinator and store of its own.
 fn node(set: impl FnOnce(&mut Settings)) -> Node {
-    let coordinator: Arc<dyn Coordinator> = Arc::new(MemoryCoordinator::default());
     let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(
         object_store::memory::InMemory::new(),
     )));
+    node_on(blobs, set)
+}
+
+/// A node, as `set` sets it up, on a coordinator of its own and `blobs`.
+fn node_on(blobs: Arc<dyn Blobs>, set: impl FnOnce(&mut Settings)) -> Node {
+    let coordinator: Arc<dyn Coordinator> = Arc::new(MemoryCoordinator::default());
     let mut settings = Settings {
         warm: None,
         ..Settings::new(NodeId::generate("node"))
@@ -507,6 +512,141 @@ async fn losing_a_tenant_stops_a_merge_a_request_makes() {
     .unwrap();
     until(5, "the stopped build's turn was never free", || {
         builds.under_way() == 0 && builds.turns_free() == MERGE_BUILDS
+    })
+    .await;
+}
+
+/// Write `held` steadily, half a flush every tenth of a second, until
+/// `writing` is cleared: each write must go through.
+fn steadily(
+    held: Arc<vellev_node::Tenant>,
+    writing: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut round = 0;
+        while writing.load(Ordering::SeqCst) {
+            let batch: Vec<Mutation> = (0..NOTES / 2)
+                .map(|n| note(100_000 + round * NOTES + n))
+                .collect();
+            let wrote = held.write(batch).await;
+            assert!(wrote.is_ok(), "a write was refused: {wrote:?}");
+            round += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+}
+
+/// A tenant written steadily, whose merge gives way to each flush that
+/// falls due while it waits for a turn, keeps its place: the next turn to
+/// come free is its, not that of a merge that queued behind it, however
+/// often it gives way. Its writes go on, and through, all the while.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_written_steadily_keeps_its_place_for_a_merge_turn() {
+    let node = node(|settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    four_flushes(&node, "first").await;
+    four_flushes(&node, "second").await;
+    until(30, "two merges never came to build", || builds.held() == 2).await;
+    // Its merge queues first, then gives way to flush after flush.
+    four_flushes(&node, "written").await;
+    let written = node.tenant(&tenant("written")).await.unwrap();
+    let key = written.partition().key().clone();
+    let writing = Arc::new(AtomicBool::new(true));
+    let writes = steadily(written.clone(), writing.clone());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Two more merges queue behind it.
+    four_flushes(&node, "behind").await;
+    four_flushes(&node, "further").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // One turn comes free: the written tenant's.
+    builds.let_one_go();
+    until(
+        10,
+        "the next turn went to a merge that queued behind one that gave way",
+        || builds.under_way_for(&key),
+    )
+    .await;
+    // The rest of the merges go on, and the writes with them.
+    builds.hold(None);
+    let merged = || written.read(|state| state.segments().count()) <= 2;
+    until(60, "the written tenant's merge was never made", merged).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    writing.store(false, Ordering::SeqCst);
+    within(10, "the writes never ended", writes).await.unwrap();
+    until(60, "a build was left counted under way", || {
+        builds.under_way() == 0
+    })
+    .await;
+}
+
+/// A store whose listings, once armed, wait until it is disarmed: as
+/// cleaning up waits on a slow store.
+#[derive(Debug)]
+struct SlowListing {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Blobs for SlowListing {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        while self.armed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A maintenance round whose merge gives way to a flush does nothing more:
+/// it doesn't clean up, which waits on the store, before the flush.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_round_whose_merge_gives_way_to_a_flush_does_nothing_more() {
+    let slow = Arc::new(SlowListing {
+        inner: Arc::new(ObjectBlobs::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        ))),
+        armed: AtomicBool::new(false),
+    });
+    let node = node_on(slow.clone(), |settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    four_flushes(&node, "first").await;
+    four_flushes(&node, "second").await;
+    until(30, "two merges never came to build", || builds.held() == 2).await;
+    four_flushes(&node, "written").await;
+    let written = node.tenant(&tenant("written")).await.unwrap();
+    let before = written.read(|state| state.segments().count());
+    slow.armed.store(true, Ordering::SeqCst);
+    let writing = Arc::new(AtomicBool::new(true));
+    let writes = steadily(written.clone(), writing.clone());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    writing.store(false, Ordering::SeqCst);
+    within(10, "the writes never ended", writes).await.unwrap();
+    let flushed = written.read(|state| state.segments().count()) - before;
+    assert!(
+        flushed >= 10,
+        "the tenant flushed {flushed} times while its rounds' cleaning up waited on the store"
+    );
+    slow.armed.store(false, Ordering::SeqCst);
+    builds.hold(None);
+    until(60, "a build was left counted under way", || {
+        builds.under_way() == 0
     })
     .await;
 }

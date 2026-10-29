@@ -2985,7 +2985,11 @@ impl Writer {
             if self.restoring.load(Ordering::SeqCst) {
                 return Ok(None);
             }
-            let Some(build) = self.merge_builds.turn(stopping, flush_due).await? else {
+            let Some(build) = self
+                .merge_builds
+                .turn(&self.lease.key, stopping, flush_due)
+                .await?
+            else {
                 return Ok(None);
             };
             if let Ok(planning) = self.building.try_lock() {

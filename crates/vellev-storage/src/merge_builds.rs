@@ -18,6 +18,7 @@ use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vellev_index::stop::Stop;
 
+use crate::coordinator::PartitionKey;
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
 
@@ -29,6 +30,12 @@ pub const MERGE_BUILDS: usize = 2;
 /// The longest a build waits where a test holds it, were the test never to
 /// let it go.
 const HELD_AT_MOST: Duration = Duration::from_secs(60);
+
+/// How long a turn granted to a merge that gave way to a flush is kept for
+/// its next attempt, at the most: past a flush, which takes seconds, and
+/// far short of a build, which takes minutes. One not taken up by then, as
+/// by a writer whose rounds have stopped, is let go.
+const PARKED_AT_MOST: Duration = Duration::from_secs(60);
 
 /// How often a build a test holds asks whether to go on, and a merge
 /// waiting for its turn whether a flush is due.
@@ -48,6 +55,11 @@ pub struct MergeBuilds {
     let_go: Condvar,
     /// How many builds wait where a test holds them now.
     held: AtomicUsize,
+    /// How many builds a test has let go one at a time, not yet gone on.
+    released: AtomicUsize,
+    /// How long a turn granted to a merge that gave way to a flush is kept
+    /// for its next attempt: see [`Self::park_for`].
+    parked_at_most: Mutex<Duration>,
     /// What the last build to end was reckoned to hold, as it was planned
     /// and once its rows were gathered.
     last_planned: AtomicUsize,
@@ -61,6 +73,8 @@ pub struct MergeBuilds {
 /// What one build under way is reckoned to hold, and the stop of its merge.
 #[derive(Debug)]
 struct Reckoned {
+    /// The partition merged.
+    key: PartitionKey,
     stop: Stop,
     bytes: AtomicUsize,
     /// What it was reckoned to hold as it was planned.
@@ -128,6 +142,8 @@ impl MergeBuilds {
             holding: Mutex::default(),
             let_go: Condvar::new(),
             held: AtomicUsize::new(0),
+            released: AtomicUsize::new(0),
+            parked_at_most: Mutex::new(PARKED_AT_MOST),
             last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
             probing: AtomicBool::new(false),
@@ -175,6 +191,28 @@ impl MergeBuilds {
         self.held.load(Ordering::SeqCst)
     }
 
+    /// Let one build held go on, the first to ask, whichever it is. For
+    /// tests that hand turns over one at a time.
+    #[doc(hidden)]
+    pub fn let_one_go(&self) {
+        self.released.fetch_add(1, Ordering::SeqCst);
+        self.let_go.notify_all();
+    }
+
+    /// Whether a build of `key`'s partition is under way. For tests.
+    #[doc(hidden)]
+    pub fn under_way_for(&self, key: &PartitionKey) -> bool {
+        lock(&self.under_way).iter().any(|build| &build.key == key)
+    }
+
+    /// Keep a turn granted to a merge that gave way to a flush for its next
+    /// attempt for at most `parked`, instead of [`PARKED_AT_MOST`]. For
+    /// tests.
+    #[doc(hidden)]
+    pub fn park_for(&self, parked: Duration) {
+        *lock(&self.parked_at_most) = parked;
+    }
+
     /// What the last build to end was reckoned to hold at its peak. For
     /// tests that hold the reckoning to what a build is measured to hold.
     #[doc(hidden)]
@@ -210,6 +248,7 @@ impl MergeBuilds {
     /// not other merges'.
     pub(crate) async fn turn(
         self: &Arc<Self>,
+        key: &PartitionKey,
         stopping: &Stopping,
         flush_due: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<MergeBuild>> {
@@ -230,6 +269,7 @@ impl MergeBuilds {
         };
         let turn = turn.map_err(|error| StorageError::Background(error.to_string()))?;
         let reckoned = Arc::new(Reckoned {
+            key: key.clone(),
             stop: stopping.stop().clone(),
             bytes: AtomicUsize::new(0),
             planned: AtomicUsize::new(0),
@@ -309,7 +349,14 @@ impl MergeBuild {
                 Some(Holding::UntilLetGo | Holding::BuiltUntilLetGo) => false,
                 Some(Holding::UntilStopped) => stopping.is_stopped(),
             };
-            if goes_on || Instant::now() >= until {
+            let one_let_go = !goes_on
+                && builds
+                    .released
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok();
+            if goes_on || one_let_go || Instant::now() >= until {
                 break;
             }
             holding = builds

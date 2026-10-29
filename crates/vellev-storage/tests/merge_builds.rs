@@ -640,3 +640,270 @@ async fn a_merge_whose_commit_fails_once_its_files_are_kept_gives_its_turn_back(
     })
     .await;
 }
+
+/// Two writers among `builds` of one turn: the first's merge built and
+/// held there, the second's waiting for the turn until `due` says its
+/// flush is due, when it gives way. Returns once it has.
+async fn one_gave_way(
+    builds: &Arc<MergeBuilds>,
+    due: &Arc<AtomicBool>,
+) -> (
+    Arc<Writer>,
+    tokio::task::JoinHandle<vellev_storage::Result<Option<LogPosition>>>,
+    Arc<Writer>,
+) {
+    let (one, other) = (Cluster::new().await, Cluster::new().await);
+    let first = flushed(&one, builds, 2).await;
+    let second = flushed(&other, builds, 2).await;
+    let building = tokio::spawn({
+        let first = first.clone();
+        async move { first.merge().await }
+    });
+    until(60, "the first merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    let waiting = tokio::spawn({
+        let (second, due) = (second.clone(), due.clone());
+        async move {
+            second
+                .merge_giving_way(&|| due.load(Ordering::SeqCst))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "a merge gave way with no flush due");
+    due.store(true, Ordering::SeqCst);
+    let gave_way = within(5, "a merge never gave way to a due flush", waiting).await;
+    assert_eq!(gave_way.unwrap().unwrap(), None);
+    (first, building, second)
+}
+
+/// A merge that gives way to a flush while it waits for its turn keeps its
+/// place: the turn that comes free next is kept for its next attempt, not
+/// taken by a merge that queued behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_that_gives_way_to_a_flush_keeps_its_place_for_a_turn() {
+    let builds = MergeBuilds::new(1);
+    builds.hold(Some(Holding::UntilLetGo));
+    let (one, other, third) = (
+        Cluster::new().await,
+        Cluster::new().await,
+        Cluster::new().await,
+    );
+    let first = flushed(&one, &builds, 2).await;
+    let second = flushed(&other, &builds, 2).await;
+    let behind = flushed(&third, &builds, 2).await;
+    let building = tokio::spawn({
+        let first = first.clone();
+        async move { first.merge().await }
+    });
+    until(60, "the first merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    let due = Arc::new(AtomicBool::new(false));
+    let waiting = tokio::spawn({
+        let (second, due) = (second.clone(), due.clone());
+        async move {
+            second
+                .merge_giving_way(&|| due.load(Ordering::SeqCst))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Queued behind the second.
+    let queued = tokio::spawn({
+        let behind = behind.clone();
+        async move { behind.merge().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    due.store(true, Ordering::SeqCst);
+    let gave_way = within(5, "a merge never gave way to a due flush", waiting).await;
+    assert_eq!(gave_way.unwrap().unwrap(), None);
+    // The turn comes free.
+    builds.let_one_go();
+    let built = within(60, "the first merge never ended", building).await;
+    assert!(built.unwrap().unwrap().is_some());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !builds.under_way_for(&behind.lease().key),
+        "a merge queued behind one that gave way to a flush took its turn"
+    );
+    assert_eq!(builds.held(), 0);
+    // Its next attempt takes the turn kept for it.
+    due.store(false, Ordering::SeqCst);
+    let next = tokio::spawn({
+        let (second, due) = (second.clone(), due.clone());
+        async move {
+            second
+                .merge_giving_way(&|| due.load(Ordering::SeqCst))
+                .await
+        }
+    });
+    until(10, "the merge that gave way never took its turn", || {
+        builds.under_way_for(&second.lease().key)
+    })
+    .await;
+    builds.hold(None);
+    let merged = within(60, "the merge that gave way never ended", next).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    let merged = within(60, "the merge behind it never ended", queued).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    assert_eq!(builds.under_way(), 0);
+    assert_eq!(builds.turns_free(), 1);
+}
+
+/// A turn kept for a merge that gave way to a flush is let go once its
+/// writer's merges are stopped, as letting the tenant go stops them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_kept_for_a_merge_is_let_go_once_its_merges_are_stopped() {
+    let builds = MergeBuilds::new(1);
+    builds.hold(Some(Holding::UntilLetGo));
+    let due = Arc::new(AtomicBool::new(false));
+    let (_first, building, second) = one_gave_way(&builds, &due).await;
+    builds.let_one_go();
+    within(60, "the first merge never ended", building)
+        .await
+        .unwrap()
+        .unwrap();
+    until(
+        5,
+        "the turn was not kept for the merge that gave way",
+        || builds.turns_free() == 0,
+    )
+    .await;
+    second.stop_merges();
+    until(
+        5,
+        "a turn kept for a stopped writer was never let go",
+        || builds.turns_free() == 1,
+    )
+    .await;
+}
+
+/// A turn kept for a merge that gave way to a flush is let go once its
+/// writer is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_kept_for_a_merge_is_let_go_once_its_writer_is_dropped() {
+    let builds = MergeBuilds::new(1);
+    builds.hold(Some(Holding::UntilLetGo));
+    let due = Arc::new(AtomicBool::new(false));
+    let (_first, building, second) = one_gave_way(&builds, &due).await;
+    builds.let_one_go();
+    within(60, "the first merge never ended", building)
+        .await
+        .unwrap()
+        .unwrap();
+    until(
+        5,
+        "the turn was not kept for the merge that gave way",
+        || builds.turns_free() == 0,
+    )
+    .await;
+    drop(second);
+    until(
+        5,
+        "a turn kept for a dropped writer was never let go",
+        || builds.turns_free() == 1,
+    )
+    .await;
+}
+
+/// A turn kept for a merge that gave way to a flush, never taken up, is let
+/// go once it has been kept as long as it is kept at most.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_kept_for_a_merge_never_taken_up_is_let_go() {
+    let builds = MergeBuilds::new(1);
+    builds.park_for(Duration::from_millis(300));
+    builds.hold(Some(Holding::UntilLetGo));
+    let due = Arc::new(AtomicBool::new(false));
+    let (_first, building, _second) = one_gave_way(&builds, &due).await;
+    builds.let_one_go();
+    within(60, "the first merge never ended", building)
+        .await
+        .unwrap()
+        .unwrap();
+    until(
+        5,
+        "the turn was not kept for the merge that gave way",
+        || builds.turns_free() == 0,
+    )
+    .await;
+    until(5, "a turn kept and never taken up was never let go", || {
+        builds.turns_free() == 1
+    })
+    .await;
+}
+
+/// A stopped build gives its turn back only once the last of what it
+/// gathered is dropped: held at its start, its merge dropped unstopped,
+/// the probe dropped last of all it holds sees the turn still taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_build_holds_its_turn_until_what_it_gathered_is_dropped() {
+    let builds = MergeBuilds::new(1);
+    builds.probe(true);
+    builds.hold(Some(Holding::UntilLetGo));
+    let cluster = Cluster::new().await;
+    let writer = flushed(&cluster, &builds, 2).await;
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    until(60, "the merge never came to build", || builds.held() == 1).await;
+    merging.abort();
+    assert!(merging.await.unwrap_err().is_cancelled());
+    builds.hold(None);
+    until(30, "the build was never let go", || builds.under_way() == 0).await;
+    let probed = builds.probed().expect("the probe was never dropped");
+    assert_eq!(
+        probed.under_way, 1,
+        "a stopped build's count was let go before what it gathered"
+    );
+    assert_eq!(
+        probed.turns_free, 0,
+        "a stopped build's turn was free before what it gathered was dropped"
+    );
+}
+
+/// A merge dropped with its runtime, where nothing is left to delete what
+/// it uploaded from a store that keeps what it is given, as one in memory
+/// does, gives its turn back all the same.
+#[test]
+fn a_merge_dropped_with_its_runtime_gives_its_turn_back() {
+    let builds = MergeBuilds::new(1);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    // The store outlives the runtime, as a node's does its tasks.
+    let store = runtime.block_on(async {
+        let mut cluster = Cluster::new().await;
+        let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
+        let held = Arc::new(HeldUpload {
+            inner: cluster.blobs.clone(),
+            // Its vectors are kept by then.
+            kind: |key| key.contains("-merged.segment"),
+            builds: builds.clone(),
+            armed: AtomicBool::new(false),
+            putting,
+            let_go: tokio::sync::Notify::new(),
+            ended: Arc::default(),
+        });
+        cluster.blobs = held.clone();
+        let writer = flushed(&cluster, &builds, 2).await;
+        held.armed.store(true, Ordering::SeqCst);
+        tokio::spawn(async move { writer.merge().await });
+        within(60, "the merge's segment never began to go up", put.recv()).await;
+        assert_eq!(builds.turns_free(), 0);
+        held.inner.clone()
+    });
+    drop(runtime);
+    assert_eq!(
+        builds.turns_free(),
+        1,
+        "a merge dropped with its runtime kept its turn"
+    );
+    drop(store);
+}

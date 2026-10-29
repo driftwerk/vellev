@@ -131,6 +131,8 @@ enum Text {
     Wide,
     /// 200 words drawn from 20.
     Few,
+    /// 100 words of 40 characters, each found in this row alone.
+    LongUnique,
 }
 
 impl Text {
@@ -146,12 +148,17 @@ impl Text {
             // as often as its inverse, as words are.
             Self::Wide => words(&mut |_| format!("w{}", 50_000f32.powf(random.unit()) as usize)),
             Self::Few => words(&mut |_| format!("f{}", (random.unit() * 20.0) as usize)),
+            Self::LongUnique => (0..100)
+                .map(|at| format!("{:x>40}", format!("l{n}y{at}")))
+                .collect::<Vec<_>>()
+                .join(" "),
         }
     }
 }
 
 /// Commit `rows` rows of `dimensions`, numbered from `first`, titled as
-/// `text` says.
+/// `text` says. Where `rewriting`, every fourth row rewrites the one
+/// `rewriting` rows before it, which dies.
 async fn committed(
     writer: &Writer,
     random: &mut Random,
@@ -159,12 +166,19 @@ async fn committed(
     rows: usize,
     dimensions: usize,
     text: Text,
+    rewriting: Option<usize>,
 ) {
+    let id = |n: usize| match rewriting {
+        Some(back) if n % 4 == 3 && n >= back => {
+            ObjectId(uuid::Uuid::from_u128((n - back) as u128))
+        }
+        _ => ObjectId(uuid::Uuid::from_u128(n as u128)),
+    };
     for batch in (0..rows).step_by(500) {
         let writes = (batch..(batch + 500).min(rows))
             .map(|n| Mutation::Upsert {
                 collection: name("docs"),
-                id: ObjectId::generate(),
+                id: id(first + n),
                 properties: json!({ "title": text.of(first + n, random), "n": first + n })
                     .as_object()
                     .unwrap()
@@ -183,7 +197,8 @@ async fn flush_peak(rows: usize, dimensions: usize) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
     writer.commit(vec![collection(dimensions)]).await.unwrap();
-    committed(&writer, &mut Random(7), 0, rows, dimensions, Text::Short).await;
+    let mut random = Random(7);
+    committed(&writer, &mut random, 0, rows, dimensions, Text::Short, None).await;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.flush().await.unwrap();
@@ -193,17 +208,21 @@ async fn flush_peak(rows: usize, dimensions: usize) -> usize {
 /// What a merge of four flushed segments of `rows` rows in all, of
 /// `dimensions`, holds at its peak beyond what was held before it.
 async fn merge_peak(rows: usize, dimensions: usize) -> usize {
-    merge_measured(rows, dimensions, Text::Short, false).await.0
+    merge_measured(rows, dimensions, Text::Short, false, false)
+        .await
+        .0
 }
 
 /// What a merge as [`merge_peak`] makes, its rows titled as `text` says,
-/// and their vectors `clustered` or not, holds at its peak, and what it
+/// their vectors `clustered` or not, and a quarter of each segment's rows
+/// `rewriting` the segment's before, holds at its peak, and what it
 /// reckoned it would once its rows were gathered, and as it was planned.
 async fn merge_measured(
     rows: usize,
     dimensions: usize,
     text: Text,
     clustered: bool,
+    rewriting: bool,
 ) -> (usize, usize, usize) {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
@@ -221,13 +240,16 @@ async fn merge_measured(
     writer.commit(vec![collection(dimensions)]).await.unwrap();
     let mut random = Random(11);
     for segment in 0..4 {
+        let back = rewriting.then_some(rows);
+        let first = segment * rows;
         committed(
             &writer,
             &mut random,
-            segment * rows,
+            first,
             rows / 4,
             dimensions,
             text,
+            back,
         )
         .await;
         writer.flush().await.unwrap();
@@ -292,25 +314,32 @@ async fn a_merge_holds_its_vectors_once() {
 async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
     let _alone = ALONE.lock().await;
     let shapes = [
-        (FEWER, WIDE, Text::Short, false),
-        (MORE, WIDE, Text::Short, false),
-        (FEWER, NARROW, Text::Short, false),
-        (MORE, NARROW, Text::Short, false),
-        (TEXTS, NARROW, Text::Unique, false),
-        (TEXTS, WIDE, Text::Unique, false),
-        (TEXTS, NARROW, Text::Wide, false),
-        (TEXTS, NARROW, Text::Few, false),
+        (FEWER, WIDE, Text::Short, false, false),
+        (MORE, WIDE, Text::Short, false, false),
+        (FEWER, NARROW, Text::Short, false, false),
+        (MORE, NARROW, Text::Short, false, false),
+        (TEXTS, NARROW, Text::Unique, false, false),
+        (TEXTS, WIDE, Text::Unique, false, false),
+        (TEXTS, NARROW, Text::LongUnique, false, false),
+        (TEXTS, NARROW, Text::Wide, false, false),
+        (TEXTS, NARROW, Text::Few, false, false),
+        // A quarter of each segment's rows dead by the merge.
+        (FEWER, NARROW, Text::Short, false, true),
         // Few enough rows that training is much of the peak.
-        (TRAINED, WIDE, Text::Short, true),
-        (FEWER, WIDE, Text::Short, true),
-        (MORE, WIDE, Text::Short, true),
-        (FEWER, NARROW, Text::Short, true),
+        (TRAINED, WIDE, Text::Short, true, false),
+        (FEWER, WIDE, Text::Short, true, false),
+        (MORE, WIDE, Text::Short, true, false),
+        (FEWER, NARROW, Text::Short, true, false),
     ];
     let mut measured = Vec::new();
-    for (rows, dimensions, text, clustered) in shapes {
-        let (peak, reckoned, planned) = merge_measured(rows, dimensions, text, clustered).await;
+    for (rows, dimensions, text, clustered, rewriting) in shapes {
+        let (peak, reckoned, planned) =
+            merge_measured(rows, dimensions, text, clustered, rewriting).await;
         let off = |by: usize| (by as f64 - peak as f64) / peak as f64;
-        let shape = format!("{rows} rows of {dimensions}, {text:?} text, clustered {clustered}");
+        let shape = format!(
+            "{rows} rows of {dimensions}, {text:?} text, clustered {clustered}, \
+             rewriting {rewriting}"
+        );
         eprintln!(
             "a merge of {shape} held {peak} bytes at its peak, \
              reckoned {reckoned} ({:+.0}%), planned {planned} ({:+.0}%)",
