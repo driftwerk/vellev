@@ -2835,8 +2835,11 @@ impl Writer {
         let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
             return Ok(None);
         };
-        build.reckon_planned(self.partition.read(|state| state.merge_reckoned(&merge)));
         let above = self.merging.clustered_above;
+        let reckoning = self
+            .partition
+            .read(|state| state.merge_reckoning(&merge, above));
+        build.reckon_planned(reckoning.peak());
         let Some((file, vectors, shape, named_at, alive)) = self.partition.read(|state| {
             let named_at = state.position();
             let (file, vectors) = state.merged(&merge, named_at, &stopping)?;
@@ -2849,7 +2852,8 @@ impl Writer {
         };
         let catalog = self.partition.read(|state| state.catalog().clone());
         drop(planning);
-        build.reckon(state::gathered_reckoned(&file, &vectors));
+        let reckoning = reckoning.gathered(&file, &vectors);
+        build.reckon(reckoning.peak());
         // A merge planned at another epoch than this is dropped before any
         // work is spent on it, and again at its commit below.
         if self.stale(planned) {

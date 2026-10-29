@@ -93,6 +93,8 @@ static ALONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// out of the difference.
 const FEWER: usize = 10_000;
 const MORE: usize = 20_000;
+/// Rows merged where each holds long text: fewer, as each holds far more.
+const TEXTS: usize = 4_000;
 /// The width measured, and one so narrow that its vectors cost next to
 /// nothing: the difference between their peaks is what the vectors cost,
 /// whatever each row costs besides.
@@ -115,20 +117,52 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
     (cluster, writer)
 }
 
-/// Commit `rows` rows of `dimensions`, numbered from `first`.
+/// The text each row's title holds.
+#[derive(Debug, Clone, Copy)]
+enum Text {
+    /// "row" and its number.
+    Short,
+    /// 200 words, each found in this row alone: as code, paths and ids are.
+    Unique,
+    /// 200 words drawn from 50,000, the commoner far more often.
+    Wide,
+    /// 200 words drawn from 20.
+    Few,
+}
+
+impl Text {
+    /// Row `n`'s title.
+    fn of(self, n: usize, random: &mut Random) -> String {
+        let words = |word: &mut dyn FnMut(usize) -> String| {
+            (0..200).map(word).collect::<Vec<_>>().join(" ")
+        };
+        match self {
+            Self::Short => format!("row {n}"),
+            Self::Unique => words(&mut |at| format!("u{n}x{at}")),
+            // Of rank 50,000 to the power of a uniform draw: each rank about
+            // as often as its inverse, as words are.
+            Self::Wide => words(&mut |_| format!("w{}", 50_000f32.powf(random.unit()) as usize)),
+            Self::Few => words(&mut |_| format!("f{}", (random.unit() * 20.0) as usize)),
+        }
+    }
+}
+
+/// Commit `rows` rows of `dimensions`, numbered from `first`, titled as
+/// `text` says.
 async fn committed(
     writer: &Writer,
     random: &mut Random,
     first: usize,
     rows: usize,
     dimensions: usize,
+    text: Text,
 ) {
     for batch in (0..rows).step_by(500) {
         let writes = (batch..(batch + 500).min(rows))
             .map(|n| Mutation::Upsert {
                 collection: name("docs"),
                 id: ObjectId::generate(),
-                properties: json!({ "title": format!("row {}", first + n), "n": first + n })
+                properties: json!({ "title": text.of(first + n, random), "n": first + n })
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -146,7 +180,7 @@ async fn flush_peak(rows: usize, dimensions: usize) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
     writer.commit(vec![collection(dimensions)]).await.unwrap();
-    committed(&writer, &mut Random(7), 0, rows, dimensions).await;
+    committed(&writer, &mut Random(7), 0, rows, dimensions, Text::Short).await;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     writer.flush().await.unwrap();
@@ -156,25 +190,43 @@ async fn flush_peak(rows: usize, dimensions: usize) -> usize {
 /// What a merge of four flushed segments of `rows` rows in all, of
 /// `dimensions`, holds at its peak beyond what was held before it.
 async fn merge_peak(rows: usize, dimensions: usize) -> usize {
-    merge_measured(rows, dimensions).await.0
+    merge_measured(rows, dimensions, Text::Short, false).await.0
 }
 
-/// What a merge as [`merge_peak`] makes holds at its peak, and what it
+/// What a merge as [`merge_peak`] makes, its rows titled as `text` says,
+/// and their vectors `clustered` or not, holds at its peak, and what it
 /// reckoned it would once its rows were gathered, and as it was planned.
-async fn merge_measured(rows: usize, dimensions: usize) -> (usize, usize, usize) {
+async fn merge_measured(
+    rows: usize,
+    dimensions: usize,
+    text: Text,
+    clustered: bool,
+) -> (usize, usize, usize) {
     let dir = tempfile::tempdir().unwrap();
     let (_cluster, writer) = on_disk(dir.path()).await;
     let builds = vellev_storage::MergeBuilds::new(1);
     let writer = writer
         .merging_with(vellev_storage::Merging {
             fanout: 4,
+            clustered_above: match clustered {
+                true => 1_000,
+                false => vellev_storage::Merging::default().clustered_above,
+            },
             ..vellev_storage::Merging::default()
         })
         .merging_among(builds.clone());
     writer.commit(vec![collection(dimensions)]).await.unwrap();
     let mut random = Random(11);
     for segment in 0..4 {
-        committed(&writer, &mut random, segment * rows, rows / 4, dimensions).await;
+        committed(
+            &writer,
+            &mut random,
+            segment * rows,
+            rows / 4,
+            dimensions,
+            text,
+        )
+        .await;
         writer.flush().await.unwrap();
     }
     COUNTING.reset_peak();
@@ -228,36 +280,50 @@ async fn a_merge_holds_its_vectors_once() {
 
 /// A merge reckons what it holds at its peak to within 30% of what it is
 /// measured to hold once its rows are gathered, and to within half as it
-/// is planned, from what its run's segments hold (merge note, §7.6): the
-/// node counts what a stopped merge was reckoned to hold as draining,
-/// until it has ended.
+/// is planned, from what its run's segments hold (merge note, §7.6 and
+/// §7.7): the node counts what a stopped merge was reckoned to hold as
+/// draining, until it has ended. Over short text and long, text of words
+/// each in one row, over a large vocabulary and a small one, and vectors
+/// clustered or not.
 #[tokio::test(flavor = "current_thread")]
 async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
     let _alone = ALONE.lock().await;
+    let shapes = [
+        (FEWER, WIDE, Text::Short, false),
+        (MORE, WIDE, Text::Short, false),
+        (FEWER, NARROW, Text::Short, false),
+        (MORE, NARROW, Text::Short, false),
+        (TEXTS, NARROW, Text::Unique, false),
+        (TEXTS, WIDE, Text::Unique, false),
+        (TEXTS, NARROW, Text::Wide, false),
+        (TEXTS, NARROW, Text::Few, false),
+        (FEWER, WIDE, Text::Short, true),
+        (MORE, WIDE, Text::Short, true),
+        (FEWER, NARROW, Text::Short, true),
+    ];
     let mut measured = Vec::new();
-    for (rows, dimensions) in [(FEWER, WIDE), (MORE, WIDE), (FEWER, NARROW), (MORE, NARROW)] {
-        let (peak, reckoned, planned) = merge_measured(rows, dimensions).await;
+    for (rows, dimensions, text, clustered) in shapes {
+        let (peak, reckoned, planned) = merge_measured(rows, dimensions, text, clustered).await;
         let off = |by: usize| (by as f64 - peak as f64) / peak as f64;
+        let shape = format!("{rows} rows of {dimensions}, {text:?} text, clustered {clustered}");
         eprintln!(
-            "a merge of {rows} rows of {dimensions} held {peak} bytes at its peak, \
+            "a merge of {shape} held {peak} bytes at its peak, \
              reckoned {reckoned} ({:+.0}%), planned {planned} ({:+.0}%)",
             off(reckoned) * 100.0,
             off(planned) * 100.0
         );
-        measured.push((rows, dimensions, peak, reckoned, planned));
+        measured.push((shape, peak, reckoned, planned));
     }
-    for (rows, dimensions, peak, reckoned, planned) in measured {
+    for (shape, peak, reckoned, planned) in measured {
         let off = |by: usize| (by as f64 - peak as f64) / peak as f64;
         assert!(
             off(reckoned).abs() <= 0.3,
-            "a merge of {rows} rows of {dimensions} reckoned {reckoned} bytes, \
-             held {peak} at its peak: {:+.0}%",
+            "a merge of {shape} reckoned {reckoned} bytes, held {peak} at its peak: {:+.0}%",
             off(reckoned) * 100.0
         );
         assert!(
             off(planned).abs() <= 0.5,
-            "a merge of {rows} rows of {dimensions} was planned at {planned} bytes, \
-             held {peak} at its peak: {:+.0}%",
+            "a merge of {shape} was planned at {planned} bytes, held {peak} at its peak: {:+.0}%",
             off(planned) * 100.0
         );
     }

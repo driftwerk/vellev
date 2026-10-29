@@ -496,6 +496,41 @@ pub struct RowIndex {
 }
 
 impl RowIndex {
+    /// About how many bytes the index takes in memory: every row recorded,
+    /// and each property's values, with the text of each, the rows holding
+    /// each, and the runs over them. Rough, and a walk over every value.
+    pub fn resident(&self) -> usize {
+        const VALUE: usize = std::mem::size_of::<(Key, RoaringBitmap)>() + 16;
+        let bitmap = |rows: &RoaringBitmap| rows.serialized_size();
+        let properties: usize = self
+            .properties
+            .iter()
+            .map(|(name, index)| {
+                let values: usize = index
+                    .values
+                    .iter()
+                    .map(|(key, rows)| {
+                        let text = match key {
+                            Key::Text(text) => text.capacity(),
+                            _ => 0,
+                        };
+                        VALUE + text + bitmap(rows)
+                    })
+                    .sum();
+                let runs: usize = index.runs.as_ref().map_or(0, |runs| {
+                    runs.levels
+                        .iter()
+                        .flatten()
+                        .map(|rows| std::mem::size_of::<RoaringBitmap>() + bitmap(rows))
+                        .sum::<usize>()
+                        + runs.firsts.len() * std::mem::size_of::<Key>()
+                });
+                name.capacity() + bitmap(&index.present) + values + runs
+            })
+            .sum();
+        bitmap(&self.rows) + properties
+    }
+
     /// Every row recorded.
     pub fn rows(&self) -> &RoaringBitmap {
         &self.rows
