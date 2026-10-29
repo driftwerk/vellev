@@ -7,7 +7,9 @@
 mod common;
 
 use common::*;
-use vellev_storage::{Holding, MergeBuilds, Merging};
+use vellev_storage::backups::Held;
+use vellev_storage::coordinator::{Clock, Restore};
+use vellev_storage::{Holding, MergeBuilds, MergeStage, Merging};
 
 /// Notes in each segment merged.
 const NOTES: u32 = 300;
@@ -255,6 +257,11 @@ async fn a_merge_stopped_while_it_uploads_holds_its_turn_and_count_until_the_upl
     }
     held.let_go.notify_one();
     until(30, "the build was never let go", || builds.under_way() == 0).await;
+    // Its turn goes just after its count.
+    until(5, "the build's turn was never given back", || {
+        builds.turns_free() == 1
+    })
+    .await;
     let seen = held.ended.lock().unwrap().expect("the upload ended");
     assert_eq!(
         seen,
@@ -418,4 +425,164 @@ async fn a_turn_is_not_held_while_its_partition_s_building_lock_is() {
     assert!(merged.unwrap().unwrap().is_some());
     assert_eq!(builds.under_way(), 0);
     assert_eq!(builds.turns_free(), 1);
+}
+
+/// A store that hands a copy of each merged vectors file it is given, once
+/// armed, to a thread of its own, which holds it until let go: as a cache
+/// writes its local copy on a thread of its own, or a local store writes on
+/// a blocking thread, whoever stops waiting.
+#[derive(Debug)]
+struct Copying {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    let_go: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[async_trait]
+impl Blobs for Copying {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if self.armed.load(Ordering::SeqCst) && key.contains("-merged.vectors") {
+            let (copy, let_go) = (bytes.clone(), self.let_go.clone());
+            std::thread::spawn(move || {
+                let (gone, told) = &*let_go;
+                let mut gone = gone.lock().unwrap();
+                while !*gone {
+                    gone = told.wait(gone).unwrap();
+                }
+                drop(copy);
+            });
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// What a stopped merge uploaded may be held on by a store's own thread
+/// after the merge, its uploads and their deletes have all ended: the build
+/// holds its turn, its count and what it drains until the last copy is let
+/// go, wherever it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_of_a_stopped_merge_s_upload_holds_its_turn_until_it_is_let_go() {
+    let builds = MergeBuilds::new(1);
+    let mut cluster = Cluster::new().await;
+    let copying = Arc::new(Copying {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+        let_go: Arc::default(),
+    });
+    cluster.blobs = copying.clone();
+    let writer = flushed(&cluster, &builds, 2).await;
+    copying.armed.store(true, Ordering::SeqCst);
+    // Stopped once uploaded, as it loads back what it built.
+    writer.stop_merges_at(Some(MergeStage::Loading));
+    let merged = within(60, "the merge never gave up", writer.merge()).await;
+    assert_eq!(merged.unwrap(), None);
+    for _ in 0..30 {
+        assert_eq!(
+            builds.under_way(),
+            1,
+            "a build was let go while a store's thread held what it built"
+        );
+        assert_eq!(
+            builds.turns_free(),
+            0,
+            "a build's turn was given back early"
+        );
+        assert!(
+            builds.draining() > 0,
+            "a stopped build stopped draining early"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (gone, told) = &*copying.let_go;
+    *gone.lock().unwrap() = true;
+    told.notify_all();
+    until(5, "the build was never let go once the copy was", || {
+        builds.under_way() == 0 && builds.turns_free() == 1
+    })
+    .await;
+    assert_eq!(builds.draining(), 0);
+}
+
+/// A merge that commits gives its turn back, though a store keeps what it
+/// uploaded, as one in memory does: what it built is the partition's now,
+/// counted as what the partition holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_committed_merge_gives_its_turn_back_though_its_store_keeps_its_files() {
+    let builds = MergeBuilds::new(1);
+    let cluster = Cluster::new().await;
+    let writer = flushed(&cluster, &builds, 2).await;
+    let mut random = Random(13);
+    for round in 0..3 {
+        let merged = within(
+            60,
+            "a merge waited for a turn a committed one kept",
+            writer.merge(),
+        );
+        assert!(merged.await.unwrap().is_some(), "merge {round}");
+        assert_eq!(builds.under_way(), 0, "merge {round}");
+        assert_eq!(builds.turns_free(), 1, "merge {round}");
+        let notes = (0..NOTES).map(|n| note((20 + round) * NOTES + n, &mut random));
+        writer.commit(notes.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+}
+
+/// Holds the claim a restore is made under.
+struct Claimed;
+
+#[async_trait]
+impl Held for Claimed {
+    async fn held(&self) -> vellev_storage::Result<bool> {
+        Ok(true)
+    }
+    fn still(&self) -> bool {
+        true
+    }
+}
+
+/// A merge on a writer that is restoring takes no turn: it could only be
+/// dropped, the partition put back, and the turn is another's meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_while_its_writer_restores_takes_no_turn() {
+    let builds = MergeBuilds::new(1);
+    let cluster = Cluster::new().await;
+    let writer = flushed(&cluster, &builds, 2).await;
+    let at = cluster.committed().await;
+    let restore = Restore {
+        request: RequestId::generate(),
+        asked: [0; 32],
+        from: at.log_position,
+        from_at: cluster.clock.now(),
+    };
+    let restoring = writer
+        .restore_from(
+            cluster.blobs.clone(),
+            at.manifest.as_ref(),
+            restore,
+            None,
+            &Claimed,
+        )
+        .await
+        .unwrap();
+    let merged = within(
+        5,
+        "a merge on a writer that is restoring waited",
+        writer.merge(),
+    )
+    .await;
+    assert_eq!(merged.unwrap(), None);
+    assert_eq!(builds.under_way(), 0);
+    assert_eq!(builds.turns_free(), 1);
+    drop(restoring);
+    let next = within(60, "the next merge never ended", writer.merge()).await;
+    assert!(next.unwrap().is_some());
 }
