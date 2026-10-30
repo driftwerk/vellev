@@ -370,6 +370,10 @@ impl Timings {
 #[derive(Debug, Default)]
 pub(crate) struct Lag {
     state: Mutex<LagState>,
+    /// Where a note of rows applied waits, before it is made, while a test
+    /// asks for a checkpoint beside it.
+    #[cfg(test)]
+    pub(crate) paused: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
 }
 
 #[derive(Debug, Default)]
@@ -417,6 +421,14 @@ impl Lag {
 
     /// Rows were applied, and the partition holds `unflushed`.
     pub(crate) fn applied(&self, unflushed: usize) {
+        #[cfg(test)]
+        {
+            let paused = self.paused.lock().unwrap().take();
+            if let Some(paused) = paused {
+                paused.wait();
+                paused.wait();
+            }
+        }
         self.state().saw(unflushed, Instant::now());
     }
 

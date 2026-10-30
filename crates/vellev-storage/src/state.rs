@@ -1085,7 +1085,7 @@ pub(crate) fn indexed_stopping<'a>(
     let asked = |row: usize| {
         row.is_multiple_of(ROWS_BETWEEN_ASKING) && stopping.stopped(MergeStage::Indexing)
     };
-    let tokenized: Vec<Option<Tokenized>> = on.section(|| {
+    let tokenized: Vec<Option<Tokenized>> = on.section("tokenizing", || {
         rows.par_iter()
             .map(|Row { collection, object }| {
                 if stopping.stopped(MergeStage::Indexing) {
@@ -1101,7 +1101,7 @@ pub(crate) fn indexed_stopping<'a>(
     }
     // The filterable values and vectors on one thread, the text on
     // another: each in row order, as indexing each row in turn makes them.
-    let ((mut indexes, vectors), texts) = on.section(|| {
+    let ((mut indexes, vectors), texts) = on.section("indexing", || {
         rayon::join(
             || {
                 let mut indexes = Indexes::new();
@@ -1165,12 +1165,11 @@ pub(crate) fn indexed_stopping<'a>(
             None if clustered_above
                 .is_some_and(|above| vectors.len() > above.max(SHORTLIST_ABOVE)) =>
             {
-                on.section(|| ClusteredIndex::build_stopping(schema.distance, vectors, stop))
+                ClusteredIndex::build_stopping_on(schema.distance, vectors, stop, on)
                     .ok()?
                     .map(|clustered| Vectors::Clustered(Arc::new(clustered)))
             }
-            None => on
-                .section(|| BinaryIndex::build_stopping(schema.distance, vectors, stop))
+            None => BinaryIndex::build_stopping_on(schema.distance, vectors, stop, on)
                 .ok()?
                 .map(Vectors::Binary),
         };
@@ -1179,7 +1178,7 @@ pub(crate) fn indexed_stopping<'a>(
         if stopping.stopped(MergeStage::Indexing) {
             return None;
         }
-        index.rows.summarise();
+        on.section("summarising", || index.rows.summarise());
     }
     Some((indexes, threads.most()))
 }

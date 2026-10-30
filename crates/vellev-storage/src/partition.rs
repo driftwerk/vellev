@@ -61,35 +61,6 @@ const CLEANING_AT_ONCE: usize = 16;
 /// that waits for it can well wait.
 const CLEANING_WITHIN: Duration = Duration::from_secs(60);
 
-std::thread_local! {
-    /// How many builds this thread is in: more than one is a build nested
-    /// in another's, as a pool's thread waiting in a section takes on
-    /// whatever else is queued (review of #169).
-    static BUILDS_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// A build entered on this thread, left as this is dropped; one entered
-/// inside another is counted among its merge builds' nested ones.
-struct Nesting;
-
-impl Nesting {
-    fn entered(build: Option<&MergeBuild>) -> Self {
-        let depth = BUILDS_HERE.with(|here| here.replace(here.get() + 1));
-        if depth > 0 {
-            if let Some(build) = build {
-                build.builds().nested_here();
-            }
-        }
-        Nesting
-    }
-}
-
-impl Drop for Nesting {
-    fn drop(&mut self) {
-        BUILDS_HERE.with(|here| here.set(here.get() - 1));
-    }
-}
-
 /// A segment built and ready to write: its file without the rows'
 /// vectors, which the column holds, its indexes, and the frames of the
 /// file and the column.
@@ -123,7 +94,6 @@ fn segment_built(
     on: OnPool<'_>,
 ) -> Result<Option<Built>> {
     let _turn = turn;
-    let _building = Nesting::entered(build);
     // Before the rows it was given are bound below it, as parameters are
     // dropped after locals: so that it is dropped last of all the build
     // holds, the rows gathered among them, however the build ends.
@@ -133,7 +103,7 @@ fn segment_built(
         build.held_here(stopping, false);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
-    let vectors = vectors.map(|gathered| gathered.finish(format));
+    let vectors = vectors.map(|gathered| on.section("finishing", || gathered.finish(format)));
     let indexes = match &vectors {
         Some(column) => state::indexed(
             catalog,
@@ -163,13 +133,13 @@ fn segment_built(
         return Ok(None);
     }
     let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
-    let segment = encode_as(Kind::Segment, format, &file)?;
+    let segment = on.section("encoding", || encode_as(Kind::Segment, format, &file))?;
     if stopping.stopped(MergeStage::Encoding) {
         return Ok(None);
     }
-    let column = vectors.encode_as(format);
+    let column = on.section("encoding_vectors", || vectors.encode_as(format));
     // Here, off the async threads and the state's lock, once.
-    let parts = state::Parts::of(&file, &indexes);
+    let parts = on.section("parts", || state::Parts::of(&file, &indexes));
     if let Some(build) = build {
         build.held_here(stopping, true);
     }
@@ -2709,27 +2679,30 @@ impl Writer {
         // it. Never left to the closure's captures, whose order is not set.
         let built = at_once(move || {
             let build = build;
-            // A merge's build's parallel sections on the pool its node gives
-            // merge builds, if not the global one, the rest here; a flush's
-            // where it is.
-            let pool = build.as_deref().and_then(|build| build.builds().pool());
+            // A merge's build's sections on the pool its node gives merge
+            // builds, if not the global one, the rest here; a flush's where
+            // it is.
             let on = match &build {
-                Some(_) => OnPool::merge(pool.map(|pool| &**pool)),
+                Some(build) => OnPool::merge(build.builds()),
                 None => OnPool::global(),
             };
-            let built = on.build(|on| {
-                segment_built(
-                    turn,
-                    file,
-                    vectors,
-                    &catalog,
-                    &stopping,
-                    build.as_deref(),
-                    above,
-                    format,
-                    on,
-                )
-            });
+            let cpu = vellev_index::pool::thread_cpu();
+            let built = segment_built(
+                turn,
+                file,
+                vectors,
+                &catalog,
+                &stopping,
+                build.as_deref(),
+                above,
+                format,
+                on,
+            );
+            if let (Some(build), Some(before), Some(after)) =
+                (&build, cpu, vellev_index::pool::thread_cpu())
+            {
+                build.builds().spent_on_top(after.saturating_sub(before));
+            }
             (built, build)
         });
         built.await?.0
@@ -4578,6 +4551,51 @@ mod tests {
 
     /// A writer of a partition of its own, in memory, which merges two
     /// segments as soon as there are two.
+    /// Review of #169 (MEDIUM 2): rows applied are noted under the state's
+    /// lock, as a checkpoint notes what it takes. A checkpoint asked for
+    /// while the note is being made waits for it, so the rows it takes are
+    /// timed as due; were the note made after the lock, the checkpoint
+    /// would take rows it never knew had fallen due, and their wait would
+    /// be lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_applied_are_noted_before_a_checkpoint_can_take_them() {
+        let timings = Arc::new(Timings::default());
+        timings.keep_events(true);
+        let writer = writer()
+            .await
+            .measured_by(timings.clone())
+            .flushing_due_at(3, 0);
+        let writer = Arc::new(writer);
+        writer.commit(vec![create()]).await.unwrap();
+        let paused = Arc::new(std::sync::Barrier::new(2));
+        *writer.lag.paused.lock().unwrap() = Some(paused.clone());
+        let committing = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.commit(vec![upsert(1), upsert(2), upsert(3)]).await }
+        });
+        let wait = |paused: Arc<std::sync::Barrier>| {
+            tokio::task::spawn_blocking(move || {
+                paused.wait();
+            })
+        };
+        // The rows are applied, and their note waits to be made.
+        wait(paused.clone()).await.unwrap();
+        let flushing = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.flush().await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait(paused).await.unwrap();
+        committing.await.unwrap().unwrap();
+        flushing.await.unwrap().unwrap();
+        let due = timings
+            .drain_events()
+            .into_iter()
+            .filter(|event| event.timed == Timed::FlushDue)
+            .count();
+        assert_eq!(due, 1, "the rows the checkpoint took not timed as due");
+    }
+
     async fn writer() -> Writer {
         let blobs = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
         writer_on(blobs).await.0

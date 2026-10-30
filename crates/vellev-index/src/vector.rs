@@ -18,6 +18,7 @@ use roaring::RoaringBitmap;
 use vellev_core::{Distance, SQUARED_LENGTH_UNDER};
 
 use crate::rotation::{Random, Rotation};
+use crate::pool::{CallersPool, Passes};
 use crate::stop::{Stage, Stop, Stopped};
 
 const LANES: usize = 16;
@@ -590,7 +591,7 @@ impl BinaryIndex {
         vectors: &[(u32, &[f32])],
         centre: Vec<f32>,
     ) -> Option<Self> {
-        match Self::build_about_stopping(metric, vectors, centre, &Stop::new()) {
+        match Self::build_about_stopping(metric, vectors, centre, &Stop::new(), CallersPool) {
             Ok(index) => index,
             Err(Stopped) => unreachable!("a build without a stop is never stopped"),
         }
@@ -602,6 +603,7 @@ impl BinaryIndex {
         vectors: &[(u32, &[f32])],
         centre: Vec<f32>,
         stop: &Stop,
+        on: impl Passes,
     ) -> Result<Option<Self>, Stopped> {
         let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
             return Ok(None);
@@ -615,27 +617,29 @@ impl BinaryIndex {
         let words = index.words;
         let mut codes = vec![0u64; measured.len() * words];
         let (rotation, centre) = (&index.rotation, &index.centre);
-        let factors = codes
-            .par_chunks_mut(words)
-            .zip(measured.par_iter())
-            .map(|(code, (_, vector))| {
-                // Given up: the rows left are not coded, and the build
-                // gives up once the pass is through them.
-                if stop.check(Stage::Coding).is_err() {
-                    return (0.0, 0.0);
-                }
-                let vector = rotation.apply(&normalised(metric, vector));
-                code.iter_mut()
-                    .zip(encode(centre, &vector))
-                    .for_each(|(slot, word)| *slot = word);
-                let (squared, along) = residual(centre, &vector);
-                let term = match metric {
-                    Distance::L2 => squared,
-                    Distance::Dot | Distance::Cosine => -along,
-                };
-                (term, squared.sqrt())
-            })
-            .collect();
+        let factors = on.pass("coding", || {
+            codes
+                .par_chunks_mut(words)
+                .zip(measured.par_iter())
+                .map(|(code, (_, vector))| {
+                    // Given up: the rows left are not coded, and the build
+                    // gives up once the pass is through them.
+                    if stop.check(Stage::Coding).is_err() {
+                        return (0.0, 0.0);
+                    }
+                    let vector = rotation.apply(&normalised(metric, vector));
+                    code.iter_mut()
+                        .zip(encode(centre, &vector))
+                        .for_each(|(slot, word)| *slot = word);
+                    let (squared, along) = residual(centre, &vector);
+                    let term = match metric {
+                        Distance::L2 => squared,
+                        Distance::Dot | Distance::Cosine => -along,
+                    };
+                    (term, squared.sqrt())
+                })
+                .collect()
+        });
         stop.passed()?;
         index.rows = measured.iter().map(|(row, _)| *row).collect();
         index.codes = codes;
@@ -684,6 +688,18 @@ impl BinaryIndex {
         vectors: &[(u32, &[f32])],
         stop: &Stop,
     ) -> Result<Option<Self>, Stopped> {
+        Self::build_stopping_on(metric, vectors, stop, CallersPool)
+    }
+
+    /// As [`Self::build_stopping`], each parallel pass where `on` says:
+    /// sampling for the centre, and coding. The rest stays on the calling
+    /// thread.
+    pub fn build_stopping_on(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        stop: &Stop,
+        on: impl Passes,
+    ) -> Result<Option<Self>, Stopped> {
         let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
             return Ok(None);
         };
@@ -693,17 +709,19 @@ impl BinaryIndex {
             .map(|(_, vector)| *vector)
             .filter(|vector| measurable(metric, vector))
             .collect();
-        let sampled: Vec<Vec<f32>> = Random(ROTATION_SEED)
-            .sample(measured.len(), CENTRE_SAMPLE)
-            .into_par_iter()
-            .map(|at| match stop.check(Stage::Sampling) {
-                Ok(()) => rotation.apply(&normalised(metric, measured[at])),
-                Err(Stopped) => Vec::new(),
-            })
-            .collect();
+        let sample = Random(ROTATION_SEED).sample(measured.len(), CENTRE_SAMPLE);
+        let sampled: Vec<Vec<f32>> = on.pass("sampling", || {
+            sample
+                .into_par_iter()
+                .map(|at| match stop.check(Stage::Sampling) {
+                    Ok(()) => rotation.apply(&normalised(metric, measured[at])),
+                    Err(Stopped) => Vec::new(),
+                })
+                .collect()
+        });
         stop.passed()?;
         let centre = median(rotation.width, sampled.iter().map(Vec::as_slice));
-        Self::build_about_stopping(metric, vectors, centre, stop)
+        Self::build_about_stopping(metric, vectors, centre, stop, on)
     }
 
     /// An index of no rows yet, its codes to be taken about the mean of
