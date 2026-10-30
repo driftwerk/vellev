@@ -57,7 +57,7 @@ pub const BLOCK: usize = 128;
 /// The most any posting in a block of them can contribute: the highest
 /// frequency and the shortest row in the block, which together bound the
 /// score of every posting in it, whatever the average length and weight.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Block {
     max_frequency: u32,
     min_length: u32,
@@ -65,7 +65,7 @@ struct Block {
 
 /// The rows holding one token, as positions in the field's `rows`, with a
 /// bound per [`BLOCK`] of them.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Postings {
     holders: Vec<u32>,
     frequencies: Vec<u32>,
@@ -186,7 +186,7 @@ fn bound(parameters: Bm25, weight: f32, average: f32, block: &Block) -> f32 {
 
 /// One property's text: the rows that have it, ascending, with their
 /// lengths, and for every token the rows holding it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Field {
     rows: Vec<u32>,
     lengths: Vec<u32>,
@@ -217,7 +217,7 @@ impl Field {
 
 /// The searchable text of one collection's rows, by property. Rows are
 /// numbered by the caller and must be inserted in ascending order.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextIndex {
     fields: HashMap<String, Field>,
 }

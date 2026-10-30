@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use vellev_index::stop::{Stage, Stop};
 
+use crate::state::TOKENIZED_AT_ONCE;
+
 /// The stages of a merge in which it asks its stop. Named for tests that
 /// show each one asks; not for use.
 #[doc(hidden)]
@@ -38,13 +40,29 @@ pub enum MergeStage {
 /// How often a merge waiting on the store or the disk asks its stop.
 const ASKS_EVERY: Duration = Duration::from_millis(20);
 
-/// A build's stop, and the stage a test has it stop itself in.
+/// A build's stop, the stage a test has it stop itself in, and what else a
+/// test asks of the build.
 #[derive(Clone, Debug)]
 pub(crate) struct Stopping {
     stop: Stop,
     at: Option<MergeStage>,
     /// Whether the build panics, as a test asks.
     panics: bool,
+    /// How many rows' text the build holds tokenized at once, at the most:
+    /// [`TOKENIZED_AT_ONCE`], unless a test asks otherwise.
+    tokenized_at_once: usize,
+    /// Its askings, counted as a test asks.
+    #[cfg(test)]
+    asked: Option<std::sync::Arc<Asked>>,
+}
+
+/// How often a build asked its stop in any stage, and the asking at which
+/// the stop stops itself.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct Asked {
+    pub times: std::sync::atomic::AtomicUsize,
+    pub stops_at: usize,
 }
 
 impl Stopping {
@@ -55,7 +73,14 @@ impl Stopping {
             Some(MergeStage::Vectors(stage)) => Stop::at_first(stage),
             _ => Stop::new(),
         };
-        Self { stop, at, panics }
+        Self {
+            stop,
+            at,
+            panics,
+            tokenized_at_once: TOKENIZED_AT_ONCE,
+            #[cfg(test)]
+            asked: None,
+        }
     }
 
     /// For a flush or a restore, which nothing stops.
@@ -64,7 +89,33 @@ impl Stopping {
             stop: Stop::new(),
             at: None,
             panics: false,
+            tokenized_at_once: TOKENIZED_AT_ONCE,
+            #[cfg(test)]
+            asked: None,
         }
+    }
+
+    /// As this, holding `rows` rows' text tokenized at once, at the most,
+    /// and at least one: how a test weighs a build against another.
+    pub(crate) fn tokenizing(self, rows: usize) -> Self {
+        Self {
+            tokenized_at_once: rows.max(1),
+            ..self
+        }
+    }
+
+    /// As this, its askings counted, and stopped at the `stops_at`th.
+    #[cfg(test)]
+    pub(crate) fn counted(self, stops_at: usize) -> (Self, std::sync::Arc<Asked>) {
+        let asked = std::sync::Arc::new(Asked {
+            times: std::sync::atomic::AtomicUsize::new(0),
+            stops_at,
+        });
+        let stopping = Self {
+            asked: Some(asked.clone()),
+            ..self
+        };
+        (stopping, asked)
     }
 
     /// The stop an index build is given.
@@ -76,6 +127,15 @@ impl Stopping {
     pub(crate) fn stopped(&self, stage: MergeStage) -> bool {
         if self.at == Some(stage) {
             self.stop.stop();
+        }
+        #[cfg(test)]
+        if let Some(asked) = &self.asked {
+            let times = asked
+                .times
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if times + 1 >= asked.stops_at {
+                self.stop.stop();
+            }
         }
         self.stop.is_stopped()
     }

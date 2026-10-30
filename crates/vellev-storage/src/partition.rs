@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,8 +102,8 @@ fn segment_built(
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
     let vectors = vectors.map(|gathered| gathered.finish(format));
-    let indexes = match &vectors {
-        Some(column) => state::indexed(
+    let indexed = match &vectors {
+        Some(column) => state::indexed_stopping(
             catalog,
             &file.rows,
             |row: usize| column.get(row),
@@ -112,7 +112,7 @@ fn segment_built(
             above,
             stopping,
         ),
-        None => state::indexed(
+        None => state::indexed_stopping(
             catalog,
             &file.rows,
             |row: usize| file.rows[row].object.vector.as_deref(),
@@ -122,9 +122,17 @@ fn segment_built(
             stopping,
         ),
     };
-    let Some(indexes) = indexes else {
+    let Some(state::Indexed {
+        indexes,
+        tokenized_at_once,
+        ..
+    }) = indexed
+    else {
         return Ok(None);
     };
+    if let Some(build) = build {
+        build.tokenized_at_once(tokenized_at_once);
+    }
     if stopping.stopped(MergeStage::Encoding) {
         return Ok(None);
     }
@@ -1126,6 +1134,9 @@ pub struct Writer {
     /// Whether each merge's build panics, as a test asks: see
     /// [`Self::panic_merges_in_build`].
     merge_panics: AtomicBool,
+    /// How many rows' text each merge's build holds tokenized at once, at
+    /// the most: see [`Self::tokenize_merges_at_once`].
+    merge_tokenized_at_once: AtomicUsize,
     /// How many merges were stopped only once they had loaded back what
     /// they built, past where a stop ends them.
     stops_past_loading: AtomicU64,
@@ -1291,6 +1302,7 @@ impl Writer {
             merge_stop_at: std::sync::Mutex::new(None),
             merges_stopped: AtomicU64::new(0),
             merge_panics: AtomicBool::new(false),
+            merge_tokenized_at_once: AtomicUsize::new(state::TOKENIZED_AT_ONCE),
             stops_past_loading: AtomicU64::new(0),
             merge_past_loading: AtomicBool::new(false),
             merge_builds: MergeBuilds::new(MERGE_BUILDS),
@@ -2818,7 +2830,8 @@ impl Writer {
         // from here to the end of loading back what it built: it then gives
         // up where it is, and leaves nothing (merge note, step 3).
         let panics = self.merge_panics.load(Ordering::SeqCst);
-        let stopping = Stopping::merge(*lock(&self.merge_stop_at), panics);
+        let tokenizing = self.merge_tokenized_at_once.load(Ordering::SeqCst);
+        let stopping = Stopping::merge(*lock(&self.merge_stop_at), panics).tokenizing(tokenizing);
         {
             let mut under_way = lock(&self.merge_stop);
             self.merge_past_loading.store(false, Ordering::SeqCst);
@@ -3078,6 +3091,14 @@ impl Writer {
     #[doc(hidden)]
     pub fn panic_merges_in_build(&self, panics: bool) {
         self.merge_panics.store(panics, Ordering::SeqCst);
+    }
+
+    /// Have each merge's build from now on hold `rows` rows' text tokenized
+    /// at once, at the most. For tests that weigh a build tokenized in
+    /// chunks against one tokenized all at once.
+    #[doc(hidden)]
+    pub fn tokenize_merges_at_once(&self, rows: usize) {
+        self.merge_tokenized_at_once.store(rows, Ordering::SeqCst);
     }
 
     /// How many stops came too late: to a merge already past loading back
