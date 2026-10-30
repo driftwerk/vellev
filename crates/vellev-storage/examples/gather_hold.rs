@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use object_store::memory::InMemory;
 use serde_json::json;
-use tracing_subscriber::filter::filter_fn;
+use tracing::subscriber::Interest;
+use tracing_subscriber::filter::DynFilterFn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -115,9 +116,13 @@ async fn flush_and_commit(writer: &Writer, n: u64, dims: usize) -> (Duration, Du
 
 #[tokio::main]
 async fn main() {
-    let adopted = filter_fn(|meta| {
-        LOGGING.load(Ordering::SeqCst) && meta.fields().field("adopting").is_some()
-    });
+    let adopted =
+        DynFilterFn::new(|_, _| LOGGING.load(Ordering::SeqCst)).with_callsite_filter(|meta| {
+            match meta.fields().field("adopting") {
+                Some(_) => Interest::sometimes(),
+                None => Interest::never(),
+            }
+        });
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(adopted))
         .init();
