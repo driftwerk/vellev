@@ -129,6 +129,11 @@ impl Drop for Turn {
 /// given [`Passes`] asks from the thread that called it, which is on no
 /// pool.
 pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, Stopped> {
+    debug_assert_eq!(
+        rayon::current_thread_index(),
+        None,
+        "a turn to tune asked for from a pool's thread"
+    );
     let (turns, turned) = turns();
     let mut now = taken(turns);
     let ticket = now.next;
@@ -180,8 +185,14 @@ pub fn thread_cpu() -> Option<Duration> {
 ///
 /// A pass names what it is, for whoever keeps track.
 pub trait Passes: Copy + Send + Sync {
-    /// Run `pass`, named `name`, and give back what it gives.
-    fn pass<R: Send>(self, name: &'static str, pass: impl FnOnce() -> R + Send) -> R;
+    /// Run `pass`, named `name`, and give back what it gives; or give up
+    /// without running it, [`Stopped`], should the build be stopped while
+    /// waiting for it to be run.
+    fn pass<R: Send>(
+        self,
+        name: &'static str,
+        pass: impl FnOnce() -> R + Send,
+    ) -> Result<R, Stopped>;
 }
 
 /// Each pass on the pool of the thread that asks: rayon's global one, off
@@ -190,8 +201,8 @@ pub trait Passes: Copy + Send + Sync {
 pub struct CallersPool;
 
 impl Passes for CallersPool {
-    fn pass<R: Send>(self, _: &'static str, pass: impl FnOnce() -> R + Send) -> R {
-        pass()
+    fn pass<R: Send>(self, _: &'static str, pass: impl FnOnce() -> R + Send) -> Result<R, Stopped> {
+        Ok(pass())
     }
 }
 

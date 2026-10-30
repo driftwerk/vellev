@@ -65,6 +65,7 @@ async fn a_clustered_merges_sections_run_on_its_pool_and_a_flushs_never_do() {
     assert!(!flushes.iter().any(on_pool), "{ran_on:?}");
     assert!(merges.iter().all(on_pool), "{ran_on:?}");
     for section in [
+        "finishing",
         "tokenizing",
         "indexing",
         "sampling",

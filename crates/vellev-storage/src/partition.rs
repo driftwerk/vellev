@@ -103,7 +103,13 @@ fn segment_built(
         build.held_here(stopping, false);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
-    let vectors = vectors.map(|gathered| on.section("finishing", || gathered.finish(format)));
+    let vectors = match vectors {
+        Some(gathered) => match on.section("finishing", || gathered.finish(format)) {
+            Ok(column) => Some(column),
+            Err(_) => return Ok(None),
+        },
+        None => None,
+    };
     let indexes = match &vectors {
         Some(column) => state::indexed(
             catalog,
@@ -133,13 +139,20 @@ fn segment_built(
         return Ok(None);
     }
     let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
-    let segment = on.section("encoding", || encode_as(Kind::Segment, format, &file))?;
+    let Ok(segment) = on.section("encoding", || encode_as(Kind::Segment, format, &file)) else {
+        return Ok(None);
+    };
+    let segment = segment?;
     if stopping.stopped(MergeStage::Encoding) {
         return Ok(None);
     }
-    let column = on.section("encoding_vectors", || vectors.encode_as(format));
+    let Ok(column) = on.section("encoding_vectors", || vectors.encode_as(format)) else {
+        return Ok(None);
+    };
     // Here, off the async threads and the state's lock, once.
-    let parts = on.section("parts", || state::Parts::of(&file, &indexes));
+    let Ok(parts) = on.section("parts", || state::Parts::of(&file, &indexes)) else {
+        return Ok(None);
+    };
     if let Some(build) = build {
         build.held_here(stopping, true);
     }
@@ -2683,7 +2696,7 @@ impl Writer {
             // builds, if not the global one, the rest here; a flush's where
             // it is.
             let on = match &build {
-                Some(build) => OnPool::merge(build.builds()),
+                Some(build) => OnPool::merge(build.builds(), stopping.stop()),
                 None => OnPool::global(),
             };
             let cpu = vellev_index::pool::thread_cpu();

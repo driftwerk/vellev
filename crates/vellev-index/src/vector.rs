@@ -639,7 +639,7 @@ impl BinaryIndex {
                     (term, squared.sqrt())
                 })
                 .collect()
-        });
+        })?;
         stop.passed()?;
         index.rows = measured.iter().map(|(row, _)| *row).collect();
         index.codes = codes;
@@ -718,7 +718,7 @@ impl BinaryIndex {
                     Err(Stopped) => Vec::new(),
                 })
                 .collect()
-        });
+        })?;
         stop.passed()?;
         let centre = median(rotation.width, sampled.iter().map(Vec::as_slice));
         Self::build_about_stopping(metric, vectors, centre, stop, on)

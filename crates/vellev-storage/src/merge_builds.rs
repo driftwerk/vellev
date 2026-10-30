@@ -10,6 +10,7 @@
 //! further merge gathers beside it. What a stopped merge is reckoned to
 //! hold counts as draining until then.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vellev_index::pool::Passes;
-use vellev_index::stop::Stop;
+use vellev_index::stop::{Stop, Stopped};
 
 use crate::coordinator::PartitionKey;
 use crate::stopping::{MergeStage, Stopping};
@@ -38,12 +39,13 @@ pub const MERGE_BUILDS: usize = 2;
 /// the pool at once, a thread of it waiting in one would take the other
 /// on, whatever the size of either, and the first could neither end nor
 /// heed its stop until the other's had: rayon gives a waiting worker
-/// whatever else is queued (review of #169). So one build waits for at
-/// most the section under way, and that is what a stop waits for too.
+/// whatever else is queued (review of #169). A build stopped while it
+/// waits for a turn gives up at once, leaving its place in the order: one
+/// under way runs out, heeding its own stop as it goes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OnPool<'a> {
-    /// The merge builds of the build, if it is a merge's.
-    builds: Option<&'a MergeBuilds>,
+    /// The merge builds of the build, if it is a merge's, and its stop.
+    builds: Option<(&'a MergeBuilds, &'a Stop)>,
 }
 
 /// Whether each section's thread is kept, as a test asks: see
@@ -78,20 +80,21 @@ impl<'a> OnPool<'a> {
     }
 
     /// For a merge's build among `builds`, its sections on their pool if
-    /// they have one.
-    pub(crate) fn merge(builds: &'a MergeBuilds) -> Self {
+    /// they have one; giving up waiting for a turn once `stop` is stopped.
+    pub(crate) fn merge(builds: &'a MergeBuilds, stop: &'a Stop) -> Self {
         Self {
-            builds: Some(builds),
+            builds: Some((builds, stop)),
         }
     }
 
-    /// Run the section `section`, named `name`, where this says.
+    /// Run the section `section`, named `name`, where this says; or give
+    /// up, not running it, should the build be stopped while it waits.
     pub(crate) fn section<R: Send>(
         self,
         name: &'static str,
         section: impl FnOnce() -> R + Send,
-    ) -> R {
-        let builds = self.builds;
+    ) -> std::result::Result<R, Stopped> {
+        let builds = self.builds.map(|(builds, _)| builds);
         let noted = move || {
             let _inside = InSection::entered(builds);
             if RECORDING.load(Ordering::SeqCst) {
@@ -106,19 +109,25 @@ impl<'a> OnPool<'a> {
         // Inside a section already, none begins: it is counted, and runs
         // here, as it could never have its turn behind its own.
         let inside = IN_SECTIONS.with(|inside| inside.get() > 0);
-        let on_pool = builds.and_then(|builds| Some((builds, builds.pool.as_ref()?)));
+        let on_pool = self
+            .builds
+            .and_then(|(builds, stop)| Some((builds, stop, builds.pool.as_ref()?)));
         match on_pool.filter(|_| !inside) {
-            Some((builds, pool)) => {
-                let _turn = builds.section_turn();
-                pool.install(noted)
+            Some((builds, stop, pool)) => {
+                let _turn = builds.section_turn(stop)?;
+                Ok(pool.install(noted))
             }
-            None => noted(),
+            None => Ok(noted()),
         }
     }
 }
 
 impl Passes for OnPool<'_> {
-    fn pass<R: Send>(self, name: &'static str, pass: impl FnOnce() -> R + Send) -> R {
+    fn pass<R: Send>(
+        self,
+        name: &'static str,
+        pass: impl FnOnce() -> R + Send,
+    ) -> std::result::Result<R, Stopped> {
         self.section(name, pass)
     }
 }
@@ -128,13 +137,25 @@ std::thread_local! {
     static IN_SECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The turns sections take on a merge pool: tickets handed out in the
-/// order asked for, and the one being served.
+/// The tickets of the turns sections take on a merge pool: handed out in
+/// the order asked for, the one being served, and those whose builds were
+/// stopped waiting, to be passed over.
+#[derive(Debug, Default)]
+struct Tickets {
+    next: u64,
+    serving: u64,
+    left: BTreeSet<u64>,
+}
+
+/// The turns sections take on a merge pool.
 #[derive(Debug, Default)]
 struct SectionTurns {
-    tickets: Mutex<(u64, u64)>,
+    tickets: Mutex<Tickets>,
     turned: Condvar,
 }
+
+/// How often a section waiting for its turn asks its build's stop.
+const WAITING_ASKS_EVERY: Duration = Duration::from_millis(20);
 
 /// A section's turn on the pool, handed on as it is dropped, the section
 /// done or panicked.
@@ -142,7 +163,16 @@ struct SectionTurn<'a>(&'a SectionTurns);
 
 impl Drop for SectionTurn<'_> {
     fn drop(&mut self) {
-        lock(&self.0.tickets).1 += 1;
+        let mut tickets = lock(&self.0.tickets);
+        tickets.serving += 1;
+        loop {
+            let serving = tickets.serving;
+            if !tickets.left.remove(&serving) {
+                break;
+            }
+            tickets.serving += 1;
+        }
+        drop(tickets);
         self.0.turned.notify_all();
     }
 }
@@ -371,22 +401,27 @@ impl MergeBuilds {
     }
 
     /// Wait for a section's turn on the pool.
-    fn section_turn(&self) -> SectionTurn<'_> {
+    fn section_turn(&self, stop: &Stop) -> std::result::Result<SectionTurn<'_>, Stopped> {
         let asked = Instant::now();
         let turns = &self.section_turns;
         let mut tickets = lock(&turns.tickets);
-        let ticket = tickets.0;
-        tickets.0 += 1;
-        while tickets.1 != ticket {
+        let ticket = tickets.next;
+        tickets.next += 1;
+        while tickets.serving != ticket {
+            if stop.is_stopped() {
+                tickets.left.insert(ticket);
+                return Err(Stopped);
+            }
             tickets = turns
                 .turned
-                .wait(tickets)
-                .unwrap_or_else(|held| held.into_inner());
+                .wait_timeout(tickets, WAITING_ASKS_EVERY)
+                .unwrap_or_else(|held| held.into_inner())
+                .0;
         }
         drop(tickets);
         let waited = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.sections_waited.fetch_add(waited, Ordering::SeqCst);
-        SectionTurn(turns)
+        Ok(SectionTurn(turns))
     }
 
     /// How long sections of merge builds have waited for their turns on
@@ -960,26 +995,29 @@ mod nesting {
                 .unwrap(),
         );
         let builds = MergeBuilds::building_on(2, pool);
+        let stop = Arc::new(Stop::new());
         let first = std::thread::spawn({
-            let builds = builds.clone();
+            let (builds, stop) = (builds.clone(), stop.clone());
             move || {
                 let began = Instant::now();
-                OnPool::merge(&builds).section("first", || {
-                    rayon::join(
-                        || std::thread::sleep(Duration::from_millis(50)),
-                        || std::thread::sleep(Duration::from_millis(500)),
-                    )
-                });
+                OnPool::merge(&builds, &stop)
+                    .section("first", || {
+                        rayon::join(
+                            || std::thread::sleep(Duration::from_millis(50)),
+                            || std::thread::sleep(Duration::from_millis(500)),
+                        )
+                    })
+                    .unwrap();
                 began.elapsed()
             }
         });
         std::thread::sleep(Duration::from_millis(20));
         let second = std::thread::spawn({
-            let builds = builds.clone();
+            let (builds, stop) = (builds.clone(), stop.clone());
             move || {
-                OnPool::merge(&builds).section("second", || {
-                    std::thread::sleep(Duration::from_secs(3));
-                });
+                OnPool::merge(&builds, &stop)
+                    .section("second", || std::thread::sleep(Duration::from_secs(3)))
+                    .unwrap();
             }
         });
         let took = first.join().unwrap();
@@ -1009,10 +1047,12 @@ mod nesting {
             .map(|n| {
                 let (builds, order) = (builds.clone(), order.clone());
                 let thread = std::thread::spawn(move || {
-                    OnPool::merge(&builds).section("turn", || {
-                        std::thread::sleep(Duration::from_millis(100));
-                        order.lock().unwrap().push(n);
-                    });
+                    OnPool::merge(&builds, &Stop::new())
+                        .section("turn", || {
+                            std::thread::sleep(Duration::from_millis(100));
+                            order.lock().unwrap().push(n);
+                        })
+                        .unwrap();
                 });
                 std::thread::sleep(Duration::from_millis(30));
                 thread
@@ -1034,11 +1074,69 @@ mod nesting {
                 .unwrap(),
         );
         for builds in [MergeBuilds::building_on(2, pool), MergeBuilds::new(2)] {
-            let on = OnPool::merge(&builds);
-            assert_eq!(on.section("outer", || on.section("inner", || 7)), 7);
+            let stop = Stop::new();
+            let on = OnPool::merge(&builds, &stop);
+            let inner = on.section("outer", || on.section("inner", || 7));
+            assert_eq!(inner.unwrap().unwrap(), 7);
             assert_eq!(builds.nested_sections(), 1);
-            on.section("after", || ());
+            on.section("after", || ()).unwrap();
             assert_eq!(builds.nested_sections(), 1, "the count left behind");
         }
+    }
+
+    /// A build stopped while it waits for a turn gives up at once, not
+    /// holding what it gathered and its turn among the merge builds until
+    /// the section under way is done, and the build behind it is not left
+    /// waiting on the ticket it gave up (review of #169).
+    #[test]
+    fn a_build_stopped_waiting_for_a_turn_gives_up_and_holds_nobody_up() {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
+        let builds = MergeBuilds::building_on(2, pool);
+        let first = std::thread::spawn({
+            let builds = builds.clone();
+            move || {
+                OnPool::merge(&builds, &Stop::new())
+                    .section("first", || std::thread::sleep(Duration::from_millis(900)))
+                    .unwrap();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let stop = Arc::new(Stop::new());
+        let second = std::thread::spawn({
+            let (builds, stop) = (builds.clone(), stop.clone());
+            move || {
+                let asked = Instant::now();
+                let ran = OnPool::merge(&builds, &stop).section("second", || ());
+                (ran, asked.elapsed())
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let builds = builds.clone();
+            move || {
+                let ran = OnPool::merge(&builds, &Stop::new()).section("third", || ());
+                done.send(ran).unwrap();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        stop.stop();
+        let (ran, took) = second.join().unwrap();
+        assert_eq!(ran, Err(Stopped), "it ran, stopped");
+        assert!(
+            took < Duration::from_millis(500),
+            "it held on for {took:?}, with a section of 900 ms ahead of it"
+        );
+        first.join().unwrap();
+        let third = finished.recv_timeout(Duration::from_secs(5));
+        assert_eq!(
+            third.expect("the build behind it waits on the ticket it gave up"),
+            Ok(())
+        );
     }
 }

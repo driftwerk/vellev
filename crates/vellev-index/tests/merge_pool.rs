@@ -12,7 +12,7 @@ use rayon::ThreadPool;
 use vellev_core::Distance;
 use vellev_index::clustered::ClusteredIndex;
 use vellev_index::pool::{self, Passes};
-use vellev_index::stop::Stop;
+use vellev_index::stop::{Stop, Stopped};
 use vellev_index::vector::BinaryIndex;
 
 /// Passes run on a pool, each kept: its name, and the thread it ran on.
@@ -23,17 +23,21 @@ struct OnPool<'a> {
 }
 
 impl Passes for OnPool<'_> {
-    fn pass<R: Send>(self, name: &'static str, pass: impl FnOnce() -> R + Send) -> R {
+    fn pass<R: Send>(
+        self,
+        name: &'static str,
+        pass: impl FnOnce() -> R + Send,
+    ) -> Result<R, Stopped> {
         assert_eq!(
             rayon::current_thread_index(),
             None,
             "{name} asked for from a pool's thread"
         );
-        self.pool.install(|| {
+        Ok(self.pool.install(|| {
             let thread = std::thread::current().name().unwrap_or("").to_string();
             self.ran.lock().unwrap().push((name, thread));
             pass()
-        })
+        }))
     }
 }
 
