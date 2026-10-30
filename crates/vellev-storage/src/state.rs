@@ -9,7 +9,9 @@ use vellev_core::{
 };
 use vellev_index::clustered::{ClusteredIndex, Unfit};
 use vellev_index::filter::{Filter, Predicate, RowIndex};
-use vellev_index::text::{TextIndex, Tokenized};
+use vellev_index::text::{
+    dictionary_bytes, last_grown_at, table_bytes, FieldShape, TextIndex, Tokenized, Vocabulary,
+};
 use vellev_index::vector::{BinaryIndex, Coded, Skipped, Ties, VectorIndex};
 
 use crate::answers::Answers;
@@ -753,12 +755,11 @@ fn segment_bytes(rows: &[Row], vectors: &Column) -> usize {
     rows.iter().map(row_bytes).sum::<usize>() + vectors.resident()
 }
 
-/// What a merge holds at its peak, reckoned by part (merge note, §7.7):
-/// what it gathers, its rows and their vectors; what its text and filter
-/// indexes come to hold as they are built; its rows' tokens, a chunk's at a
-/// time; and what training a clustered index holds. Each part is what the
-/// run's segments hold of it, their live rows' share, as they are planned;
-/// the rows and vectors are what was gathered once they are.
+/// What a merge holds at its peak, reckoned by stage (node memory note,
+/// §2.1, and merge note, §7.7): what it gathers, and on top of that the
+/// most of what each stage of its build holds. Each is what the run's
+/// segments hold of it, their live rows' share, as it is planned; the rows
+/// and vectors are what was gathered once they are.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Reckoning {
     /// How many rows.
@@ -767,63 +768,45 @@ pub(crate) struct Reckoning {
     pub rows: f64,
     /// Their vectors.
     pub vectors: f64,
-    /// Their text indexed.
-    pub text_index: f64,
-    /// Their text tokenized, every row's, of which a chunk's is held at
-    /// once.
-    pub tokenized: f64,
-    /// Their filterable values indexed.
-    pub filters: f64,
-    /// What training each clustered index holds: its sample, rotated, its
-    /// centroids, and for every row its code as it is made.
+    /// Their segment's frame, as [`encoded_bytes`] counts it.
+    pub encoded: f64,
+    /// What their indexes come to once built.
+    pub indexed: f64,
+    /// The most that indexing them holds, from the first chunk of tokens to
+    /// the last.
+    pub indexing: f64,
+    /// What training a clustered index holds, its sample, rotated, its
+    /// centroids, and for every row its code as it is made; or for a scan of
+    /// codes, its centre's sample and each row's factors.
     pub training: f64,
 }
 
-/// What a merge holds at its peak for each row, and for each byte of each
-/// part of its [`Reckoning`]: fitted to the counting allocator's peaks over
-/// 25 merges, of 4,000 to 200,000 rows, of 8 and 768 dimensions, with short
-/// text, passages, text of words each found in one row, text over a large
-/// vocabulary and over a small one, and with their vectors clustered, to
-/// within 26% of each (`flush_memory`'s
-/// `a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent`,
-/// which holds the reckoning to within 30%).
-///
-/// What a row holds besides its parts: its place in the maps a merge
-/// builds of the rows it keeps, and the like.
-const EACH_ROW: f64 = 900.0;
-/// The copy gathered, and the segment encoded from it.
-const ROWS_AT_PEAK: f64 = 1.75;
-/// The frame they are gathered into, which is the column and the file
-/// uploaded too, and what the vector index builds beside it. Each further
-/// row's vector costs once (`a_merge_holds_its_vectors_once`); the rest
-/// comes from the smaller merges measured, much the same whatever their
-/// rows, so a merge far larger is reckoned up to about a fifth over on its
-/// vectors: more counted as draining than there is, not less.
-const VECTORS_AT_PEAK: f64 = 1.3;
-/// Its text index, or a chunk's tokens, whichever comes to more, never the
-/// two together: each row's tokens go as they are indexed, those new to the
-/// index into it, so that a merge's tokens are at their most before its
-/// index has grown, and the index at its largest once they have gone. The
-/// run's indexes are added up, though the vocabulary they share is held
-/// once in what is merged; more over a wide vocabulary, then, and the rule
-/// holds it from both sides: 1.05 reckoned a merge of it 30% over when its
-/// threads happened to meet at a lower peak, one run in twenty.
-const TEXT_AT_PEAK: f64 = 1.0;
-const TOKENIZED_AT_PEAK: f64 = 1.0;
-const FILTERS_AT_PEAK: f64 = 1.0;
-const TRAINING_AT_PEAK: f64 = 0.8;
+/// What a row gathered holds past what [`copied_bytes`] counts: the nodes of
+/// its map and the like. Fitted to the counting allocator: 473 to 483 bytes
+/// over 37 merges of every shape in `flush_memory`'s
+/// `a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent`, which
+/// holds the reckoning to within 30%.
+const EACH_ROW: f64 = 480.0;
+/// What a row indexed holds past what the indexes' own counts say: the
+/// filter index's nodes and the like. Fitted as [`EACH_ROW`] is.
+const INDEXED_EACH_ROW: f64 = 345.0;
+/// What a row's code holds, and its centre's sample holds past the rows:
+/// see [`coded_bytes`].
+const CODE_EACH_ROW: f64 = 24.0;
+const FACTORS_EACH_ROW: f64 = 60.0;
+/// The most a segment's encoding holds, for each byte of its frame. Not
+/// fitted: its body is grown by doubling, to less than twice its length, and
+/// `frame` copies it, the two then held together, so that it comes to two
+/// to three times the frame, by where the doubling falls: 2.03 to 2.48
+/// measured. The most it can be, as the reckoning would sooner count over.
+const ENCODED_AT_PEAK: f64 = 3.0;
 
 impl Reckoning {
     /// About how many bytes the merge holds at its peak.
     pub(crate) fn peak(&self) -> usize {
-        let chunk = (TOKENIZED_AT_ONCE as f64 / self.count).min(1.0);
-        let text = (self.text_index * TEXT_AT_PEAK).max(self.tokenized * chunk * TOKENIZED_AT_PEAK);
-        (self.count * EACH_ROW
-            + self.rows * ROWS_AT_PEAK
-            + self.vectors * VECTORS_AT_PEAK
-            + text
-            + self.filters * FILTERS_AT_PEAK
-            + self.training * TRAINING_AT_PEAK) as usize
+        let encoding = self.encoded * ENCODED_AT_PEAK;
+        let built = self.indexed + self.training.max(encoding);
+        (self.count * EACH_ROW + self.rows + self.vectors + self.indexing.max(built)) as usize
     }
 
     /// As reckoned at plan, its rows and vectors now what was gathered:
@@ -834,9 +817,28 @@ impl Reckoning {
             count: count as f64,
             rows: copied as f64,
             vectors: vectors.bytes() as f64,
+            encoded: match self.rows > 0.0 {
+                true => self.encoded * copied as f64 / self.rows,
+                false => self.encoded,
+            },
             ..self
         }
     }
+}
+
+/// How many rows [`TextParts::tokens`] goes by.
+const TOKENS_EVERY: usize = 1_024;
+
+/// What a segment's text comes to for a merge's [`Reckoning`], past what
+/// adds up: shared, as it is walked only once.
+#[derive(Debug, Clone, Default)]
+struct TextParts {
+    /// Each searchable property.
+    fields: Vec<(CollectionId, String, FieldShape)>,
+    /// How many bytes of tokens each [`TOKENS_EVERY`] rows make, in row
+    /// order: rows stay in order through a merge, so that a block of long
+    /// documents comes to one chunk however few of the run's rows it is.
+    tokens: Vec<usize>,
 }
 
 /// What a segment's rows and indexes come to, for a merge's [`Reckoning`]:
@@ -848,37 +850,157 @@ pub(crate) struct Parts {
     count: usize,
     /// Its rows, as [`copied_bytes`] counts them.
     copied: usize,
-    /// Its text indexed.
-    text_index: usize,
-    /// Its rows' text tokenized, every row's, as [`TextIndex::tokenize`]
-    /// gives it before it is indexed.
-    tokenized: usize,
+    /// Its frame, as [`encoded_bytes`] counts it.
+    encoded: usize,
     /// Its filterable values indexed.
     filters: usize,
     /// How many of its rows each collection has.
     collections: Vec<(CollectionId, usize)>,
+    text: Arc<TextParts>,
 }
 
 impl Parts {
     /// Of a segment of `file`'s rows, indexed as `indexes`. A walk over
     /// every row, token and value.
     pub(crate) fn of(file: &SegmentFile, indexes: &Indexes) -> Self {
-        let (mut text_index, mut tokenized, mut filters, mut collections) = (0, 0, 0, Vec::new());
+        let (mut filters, mut collections) = (0, Vec::new());
+        let mut text = TextParts {
+            fields: Vec::new(),
+            tokens: vec![0; file.rows.len().div_ceil(TOKENS_EVERY)],
+        };
         for (collection, index) in indexes {
-            text_index += index.text.resident();
-            tokenized += index.text.tokenized_resident();
             filters += index.rows.resident();
             collections.push((*collection, index.rows.rows().len() as usize));
+            index.text.tokenized_by_rows(TOKENS_EVERY, &mut text.tokens);
+            let shapes = index.text.shapes();
+            let shapes = shapes.map(|(name, shape)| (*collection, name.to_string(), shape));
+            text.fields.extend(shapes);
         }
         Self {
             count: file.rows.len(),
             copied: file.rows.iter().map(copied_bytes).sum(),
-            text_index,
-            tokenized,
+            encoded: file.rows.iter().map(encoded_bytes).sum(),
             filters,
             collections,
+            text: Arc::new(text),
         }
     }
+}
+
+/// One property of a run's text: what its segments come to together.
+#[derive(Debug, Default)]
+struct RunField {
+    /// How many segments hold it, how many tokens the most of them does,
+    /// and how many all do, shared or not.
+    segments: usize,
+    most_tokens: usize,
+    tokens: usize,
+    token_bytes: usize,
+    /// Their live rows' postings.
+    postings: f64,
+    vocabulary: Vocabulary,
+}
+
+impl RunField {
+    fn add(&mut self, shape: &FieldShape, live: f64) {
+        self.segments += 1;
+        self.most_tokens = self.most_tokens.max(shape.tokens);
+        self.tokens += shape.tokens;
+        self.token_bytes += shape.token_bytes;
+        self.postings += shape.postings as f64 * live;
+        self.vocabulary.union(&shape.vocabulary);
+    }
+
+    /// How many different tokens the run holds: one segment's own count, or
+    /// the sketches' together, which cannot be off past where the counts
+    /// are. Tokens only dead rows hold are counted, as a build is not sure
+    /// to lose any.
+    fn merged_tokens(&self) -> usize {
+        match self.segments {
+            0 | 1 => self.most_tokens,
+            _ => (self.vocabulary.estimate() as usize).clamp(self.most_tokens, self.tokens),
+        }
+    }
+
+    /// What its dictionary comes to, merged.
+    fn dictionary(&self) -> f64 {
+        let tokens = self.merged_tokens();
+        let each = self.token_bytes as f64 / self.tokens.max(1) as f64;
+        dictionary_bytes(tokens, (tokens as f64 * each) as usize) as f64
+    }
+}
+
+/// The tokens of each chunk a build will tokenize of rows given in order, as
+/// `(rows, bytes of tokens)` by [`TOKENS_EVERY`], each even within itself:
+/// `TOKENIZED_AT_ONCE` rows at a time, however the rows fall across
+/// segments.
+fn chunked(rows: impl Iterator<Item = (f64, f64)>) -> Vec<(f64, f64)> {
+    let at_once = TOKENIZED_AT_ONCE as f64;
+    let mut chunks = Vec::new();
+    let (mut held, mut tokens) = (0.0, 0.0);
+    for (mut left, mut those) in rows {
+        while left > 0.0 {
+            let taken = left.min(at_once - held);
+            let share = those * taken / left;
+            (held, tokens) = (held + taken, tokens + share);
+            (left, those) = (left - taken, those - share);
+            if held >= at_once {
+                chunks.push((held, tokens));
+                (held, tokens) = (0.0, 0.0);
+            }
+        }
+    }
+    if held > 0.0 {
+        chunks.push((held, tokens));
+    }
+    chunks
+}
+
+/// The most held while a run's rows are indexed, of `chunks` of them, past
+/// what was gathered. The build makes each chunk's tokens before it indexes
+/// any, so that a chunk's tokens lie beside the indexes of those before it;
+/// `besides` is what else grows with the rows.
+///
+/// As a row's tokens are indexed they go, those new to the dictionary into
+/// it: a chunk's crest lies between the index of those before it and of
+/// those up to it, so it is reckoned at the latter, the sooner to count over,
+/// and the dictionary whole from the first chunk, as most vocabularies are
+/// nearly whole early on. And a map holds its old table beside its new as
+/// it doubles, which is the crest of text of few repeats.
+fn indexing_crest(chunks: &[(f64, f64)], fields: &[RunField], besides: f64) -> f64 {
+    let dictionary: f64 = fields.iter().map(RunField::dictionary).sum();
+    let postings: f64 = fields.iter().map(|field| field.postings).sum();
+    let rows: f64 = chunks.iter().map(|(rows, _)| rows).sum();
+    let tokens: f64 = chunks.iter().map(|(_, tokens)| tokens).sum();
+    let share = |rows_up_to: f64, tokens_up_to: f64| match tokens > 0.0 {
+        true => tokens_up_to / tokens,
+        false => rows_up_to / rows.max(1.0),
+    };
+    let (mut crest, mut rows_up_to, mut tokens_up_to) = (0.0f64, 0.0, 0.0);
+    for (rows_of, tokens_of) in chunks {
+        rows_up_to += rows_of;
+        tokens_up_to += tokens_of;
+        let index = dictionary + postings * share(rows_up_to, tokens_up_to);
+        crest = crest.max(index + besides * rows_up_to / rows.max(1.0) + tokens_of);
+    }
+    for field in fields {
+        let merged = field.merged_tokens();
+        let Some(grown_at) = last_grown_at(merged) else {
+            continue;
+        };
+        let table = table_bytes(merged) as f64;
+        let by_then = grown_at as f64 / merged.max(1) as f64;
+        let index = dictionary + postings - table;
+        // What is left of the chunk that many tokens in.
+        let mut before = 0.0;
+        let tokens_left = chunks.iter().find_map(|(_, tokens_of)| {
+            before += tokens_of;
+            (before >= by_then * tokens).then(|| before - by_then * tokens)
+        });
+        let grown = (index + besides) * by_then + 1.5 * table + tokens_left.unwrap_or(0.0);
+        crest = crest.max(grown);
+    }
+    crest
 }
 
 /// About how many bytes a copy of a row takes, its vector apart: the row,
@@ -901,6 +1023,45 @@ fn copied_bytes(Row { object, .. }: &Row) -> usize {
         })
         .sum();
     ROW + properties
+}
+
+/// About how many bytes a row takes in its segment's frame, its vector apart:
+/// the names of its fields, and each property's name and value. Held to
+/// frames by a rule, and a walk over every property.
+fn encoded_bytes(Row { object, .. }: &Row) -> usize {
+    const ROW: usize = 64;
+    let properties: usize = object
+        .properties
+        .iter()
+        .map(|(name, value)| {
+            name.len()
+                + 1
+                + match value {
+                    Value::Text(text) => text.len() + 3,
+                    Value::TextArray(texts) => {
+                        texts.iter().map(|text| text.len() + 3).sum::<usize>() + 3
+                    }
+                    Value::Int(_) | Value::Number(_) => 9,
+                    Value::Bool(_) => 1,
+                    Value::Date(_) => 21,
+                }
+        })
+        .sum();
+    ROW + properties
+}
+
+/// What the codes of `rows` vectors of `dimensions` hold once built, for a
+/// scan of them.
+fn coded_bytes(rows: f64, dimensions: usize) -> f64 {
+    rows * (dimensions as f64 / 8.0 + CODE_EACH_ROW)
+}
+
+/// About how many bytes coding `rows` vectors of `dimensions` holds as it
+/// builds, past [`coded_bytes`]: its centre's sample, rotated to the next
+/// power of two wide, and every row's factors as they are made.
+fn coding_bytes(rows: f64, dimensions: usize) -> f64 {
+    let width = dimensions.next_power_of_two().max(64) as f64;
+    rows.min(4_096.0) * (width * 4.0 + 24.0) + rows * FACTORS_EACH_ROW
 }
 
 /// About how many bytes training a clustered index of `rows` vectors of
@@ -2351,6 +2512,8 @@ impl State {
         };
         let mut reckoning = Reckoning::default();
         let mut rows_of: HashMap<CollectionId, f64> = HashMap::new();
+        let mut fields: HashMap<(CollectionId, &str), RunField> = HashMap::new();
+        let mut tokens = Vec::new();
         for segment in run {
             let parts = &segment.parts;
             if parts.count == 0 {
@@ -2360,23 +2523,46 @@ impl State {
             reckoning.count += (parts.count - segment.dead.count()) as f64;
             reckoning.rows += parts.copied as f64 * live;
             reckoning.vectors += segment.vectors.bytes() as f64 * live;
-            reckoning.text_index += parts.text_index as f64 * live;
-            reckoning.tokenized += parts.tokenized as f64 * live;
-            reckoning.filters += parts.filters as f64 * live;
+            reckoning.encoded += parts.encoded as f64 * live;
+            reckoning.indexed += parts.filters as f64 * live;
             for (collection, rows) in &parts.collections {
                 *rows_of.entry(*collection).or_default() += *rows as f64 * live;
             }
+            for (collection, name, shape) in &parts.text.fields {
+                fields
+                    .entry((*collection, name.as_str()))
+                    .or_default()
+                    .add(shape, live);
+            }
+            for (at, bytes) in parts.text.tokens.iter().enumerate() {
+                let rows = (parts.count - at * TOKENS_EVERY).min(TOKENS_EVERY);
+                tokens.push((rows as f64 * live, *bytes as f64 * live));
+            }
         }
+        reckoning.indexed += reckoning.count * INDEXED_EACH_ROW;
         for (collection, rows) in rows_of {
             let dimensions = self
                 .catalog
                 .schema(collection)
                 .map_or(0, |schema| schema.embedding.dimensions as usize);
-            // Clustered as `clustered` says a merged segment's vectors are.
-            if rows > clustered_above.max(SHORTLIST_ABOVE) as f64 && dimensions > 0 {
-                reckoning.training += training_bytes(rows, dimensions);
+            if rows <= SHORTLIST_ABOVE as f64 || dimensions == 0 {
+                continue;
             }
+            reckoning.indexed += coded_bytes(rows, dimensions);
+            // Clustered as `clustered` says a merged segment's vectors are.
+            reckoning.training += match rows > clustered_above as f64 {
+                true => training_bytes(rows, dimensions),
+                false => coding_bytes(rows, dimensions),
+            };
         }
+        let fields: Vec<RunField> = fields.into_values().collect();
+        let besides = reckoning.indexed;
+        let text: f64 = fields
+            .iter()
+            .map(|field| field.dictionary() + field.postings)
+            .sum();
+        reckoning.indexed += text;
+        reckoning.indexing = indexing_crest(&chunked(tokens.into_iter()), &fields, besides);
         reckoning
     }
 
@@ -3348,6 +3534,59 @@ mod tests {
         let at_most = ASKED_ROWS + 4;
         let times = asked.times.load(std::sync::atomic::Ordering::SeqCst);
         assert!(times <= at_most, "asked {times} times, not {at_most}");
+    }
+
+    /// A row's frame is what `encoded_bytes` counts, to within a few bytes
+    /// a row, whatever its properties hold.
+    #[test]
+    fn a_frame_is_reckoned_from_its_rows() {
+        let (_, mut rows) = texts(4_000);
+        rows.iter_mut().for_each(|row| row.object.vector = None);
+        let file = SegmentFile {
+            position: LogPosition(1),
+            rows,
+            tombstones: Vec::new(),
+        };
+        let frame = crate::format::encode(crate::format::Kind::Segment, &file)
+            .unwrap()
+            .len() as f64;
+        let reckoned: usize = file.rows.iter().map(encoded_bytes).sum();
+        let off = (reckoned as f64 - frame) / frame;
+        assert!(off.abs() < 0.05, "{reckoned} bytes, of a frame of {frame}");
+    }
+
+    /// A run's rows go into chunks as a build will take them, across its
+    /// segments' ends, and a block of tokens is a chunk's however few of
+    /// the run's rows it is.
+    #[test]
+    fn tokens_are_reckoned_by_the_chunk_they_fall_in() {
+        let at_once = TOKENIZED_AT_ONCE as f64;
+        let quiet = (at_once / 2.0, 100.0);
+        let block = (at_once / 2.0, 500_000.0);
+        let run = [quiet, quiet, quiet, block, block, quiet, quiet];
+        let chunks = chunked(run.into_iter());
+        let tokens: Vec<f64> = chunks.iter().map(|(_, tokens)| *tokens).collect();
+        assert_eq!(tokens, [200.0, 500_100.0, 500_100.0, 100.0]);
+        assert_eq!(chunks.last().map(|(rows, _)| *rows), Some(at_once / 2.0));
+    }
+
+    /// What indexing holds at its crest: the last chunk's tokens beside the
+    /// indexes of those before it, not whichever is more.
+    #[test]
+    fn indexing_is_reckoned_at_a_chunks_tokens_beside_the_index_so_far() {
+        let field = RunField {
+            segments: 1,
+            most_tokens: 4,
+            tokens: 4,
+            token_bytes: 40,
+            postings: 3_000_000.0,
+            vocabulary: Vocabulary::default(),
+        };
+        let chunks = [(10.0, 1_000_000.0); 3];
+        let crest = indexing_crest(&chunks, std::slice::from_ref(&field), 300_000.0);
+        // All of each, and one chunk's tokens: the last chunk's crest.
+        let expected = field.dictionary() + 3_000_000.0 + 300_000.0 + 1_000_000.0;
+        assert!((crest - expected).abs() < 1.0, "{crest}, not {expected}");
     }
 
     /// A partition in memory, with the writer's part of flushing and

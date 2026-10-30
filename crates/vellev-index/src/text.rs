@@ -63,6 +63,126 @@ struct Block {
     min_length: u32,
 }
 
+/// How many registers a [`Vocabulary`] keeps: about 3% off, as a sketch of
+/// this size is.
+const REGISTERS: usize = 1 << 10;
+
+/// About how many different tokens have been seen, kept in a kilobyte
+/// however many there are: a HyperLogLog. Sketches of two sets of tokens
+/// come together as a sketch of what either holds, which adding their
+/// counts up cannot tell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Vocabulary {
+    /// Of the hashes falling to each register, the most leading zeros seen
+    /// in what the register's own bits leave, and one.
+    registers: Box<[u8; REGISTERS]>,
+}
+
+impl Default for Vocabulary {
+    fn default() -> Self {
+        Self {
+            registers: Box::new([0; REGISTERS]),
+        }
+    }
+}
+
+impl Vocabulary {
+    /// Count `token`. The hash is the same in every process, as FNV-1a is,
+    /// its bits then mixed as Murmur3 finishes, so that sketches come
+    /// together with those of any other segment.
+    fn add(&mut self, token: &str) {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in token.bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        hash ^= hash >> 33;
+        let bits = REGISTERS.trailing_zeros();
+        let register = (hash >> (64 - bits)) as usize;
+        let rank = ((hash << bits) | (1 << (bits - 1))).leading_zeros() as u8 + 1;
+        self.registers[register] = self.registers[register].max(rank);
+    }
+
+    /// Take in what `other` has seen.
+    pub fn union(&mut self, other: &Self) {
+        for (mine, theirs) in self.registers.iter_mut().zip(other.registers.iter()) {
+            *mine = (*mine).max(*theirs);
+        }
+    }
+
+    /// About how many different tokens have been seen.
+    pub fn estimate(&self) -> f64 {
+        let registers = REGISTERS as f64;
+        let harmonic: f64 = self
+            .registers
+            .iter()
+            .map(|rank| 2f64.powi(-i32::from(*rank)))
+            .sum();
+        let raw = 0.7213 / (1.0 + 1.079 / registers) * registers * registers / harmonic;
+        let empty = self.registers.iter().filter(|rank| **rank == 0).count();
+        // Few enough that the empty registers tell it better.
+        if raw <= 2.5 * registers && empty > 0 {
+            registers * (registers / empty as f64).ln()
+        } else {
+            raw
+        }
+    }
+}
+
+/// What a merge's reckoning takes of one searchable property of a segment:
+/// what adding segments up can tell, and what it can't, the vocabulary they
+/// share being held once in what is merged.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FieldShape {
+    /// How many different tokens it holds, and the bytes of their text.
+    pub tokens: usize,
+    pub token_bytes: usize,
+    /// What it holds past [`dictionary_bytes`]: postings past their least,
+    /// and its rows and lengths.
+    pub postings: usize,
+    /// The sketch of its tokens.
+    pub vocabulary: Vocabulary,
+}
+
+/// The least a token's postings hold: a vector's first allocation is of
+/// four entries.
+const LEAST_POSTINGS: usize = 2 * 4 * std::mem::size_of::<u32>() + 4 * std::mem::size_of::<Block>();
+
+/// A slot of a field's map of tokens, and its control byte.
+const SLOT: usize = std::mem::size_of::<(String, Postings)>() + 1;
+
+/// How many slots a field's map has allocated for `tokens` tokens, as
+/// hashbrown sizes them: a power of two, kept at most seven eighths full.
+fn slots(tokens: usize) -> usize {
+    match tokens {
+        0 => 0,
+        1..=3 => 4,
+        4..=7 => 8,
+        _ => (tokens * 8 / 7 + 1).next_power_of_two(),
+    }
+}
+
+/// What a field's map takes for `tokens` tokens.
+pub fn table_bytes(tokens: usize) -> usize {
+    slots(tokens) * SLOT
+}
+
+/// How many tokens a field's map held as it last grew to hold `tokens`:
+/// both tables are held as it does. Nothing for a map too small to matter.
+pub fn last_grown_at(tokens: usize) -> Option<usize> {
+    let before = slots(tokens) / 2;
+    (before >= 8).then_some(before / 8 * 7)
+}
+
+/// What a field's `tokens` tokens of `token_bytes` of text take whatever
+/// rows hold them: its map, their text and their least postings.
+pub fn dictionary_bytes(tokens: usize, token_bytes: usize) -> usize {
+    table_bytes(tokens) + token_bytes + tokens * LEAST_POSTINGS
+}
+
 /// The rows holding one token, as positions in the field's `rows`, with a
 /// bound per [`BLOCK`] of them.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -244,8 +364,6 @@ impl TextIndex {
     /// rows and their lengths, and each token's text, its place in the
     /// property's map and its postings. Rough, and a walk over every token.
     pub fn resident(&self) -> usize {
-        // A slot of the map, taken or not, and its control byte.
-        const SLOT: usize = std::mem::size_of::<(String, Postings)>() + 1;
         self.fields
             .iter()
             .map(|(name, field)| {
@@ -279,6 +397,49 @@ impl TextIndex {
             .flat_map(|field| field.postings.iter())
             .map(|(token, postings)| postings.holders.len() * (HELD + token.len()))
             .sum()
+    }
+
+    /// What a merge's reckoning takes of each property: a walk over every
+    /// token.
+    pub fn shapes(&self) -> impl Iterator<Item = (&str, FieldShape)> + '_ {
+        self.fields.iter().map(|(name, field)| {
+            let mut shape = FieldShape {
+                tokens: field.postings.len(),
+                ..FieldShape::default()
+            };
+            let mut postings = field.rows.capacity() * 4 + field.lengths.capacity() * 4;
+            for (token, held) in &field.postings {
+                shape.vocabulary.add(token);
+                shape.token_bytes += token.len();
+                postings += held.holders.capacity() * 4
+                    + held.frequencies.capacity() * 4
+                    + held.blocks.capacity() * std::mem::size_of::<Block>();
+            }
+            shape.postings = postings.saturating_sub(shape.tokens * LEAST_POSTINGS);
+            (name.as_str(), shape)
+        })
+    }
+
+    /// Add to `tokens` about how many bytes each `every` rows take
+    /// tokenized, as [`Self::tokenized_resident`] counts them, their share
+    /// of it going by how many words each row has: a walk over every row
+    /// holding text. Bytes for rows past its end are left out.
+    pub fn tokenized_by_rows(&self, every: usize, tokens: &mut [usize]) {
+        const HELD: usize = std::mem::size_of::<(String, u32)>();
+        for field in self.fields.values() {
+            let held: usize = field
+                .postings
+                .iter()
+                .map(|(token, postings)| postings.holders.len() * (HELD + token.len()))
+                .sum();
+            let words: u64 = field.lengths.iter().map(|words| u64::from(*words)).sum();
+            let each = held as f64 / words.max(1) as f64;
+            for (row, words) in field.rows.iter().zip(&field.lengths) {
+                if let Some(tokens) = tokens.get_mut(*row as usize / every) {
+                    *tokens += (f64::from(*words) * each) as usize;
+                }
+            }
+        }
     }
 
     /// `object`'s searchable text as [`Self::insert`] would index it.
@@ -376,6 +537,51 @@ pub fn score(parameters: Bm25, idf: f32, frequency: f32, length: f32, average: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sketches come within what a kilobyte's can of how many different
+    /// tokens there are, however many, and together come within it of what
+    /// either holds, the tokens they share counted once.
+    #[test]
+    fn a_vocabulary_counts_different_tokens_once_and_sketches_come_together() {
+        let sketch = |tokens: std::ops::Range<usize>| {
+            let mut sketch = Vocabulary::default();
+            tokens.for_each(|token| sketch.add(&format!("t{token}")));
+            sketch
+        };
+        for tokens in [10, 1_000, 30_000, 2_000_000] {
+            let estimate = sketch(0..tokens).estimate();
+            let off = (estimate / tokens as f64 - 1.0).abs();
+            assert!(off < 0.1, "{estimate} for {tokens} tokens");
+        }
+        let mut twice = sketch(0..50_000);
+        twice.union(&sketch(0..50_000));
+        assert_eq!(twice, sketch(0..50_000));
+        let mut overlapping = sketch(0..50_000);
+        overlapping.union(&sketch(40_000..90_000));
+        let off = (overlapping.estimate() / 90_000.0 - 1.0).abs();
+        assert!(off < 0.1, "{} for 90,000", overlapping.estimate());
+    }
+
+    /// A map of tokens is what hashbrown allocates for them, past each
+    /// doubling, and it last grew at the doubling before.
+    #[test]
+    fn a_field_map_is_reckoned_as_hashbrown_grows_it() {
+        for tokens in [
+            1usize, 3, 4, 7, 8, 14, 15, 28, 29, 28_672, 28_673, 1_000_000,
+        ] {
+            let mut map: HashMap<usize, ()> = HashMap::new();
+            (0..tokens).for_each(|token| {
+                map.insert(token, ());
+            });
+            let capacity = match slots(tokens) {
+                slots @ ..=8 => slots - 1,
+                slots => slots / 8 * 7,
+            };
+            assert_eq!(map.capacity(), capacity, "{tokens}");
+        }
+        assert_eq!(last_grown_at(28_673), Some(28_672));
+        assert_eq!(last_grown_at(57_344), Some(28_672));
+    }
 
     fn words(text: &str) -> Vec<String> {
         super::words(text).collect()
