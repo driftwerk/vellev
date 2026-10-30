@@ -477,9 +477,12 @@ const PEAK_TOLD_TO: f64 = 0.001;
 /// holds no more at its peak for that than the same build tokenizing every
 /// row at once, as it did before it took chunks (node memory note, §2.1).
 /// What it saves is what the later stages leave of the tokens' share,
-/// printed for the PR to say: nothing, for passages of 768 dimensions,
-/// whose encoding sets the peak, and at least a tenth where the tokens do.
-/// Each holds its reckoning's bounds too.
+/// printed for the PR to say. For passages of 768 dimensions that is
+/// nothing: tokenizing in chunks takes a fifth off the stage that indexes
+/// them, but encoding the segment, with its body and its frame both held,
+/// comes to as much as that stage held before, and sets the peak now. Where
+/// the tokens hold more than that, chunks save at least a tenth. Each holds
+/// its reckoning's bounds too.
 ///
 /// "No more" is to within [`PEAK_TOLD_TO`], a thousandth. Where a stage
 /// after the tokens sets the peak, the two builds make the same allocations

@@ -3093,6 +3093,8 @@ mod tests {
             }
         }
         assert_eq!(in_turn.len(), 2);
+        // Flushes and opens, which nothing asks otherwise of, as a merge.
+        assert_eq!(Stopping::never().tokenized_at_once(), TOKENIZED_AT_ONCE);
         for at_once in [1, 7, 4_096, ROWS] {
             let stopping = Stopping::never().tokenizing(at_once);
             let indexed = indexed_as(&catalog, &rows, &stopping).unwrap();
