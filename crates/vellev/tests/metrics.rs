@@ -449,10 +449,10 @@ async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
     served.stop().await;
 }
 
-/// What the tenants hold, how many are open, and what waits for a flush
-/// are reported as the last sweep found them: the figures the memory
-/// budget was last held to, read without holding any tenant. Rows written
-/// since show once the node next sweeps.
+/// What the tenants hold and how many are open are reported as the last
+/// sweep found them: the figures the memory budget was last held to, read
+/// without holding any tenant. Tenants opened and rows written since show
+/// there once the node next sweeps; what waits for a flush shows at once.
 #[tokio::test]
 async fn what_the_tenants_hold_is_reported_as_the_last_sweep_found_it() {
     // No budget, so that opening a tenant does not sweep at once: only the
@@ -474,7 +474,7 @@ async fn what_the_tenants_hold_is_reported_as_the_last_sweep_found_it() {
     note_in(&served, "beta", 1).await;
     let unswept = served.app.metrics().encoded();
     assert_eq!(resident(&unswept), Some(first), "as last swept: {unswept}");
-    assert_eq!(unflushed(&unswept), Some(1.0), "as last swept: {unswept}");
+    assert_eq!(unflushed(&unswept), Some(3.0), "as it is: {unswept}");
     assert_eq!(
         sample(&unswept, "vellev_tenants_open", &[("kind", "writer")]),
         Some(1.0),
@@ -492,6 +492,76 @@ async fn what_the_tenants_hold_is_reported_as_the_last_sweep_found_it() {
         Some(2.0),
         "{again}"
     );
+    served.stop().await;
+}
+
+/// CI on #165 (the 100k gate): the segments, what is unsettled and what
+/// waits for a flush are as they are when scraped, never as some sweep
+/// found them, for whatever reads them to tell the node has settled. With
+/// no sweep at all, a tenant flushed and merged by its own maintenance
+/// shows each step at the next scrape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_segments_and_what_waits_are_as_they_are_when_scraped() {
+    // Nothing sweeps; three rows are a flush.
+    let served = Cluster::new()
+        .serve_unstarted_with(|settings| Settings {
+            memory: None,
+            flush_rows: 3,
+            ..settings
+        })
+        .await;
+    let gauges = |served: &Served| {
+        let text = served.app.metrics().encoded();
+        let value = |name: &str, labels: &[(&str, &str)]| sample(&text, name, labels);
+        let plain = value("vellev_segments", &[("index", "plain")]).unwrap_or(-1.0);
+        let rows = value("vellev_segment_rows", &[("index", "plain")]).unwrap_or(-1.0);
+        let unflushed = value("vellev_unflushed_rows", &[]).unwrap_or(-1.0);
+        let unsettled = value("vellev_tenants_unsettled", &[]).unwrap_or(-1.0);
+        (plain, rows, unflushed, unsettled)
+    };
+    let until = |what: &str, served: &Served, wanted: &dyn Fn((f64, f64, f64, f64)) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let seen = gauges(served);
+            if wanted(seen) {
+                return seen;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: (segments, rows, unflushed, unsettled) stayed {seen:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    for n in 1..=2 {
+        note_in(&served, "acme", n).await;
+    }
+    until("two rows wait", &served, &|(_, _, unflushed, _)| {
+        unflushed == 2.0
+    });
+    note_in(&served, "acme", 3).await;
+    until("one flush", &served, &|(
+        plain,
+        rows,
+        unflushed,
+        unsettled,
+    )| {
+        plain == 1.0 && rows == 3.0 && unflushed == 0.0 && unsettled == 0.0
+    });
+    // Three flushes more: four segments of three rows, merged as the node
+    // looks after the tenant, all of them at last in segments.
+    for n in 4..=12 {
+        note_in(&served, "acme", n).await;
+    }
+    let (plain, _, _, _) = until("twelve rows flushed", &served, &|(
+        _,
+        rows,
+        unflushed,
+        unsettled,
+    )| {
+        rows == 12.0 && unflushed == 0.0 && unsettled == 0.0
+    });
+    assert!(plain >= 1.0);
     served.stop().await;
 }
 
