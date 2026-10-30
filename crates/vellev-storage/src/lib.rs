@@ -19,6 +19,7 @@ mod merge_builds;
 mod mutation;
 mod partition;
 pub mod prefix;
+mod published;
 mod search;
 pub mod shipper;
 mod state;

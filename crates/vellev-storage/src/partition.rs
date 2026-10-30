@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -30,6 +30,7 @@ use crate::merge_builds::{
     MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
+use crate::published::Published;
 use crate::state::{
     self, Discarded, Figures, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
 };
@@ -173,11 +174,8 @@ pub struct Partition {
     /// follows it into another.
     incarnation: Incarnation,
     blobs: Arc<dyn Blobs>,
-    /// Changed only through [`Self::changing`], which publishes what it
-    /// comes to in `figures`.
-    state: RwLock<State>,
-    /// What the state came to as it was last changed: see [`Self::figures`].
-    figures: std::sync::Mutex<Figures>,
+    /// The state, changed only so that what it comes to is published.
+    state: Published,
     /// Serialises catch-up, and remembers the newest coordinator generation
     /// seen so an older reading of the committed state is recognised as stale.
     seen: Mutex<Generation>,
@@ -373,24 +371,26 @@ impl Partition {
     /// Run `f` against a consistent view of the partition. The lock is a
     /// blocking one and is never held across an await.
     pub fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {
-        f(&self.state.read().expect("partition lock"))
+        self.state.read(f)
     }
 
     /// What the partition comes to, as it was last changed: read without
     /// its lock, so never waiting on a change under way, as a node reads it
     /// of every tenant for its metrics and its memory budget.
     pub fn figures(&self) -> Figures {
-        *lock(&self.figures)
+        self.state.figures()
     }
 
-    /// Change the state as `f` does, under its lock, and publish what it
-    /// then comes to, under the same lock, so that what is published
-    /// follows the changes in their order.
+    /// Change the state as `f` does, publishing all it then comes to: see
+    /// [`Published::changing`].
     fn changing<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
-        let mut state = self.state.write().expect("partition lock");
-        let changed = f(&mut state);
-        *lock(&self.figures) = state.figures();
-        changed
+        self.state.changing(f)
+    }
+
+    /// Apply a commit as `f` does, publishing what it changes: see
+    /// [`Published::applying`].
+    fn applying<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        self.state.applying(f)
     }
 
     async fn load(key: PartitionKey, blobs: Arc<dyn Blobs>, committed: &Committed) -> Result<Self> {
@@ -431,8 +431,7 @@ impl Partition {
             key,
             incarnation,
             blobs,
-            state: RwLock::new(State::default()),
-            figures: std::sync::Mutex::default(),
+            state: Published::default(),
             seen: Mutex::new(Generation(0)),
             commits: None,
             replayed: std::sync::Mutex::default(),
@@ -773,7 +772,7 @@ impl Partition {
                         prepared
                     });
                     for ((key, log), prepared) in run.iter().zip(prepared) {
-                        self.changing(|state| state.apply_prepared(key, log, prepared))?;
+                        self.applying(|state| state.apply_prepared(key, log, prepared))?;
                     }
                 }
             }
@@ -1681,7 +1680,7 @@ impl Writer {
                     // Coded first, while readers may still read; the apply
                     // under the lock then only stores the codes.
                     let prepared = partition.read(|state| state.prepared(&log));
-                    partition.changing(|state| state.apply_prepared(&applied, &log, prepared))
+                    partition.applying(|state| state.apply_prepared(&applied, &log, prepared))
                 })
                 .await??;
                 tracing::debug!(
@@ -4310,7 +4309,7 @@ mod tests {
         gated.waiting.notified().await;
         let moved = following(committed.log_position).unwrap();
         let state = &writer.partition.state;
-        state.write().unwrap().moved_to(moved);
+        state.unpublished(|state| state.moved_to(moved));
         gated.go_on.notify_one();
 
         let refused = restoring.await.unwrap().unwrap_err();

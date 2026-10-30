@@ -560,6 +560,13 @@ impl Collector for Counted {
             ConstCounter::new(count).encode(family.encode_family(&[("kind", kind)])?)?;
         }
         let merges = node.merges();
+        let counter = ConstCounter::new(node.sweeps());
+        counter.encode(encoder.encode_descriptor(
+            "sweeps",
+            "Sweeps begun: those asked for while one ran are coalesced into one more",
+            None,
+            counter.metric_type(),
+        )?)?;
         let counter = ConstCounter::new(node.tenants_kept_by_sweeps());
         counter.encode(encoder.encode_descriptor(
             "sweep_tenants_kept",
