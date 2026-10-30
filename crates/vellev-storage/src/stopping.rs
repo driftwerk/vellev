@@ -19,10 +19,10 @@ pub enum MergeStage {
     /// Waiting for a turn among the node's merge builds, before it gathers,
     /// or, without one, for its partition's building lock.
     Queued,
-    /// Copying the run's live rows out, between its segments.
-    Gathering,
     /// Waiting for a turn among the work done off the async threads.
     Turn,
+    /// Copying the run's live rows out, before each chunk of them.
+    Gathering,
     /// Indexing the rows' filterable values and text.
     Indexing,
     /// Indexing the vectors, in the index build's own stage.
