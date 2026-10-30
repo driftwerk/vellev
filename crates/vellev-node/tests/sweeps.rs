@@ -202,3 +202,52 @@ async fn a_sweep_does_not_begin_while_another_runs() {
     .expect("both sweeps end once let go");
     assert_eq!(node.sweeps(), begun + 1, "the second, once the first ended");
 }
+
+/// Final review of #165, L1: the sweeps a tenant's use asks for are spaced.
+/// Each use over the budget asks for one, and coalesced, with nothing to
+/// let go, they would run back to back for as long as uses come, each
+/// taking the node's lock twice. Asked for without let-up for two seconds,
+/// they run no more often than `SWEEPS_SPACED` allows; the first, asked for
+/// after a quiet spell, begins at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweeps_asked_for_by_use_are_spaced() {
+    use vellev_node::SWEEPS_SPACED;
+    let node = node_on(memory(), |settings| {
+        // A budget, so that each use asks for a sweep; nothing over it.
+        settings.memory = Some(1 << 40);
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    node.create_tenant(&tenant("used")).await.unwrap();
+    let used = node.tenant(&tenant("used")).await.unwrap();
+    used.write(vec![notes(), note(1)]).await.unwrap();
+    drop(used);
+    // A quiet spell longer than the spacing.
+    tokio::time::sleep(SWEEPS_SPACED * 2).await;
+    let before = node.sweeps();
+    let asked = std::time::Instant::now();
+    drop(node.tenant(&tenant("used")).await.unwrap());
+    until(1, "the sweep asked for never began", || {
+        node.sweeps() > before
+    })
+    .await;
+    assert!(
+        asked.elapsed() < SWEEPS_SPACED / 2,
+        "the first sweep after a quiet spell waited {:?}",
+        asked.elapsed()
+    );
+    let streaming = Duration::from_secs(2);
+    let began = std::time::Instant::now();
+    let mut uses = 0;
+    while began.elapsed() < streaming {
+        drop(node.tenant(&tenant("used")).await.unwrap());
+        uses += 1;
+    }
+    let ran = node.sweeps() - before;
+    let most = (streaming.as_millis() / SWEEPS_SPACED.as_millis()) as u64 + 2;
+    assert!(uses > 1_000, "only {uses} uses");
+    assert!(
+        ran <= most,
+        "{ran} sweeps for {uses} uses in {streaming:?}, at most {most} spaced {SWEEPS_SPACED:?}"
+    );
+    assert!(ran >= 2, "the sweeps asked for ran: {ran}");
+}

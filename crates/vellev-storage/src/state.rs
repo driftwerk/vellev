@@ -3555,6 +3555,22 @@ mod tests {
     /// row the run holds live: one that lacks a live row, as a merge made
     /// before a restore that brought it back would, is not, so it is never
     /// carried out; rows of the run that died since are no matter.
+    /// Final review of #165, L2: applying a commit publishes only what it
+    /// changes, as it never changes the segments. One that did is caught
+    /// where the debug assertions are built in, as in every test.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "applying a commit changed what only a change of segments may")]
+    fn applying_what_changes_the_segments_is_caught() {
+        let mut built = Built::new(&["notes"]);
+        built.commit((1..=4).map(|n| upsert(0, n, n as i64)).collect());
+        built.flush();
+        let published = crate::published::Published::default();
+        let state = std::mem::take(&mut built.state);
+        published.changing(|now| *now = state);
+        published.applying(|state| state.segments[0].meta.rows += 1);
+    }
+
     #[test]
     fn a_merged_segment_covers_its_run_only_if_it_holds_every_live_row() {
         let mut built = Built::new(&["notes"]);
