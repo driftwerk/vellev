@@ -142,6 +142,9 @@ enum Text {
     Wide,
     /// 200 words drawn from 20.
     Few,
+    /// 200 words drawn evenly from 50,000, each of a row's nearly always
+    /// different: as many tokens as text of its length can hold.
+    Even,
     /// 100 words of 40 characters, each found in this row alone.
     LongUnique,
     /// About 120 words in about 690 bytes, about 60 of them different and
@@ -161,6 +164,7 @@ impl Text {
             Self::Unique => words(&mut |at| format!("u{n}x{at}")),
             Self::Wide => words(&mut |_| format!("w{}", Self::ranked(random))),
             Self::Few => words(&mut |_| format!("f{}", (Self::drawn(random) * 20.0) as usize)),
+            Self::Even => words(&mut |_| format!("e{}", (Self::drawn(random) * 50_000.0) as usize)),
             Self::LongUnique => (0..100)
                 .map(|at| format!("{:x>40}", format!("l{n}y{at}")))
                 .collect::<Vec<_>>()
@@ -229,13 +233,18 @@ async fn committed(
 /// what was held before it.
 async fn flush_peak(rows: usize, dimensions: usize) -> usize {
     let dir = tempfile::tempdir().unwrap();
-    let (_cluster, writer) = on_disk(dir.path()).await;
-    writer.commit(vec![collection(dimensions)]).await.unwrap();
+    let opened = within(WRITTEN_WITHIN, "the writer opened", on_disk(dir.path()));
+    let (_cluster, writer) = opened.await;
     let mut random = Random(7);
-    committed(&writer, &mut random, 0, rows, dimensions, Text::Short, None).await;
+    let written = async {
+        writer.commit(vec![collection(dimensions)]).await.unwrap();
+        committed(&writer, &mut random, 0, rows, dimensions, Text::Short, None).await;
+    };
+    within(WRITTEN_WITHIN, "the rows written", written).await;
     COUNTING.reset_peak();
     let before = COUNTING.now();
-    writer.flush().await.unwrap();
+    let flushed = within(MERGED_WITHIN, "the flush ended", writer.flush()).await;
+    flushed.unwrap();
     COUNTING.peak() - before
 }
 
@@ -282,7 +291,8 @@ async fn merge_measured(
     at_once: usize,
 ) -> Measured {
     let dir = tempfile::tempdir().unwrap();
-    let (_cluster, writer) = on_disk(dir.path()).await;
+    let opened = within(WRITTEN_WITHIN, "the writer opened", on_disk(dir.path()));
+    let (_cluster, writer) = opened.await;
     let builds = vellev_storage::MergeBuilds::new(1);
     let writer = writer
         .merging_with(vellev_storage::Merging {
@@ -295,9 +305,9 @@ async fn merge_measured(
         })
         .merging_among(builds.clone());
     writer.tokenize_merges_at_once(at_once);
-    writer.commit(vec![collection(dimensions)]).await.unwrap();
     let mut random = Random(11);
     let written = async {
+        writer.commit(vec![collection(dimensions)]).await.unwrap();
         for segment in 0..4 {
             let back = rewriting.then_some(rows);
             let first = segment * rows;
@@ -402,6 +412,7 @@ async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
         (CHUNKED, NARROW, Text::Short, false, false),
         (CHUNKED, NARROW, Text::Few, false, false),
         (CHUNKED_MORE, NARROW, Text::Wide, false, false),
+        (CHUNKED, NARROW, Text::Even, false, false),
         (CHUNKED, NARROW, Text::Passage, false, false),
         (CHUNKED, WIDE, Text::Passage, false, false),
         (CHUNKED, NARROW, Text::Unique, false, false),
@@ -457,9 +468,8 @@ const WHOLE_BUILDS: [(usize, usize, Text); 4] = [
 /// How much of a build whose tokens set its peak the chunks must save.
 const SAVED_AT_LEAST: f64 = 0.1;
 
-/// How much a build's peak may differ with nothing to tell it by: a stage
-/// after the tokens sets it, in both, to within a few bytes as its threads
-/// free things in another order.
+/// How much two builds' peaks may differ with nothing to tell them by: see
+/// the rule below.
 const PEAK_TOLD_TO: f64 = 0.001;
 
 /// M1-R1. A merge's build holds at most `TOKENIZED_AT_ONCE` rows' tokens at
@@ -470,6 +480,14 @@ const PEAK_TOLD_TO: f64 = 0.001;
 /// printed for the PR to say: nothing, for passages of 768 dimensions,
 /// whose encoding sets the peak, and at least a tenth where the tokens do.
 /// Each holds its reckoning's bounds too.
+///
+/// "No more" is to within [`PEAK_TOLD_TO`], a thousandth. Where a stage
+/// after the tokens sets the peak, the two builds make the same allocations
+/// there, and differ only by which thread frees what first: 64 bytes of
+/// 181 MB has been seen, and an all-at-once build's own peak has come out
+/// 0.2% higher one run than the next. Compared to the byte the rule would
+/// fail at random. A build holding even a chunk's tokens for longer than it
+/// should is hundreds of times past a thousandth.
 ///
 /// As the reckoning's rule: run optimised, in CI's Test job, as
 /// `cargo test --release -p vellev-storage --test flush_memory -- --ignored`.
