@@ -1009,6 +1009,7 @@ impl Snapshot {
 /// there will be. An index built under an older catalog stays right: a
 /// property never changes once added, and neither a property nor a
 /// collection added since has anything in an older layer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn indexed<'a>(
     catalog: &Catalog,
     rows: &'a [Row],
