@@ -12,7 +12,9 @@
 # STEP3_* variables pass through to the bench (see crates/vellev/tests/
 # step3_bench.rs); STEP3_SOAK_SECS below 1800 is a smoke, never compared.
 #
-# Needs root, through sudo or as root, to drop to uid 10001.
+# Needs root, through sudo or as root, to drop to uid 10001, and every
+# path given where uid 10001 can reach it: not under a home it may not
+# enter, such as a GitHub runner's $RUNNER_TEMP.
 set -euo pipefail
 
 fixture=$(realpath "$1")
@@ -27,6 +29,13 @@ as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
 mkdir -p "$out"
 as_root install -d -o 10001 -g 10001 "$data"
 as_root chmod -R a+rX "$fixture"
+# Uid 10001 reaches all three, or the run stops here, saying which.
+for path in "$fixture/vectors/passages" "$out" "$data"; do
+  if ! as_root setpriv --reuid=10001 --regid=10001 --clear-groups test -x "$path"; then
+    echo "uid 10001 cannot reach $path: give paths it can (see the top of this script)" >&2
+    exit 1
+  fi
+done
 
 # What the machine is, as the run found it.
 {
@@ -73,7 +82,7 @@ for arm in "${arms[@]}"; do
     run=(systemd-run --scope --quiet -p MemoryAccounting=yes "${run[@]}")
   fi
   # An arm that fails is said, and the others still run.
-  as_root "${run[@]}" 2>&1 | tee "$out/arm-$arm.log" || failed+=("$arm")
+  as_root "${run[@]}" 2>&1 | as_root tee "$out/arm-$arm.log" || failed+=("$arm")
 done
 
 echo "## steal over the run (ticks): $(( $(steal) - steal_before ))" | as_root tee -a "$out/machine.txt"
