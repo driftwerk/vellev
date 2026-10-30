@@ -334,6 +334,31 @@ impl Collector for Counted {
         for (kind, count) in [("writer", opens.writers), ("copy", opens.copies)] {
             ConstCounter::new(count).encode(family.encode_family(&[("kind", kind)])?)?;
         }
+        let merges = node.merges();
+        let counter = ConstCounter::new(merges.held_let_go);
+        counter.encode(encoder.encode_descriptor(
+            "merge_turns_let_go",
+            "Merge turns let go as a store held what a stopped or failed merge uploaded \
+             longer than any write of it may take",
+            None,
+            counter.metric_type(),
+        )?)?;
+        for (name, help, value) in [
+            (
+                "merge_draining_bytes",
+                "About how many bytes merges stopped and not yet ended hold, counted against \
+                 the memory budget",
+                merges.draining,
+            ),
+            (
+                "merge_abandoned_bytes",
+                "About how many bytes stores keep of merges whose turns were let go for it",
+                merges.abandoned,
+            ),
+        ] {
+            let gauge = ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX));
+            gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+        }
         let flushing = node.flushing();
         for (name, help, count) in [
             (

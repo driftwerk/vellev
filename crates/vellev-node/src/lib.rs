@@ -188,6 +188,11 @@ pub struct Settings {
     /// How long a tenant this node writes for is kept unused before it is
     /// let go, its memory given back and its lease left for any node.
     pub tenant_idle: Duration,
+    /// How long a tenant's maintenance goes, at most, without cleaning up
+    /// and making the curves of its segments' rows, though each round
+    /// gives way to a flush: under writes that never let up, rounds would
+    /// otherwise never get that far.
+    pub clean_at_least_every: Duration,
     /// The most queries a second one tenant may ask of this node, if any.
     pub queries_per_second: Option<f64>,
     /// The most objects a second one tenant may write through this node,
@@ -290,6 +295,7 @@ impl Settings {
             warm_most: 16,
             max_format: DEFAULT_MAX_FORMAT,
             tenant_idle: Duration::from_secs(15 * 60),
+            clean_at_least_every: Duration::from_secs(10 * 60),
             queries_per_second: None,
             writes_per_second: None,
             memory: None,
@@ -1397,6 +1403,20 @@ impl Segments {
     }
 }
 
+/// The merges this node builds, as memory goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Merges {
+    /// About how many bytes merges stopped and not yet ended hold, and
+    /// what stores keep of those whose turns were let go: counted against
+    /// the memory budget.
+    pub draining: usize,
+    /// About how many bytes stores keep of stopped or failed merges whose
+    /// turns were let go for it, as the store held them too long.
+    pub abandoned: usize,
+    /// How many merge turns were let go so, since the node started.
+    pub held_let_go: u64,
+}
+
 /// What this node's tenants hold unflushed, and how their flushes went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flushing {
@@ -1537,6 +1557,16 @@ impl Node {
     /// in memory together.
     pub fn resident(&self) -> usize {
         self.0.held_now().iter().map(|held| held.size).sum()
+    }
+
+    /// The merges this node builds, as memory goes.
+    pub fn merges(&self) -> Merges {
+        let builds = &self.0.merge_builds;
+        Merges {
+            draining: builds.draining(),
+            abandoned: builds.abandoned(),
+            held_let_go: builds.held_let_go(),
+        }
     }
 
     /// The merge builds of the tenants this node writes for. For tests.

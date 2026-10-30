@@ -10,7 +10,7 @@
 //! further merge gathers beside it. What a stopped merge is reckoned to
 //! hold counts as draining until then.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,10 @@ pub struct MergeBuilds {
     let_go: Condvar,
     /// How many builds wait where a test holds them now.
     held: AtomicUsize,
+    /// See [`Self::held_let_go`].
+    held_let_go: AtomicU64,
+    /// See [`Self::abandoned`].
+    abandoned: AtomicUsize,
     /// How many builds a test has let go one at a time, not yet gone on.
     released: AtomicUsize,
     /// How long a turn granted to a merge that gave way to a flush is kept
@@ -154,6 +158,8 @@ impl MergeBuilds {
             holding: Mutex::default(),
             let_go: Condvar::new(),
             held: AtomicUsize::new(0),
+            held_let_go: AtomicU64::new(0),
+            abandoned: AtomicUsize::new(0),
             released: AtomicUsize::new(0),
             parked_at_most: Mutex::new(PARKED_AT_MOST),
             held_at_most: Mutex::new(STORE_HELD_AT_MOST),
@@ -231,6 +237,18 @@ impl MergeBuilds {
     #[doc(hidden)]
     pub fn park_for(&self, parked: Duration) {
         *lock(&self.parked_at_most) = parked;
+    }
+
+    /// How many times what a store kept of a stopped or failed merge's
+    /// bytes held its turn so long that the turn was let go.
+    pub fn held_let_go(&self) -> u64 {
+        self.held_let_go.load(Ordering::SeqCst)
+    }
+
+    /// About how many bytes stores still keep of stopped or failed merges
+    /// whose turns were let go for it: counted in [`Self::draining`].
+    pub fn abandoned(&self) -> usize {
+        self.abandoned.load(Ordering::SeqCst)
     }
 
     /// What the last build to end was reckoned to hold at its peak. For

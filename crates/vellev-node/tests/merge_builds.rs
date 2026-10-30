@@ -623,6 +623,8 @@ async fn a_round_whose_merge_gives_way_to_a_flush_does_nothing_more() {
     let node = node_on(slow.clone(), |settings| {
         settings.flush_rows = NOTES as usize;
         settings.tenant_idle = Duration::from_secs(60 * 60);
+        // Cleaning up is not due again for an hour.
+        settings.clean_at_least_every = Duration::from_secs(60 * 60);
     });
     let builds = node.merge_builds().clone();
     builds.hold(Some(Holding::UntilLetGo));
@@ -644,6 +646,72 @@ async fn a_round_whose_merge_gives_way_to_a_flush_does_nothing_more() {
         "the tenant flushed {flushed} times while its rounds' cleaning up waited on the store"
     );
     slow.armed.store(false, Ordering::SeqCst);
+    builds.hold(None);
+    until(60, "a build was left counted under way", || {
+        builds.under_way() == 0
+    })
+    .await;
+}
+
+/// A store that counts its listings: cleaning up lists the partition.
+#[derive(Debug)]
+struct CountedListing {
+    inner: Arc<dyn Blobs>,
+    listed: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Blobs for CountedListing {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.listed.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// Under writes that never let up, whose flushes a tenant's merge gives
+/// way to round after round, its maintenance still cleans up, at least as
+/// often as the node is set to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn under_writes_that_never_let_up_a_tenant_is_still_cleaned_up() {
+    let counted = Arc::new(CountedListing {
+        inner: Arc::new(ObjectBlobs::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        ))),
+        listed: AtomicUsize::new(0),
+    });
+    let node = node_on(counted.clone(), |settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+        settings.clean_at_least_every = Duration::from_secs(1);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    four_flushes(&node, "first").await;
+    four_flushes(&node, "second").await;
+    until(30, "two merges never came to build", || builds.held() == 2).await;
+    four_flushes(&node, "written").await;
+    let written = node.tenant(&tenant("written")).await.unwrap();
+    let writing = Arc::new(AtomicBool::new(true));
+    let writes = steadily(written.clone(), writing.clone());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = counted.listed.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let cleaned = counted.listed.load(Ordering::SeqCst) - before;
+    writing.store(false, Ordering::SeqCst);
+    within(10, "the writes never ended", writes).await.unwrap();
+    assert!(
+        cleaned >= 1,
+        "a tenant written without let-up was never cleaned up in 4 s"
+    );
     builds.hold(None);
     until(60, "a build was left counted under way", || {
         builds.under_way() == 0

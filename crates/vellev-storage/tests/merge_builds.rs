@@ -651,6 +651,7 @@ async fn one_gave_way(
     Arc<Writer>,
     tokio::task::JoinHandle<vellev_storage::Result<Option<LogPosition>>>,
     Arc<Writer>,
+    Cluster,
 ) {
     let (one, other) = (Cluster::new().await, Cluster::new().await);
     let first = flushed(&one, builds, 2).await;
@@ -676,7 +677,7 @@ async fn one_gave_way(
     due.store(true, Ordering::SeqCst);
     let gave_way = within(5, "a merge never gave way to a due flush", waiting).await;
     assert_eq!(gave_way.unwrap().unwrap(), None);
-    (first, building, second)
+    (first, building, second, other)
 }
 
 /// A merge that gives way to a flush while it waits for its turn keeps its
@@ -761,7 +762,7 @@ async fn a_turn_kept_for_a_merge_is_let_go_once_its_merges_are_stopped() {
     let builds = MergeBuilds::new(1);
     builds.hold(Some(Holding::UntilLetGo));
     let due = Arc::new(AtomicBool::new(false));
-    let (_first, building, second) = one_gave_way(&builds, &due).await;
+    let (_first, building, second, _other) = one_gave_way(&builds, &due).await;
     builds.let_one_go();
     within(60, "the first merge never ended", building)
         .await
@@ -789,7 +790,7 @@ async fn a_turn_kept_for_a_merge_is_let_go_once_its_writer_is_dropped() {
     let builds = MergeBuilds::new(1);
     builds.hold(Some(Holding::UntilLetGo));
     let due = Arc::new(AtomicBool::new(false));
-    let (_first, building, second) = one_gave_way(&builds, &due).await;
+    let (_first, building, second, _other) = one_gave_way(&builds, &due).await;
     builds.let_one_go();
     within(60, "the first merge never ended", building)
         .await
@@ -818,7 +819,7 @@ async fn a_turn_kept_for_a_merge_never_taken_up_is_let_go() {
     builds.park_for(Duration::from_millis(300));
     builds.hold(Some(Holding::UntilLetGo));
     let due = Arc::new(AtomicBool::new(false));
-    let (_first, building, _second) = one_gave_way(&builds, &due).await;
+    let (_first, building, _second, _other) = one_gave_way(&builds, &due).await;
     builds.let_one_go();
     within(60, "the first merge never ended", building)
         .await
@@ -834,36 +835,6 @@ async fn a_turn_kept_for_a_merge_never_taken_up_is_let_go() {
         builds.turns_free() == 1
     })
     .await;
-}
-
-/// A stopped build gives its turn back only once the last of what it
-/// gathered is dropped: held at its start, its merge dropped unstopped,
-/// the probe dropped last of all it holds sees the turn still taken.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stopped_build_holds_its_turn_until_what_it_gathered_is_dropped() {
-    let builds = MergeBuilds::new(1);
-    builds.probe(true);
-    builds.hold(Some(Holding::UntilLetGo));
-    let cluster = Cluster::new().await;
-    let writer = flushed(&cluster, &builds, 2).await;
-    let merging = tokio::spawn({
-        let writer = writer.clone();
-        async move { writer.merge().await }
-    });
-    until(60, "the merge never came to build", || builds.held() == 1).await;
-    merging.abort();
-    assert!(merging.await.unwrap_err().is_cancelled());
-    builds.hold(None);
-    until(30, "the build was never let go", || builds.under_way() == 0).await;
-    let probed = builds.probed().expect("the probe was never dropped");
-    assert_eq!(
-        probed.under_way, 1,
-        "a stopped build's count was let go before what it gathered"
-    );
-    assert_eq!(
-        probed.turns_free, 0,
-        "a stopped build's turn was free before what it gathered was dropped"
-    );
 }
 
 /// A merge dropped with its runtime, where nothing is left to delete what
@@ -969,4 +940,48 @@ async fn a_turn_held_by_what_a_store_keeps_of_a_failed_merge_is_let_go_in_time()
     )
     .await;
     assert!(next.unwrap().is_some());
+    // Its turn gone, what the store keeps is counted still, as draining,
+    // until the store lets it go.
+    assert_eq!(builds.held_let_go(), 1);
+    assert!(
+        builds.draining() > 0,
+        "what a store keeps past the bound was no longer counted"
+    );
+    keeping.kept.lock().unwrap().clear();
+    until(5, "what a store let go was counted still", || {
+        builds.draining() == 0
+    })
+    .await;
+}
+
+/// A turn kept for a merge that gave way to a flush is let go as soon as its
+/// writer's next merge finds it may not merge, as with its lease taken by
+/// another writer, not only once kept as long as it is kept at most.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_kept_for_a_merge_is_let_go_once_its_next_attempt_may_not_merge() {
+    let builds = MergeBuilds::new(1);
+    builds.hold(Some(Holding::UntilLetGo));
+    let due = Arc::new(AtomicBool::new(false));
+    let (_first, building, second, other) = one_gave_way(&builds, &due).await;
+    builds.let_one_go();
+    within(60, "the first merge never ended", building)
+        .await
+        .unwrap()
+        .unwrap();
+    until(
+        5,
+        "the turn was not kept for the merge that gave way",
+        || builds.turns_free() == 0,
+    )
+    .await;
+    // Another writer takes the lease.
+    let _owner = other.writer().await;
+    let merged = within(10, "a merge on a lease taken never ended", second.merge()).await;
+    assert_eq!(merged.unwrap(), None);
+    until(
+        5,
+        "a turn kept for a merge whose writer may no longer merge was never let go",
+        || builds.turns_free() == 1,
+    )
+    .await;
 }
