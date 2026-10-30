@@ -39,7 +39,9 @@ pub use merge_builds::{sections_ran_on, Holding, MergeBuilds, Probed, SectionRan
 pub use mutation::{
     Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
 };
-pub use partition::{Embedded, FlushTimes, Follower, MergeGate, Partition, RestoreFrom, Writer};
+pub use partition::{
+    Embedded, FlushTimes, Follower, MergeGate, Partition, RestoreFrom, Writer, GATHERED_AT_ONCE,
+};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::{Figures, Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM};
 pub use stopping::MergeStage;

@@ -240,6 +240,8 @@ pub struct MergeBuilds {
     abandoned: AtomicUsize,
     /// How many builds a test has let go one at a time, not yet gone on.
     released: AtomicUsize,
+    /// How many rows the gather last to come to a chunk had copied by then.
+    last_gathered: AtomicUsize,
     /// How long a turn granted to a merge that gave way to a flush is kept
     /// for its next attempt: see [`Self::park_for`].
     parked_at_most: Mutex<Duration>,
@@ -285,7 +287,7 @@ struct Reckoned {
 }
 
 /// How a test holds each merge's build off the async threads, with its
-/// turn taken and its rows gathered. Not for use.
+/// turn taken. Not for use.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Holding {
@@ -298,6 +300,20 @@ pub enum Holding {
     /// Once built, past the last place it asks its stop, until let go: a
     /// build that ends with what it built, whether or not it is awaited.
     BuiltUntilLetGo,
+    /// Part way through gathering its rows, at each chunk of them it comes
+    /// to with some copied, until let go, stopped or not: a long gather.
+    GatheringUntilLetGo,
+}
+
+/// Where a merge's build asks whether a test holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeldAt {
+    /// With its rows gathered, before any is indexed.
+    Start,
+    /// Part way through gathering them.
+    Gathering,
+    /// Once built.
+    Built,
 }
 
 /// How the builds stood as a [`Probe`] was dropped. Not for use.
@@ -364,6 +380,7 @@ impl MergeBuilds {
             held_let_go: AtomicU64::new(0),
             abandoned: AtomicUsize::new(0),
             released: AtomicUsize::new(0),
+            last_gathered: AtomicUsize::new(0),
             parked_at_most: Mutex::new(PARKED_AT_MOST),
             held_at_most: Mutex::new(STORE_HELD_AT_MOST),
             last_planned: AtomicUsize::new(0),
@@ -520,6 +537,13 @@ impl MergeBuilds {
     /// whose turns were let go for it: counted in [`Self::draining`].
     pub fn abandoned(&self) -> usize {
         self.abandoned.load(Ordering::SeqCst)
+    }
+
+    /// How many rows the gather last to come to a chunk had copied by
+    /// then. For tests that show how soon a gather gives up.
+    #[doc(hidden)]
+    pub fn last_gathered(&self) -> usize {
+        self.last_gathered.load(Ordering::SeqCst)
     }
 
     /// What the last build to end was reckoned to hold at its peak. For
@@ -744,16 +768,26 @@ impl MergeBuild {
             .store(true, Ordering::SeqCst);
     }
 
-    /// Wait here, off the async threads, while a test holds builds at
-    /// their start, or once `built`: see [`MergeBuilds::hold`]. At most
-    /// [`HELD_AT_MOST`].
-    pub(crate) fn held_here(&self, stopping: &Stopping, built: bool) {
+    /// Note the gather come to a chunk, `rows` copied so far, and wait
+    /// here while a test holds gathers part way through them.
+    pub(crate) fn gathering(&self, rows: usize, stopping: &Stopping) {
+        let builds = &self.counted.builds;
+        builds.last_gathered.store(rows, Ordering::SeqCst);
+        if rows > 0 {
+            self.held_here(stopping, HeldAt::Gathering);
+        }
+    }
+
+    /// Wait here while a test holds builds `at` this point: see
+    /// [`MergeBuilds::hold`]. At most [`HELD_AT_MOST`].
+    pub(crate) fn held_here(&self, stopping: &Stopping, at: HeldAt) {
         let builds = &self.counted.builds;
         let mut holding = lock(&builds.holding);
         let here = match *holding {
             None => false,
-            Some(Holding::BuiltUntilLetGo) => built,
-            Some(Holding::UntilLetGo | Holding::UntilStopped) => !built,
+            Some(Holding::BuiltUntilLetGo) => at == HeldAt::Built,
+            Some(Holding::UntilLetGo | Holding::UntilStopped) => at == HeldAt::Start,
+            Some(Holding::GatheringUntilLetGo) => at == HeldAt::Gathering,
         };
         if !here {
             return;
@@ -763,7 +797,9 @@ impl MergeBuild {
         loop {
             let goes_on = match *holding {
                 None => true,
-                Some(Holding::UntilLetGo | Holding::BuiltUntilLetGo) => false,
+                Some(
+                    Holding::UntilLetGo | Holding::BuiltUntilLetGo | Holding::GatheringUntilLetGo,
+                ) => false,
                 Some(Holding::UntilStopped) => stopping.is_stopped(),
             };
             let one_let_go = !goes_on
