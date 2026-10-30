@@ -11,7 +11,8 @@
 //! A bench that needs each duration exactly, not its bucket, keeps them as
 //! they come ([`Timings::keep_events`]).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt::Display;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -288,6 +289,10 @@ pub struct Event {
 pub struct Timings {
     histograms: [Histogram; SLOTS],
     ended: [AtomicU64; MergeEnd::ALL.len()],
+    /// Whether a bench keeps events: looked at before anything is made
+    /// for one, so that a duration timed while none does takes no lock
+    /// and allocates nothing.
+    keeping: AtomicBool,
     /// Every duration as it is timed, while a bench keeps them.
     events: Mutex<Option<Vec<Event>>>,
 }
@@ -297,23 +302,30 @@ impl Default for Timings {
         Self {
             histograms: std::array::from_fn(|_| Histogram::default()),
             ended: std::array::from_fn(|_| AtomicU64::new(0)),
+            keeping: AtomicBool::new(false),
             events: Mutex::new(None),
         }
     }
 }
 
 impl Timings {
-    /// Count `took` as `timed`, for `partition`.
-    pub fn record(&self, timed: Timed, partition: &str, took: Duration) {
+    /// Count `took` as `timed`, for `partition`, which is named only for
+    /// an event kept: while no bench keeps them, this allocates nothing.
+    pub fn record(&self, timed: Timed, partition: &(impl Display + ?Sized), took: Duration) {
         self.histograms[timed.slot()].observe(took);
+        if !self.keeping.load(Ordering::Acquire) {
+            return;
+        }
+        let event = Event {
+            timed,
+            took,
+            partition: partition.to_string(),
+            at: Instant::now(),
+        };
         let mut events = self.events.lock().unwrap_or_else(|held| held.into_inner());
+        // Kept until asked otherwise: one timed as keeping stopped is not.
         if let Some(events) = events.as_mut() {
-            events.push(Event {
-                timed,
-                took,
-                partition: partition.to_string(),
-                at: Instant::now(),
-            });
+            events.push(event);
         }
     }
 
@@ -341,6 +353,7 @@ impl Timings {
     pub fn keep_events(&self, keep: bool) {
         let mut events = self.events.lock().unwrap_or_else(|held| held.into_inner());
         *events = keep.then(Vec::new);
+        self.keeping.store(keep, Ordering::Release);
     }
 
     /// The durations kept since the last drain, oldest first. For a bench.

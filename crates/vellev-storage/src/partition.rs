@@ -1476,8 +1476,7 @@ impl Writer {
 
     /// Count `took` as `timed` of this writer's partition.
     fn timed(&self, timed: Timed, took: Duration) {
-        let partition = self.lease.key.to_string();
-        self.timings.record(timed, &partition, took);
+        self.timings.record(timed, &self.lease.key, took);
     }
 
     pub fn partition(&self) -> &Arc<Partition> {

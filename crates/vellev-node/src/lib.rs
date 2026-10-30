@@ -1029,9 +1029,9 @@ impl Tenant {
         let (position, times) = flushed.map_err(|error| self.failed(error))?;
         self.settling.flushed.fetch_add(1, Ordering::SeqCst);
         let timings = self.writer.timings();
-        let partition = self.writer.lease().key.to_string();
-        timings.record(Timed::LetGoFlushWait, &partition, times.waited);
-        timings.record(Timed::LetGoFlushHeld, &partition, times.held);
+        let partition = &self.writer.lease().key;
+        timings.record(Timed::LetGoFlushWait, partition, times.waited);
+        timings.record(Timed::LetGoFlushHeld, partition, times.held);
         Ok(position)
     }
 
