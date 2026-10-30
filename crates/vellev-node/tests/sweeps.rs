@@ -251,3 +251,38 @@ async fn sweeps_asked_for_by_use_are_spaced() {
     );
     assert!(ran >= 2, "the sweeps asked for ran: {ran}");
 }
+
+/// Review of #167, L1: a sweep waiting out the spacing does so before it
+/// takes the lock, so a sweep the lock is wanted for meanwhile, as a test's
+/// `sweep_now`, never waits on the spacing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_asked_for_now_never_waits_on_the_spacing() {
+    use vellev_node::SWEEPS_SPACED;
+    let node = node_on(memory(), |settings| {
+        settings.memory = Some(1 << 40);
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    node.create_tenant(&tenant("used")).await.unwrap();
+    let used = node.tenant(&tenant("used")).await.unwrap();
+    used.write(vec![notes(), note(1)]).await.unwrap();
+    drop(used);
+    tokio::time::sleep(SWEEPS_SPACED * 2).await;
+    let before = node.sweeps();
+    // A sweep a use asks for, at once after a quiet spell, and ended.
+    drop(node.tenant(&tenant("used")).await.unwrap());
+    until(1, "the sweep asked for never began", || {
+        node.sweeps() > before
+    })
+    .await;
+    tokio::time::sleep(SWEEPS_SPACED / 5).await;
+    // Another asked for, which waits out the rest of the spacing.
+    drop(node.tenant(&tenant("used")).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let asked = std::time::Instant::now();
+    node.sweep_now().await;
+    assert!(
+        asked.elapsed() < SWEEPS_SPACED / 2,
+        "a sweep asked for now waited {:?} on the spacing",
+        asked.elapsed()
+    );
+}

@@ -1409,7 +1409,10 @@ struct Inner {
     /// How many sweeps have begun.
     sweeps_begun: AtomicU64,
     /// When the last sweep began: those uses ask for are spaced from it.
+    /// Tokio's time, so that spacing follows `tokio::time::pause()`.
     last_swept: Mutex<Option<Instant>>,
+    /// One waits to sweep, spaced, not yet holding [`Inner::sweeping`].
+    sweep_queued: AtomicBool,
     /// The node's own sweep was asked for, not held to [`SWEEPS_SPACED`].
     sweep_on_time: AtomicBool,
     /// Where a test holds each sweep as it is about to take tenants out.
@@ -1612,6 +1615,7 @@ impl Node {
             sweep_again: AtomicBool::new(false),
             sweeps_begun: AtomicU64::new(0),
             last_swept: Mutex::new(None),
+            sweep_queued: AtomicBool::new(false),
             sweep_on_time: AtomicBool::new(false),
             sweep_hold: Mutex::default(),
             started: Instant::now(),
@@ -1755,8 +1759,11 @@ impl Node {
     pub async fn sweep_now(&self) {
         let sweeping = self.0.sweeping.clone().lock_owned().await;
         self.0.sweep().await;
+        drop(sweeping);
         // Any asked for meanwhile, as one that found it running would.
-        self.0.clone().sweeping_while_asked(sweeping).await;
+        if self.0.sweep_again.load(Ordering::SeqCst) {
+            self.0.sweep_soon();
+        }
     }
 
     /// How many local embedding models are loaded, or loading.
@@ -2240,35 +2247,45 @@ impl Inner {
     /// use of a tenant over the budget asks for one, and a sweep can wait
     /// long on a flush or on releasing a lease: queued, they would be one
     /// for each request, each holding the node. At most one runs and one
-    /// waits to.
+    /// waits to, spaced from the last (see [`Self::spaced`]) before it takes
+    /// the lock, so that a sweep the lock is wanted for meanwhile, as
+    /// [`Node::sweep_now`]'s, never waits on the spacing.
     ///
     /// The ask is marked before the lock is tried, and the sweep running
     /// looks for it again once it has let the lock go, so that none is
     /// lost between its last look and its letting go.
     fn sweep_soon(self: &Arc<Self>) {
         self.sweep_again.store(true, Ordering::SeqCst);
-        if let Ok(sweeping) = self.sweeping.clone().try_lock_owned() {
-            tokio::spawn(self.clone().sweeping_while_asked(sweeping));
+        // A sweep running looks for the ask once it has let the lock go.
+        if self.sweeping.try_lock().is_err() {
+            return;
         }
+        // One waiting to sweep already, which will find the ask.
+        if self.sweep_queued.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let inner = self.clone();
+        tokio::spawn(async move {
+            inner.spaced().await;
+            inner.sweep_queued.store(false, Ordering::SeqCst);
+            // Taken by a sweep meanwhile, which looks for the ask as it
+            // lets the lock go.
+            if let Ok(sweeping) = inner.sweeping.clone().try_lock_owned() {
+                inner.sweeping_while_asked(sweeping).await;
+            }
+        });
     }
 
-    /// Sweep while a sweep is asked for, holding `sweeping`, and then let
-    /// it go; and once more if one was asked for as it was let go.
-    async fn sweeping_while_asked(self: Arc<Self>, mut sweeping: tokio::sync::OwnedMutexGuard<()>) {
-        loop {
-            while self.sweep_again.swap(false, Ordering::SeqCst) {
-                self.spaced().await;
-                self.sweep().await;
-            }
-            drop(sweeping);
-            if !self.sweep_again.load(Ordering::SeqCst) {
-                return;
-            }
-            match self.sweeping.clone().try_lock_owned() {
-                Ok(again) => sweeping = again,
-                // Another has it, and sweeps for the ask.
-                Err(_) => return,
-            }
+    /// Sweep if a sweep is asked for, holding `sweeping`, and then let it
+    /// go; and ask once more, spaced, if one was asked for as it ran or as
+    /// it was let go.
+    async fn sweeping_while_asked(self: Arc<Self>, sweeping: tokio::sync::OwnedMutexGuard<()>) {
+        if self.sweep_again.swap(false, Ordering::SeqCst) {
+            self.sweep().await;
+        }
+        drop(sweeping);
+        if self.sweep_again.load(Ordering::SeqCst) {
+            self.sweep_soon();
         }
     }
 

@@ -3551,10 +3551,6 @@ mod tests {
         assert_eq!(ranked(&index(&other)), ranked(&index(&plain)));
     }
 
-    /// A merged segment is taken to cover its run only if it holds every
-    /// row the run holds live: one that lacks a live row, as a merge made
-    /// before a restore that brought it back would, is not, so it is never
-    /// carried out; rows of the run that died since are no matter.
     /// Final review of #165, L2: applying a commit publishes only what it
     /// changes, as it never changes the segments. One that did is caught
     /// where the debug assertions are built in, as in every test.
@@ -3571,6 +3567,10 @@ mod tests {
         published.applying(|state| state.segments[0].meta.rows += 1);
     }
 
+    /// A merged segment is taken to cover its run only if it holds every
+    /// row the run holds live: one that lacks a live row, as a merge made
+    /// before a restore that brought it back would, is not, so it is never
+    /// carried out; rows of the run that died since are no matter.
     #[test]
     fn a_merged_segment_covers_its_run_only_if_it_holds_every_live_row() {
         let mut built = Built::new(&["notes"]);
