@@ -146,9 +146,10 @@ impl Followed {
         *self.used.lock().expect("use lock")
     }
 
-    /// About how many bytes the copy takes in memory.
+    /// About how many bytes the copy takes in memory, as it was last
+    /// changed: read without its lock.
     pub(crate) fn resident(&self) -> usize {
-        self.follower.partition().read(State::resident)
+        self.follower.partition().figures().resident
     }
 
     fn reached(&self, incarnation: Incarnation, position: LogPosition) -> bool {

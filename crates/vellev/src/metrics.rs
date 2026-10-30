@@ -489,18 +489,18 @@ impl Collector for Counted {
                 gauge.metric_type(),
             )?)?;
         }
-        let gauge = ConstGauge::new(i64::try_from(census.unsettled).unwrap_or(i64::MAX));
+        let gauge = ConstGauge::new(i64::try_from(node.unsettled()).unwrap_or(i64::MAX));
         gauge.encode(encoder.encode_descriptor(
             "tenants_unsettled",
-            "Tenants this node writes for with a flush or merge due or under way, as the last sweep found them",
+            "Tenants this node writes for with a flush or merge due or under way",
             None,
             gauge.metric_type(),
         )?)?;
-        let held = census.segments;
+        let held = node.segments();
         for (name, help, values) in [
             (
                 "segments",
-                "Segments the tenants this node writes hold, as the last sweep found them, by whether they have an index file: clustered counts those with one (a clustered vector index for at least one of their collections), plain the rest",
+                "Segments the tenants this node writes hold, by whether they have an index file: clustered counts those with one (a clustered vector index for at least one of their collections), plain the rest",
                 [("clustered", held.clustered as u64), ("plain", held.plain as u64)],
             ),
             (
@@ -605,7 +605,7 @@ impl Collector for Counted {
             let gauge = ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX));
             gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
         }
-        let flushing = node.flushing_as_swept();
+        let flushing = node.flushing();
         for (name, help, count) in [
             (
                 "flush_failures",
@@ -629,12 +629,12 @@ impl Collector for Counted {
         for (name, help, value) in [
             (
                 "unflushed_rows",
-                "Rows written to the tenants this node writes and not flushed yet, as the last sweep found them",
+                "Rows written to the tenants this node writes and not flushed yet",
                 flushing.unflushed_rows,
             ),
             (
                 "unflushed_bytes",
-                "About how many bytes the rows not flushed yet take in memory, as the last sweep found them",
+                "About how many bytes the rows not flushed yet take in memory",
                 flushing.unflushed_bytes,
             ),
         ] {

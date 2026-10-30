@@ -31,7 +31,7 @@ use crate::merge_builds::{
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::state::{
-    self, Discarded, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
+    self, Discarded, Figures, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
 };
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Refusal, Result, StorageError};
@@ -173,7 +173,11 @@ pub struct Partition {
     /// follows it into another.
     incarnation: Incarnation,
     blobs: Arc<dyn Blobs>,
+    /// Changed only through [`Self::changing`], which publishes what it
+    /// comes to in `figures`.
     state: RwLock<State>,
+    /// What the state came to as it was last changed: see [`Self::figures`].
+    figures: std::sync::Mutex<Figures>,
     /// Serialises catch-up, and remembers the newest coordinator generation
     /// seen so an older reading of the committed state is recognised as stale.
     seen: Mutex<Generation>,
@@ -372,6 +376,23 @@ impl Partition {
         f(&self.state.read().expect("partition lock"))
     }
 
+    /// What the partition comes to, as it was last changed: read without
+    /// its lock, so never waiting on a change under way, as a node reads it
+    /// of every tenant for its metrics and its memory budget.
+    pub fn figures(&self) -> Figures {
+        *lock(&self.figures)
+    }
+
+    /// Change the state as `f` does, under its lock, and publish what it
+    /// then comes to, under the same lock, so that what is published
+    /// follows the changes in their order.
+    fn changing<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        let mut state = self.state.write().expect("partition lock");
+        let changed = f(&mut state);
+        *lock(&self.figures) = state.figures();
+        changed
+    }
+
     async fn load(key: PartitionKey, blobs: Arc<dyn Blobs>, committed: &Committed) -> Result<Self> {
         Self::load_reusing(key, blobs, committed, Loading::default()).await
     }
@@ -411,6 +432,7 @@ impl Partition {
             incarnation,
             blobs,
             state: RwLock::new(State::default()),
+            figures: std::sync::Mutex::default(),
             seen: Mutex::new(Generation(0)),
             commits: None,
             replayed: std::sync::Mutex::default(),
@@ -733,7 +755,7 @@ impl Partition {
                 let mut state = self.restore(&key, manifest, held, reloading).await?;
                 let together = state.apply_together(&tail.logs)?;
                 self.replayed_together(together);
-                *self.state.write().expect("partition lock") = state;
+                self.changing(|now| *now = state);
             }
             None => {
                 // A run of logs at a time, the codes of each made together
@@ -751,8 +773,7 @@ impl Partition {
                         prepared
                     });
                     for ((key, log), prepared) in run.iter().zip(prepared) {
-                        let mut state = self.state.write().expect("partition lock");
-                        state.apply_prepared(key, log, prepared)?;
+                        self.changing(|state| state.apply_prepared(key, log, prepared))?;
                     }
                 }
             }
@@ -1660,8 +1681,7 @@ impl Writer {
                     // Coded first, while readers may still read; the apply
                     // under the lock then only stores the codes.
                     let prepared = partition.read(|state| state.prepared(&log));
-                    let mut state = partition.state.write().expect("partition lock");
-                    state.apply_prepared(&applied, &log, prepared)
+                    partition.changing(|state| state.apply_prepared(&applied, &log, prepared))
                 })
                 .await??;
                 tracing::debug!(
@@ -1836,7 +1856,7 @@ impl Writer {
                 self.publish(&turn, key, frame, position, None, None)
                     .await?;
                 let adopting = Instant::now();
-                let adopted = adopt(&mut self.partition.state.write().expect("partition lock"));
+                let adopted = self.partition.changing(adopt);
                 tracing::debug!(
                     partition = %self.lease.key,
                     ?position,
@@ -1985,10 +2005,7 @@ impl Writer {
             .attempt(async {
                 self.publish(&turn, &key, frame, restored, restore, adopting)
                     .await?;
-                let replaced = std::mem::replace(
-                    &mut *self.partition.state.write().expect("partition lock"),
-                    state,
-                );
+                let replaced = self.partition.changing(|now| std::mem::replace(now, state));
                 self.epoch.fetch_add(1, Ordering::SeqCst);
                 Ok(replaced)
             })
@@ -3970,10 +3987,9 @@ impl RestoreFrom<'_> {
                 writer
                     .publish(&turn, &key, frame, restored, Some(restore), adopting)
                     .await?;
-                let replaced = std::mem::replace(
-                    &mut *writer.partition.state.write().expect("partition lock"),
-                    state,
-                );
+                let replaced = writer
+                    .partition
+                    .changing(|now| std::mem::replace(now, state));
                 writer.epoch.fetch_add(1, Ordering::SeqCst);
                 Ok(replaced)
             })

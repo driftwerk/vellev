@@ -928,8 +928,14 @@ impl Tenant {
     /// tenant settled.
     fn settled(&self) -> bool {
         let settling = &self.settling;
-        self.read(State::unflushed) < self.flush_rows
+        self.figures().unflushed < self.flush_rows
             && settling.maintained.load(Ordering::SeqCst) >= settling.flushed.load(Ordering::SeqCst)
+    }
+
+    /// What the tenant comes to, as it was last changed: read without the
+    /// lock on its state, as a scrape and a sweep read it.
+    fn figures(&self) -> vellev_storage::Figures {
+        self.writer.partition().figures()
     }
 
     /// Refuse a write while the tenant holds [`Settings::backlog_rows`]
@@ -1423,17 +1429,12 @@ pub struct Segments {
 pub use vellev_storage::Probes;
 
 impl Segments {
-    fn add(&mut self, meta: &vellev_storage::format::SegmentMeta) {
-        match meta.index.is_some() {
-            true => {
-                self.clustered += 1;
-                self.clustered_rows += meta.rows;
-            }
-            false => {
-                self.plain += 1;
-                self.plain_rows += meta.rows;
-            }
-        }
+    fn add(&mut self, figures: &vellev_storage::Figures) {
+        self.clustered += figures.clustered;
+        self.clustered_rows += figures.clustered_rows;
+        self.plain += figures.plain;
+        self.plain_rows += figures.plain_rows;
+        self.probes += figures.probes;
     }
 }
 
@@ -1472,19 +1473,13 @@ pub struct Holding {
 /// What a sweep found the node holding as it began, which is what it
 /// held to the memory budget: published by every sweep, so that reading
 /// it holds no tenant. A sweep lets a tenant go only if nothing else holds
-/// it, so whatever read the tenants themselves would keep them.
+/// it, so whatever held the tenants to read them would keep them. What is
+/// not the sweep's own decision (what waits for a flush, the segments) is
+/// read as it is instead, from each tenant's published figures.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Census {
     /// The tenants held, and what they are reckoned to take.
     pub holding: Holding,
-    /// Rows written to the tenants written for and not flushed yet.
-    pub unflushed_rows: usize,
-    /// About how many bytes those rows take, with their codes.
-    pub unflushed_bytes: usize,
-    /// Tenants written for with a flush or merge due or under way.
-    pub unsettled: usize,
-    /// The segments the tenants written for hold.
-    pub segments: Segments,
     /// When the sweep that took it began; none before the first.
     pub swept_at: Option<Instant>,
 }
@@ -1497,16 +1492,7 @@ impl Census {
             census.holding.resident += held.size;
             census.holding.largest = census.holding.largest.max(held.size);
             match &held.kind {
-                Kind::Writer(_, tenant) => {
-                    census.holding.writers += 1;
-                    census.unflushed_rows += tenant.read(State::unflushed);
-                    census.unflushed_bytes += tenant.read(State::unflushed_bytes);
-                    census.unsettled += usize::from(!tenant.settled());
-                    tenant.read(|state| {
-                        state.segments().for_each(|meta| census.segments.add(meta));
-                        census.segments.probes += state.probes();
-                    });
-                }
+                Kind::Writer(..) => census.holding.writers += 1,
                 Kind::Copy(..) => census.holding.copies += 1,
             }
         }
@@ -1780,15 +1766,15 @@ impl Node {
     }
 
     /// What the tenants this node writes hold unflushed, and how many of
-    /// their flushes failed.
+    /// their flushes failed: as they are now, from each tenant's published
+    /// figures, holding none of them (see `Inner::each_writer`).
     pub fn flushing(&self) -> Flushing {
         let (mut rows, mut bytes) = (0, 0);
-        for held in self.0.held_now() {
-            if let Kind::Writer(_, tenant) = &held.kind {
-                rows += tenant.read(State::unflushed);
-                bytes += tenant.read(State::unflushed_bytes);
-            }
-        }
+        self.0.each_writer(|tenant| {
+            let figures = tenant.figures();
+            rows += figures.unflushed;
+            bytes += figures.unflushed_bytes;
+        });
         Flushing {
             failed: self.0.flushing.failed.load(Ordering::Relaxed),
             backlogged: self.0.flushing.backlogged.load(Ordering::Relaxed),
@@ -1797,42 +1783,21 @@ impl Node {
         }
     }
 
-    /// As [`Self::flushing`], what is unflushed as the last sweep found
-    /// it ([`Self::census`]), reading no tenant: the failures and refusals
-    /// are counted as they happen.
-    pub fn flushing_as_swept(&self) -> Flushing {
-        let census = self.census();
-        Flushing {
-            failed: self.0.flushing.failed.load(Ordering::Relaxed),
-            backlogged: self.0.flushing.backlogged.load(Ordering::Relaxed),
-            unflushed_rows: census.unflushed_rows,
-            unflushed_bytes: census.unflushed_bytes,
-        }
-    }
-
     /// How many tenants this node writes for have a flush or merge due or
-    /// under way. A node with none has nothing left to do in the
-    /// background but clean up files past their grace.
+    /// under way, as they are now. A node with none has nothing left to do
+    /// in the background but clean up files past their grace.
     pub fn unsettled(&self) -> usize {
+        let mut unsettled = 0;
         self.0
-            .held_now()
-            .iter()
-            .filter(|held| matches!(&held.kind, Kind::Writer(_, tenant) if !tenant.settled()))
-            .count()
+            .each_writer(|tenant| unsettled += usize::from(!tenant.settled()));
+        unsettled
     }
 
     /// The segments the tenants this node writes hold, by whether they
-    /// have a clustered index.
+    /// have a clustered index, as they are now.
     pub fn segments(&self) -> Segments {
         let mut segments = Segments::default();
-        for held in self.0.held_now() {
-            if let Kind::Writer(_, tenant) = &held.kind {
-                tenant.read(|state| {
-                    state.segments().for_each(|meta| segments.add(meta));
-                    segments.probes += state.probes();
-                });
-            }
-        }
+        self.0.each_writer(|tenant| segments.add(&tenant.figures()));
         segments
     }
 
@@ -2186,18 +2151,30 @@ impl Inner {
     }
 
     /// What the tenants and copies held take, read under the node's lock
-    /// and holding none of them: see [`Node::resident`].
+    /// from what each published as it last changed, holding none of them
+    /// and waiting on no lock of theirs: see [`Node::resident`].
     fn resident(&self) -> usize {
         let open = self.opened();
         let writers: usize = (open.tenants.values())
             .filter_map(|opening| opening.get())
-            .map(|tenant| tenant.read(State::resident))
+            .map(|tenant| tenant.figures().resident)
             .sum();
         let copies: usize = (open.followers.values())
             .filter_map(|following| following.get())
             .map(|copy| copy.resident())
             .sum();
         writers + copies
+    }
+
+    /// Call `f` with each tenant written for, under the node's lock and
+    /// holding none of them: a sweep lets a tenant go only if nothing but
+    /// the node holds it, so reading one must never hold it. `f` reads
+    /// what each published as it last changed, never waiting on its lock.
+    fn each_writer(&self, mut f: impl FnMut(&Tenant)) {
+        let open = self.opened();
+        for tenant in open.tenants.values().filter_map(|opening| opening.get()) {
+            f(tenant);
+        }
     }
 
     /// What the node holds now, sized and aged without holding the lock.
@@ -2217,7 +2194,7 @@ impl Inner {
         held.into_iter()
             .map(|(id, kind)| {
                 let (unused, size, warmed) = match &kind {
-                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.read(State::resident), false),
+                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.figures().resident, false),
                     Kind::Copy(_, copy) => (copy.idle(), copy.resident(), copy.warmed().is_some()),
                 };
                 Held {
@@ -2556,10 +2533,15 @@ mod segment_tests {
 
     #[test]
     fn a_segment_with_an_index_file_is_counted_as_clustered() {
-        let mut segments = Segments::default();
-        for (rows, clustered) in [(800_000, true), (200_000, false), (50_000, false)] {
-            segments.add(&meta(rows, clustered));
+        // Two tenants' figures, the first of two segments, added up.
+        let (mut first, mut second) = (vellev_storage::Figures::default(), Default::default());
+        for (rows, clustered) in [(800_000, true), (200_000, false)] {
+            first.count(&meta(rows, clustered));
         }
+        vellev_storage::Figures::count(&mut second, &meta(50_000, false));
+        let mut segments = Segments::default();
+        segments.add(&first);
+        segments.add(&second);
         assert_eq!(
             segments,
             Segments {
