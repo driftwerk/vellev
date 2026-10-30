@@ -995,7 +995,7 @@ fn indexing_crest(chunks: &[(f64, f64)], fields: &[RunField], besides: f64) -> f
         let mut before = 0.0;
         let tokens_left = chunks.iter().find_map(|(_, tokens_of)| {
             before += tokens_of;
-            (before >= by_then * tokens).then(|| before - by_then * tokens)
+            (before >= by_then * tokens).then_some(before - by_then * tokens)
         });
         let grown = (index + besides) * by_then + 1.5 * table + tokens_left.unwrap_or(0.0);
         crest = crest.max(grown);
