@@ -566,8 +566,9 @@ const RECKONED: [Shape; 27] = [
             short: false,
         },
     ),
-    // Tokens far past what encoding comes to, so that a chunk's are what
-    // the peak is, and spread over the run they would be missed.
+    // Tokens far past what encoding comes to. Spread evenly over the run
+    // they are still reckoned within the bounds here: what tells that from a
+    // block is the plan's own rule, in `state`.
     Shape::of(
         CHUNKED_MORE,
         NARROW,
