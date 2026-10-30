@@ -167,6 +167,11 @@ impl Room {
         (self.most, self.idle, self.own.as_deref())
     }
 
+    /// How many models have a place: loaded, or loading.
+    pub(crate) fn count(&self) -> usize {
+        self.loaded.lock().expect("room lock").len()
+    }
+
     /// The models that have a place, in the order they took them.
     #[cfg(test)]
     pub(crate) fn loaded(&self) -> Vec<String> {

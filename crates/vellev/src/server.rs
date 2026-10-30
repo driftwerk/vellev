@@ -198,11 +198,18 @@ impl App {
         }
     }
 
-    /// Report what `allocator`, the one this process runs on, holds: as the
-    /// `vellev` binary does, whose global allocator it is. A process on
-    /// another allocator must not, as jemalloc's counts would say nothing
-    /// of it.
+    /// Report what `allocator` holds, which must be the process's global
+    /// allocator, as it is the `vellev` binary's: in a process on another,
+    /// jemalloc's counts say nothing of it. So it is taken only if it is
+    /// seen to be ([`Allocator::is_global`]); otherwise none of its counts
+    /// are reported, and that is said in the log.
     pub fn running_on(self, allocator: &'static Allocator) -> Self {
+        if !allocator.is_global() {
+            tracing::warn!(
+                "jemalloc is not this process's global allocator: its counts are not reported"
+            );
+            return self;
+        }
         let memory = Sources {
             allocator: Some(allocator),
             ..self.memory.clone()

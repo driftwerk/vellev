@@ -30,8 +30,14 @@ pub struct Memory {
     pub file: Option<u64>,
     /// The cgroup's memory now (`memory.current`).
     pub current: Option<u64>,
-    /// The cgroup's limit (`memory.max`), unless it has none.
+    /// The most it has held (`memory.peak`, kernels from 5.19).
+    pub peak: Option<u64>,
+    /// The cgroup's own limit (`memory.max`), unless it has none. A lower
+    /// limit an ancestor sets binds it too, and is not this.
     pub max: Option<u64>,
+    /// Its own high mark (`memory.high`), past which it is throttled and
+    /// reclaimed from, unless it has none.
+    pub high: Option<u64>,
     /// How often the cgroup was throttled, met its limit, ran out and had a
     /// process killed for it (`memory.events`), as many of those as it says.
     pub events: Vec<(&'static str, u64)>,
@@ -50,8 +56,7 @@ impl MemoryFiles {
     pub fn of_this_process() -> Self {
         let cgroup = std::fs::read_to_string("/proc/self/cgroup")
             .ok()
-            .and_then(|named| v2_cgroup(&named).map(str::to_string))
-            .map(|path| Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')));
+            .and_then(|named| cgroup_dir(Path::new("/sys/fs/cgroup"), &named));
         Self {
             status: PathBuf::from("/proc/self/status"),
             cgroup,
@@ -69,17 +74,20 @@ impl MemoryFiles {
         let status = std::fs::read_to_string(&self.status).ok();
         let kib = |name: &str| status.as_deref().and_then(|text| status_kib(text, name));
         let mut memory = Memory {
-            anon: kib("RssAnon:").map(|kib| kib * 1024),
-            file: kib("RssFile:").map(|kib| kib * 1024),
+            anon: kib("RssAnon:").and_then(|kib| kib.checked_mul(1024)),
+            file: kib("RssFile:").and_then(|kib| kib.checked_mul(1024)),
             ..Memory::default()
         };
         let Some(cgroup) = &self.cgroup else {
             return memory;
         };
         let read = |name: &str| std::fs::read_to_string(cgroup.join(name)).ok();
-        memory.current = read("memory.current").and_then(|text| text.trim().parse().ok());
-        // "max" where there is no limit.
-        memory.max = read("memory.max").and_then(|text| text.trim().parse().ok());
+        // Each is "max" where there is no bound, and so is left out.
+        let bytes = |name: &str| read(name).and_then(|text| text.trim().parse().ok());
+        memory.current = bytes("memory.current");
+        memory.peak = bytes("memory.peak");
+        memory.max = bytes("memory.max");
+        memory.high = bytes("memory.high");
         if let Some(text) = read("memory.events") {
             memory.events = keyed(&text, &EVENTS);
         }
@@ -88,6 +96,26 @@ impl MemoryFiles {
         }
         memory
     }
+}
+
+/// The directory of the cgroup v2 a process is in, under `root`, where
+/// cgroup v2 is mounted, from what `/proc/self/cgroup` says (`named`): the
+/// line `0::PATH`. None where memory is not on cgroup v2: a host with v1
+/// alone has no such line, and a hybrid host has one but keeps memory on
+/// v1 (a line `N:...memory...:PATH`), so that v2 has no memory files.
+pub fn cgroup_dir(root: &Path, named: &str) -> Option<PathBuf> {
+    let on_v1 = named.lines().any(|line| {
+        let mut fields = line.splitn(3, ':');
+        let (_, controllers) = (fields.next(), fields.next().unwrap_or(""));
+        controllers
+            .split(',')
+            .any(|controller| controller == "memory")
+    });
+    if on_v1 {
+        return None;
+    }
+    let path = v2_cgroup(named)?;
+    Some(root.join(path.trim_start_matches('/')))
 }
 
 /// The path of the cgroup v2 a process is in, as `/proc/self/cgroup`

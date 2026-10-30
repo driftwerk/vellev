@@ -295,7 +295,7 @@ impl Counted {
         if let Some(held) = self.sources.allocator.and_then(Allocator::held) {
             for (name, help, value) in [
                 (
-                    "allocated_bytes",
+                    "allocator_allocated_bytes",
                     "Bytes the node's Rust code has allocated through jemalloc and not freed; not what libraries allocate through the C library's malloc, as the local embedding model does",
                     held.allocated,
                 ),
@@ -324,9 +324,19 @@ impl Counted {
                 memory.current,
             ),
             (
+                "cgroup_memory_peak_bytes",
+                "The most memory the node's cgroup has held (memory.peak), where the kernel keeps it",
+                memory.peak,
+            ),
+            (
                 "cgroup_memory_max_bytes",
-                "The node's cgroup's memory limit (memory.max), if it has one",
+                "The node's cgroup's own memory limit (memory.max), if it has one: the leaf's, not a lower one an ancestor may set, which binds it too",
                 memory.max,
+            ),
+            (
+                "cgroup_memory_high_bytes",
+                "The node's cgroup's own high mark (memory.high), past which it is throttled and reclaimed from, if it has one",
+                memory.high,
             ),
         ] {
             if let Some(value) = value {
@@ -360,12 +370,15 @@ impl Counted {
             labelled(
                 encoder,
                 "memory_baseline_bytes",
-                "What the process and its cgroup held as the node started, before it opened any tenant: its cgroup's memory, the process's anonymous memory, and what it had allocated through jemalloc. The local embedding model is loaded when first used, so it is not in these",
-                "of",
+                "What the process and its cgroup held as the node started, before it opened any tenant: its cgroup's memory, the process's anonymous memory, and what it had allocated through jemalloc. The local embedding model is loaded when first used, so it is not in these: see vellev_local_models_loaded",
+                "kind",
                 [
                     ("cgroup", baseline.memory.current),
                     ("process_anon", baseline.memory.anon),
-                    ("allocated", baseline.allocated.map(|bytes| bytes as u64)),
+                    (
+                        "allocator_allocated",
+                        baseline.allocated.map(|bytes| bytes as u64),
+                    ),
                 ],
             )?;
         }
@@ -431,11 +444,14 @@ impl Collector for Counted {
         let Some(node) = self.node.get() else {
             return Ok(());
         };
-        let holding = node.holding();
+        // As the last sweep found the node, which reading holds no tenant
+        // for: a sweep lets go only what nothing else holds.
+        let census = node.census();
+        let holding = census.holding;
         let gauge0 = ConstGauge::new(0i64);
         let mut family = encoder.encode_descriptor(
             "tenants_open",
-            "Tenants this node holds open, as their writer or as a copy to read from",
+            "Tenants this node holds open, as their writer or as a copy to read from, as the last sweep found them",
             None,
             gauge0.metric_type(),
         )?;
@@ -445,12 +461,12 @@ impl Collector for Counted {
         for (name, help, value) in [
             (
                 "tenants_resident_bytes",
-                "About how many bytes the tenants this node holds take in memory together, as the node reckons them for its memory budget, by how it reckons them (rows: from each row's size)",
+                "About how many bytes the tenants this node holds take in memory together, as the node reckons them for its memory budget, by how it reckons them (rows: from each row's size), as the last sweep found them: the figure it held to the budget",
                 holding.resident,
             ),
             (
                 "tenant_resident_largest_bytes",
-                "About how many bytes the one tenant this node holds that takes the most takes, reckoned as for the memory budget",
+                "About how many bytes the one tenant this node holds that takes the most takes, reckoned as for the memory budget, as the last sweep found it",
                 holding.largest,
             ),
         ] {
@@ -466,18 +482,18 @@ impl Collector for Counted {
                 gauge.metric_type(),
             )?)?;
         }
-        let gauge = ConstGauge::new(i64::try_from(node.unsettled()).unwrap_or(i64::MAX));
+        let gauge = ConstGauge::new(i64::try_from(census.unsettled).unwrap_or(i64::MAX));
         gauge.encode(encoder.encode_descriptor(
             "tenants_unsettled",
-            "Tenants this node writes for with a flush or merge due or under way",
+            "Tenants this node writes for with a flush or merge due or under way, as the last sweep found them",
             None,
             gauge.metric_type(),
         )?)?;
-        let held = node.segments();
+        let held = census.segments;
         for (name, help, values) in [
             (
                 "segments",
-                "Segments the tenants this node writes hold, by whether they have an index file: clustered counts those with one (a clustered vector index for at least one of their collections), plain the rest",
+                "Segments the tenants this node writes hold, as the last sweep found them, by whether they have an index file: clustered counts those with one (a clustered vector index for at least one of their collections), plain the rest",
                 [("clustered", held.clustered as u64), ("plain", held.plain as u64)],
             ),
             (
@@ -537,6 +553,20 @@ impl Collector for Counted {
             ConstCounter::new(count).encode(family.encode_family(&[("kind", kind)])?)?;
         }
         let merges = node.merges();
+        let counter = ConstCounter::new(merges.stopped_for_budget);
+        counter.encode(encoder.encode_descriptor(
+            "merges_stopped_for_budget",
+            "Merges sweeps stopped so that a tenant over the memory budget, held by something else as it merged, could be let go",
+            None,
+            counter.metric_type(),
+        )?)?;
+        let gauge = gauge_of(node.local_models_loaded());
+        gauge.encode(encoder.encode_descriptor(
+            "local_models_loaded",
+            "Local embedding models loaded or loading: each takes memory outside jemalloc, which shows as a step in the process's anonymous memory as it loads",
+            None,
+            gauge.metric_type(),
+        )?)?;
         let counter = ConstCounter::new(merges.held_let_go);
         counter.encode(encoder.encode_descriptor(
             "merge_turns_let_go",
@@ -561,7 +591,7 @@ impl Collector for Counted {
             let gauge = ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX));
             gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
         }
-        let flushing = node.flushing();
+        let flushing = node.flushing_as_swept();
         for (name, help, count) in [
             (
                 "flush_failures",
@@ -585,12 +615,12 @@ impl Collector for Counted {
         for (name, help, value) in [
             (
                 "unflushed_rows",
-                "Rows written to the tenants this node writes and not flushed yet",
+                "Rows written to the tenants this node writes and not flushed yet, as the last sweep found them",
                 flushing.unflushed_rows,
             ),
             (
                 "unflushed_bytes",
-                "About how many bytes the rows not flushed yet take in memory",
+                "About how many bytes the rows not flushed yet take in memory, as the last sweep found them",
                 flushing.unflushed_bytes,
             ),
         ] {

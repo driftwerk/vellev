@@ -1375,6 +1375,11 @@ struct Inner {
     /// The merge builds of every tenant this node writes for, taken in
     /// turns, at most [`MERGE_BUILDS`] at once.
     merge_builds: Arc<MergeBuilds>,
+    /// What the last sweep found the node holding: see [`Node::census`].
+    census: Mutex<Census>,
+    /// How many merges sweeps have stopped so that a tenant over the
+    /// budget could be let go.
+    stopped_for_budget: AtomicU64,
 }
 
 /// Flushes that failed, and writes refused while they did.
@@ -1431,6 +1436,9 @@ pub struct Merges {
     pub abandoned: usize,
     /// How many merge turns were let go so, since the node started.
     pub held_let_go: u64,
+    /// How many merges sweeps have stopped since the node started, so that
+    /// a tenant over the memory budget could be let go.
+    pub stopped_for_budget: u64,
 }
 
 /// What this node holds open, and what it reckons that holds in memory:
@@ -1446,6 +1454,49 @@ pub struct Holding {
     pub resident: usize,
     /// About how many bytes the one that takes the most takes.
     pub largest: usize,
+}
+
+/// What a sweep found the node holding as it began, which is what it
+/// held to the memory budget: published by every sweep, so that reading
+/// it holds no tenant. A sweep lets a tenant go only if nothing else holds
+/// it, so whatever read the tenants themselves would keep them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Census {
+    /// The tenants held, and what they are reckoned to take.
+    pub holding: Holding,
+    /// Rows written to the tenants written for and not flushed yet.
+    pub unflushed_rows: usize,
+    /// About how many bytes those rows take, with their codes.
+    pub unflushed_bytes: usize,
+    /// Tenants written for with a flush or merge due or under way.
+    pub unsettled: usize,
+    /// The segments the tenants written for hold.
+    pub segments: Segments,
+}
+
+impl Census {
+    /// Of the tenants and copies in `held`, read one at a time.
+    fn of(held: &[Held]) -> Self {
+        let mut census = Self::default();
+        for held in held {
+            census.holding.resident += held.size;
+            census.holding.largest = census.holding.largest.max(held.size);
+            match &held.kind {
+                Kind::Writer(_, tenant) => {
+                    census.holding.writers += 1;
+                    census.unflushed_rows += tenant.read(State::unflushed);
+                    census.unflushed_bytes += tenant.read(State::unflushed_bytes);
+                    census.unsettled += usize::from(!tenant.settled());
+                    tenant.read(|state| {
+                        state.segments().for_each(|meta| census.segments.add(meta));
+                        census.segments.probes += state.probes();
+                    });
+                }
+                Kind::Copy(..) => census.holding.copies += 1,
+            }
+        }
+        census
+    }
 }
 
 /// What this node's tenants hold unflushed, and how their flushes went.
@@ -1498,6 +1549,8 @@ impl Node {
             flushing: Arc::default(),
             warm: warm::Warm::default(),
             merge_builds: MergeBuilds::new(MERGE_BUILDS),
+            census: Mutex::default(),
+            stopped_for_budget: AtomicU64::new(0),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -1590,19 +1643,24 @@ impl Node {
         self.0.held_now().iter().map(|held| held.size).sum()
     }
 
-    /// What this node holds open and what it reckons that takes in
-    /// memory, all from one look, as [`Self::resident`] reckons it.
-    pub fn holding(&self) -> Holding {
-        let mut holding = Holding::default();
-        for held in self.0.held_now() {
-            match held.kind {
-                Kind::Writer(..) => holding.writers += 1,
-                Kind::Copy(..) => holding.copies += 1,
-            }
-            holding.resident += held.size;
-            holding.largest = holding.largest.max(held.size);
-        }
-        holding
+    /// What the last sweep found this node holding, as it began: what it
+    /// held to the memory budget. Read without holding any tenant, so that
+    /// reading it, as /metrics does, never keeps a tenant from being let
+    /// go. All zero until the first sweep.
+    pub fn census(&self) -> Census {
+        *self.0.census.lock().expect("census lock")
+    }
+
+    /// Sweep now, as the node does every so often: for a test that reads
+    /// what a sweep found.
+    #[doc(hidden)]
+    pub async fn sweep_now(&self) {
+        self.0.sweep().await;
+    }
+
+    /// How many local embedding models are loaded, or loading.
+    pub fn local_models_loaded(&self) -> usize {
+        self.0.embedders.local_models_loaded()
     }
 
     /// The memory budget this node holds its tenants to, if it has one:
@@ -1618,6 +1676,7 @@ impl Node {
             draining: builds.draining(),
             abandoned: builds.abandoned(),
             held_let_go: builds.held_let_go(),
+            stopped_for_budget: self.0.stopped_for_budget.load(Ordering::Relaxed),
         }
     }
 
@@ -1699,6 +1758,19 @@ impl Node {
             backlogged: self.0.flushing.backlogged.load(Ordering::Relaxed),
             unflushed_rows: rows,
             unflushed_bytes: bytes,
+        }
+    }
+
+    /// As [`Self::flushing`], what is unflushed as the last sweep found
+    /// it ([`Self::census`]), reading no tenant: the failures and refusals
+    /// are counted as they happen.
+    pub fn flushing_as_swept(&self) -> Flushing {
+        let census = self.census();
+        Flushing {
+            failed: self.0.flushing.failed.load(Ordering::Relaxed),
+            backlogged: self.0.flushing.backlogged.load(Ordering::Relaxed),
+            unflushed_rows: census.unflushed_rows,
+            unflushed_bytes: census.unflushed_bytes,
         }
     }
 
@@ -2005,6 +2077,7 @@ impl Inner {
     /// against the budget until its work has ended (merge note, §7.7).
     async fn sweep(&self) {
         let held = self.held_now();
+        *self.census.lock().expect("census lock") = Census::of(&held);
         let (idle, recent) = (self.settings.tenant_idle, RESIDENT_AT_LEAST);
         let draining = self.merge_builds.draining();
         let total = held.iter().map(|held| held.size).sum::<usize>() + draining;
@@ -2044,6 +2117,7 @@ impl Inner {
                     }
                     tracing::debug!(tenant = %tenant.id, "over the memory budget: a merge is stopped so that the tenant can be let go");
                     tenant.writer.stop_merges();
+                    self.stopped_for_budget.fetch_add(1, Ordering::Relaxed);
                     over = over.saturating_sub(*size);
                 }
                 tracing::warn!(

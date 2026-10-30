@@ -51,6 +51,24 @@ impl Allocator {
     }
 }
 
+impl Allocator {
+    /// Whether this is the process's global allocator: whether memory the
+    /// process allocates, 4 MiB of it, shows in jemalloc's count. jemalloc
+    /// linked but not the global allocator still counts what it allocates
+    /// for itself, so its count alone does not say. Memory freed elsewhere
+    /// meanwhile can only make this say no, never yes wrongly.
+    pub fn is_global(&self) -> bool {
+        const PROBE: usize = 4 * 1024 * 1024;
+        let Some(before) = self.held() else {
+            return false;
+        };
+        let probe = std::hint::black_box(vec![1u8; PROBE]);
+        let after = self.held();
+        drop(probe);
+        after.is_some_and(|after| after.allocated >= before.allocated + PROBE)
+    }
+}
+
 impl std::fmt::Debug for Allocator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Allocator(jemalloc)")

@@ -455,9 +455,11 @@ async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
 /// since show once the node next sweeps.
 #[tokio::test]
 async fn what_the_tenants_hold_is_reported_as_the_last_sweep_found_it() {
+    // No budget, so that opening a tenant does not sweep at once: only the
+    // test sweeps.
     let served = Cluster::new()
         .serve_unstarted_with(|settings| Settings {
-            memory: Some(64 * 1024 * 1024),
+            memory: None,
             ..settings
         })
         .await;
