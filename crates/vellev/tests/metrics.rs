@@ -11,6 +11,7 @@ use axum::http::{Method, StatusCode};
 use common::*;
 use serde_json::{json, Value};
 use vellev::metrics::{self, Stage};
+use vellev_core::TenantId;
 use vellev_node::Settings;
 
 const HYBRID: &str = "/v1/tenants/{tenant}/collections/{collection}/hybrid";
@@ -548,20 +549,35 @@ async fn the_segments_and_what_waits_are_as_they_are_when_scraped() {
     )| {
         plain == 1.0 && rows == 3.0 && unflushed == 0.0 && unsettled == 0.0
     });
-    // Three flushes more: four segments of three rows, merged as the node
-    // looks after the tenant, all of them at last in segments.
+    // Nine rows more, flushed as they come, a flush taking whatever has
+    // come by then, and merged as the node looks after the tenant: settled
+    // at last with all twelve in segments but fewer than a flush.
     for n in 4..=12 {
         note_in(&served, "acme", n).await;
     }
-    let (plain, _, _, _) = until("twelve rows flushed", &served, &|(
+    let (plain, rows, unflushed, _) = until("twelve rows settled", &served, &|(
         _,
         rows,
         unflushed,
         unsettled,
     )| {
-        rows == 12.0 && unflushed == 0.0 && unsettled == 0.0
+        rows + unflushed == 12.0 && unflushed < 3.0 && unsettled == 0.0
     });
-    assert!(plain >= 1.0);
+    // Just as the tenant holds them.
+    let acme = served
+        .node
+        .tenant(&TenantId::new("acme").unwrap())
+        .await
+        .unwrap();
+    let (held_rows, held_unflushed, held_segments) = acme.read(|state| {
+        let metas: Vec<_> = state.segments().collect();
+        let rows: u64 = metas.iter().map(|meta| meta.rows).sum();
+        (rows as f64, state.unflushed() as f64, metas.len() as f64)
+    });
+    assert_eq!(
+        (plain, rows, unflushed),
+        (held_segments, held_rows, held_unflushed)
+    );
     served.stop().await;
 }
 
