@@ -1565,9 +1565,10 @@ fn a_merge_build_is_idle_by_whether_its_tenant_was_active_as_it_began() {
 
 /// The flush-due mark (§9.6): how long rows wait from falling due to the
 /// commit that takes them, which sees what the wait for the lock does not.
-/// Its p99 is below twice a flush's own p99, and below the arm's median
-/// merge build: §3's "never a merge build's length", at the end-to-end
-/// wait. All three in seconds, sorted.
+/// Its p99 is below twice a flush's own p99; and what it comes to beyond a
+/// flush's own p99, the wait and not the flush, is below the arm's median
+/// merge build: §3's "never a merge build's length". A flush that is slow,
+/// but never waits, does not fail it. All three in seconds, sorted.
 fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
     let (due_p99, held_p99, build_p50) = (
         percentile(due, 99.0),
@@ -1576,11 +1577,11 @@ fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
     );
     json!({
         "passed": match (due_p99, held_p99, build_p50) {
-            (Some(due), Some(held), Some(build)) => due < 2.0 * held && due < build,
+            (Some(due), Some(held), Some(build)) => due < 2.0 * held && due - held < build,
             _ => false,
         },
         "due_p99_s": due_p99, "held_p99_s": held_p99, "merge_build_p50_s": build_p50,
-        "mark": "flush_due p99 < 2 x held p99, and < the median merge build",
+        "mark": "flush_due p99 < 2 x held p99, and its excess over held p99 < the median merge build",
     })
 }
 
@@ -1593,13 +1594,18 @@ fn rows_waiting_a_merge_builds_length_fail_the_flush_due_mark() {
         flush_due_mark(&[1.0, due], &[held], &[build])["passed"] == json!(true)
     };
     assert!(passed(3.0, 2.0, 60.0));
+    // Slow, but never held: as long as it takes itself, whatever a merge
+    // build takes.
+    assert!(passed(64.0, 63.3, 14.8), "a slow flush that never waited");
+    // Run 41057905038: 156 s, of a flush of at most 63 s, builds of 15 s.
+    assert!(!passed(156.0, 63.3, 14.8), "held up 93 s");
     assert!(!passed(135.0, 2.0, 75.0), "a merge build's length");
-    assert!(
-        !passed(110.0, 63.0, 75.0),
-        "as long as a merge build, however long a flush"
-    );
     assert!(!passed(30.0, 2.0, 75.0), "fifteen flushes' length");
-    assert!(!passed(70.0, 40.0, 60.0), "over the median build alone");
+    // Within twice its own, but held a merge build's length beyond it.
+    assert!(
+        !passed(70.0, 40.0, 20.0),
+        "held 30 s, over the median build"
+    );
     assert_eq!(flush_due_mark(&[], &[1.0], &[1.0])["passed"], json!(false));
     assert_eq!(flush_due_mark(&[1.0], &[1.0], &[])["passed"], json!(false));
 }
