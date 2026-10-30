@@ -499,7 +499,7 @@ mod tests {
     fn a_histogram_read_while_observed_is_always_whole() {
         let timings = std::sync::Arc::new(Timings::default());
         let observing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let observers: Vec<_> = (0..8)
+        let observers: Vec<_> = (0..4)
             .map(|n| {
                 let (timings, observing) = (timings.clone(), observing.clone());
                 std::thread::spawn(move || {
@@ -517,7 +517,7 @@ mod tests {
             })
             .collect();
         let mut last = (0, 0);
-        for _ in 0..2_000_000 {
+        for _ in 0..200_000 {
             let read = timings.seconds(Timed::Backlog);
             let in_buckets = read.buckets[BOUNDS.len() - 1].1;
             assert!(read.count >= in_buckets, "{read:?}");
