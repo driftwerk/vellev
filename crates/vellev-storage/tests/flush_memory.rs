@@ -380,11 +380,12 @@ async fn a_merge_holds_its_vectors_once() {
 /// measured to hold once its rows are gathered, and to within half as it
 /// is planned, from what its run's segments hold (merge note, §7.6 and
 /// §7.7): the node counts what a stopped merge was reckoned to hold as
-/// draining, until it has ended. Over short text and long, text of words
-/// each in one row, over a large vocabulary and a small one, and vectors
-/// clustered or not.
+/// draining, until it has ended. Over short text and long, passages, text
+/// of words each in one row, over a large vocabulary, drawn by rank or
+/// evenly, and a small one, and vectors clustered or not, up to and past
+/// what a build tokenizes at once.
 ///
-/// A dozen merges and more, too slow built for debugging: run optimised,
+/// A score of merges and more, too slow built for debugging: run optimised,
 /// in CI's Test job, as
 /// `cargo test --release -p vellev-storage --test flush_memory -- --ignored`.
 #[tokio::test(flavor = "current_thread")]

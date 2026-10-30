@@ -613,7 +613,7 @@ pub(crate) struct Reckoning {
 
 /// What a merge holds at its peak for each row, and for each byte of each
 /// part of its [`Reckoning`]: fitted to the counting allocator's peaks over
-/// 24 merges, of 4,000 to 200,000 rows, of 8 and 768 dimensions, with short
+/// 25 merges, of 4,000 to 200,000 rows, of 8 and 768 dimensions, with short
 /// text, passages, text of words each found in one row, text over a large
 /// vocabulary and over a small one, and with their vectors clustered, to
 /// within 26% of each (`flush_memory`'s
