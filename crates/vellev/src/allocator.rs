@@ -52,20 +52,21 @@ impl Allocator {
 }
 
 impl Allocator {
-    /// Whether this is the process's global allocator: whether memory the
-    /// process allocates, 4 MiB of it, shows in jemalloc's count. jemalloc
-    /// linked but not the global allocator still counts what it allocates
-    /// for itself, so its count alone does not say. Memory freed elsewhere
-    /// meanwhile can only make this say no, never yes wrongly.
-    pub fn is_global(&self) -> bool {
-        const PROBE: usize = 4 * 1024 * 1024;
-        let Some(before) = self.held() else {
-            return false;
-        };
-        let probe = std::hint::black_box(vec![1u8; PROBE]);
-        let after = self.held();
+    /// Whether this is the process's global allocator: whether 4 MiB this
+    /// thread allocates shows in what jemalloc says this thread has ever
+    /// allocated (`thread.allocatedp`), a count of its own that no other
+    /// thread's allocating or freeing moves. jemalloc linked but not the
+    /// global allocator counts some of its own allocations, so a count of
+    /// the process's as a whole does not say. None if its statistics
+    /// cannot be read at all.
+    pub fn is_global(&self) -> Option<bool> {
+        const PROBE: u64 = 4 * 1024 * 1024;
+        let ever = tikv_jemalloc_ctl::thread::allocatedp::read().ok()?;
+        let before = ever.get();
+        let probe = std::hint::black_box(vec![1u8; PROBE as usize]);
+        let after = ever.get();
         drop(probe);
-        after.is_some_and(|after| after.allocated >= before.allocated + PROBE)
+        Some(after.saturating_sub(before) >= PROBE)
     }
 }
 

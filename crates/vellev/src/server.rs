@@ -204,11 +204,18 @@ impl App {
     /// seen to be ([`Allocator::is_global`]); otherwise none of its counts
     /// are reported, and that is said in the log.
     pub fn running_on(self, allocator: &'static Allocator) -> Self {
-        if !allocator.is_global() {
-            tracing::warn!(
-                "jemalloc is not this process's global allocator: its counts are not reported"
-            );
-            return self;
+        match allocator.is_global() {
+            Some(true) => {}
+            Some(false) => {
+                tracing::warn!(
+                    "jemalloc is not this process's global allocator: its counts are not reported"
+                );
+                return self;
+            }
+            None => {
+                tracing::warn!("jemalloc's statistics cannot be read: its counts are not reported");
+                return self;
+            }
         }
         let memory = Sources {
             allocator: Some(allocator),

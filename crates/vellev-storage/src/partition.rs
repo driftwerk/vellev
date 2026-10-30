@@ -3035,22 +3035,26 @@ impl Writer {
     /// block of rows it comes to, or at once if it waits on the store or the
     /// disk, and leaves nothing behind. One past loading back what it built
     /// commits, or is dropped, as it would have been. A merge begun after
-    /// this is not stopped.
-    pub fn stop_merges(&self) {
+    /// this is not stopped. Returns whether a merge was under way to stop.
+    pub fn stop_merges(&self) -> bool {
         self.merges_stopped.fetch_add(1, Ordering::SeqCst);
-        if let Some(stop) = &*lock(&self.merge_stop) {
+        let under_way = if let Some(stop) = &*lock(&self.merge_stop) {
             // Too late for one past loading back: counted, for tests that
             // tell a stop too late from one not heeded.
             if self.merge_past_loading.load(Ordering::SeqCst) {
                 self.stops_past_loading.fetch_add(1, Ordering::SeqCst);
             }
             stop.stop();
-        }
+            true
+        } else {
+            false
+        };
         // A place kept among those waiting for a turn, or a turn kept for
         // the next merge, is given up: once stopped, so that a merge giving
         // way meanwhile, which keeps its place only unstopped, as it sees
         // under this lock, leaves none behind.
         lock(&self.merge_place).take();
+        under_way
     }
 
     /// Have each merge's build panic from now on, or not. For tests that

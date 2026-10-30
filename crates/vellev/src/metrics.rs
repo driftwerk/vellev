@@ -448,6 +448,13 @@ impl Collector for Counted {
         // for: a sweep lets go only what nothing else holds.
         let census = node.census();
         let holding = census.holding;
+        let age = ConstGauge::new(node.census_age().as_secs_f64());
+        age.encode(encoder.encode_descriptor(
+            "census_age_seconds",
+            "How long ago the last sweep took the census the tenant gauges come from, or since the node started if none has: a sweep that has stopped, and with it the memory budget, shows as this grows",
+            None,
+            age.metric_type(),
+        )?)?;
         let gauge0 = ConstGauge::new(0i64);
         let mut family = encoder.encode_descriptor(
             "tenants_open",
@@ -553,10 +560,17 @@ impl Collector for Counted {
             ConstCounter::new(count).encode(family.encode_family(&[("kind", kind)])?)?;
         }
         let merges = node.merges();
+        let counter = ConstCounter::new(node.tenants_kept_by_sweeps());
+        counter.encode(encoder.encode_descriptor(
+            "sweep_tenants_kept",
+            "Tenants a sweep chose to let go, for being idle or for the memory budget, but found something else holding, as a request or a merge does: let go at a later round",
+            None,
+            counter.metric_type(),
+        )?)?;
         let counter = ConstCounter::new(merges.stopped_for_budget);
         counter.encode(encoder.encode_descriptor(
             "merges_stopped_for_budget",
-            "Merges sweeps stopped so that a tenant over the memory budget, held by something else as it merged, could be let go",
+            "Merges sweeps stopped, each under way when asked, so that a tenant over the memory budget, held by something else as it merged, could be let go",
             None,
             counter.metric_type(),
         )?)?;
