@@ -837,6 +837,13 @@ impl Tenant {
         self.deadline.lock().expect("deadline lock")
     }
 
+    /// When the hold on the tenant runs out unless renewed: each renewal
+    /// moves it on. For tests.
+    #[doc(hidden)]
+    pub fn held_until(&self) -> Instant {
+        *self.deadline()
+    }
+
     fn touch(&self) {
         *self.used.lock().expect("used lock") = Instant::now();
     }

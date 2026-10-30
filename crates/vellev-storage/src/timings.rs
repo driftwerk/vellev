@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 pub enum Holder {
     /// A flush: from before it copies the memtable's rows to its commit.
     Flush,
-    /// A merge planning: from its plan to the end of gathering its rows.
+    /// A merge planning, in moments: its gather comes after, with no lock.
     MergePlan,
     /// A merge committing: its flush along, and its checkpoint.
     MergeCommit,
@@ -60,7 +60,7 @@ impl Holder {
 pub enum MergePhase {
     /// Waiting for a turn among the node's merge builds.
     Turn,
-    /// Gathering the run's live rows (`merged()`), under the building lock.
+    /// Gathering the run's live rows, a chunk at a time with no lock held.
     Gather,
     /// Building the merged segment: indexing and encoding it, without the
     /// lock.

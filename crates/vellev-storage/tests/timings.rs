@@ -293,10 +293,10 @@ async fn each_holder_of_the_building_lock_is_timed_under_its_own_name() {
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Clean)).len(), 1);
 }
 
-/// Rule 5. A merge's gather, under the building lock as it plans, is
-/// timed apart from its build, which holds no lock: with the build held
-/// for a while, the plan's hold and the gather are each short, and the
-/// build takes the while.
+/// Rule 5. A merge's gather, which holds no lock since M4, is timed apart
+/// from its build and from the plan's hold of the building lock: with the
+/// build held for a while, the plan's hold and the gather are each short,
+/// and the build takes the while.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_merges_gather_is_timed_apart_from_its_build() {
     let cluster = Cluster::new().await;
@@ -329,11 +329,7 @@ async fn a_merges_gather_is_timed_apart_from_its_build() {
     );
     assert_eq!(commit.len(), 1, "{events:?}");
     assert!(plan[0] < HELD / 2, "the plan held the lock {:?}", plan[0]);
-    assert!(
-        gather[0] <= plan[0],
-        "the gather {:?} is within the plan",
-        gather[0]
-    );
+    assert!(gather[0] < HELD / 2, "the gather took {:?}", gather[0]);
     assert!(build[0] >= HELD, "the build took {:?}", build[0]);
     for phase in [MergePhase::Turn, MergePhase::Upload, MergePhase::Load] {
         assert_eq!(
