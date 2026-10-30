@@ -1278,6 +1278,18 @@ const RESTORE_WAITS: usize = 3;
 /// memory budget.
 const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
 
+/// The least time between sweeps that uses of tenants ask for (see
+/// `Inner::sweep_soon`). Over the budget every use asks for one, and with
+/// nothing to let go, coalesced, they would run back to back for as long
+/// as uses come, each taking the node's lock twice. A quarter of
+/// [`RESIDENT_AT_LEAST`]: a tenant used within that is kept whatever a
+/// sweep finds, so sweeping more often lets nothing more go, and four
+/// looks a second still answer an open that takes the node over its
+/// budget long before what it holds grows much further. The node's own
+/// sweeps, a second apart at the least, and [`Node::sweep_now`] are not
+/// held to it.
+pub const SWEEPS_SPACED: Duration = Duration::from_millis(250);
+
 /// A tenant written for or copied, as a sweep finds it.
 struct Held {
     id: TenantId,
@@ -1396,6 +1408,13 @@ struct Inner {
     sweep_again: AtomicBool,
     /// How many sweeps have begun.
     sweeps_begun: AtomicU64,
+    /// When the last sweep began: those uses ask for are spaced from it.
+    /// Tokio's time, so that spacing follows `tokio::time::pause()`.
+    last_swept: Mutex<Option<Instant>>,
+    /// One waits to sweep, spaced, not yet holding [`Inner::sweeping`].
+    sweep_queued: AtomicBool,
+    /// The node's own sweep was asked for, not held to [`SWEEPS_SPACED`].
+    sweep_on_time: AtomicBool,
     /// Where a test holds each sweep as it is about to take tenants out.
     sweep_hold: Mutex<Option<Arc<SweepHold>>>,
     /// When the node was made: how old its census is until its first sweep.
@@ -1595,6 +1614,9 @@ impl Node {
             sweeping: Arc::new(tokio::sync::Mutex::new(())),
             sweep_again: AtomicBool::new(false),
             sweeps_begun: AtomicU64::new(0),
+            last_swept: Mutex::new(None),
+            sweep_queued: AtomicBool::new(false),
+            sweep_on_time: AtomicBool::new(false),
             sweep_hold: Mutex::default(),
             started: Instant::now(),
             held_elsewhere: AtomicU64::new(0),
@@ -1737,8 +1759,11 @@ impl Node {
     pub async fn sweep_now(&self) {
         let sweeping = self.0.sweeping.clone().lock_owned().await;
         self.0.sweep().await;
+        drop(sweeping);
         // Any asked for meanwhile, as one that found it running would.
-        self.0.clone().sweeping_while_asked(sweeping).await;
+        if self.0.sweep_again.load(Ordering::SeqCst) {
+            self.0.sweep_soon();
+        }
     }
 
     /// How many local embedding models are loaded, or loading.
@@ -1785,6 +1810,8 @@ impl Node {
                     return;
                 }
                 inner.limits.forget_idle();
+                // Not held to the spacing of those uses ask for.
+                inner.sweep_on_time.store(true, Ordering::SeqCst);
                 inner.sweep_soon();
             }
         });
@@ -2139,6 +2166,7 @@ impl Inner {
     /// against the budget until its work has ended (merge note, §7.7).
     async fn sweep(&self) {
         self.sweeps_begun.fetch_add(1, Ordering::Relaxed);
+        *self.last_swept.lock().expect("last swept lock") = Some(Instant::now());
         let held = self.held_now();
         *self.census.lock().expect("census lock") = Census {
             swept_at: Some(Instant::now()),
@@ -2219,35 +2247,58 @@ impl Inner {
     /// use of a tenant over the budget asks for one, and a sweep can wait
     /// long on a flush or on releasing a lease: queued, they would be one
     /// for each request, each holding the node. At most one runs and one
-    /// waits to.
+    /// waits to, spaced from the last (see [`Self::spaced`]) before it takes
+    /// the lock, so that a sweep the lock is wanted for meanwhile, as
+    /// [`Node::sweep_now`]'s, never waits on the spacing.
     ///
     /// The ask is marked before the lock is tried, and the sweep running
     /// looks for it again once it has let the lock go, so that none is
     /// lost between its last look and its letting go.
     fn sweep_soon(self: &Arc<Self>) {
         self.sweep_again.store(true, Ordering::SeqCst);
-        if let Ok(sweeping) = self.sweeping.clone().try_lock_owned() {
-            tokio::spawn(self.clone().sweeping_while_asked(sweeping));
+        // A sweep running looks for the ask once it has let the lock go.
+        if self.sweeping.try_lock().is_err() {
+            return;
+        }
+        // One waiting to sweep already, which will find the ask.
+        if self.sweep_queued.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let inner = self.clone();
+        tokio::spawn(async move {
+            inner.spaced().await;
+            inner.sweep_queued.store(false, Ordering::SeqCst);
+            // Taken by a sweep meanwhile, which looks for the ask as it
+            // lets the lock go.
+            if let Ok(sweeping) = inner.sweeping.clone().try_lock_owned() {
+                inner.sweeping_while_asked(sweeping).await;
+            }
+        });
+    }
+
+    /// Sweep if a sweep is asked for, holding `sweeping`, and then let it
+    /// go; and ask once more, spaced, if one was asked for as it ran or as
+    /// it was let go.
+    async fn sweeping_while_asked(self: Arc<Self>, sweeping: tokio::sync::OwnedMutexGuard<()>) {
+        if self.sweep_again.swap(false, Ordering::SeqCst) {
+            self.sweep().await;
+        }
+        drop(sweeping);
+        if self.sweep_again.load(Ordering::SeqCst) {
+            self.sweep_soon();
         }
     }
 
-    /// Sweep while a sweep is asked for, holding `sweeping`, and then let
-    /// it go; and once more if one was asked for as it was let go.
-    async fn sweeping_while_asked(self: Arc<Self>, mut sweeping: tokio::sync::OwnedMutexGuard<()>) {
-        loop {
-            while self.sweep_again.swap(false, Ordering::SeqCst) {
-                self.sweep().await;
-            }
-            drop(sweeping);
-            if !self.sweep_again.load(Ordering::SeqCst) {
-                return;
-            }
-            match self.sweeping.clone().try_lock_owned() {
-                Ok(again) => sweeping = again,
-                // Another has it, and sweeps for the ask.
-                Err(_) => return,
-            }
+    /// Wait until [`SWEEPS_SPACED`] has passed since the last sweep began,
+    /// unless the node's own sweep is asked for, and give the worker up
+    /// either way, so that sweeps asked for without let-up never hold it.
+    async fn spaced(&self) {
+        let on_time = self.sweep_on_time.swap(false, Ordering::SeqCst);
+        let last = *self.last_swept.lock().expect("last swept lock");
+        if let Some(last) = last.filter(|_| !on_time) {
+            tokio::time::sleep_until(last + SWEEPS_SPACED).await;
         }
+        tokio::task::yield_now().await;
     }
 
     /// What the tenants and copies held take, read under the node's lock
