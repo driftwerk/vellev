@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # The step 3 bench (merge note, §3 and §9), every arm one after another on
-# this machine, each in a process of its own run as the image runs: uid
-# 10001, no capabilities, the default limits. Linux only.
+# this machine. Each arm is two processes run as the image runs (uid
+# 10001, no capabilities, the default limits), each in a systemd scope of
+# its own where systemd can make one: the node (step3_arm), and the load
+# generator (step3_load), which finds the node through a file the node
+# writes. The node's memory and CPU are then its own. Linux only.
 #
 #   scripts/step3-bench/run.sh FIXTURE OUT DATA [ARMS...]
 #
 # FIXTURE is the bench fixture unpacked (text/, vectors/), as the
 # benchmark workflow unpacks it; OUT gets each arm's JSON and metrics, the
 # machine's description, summary.md and verdict.json; DATA holds each
-# arm's store while it runs, deleted after. ARMS defaults to "a b c d".
+# arm's store while it runs, deleted after. ARMS defaults to "a b c d b2":
+# b2 is (b) run again, its spread from (b) the noise floor.
 # STEP3_* variables pass through to the bench (see crates/vellev/tests/
 # step3_bench.rs); STEP3_SOAK_SECS below 1800 is a smoke, never compared.
 #
@@ -21,7 +25,7 @@ fixture=$(realpath "$1")
 out=$(realpath -m "$2")
 data=$(realpath -m "$3")
 shift 3
-arms=("${@:-a b c d}")
+arms=("${@:-a b c d b2}")
 read -r -a arms <<< "${arms[*]}"
 
 as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
@@ -53,6 +57,11 @@ done
 } > "$out/machine.txt" 2>&1
 steal() { awk '/^cpu /{print $9}' /proc/stat; }
 steal_before=$(steal)
+# The commit the bench is built from, stamped into every arm's reports:
+# arms built from different commits are not compared.
+sha=$(git -C "$(dirname "$0")" rev-parse HEAD)
+if ! git -C "$(dirname "$0")" diff --quiet HEAD; then sha="$sha-dirty"; fi
+echo "## commit: $sha" >> "$out/machine.txt"
 
 # The bench, built once, optimised, as the image is.
 export CARGO_INCREMENTAL=0
@@ -64,25 +73,60 @@ cp "$bin" "$out/step3_bench"
 chmod a+rx "$out/step3_bench"
 as_root chown -R 10001:10001 "$out"
 
-# Each arm: in a cgroup of its own where systemd can make one, so that its
-# memory peak is the arm's; as uid 10001 with no capabilities either way.
+# Whether systemd can make a scope here, so that each process's memory
+# peak and CPU are its own.
+scoped=0
+if command -v systemd-run > /dev/null \
+  && as_root systemd-run --scope --quiet -p MemoryAccounting=yes true 2> /dev/null; then
+  scoped=1
+fi
+echo "## systemd scopes: $scoped" | as_root tee -a "$out/machine.txt" > /dev/null
+
+# One process of an arm, as uid 10001 with no capabilities, in a scope of
+# its own where one can be made, its output to a log of its own (written
+# as root, as the output directory is uid 10001's): started in the
+# background, its pid the caller's $!.
+start() {
+  local name=$1 test=$2 log=$3
+  local envs=(STEP3_ARM="$arm" STEP3_FIXTURE="$fixture" STEP3_OUT="$out" STEP3_DATA="$data"
+              STEP3_AS_IMAGE=1 STEP3_SHA="$sha" STEP3_SCOPE="$scoped" RUST_BACKTRACE=1)
+  local name_value
+  while IFS='=' read -r name_value value; do
+    case "$name_value" in
+      STEP3_ARM|STEP3_FIXTURE|STEP3_OUT|STEP3_DATA|STEP3_AS_IMAGE|STEP3_SHA|STEP3_SCOPE) ;;
+      STEP3_*) envs+=("$name_value=$value") ;;
+    esac
+  done < <(env)
+  local run=(setpriv --reuid=10001 --regid=10001 --clear-groups --inh-caps=-all
+             env -i HOME=/tmp PATH=/usr/bin:/bin "${envs[@]}"
+             "$out/step3_bench" --ignored --exact "$test" --nocapture --test-threads 1)
+  if [ "$scoped" = 1 ]; then
+    run=(systemd-run --scope --quiet --unit="step3-$name-$arm-$$" -p MemoryAccounting=yes
+         "${run[@]}")
+  fi
+  as_root bash -c 'exec "$@" > "$0" 2>&1' "$log" "${run[@]}" &
+}
+
+# Each arm: the node, then its load generator, then both waited for. If
+# either fails, the other is stopped, the arm is said to have failed, and
+# the others still run.
 failed=()
 for arm in "${arms[@]}"; do
   echo "== arm $arm"
-  envs=(STEP3_ARM="$arm" STEP3_FIXTURE="$fixture" STEP3_OUT="$out" STEP3_DATA="$data"
-        STEP3_AS_IMAGE=1 RUST_BACKTRACE=1)
-  while IFS='=' read -r name value; do
-    case "$name" in STEP3_ARM|STEP3_FIXTURE|STEP3_OUT|STEP3_DATA|STEP3_AS_IMAGE) ;;
-      STEP3_*) envs+=("$name=$value") ;; esac
-  done < <(env)
-  run=(setpriv --reuid=10001 --regid=10001 --clear-groups --inh-caps=-all
-       env -i HOME=/tmp PATH=/usr/bin:/bin "${envs[@]}"
-       "$out/step3_bench" --ignored --exact step3_arm --nocapture --test-threads 1)
-  if command -v systemd-run > /dev/null && as_root systemd-run --scope --quiet -p MemoryAccounting=yes true 2> /dev/null; then
-    run=(systemd-run --scope --quiet -p MemoryAccounting=yes "${run[@]}")
+  as_root rm -f "$out/ready-$arm.json" "$out/load-$arm.json" "$out/arm-$arm.json"
+  start node step3_arm "$out/arm-$arm.log"
+  node=$!
+  start load step3_load "$out/load-$arm.log"
+  load=$!
+  ok=1
+  if ! wait -n -p first "$node" "$load"; then
+    ok=0
+    as_root kill "$node" "$load" 2> /dev/null || true
   fi
-  # An arm that fails is said, and the others still run.
-  as_root "${run[@]}" 2>&1 | as_root tee "$out/arm-$arm.log" || failed+=("$arm")
+  if [ "$first" = "$node" ]; then rest=$load; else rest=$node; fi
+  wait "$rest" || ok=0
+  tail -n 30 "$out/arm-$arm.log" "$out/load-$arm.log" || true
+  if [ "$ok" = 0 ]; then failed+=("$arm"); fi
 done
 
 echo "## steal over the run (ticks): $(( $(steal) - steal_before ))" | as_root tee -a "$out/machine.txt"
