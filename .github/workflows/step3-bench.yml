@@ -23,8 +23,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       # A smoke: set to 1800 and 1 to measure (§9.5).
-      STEP3_SOAK_SECS: '120'
-      STEP3_SCALE: '0.05'
+      STEP3_SOAK_SECS: '420'
+      STEP3_SCALE: '0.5'
       ARMS: 'a b c d b2'
     steps:
       - uses: actions/checkout@v5
