@@ -26,9 +26,11 @@ use vellev_node::{Node, NodeError};
 use vellev_storage::coordinator::MAX_RESTORE_WINDOW;
 use vellev_storage::{DEFAULT_CANDIDATES, DEFAULT_OVERSAMPLE, DELETED_AT_MOST};
 
+use crate::allocator::Allocator;
 use crate::api;
 use crate::identity::{Caller, IdentityKeys};
-use crate::metrics::{self, Metrics, Stage};
+use crate::memory::MemoryFiles;
+use crate::metrics::{self, Metrics, Sources, Stage};
 use crate::problem::ApiError;
 use crate::turns::{Turn, Turns};
 
@@ -117,6 +119,8 @@ pub struct App {
     reading: Arc<Turns>,
     /// What the node measures of the requests it answers.
     metrics: Arc<Metrics>,
+    /// Where it reads what memory it really holds.
+    memory: Sources,
     /// For sending a request on to the node that holds its tenant.
     http: reqwest::Client,
 }
@@ -168,8 +172,10 @@ impl App {
     pub fn new(keys: Arc<[String]>, limits: Limits) -> Self {
         let node = Arc::<OnceLock<Arc<Node>>>::default();
         let reading = Turns::new(limits.reads);
+        let memory = Sources::default();
         Self {
-            metrics: Arc::new(Metrics::new(node.clone(), reading.clone())),
+            metrics: Arc::new(Metrics::new(node.clone(), reading.clone(), memory.clone())),
+            memory,
             node,
             stopping: Arc::default(),
             keys,
@@ -192,11 +198,49 @@ impl App {
         }
     }
 
+    /// Report what `allocator`, the one this process runs on, holds: as the
+    /// `vellev` binary does, whose global allocator it is. A process on
+    /// another allocator must not, as jemalloc's counts would say nothing
+    /// of it.
+    pub fn running_on(self, allocator: &'static Allocator) -> Self {
+        let memory = Sources {
+            allocator: Some(allocator),
+            ..self.memory.clone()
+        };
+        self.measuring(memory)
+    }
+
+    /// Read the process's and its cgroup's memory from `files`, in place
+    /// of this process's own.
+    pub fn reading_memory_from(self, files: MemoryFiles) -> Self {
+        let memory = Sources {
+            files,
+            ..self.memory.clone()
+        };
+        self.measuring(memory)
+    }
+
+    /// As this, its measures reading memory from `memory`: made afresh, as
+    /// a node is set up, before anything is measured.
+    fn measuring(self, memory: Sources) -> Self {
+        Self {
+            metrics: Arc::new(Metrics::new(
+                self.node.clone(),
+                self.reading.clone(),
+                memory.clone(),
+            )),
+            memory,
+            ..self
+        }
+    }
+
     /// Serve from `node` from now on, and have it do what a node does of
     /// its own accord: say that it runs, let idle tenants go, back tenants
     /// up and purge those removed. Only the first node given is kept.
     pub fn start(&self, node: Arc<Node>) {
         if self.serve_from(node.clone()) {
+            // Before it opens any tenant, as warming would.
+            self.metrics.started();
             node.announcing();
             node.warming();
             node.sweeping();

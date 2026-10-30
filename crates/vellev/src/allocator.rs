@@ -24,6 +24,39 @@ impl Allocator {
     }
 }
 
+/// What jemalloc holds, as its statistics say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Held {
+    /// Bytes allocated by the process's Rust code and not yet freed. Only
+    /// what goes through this allocator: a library that calls the C
+    /// library's `malloc`, as onnxruntime does for the model, is not in
+    /// it, since jemalloc's names here are prefixed (`_rjem_`).
+    pub allocated: usize,
+    /// Bytes in the pages jemalloc holds resident for it: allocated, its
+    /// own metadata, and freed pages not yet given back.
+    pub resident: usize,
+}
+
+impl Allocator {
+    /// What jemalloc holds now. Its statistics are a snapshot it refreshes
+    /// only when asked, so each read asks first (an `epoch` advance, which
+    /// merges each arena's counts: microseconds, for a scrape, never a
+    /// path a request takes). None if they cannot be read.
+    pub fn held(&self) -> Option<Held> {
+        tikv_jemalloc_ctl::epoch::advance().ok()?;
+        Some(Held {
+            allocated: tikv_jemalloc_ctl::stats::allocated::read().ok()?,
+            resident: tikv_jemalloc_ctl::stats::resident::read().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Debug for Allocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Allocator(jemalloc)")
+    }
+}
+
 impl Default for Allocator {
     fn default() -> Self {
         Self::new()

@@ -1433,6 +1433,21 @@ pub struct Merges {
     pub held_let_go: u64,
 }
 
+/// What this node holds open, and what it reckons that holds in memory:
+/// the figures its memory budget is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Holding {
+    /// Tenants it holds open as their writer.
+    pub writers: usize,
+    /// Tenants it holds open as a copy to read from.
+    pub copies: usize,
+    /// About how many bytes they take in memory together, as
+    /// [`Node::resident`] reckons them.
+    pub resident: usize,
+    /// About how many bytes the one that takes the most takes.
+    pub largest: usize,
+}
+
 /// What this node's tenants hold unflushed, and how their flushes went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flushing {
@@ -1573,6 +1588,27 @@ impl Node {
     /// in memory together.
     pub fn resident(&self) -> usize {
         self.0.held_now().iter().map(|held| held.size).sum()
+    }
+
+    /// What this node holds open and what it reckons that takes in
+    /// memory, all from one look, as [`Self::resident`] reckons it.
+    pub fn holding(&self) -> Holding {
+        let mut holding = Holding::default();
+        for held in self.0.held_now() {
+            match held.kind {
+                Kind::Writer(..) => holding.writers += 1,
+                Kind::Copy(..) => holding.copies += 1,
+            }
+            holding.resident += held.size;
+            holding.largest = holding.largest.max(held.size);
+        }
+        holding
+    }
+
+    /// The memory budget this node holds its tenants to, if it has one:
+    /// see [`Settings::memory`].
+    pub fn memory_budget(&self) -> Option<usize> {
+        self.0.settings.memory
     }
 
     /// The merges this node builds, as memory goes.
