@@ -259,10 +259,23 @@ pub enum Unlinkable {
 
 /// How the head `header` describes is shipped to a store that creates
 /// files of `creates_at_most` bytes at most: inline if the link with its
-/// frame fits [`inline_most`], else spilled. Its `body` is not read.
+/// frame fits `inlined` bytes, held to [`inline_most`] of the store, else
+/// spilled. Its `body` is not read.
+///
+/// A known limit: a checkpoint's header lists every file of the
+/// checkpoint, about 170 bytes each, and is never spilled. One whose
+/// header with its frame spilled is larger than the store creates cannot
+/// be linked: the node stops shipping the run there with an alarm (a stall
+/// of its own store's, [`crate::shipper::Stall::is_local`]), and so does
+/// any node shipping to such a store, for as long as the partition holds
+/// that many files. At a store's 16 MiB a part that is about 98,000
+/// files, where a partition of a hundred million rows has a few hundred. Were stores of far smaller creates to be met, the
+/// list of files could be spilled beside the frame, as a new link
+/// version.
 pub fn shape(
     header: &Header,
     creates_at_most: Option<usize>,
+    inlined: usize,
 ) -> std::result::Result<Body, Unlinkable> {
     let most = creates_at_most.ok_or(Unlinkable::NoCreate)?;
     let link = |body| {
@@ -273,7 +286,7 @@ pub fn shape(
         PREAMBLE + header.encoded().len()
     };
     let size = usize::try_from(header.size).unwrap_or(usize::MAX);
-    if link(Body::Inline).saturating_add(size) <= inline_most(most) {
+    if link(Body::Inline).saturating_add(size) <= inlined.min(inline_most(most)) {
         return Ok(Body::Inline);
     }
     match link(Body::Spilled) {
@@ -533,30 +546,45 @@ mod tests {
         // The link of a 1000-byte frame inline, its exact length.
         let inline_len = encode(&header, Some(&frame)).unwrap().len();
         // A store that creates exactly that much takes it inline.
-        assert_eq!(shape(&header, Some(inline_len)), Ok(Body::Inline));
+        assert_eq!(
+            shape(&header, Some(inline_len), INLINE_MOST),
+            Ok(Body::Inline)
+        );
         // One byte less, and the frame is spilled.
-        assert_eq!(shape(&header, Some(inline_len - 1)), Ok(Body::Spilled));
+        assert_eq!(
+            shape(&header, Some(inline_len - 1), INLINE_MOST),
+            Ok(Body::Spilled)
+        );
         // A store that creates more is held to INLINE_MOST.
         header.size = INLINE_MOST as u64;
-        assert_eq!(shape(&header, Some(16 * 1024 * 1024)), Ok(Body::Spilled));
+        assert_eq!(
+            shape(&header, Some(16 * 1024 * 1024), INLINE_MOST),
+            Ok(Body::Spilled)
+        );
         // A store that creates less than INLINE_MOST holds it to that.
         header.size = 4 * 1024 * 1024;
-        assert_eq!(shape(&header, Some(16 * 1024 * 1024)), Ok(Body::Inline));
-        assert_eq!(shape(&header, Some(4 * 1024 * 1024)), Ok(Body::Spilled));
+        assert_eq!(
+            shape(&header, Some(16 * 1024 * 1024), INLINE_MOST),
+            Ok(Body::Inline)
+        );
+        assert_eq!(
+            shape(&header, Some(4 * 1024 * 1024), INLINE_MOST),
+            Ok(Body::Spilled)
+        );
     }
 
     #[test]
     fn a_store_that_creates_nothing_or_too_little_for_the_header_takes_no_link() {
         let header = manifest_header();
-        assert_eq!(shape(&header, None), Err(Unlinkable::NoCreate));
+        assert_eq!(shape(&header, None, INLINE_MOST), Err(Unlinkable::NoCreate));
         let spilled = Header {
             body: Body::Spilled,
             ..header.clone()
         };
         let bytes = encode(&spilled, None).unwrap().len();
-        assert_eq!(shape(&header, Some(bytes)), Ok(Body::Spilled));
+        assert_eq!(shape(&header, Some(bytes), INLINE_MOST), Ok(Body::Spilled));
         assert_eq!(
-            shape(&header, Some(bytes - 1)),
+            shape(&header, Some(bytes - 1), INLINE_MOST),
             Err(Unlinkable::HeaderTooLarge {
                 bytes,
                 most: bytes - 1

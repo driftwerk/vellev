@@ -73,10 +73,18 @@ use vellev_storage::{Batch, Embedded, Live, Merging, Outcome, Transfers};
 
 const COLLECTION: &str = "sim";
 
-/// The most bytes the backup store of a shipping history creates a file
-/// of: so that some frames go inline and some spill, a large write's log
-/// among them, and every link's header fits.
+/// The most bytes a link with its frame inline is, in a shipping history:
+/// so that some frames go inline and some spill, a large write's log among
+/// them.
 const SPILL_ABOVE: usize = 4096;
+
+/// The most bytes the backup store of a shipping history creates a file
+/// of: past the largest header any history can make (see
+/// `the_largest_header_a_shipping_history_can_make_fits_its_store`), so
+/// that every link can be made. Apart from [`SPILL_ABOVE`]: a store that
+/// creates no more than the inline limit fits no checkpoint header of a
+/// partition of a few segments (nightly runs 40657750514, 41027977632).
+const HEADERS_FIT: usize = 1024 * 1024;
 
 /// The lineage and the cluster the partition's history is shipped as.
 const LINEAGE: Lineage = Lineage(uuid::Uuid::from_u128(0x6681));
@@ -2661,7 +2669,10 @@ impl World {
     fn shipper(&mut self) -> Shipper {
         let (blobs, backup) = (self.blobs.clone(), self.backup.clone());
         let (coordinator, key) = (self.coordinator.clone(), self.cluster.key.clone());
-        let made = || Shipper::new(blobs, backup, coordinator, key, LINEAGE, CLUSTER);
+        let made = || {
+            Shipper::new(blobs, backup, coordinator, key, LINEAGE, CLUSTER)
+                .inlining_at_most(SPILL_ABOVE)
+        };
         self.node_shipper.get_or_insert_with(made).clone()
     }
 
@@ -2988,14 +2999,17 @@ impl World {
                 fences: self.stale_fences.clone(),
                 window: self.stale_window.clone(),
             };
-            self.stale_shipper = Some(Shipper::new(
-                self.blobs.clone(),
-                self.backup.clone(),
-                Arc::new(view),
-                self.cluster.key.clone(),
-                LINEAGE,
-                CLUSTER,
-            ));
+            self.stale_shipper = Some(
+                Shipper::new(
+                    self.blobs.clone(),
+                    self.backup.clone(),
+                    Arc::new(view),
+                    self.cluster.key.clone(),
+                    LINEAGE,
+                    CLUSTER,
+                )
+                .inlining_at_most(SPILL_ABOVE),
+            );
         }
         self.node_shipper = None;
         // Waiting out the lease moves the coordinator's clock, and the
@@ -4805,7 +4819,7 @@ fn shipping_histories() -> impl Strategy<Value = (Clocks, Vec<Action>)> {
     let part = prop_oneof![3 => action(), 2 => shipping_action()];
     let actions = prop::collection::vec(part, 1..60).prop_map(|actions| {
         let mut history = vec![
-            Action::BackupCreatesAtMost(SPILL_ABOVE),
+            Action::BackupCreatesAtMost(HEADERS_FIT),
             written(),
             Action::BeginShipping,
         ];
@@ -7173,4 +7187,471 @@ fn a_put_delayed_lands_only_when_delivered_over_whatever_is_there() {
         store.deliver_delayed().await;
         assert_eq!(store.get("frame").await.unwrap(), "A");
     });
+}
+
+/// Nightly run 41027977632's minimal history: at step 17, a checkpoint at position 19 whose header is 4104 bytes, shipped to a store that creates 4096.
+fn nightly_header_of_4104_bytes() -> (Clocks, Vec<Action>) {
+    use Action::*;
+    #[allow(unused_imports)]
+    use Who::*;
+    (
+        Clocks {
+            coordinator: 0,
+            node: -1,
+        },
+        vec![
+            BackupCreatesAtMost(4096),
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            BeginShipping,
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            Flush { who: Current },
+            Write {
+                who: Current,
+                rows: 40,
+                delete: None,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            BeginShipping,
+            Flush { who: Current },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Flush { who: Current },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Ship(5),
+            Flush { who: Current },
+            Ship(2),
+        ],
+    )
+}
+
+/// Nightly run 40657750514's minimal history: at step 22, a checkpoint at position 23 whose header is 4103 bytes, shipped to a store that creates 4096.
+fn nightly_header_of_4103_bytes() -> (Clocks, Vec<Action>) {
+    use Action::*;
+    #[allow(unused_imports)]
+    use Who::*;
+    (
+        Clocks {
+            coordinator: 0,
+            node: -1,
+        },
+        vec![
+            BackupCreatesAtMost(4096),
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            BeginShipping,
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            Flush { who: Current },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Takeover,
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            BeginShipping,
+            FailCommits(CommitFault::Refuse, 1),
+            Ship(1),
+            FailRecord(RecordFault::Refuse),
+            Ship(1),
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            Ship(2),
+        ],
+    )
+}
+
+/// Nightly run 40469842448's minimal history: a stale shipper, after the rows it last saw were forgotten, linked the link at 8 on 6, not 7.
+fn nightly_stale_link_at_8() -> (Clocks, Vec<Action>) {
+    use Action::*;
+    #[allow(unused_imports)]
+    use Who::*;
+    (
+        Clocks {
+            coordinator: 0,
+            node: 0,
+        },
+        vec![
+            BackupCreatesAtMost(4096),
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            BeginShipping,
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            FailRecord(RecordFault::Refuse),
+            Flush { who: Current },
+            BeginShipping,
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            Ship(2),
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Takeover,
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Ship(1),
+            ForgetHistory,
+            ShipStale(1),
+        ],
+    )
+}
+
+/// Nightly run 40288101802's minimal history: a stale shipper, after the rows it last saw were forgotten, linked the link at 6 on 3, not 5.
+fn nightly_stale_link_at_6() -> (Clocks, Vec<Action>) {
+    use Action::*;
+    #[allow(unused_imports)]
+    use Who::*;
+    (
+        Clocks {
+            coordinator: 0,
+            node: -1,
+        },
+        vec![
+            BackupCreatesAtMost(4096),
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            BeginShipping,
+            WriteBesideFlush {
+                who: Current,
+                rows: 1,
+                delete: None,
+                first: false,
+            },
+            BeginShipping,
+            Ship(1),
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Flush { who: Current },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            Takeover,
+            FailRecord(RecordFault::Refuse),
+            Write {
+                who: Current,
+                rows: 1,
+                delete: None,
+            },
+            ShipStale(2),
+            ForgetHistory,
+            ShipStale(1),
+        ],
+    )
+}
+
+/// The nightly histories whose checkpoint headers outgrew a store that
+/// creates no more than the inline limit, at the store a shipping history
+/// now has: every link is made, nothing stalls, and frames still spill
+/// past the inline limit.
+#[test]
+fn the_nightly_histories_of_an_outgrown_header_ship_whole_where_headers_fit() {
+    for (name, (clocks, mut actions)) in [
+        ("4104", nightly_header_of_4104_bytes()),
+        ("4103", nightly_header_of_4103_bytes()),
+    ] {
+        assert!(
+            matches!(actions[0], Action::BackupCreatesAtMost(4096)),
+            "{name}"
+        );
+        actions[0] = Action::BackupCreatesAtMost(HEADERS_FIT);
+        let made = run_on((clocks, actions), None).unwrap_or_else(|v| panic!("{name}: {v}"));
+        assert!(
+            made.spilled + made.spilled_logs >= 1,
+            "{name}: nothing spilled: {made:?}"
+        );
+    }
+}
+
+/// The keys of the checkpoint files a world's backup store holds.
+async fn copied(world: &World) -> BTreeSet<String> {
+    let listed = world.backup.clean.list("_backups/").await.unwrap();
+    let keys = listed.into_iter().map(|file| file.key);
+    keys.filter(|key| key.contains("/files/")).collect()
+}
+
+/// The same histories at a store that creates no more than the inline
+/// limit: the checkpoint whose header the store cannot take stops this
+/// node's shipping there, said so to the byte, with nothing shipped past
+/// it. The run itself is not stalled: the reason is the node's own store,
+/// and another node may ship it.
+#[test]
+fn an_outgrown_header_stops_this_nodes_shipping_there() {
+    for (name, (clocks, actions), at, bytes) in [
+        ("4104", nightly_header_of_4104_bytes(), 19, 4104),
+        ("4103", nightly_header_of_4103_bytes(), 23, 4103),
+    ] {
+        paused().block_on(async {
+            let (last, before) = actions.split_last().unwrap();
+            assert!(matches!(last, Action::Ship(_)), "{name}");
+            let mut world = World::with_clocks(None, clocks).await;
+            for action in before {
+                world.step(action.clone()).await.unwrap();
+                world.verify().await.unwrap();
+            }
+            world.step(last.clone()).await.unwrap();
+            let position = LogPosition(at);
+            let why = format!("its header is {bytes} bytes; the store creates 4096 at most");
+            assert_eq!(
+                world.stalls,
+                vec![Stall::NotCreated { position, why }],
+                "{name}"
+            );
+            let key = world.cluster.key.clone();
+            let shipping = world.coordinator.shipping(&key).await.unwrap();
+            assert!(
+                shipping.stalled.is_none(),
+                "{name}: the run is stalled: {shipping:?}"
+            );
+            assert!(
+                shipping.shipped.is_none_or(|shipped| shipped < position),
+                "{name}: shipped past it: {shipping:?}"
+            );
+        });
+    }
+}
+
+/// At a store far smaller than a checkpoint's header, whatever its files'
+/// sizes come to, the checkpoint stops this node's shipping before any of
+/// its files is copied, for nothing.
+#[test]
+fn a_header_that_cannot_fit_whatever_its_files_copies_none_of_them() {
+    for (name, (clocks, mut actions)) in [
+        ("4104", nightly_header_of_4104_bytes()),
+        ("4103", nightly_header_of_4103_bytes()),
+    ] {
+        actions[0] = Action::BackupCreatesAtMost(2048);
+        paused().block_on(async {
+            let mut world = World::with_clocks(None, clocks).await;
+            let mut stopped = 0;
+            for action in actions {
+                let before = (copied(&world).await, world.stalls.len());
+                world.step(action).await.unwrap();
+                for stall in &world.stalls[before.1..] {
+                    let Stall::NotCreated { why, .. } = stall else {
+                        panic!("{name}: {stall:?}");
+                    };
+                    assert!(why.starts_with("its header is at least"), "{name}: {why}");
+                    assert_eq!(copied(&world).await, before.0, "{name}: copied for nothing");
+                    stopped += 1;
+                }
+            }
+            assert!(stopped > 0, "{name}: no checkpoint outgrew the store");
+        });
+    }
+}
+
+/// The nightly histories in which a stale shipper linked a checkpoint on
+/// a commit before the one just before it: shipped as committed now, and
+/// caught with the stale run's read unfenced again (fae162e).
+#[test]
+fn the_nightly_histories_of_a_stale_link_ship_as_committed_and_catch_it_unfenced() {
+    for (name, history, caught) in [
+        (
+            "8 on 6",
+            nightly_stale_link_at_8(),
+            "the link at LogPosition(8) is made on LogPosition(6), and the commit just before it is Some(LogPosition(7))",
+        ),
+        (
+            "6 on 3",
+            nightly_stale_link_at_6(),
+            "the link at LogPosition(6) is made on LogPosition(3), and the commit just before it is Some(LogPosition(5))",
+        ),
+    ] {
+        run_on(history.clone(), None).unwrap_or_else(|v| panic!("{name}: {v}"));
+        let found = run_on(history, Some(Canary::StaleRunReads)).unwrap_err();
+        assert!(found.contains(caught), "{name}: {found}");
+    }
+}
+
+/// The largest checkpoint header a shipping history can make fits the
+/// store it ships to: a partition of two segments for each of the most
+/// actions a history has, each with its segment, index and vectors files
+/// at the longest key and size there are.
+#[test]
+fn the_largest_header_a_shipping_history_can_make_fits_its_store() {
+    let most_actions = 3 + 60;
+    let files = 2 * most_actions * 3;
+    let key = |n: usize| {
+        format!(
+            "tenant-of-a-long-name/65535/segment/{:020}-{:020}-{}-{:016x}-merged.vectors",
+            u64::MAX,
+            u64::MAX,
+            "f".repeat(32),
+            n
+        )
+    };
+    let header = Header {
+        tenant: TenantId::new("tenant-of-a-long-name").unwrap(),
+        lineage: LINEAGE,
+        cluster: CLUSTER,
+        incarnation: Incarnation(u64::MAX),
+        partition: vellev_core::Partition(u32::MAX),
+        position: LogPosition(u64::MAX),
+        key: key(0),
+        head: Shipped::Manifest,
+        generation: Generation(u64::MAX),
+        committed_at: chrono::DateTime::<chrono::Utc>::MAX_UTC,
+        sum: Sum("f".repeat(64)),
+        size: u64::MAX,
+        before: None,
+        files: (0..files)
+            .map(|n| link::Needed {
+                key: key(n),
+                size: u64::MAX,
+                sum: Sum("f".repeat(64)),
+            })
+            .collect(),
+        body: link::Body::Spilled,
+    };
+    assert_eq!(
+        link::shape(&header, Some(HEADERS_FIT), SPILL_ABOVE),
+        Ok(link::Body::Spilled)
+    );
+    // Where a store that creates only what goes inline does not.
+    assert!(link::shape(&header, Some(SPILL_ABOVE), SPILL_ABOVE).is_err());
 }
