@@ -587,11 +587,10 @@ fn segment_bytes(rows: &[Row], vectors: &Column) -> usize {
 
 /// What a merge holds at its peak, reckoned by part (merge note, §7.7):
 /// what it gathers, its rows and their vectors; what its text and filter
-/// indexes come to hold as they are built, and its rows tokenized all at
-/// once before they are; and what training a clustered index holds. Each
-/// part is what the run's segments hold of it, their live rows' share,
-/// as they are planned; the rows and vectors are what was gathered once
-/// they are.
+/// indexes come to hold as they are built; its rows' tokens, a chunk's at a
+/// time; and what training a clustered index holds. Each part is what the
+/// run's segments hold of it, their live rows' share, as they are planned;
+/// the rows and vectors are what was gathered once they are.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Reckoning {
     /// How many rows.
@@ -600,8 +599,11 @@ pub(crate) struct Reckoning {
     pub rows: f64,
     /// Their vectors.
     pub vectors: f64,
-    /// Their text indexed, and tokenized all at once.
-    pub text: f64,
+    /// Their text indexed.
+    pub text_index: f64,
+    /// Their text tokenized, every row's, of which a chunk's is held at
+    /// once.
+    pub tokenized: f64,
     /// Their filterable values indexed.
     pub filters: f64,
     /// What training each clustered index holds: its sample, rotated, its
@@ -611,17 +613,16 @@ pub(crate) struct Reckoning {
 
 /// What a merge holds at its peak for each row, and for each byte of each
 /// part of its [`Reckoning`]: fitted to the counting allocator's peaks over
-/// eleven merges, of 4,000 to 20,000 rows, of 8 and 768 dimensions, with
-/// short text, text of words each found in one row, text over a large
+/// 24 merges, of 4,000 to 200,000 rows, of 8 and 768 dimensions, with short
+/// text, passages, text of words each found in one row, text over a large
 /// vocabulary and over a small one, and with their vectors clustered, to
-/// within 15% of each (`flush_memory`'s
+/// within a quarter of each (`flush_memory`'s
 /// `a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent`,
 /// which holds the reckoning to within 30%).
 ///
 /// What a row holds besides its parts: its place in the maps a merge
-/// builds of the rows it keeps, its tokenized text's own vectors, and the
-/// like.
-const EACH_ROW: f64 = 700.0;
+/// builds of the rows it keeps, and the like.
+const EACH_ROW: f64 = 900.0;
 /// The copy gathered, and the segment encoded from it.
 const ROWS_AT_PEAK: f64 = 1.75;
 /// The frame they are gathered into, which is the column and the file
@@ -631,17 +632,26 @@ const ROWS_AT_PEAK: f64 = 1.75;
 /// rows, so a merge far larger is reckoned up to about a fifth over on its
 /// vectors: more counted as draining than there is, not less.
 const VECTORS_AT_PEAK: f64 = 1.3;
-const TEXT_AT_PEAK: f64 = 0.9;
+/// Its text index, or a chunk's tokens, whichever comes to more, never the
+/// two together: each row's tokens go as they are indexed, those new to the
+/// index into it, so that a merge's tokens are at their most before its
+/// index has grown, and the index at its largest once they have gone.
+/// The index's maps and postings grown beyond what they keep count for the
+/// fraction over one.
+const TEXT_AT_PEAK: f64 = 1.05;
+const TOKENIZED_AT_PEAK: f64 = 1.0;
 const FILTERS_AT_PEAK: f64 = 1.0;
 const TRAINING_AT_PEAK: f64 = 0.8;
 
 impl Reckoning {
     /// About how many bytes the merge holds at its peak.
     pub(crate) fn peak(&self) -> usize {
+        let chunk = (TOKENIZED_AT_ONCE as f64 / self.count).min(1.0);
+        let text = (self.text_index * TEXT_AT_PEAK).max(self.tokenized * chunk * TOKENIZED_AT_PEAK);
         (self.count * EACH_ROW
             + self.rows * ROWS_AT_PEAK
             + self.vectors * VECTORS_AT_PEAK
-            + self.text * TEXT_AT_PEAK
+            + text
             + self.filters * FILTERS_AT_PEAK
             + self.training * TRAINING_AT_PEAK) as usize
     }
@@ -668,8 +678,11 @@ pub(crate) struct Parts {
     count: usize,
     /// Its rows, as [`copied_bytes`] counts them.
     copied: usize,
-    /// Its text indexed, and its rows tokenized all at once.
-    text: usize,
+    /// Its text indexed.
+    text_index: usize,
+    /// Its rows' text tokenized, every row's, as [`TextIndex::tokenize`]
+    /// gives it before it is indexed.
+    tokenized: usize,
     /// Its filterable values indexed.
     filters: usize,
     /// How many of its rows each collection has.
@@ -680,16 +693,18 @@ impl Parts {
     /// Of a segment of `file`'s rows, indexed as `indexes`. A walk over
     /// every row, token and value.
     pub(crate) fn of(file: &SegmentFile, indexes: &Indexes) -> Self {
-        let (mut text, mut filters, mut collections) = (0, 0, Vec::new());
+        let (mut text_index, mut tokenized, mut filters, mut collections) = (0, 0, 0, Vec::new());
         for (collection, index) in indexes {
-            text += index.text.resident() + index.text.tokenized_resident();
+            text_index += index.text.resident();
+            tokenized += index.text.tokenized_resident();
             filters += index.rows.resident();
             collections.push((*collection, index.rows.rows().len() as usize));
         }
         Self {
             count: file.rows.len(),
             copied: file.rows.iter().map(copied_bytes).sum(),
-            text,
+            text_index,
+            tokenized,
             filters,
             collections,
         }
@@ -2219,7 +2234,8 @@ impl State {
             reckoning.count += (parts.count - segment.dead.count()) as f64;
             reckoning.rows += parts.copied as f64 * live;
             reckoning.vectors += segment.vectors.bytes() as f64 * live;
-            reckoning.text += parts.text as f64 * live;
+            reckoning.text_index += parts.text_index as f64 * live;
+            reckoning.tokenized += parts.tokenized as f64 * live;
             reckoning.filters += parts.filters as f64 * live;
             for (collection, rows) in &parts.collections {
                 *rows_of.entry(*collection).or_default() += *rows as f64 * live;

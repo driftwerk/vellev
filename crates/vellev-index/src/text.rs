@@ -268,10 +268,10 @@ impl TextIndex {
             .sum()
     }
 
-    /// About how many bytes the index's rows take tokenized all at once,
-    /// as [`Self::tokenize`] gives them before they are indexed: for every
-    /// token a row holds, the token and how often it occurs. Rough, and a
-    /// walk over every token.
+    /// About how many bytes the index's rows take tokenized, every one of
+    /// them, as [`Self::tokenize`] gives them before they are indexed: for
+    /// every token a row holds, the token and how often it occurs. Rough,
+    /// and a walk over every token.
     pub fn tokenized_resident(&self) -> usize {
         const HELD: usize = std::mem::size_of::<(String, u32)>();
         self.fields
