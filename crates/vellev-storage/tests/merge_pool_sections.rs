@@ -62,8 +62,8 @@ async fn a_clustered_merges_sections_run_on_its_pool_and_a_flushs_never_do() {
     let (merges, flushes): (Vec<&SectionRan>, Vec<&SectionRan>) =
         ran_on.iter().partition(|ran| ran.merge);
     assert!(!flushes.is_empty(), "{ran_on:?}");
-    assert!(!flushes.iter().any(|ran| on_pool(ran)), "{ran_on:?}");
-    assert!(merges.iter().all(|ran| on_pool(&ran)), "{ran_on:?}");
+    assert!(!flushes.iter().any(on_pool), "{ran_on:?}");
+    assert!(merges.iter().all(on_pool), "{ran_on:?}");
     for section in [
         "tokenizing",
         "indexing",
