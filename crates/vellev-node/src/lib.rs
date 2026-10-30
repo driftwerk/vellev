@@ -267,10 +267,32 @@ pub enum MergePool {
     /// process's priority.
     #[default]
     Global,
-    /// A pool of their own of `threads` threads, each run `nice` lower than
-    /// the rest of the process, on Linux; 0 runs them as it does. A build's
-    /// clustered indexes tune on the one tuning thread whatever this says.
+    /// A pool of their own of `threads` threads, at least one, each run
+    /// `nice` lower than the rest of the process, on Linux, from 0, which
+    /// runs them as it does, to 19, as [`Settings::check`] makes sure. A
+    /// build's clustered indexes tune on the one tuning thread whatever
+    /// this says.
     Own { threads: usize, nice: i32 },
+}
+
+impl MergePool {
+    /// Why a node cannot build its merges on this pool, if it cannot: one
+    /// of no threads builds nothing, and a nice outside 0 to 19 is either
+    /// a priority above the process's, which a merge never needs and the
+    /// image's user may not take, or below the lowest there is.
+    pub fn problem(&self) -> Option<String> {
+        match *self {
+            MergePool::Global => None,
+            MergePool::Own { threads: 0, .. } => {
+                Some("a merge pool of no threads would build no merge".into())
+            }
+            MergePool::Own { nice, .. } if !(0..=19).contains(&nice) => Some(format!(
+                "a nice of {nice} for the merge pool is outside 0 to 19: a merge pool runs \
+                 at the process's priority or lower, never higher"
+            )),
+            MergePool::Own { .. } => None,
+        }
+    }
 }
 
 /// The tenants a node serves.
@@ -343,6 +365,7 @@ impl Settings {
             .grace_problem(self.grace)
             .or_else(|| self.request_bounds.claim_problem(self.backup_claim))
             .or_else(|| self.backlog_problem())
+            .or_else(|| self.merge_pool.problem())
             .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
     }
 

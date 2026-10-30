@@ -4132,6 +4132,46 @@ fn a_grace_below_fifteen_minutes_or_three_requests_to_the_store_is_refused() {
     assert!(!refused.contains("backup claim"), "{refused}");
 }
 
+/// A merge pool of no threads could build nothing, and one at a negative
+/// nice would ask for a priority above the process's, which the image's
+/// user may not take and which a merge never needs (merge note, §3): both
+/// are refused by the settings' check, saying why, not left to panic as
+/// the node starts. From 0 to 19, the whole range of a lower priority, a
+/// pool of a thread or more is let through.
+#[test]
+fn a_merge_pool_of_no_threads_or_a_higher_priority_is_refused() {
+    use vellev_node::MergePool;
+    let pooled = |merge_pool| {
+        Settings {
+            merge_pool,
+            ..Settings::new(NodeId::generate("node"))
+        }
+        .check()
+    };
+    let refusal = |checked: Result<(), NodeError>| match checked {
+        Err(NodeError::Settings(problem)) => problem,
+        other => panic!("not refused for its settings: {other:?}"),
+    };
+    pooled(MergePool::Global).unwrap();
+    for (threads, nice) in [(1, 0), (2, 5), (16, 10), (1, 19)] {
+        pooled(MergePool::Own { threads, nice }).unwrap();
+    }
+    let refused = refusal(pooled(MergePool::Own {
+        threads: 0,
+        nice: 0,
+    }));
+    assert!(refused.contains("a merge pool of no threads"), "{refused}");
+    for nice in [-1, -20] {
+        let refused = refusal(pooled(MergePool::Own { threads: 2, nice }));
+        assert!(refused.contains(&format!("a nice of {nice}")), "{refused}");
+    }
+    let refused = refusal(pooled(MergePool::Own {
+        threads: 2,
+        nice: 20,
+    }));
+    assert!(refused.contains("a nice of 20"), "{refused}");
+}
+
 #[test]
 fn a_backup_claim_must_outlast_a_request_and_leave_time_to_renew_it() {
     let seconds = Duration::from_secs;
