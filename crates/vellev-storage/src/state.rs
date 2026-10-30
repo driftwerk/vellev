@@ -20,6 +20,7 @@ use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
     SegmentMeta,
 };
+use crate::merge_builds::OnPool;
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
 
@@ -1008,6 +1009,7 @@ impl Snapshot {
 /// there will be. An index built under an older catalog stays right: a
 /// property never changes once added, and neither a property nor a
 /// collection added since has anything in an older layer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn indexed<'a>(
     catalog: &Catalog,
     rows: &'a [Row],
@@ -1016,6 +1018,7 @@ pub(crate) fn indexed<'a>(
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
     stopping: &Stopping,
+    on: OnPool<'_>,
 ) -> Option<Indexes> {
     indexed_stopping(
         catalog,
@@ -1025,6 +1028,7 @@ pub(crate) fn indexed<'a>(
         unused,
         clustered_above,
         stopping,
+        on,
     )
     .map(|(indexes, _)| indexes)
 }
@@ -1050,6 +1054,7 @@ pub(crate) fn indexed_on<'a>(
         unused,
         clustered_above,
         &never,
+        OnPool::global(),
     ) {
         Some(indexed) => indexed,
         None => unreachable!("indexing nothing stops is never stopped"),
@@ -1073,65 +1078,70 @@ pub(crate) fn indexed_stopping<'a>(
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
     stopping: &Stopping,
+    on: OnPool<'_>,
 ) -> Option<(Indexes, usize)> {
     use rayon::prelude::*;
     let threads = Threads::default();
     let asked = |row: usize| {
         row.is_multiple_of(ROWS_BETWEEN_ASKING) && stopping.stopped(MergeStage::Indexing)
     };
-    let tokenized: Vec<Option<Tokenized>> = rows
-        .par_iter()
-        .map(|Row { collection, object }| {
-            if stopping.stopped(MergeStage::Indexing) {
-                return None;
-            }
-            let schema = catalog.schema(*collection)?;
-            Some(threads.on(|| TextIndex::tokenize(schema, object)))
-        })
-        .collect();
+    let tokenized: Vec<Option<Tokenized>> = on.section(|| {
+        rows.par_iter()
+            .map(|Row { collection, object }| {
+                if stopping.stopped(MergeStage::Indexing) {
+                    return None;
+                }
+                let schema = catalog.schema(*collection)?;
+                Some(threads.on(|| TextIndex::tokenize(schema, object)))
+            })
+            .collect()
+    });
     if stopping.is_stopped() {
         return None;
     }
     // The filterable values and vectors on one thread, the text on
     // another: each in row order, as indexing each row in turn makes them.
-    let ((mut indexes, vectors), texts) = rayon::join(
-        || {
-            let mut indexes = Indexes::new();
-            let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
-            for (row, Row { collection, object }) in rows.iter().enumerate() {
-                if asked(row) {
-                    break;
-                }
-                if let Some(schema) = catalog.schema(*collection) {
-                    let index = indexes.entry(*collection).or_default();
-                    index.rows.insert(schema, row as u32, object);
-                    if let Some(vector) = vector_of(row) {
-                        vectors
-                            .entry(*collection)
-                            .or_default()
-                            .push((row as u32, vector));
+    let ((mut indexes, vectors), texts) = on.section(|| {
+        rayon::join(
+            || {
+                let mut indexes = Indexes::new();
+                let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
+                for (row, Row { collection, object }) in rows.iter().enumerate() {
+                    if asked(row) {
+                        break;
+                    }
+                    if let Some(schema) = catalog.schema(*collection) {
+                        let index = indexes.entry(*collection).or_default();
+                        index.rows.insert(schema, row as u32, object);
+                        if let Some(vector) = vector_of(row) {
+                            vectors
+                                .entry(*collection)
+                                .or_default()
+                                .push((row as u32, vector));
+                        }
                     }
                 }
-            }
-            (indexes, vectors)
-        },
-        || {
-            let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
-            for ((row, Row { collection, .. }), tokenized) in rows.iter().enumerate().zip(tokenized)
-            {
-                if asked(row) {
-                    break;
+                (indexes, vectors)
+            },
+            || {
+                let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
+                for ((row, Row { collection, .. }), tokenized) in
+                    rows.iter().enumerate().zip(tokenized)
+                {
+                    if asked(row) {
+                        break;
+                    }
+                    if let Some(tokenized) = tokenized {
+                        texts
+                            .entry(*collection)
+                            .or_default()
+                            .insert_tokenized(row as u32, tokenized);
+                    }
                 }
-                if let Some(tokenized) = tokenized {
-                    texts
-                        .entry(*collection)
-                        .or_default()
-                        .insert_tokenized(row as u32, tokenized);
-                }
-            }
-            texts
-        },
-    );
+                texts
+            },
+        )
+    });
     if stopping.is_stopped() {
         return None;
     }
@@ -1155,11 +1165,12 @@ pub(crate) fn indexed_stopping<'a>(
             None if clustered_above
                 .is_some_and(|above| vectors.len() > above.max(SHORTLIST_ABOVE)) =>
             {
-                ClusteredIndex::build_stopping(schema.distance, vectors, stop)
+                on.section(|| ClusteredIndex::build_stopping(schema.distance, vectors, stop))
                     .ok()?
                     .map(|clustered| Vectors::Clustered(Arc::new(clustered)))
             }
-            None => BinaryIndex::build_stopping(schema.distance, vectors, stop)
+            None => on
+                .section(|| BinaryIndex::build_stopping(schema.distance, vectors, stop))
                 .ok()?
                 .map(Vectors::Binary),
         };

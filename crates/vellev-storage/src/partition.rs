@@ -27,7 +27,7 @@ use crate::format::{
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
 use crate::merge_builds::{
-    MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
+    MergeBuild, MergeBuilds, OnPool, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::published::Published;
@@ -61,6 +61,35 @@ const CLEANING_AT_ONCE: usize = 16;
 /// that waits for it can well wait.
 const CLEANING_WITHIN: Duration = Duration::from_secs(60);
 
+std::thread_local! {
+    /// How many builds this thread is in: more than one is a build nested
+    /// in another's, as a pool's thread waiting in a section takes on
+    /// whatever else is queued (review of #169).
+    static BUILDS_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A build entered on this thread, left as this is dropped; one entered
+/// inside another is counted among its merge builds' nested ones.
+struct Nesting;
+
+impl Nesting {
+    fn entered(build: Option<&MergeBuild>) -> Self {
+        let depth = BUILDS_HERE.with(|here| here.replace(here.get() + 1));
+        if depth > 0 {
+            if let Some(build) = build {
+                build.builds().nested_here();
+            }
+        }
+        Nesting
+    }
+}
+
+impl Drop for Nesting {
+    fn drop(&mut self) {
+        BUILDS_HERE.with(|here| here.set(here.get() - 1));
+    }
+}
+
 /// A segment built and ready to write: its file without the rows'
 /// vectors, which the column holds, its indexes, and the frames of the
 /// file and the column.
@@ -91,15 +120,16 @@ fn segment_built(
     build: Option<&MergeBuild>,
     above: Option<usize>,
     format: u16,
+    on: OnPool<'_>,
 ) -> Result<Option<Built>> {
     let _turn = turn;
+    let _building = Nesting::entered(build);
     // Before the rows it was given are bound below it, as parameters are
     // dropped after locals: so that it is dropped last of all the build
     // holds, the rows gathered among them, however the build ends.
     let probe = build.and_then(MergeBuild::probe);
     let mut file = file;
     if let Some(build) = build {
-        build.builds().ran_here();
         build.held_here(stopping, false);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
@@ -113,6 +143,7 @@ fn segment_built(
             |_, _| {},
             above,
             stopping,
+            on,
         ),
         None => state::indexed(
             catalog,
@@ -122,6 +153,7 @@ fn segment_built(
             |_, _| {},
             above,
             stopping,
+            on,
         ),
     };
     let Some(indexes) = indexes else {
@@ -1187,6 +1219,9 @@ struct Building<'a> {
     holder: Holder,
     since: Instant,
     writer: &'a Writer,
+    /// Whether its hold is timed as it is let go: not when it built
+    /// nothing, as a flush with nothing to flush.
+    timed: bool,
 }
 
 impl Building<'_> {
@@ -1194,12 +1229,19 @@ impl Building<'_> {
     fn held(&self) -> Duration {
         self.since.elapsed()
     }
+
+    /// It built nothing: its hold is not timed as one of its holder's.
+    fn built_nothing(&mut self) {
+        self.timed = false;
+    }
 }
 
 impl Drop for Building<'_> {
     fn drop(&mut self) {
-        let held = self.since.elapsed();
-        self.writer.timed(Timed::BuildingHeld(self.holder), held);
+        if self.timed {
+            let held = self.since.elapsed();
+            self.writer.timed(Timed::BuildingHeld(self.holder), held);
+        }
     }
 }
 
@@ -1210,11 +1252,12 @@ enum Ended {
 }
 
 /// How long a flush waited for its partition's building lock, and then
-/// held it: its whole build and commit.
+/// held it: its whole build and commit, or `None` if it found nothing to
+/// flush and so built nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlushTimes {
     pub waited: Duration,
-    pub held: Duration,
+    pub held: Option<Duration>,
 }
 
 /// A merge's uploads kept from [`Writer::clean`] while it is under way,
@@ -1428,6 +1471,7 @@ impl Writer {
             holder,
             since: Instant::now(),
             writer: self,
+            timed: true,
         }
     }
 
@@ -1444,8 +1488,7 @@ impl Writer {
 
     /// Count `took` as `timed` of this writer's partition.
     fn timed(&self, timed: Timed, took: Duration) {
-        let partition = self.lease.key.to_string();
-        self.timings.record(timed, &partition, took);
+        self.timings.record(timed, &self.lease.key, took);
     }
 
     pub fn partition(&self) -> &Arc<Partition> {
@@ -1777,14 +1820,17 @@ impl Writer {
                     // Coded first, while readers may still read; the apply
                     // under the lock then only stores the codes.
                     let prepared = partition.read(|state| state.prepared(&log));
-                    let (made, unflushed) = partition.applying(|state| {
+                    // Noted under the state's lock, as a checkpoint notes
+                    // what it takes under it: so that no checkpoint comes
+                    // between the rows applied and their note (review of
+                    // #169). The partition's lock, then the lag's, always.
+                    partition.applying(|state| {
                         let made = state.apply_prepared(&applied, &log, prepared);
-                        (made, state.unflushed())
-                    });
-                    if made.is_ok() {
-                        lag.applied(unflushed);
-                    }
-                    made
+                        if made.is_ok() {
+                            lag.applied(state.unflushed());
+                        }
+                        made
+                    })
                 })
                 .await??;
                 tracing::debug!(
@@ -1925,15 +1971,16 @@ impl Writer {
     /// lets a tenant go.
     pub async fn flush_timed(&self) -> Result<(LogPosition, FlushTimes)> {
         let asked = Instant::now();
-        let building = self.building(Holder::Flush).await;
+        let mut building = self.building(Holder::Flush).await;
         let waited = asked.elapsed().saturating_sub(building.held());
-        let position = self.flushing_held().await?;
-        let held = building.held();
+        let position = self.flushing_held(&mut building).await?;
+        let held = building.timed.then(|| building.held());
         Ok((position, FlushTimes { waited, held }))
     }
 
-    /// What [`Self::flush`] does once it holds the building lock.
-    async fn flushing_held(&self) -> Result<LogPosition> {
+    /// What [`Self::flush`] does once it holds the building lock, as
+    /// `building`: which, if there is nothing to flush, built nothing.
+    async fn flushing_held(&self, building: &mut Building<'_>) -> Result<LogPosition> {
         // Noted under the lock it is taken under, so that no rows are
         // applied between: the rows it takes are exactly those it notes.
         let taken = self.partition.read(|state| {
@@ -1942,6 +1989,7 @@ impl Writer {
             Some((snapshot, taking))
         });
         let Some((snapshot, taking)) = taken else {
+            building.built_nothing();
             return Ok(self.partition.read(State::position));
         };
         let mut staged = self.staging();
@@ -2661,7 +2709,15 @@ impl Writer {
         // it. Never left to the closure's captures, whose order is not set.
         let built = at_once(move || {
             let build = build;
-            let building = || {
+            // A merge's build's parallel sections on the pool its node gives
+            // merge builds, if not the global one, the rest here; a flush's
+            // where it is.
+            let pool = build.as_deref().and_then(|build| build.builds().pool());
+            let on = match &build {
+                Some(_) => OnPool::merge(pool.map(|pool| &**pool)),
+                None => OnPool::global(),
+            };
+            let built = on.build(|on| {
                 segment_built(
                     turn,
                     file,
@@ -2671,15 +2727,9 @@ impl Writer {
                     build.as_deref(),
                     above,
                     format,
+                    on,
                 )
-            };
-            // A merge's build, all of it, on the pool its node gives merge
-            // builds, if not the global one; a flush's where it is.
-            let pool = build.as_deref().and_then(|build| build.builds().pool());
-            let built = match pool {
-                Some(pool) => pool.install(building),
-                None => building(),
-            };
+            });
             (built, build)
         });
         built.await?.0
@@ -3235,6 +3285,7 @@ impl Writer {
                     holder: Holder::MergePlan,
                     since: Instant::now(),
                     writer: self,
+                    timed: true,
                 };
                 return Ok(Some((build, planning)));
             }

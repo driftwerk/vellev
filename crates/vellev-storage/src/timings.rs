@@ -11,7 +11,8 @@
 //! A bench that needs each duration exactly, not its bucket, keeps them as
 //! they come ([`Timings::keep_events`]).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt::Display;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -211,31 +212,51 @@ pub const BOUNDS: [f64; 22] = {
 #[derive(Debug, Default)]
 struct Histogram {
     /// How many fell in each bucket: at most its bound and over the one
-    /// before. Those over every bound are in `count` alone.
-    buckets: [AtomicU64; BOUNDS.len()],
-    count: AtomicU64,
+    /// before; the last, past every bound. The count is their sum, worked
+    /// out as they are read, so that a read made while one is observed
+    /// never counts it in the whole and not in a bucket (review of #169).
+    buckets: [AtomicU64; BOUNDS.len() + 1],
     micros: AtomicU64,
+    /// Where an observe waits, its bucket counted and nothing else yet,
+    /// while a test reads it half observed.
+    #[cfg(test)]
+    paused: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
 }
 
 impl Histogram {
     fn observe(&self, took: Duration) {
         let seconds = took.as_secs_f64();
-        if let Some(bucket) = BOUNDS.iter().position(|bound| seconds <= *bound) {
-            self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
-        }
-        self.count.fetch_add(1, Ordering::Relaxed);
+        let bucket = BOUNDS
+            .iter()
+            .position(|bound| seconds <= *bound)
+            .unwrap_or(BOUNDS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.paused_here();
         let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
         self.micros.fetch_add(micros, Ordering::Relaxed);
     }
 
+    /// Wait while a test reads this half observed, if one asked to.
+    #[cfg(test)]
+    fn paused_here(&self) {
+        let paused = self.paused.lock().unwrap().clone();
+        if let Some(paused) = paused {
+            paused.wait();
+            paused.wait();
+        }
+    }
+
     fn read(&self) -> Seconds {
+        let each: [u64; BOUNDS.len() + 1] =
+            std::array::from_fn(|bucket| self.buckets[bucket].load(Ordering::Relaxed));
         let mut cumulative = 0;
         let buckets = std::array::from_fn(|bucket| {
-            cumulative += self.buckets[bucket].load(Ordering::Relaxed);
+            cumulative += each[bucket];
             (BOUNDS[bucket], cumulative)
         });
         Seconds {
-            count: self.count.load(Ordering::Relaxed),
+            count: each.iter().sum(),
             sum: self.micros.load(Ordering::Relaxed) as f64 / 1e6,
             buckets,
         }
@@ -268,6 +289,10 @@ pub struct Event {
 pub struct Timings {
     histograms: [Histogram; SLOTS],
     ended: [AtomicU64; MergeEnd::ALL.len()],
+    /// Whether a bench keeps events: looked at before anything is made
+    /// for one, so that a duration timed while none does takes no lock
+    /// and allocates nothing.
+    keeping: AtomicBool,
     /// Every duration as it is timed, while a bench keeps them.
     events: Mutex<Option<Vec<Event>>>,
 }
@@ -277,23 +302,30 @@ impl Default for Timings {
         Self {
             histograms: std::array::from_fn(|_| Histogram::default()),
             ended: std::array::from_fn(|_| AtomicU64::new(0)),
+            keeping: AtomicBool::new(false),
             events: Mutex::new(None),
         }
     }
 }
 
 impl Timings {
-    /// Count `took` as `timed`, for `partition`.
-    pub fn record(&self, timed: Timed, partition: &str, took: Duration) {
+    /// Count `took` as `timed`, for `partition`, which is named only for
+    /// an event kept: while no bench keeps them, this allocates nothing.
+    pub fn record(&self, timed: Timed, partition: &(impl Display + ?Sized), took: Duration) {
         self.histograms[timed.slot()].observe(took);
+        if !self.keeping.load(Ordering::Acquire) {
+            return;
+        }
+        let event = Event {
+            timed,
+            took,
+            partition: partition.to_string(),
+            at: Instant::now(),
+        };
         let mut events = self.events.lock().unwrap_or_else(|held| held.into_inner());
+        // Kept until asked otherwise: one timed as keeping stopped is not.
         if let Some(events) = events.as_mut() {
-            events.push(Event {
-                timed,
-                took,
-                partition: partition.to_string(),
-                at: Instant::now(),
-            });
+            events.push(event);
         }
     }
 
@@ -321,6 +353,7 @@ impl Timings {
     pub fn keep_events(&self, keep: bool) {
         let mut events = self.events.lock().unwrap_or_else(|held| held.into_inner());
         *events = keep.then(Vec::new);
+        self.keeping.store(keep, Ordering::Release);
     }
 
     /// The durations kept since the last drain, oldest first. For a bench.
@@ -486,6 +519,33 @@ mod tests {
         // Over the last bound: in the whole alone.
         assert_eq!(read.buckets[BOUNDS.len() - 1].1, 2);
         assert!((read.sum - 4_000.003_5).abs() < 1e-6);
+    }
+
+    /// Review of #169 (MEDIUM 1): a histogram read while a duration is
+    /// half observed, its bucket counted and nothing else yet, is whole:
+    /// its count is never less than its buckets hold. The observe is held
+    /// there while it is read, so that the race is shown every time, not
+    /// hoped for among millions of reads.
+    #[test]
+    fn a_histogram_read_half_observed_is_whole() {
+        let timings = std::sync::Arc::new(Timings::default());
+        let timed = Timed::Backlog;
+        let paused = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *timings.histograms[timed.slot()].paused.lock().unwrap() = Some(paused.clone());
+        let observing = {
+            let timings = timings.clone();
+            std::thread::spawn(move || timings.record(timed, "p", Duration::from_millis(3)))
+        };
+        // Its bucket is counted, and it waits there until read.
+        paused.wait();
+        let half = timings.seconds(timed);
+        paused.wait();
+        observing.join().unwrap();
+        let in_buckets = half.buckets[BOUNDS.len() - 1].1;
+        assert_eq!(in_buckets, 1, "{half:?}");
+        assert!(half.count >= in_buckets, "{half:?}");
+        let whole = timings.seconds(timed);
+        assert_eq!((whole.count, whole.buckets[BOUNDS.len() - 1].1), (1, 1));
     }
 
     #[test]

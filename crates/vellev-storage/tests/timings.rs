@@ -2,8 +2,8 @@
 //! §9.7): how long rows wait once their flush is due, however the
 //! checkpoint that takes them comes; spells at the backlog; the building
 //! lock, waited for and held, by whoever holds it; a merge's phases, its
-//! gather apart from its build; how each merge ended; and that a merge's
-//! build runs on the pool its node gives it.
+//! gather apart from its build; and how each merge ended. Which pool a
+//! build's sections run on is told in `merge_pool_sections`.
 
 mod common;
 
@@ -157,6 +157,38 @@ async fn rows_due_while_a_flush_builds_are_timed_from_when_they_fell_due() {
          committed {:?} ago",
         after_first.elapsed()
     );
+}
+
+/// A flush that finds nothing to flush builds nothing, so its hold of the
+/// building lock is no flush's build and is not timed as one: the flush
+/// wait mark sets the wait against a flush's own build, which a run of
+/// empty holds would make look shorter than it is (review of #169). Its
+/// wait for the lock is real, and is timed as any flush's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    writer.commit(notes(0, 3)).await.unwrap();
+    writer.flush().await.unwrap();
+    timings.drain_events();
+    // Nothing written since: nothing to flush.
+    let (_, times) = writer.flush_timed().await.unwrap();
+    assert_eq!(times.held, None, "{times:?}");
+    let events = timings.drain_events();
+    assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 1);
+    assert_eq!(
+        kept(&events, Timed::BuildingHeld(Holder::Flush)),
+        Vec::<Duration>::new(),
+        "an empty flush timed as a flush's hold"
+    );
+    // One that flushes is held, and timed so.
+    writer.commit(notes(10, 3)).await.unwrap();
+    let (_, times) = writer.flush_timed().await.unwrap();
+    assert!(times.held.is_some(), "{times:?}");
+    let events = timings.drain_events();
+    assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 1);
+    assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
 }
 
 /// Rule 3. A spell at the backlog runs from the rows unflushed coming to
@@ -320,23 +352,4 @@ async fn each_merge_is_counted_by_how_it_ended() {
             (MergeEnd::Stopped, 1)
         ]
     );
-}
-
-/// Rule 7. A merge's build runs on the pool its node gives it, all of
-/// it, and on no other thread: so that an arm of the bench that builds
-/// merges on a pool of their own, smaller or niced, builds them there.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_merges_build_runs_on_the_pool_it_is_given() {
-    let cluster = Cluster::new().await;
-    let timings = Arc::new(Timings::default());
-    let pool = Arc::new(vellev_index::pool::merge_builds(1, 0));
-    let builds = MergeBuilds::building_on(1, pool);
-    let writer = timed_writer(&cluster, &timings, 0, builds.clone()).await;
-    for round in 0..2 {
-        writer.commit(notes(round * 10, 10)).await.unwrap();
-        writer.flush().await.unwrap();
-    }
-    assert!(builds.builds_ran_on().is_empty(), "flushes build no merge");
-    assert!(writer.merge().await.unwrap().is_some());
-    assert_eq!(builds.builds_ran_on(), vec!["vellev-merge-0".to_string()]);
 }
