@@ -1809,14 +1809,17 @@ impl Writer {
                     // Coded first, while readers may still read; the apply
                     // under the lock then only stores the codes.
                     let prepared = partition.read(|state| state.prepared(&log));
-                    let (made, unflushed) = partition.applying(|state| {
+                    // Noted under the state's lock, as a checkpoint notes
+                    // what it takes under it: so that no checkpoint comes
+                    // between the rows applied and their note (review of
+                    // #169). The partition's lock, then the lag's, always.
+                    partition.applying(|state| {
                         let made = state.apply_prepared(&applied, &log, prepared);
-                        (made, state.unflushed())
-                    });
-                    if made.is_ok() {
-                        lag.applied(unflushed);
-                    }
-                    made
+                        if made.is_ok() {
+                            lag.applied(state.unflushed());
+                        }
+                        made
+                    })
                 })
                 .await??;
                 tracing::debug!(
