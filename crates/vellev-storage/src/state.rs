@@ -520,6 +520,108 @@ pub(crate) struct DeadRows {
     count: usize,
 }
 
+/// What a merge takes of its run's segments under the state's lock, to
+/// gather their rows from with no lock held: their files and vectors, which
+/// are never changed in place, and their marks as they stood. Rows that die
+/// after are carried out at the commit, as those that die as it builds are.
+/// It holds the segments only as long as the gather runs.
+#[derive(Debug)]
+pub(crate) struct Run {
+    segments: Vec<(Arc<SegmentFile>, Arc<Column>)>,
+    dead: Arc<[DeadRows]>,
+    /// Whether anything older is left for the run's tombstones to act on.
+    tombstones_act: bool,
+}
+
+impl Run {
+    /// The marks as they stood: what the merge's commit holds them to.
+    pub(crate) fn dead(&self) -> Arc<[DeadRows]> {
+        self.dead.clone()
+    }
+
+    /// The segment that replaces the run: its live rows, oldest first, and
+    /// its tombstones if there is anything older left for them to act on.
+    /// `position` is the one the rows are taken at. The rows come without
+    /// their vectors, which are gathered once into the merged segment's
+    /// column, sized exactly beforehand: not copied into each row and then
+    /// gathered again; and what the rows come to, as [`copied_bytes`]
+    /// counts them.
+    ///
+    /// Before each `chunk` of a segment's rows, in sizing it and in copying
+    /// it, `goes_on` is told how many are copied so far: `None` as soon as
+    /// it says not, so that nothing runs on for more than a chunk past it.
+    pub(crate) fn merged(
+        self,
+        position: LogPosition,
+        chunk: usize,
+        mut goes_on: impl FnMut(usize) -> bool,
+    ) -> Option<(SegmentFile, Gathering, usize)> {
+        let Self {
+            segments,
+            dead,
+            tombstones_act,
+        } = self;
+        let of = |rows: usize| {
+            let chunks = (0..rows).step_by(chunk);
+            chunks.map(move |from| from..(from + chunk).min(rows))
+        };
+        let (mut count, mut values) = (0, 0);
+        for ((file, column), dead) in segments.iter().zip(dead.iter()) {
+            for rows in of(file.rows.len()) {
+                if !goes_on(0) {
+                    return None;
+                }
+                for row in rows.filter(|row| !dead.is_dead(*row)) {
+                    count += 1;
+                    values += column.get(row).map_or(0, <[f32]>::len);
+                }
+            }
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(count);
+        let mut vectors = Gathering::with_capacity(values, count);
+        // What the rows copied come to, as they are, for the reckoning.
+        let mut copied = 0;
+        for ((file, column), dead) in segments.iter().zip(dead.iter()) {
+            for at in of(file.rows.len()) {
+                if !goes_on(rows.len()) {
+                    return None;
+                }
+                for row in at.filter(|row| !dead.is_dead(*row)) {
+                    let Row { collection, object } = &file.rows[row];
+                    vectors.push(column.get(row));
+                    let row = Row {
+                        collection: *collection,
+                        object: Object {
+                            id: object.id,
+                            properties: object.properties.clone(),
+                            vector: None,
+                        },
+                    };
+                    copied += copied_bytes(&row);
+                    rows.push(row);
+                }
+            }
+        }
+        let tombstones: Vec<RowKey> = match tombstones_act {
+            false => Vec::new(),
+            true => {
+                let mut seen = HashSet::new();
+                segments
+                    .iter()
+                    .flat_map(|(file, _)| file.tombstones.iter().copied())
+                    .filter(|key| seen.insert(*key))
+                    .collect()
+            }
+        };
+        let file = SegmentFile {
+            position,
+            rows,
+            tombstones,
+        };
+        Some((file, vectors, copied))
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     /// How many rows this thread has asked the marks of.
@@ -2133,81 +2235,19 @@ impl State {
         None
     }
 
-    /// The segment that replaces `merge`'s run: their live rows, oldest
-    /// first, and their tombstones if there is anything older left for the
-    /// tombstones to act on. `position` is the one the rows are taken at.
-    /// The live rows of the run `merge` was planned over, without their
-    /// vectors, and those vectors gathered once into the merged segment's
-    /// column, sized exactly beforehand: not copied into each row and then
-    /// gathered again. None too if `stopping` is stopped, asked before
-    /// each segment of the run is copied out. `at_chunk` is told how many
-    /// rows are copied each time it comes to `chunk` more of a segment's.
-    pub(crate) fn merged(
-        &self,
-        merge: &Merge,
-        position: LogPosition,
-        stopping: &Stopping,
-        chunk: usize,
-        mut at_chunk: impl FnMut(usize),
-    ) -> Option<(SegmentFile, Gathering, usize)> {
-        if !self.unchanged(merge) {
-            return None;
-        }
+    /// What gathering `merge`'s run takes of its segments, in moments, as
+    /// it was planned just now under the same lock: a walk of the segments
+    /// and a copy of their marks' words, no row of them touched.
+    pub(crate) fn merge_run(&self, merge: &Merge) -> Run {
         let run = &self.segments[merge.run.clone()];
-        fn live(segment: &Segment) -> impl Iterator<Item = usize> + '_ {
-            (0..segment.file.rows.len()).filter(|row| !segment.dead.is_dead(*row))
+        Run {
+            segments: run
+                .iter()
+                .map(|segment| (segment.file.clone(), segment.vectors.clone()))
+                .collect(),
+            dead: run.iter().map(|segment| segment.dead.clone()).collect(),
+            tombstones_act: merge.run.start > 0,
         }
-        let (count, values) = run.iter().fold((0, 0), |(count, values), segment| {
-            live(segment).fold((count, values), |(count, values), row| {
-                (
-                    count + 1,
-                    values + segment.vectors.get(row).map_or(0, <[f32]>::len),
-                )
-            })
-        });
-        let mut rows: Vec<Row> = Vec::with_capacity(count);
-        let mut vectors = Gathering::with_capacity(values, count);
-        // What the rows copied come to, as they are, for the reckoning.
-        let mut copied = 0;
-        for segment in run {
-            if stopping.stopped(MergeStage::Gathering) {
-                return None;
-            }
-            for from in (0..segment.file.rows.len()).step_by(chunk) {
-                at_chunk(rows.len());
-                let to = (from + chunk).min(segment.file.rows.len());
-                for row in (from..to).filter(|row| !segment.dead.is_dead(*row)) {
-                    let Row { collection, object } = &segment.file.rows[row];
-                    vectors.push(segment.vectors.get(row));
-                    let row = Row {
-                        collection: *collection,
-                        object: Object {
-                            id: object.id,
-                            properties: object.properties.clone(),
-                            vector: None,
-                        },
-                    };
-                    copied += copied_bytes(&row);
-                    rows.push(row);
-                }
-            }
-        }
-        let tombstones: Vec<RowKey> = match merge.run.start {
-            0 => Vec::new(),
-            _ => {
-                let mut seen = HashSet::new();
-                run.iter()
-                    .flat_map(|segment| segment.file.tombstones.iter().copied())
-                    .filter(|key| seen.insert(*key))
-                    .collect()
-            }
-        };
-        let file = SegmentFile {
-            position,
-            rows,
-            tombstones,
-        };
-        Some((file, vectors, copied))
     }
 
     /// What a merge of `merge`'s run is reckoned to hold at its peak, as it
@@ -2432,43 +2472,33 @@ impl State {
             .collect()
     }
 
-    pub(crate) fn alive(&self, merge: &Merge) -> Vec<Vec<bool>> {
-        self.segments[merge.run.clone()]
-            .iter()
-            .map(|segment| {
-                (0..segment.dead.rows())
-                    .map(|row| !segment.dead.is_dead(row))
-                    .collect()
-            })
-            .collect()
-    }
-
-    /// Whether `merged`, made for `merge` of the rows `alive` when it was
-    /// planned, holds every row the run holds live now, so that carrying
-    /// the merge out can place each: a merge is committed only then. It
-    /// does if it holds the rows that were alive, the same rows in the same
-    /// order, as `merged()` gathers them, and no row of the run is live now
-    /// that was not then; rows of the run that died since are no matter,
-    /// being dead in the merged segment too. Only a restore brings a row
-    /// back to life. One pass over the run's marks and the merged rows,
-    /// side by side: nothing is hashed or looked up.
-    pub(crate) fn covers(&self, merge: &Merge, alive: &[Vec<bool>], merged: &Fit) -> bool {
+    /// Whether `merged`, made for `merge` of the rows `dead` left when it
+    /// was planned, holds every row the run holds live now, so that
+    /// carrying the merge out can place each: a merge is committed only
+    /// then. It does if it holds the rows that were live, the same rows in
+    /// the same order, as [`Run::merged`] gathers them, and no row of the
+    /// run is live now that was not then; rows of the run that died since
+    /// are no matter, being dead in the merged segment too. Only a restore
+    /// brings a row back to life. One pass over the run's marks and the
+    /// merged rows, side by side: nothing is hashed or looked up.
+    pub(crate) fn covers(&self, merge: &Merge, dead: &[DeadRows], merged: &Fit) -> bool {
         let Some(run) = self.segments.get(merge.run.clone()) else {
             return false;
         };
-        if run.len() != alive.len() {
+        if run.len() != dead.len() {
             return false;
         }
         let mut gathered = merged.file.rows.iter();
-        for (segment, alive) in run.iter().zip(alive) {
-            if segment.dead.rows() != alive.len() || segment.file.rows.len() != alive.len() {
+        for (segment, dead) in run.iter().zip(dead) {
+            if segment.dead.rows() != dead.rows() || segment.file.rows.len() != dead.rows() {
                 return false;
             }
-            for ((at, row), was) in segment.file.rows.iter().enumerate().zip(alive) {
-                if !segment.dead.is_dead(at) && !*was {
+            for (at, row) in segment.file.rows.iter().enumerate() {
+                let was = !dead.is_dead(at);
+                if !segment.dead.is_dead(at) && !was {
                     return false;
                 }
-                if *was {
+                if was {
                     let same = gathered.next().is_some_and(|got| {
                         (got.collection, got.object.id) == (row.collection, row.object.id)
                     });
@@ -3145,16 +3175,9 @@ mod tests {
         /// What `plan`'s run comes to, gathered `chunk` rows at a time,
         /// its rows' vectors put back.
         fn gathered(&self, plan: &Merge, chunk: usize) -> SegmentFile {
-            let (mut file, gathered, _) = self
-                .state
-                .merged(
-                    plan,
-                    self.state.position(),
-                    &Stopping::never(),
-                    chunk,
-                    |_| {},
-                )
-                .unwrap();
+            let run = self.state.merge_run(plan);
+            let (mut file, gathered, _) =
+                run.merged(self.state.position(), chunk, |_| true).unwrap();
             for (row, at) in file.rows.iter_mut().zip(0..) {
                 row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
             }
@@ -3624,29 +3647,29 @@ mod tests {
         built.commit((5..=8).map(|n| upsert(0, n, n as i64)).collect());
         built.flush();
         let (plan, fit) = built.planned();
-        let alive = built.state.alive(&plan);
-        assert!(built.state.covers(&plan, &alive, &fit));
+        let dead = built.state.merge_run(&plan).dead();
+        assert!(built.state.covers(&plan, &dead, &fit));
         // A row of the run dies after the merge was made: still covered.
         built.commit(vec![delete(0, 3)]);
-        assert!(built.state.covers(&plan, &alive, &fit));
+        assert!(built.state.covers(&plan, &dead, &fit));
         // A row of the run live again that was not when the merge was made,
         // as only a restore could make one: not.
         let (plan, fit) = built.planned();
-        let alive = built.state.alive(&plan);
+        let dead = built.state.merge_run(&plan).dead();
         let segment = plan.run.start;
         let marks = &built.state.segments[segment].dead;
-        let dead = (0..marks.rows())
+        let row = (0..marks.rows())
             .find(|row| marks.is_dead(*row))
             .expect("the row deleted above");
-        built.state.segments[segment].dead.revive(dead);
-        assert!(!built.state.covers(&plan, &alive, &fit));
-        built.state.segments[segment].dead.mark(dead);
+        built.state.segments[segment].dead.revive(row);
+        assert!(!built.state.covers(&plan, &dead, &fit));
+        built.state.segments[segment].dead.mark(row);
         // A merged file that lacks a row the run held live: not.
         let mut file = (*fit.file).clone();
         file.rows.retain(|row| row.object.id != oid(6));
         let catalog = built.state.catalog().clone();
         let short = built.fit(file, &catalog);
-        assert!(!built.state.covers(&plan, &alive, &short));
+        assert!(!built.state.covers(&plan, &dead, &short));
         // One with as many rows, one of them not the run's: not.
         let mut file = (*fit.file).clone();
         let wrong = file
@@ -3656,22 +3679,24 @@ mod tests {
             .expect("row 6 in the merged file");
         wrong.object.id = oid(99);
         let wrong = built.fit(file, &catalog);
-        assert!(!built.state.covers(&plan, &alive, &wrong));
-        assert!(built.state.covers(&plan, &alive, &fit));
+        assert!(!built.state.covers(&plan, &dead, &wrong));
+        assert!(built.state.covers(&plan, &dead, &fit));
     }
 
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
         /// A gather comes to the same file whatever the size of its chunks
         /// (M4): the run's live rows, oldest first, each with its vector or
-        /// without one, and the run's tombstones, with dead rows lying at
-        /// chunks' edges and segments no multiple of a chunk.
+        /// without one, and the run's tombstones if anything older is left
+        /// for them to act on, with dead rows lying at chunks' edges and
+        /// segments no multiple of a chunk.
         #[test]
         fn a_gather_in_chunks_makes_the_file_a_gather_whole_would(
             segments in proptest::collection::vec(
                 proptest::collection::vec((1u128..200, 0u8..5), 1..60),
                 2..5,
             ),
+            start in 0usize..2,
             chunk in 1usize..70,
         ) {
             let mut built = Built::new(&["notes"]);
@@ -3686,16 +3711,16 @@ mod tests {
                 built.commit(ops.collect());
                 built.flush();
             }
-            let merging = Merging {
-                fanout: 2,
-                stale: 2.0,
-                ..Merging::default()
-            };
-            let Some(plan) = built.state.merge_plan(&merging) else {
-                return Ok(());
+            let run = start..built.state.segments.len();
+            let plan = Merge {
+                keys: built.state.segments[run.clone()]
+                    .iter()
+                    .map(|segment| segment.meta.key.clone())
+                    .collect(),
+                run,
             };
             let run = &built.state.segments[plan.run.clone()];
-            let whole: Vec<Row> = run
+            let rows: Vec<Row> = run
                 .iter()
                 .flat_map(|segment| {
                     let live = (0..segment.file.rows.len())
@@ -3707,10 +3732,17 @@ mod tests {
                     })
                 })
                 .collect();
+            let mut tombstones: Vec<RowKey> = Vec::new();
+            for segment in run.iter().filter(|_| start > 0) {
+                for key in &segment.file.tombstones {
+                    if !tombstones.contains(key) {
+                        tombstones.push(*key);
+                    }
+                }
+            }
             let file = built.gathered(&plan, chunk);
-            proptest::prop_assert_eq!(&file.rows, &whole);
-            let all = built.gathered(&plan, GATHERED_AT_ONCE);
-            proptest::prop_assert_eq!(&file.tombstones, &all.tombstones);
+            proptest::prop_assert_eq!(&file.rows, &rows);
+            proptest::prop_assert_eq!(&file.tombstones, &tombstones);
         }
 
         /// A segment's dead rows are just those the live map does not lead
