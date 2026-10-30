@@ -354,8 +354,8 @@ async fn segments_are_reported_by_whether_they_are_clustered() {
     served.stop().await;
 }
 
-/// A node with a memory budget of `budget` bytes, and `acme`'s notes, three
-/// of them, written with vectors supplied.
+/// A node with a memory budget of `budget` bytes, and two tenants: `acme`
+/// with three notes and `beta` with one, written with vectors supplied.
 async fn holding(budget: Option<usize>) -> Served {
     let cluster = Cluster::new();
     let served = match budget {
@@ -367,12 +367,19 @@ async fn holding(budget: Option<usize>) -> Served {
         let note = json!({ "properties": { "title": format!("note {n}"), "n": n }, "vector": [1.0, n as f64] });
         served.ok(Method::PUT, &object(n), Some(note)).await;
     }
+    let beta = "/v1/tenants/beta/collections/notes";
+    served.ok(Method::PUT, "/v1/tenants/beta", None).await;
+    served.ok(Method::PUT, beta, Some(notes(supplied()))).await;
+    let note = json!({ "properties": { "title": "note 1", "n": 1 }, "vector": [1.0, 1.0] });
+    let path = format!("{beta}/objects/{}", id(1));
+    served.ok(Method::PUT, &path, Some(note)).await;
     served
 }
 
 /// Resident accounting PR 1: what the node reckons its tenants hold, the
 /// figure its memory budget is held to, is on /metrics with that budget,
-/// so that the two can be seen beside what the allocator holds.
+/// with how many tenants it holds open and the most any one holds, so
+/// that they can be seen beside what the process really holds.
 #[tokio::test]
 async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
     const BUDGET: usize = 64 * 1024 * 1024;
@@ -380,7 +387,7 @@ async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
     let before = served.node.resident();
     let text = served.app.metrics().encoded();
     let after = served.node.resident();
-    assert!(before > 0, "a tenant with three notes holds something");
+    assert!(before > 0, "two tenants with notes hold something");
     assert_eq!(before, after, "nothing was let go meanwhile");
     assert_eq!(
         sample(&text, "vellev_tenants_resident_bytes", &[("by", "rows")]),
@@ -391,6 +398,28 @@ async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
         sample(&text, "vellev_memory_budget_bytes", &[]),
         Some(BUDGET as f64),
         "{text}"
+    );
+    assert_eq!(
+        sample(&text, "vellev_tenants_open", &[("kind", "writer")]),
+        Some(2.0),
+        "{text}"
+    );
+    assert_eq!(
+        sample(&text, "vellev_tenants_open", &[("kind", "copy")]),
+        Some(0.0),
+        "{text}"
+    );
+    // `acme` holds three notes to `beta`'s one: the most one holds is
+    // more than half of what both hold, and less than all of it.
+    let largest = sample(
+        &text,
+        "vellev_tenant_resident_largest_bytes",
+        &[("by", "rows")],
+    )
+    .unwrap_or_else(|| panic!("no largest: {text}"));
+    assert!(
+        largest > before as f64 / 2.0 && largest < before as f64,
+        "the most one of two tenants holds is {largest} of {before}: {text}"
     );
     served.stop().await;
 }
@@ -424,5 +453,156 @@ async fn a_node_not_told_its_allocator_reports_no_allocator_counts() {
     for name in ["vellev_allocated_bytes", "vellev_allocator_resident_bytes"] {
         assert!(!text.contains(name), "{name} reported: {text}");
     }
+    served.stop().await;
+}
+
+/// Linux's memory files as a container has them: the process's status,
+/// and its cgroup's (v2) memory, its limit, its events and its kinds of
+/// memory, with `current` as the cgroup's memory now.
+fn linux_files(current: u64, max: &str) -> (tempfile::TempDir, MemoryFiles) {
+    let dir = tempfile::tempdir().unwrap();
+    let status = dir.path().join("status");
+    std::fs::write(
+        &status,
+        "Name:\tvellev\nVmRSS:\t    3000 kB\nRssAnon:\t    2000 kB\nRssFile:\t     900 kB\nRssShmem:\t     100 kB\n",
+    )
+    .unwrap();
+    let cgroup = dir.path().join("cgroup");
+    std::fs::create_dir(&cgroup).unwrap();
+    let write = |name: &str, text: &str| std::fs::write(cgroup.join(name), text).unwrap();
+    write("memory.current", &format!("{current}\n"));
+    write("memory.max", &format!("{max}\n"));
+    write("memory.events", "low 0\nhigh 3\nmax 4\noom 1\noom_kill 2\n");
+    write(
+        "memory.stat",
+        "anon 1048576\nfile 2097152\nkernel 4096\nshmem 0\nfile_mapped 8192\n",
+    );
+    let files = MemoryFiles::at(status, Some(cgroup));
+    (dir, files)
+}
+
+/// Resident accounting PR 1: the process's resident memory, anonymous and
+/// file-backed apart, and its cgroup's memory, limit, events and kinds of
+/// memory are on /metrics as Linux's files say: what the node is really
+/// held to, beside what it reckons its tenants hold.
+#[tokio::test]
+async fn the_process_and_its_cgroups_memory_are_reported_as_linux_says() {
+    let (_dir, files) = linux_files(5_000_000, "2147483648");
+    let served = Cluster::new().serve_reading_memory_from(files).await;
+    let text = served.app.metrics().encoded();
+    let value = |name: &str, labels: &[(&str, &str)]| sample(&text, name, labels);
+    let resident = "vellev_process_resident_bytes";
+    assert_eq!(
+        value(resident, &[("kind", "anon")]),
+        Some(2_048_000.0),
+        "{text}"
+    );
+    assert_eq!(
+        value(resident, &[("kind", "file")]),
+        Some(921_600.0),
+        "{text}"
+    );
+    assert_eq!(
+        value("vellev_cgroup_memory_bytes", &[]),
+        Some(5_000_000.0),
+        "{text}"
+    );
+    assert_eq!(
+        value("vellev_cgroup_memory_max_bytes", &[]),
+        Some(2_147_483_648.0),
+        "{text}"
+    );
+    let events = "vellev_cgroup_memory_events_total";
+    assert_eq!(value(events, &[("event", "high")]), Some(3.0), "{text}");
+    assert_eq!(value(events, &[("event", "max")]), Some(4.0), "{text}");
+    assert_eq!(value(events, &[("event", "oom")]), Some(1.0), "{text}");
+    assert_eq!(value(events, &[("event", "oom_kill")]), Some(2.0), "{text}");
+    let stat = "vellev_cgroup_memory_stat_bytes";
+    assert_eq!(
+        value(stat, &[("kind", "anon")]),
+        Some(1_048_576.0),
+        "{text}"
+    );
+    assert_eq!(
+        value(stat, &[("kind", "file")]),
+        Some(2_097_152.0),
+        "{text}"
+    );
+    served.stop().await;
+}
+
+/// Where there are no such files, as on macOS, or no cgroup v2, nothing
+/// of them is reported: no figure at all, never a figure of nothing. A
+/// cgroup with no limit reports its memory but no limit.
+#[tokio::test]
+async fn memory_linux_does_not_say_is_not_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = MemoryFiles::at(dir.path().join("status"), Some(dir.path().join("cgroup")));
+    let served = Cluster::new().serve_reading_memory_from(nowhere).await;
+    let text = served.app.metrics().encoded();
+    for name in [
+        "vellev_process_resident_bytes",
+        "vellev_cgroup_memory_bytes",
+        "vellev_cgroup_memory_max_bytes",
+        "vellev_cgroup_memory_events_total",
+        "vellev_cgroup_memory_stat_bytes",
+        "vellev_memory_baseline_bytes",
+    ] {
+        assert!(!text.contains(name), "{name} reported: {text}");
+    }
+    served.stop().await;
+    let none = MemoryFiles::at(dir.path().join("status"), None);
+    let served = Cluster::new().serve_reading_memory_from(none).await;
+    let text = served.app.metrics().encoded();
+    assert!(!text.contains("vellev_cgroup_memory"), "{text}");
+    served.stop().await;
+    let (_dir, unlimited) = linux_files(5_000_000, "max");
+    let served = Cluster::new().serve_reading_memory_from(unlimited).await;
+    let text = served.app.metrics().encoded();
+    assert_eq!(
+        sample(&text, "vellev_cgroup_memory_bytes", &[]),
+        Some(5_000_000.0),
+        "{text}"
+    );
+    assert!(!text.contains("vellev_cgroup_memory_max_bytes"), "{text}");
+    served.stop().await;
+}
+
+/// What the process and its cgroup held as the node started, before any
+/// tenant was opened, is kept as it was then: the node's own baseline,
+/// which what its tenants hold comes on top of.
+#[tokio::test]
+async fn the_memory_held_as_the_node_started_is_kept_as_its_baseline() {
+    let (dir, files) = linux_files(5_000_000, "max");
+    let served = Cluster::new().serve_reading_memory_from(files).await;
+    std::fs::write(dir.path().join("cgroup/memory.current"), "7000000\n").unwrap();
+    std::fs::write(
+        dir.path().join("status"),
+        "RssAnon:\t    9000 kB\nRssFile:\t     900 kB\n",
+    )
+    .unwrap();
+    let text = served.app.metrics().encoded();
+    let value = |name: &str, labels: &[(&str, &str)]| sample(&text, name, labels);
+    assert_eq!(
+        value("vellev_cgroup_memory_bytes", &[]),
+        Some(7_000_000.0),
+        "{text}"
+    );
+    let baseline = "vellev_memory_baseline_bytes";
+    assert_eq!(
+        value(baseline, &[("of", "cgroup")]),
+        Some(5_000_000.0),
+        "{text}"
+    );
+    assert_eq!(
+        value(baseline, &[("of", "process_anon")]),
+        Some(2_048_000.0),
+        "{text}"
+    );
+    assert_eq!(
+        value("vellev_process_resident_bytes", &[("kind", "anon")]),
+        Some(9_216_000.0),
+        "{text}"
+    );
     served.stop().await;
 }

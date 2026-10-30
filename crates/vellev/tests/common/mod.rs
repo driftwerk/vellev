@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use vellev::identity::IdentityKeys;
+pub use vellev::memory::MemoryFiles;
 use vellev::server::{App, Limits};
 use vellev_core::{NodeId, TenantId};
 use vellev_embed::Embedders;
@@ -110,9 +111,14 @@ impl Cluster {
         embedding: vellev_embed::Settings,
     ) -> Served {
         let served = self
-            .unstarted_as(&[url.to_string()], None, &[], embedding, |settings| {
-                settings
-            })
+            .unstarted_as(
+                &[url.to_string()],
+                None,
+                &[],
+                embedding,
+                |settings| settings,
+                |app| app,
+            )
             .await;
         served.app.start(served.node.clone());
         served
@@ -231,8 +237,32 @@ impl Cluster {
         trusted: &[String],
         adjusted: impl FnOnce(Settings) -> Settings,
     ) -> Served {
-        self.unstarted_as(urls, advertised, trusted, Default::default(), adjusted)
-            .await
+        self.unstarted_as(
+            urls,
+            advertised,
+            trusted,
+            Default::default(),
+            adjusted,
+            |app| app,
+        )
+        .await
+    }
+
+    /// A node that reads the process's and its cgroup's memory from
+    /// `files`, standing for Linux's.
+    pub async fn serve_reading_memory_from(&self, files: MemoryFiles) -> Served {
+        let served = self
+            .unstarted_as(
+                &[],
+                None,
+                &[],
+                Default::default(),
+                |settings| settings,
+                |app| app.reading_memory_from(files),
+            )
+            .await;
+        served.app.start(served.node.clone());
+        served
     }
 
     async fn unstarted_as(
@@ -242,6 +272,7 @@ impl Cluster {
         trusted: &[String],
         embedding: vellev_embed::Settings,
         adjusted: impl FnOnce(Settings) -> Settings,
+        made: impl FnOnce(App) -> App,
     ) -> Served {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -261,8 +292,10 @@ impl Cluster {
             reads: READS,
             reads_wait: Duration::from_millis(50),
         };
-        let app = App::new([KEY.to_string(), "second-key".to_string()].into(), limits)
-            .trusting(IdentityKeys::parse(trusted).unwrap());
+        let app = made(
+            App::new([KEY.to_string(), "second-key".to_string()].into(), limits)
+                .trusting(IdentityKeys::parse(trusted).unwrap()),
+        );
         let (stop, stopped) = oneshot::channel::<()>();
         let served = tokio::spawn(vellev::server::serve(listener, app.clone(), async {
             stopped.await.ok();
