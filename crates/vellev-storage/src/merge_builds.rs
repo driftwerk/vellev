@@ -27,8 +27,72 @@ use crate::Result;
 /// the node's merges hold at most this many times the largest.
 pub const MERGE_BUILDS: usize = 2;
 
-/// How many builds' threads are kept for [`MergeBuilds::builds_ran_on`].
-const RAN_ON_KEPT: usize = 64;
+/// Where a build's parallel sections run: on a merge pool, or, without
+/// one, on rayon's global pool. A build's top level, its serial work and
+/// the waits between its sections, stays on the thread that runs the
+/// build, never on the pool: a pool's thread waiting in a section takes on
+/// whatever else is queued on its pool, and were that a whole build, the
+/// first build could neither end nor heed its stop until the second had
+/// (review of #169). Only sections are queued, so a thread nests at most
+/// a section of another build, as on the global pool.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OnPool<'a> {
+    pool: Option<&'a rayon::ThreadPool>,
+    /// Whether the build is a merge's.
+    merge: bool,
+}
+
+/// Whether each section's thread is kept, as a test asks: see
+/// [`sections_ran_on`].
+static RECORDING: AtomicBool = AtomicBool::new(false);
+static RAN_ON: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
+
+/// Keep, from now on, the thread each build's section runs on and whether
+/// the build was a merge's, or stop keeping them; and give back those kept
+/// so far. For tests that show which pool each build's sections run on.
+#[doc(hidden)]
+pub fn sections_ran_on(keep: bool) -> Vec<(bool, String)> {
+    RECORDING.store(keep, Ordering::SeqCst);
+    std::mem::take(&mut *lock(&RAN_ON))
+}
+
+impl<'a> OnPool<'a> {
+    /// For a build that is no merge's, a flush's or a load's: its sections
+    /// on rayon's global pool.
+    pub(crate) fn global() -> Self {
+        Self {
+            pool: None,
+            merge: false,
+        }
+    }
+
+    /// For a merge's build, its sections on `pool` if there is one.
+    pub(crate) fn merge(pool: Option<&'a rayon::ThreadPool>) -> Self {
+        Self { pool, merge: true }
+    }
+
+    /// Run the build `top` from the calling thread, its sections where
+    /// this says.
+    pub(crate) fn build<R>(self, top: impl FnOnce(Self) -> R) -> R {
+        top(self)
+    }
+
+    /// Run the parallel section `section` where this says.
+    pub(crate) fn section<R: Send>(self, section: impl FnOnce() -> R + Send) -> R {
+        let merge = self.merge;
+        let noted = move || {
+            if RECORDING.load(Ordering::SeqCst) {
+                let thread = std::thread::current().name().unwrap_or("").to_string();
+                lock(&RAN_ON).push((merge, thread));
+            }
+            section()
+        };
+        match self.pool {
+            Some(pool) => pool.install(noted),
+            None => noted(),
+        }
+    }
+}
 
 /// The longest a build waits where a test holds it, were the test never to
 /// let it go.
@@ -93,9 +157,9 @@ pub struct MergeBuilds {
     /// The most any build was reckoned to hold at its peak, since the node
     /// started.
     largest: AtomicUsize,
-    /// The names of the threads builds ran on, as a test asks: see
-    /// [`Self::builds_ran_on`].
-    ran_on: Mutex<Option<Vec<String>>>,
+    /// How many builds began on a thread already in a build: see
+    /// [`Self::nested`].
+    nested: AtomicU64,
 }
 
 /// What one build under way is reckoned to hold, and the stop of its merge.
@@ -196,7 +260,7 @@ impl MergeBuilds {
             probed: Mutex::default(),
             pool,
             largest: AtomicUsize::new(0),
-            ran_on: Mutex::new(Some(Vec::new())),
+            nested: AtomicU64::new(0),
         })
     }
 
@@ -212,22 +276,16 @@ impl MergeBuilds {
         self.largest.load(Ordering::SeqCst)
     }
 
-    /// Note that a build ran on the calling thread.
-    pub(crate) fn ran_here(&self) {
-        if let Some(ran_on) = lock(&self.ran_on).as_mut() {
-            if ran_on.len() < RAN_ON_KEPT {
-                let name = std::thread::current().name().unwrap_or("").to_string();
-                ran_on.push(name);
-            }
-        }
+    /// How many merge builds began on a thread already in a build, nested in
+    /// it, since the node started: none, as a build's top level never runs
+    /// on a pool's thread.
+    pub fn nested(&self) -> u64 {
+        self.nested.load(Ordering::SeqCst)
     }
 
-    /// The names of the threads the builds so far ran on, the first
-    /// [`RAN_ON_KEPT`] of them. For tests that show which pool builds run
-    /// on.
-    #[doc(hidden)]
-    pub fn builds_ran_on(&self) -> Vec<String> {
-        lock(&self.ran_on).clone().unwrap_or_default()
+    /// Note a build begun on a thread already in one.
+    pub(crate) fn nested_here(&self) {
+        self.nested.fetch_add(1, Ordering::SeqCst);
     }
 
     /// About how many bytes the merges stopped and not yet ended hold:
@@ -765,4 +823,54 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod nesting {
+    use super::*;
+
+    /// Review of #169 (HIGH): on a merge pool of two threads, a build whose
+    /// own work is half a second, in a section of two halves, ends in about
+    /// that though a second build of three seconds is asked for while it
+    /// waits in its section. Were whole builds queued on the pool, its
+    /// thread waiting in the section would take the second on, and the
+    /// first would end, or heed its stop, only once the second had.
+    #[test]
+    fn a_build_waiting_in_its_section_never_takes_on_another_whole_build() {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .thread_name(|n| format!("vellev-merge-{n}"))
+                .build()
+                .unwrap(),
+        );
+        let first = std::thread::spawn({
+            let pool = pool.clone();
+            move || {
+                let began = Instant::now();
+                OnPool::merge(Some(&pool)).build(|on| {
+                    on.section(|| {
+                        rayon::join(
+                            || std::thread::sleep(Duration::from_millis(50)),
+                            || std::thread::sleep(Duration::from_millis(500)),
+                        )
+                    })
+                });
+                began.elapsed()
+            }
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let second = std::thread::spawn({
+            let pool = pool.clone();
+            move || {
+                OnPool::merge(Some(&pool)).build(|_| std::thread::sleep(Duration::from_secs(3)));
+            }
+        });
+        let took = first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            took < Duration::from_millis(1_500),
+            "the first build took {took:?}, its own work half a second"
+        );
+    }
 }

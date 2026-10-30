@@ -2,8 +2,8 @@
 //! §9.7): how long rows wait once their flush is due, however the
 //! checkpoint that takes them comes; spells at the backlog; the building
 //! lock, waited for and held, by whoever holds it; a merge's phases, its
-//! gather apart from its build; how each merge ended; and that a merge's
-//! build runs on the pool its node gives it.
+//! gather apart from its build; and how each merge ended. Which pool a
+//! build's sections run on is told in `merge_pool_sections`.
 
 mod common;
 
@@ -320,23 +320,4 @@ async fn each_merge_is_counted_by_how_it_ended() {
             (MergeEnd::Stopped, 1)
         ]
     );
-}
-
-/// Rule 7. A merge's build runs on the pool its node gives it, all of
-/// it, and on no other thread: so that an arm of the bench that builds
-/// merges on a pool of their own, smaller or niced, builds them there.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_merges_build_runs_on_the_pool_it_is_given() {
-    let cluster = Cluster::new().await;
-    let timings = Arc::new(Timings::default());
-    let pool = Arc::new(vellev_index::pool::merge_builds(1, 0));
-    let builds = MergeBuilds::building_on(1, pool);
-    let writer = timed_writer(&cluster, &timings, 0, builds.clone()).await;
-    for round in 0..2 {
-        writer.commit(notes(round * 10, 10)).await.unwrap();
-        writer.flush().await.unwrap();
-    }
-    assert!(builds.builds_ran_on().is_empty(), "flushes build no merge");
-    assert!(writer.merge().await.unwrap().is_some());
-    assert_eq!(builds.builds_ran_on(), vec!["vellev-merge-0".to_string()]);
 }
