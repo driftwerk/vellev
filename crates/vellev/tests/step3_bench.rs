@@ -642,6 +642,9 @@ struct Sampled {
     draining_peak: usize,
     nice_checks: u64,
     nice_wrong: Vec<String>,
+    /// What the node holds, as it reckons it and as it really is, every
+    /// 10 s: for telling where memory goes past the budget.
+    memory: Vec<Value>,
 }
 
 /// One read as a client timed it: when it began, in seconds into the
@@ -662,6 +665,86 @@ struct WritesDone {
     refused: u64,
     failed: u64,
     behind_most: f64,
+}
+
+/// What an arm's run must have done for its marks to count (§9.6).
+struct Validity {
+    let_go_flushes: usize,
+    clustered_merges: u64,
+    nice_checks: u64,
+    nice_wrong: usize,
+    as_the_image: bool,
+    measurement: bool,
+    rows_written_a_second: f64,
+    rows_a_second: usize,
+}
+
+/// The least share of its rate an arm must write for its marks to count:
+/// one that wrote less was spared the load §3 sets.
+const WRITTEN_AT_LEAST: f64 = 0.95;
+
+impl Validity {
+    /// Why the run's marks don't count, if they don't.
+    fn invalid(&self) -> Vec<String> {
+        let wrote_too_little =
+            self.rows_written_a_second < WRITTEN_AT_LEAST * self.rows_a_second as f64;
+        [
+            (
+                self.let_go_flushes == 0,
+                "no flush before letting a tenant go".to_string(),
+            ),
+            (
+                self.clustered_merges == 0,
+                "no clustered merge (over 200k rows) committed".to_string(),
+            ),
+            (
+                self.nice_wrong > 0 || self.nice_checks == 0,
+                "the priorities were not as the arm says, or were never checked".to_string(),
+            ),
+            (!self.as_the_image, "not run as the image runs".to_string()),
+            (
+                !self.measurement,
+                "a smoke, not the measurement".to_string(),
+            ),
+            (
+                wrote_too_little,
+                format!(
+                    "wrote {:.0} rows a second, under {:.0}% of {}",
+                    self.rows_written_a_second,
+                    WRITTEN_AT_LEAST * 100.0,
+                    self.rows_a_second
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter(|(wrong, _)| *wrong)
+        .map(|(_, why)| why)
+        .collect()
+    }
+}
+
+/// An arm that wrote under 95% of its rate is invalid, its marks not
+/// counted: the CI runner's first full-size run wrote 416 rows a second of
+/// 1,000 (scratch run 41054724534), a load §3 does not set. One that wrote
+/// its rate, or just under, is not invalid for it.
+#[test]
+fn an_arm_that_wrote_under_its_rate_is_invalid() {
+    let run = |written: f64| Validity {
+        let_go_flushes: 7,
+        clustered_merges: 2,
+        nice_checks: 4,
+        nice_wrong: 0,
+        as_the_image: true,
+        measurement: true,
+        rows_written_a_second: written,
+        rows_a_second: 1_000,
+    };
+    assert_eq!(run(1_000.0).invalid(), Vec::<String>::new());
+    assert_eq!(run(951.0).invalid(), Vec::<String>::new());
+    let short = run(416.0).invalid();
+    assert_eq!(short.len(), 1, "{short:?}");
+    assert!(short[0].starts_with("wrote 416 rows a second"), "{short:?}");
+    assert_eq!(run(949.0).invalid().len(), 1);
 }
 
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
@@ -746,7 +829,7 @@ async fn arm(bench: Bench, running: Running) {
     let blobs = store(&data).await;
     let mut passages = Passages::of(&bench.fixture);
     let preloading = Instant::now();
-    let (preloaded, preloaded_resident, mut rows_of) =
+    let (preloaded, preloaded_resident, rows_of) =
         preload(&bench, &coordinator, &blobs, &mut passages).await;
     let preload_secs = preloading.elapsed().as_secs_f64();
     eprintln!("preloaded in {preload_secs:.0} s: {preloaded:?}");
@@ -821,95 +904,113 @@ async fn arm(bench: Bench, running: Running) {
         }
     }));
 
-    // The writer: a batch every so often to the active tenants in turn, on
-    // a fixed schedule, caught up on once it falls behind; one refused is
-    // tried again after the wait it was told.
+    // The writers, one for each place in the active set, each writing its
+    // share of the rate to whichever tenant holds that place, on a fixed
+    // schedule, caught up on once it falls behind; a batch refused is
+    // tried again after the wait it was told. One a place, so that one
+    // tenant slow to take a write (reopened, or at its backlog) holds up
+    // only its own share, as one client among many would.
     let writes = Arc::new(Mutex::new(WritesDone::default()));
-    let writer = tokio::spawn({
-        let (active, soaking, bench, http) =
-            (active.clone(), soaking.clone(), bench.clone(), http.clone());
-        let (url, writes) = (url.clone(), writes.clone());
-        async move {
-            let mut random = Random(bench.seed);
-            let every = Duration::from_secs_f64(bench.batch as f64 / bench.rows_a_second as f64);
-            let mut k: u64 = 0;
-            while soaking.load(Ordering::SeqCst) {
-                let due = started + every * k as u32;
-                let now = Instant::now();
-                if due > now {
-                    tokio::time::sleep(due - now).await;
-                } else {
-                    let behind = (now - due).as_secs_f64();
-                    let behind_most = &mut writes.lock().unwrap().behind_most;
-                    *behind_most = behind_most.max(behind);
-                }
-                let at = {
-                    let active = active.lock().unwrap();
-                    active[k as usize % active.len()]
-                };
-                let changes: Vec<Value> = (0..bench.batch)
-                    .map(|_| {
-                        let row = passages.next_row();
-                        // One in five replaces a row the tenant holds.
-                        let n = match random.below(5) == 0 {
-                            true => random.below(rows_of[at]),
-                            false => {
-                                rows_of[at] += 1;
-                                rows_of[at] - 1
+    let passages = Arc::new(Mutex::new(passages));
+    let rows_of = Arc::new(Mutex::new(rows_of));
+    let mut writers = Vec::new();
+    for place in 0..bench.active {
+        writers.push(tokio::spawn({
+            let (active, soaking, bench, http) =
+                (active.clone(), soaking.clone(), bench.clone(), http.clone());
+            let (url, writes) = (url.clone(), writes.clone());
+            let (passages, rows_of) = (passages.clone(), rows_of.clone());
+            async move {
+                let mut random = Random(bench.seed ^ (0xa11c_e000 + place as u64));
+                let rate = bench.rows_a_second as f64 / bench.active as f64;
+                let every = Duration::from_secs_f64(bench.batch as f64 / rate);
+                let mut k: u32 = 0;
+                while soaking.load(Ordering::SeqCst) {
+                    let due = started + every * k;
+                    let now = Instant::now();
+                    if due > now {
+                        tokio::time::sleep(due - now).await;
+                    } else {
+                        let behind = (now - due).as_secs_f64();
+                        let behind_most = &mut writes.lock().unwrap().behind_most;
+                        *behind_most = behind_most.max(behind);
+                    }
+                    let at = active.lock().unwrap()[place];
+                    let (batch, size) = (bench.batch, bench.batch as u64);
+                    let picks: Vec<(bool, u64)> = (0..batch)
+                        .map(|_| (random.below(5) == 0, random.next()))
+                        .collect();
+                    // Read from the fixture off the async threads: a shard
+                    // is read whole as it is first wanted.
+                    let (passages, rows_of) = (passages.clone(), rows_of.clone());
+                    let changes = tokio::task::spawn_blocking(move || {
+                        let mut passages = passages.lock().unwrap();
+                        let mut rows_of = rows_of.lock().unwrap();
+                        picks
+                            .into_iter()
+                            .map(|(replaces, pick)| {
+                                let row = passages.next_row();
+                                // One in five replaces a row the tenant holds.
+                                let n = match replaces {
+                                    true => pick % rows_of[at].max(1),
+                                    false => {
+                                        rows_of[at] += 1;
+                                        rows_of[at] - 1
+                                    }
+                                };
+                                json!({
+                                    "op": "upsert",
+                                    "collection": COLLECTION,
+                                    "id": object_id(at, n).0,
+                                    "properties": { "text": row.text, "n": n, "bucket": row.bucket },
+                                    "vector": row.vector,
+                                })
+                            })
+                            .collect::<Vec<Value>>()
+                    });
+                    let body = json!({ "changes": changes.await.unwrap() });
+                    let route = format!("{url}/v1/tenants/{}/changes", tenant_id(at));
+                    loop {
+                        // None once written or given up; else the wait it
+                        // was told before it is tried again.
+                        let refused = match http_json(&http, route.clone(), &body).await {
+                            Ok(answer) if answer.status().is_success() => {
+                                let mut done = writes.lock().unwrap();
+                                done.rows += size;
+                                done.batches += 1;
+                                None
+                            }
+                            Ok(answer) if answer.status().as_u16() == 429 => {
+                                writes.lock().unwrap().refused += 1;
+                                let wait = answer
+                                    .headers()
+                                    .get("retry-after")
+                                    .and_then(|wait| wait.to_str().ok()?.parse::<u64>().ok())
+                                    .unwrap_or(1);
+                                Some(Duration::from_secs(wait))
+                            }
+                            Ok(answer) => {
+                                writes.lock().unwrap().failed += 1;
+                                eprintln!("a write failed: {}", answer.status());
+                                None
+                            }
+                            Err(error) => {
+                                writes.lock().unwrap().failed += 1;
+                                eprintln!("a write failed: {error}");
+                                None
                             }
                         };
-                        json!({
-                            "op": "upsert",
-                            "collection": COLLECTION,
-                            "id": object_id(at, n).0,
-                            "properties": { "text": row.text, "n": n, "bucket": row.bucket },
-                            "vector": row.vector,
-                        })
-                    })
-                    .collect();
-                let body = json!({ "changes": changes });
-                let route = format!("{url}/v1/tenants/{}/changes", tenant_id(at));
-                loop {
-                    // None once written or given up; else the wait it was
-                    // told before it is tried again.
-                    let refused = match http_json(&http, route.clone(), &body).await {
-                        Ok(answer) if answer.status().is_success() => {
-                            let mut done = writes.lock().unwrap();
-                            done.rows += bench.batch as u64;
-                            done.batches += 1;
-                            None
+                        let Some(wait) = refused else { break };
+                        tokio::time::sleep(wait).await;
+                        if !soaking.load(Ordering::SeqCst) {
+                            break;
                         }
-                        Ok(answer) if answer.status().as_u16() == 429 => {
-                            writes.lock().unwrap().refused += 1;
-                            let wait = answer
-                                .headers()
-                                .get("retry-after")
-                                .and_then(|wait| wait.to_str().ok()?.parse::<u64>().ok())
-                                .unwrap_or(1);
-                            Some(Duration::from_secs(wait))
-                        }
-                        Ok(answer) => {
-                            writes.lock().unwrap().failed += 1;
-                            eprintln!("a write failed: {}", answer.status());
-                            None
-                        }
-                        Err(error) => {
-                            writes.lock().unwrap().failed += 1;
-                            eprintln!("a write failed: {error}");
-                            None
-                        }
-                    };
-                    let Some(wait) = refused else { break };
-                    tokio::time::sleep(wait).await;
-                    if !soaking.load(Ordering::SeqCst) {
-                        break;
                     }
+                    k += 1;
                 }
-                k += 1;
             }
-            passages
-        }
-    });
+        }));
+    }
 
     // The readers, back to back.
     let reads: Vec<Arc<Mutex<ReadsDone>>> = (0..bench.readers).map(|_| Arc::default()).collect();
@@ -987,6 +1088,7 @@ async fn arm(bench: Bench, running: Running) {
                 s.unflushed_bytes_peak = s.unflushed_bytes_peak.max(flushing.unflushed_bytes);
                 s.draining_peak = s.draining_peak.max(node.merges().draining);
                 let at = started.elapsed().as_secs_f64();
+                let (mut writers_resident, mut writers) = (0, 0);
                 for (tenant, figures) in node.tenant_figures() {
                     let tenant = tenant.to_string();
                     s.tenant_unflushed_peak = s.tenant_unflushed_peak.max(figures.unflushed);
@@ -998,11 +1100,41 @@ async fn arm(bench: Bench, running: Running) {
                     {
                         s.clustered_merges_seen += 1;
                     }
+                    writers_resident += figures.resident;
+                    writers += 1;
                     if tick.is_multiple_of(40) {
                         let segments = (figures.clustered + figures.plain) as f64;
                         let point = (at, segments, figures.unmerged_rows as f64);
                         s.debt.entry(tenant).or_default().push(point);
                     }
+                }
+                if tick.is_multiple_of(40) {
+                    let held = GLOBAL.held();
+                    let census = node.census().holding;
+                    let merges = node.merges();
+                    let let_go = node.let_go();
+                    s.memory.push(json!({
+                        "t": at,
+                        "allocated": held.map(|held| held.allocated),
+                        "allocator_resident": held.map(|held| held.resident),
+                        "rss_anon": rss_anon(),
+                        "resident_now": node.resident(),
+                        "writers_now": writers,
+                        "writers_resident_now": writers_resident,
+                        "census_writers": census.writers,
+                        "census_copies": census.copies,
+                        "census_resident": census.resident,
+                        "census_largest": census.largest,
+                        "merge_builds_under_way": node.merge_builds().under_way(),
+                        "draining": merges.draining,
+                        "largest_merge_build": merges.largest,
+                        "unflushed_bytes": flushing.unflushed_bytes,
+                        "let_go_budget": let_go.for_budget,
+                        "let_go_idle": let_go.idle,
+                        "sweeps": node.sweeps(),
+                        "kept_by_sweeps": node.tenants_kept_by_sweeps(),
+                        "stopped_for_budget": merges.stopped_for_budget,
+                    }));
                 }
                 drop(s);
                 events.lock().unwrap().extend(node.timings().drain_events());
@@ -1021,7 +1153,9 @@ async fn arm(bench: Bench, running: Running) {
     soaking.store(false, Ordering::SeqCst);
     let soaked = started.elapsed();
     let cpu_after = cpu_by_pool();
-    let _passages = writer.await.unwrap();
+    for writer in writers {
+        writer.await.unwrap();
+    }
     for task in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(150), task).await;
     }
@@ -1055,6 +1189,23 @@ async fn arm(bench: Bench, running: Running) {
         .into_iter()
         .filter(|event| event.at >= started && event.at <= soak_end)
         .collect();
+    // Every event as timed, for working out what happened when.
+    let raw: Vec<Value> = events
+        .iter()
+        .map(|event| {
+            json!({
+                "timed": format!("{:?}", event.timed),
+                "partition": event.partition,
+                "took": event.took.as_secs_f64(),
+                "at": (event.at - started).as_secs_f64(),
+            })
+        })
+        .collect();
+    std::fs::write(
+        bench.out.join(format!("events-{}.json", bench.arm.name())),
+        serde_json::to_string(&raw).unwrap(),
+    )
+    .unwrap();
     let of = |timed: Timed| -> Vec<f64> {
         events
             .iter()
@@ -1213,26 +1364,17 @@ async fn arm(bench: Bench, running: Running) {
         },
         "backlog_refusals": { "refused": backlogged, "mark": "no more than arm (a)'s" },
     });
-    let invalid: Vec<String> = [
-        (
-            let_go_wait.is_empty(),
-            "no flush before letting a tenant go",
-        ),
-        (
-            sampled.clustered_merges_seen == 0,
-            "no clustered merge (over 200k rows) committed",
-        ),
-        (
-            !sampled.nice_wrong.is_empty() || sampled.nice_checks == 0,
-            "the priorities were not as the arm says, or were never checked",
-        ),
-        (!running.as_the_image(), "not run as the image runs"),
-        (!bench.is_measurement(), "a smoke, not the measurement"),
-    ]
-    .into_iter()
-    .filter(|(wrong, _)| *wrong)
-    .map(|(_, why)| why.to_string())
-    .collect();
+    let invalid = Validity {
+        let_go_flushes: let_go_wait.len(),
+        clustered_merges: sampled.clustered_merges_seen,
+        nice_checks: sampled.nice_checks,
+        nice_wrong: sampled.nice_wrong.len(),
+        as_the_image: running.as_the_image(),
+        measurement: bench.is_measurement(),
+        rows_written_a_second: writes.rows as f64 / soaked.as_secs_f64(),
+        rows_a_second: bench.rows_a_second,
+    }
+    .invalid();
 
     let report = json!({
         "arm": bench.arm.name(),
@@ -1277,6 +1419,7 @@ async fn arm(bench: Bench, running: Running) {
             "tenant_unflushed_peak": sampled.tenant_unflushed_peak,
         },
         "cpu_s_by_pool": cpu,
+        "memory_series": sampled.memory,
         "nice": { "checks": sampled.nice_checks, "wrong": sampled.nice_wrong },
     });
     let path = bench.out.join(format!("arm-{}.json", bench.arm.name()));
