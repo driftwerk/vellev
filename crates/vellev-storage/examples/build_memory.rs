@@ -213,12 +213,13 @@ async fn written(writer: &Writer, random: &mut Random, shape: Shape, first: usiz
 /// `work`, with what it held: its peak above what was held as it began,
 /// and each crest it came to.
 async fn measured<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
-    let before = COUNTING.now.load(Ordering::SeqCst);
-    COUNTING.peak.store(before, Ordering::SeqCst);
     static SAMPLING: AtomicBool = AtomicBool::new(false);
     SAMPLING.store(true, Ordering::SeqCst);
-    let sampler = std::thread::spawn(|| {
-        let mut samples = Vec::with_capacity(4_000_000);
+    // Made first, so that what it holds is held before as well as after.
+    let mut samples = Vec::with_capacity(4_000_000);
+    let before = COUNTING.now.load(Ordering::SeqCst);
+    COUNTING.peak.store(before, Ordering::SeqCst);
+    let sampler = std::thread::spawn(move || {
         while SAMPLING.load(Ordering::SeqCst) && samples.len() < samples.capacity() {
             samples.push(COUNTING.now.load(Ordering::SeqCst));
             std::thread::sleep(Duration::from_millis(1));
@@ -237,21 +238,29 @@ async fn measured<T>(what: &str, work: impl std::future::Future<Output = T>) -> 
     done
 }
 
-/// The crests of `samples`, in MB above `before`: each highest point between
-/// falls of at least a fiftieth of what the peak came to.
+/// The crests of `samples`, in MB above `before`: each high that falls by at
+/// least a fiftieth of what the peak came to, before it rises by as much.
 fn crests(samples: &[usize], before: usize, peak: usize) -> Vec<f64> {
     let fall = peak.saturating_sub(before) / 50;
+    let in_mb = |held: usize| (held as f64 / MB * 10.0).round() / 10.0;
     let mut crests = Vec::new();
-    let mut high = 0;
+    let (mut high, mut low, mut falling) = (0, 0, false);
     for sample in samples.iter().map(|sample| sample.saturating_sub(before)) {
-        if sample > high {
+        if falling {
+            low = low.min(sample);
+            if sample > low + fall {
+                (high, falling) = (sample, false);
+            }
+        } else if sample > high {
             high = sample;
         } else if sample + fall < high {
-            crests.push((high as f64 / MB * 10.0).round() / 10.0);
-            high = sample;
+            crests.push(in_mb(high));
+            (low, falling) = (sample, true);
         }
     }
-    crests.push((high as f64 / MB * 10.0).round() / 10.0);
+    if !falling {
+        crests.push(in_mb(high));
+    }
     crests
 }
 
