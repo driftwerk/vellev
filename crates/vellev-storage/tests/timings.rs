@@ -157,8 +157,8 @@ async fn rows_due_while_a_flush_builds_are_timed_from_when_they_fell_due() {
 }
 
 /// Rule 3. A spell at the backlog runs from the rows unflushed coming to
-/// it until the commit that takes the tenant below it, not until the flush
-/// that does so begins.
+/// it until the commit that takes the tenant below it: not from the flush
+/// that does so beginning, which comes a while later, nor to it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_spell_at_the_backlog_runs_to_the_commit_that_ends_it() {
     let mut cluster = Cluster::new().await;
@@ -167,6 +167,7 @@ async fn a_spell_at_the_backlog_runs_to_the_commit_that_ends_it() {
     let writer = timed_writer(&cluster, &timings, 2 * DUE, MergeBuilds::new(1)).await;
     let capped = Instant::now();
     writer.commit(notes(0, 2 * DUE)).await.unwrap();
+    tokio::time::sleep(HELD).await;
     paused.armed.store(true, Ordering::SeqCst);
     let flushing = tokio::spawn({
         let writer = writer.clone();
@@ -181,8 +182,9 @@ async fn a_spell_at_the_backlog_runs_to_the_commit_that_ends_it() {
     let spells = kept(&timings.drain_events(), Timed::Backlog);
     assert_eq!(spells.len(), 1, "one spell: {spells:?}");
     assert!(
-        spells[0] >= HELD && spells[0] <= spell,
-        "the spell timed {:?}, held {HELD:?}, at most {spell:?}",
+        spells[0] >= 2 * HELD && spells[0] <= spell,
+        "the spell timed {:?}: at the backlog {HELD:?} before the flush began, which was \
+         held {HELD:?}, and at most {spell:?} in all",
         spells[0]
     );
 }
