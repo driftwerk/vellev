@@ -2891,6 +2891,10 @@ async fn a_stopped_merges_upload_is_aborted_and_nothing_is_left() {
 /// that were under way, the one that missed its pace and those dropped
 /// beside it, run on to their end and are remembered: opened again, it
 /// sums nothing and opens, rather than needing an attempt for each file.
+///
+/// The disk is made slow, not hoped slow: each piece of a check takes two
+/// seconds, twice the longest the load waits for one, so every check
+/// misses, however quickly the machine reads a file it has just written.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn on_a_slow_disk_every_check_under_way_when_a_load_fails_is_remembered() {
@@ -2906,10 +2910,11 @@ async fn on_a_slow_disk_every_check_under_way_when_a_load_fails_is_remembered() 
         .commit(vec![Mutation::CreateCollection(Box::new(wide))])
         .await
         .unwrap();
+    // Each segment's vectors are 8 MB: two pieces of a check.
     let mut random = Random(23);
     for segment in 0..3u32 {
-        for start in (0..3_900u32).step_by(500) {
-            let notes = (start..3_900.min(start + 500)).map(|n| Mutation::Upsert {
+        for start in (0..2_000u32).step_by(500) {
+            let notes = (start..2_000.min(start + 500)).map(|n| Mutation::Upsert {
                 collection: name("notes"),
                 id: ObjectId(uuid::Uuid::from_u128(u128::from(segment * 10_000 + n) + 1)),
                 properties: json!({ "n": n }).as_object().unwrap().clone(),
@@ -2931,18 +2936,27 @@ async fn on_a_slow_disk_every_check_under_way_when_a_load_fails_is_remembered() 
             .unwrap();
         copy.set_modified(earlier).unwrap();
     }
-    // A disk that must give far more than any does: every check misses
-    // its pace, and the first to be given up fails the load.
-    let slow = Disk::new(Duration::from_millis(10), 1_000_000_000_000, 4)
+    // A disk a load waits a second for, each piece of whose checks takes
+    // two: every check misses, and the first given up fails the load.
+    let slow = Disk::new(Duration::from_secs(1), 1_000_000_000_000, 4)
         .loading_at_once(4)
-        .unwrap();
-    let slowly: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(inner.clone(), dir.path()).on(slow));
+        .unwrap()
+        .each_piece_taking(Duration::from_secs(2));
+    let slowly: Arc<dyn Blobs> =
+        Arc::new(CachedBlobs::new(inner.clone(), dir.path()).on(slow.clone()));
     assert!(
         cluster.open_on(slowly.clone()).await.is_err(),
         "too slow to open"
     );
     // The checks under way run on to their end meanwhile.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    let ended = async {
+        while slow.steps_under_way() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(120), ended)
+        .await
+        .expect("the checks under way end");
     let opened = tokio::time::timeout(Duration::from_secs(30), cluster.open_on(slowly)).await;
     let opened = opened.expect("opened in time");
     assert!(

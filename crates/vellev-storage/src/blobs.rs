@@ -568,6 +568,9 @@ pub struct Disk {
     moved: Arc<AtomicU64>,
     /// How many turns are had now, and how often that has changed.
     loads: Arc<Loads>,
+    /// How long each piece a step tells of takes at the least: none but
+    /// for tests (see [`Self::each_piece_taking`]).
+    piece_takes: Duration,
 }
 
 /// How many turns at a large file are had on a disk, and how many times
@@ -680,11 +683,14 @@ const LOADING_STILL_BEYOND: Duration = Duration::from_secs(30);
 /// and with it how far everything reading or writing large files on its
 /// disk has.
 #[derive(Debug, Clone, Default)]
-pub struct Progress(Arc<AtomicU64>, Arc<AtomicU64>);
+pub struct Progress(Arc<AtomicU64>, Arc<AtomicU64>, Duration);
 
 impl Progress {
     /// Tell of `bytes` more done.
     pub fn made(&self, bytes: usize) {
+        if !self.2.is_zero() {
+            std::thread::sleep(self.2);
+        }
         self.0.fetch_add(bytes as u64, Ordering::Relaxed);
         self.1.fetch_add(1, Ordering::Relaxed);
     }
@@ -733,8 +739,28 @@ impl Disk {
             still_for: Duration::ZERO,
             moved: Arc::default(),
             loads: Arc::default(),
+            piece_takes: Duration::ZERO,
         }
         .fetching(&Transfers::default())
+    }
+
+    /// As this disk, each piece a step on it tells of taking at least
+    /// `taking`, before it is told of: a disk slower than any machine's
+    /// cache of a file just written, for tests that need a step to miss
+    /// its pace whatever the machine. Not for use.
+    #[doc(hidden)]
+    pub fn each_piece_taking(self, taking: Duration) -> Self {
+        Self {
+            piece_takes: taking,
+            ..self
+        }
+    }
+
+    /// How many steps are on this disk's threads now, waited for or given
+    /// up and running on. For tests.
+    #[doc(hidden)]
+    pub fn steps_under_way(&self) -> usize {
+        self.threads.most - self.threads.free.available_permits()
     }
 
     /// As this disk, with files fetched to it from a store as `transfers`
@@ -893,7 +919,7 @@ impl Disk {
 
     /// Word of how far a step with a turn at a large file has got.
     pub(crate) fn progress(&self) -> Progress {
-        Progress(Arc::default(), self.moved.clone())
+        Progress(Arc::default(), self.moved.clone(), self.piece_takes)
     }
 
     /// How many whole large files this disk reads or writes at once.
