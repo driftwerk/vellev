@@ -14,6 +14,9 @@ use vellev_index::stop::{Stage, Stop};
 pub enum MergeStage {
     /// Before it plans, once its turn to merge has come.
     Planning,
+    /// Waiting for a turn among the node's merge builds, before it gathers,
+    /// or, without one, for its partition's building lock.
+    Queued,
     /// Copying the run's live rows out, between its segments.
     Gathering,
     /// Waiting for a turn among the work done off the async threads.

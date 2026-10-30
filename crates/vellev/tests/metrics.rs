@@ -274,6 +274,13 @@ async fn what_waits_for_a_flush_and_flushes_that_failed_are_reported() {
     };
     assert_eq!(value("vellev_flush_failures_total"), Some(0.0), "{text}");
     assert_eq!(value("vellev_writes_backlogged_total"), Some(0.0), "{text}");
+    assert_eq!(
+        value("vellev_merge_turns_let_go_total"),
+        Some(0.0),
+        "{text}"
+    );
+    assert_eq!(value("vellev_merge_draining_bytes"), Some(0.0), "{text}");
+    assert_eq!(value("vellev_merge_abandoned_bytes"), Some(0.0), "{text}");
     assert!(
         value("vellev_unflushed_rows").is_some_and(|rows| rows >= 1.0),
         "{text}"

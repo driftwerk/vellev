@@ -114,6 +114,12 @@ impl Gathering {
         (start < end).then(|| bytemuck::cast_slice(&self.words[AHEAD + start..AHEAD + end]))
     }
 
+    /// About how many bytes the gathering holds: room for every value and
+    /// where each row's start, made beforehand.
+    pub fn bytes(&self) -> usize {
+        self.words.capacity() * 4 + self.offsets.capacity() * 8
+    }
+
     /// The gathered rows as a column whose values lie in its frame, stamped
     /// as format `version`.
     pub fn finish(self, version: u16) -> Column {
@@ -167,6 +173,12 @@ impl Column {
             Values::Framed(frame, _) => frame.words.len() * 4,
         };
         values + self.offsets.len() * 8
+    }
+
+    /// About how many bytes the column's vectors and offsets take wherever
+    /// they lie: what a copy of it in memory would take.
+    pub fn bytes(&self) -> usize {
+        self.values().len() * 4 + self.offsets.len() * 8
     }
 
     pub fn get(&self, row: usize) -> Option<&[f32]> {

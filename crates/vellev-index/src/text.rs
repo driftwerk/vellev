@@ -240,6 +240,47 @@ struct TokenizedField {
 }
 
 impl TextIndex {
+    /// About how many bytes the index takes in memory: each property's
+    /// rows and their lengths, and each token's text, its place in the
+    /// property's map and its postings. Rough, and a walk over every token.
+    pub fn resident(&self) -> usize {
+        // A slot of the map, taken or not, and its control byte.
+        const SLOT: usize = std::mem::size_of::<(String, Postings)>() + 1;
+        self.fields
+            .iter()
+            .map(|(name, field)| {
+                let tokens: usize = field
+                    .postings
+                    .iter()
+                    .map(|(token, postings)| {
+                        token.capacity()
+                            + postings.holders.capacity() * 4
+                            + postings.frequencies.capacity() * 4
+                            + postings.blocks.capacity() * std::mem::size_of::<Block>()
+                    })
+                    .sum();
+                name.capacity()
+                    + field.rows.capacity() * 4
+                    + field.lengths.capacity() * 4
+                    + field.postings.capacity() * SLOT
+                    + tokens
+            })
+            .sum()
+    }
+
+    /// About how many bytes the index's rows take tokenized all at once,
+    /// as [`Self::tokenize`] gives them before they are indexed: for every
+    /// token a row holds, the token and how often it occurs. Rough, and a
+    /// walk over every token.
+    pub fn tokenized_resident(&self) -> usize {
+        const HELD: usize = std::mem::size_of::<(String, u32)>();
+        self.fields
+            .values()
+            .flat_map(|field| field.postings.iter())
+            .map(|(token, postings)| postings.holders.len() * (HELD + token.len()))
+            .sum()
+    }
+
     /// `object`'s searchable text as [`Self::insert`] would index it.
     pub fn tokenize(collection: &Collection, object: &Object) -> Tokenized {
         let searchable = object.properties.iter().filter(|(name, _)| {

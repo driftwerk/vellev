@@ -754,3 +754,8 @@ up, and the builds that take one, `ClusteredIndex::build_stopping` and
 `Stop` is stopped. `pool::tune` does work on the tuning pool in turn,
 giving up while it waits if its `Stop` is stopped; a clustered build takes
 its turn to tune through it. `build` is unchanged.
+
+New, additive: `TextIndex::resident` and `RowIndex::resident`, about how
+many bytes each index takes in memory, and `TextIndex::tokenized_resident`,
+about how many its rows take tokenized all at once before they are
+indexed. A merge reckons what its build holds from them.
