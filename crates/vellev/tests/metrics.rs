@@ -499,8 +499,9 @@ async fn what_the_tenants_hold_is_reported_as_the_last_sweep_found_it() {
 /// does. A sweep lets a tenant go only if nothing but the node holds it,
 /// and over the budget stops the merges of those it must keep; a scrape
 /// that held the tenants as it read them would keep them, and have their
-/// merges stopped. Scraped without let-up while eight idle tenants put
-/// the node over its budget, every one is let go and no merge is stopped.
+/// merges stopped. Scraped without let-up from four threads while 32 idle
+/// tenants put the node over its budget, three times over, every one is
+/// let go each time and no merge is stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scraping_never_keeps_a_tenant_from_being_let_go() {
     let served = Cluster::new()
@@ -514,12 +515,9 @@ async fn scraping_never_keeps_a_tenant_from_being_let_go() {
             |app| app,
         )
         .await;
-    let tenants: Vec<String> = (0..8).map(|n| format!("t{n}")).collect();
-    for tenant in &tenants {
-        note_in(&served, tenant, 1).await;
-    }
+    let tenants: Vec<String> = (0..32).map(|n| format!("t{n}")).collect();
     let scraping = Arc::new(AtomicBool::new(true));
-    let scrapers: Vec<_> = (0..2)
+    let scrapers: Vec<_> = (0..4)
         .map(|_| {
             let (app, scraping) = (served.app.clone(), scraping.clone());
             std::thread::spawn(move || {
@@ -532,15 +530,21 @@ async fn scraping_never_keeps_a_tenant_from_being_let_go() {
             })
         })
         .collect();
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    // Let go, and a sweep since that found none.
-    while served.node.census().holding.writers > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "tenants still held: {:?}",
-            served.node.census().holding
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    for round in 1..=3u64 {
+        // Each tenant written to, which opens it, and then left idle.
+        for tenant in &tenants {
+            note_in(&served, tenant, round).await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        // Let go, and a sweep since that found none.
+        while served.node.census().holding.writers > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "round {round}: tenants still held: {:?}",
+                served.node.census().holding
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
     scraping.store(false, Ordering::Relaxed);
     let scrapes: u64 = scrapers.into_iter().map(|s| s.join().unwrap()).sum();
