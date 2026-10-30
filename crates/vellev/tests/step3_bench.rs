@@ -1038,6 +1038,40 @@ fn reads_refused_or_failed_are_in_the_p99_at_what_they_took() {
     assert_eq!(summary["windows"][0]["p99_ms"], json!(120_000.0));
 }
 
+/// Why requests failed, for the report: a count by kind, and the first
+/// few as they were said, so that a run with failures says what they were.
+#[derive(Default)]
+struct Failures {
+    by_kind: BTreeMap<String, u64>,
+    first: Vec<String>,
+}
+
+impl Failures {
+    /// The most kept as they were said.
+    const KEPT: usize = 5;
+
+    fn note(&mut self, kind: String, said: String) {
+        *self.by_kind.entry(kind).or_default() += 1;
+        if self.first.len() < Self::KEPT {
+            self.first.push(said);
+        }
+    }
+
+    fn report(&self) -> Value {
+        json!({ "by_kind": self.by_kind, "first": self.first })
+    }
+
+    /// The kind of failure an answer or an error is.
+    fn kind_of(answer: &Result<reqwest::StatusCode, reqwest::Error>) -> String {
+        match answer {
+            Ok(status) => format!("status {}", status.as_u16()),
+            Err(error) if error.is_timeout() => "timeout".into(),
+            Err(error) if error.is_body() || error.is_decode() => "body".into(),
+            Err(_) => "transport".into(),
+        }
+    }
+}
+
 /// What the writers wrote, all told and by tenant.
 #[derive(Default)]
 struct WritesDone {
@@ -1049,6 +1083,7 @@ struct WritesDone {
     /// Rows written to each tenant: every batch the schedule gives it,
     /// unless the arm could not take them all.
     by_tenant: BTreeMap<String, u64>,
+    failures: Failures,
 }
 
 /// The most of the machine's CPU its host may take for others (steal)
@@ -1981,8 +2016,12 @@ async fn load(bench: Bench, running: Running) {
                                 tokio::time::sleep(wait).await;
                             }
                             answer => {
-                                writes.lock().unwrap().failed += 1;
-                                eprintln!("a write failed: {:?}", answer.map(|a| a.status()));
+                                let answer = answer.map(|answer| answer.status());
+                                let said = format!("batch {k} of place {place}: {answer:?}");
+                                eprintln!("a write failed: {said}");
+                                let mut done = writes.lock().unwrap();
+                                done.failed += 1;
+                                done.failures.note(Failures::kind_of(&answer), said);
                                 break;
                             }
                         }
@@ -1995,11 +2034,13 @@ async fn load(bench: Bench, running: Running) {
     // The readers, back to back, each to a seeded tenant of those active
     // by the clock: reads count no rows.
     let reads: Vec<Arc<Mutex<Vec<Read>>>> = (0..bench.readers).map(|_| Arc::default()).collect();
+    let read_failures: Arc<Mutex<Failures>> = Arc::default();
     let mut readers = Vec::new();
     for (reader, done) in reads.iter().enumerate() {
         readers.push(tokio::spawn({
             let (http, url, done, queries) =
                 (http.clone(), url.clone(), done.clone(), queries.clone());
+            let failures = read_failures.clone();
             let mut random = Random(bench.seed ^ (reader as u64 + 1).wrapping_mul(0x9e37_79b9));
             async move {
                 tokio::time::sleep_until(started.into()).await;
@@ -2013,18 +2054,29 @@ async fn load(bench: Bench, running: Running) {
                         tenant_id(at)
                     );
                     let began = Instant::now();
-                    let answered = match http_json(&http, route, &body).await {
+                    let answer = match http_json(&http, route, &body).await {
                         Ok(answer) => {
-                            let status = answer.status().as_u16();
-                            let read = answer.bytes().await.is_ok();
-                            match status {
-                                200..300 if read => Answered::Yes,
-                                429 | 503 => Answered::Refused,
-                                _ => Answered::Failed,
-                            }
+                            let status = answer.status();
+                            answer.bytes().await.map(|_| status)
                         }
-                        Err(_) => Answered::Failed,
+                        Err(error) => Err(error),
                     };
+                    let answered = match &answer {
+                        Ok(status) if status.is_success() => Answered::Yes,
+                        Ok(status) if matches!(status.as_u16(), 429 | 503) => Answered::Refused,
+                        _ => Answered::Failed,
+                    };
+                    if answered == Answered::Failed {
+                        let said = format!(
+                            "a read of {} at {:?}: {answer:?}",
+                            tenant_id(at),
+                            started.elapsed()
+                        );
+                        failures
+                            .lock()
+                            .unwrap()
+                            .note(Failures::kind_of(&answer), said);
+                    }
                     done.lock().unwrap().push(Read {
                         at: (began - started).as_secs_f32(),
                         ms: began.elapsed().as_secs_f32() * 1_000.0,
@@ -2067,11 +2119,13 @@ async fn load(bench: Bench, running: Running) {
         "sha": bench.sha,
         "bench": bench.config(),
         "reads": reads_summary(&reads, soaked, bench.window.as_secs_f64()),
+        "read_failures": read_failures.lock().unwrap().report(),
         "writes": {
             "rows": writes.rows, "rows_a_second": writes.rows as f64 / soaked,
             "batches": writes.batches, "refused": writes.refused, "failed": writes.failed,
             "behind_most_s": writes.behind_most,
             "by_tenant": by_tenant, "scheduled_by_tenant": schedule.rows_by_tenant(),
+            "failures": writes.failures.report(),
         },
         "invalid": invalid,
     });
