@@ -216,6 +216,10 @@ struct Histogram {
     /// never counts it in the whole and not in a bucket (review of #169).
     buckets: [AtomicU64; BOUNDS.len() + 1],
     micros: AtomicU64,
+    /// Where an observe waits, its bucket counted and nothing else yet,
+    /// while a test reads it half observed.
+    #[cfg(test)]
+    paused: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
 }
 
 impl Histogram {
@@ -226,8 +230,20 @@ impl Histogram {
             .position(|bound| seconds <= *bound)
             .unwrap_or(BOUNDS.len());
         self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.paused_here();
         let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
         self.micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Wait while a test reads this half observed, if one asked to.
+    #[cfg(test)]
+    fn paused_here(&self) {
+        let paused = self.paused.lock().unwrap().clone();
+        if let Some(paused) = paused {
+            paused.wait();
+            paused.wait();
+        }
     }
 
     fn read(&self) -> Seconds {
@@ -492,44 +508,31 @@ mod tests {
         assert!((read.sum - 4_000.003_5).abs() < 1e-6);
     }
 
-    /// Review of #169: a histogram read while durations are observed on
-    /// other threads is whole every time: its count is never less than its
-    /// last bucket, and neither ever falls between reads.
+    /// Review of #169 (MEDIUM 1): a histogram read while a duration is
+    /// half observed, its bucket counted and nothing else yet, is whole:
+    /// its count is never less than its buckets hold. The observe is held
+    /// there while it is read, so that the race is shown every time, not
+    /// hoped for among millions of reads.
     #[test]
-    fn a_histogram_read_while_observed_is_always_whole() {
+    fn a_histogram_read_half_observed_is_whole() {
         let timings = std::sync::Arc::new(Timings::default());
-        let observing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let observers: Vec<_> = (0..4)
-            .map(|n| {
-                let (timings, observing) = (timings.clone(), observing.clone());
-                std::thread::spawn(move || {
-                    let mut i = 0u64;
-                    while observing.load(Ordering::Relaxed) {
-                        // Past every bound now and then, as a spell may be.
-                        let took = match i % 7 {
-                            0 => Duration::from_secs(5_000),
-                            k => Duration::from_millis(k * (n + 1)),
-                        };
-                        timings.record(Timed::Backlog, "p", took);
-                        i += 1;
-                    }
-                })
-            })
-            .collect();
-        let mut last = (0, 0);
-        for _ in 0..200_000 {
-            let read = timings.seconds(Timed::Backlog);
-            let in_buckets = read.buckets[BOUNDS.len() - 1].1;
-            assert!(read.count >= in_buckets, "{read:?}");
-            assert!(
-                read.count >= last.0 && in_buckets >= last.1,
-                "{read:?} after {last:?}"
-            );
-            last = (read.count, in_buckets);
-        }
-        observing.store(false, Ordering::Relaxed);
-        observers.into_iter().for_each(|o| o.join().unwrap());
-        assert!(last.0 > 0);
+        let timed = Timed::Backlog;
+        let paused = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *timings.histograms[timed.slot()].paused.lock().unwrap() = Some(paused.clone());
+        let observing = {
+            let timings = timings.clone();
+            std::thread::spawn(move || timings.record(timed, "p", Duration::from_millis(3)))
+        };
+        // Its bucket is counted, and it waits there until read.
+        paused.wait();
+        let half = timings.seconds(timed);
+        paused.wait();
+        observing.join().unwrap();
+        let in_buckets = half.buckets[BOUNDS.len() - 1].1;
+        assert_eq!(in_buckets, 1, "{half:?}");
+        assert!(half.count >= in_buckets, "{half:?}");
+        let whole = timings.seconds(timed);
+        assert_eq!((whole.count, whole.buckets[BOUNDS.len() - 1].1), (1, 1));
     }
 
     #[test]
