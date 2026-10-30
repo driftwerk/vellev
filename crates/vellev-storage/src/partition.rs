@@ -27,12 +27,13 @@ use crate::format::{
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
 use crate::merge_builds::{
-    MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
+    HeldAt, MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::published::Published;
 use crate::state::{
-    self, Discarded, Figures, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
+    self, Discarded, Figures, Fit, Indexes, Loaded, Merge, Merging, Names, Reckoning, Shape,
+    Snapshot, State, Stored,
 };
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Refusal, Result, StorageError};
@@ -59,6 +60,11 @@ const CLEANING_AT_ONCE: usize = 16;
 /// from a store that answers as stores do, and no longer than anything
 /// that waits for it can well wait.
 const CLEANING_WITHIN: Duration = Duration::from_secs(60);
+
+/// How many of a segment's rows a merge gathers between one asking of its
+/// stop and the next: so that it gives up within this many rows, however
+/// large the segment.
+pub const GATHERED_AT_ONCE: usize = 4_096;
 
 /// A segment built and ready to write: its file without the rows'
 /// vectors, which the column holds, its indexes, and the frames of the
@@ -98,7 +104,7 @@ fn segment_built(
     let probe = build.and_then(MergeBuild::probe);
     let mut file = file;
     if let Some(build) = build {
-        build.held_here(stopping, false);
+        build.held_here(stopping, HeldAt::Start);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
     let vectors = vectors.map(|gathered| gathered.finish(format));
@@ -137,7 +143,7 @@ fn segment_built(
     // Here, off the async threads and the state's lock, once.
     let parts = state::Parts::of(&file, &indexes);
     if let Some(build) = build {
-        build.held_here(stopping, true);
+        build.held_here(stopping, HeldAt::Built);
     }
     Ok(Some(Built {
         file,
@@ -1172,6 +1178,18 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct MergeGate {
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+}
+
+/// A merge as it was planned, with all it takes of the state to build.
+struct MergePlanned {
+    merge: Merge,
+    /// What it is reckoned to hold at its peak, as it is planned.
+    reckoning: Reckoning,
+    /// The position its files are named at, and its rows taken at.
+    named_at: LogPosition,
+    catalog: Catalog,
+    /// Which of each segment's rows were live.
+    alive: Vec<Vec<bool>>,
 }
 
 /// A merge's uploads kept from [`Writer::clean`] while it is under way,
@@ -2872,25 +2890,29 @@ impl Writer {
         };
         let build = Arc::new(build);
         let planned = planned.unwrap_or_else(|| self.epoch());
-        let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
+        let Some(plan) = self.merge_planned() else {
             return Ok(None);
         };
+        let MergePlanned {
+            merge,
+            reckoning,
+            named_at,
+            catalog,
+            alive,
+        } = plan;
         let above = self.merging.clustered_above;
-        let reckoning = self
-            .partition
-            .read(|state| state.merge_reckoning(&merge, above));
         build.reckon_planned(reckoning.peak());
-        let Some((file, vectors, copied, shape, named_at, alive)) = self.partition.read(|state| {
-            let named_at = state.position();
-            let (file, vectors, copied) = state.merged(&merge, named_at, &stopping)?;
+        let Some((file, vectors, copied, shape)) = self.partition.read(|state| {
+            let at_chunk = |rows| build.gathering(rows, &stopping);
+            let chunk = GATHERED_AT_ONCE;
+            let (file, vectors, copied) =
+                state.merged(&merge, named_at, &stopping, chunk, at_chunk)?;
             let tombstones = file.tombstones.len();
-            let shape =
-                Shape::of_gathered(state.catalog(), &file.rows, &vectors, tombstones, above);
-            Some((file, vectors, copied, shape, named_at, state.alive(&merge)))
+            let shape = Shape::of_gathered(&catalog, &file.rows, &vectors, tombstones, above);
+            Some((file, vectors, copied, shape))
         }) else {
             return Ok(None);
         };
-        let catalog = self.partition.read(|state| state.catalog().clone());
         drop(planning);
         let reckoning = reckoning.gathered(file.rows.len(), copied, &vectors);
         build.reckon(reckoning.peak());
@@ -3004,6 +3026,21 @@ impl Writer {
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
         Ok(Some(position))
+    }
+
+    /// The merge most worth doing, as the state stands, with all it needs
+    /// of the state: made with the building lock held.
+    fn merge_planned(&self) -> Option<MergePlanned> {
+        self.partition.read(|state| {
+            let merge = state.merge_plan(&self.merging)?;
+            Some(MergePlanned {
+                reckoning: state.merge_reckoning(&merge, self.merging.clustered_above),
+                named_at: state.position(),
+                catalog: state.catalog().clone(),
+                alive: state.alive(&merge),
+                merge,
+            })
+        })
     }
 
     /// A merge's turn among the node's merge builds, then the building lock
@@ -4289,6 +4326,34 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<()> {
             self.inner.delete(key).await
         }
+    }
+
+    /// M4-G6: what a merge takes with the building lock and the state's
+    /// held comes to a walk of the run's segments and a copy of their
+    /// marks' words: no row of them is touched, however many there are.
+    #[tokio::test]
+    async fn a_merge_is_planned_touching_no_row() {
+        let (writer, _) = writer_on(Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))).await;
+        let merging = Merging {
+            fanout: 2,
+            ..Merging::default()
+        };
+        let writer = writer.merging_with(merging);
+        writer.commit(vec![create()]).await.unwrap();
+        for segment in 0..2 {
+            let rows = (0..100).map(|n| upsert(segment * 100 + n));
+            writer.commit(rows.collect()).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        let gone = Mutation::Delete {
+            collection: notes(),
+            id: ObjectId(uuid::Uuid::from_u128(3)),
+            only_if_version: None,
+        };
+        writer.commit(vec![gone]).await.unwrap();
+        let (planned, touched) = state::touching(|| writer.merge_planned());
+        assert!(planned.is_some(), "there is a merge to plan");
+        assert_eq!(touched, 0, "the plan touched {touched} rows");
     }
 
     #[tokio::test]
