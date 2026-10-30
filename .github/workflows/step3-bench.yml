@@ -23,7 +23,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       # A smoke: set to 1800 and 1 to measure (§9.5).
-      STEP3_SOAK_SECS: '300'
+      STEP3_SOAK_SECS: '900'
       STEP3_SCALE: '1'
       ARMS: 'b'
     steps:
@@ -73,5 +73,6 @@ jobs:
             /mnt/step3/out/*.txt
             /mnt/step3/out/*.log
             /mnt/step3/out/*.md
+            /mnt/step3/out/events-*.json
           retention-days: 90
           if-no-files-found: ignore
