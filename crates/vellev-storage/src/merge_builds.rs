@@ -997,7 +997,12 @@ mod nesting {
     /// by asking again as its section ends.
     #[test]
     fn sections_on_a_pool_take_turns_in_the_order_asked_for() {
-        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
         let builds = MergeBuilds::building_on(2, pool);
         let order = Arc::new(Mutex::new(Vec::new()));
         let threads: Vec<_> = (0..3u64)
@@ -1022,7 +1027,12 @@ mod nesting {
     /// behind the one it is in.
     #[test]
     fn a_section_begun_inside_another_is_counted() {
-        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
         for builds in [MergeBuilds::building_on(2, pool), MergeBuilds::new(2)] {
             let on = OnPool::merge(&builds);
             assert_eq!(on.section("outer", || on.section("inner", || 7)), 7);

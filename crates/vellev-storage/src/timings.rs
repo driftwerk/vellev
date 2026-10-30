@@ -65,6 +65,9 @@ pub enum MergePhase {
     /// Building the merged segment: indexing and encoding it, without the
     /// lock.
     Build,
+    /// As long as a build ran that was stopped before it was done: work
+    /// spent, though no merge came of it.
+    BuildStopped,
     /// Uploading its files.
     Upload,
     /// Loading it back, and seeing it fit to adopt.
@@ -72,10 +75,11 @@ pub enum MergePhase {
 }
 
 impl MergePhase {
-    pub const ALL: [MergePhase; 5] = [
+    pub const ALL: [MergePhase; 6] = [
         MergePhase::Turn,
         MergePhase::Gather,
         MergePhase::Build,
+        MergePhase::BuildStopped,
         MergePhase::Upload,
         MergePhase::Load,
     ];
@@ -85,6 +89,7 @@ impl MergePhase {
             MergePhase::Turn => "turn",
             MergePhase::Gather => "gather",
             MergePhase::Build => "build",
+            MergePhase::BuildStopped => "build_stopped",
             MergePhase::Upload => "upload",
             MergePhase::Load => "load",
         }

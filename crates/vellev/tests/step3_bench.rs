@@ -740,6 +740,82 @@ fn process(bench: &Bench) -> Value {
     json!({ "scope_made": bench.scope, "cgroup": cgroup() })
 }
 
+/// What the machine is, as far as two arms must share it to be compared.
+fn machine() -> Value {
+    let line_of = |path: &str, field: &str| {
+        let text = std::fs::read_to_string(path).ok()?;
+        let line = text.lines().find(|line| line.starts_with(field))?;
+        Some(line.split_once(':')?.1.trim().to_string())
+    };
+    json!({
+        "cpu_model": line_of("/proc/cpuinfo", "model name"),
+        "memory": line_of("/proc/meminfo", "MemTotal"),
+        "threads": std::thread::available_parallelism().map_or(1, usize::from),
+        "os": std::env::consts::OS,
+    })
+}
+
+/// How long `cpu.stat` says a cgroup was held back by its CPU limit.
+fn throttled_usec(cpu_stat: &str) -> Option<u64> {
+    cpu_stat
+        .lines()
+        .find_map(|line| line.strip_prefix("throttled_usec "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// How long the process's cgroup has been held back by its CPU limit.
+fn cgroup_throttled() -> Option<u64> {
+    let path = cgroup()?;
+    throttled_usec(&std::fs::read_to_string(format!("/sys/fs/cgroup{path}/cpu.stat")).ok()?)
+}
+
+#[test]
+fn a_cgroups_throttling_is_read_from_its_cpu_stat() {
+    let stat = "usage_usec 10\nnr_throttled 2\nthrottled_usec 1234\n";
+    assert_eq!(throttled_usec(stat), Some(1_234));
+    assert_eq!(throttled_usec("usage_usec 10\n"), None);
+}
+
+/// The share of the CPU stolen in the worst interval of `samples` within
+/// each window of `window_s`, and of the whole soak: a short spell a
+/// whole soak's share hides. `samples` are (seconds in, stolen ticks, all
+/// ticks), as sampled.
+fn steal_peaks(samples: &[(f64, u64, u64)], window_s: f64) -> Value {
+    let mut windows: BTreeMap<u64, f64> = BTreeMap::new();
+    for pair in samples.windows(2) {
+        let (ticks, stolen) = (pair[1].2 - pair[0].2, pair[1].1 - pair[0].1);
+        if ticks > 0 {
+            let share = stolen as f64 / ticks as f64;
+            let peak = windows.entry((pair[1].0 / window_s) as u64).or_default();
+            *peak = peak.max(share);
+        }
+    }
+    let peak = windows.values().copied().fold(0.0, f64::max);
+    let windows: Vec<Value> = windows
+        .into_iter()
+        .map(|(window, peak)| json!({ "from_s": window as f64 * window_s, "peak": peak }))
+        .collect();
+    json!({ "peak": peak, "windows": windows })
+}
+
+/// A spell of steal shows as its window's peak though the soak's share
+/// is small (review of #169).
+#[test]
+fn a_spell_of_steal_shows_in_its_windows_peak() {
+    let samples = [
+        (0.0, 0, 0),
+        (10.0, 0, 1_000),
+        (20.0, 300, 2_000),
+        (310.0, 300, 31_000),
+    ];
+    let peaks = steal_peaks(&samples, 300.0);
+    assert_eq!(peaks["peak"], json!(0.3), "{peaks}");
+    assert_eq!(peaks["windows"][0]["peak"], json!(0.3), "{peaks}");
+    assert_eq!(peaks["windows"][1]["peak"], json!(0.0), "{peaks}");
+}
+
 /// The machine's CPU ticks so far, from `/proc/stat`: those its host
 /// took for others (steal), and all of them.
 fn cpu_ticks() -> Option<(u64, u64)> {
@@ -862,11 +938,10 @@ fn pool_of(name: &str) -> &'static str {
     for (prefix, pool) in [
         ("vellev-read", "reads"),
         ("vellev-merge", "merges"),
-        ("vellev-tune-wa", "tuning_wait"),
         ("vellev-tune", "tuning"),
         ("vellev-pass", "passes"),
         ("vellev-build", "global"),
-        ("tokio-runtime-w", "tokio"),
+        (RUNTIME_THREADS, "tokio"),
         ("jemalloc_bg_thd", "jemalloc"),
     ] {
         if name.starts_with(prefix) {
@@ -874,6 +949,29 @@ fn pool_of(name: &str) -> &'static str {
         }
     }
     "other"
+}
+
+/// What the bench's runtime names its threads, workers and blocking ones
+/// alike: named here, as tokio's own name for them changes between
+/// releases (review of #169).
+const RUNTIME_THREADS: &str = "vellev-rt";
+
+/// Each thread's pool, told from its name, so that CPU lands under the
+/// pool that spent it and not under "other" (review of #169).
+#[test]
+fn a_threads_pool_is_told_from_its_name() {
+    for (name, pool) in [
+        ("vellev-rt", "tokio"),
+        ("vellev-merge-1", "merges"),
+        ("vellev-build-3", "global"),
+        ("vellev-read-0", "reads"),
+        ("vellev-tune", "tuning"),
+        ("vellev-pass", "passes"),
+        ("jemalloc_bg_thd", "jemalloc"),
+        ("something", "other"),
+    ] {
+        assert_eq!(pool_of(name), pool, "{name}");
+    }
 }
 
 /// CPU seconds by pool: the threads there are now, and what the process
@@ -895,8 +993,7 @@ fn cpu_by_pool() -> BTreeMap<String, f64> {
 
 /// Each thread whose priority is not as the arm says it must be (§9.2):
 /// the merge pool's at the arm's nice and as many as it has, the passes'
-/// at its own, a thread waiting for tuning as whatever made it, and every
-/// other at the process's.
+/// at its own, and every other at the process's.
 fn nice_wrong(pool: MergePool) -> Vec<String> {
     let (threads, nice) = match pool {
         MergePool::Global => (0, 0),
@@ -911,7 +1008,6 @@ fn nice_wrong(pool: MergePool) -> Vec<String> {
                 nice
             }
             "passes" => PASSES_NICE,
-            "tuning_wait" => continue,
             _ => 0,
         };
         if task.nice != expected {
@@ -942,6 +1038,8 @@ struct Sampled {
     draining_peak: usize,
     nice_checks: u64,
     nice_wrong: Vec<String>,
+    /// The machine's CPU ticks every 10 s: (seconds in, stolen, all).
+    steal: Vec<(f64, u64, u64)>,
     /// What the node holds, as it reckons it and as it really is, every
     /// 10 s: for telling where memory goes past the budget.
     memory: Vec<Value>,
@@ -1080,10 +1178,38 @@ struct WritesDone {
     refused: u64,
     failed: u64,
     behind_most: f64,
+    /// Which batch fell furthest behind, and when: for finding the cause.
+    worst_lag: Option<Value>,
+    /// The batch that took longest to be taken, retries among it.
+    slowest_batch: Option<(f64, Value)>,
+    /// Batches written after the soak's end, and how long after at most.
+    late: u64,
+    late_most: f64,
     /// Rows written to each tenant: every batch the schedule gives it,
     /// unless the arm could not take them all.
     by_tenant: BTreeMap<String, u64>,
     failures: Failures,
+}
+
+/// How long past the soak's end the writers may go on to write the batches
+/// the schedule gives: one batch late at the end does not void an arm, and
+/// the marks, windowed to the soak's end, never see them.
+const LATE_AT_MOST: Duration = Duration::from_secs(60);
+
+/// Whether a writer gives up on a batch at `now`: only once it is past
+/// the soak's end by more than may be.
+fn past_late(now: Instant, soak_end: Instant) -> bool {
+    now >= soak_end + LATE_AT_MOST
+}
+
+/// A batch at the soak's end, or within a minute of it, is still written
+/// (review of #169).
+#[test]
+fn a_batch_late_at_the_end_is_still_written_for_a_while() {
+    let end = Instant::now();
+    assert!(!past_late(end, end));
+    assert!(!past_late(end + Duration::from_secs(59), end));
+    assert!(past_late(end + Duration::from_secs(60), end));
 }
 
 /// The most of the machine's CPU its host may take for others (steal)
@@ -1102,6 +1228,9 @@ struct NodeValidity {
     /// The share of the machine's CPU stolen through the soak, if read.
     steal: Option<f64>,
     load_reported: bool,
+    /// Sections of merge builds begun inside another: none, or a thread of
+    /// the pool held up one build with another's work.
+    nested_sections: u64,
 }
 
 impl NodeValidity {
@@ -1127,6 +1256,8 @@ impl NodeValidity {
             (!self.measurement).then(|| "a smoke, not the measurement".to_string()),
             steal,
             (!self.load_reported).then(|| "the load generator never reported".to_string()),
+            (self.nested_sections > 0)
+                .then(|| format!("{} sections began inside another", self.nested_sections)),
         ]
         .into_iter()
         .flatten()
@@ -1147,12 +1278,18 @@ fn an_arm_its_host_stole_from_is_invalid() {
         measurement: true,
         steal,
         load_reported: true,
+        nested_sections: 0,
     };
     assert_eq!(run(Some(0.0)).invalid(), Vec::<String>::new());
     assert_eq!(run(Some(0.05)).invalid(), Vec::<String>::new());
     let stolen = run(Some(0.08)).invalid();
     assert_eq!(stolen, vec!["steal took 8.0% of the CPU, over 5%"]);
     assert_eq!(run(None).invalid(), vec!["steal not read"]);
+    let nested = NodeValidity {
+        nested_sections: 2,
+        ..run(Some(0.0))
+    };
+    assert_eq!(nested.invalid(), vec!["2 sections began inside another"]);
 }
 
 /// What the load generator's run must have done for the arm's marks to
@@ -1161,8 +1298,15 @@ struct LoadValidity {
     as_the_image: bool,
     rows_written_a_second: f64,
     rows_a_second: usize,
+    reads: u64,
     failed_reads: u64,
+    refused_reads: u64,
 }
+
+/// The most of its reads an arm may have refused for its marks to count:
+/// each is a read a client did not get, past what a p99 can say. A tenth
+/// of a percent, a thousandth, sits below the 1% a p99 leaves out.
+const REFUSED_AT_MOST: f64 = 0.001;
 
 /// The least share of its rate an arm must write for its marks to count:
 /// one that wrote less was spared the load §3 sets.
@@ -1183,6 +1327,14 @@ impl LoadValidity {
                 )
             }),
             (self.failed_reads > 0).then(|| format!("{} reads failed", self.failed_reads)),
+            (self.refused_reads as f64 > REFUSED_AT_MOST * self.reads as f64).then(|| {
+                format!(
+                    "{} of {} reads refused, over {}%",
+                    self.refused_reads,
+                    self.reads,
+                    REFUSED_AT_MOST * 100.0
+                )
+            }),
             (!self.as_the_image).then(|| "the load generator not run as the image runs".into()),
         ]
         .into_iter()
@@ -1201,7 +1353,9 @@ fn an_arm_that_wrote_under_its_rate_is_invalid() {
         as_the_image: true,
         rows_written_a_second: written,
         rows_a_second: 1_000,
+        reads: 1_000,
         failed_reads: 0,
+        refused_reads: 0,
     };
     assert_eq!(run(1_000.0).invalid(), Vec::<String>::new());
     assert_eq!(run(951.0).invalid(), Vec::<String>::new());
@@ -1219,10 +1373,32 @@ fn an_arm_with_a_failed_read_is_invalid() {
         as_the_image: true,
         rows_written_a_second: 1_000.0,
         rows_a_second: 1_000,
+        reads: 1_000,
         failed_reads,
+        refused_reads: 0,
     };
     assert_eq!(run(0).invalid(), Vec::<String>::new());
     assert_eq!(run(1).invalid(), vec!["1 reads failed"]);
+}
+
+/// An arm that turned away over a thousandth of its reads is invalid: a
+/// refused read is over quickly, so the p99 alone would flatter it
+/// (review of #169).
+#[test]
+fn an_arm_that_refused_more_than_a_small_share_of_reads_is_invalid() {
+    let run = |refused_reads| LoadValidity {
+        as_the_image: true,
+        rows_written_a_second: 1_000.0,
+        rows_a_second: 1_000,
+        reads: 10_000,
+        failed_reads: 0,
+        refused_reads,
+    };
+    assert_eq!(run(10).invalid(), Vec::<String>::new());
+    assert_eq!(
+        run(11).invalid(),
+        vec!["11 of 10000 reads refused, over 0.1%"]
+    );
 }
 
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
@@ -1302,9 +1478,14 @@ fn merge_debt_is_carried_forward_from_samples_at_or_before_each_point() {
     );
 }
 
+/// The share of an arm's merge build seconds on idle tenants above which a
+/// flush-wait or flush-due pass is not to be taken at face value (§9.5).
+const IDLE_SHARE_LARGE: f64 = 0.10;
+
 /// How much of an arm's merge building was on tenants outside the active
-/// set when the build began, from `builds`: each one's partition, the
-/// seconds into the soak it ended, and how long it took. A 5-minute
+/// set when the build began, from `builds`, stopped ones among them: each
+/// one's partition, the seconds into the soak it ended, and how long it
+/// ran. A 5-minute
 /// restore window has a tenant looked after every minute where production
 /// waits an hour (§9.5), so that idle tenants build merges production
 /// would not yet; those take CPU from others' flushes, whose holds are the
@@ -1325,7 +1506,26 @@ fn idle_merge_builds(builds: &[(String, f64, f64)], schedule: &Schedule) -> Valu
     json!({
         "builds": builds.len(), "idle": idle, "build_s": all_s, "idle_build_s": idle_s,
         "idle_share_of_build_s": (all_s > 0.0).then(|| idle_s / all_s),
+        "large": all_s > 0.0 && idle_s / all_s > IDLE_SHARE_LARGE,
     })
+}
+
+/// Whether `timed` is CPU spent on a merge's build, stopped ones with
+/// those that finished: a merge stopped and started again spends its
+/// build each time, and idle tenants' share must count them.
+fn spent_on_a_build(timed: Timed) -> bool {
+    matches!(
+        timed,
+        Timed::Merge(MergePhase::Build | MergePhase::BuildStopped)
+    )
+}
+
+#[test]
+fn a_stopped_build_counts_among_the_build_seconds() {
+    assert!(spent_on_a_build(Timed::Merge(MergePhase::Build)));
+    assert!(spent_on_a_build(Timed::Merge(MergePhase::BuildStopped)));
+    assert!(!spent_on_a_build(Timed::Merge(MergePhase::Upload)));
+    assert!(!spent_on_a_build(Timed::FlushDue));
 }
 
 /// A build counts as idle by when it began: one begun on an active tenant
@@ -1351,8 +1551,56 @@ fn a_merge_build_is_idle_by_whether_its_tenant_was_active_as_it_began() {
         json!(60.0 / 160.0),
         "{found}"
     );
+
+    assert_eq!(found["large"], json!(true), "{found}");
+    let small = [
+        ("t3/0".to_string(), 70.0, 10.0),
+        ("t1/0".to_string(), 150.0, 90.0),
+    ];
+    assert_eq!(idle_merge_builds(&small, &schedule)["large"], json!(false));
     let none = idle_merge_builds(&[], &schedule);
     assert_eq!(none["idle_share_of_build_s"], json!(null));
+}
+
+/// The flush-due mark (§9.6): how long rows wait from falling due to the
+/// commit that takes them, which sees what the wait for the lock does not.
+/// Its p99 is below twice a flush's own p99, and below the arm's median
+/// merge build: §3's "never a merge build's length", at the end-to-end
+/// wait. All three in seconds, sorted.
+fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
+    let (due_p99, held_p99, build_p50) = (
+        percentile(due, 99.0),
+        percentile(held, 99.0),
+        percentile(builds, 50.0),
+    );
+    json!({
+        "passed": match (due_p99, held_p99, build_p50) {
+            (Some(due), Some(held), Some(build)) => due < 2.0 * held && due < build,
+            _ => false,
+        },
+        "due_p99_s": due_p99, "held_p99_s": held_p99, "merge_build_p50_s": build_p50,
+        "mark": "flush_due p99 < 2 x held p99, and < the median merge build",
+    })
+}
+
+/// Waits behind a merge build, as the 110-156 s of §9.9, fail though the
+/// lock was never waited for; one a flush's own time does not (review of
+/// #169).
+#[test]
+fn rows_waiting_a_merge_builds_length_fail_the_flush_due_mark() {
+    let passed = |due: f64, held: f64, build: f64| {
+        flush_due_mark(&[1.0, due], &[held], &[build])["passed"] == json!(true)
+    };
+    assert!(passed(3.0, 2.0, 60.0));
+    assert!(!passed(135.0, 2.0, 75.0), "a merge build's length");
+    assert!(
+        !passed(110.0, 63.0, 75.0),
+        "as long as a merge build, however long a flush"
+    );
+    assert!(!passed(30.0, 2.0, 75.0), "fifteen flushes' length");
+    assert!(!passed(70.0, 40.0, 60.0), "over the median build alone");
+    assert_eq!(flush_due_mark(&[], &[1.0], &[1.0])["passed"], json!(false));
+    assert_eq!(flush_due_mark(&[1.0], &[1.0], &[])["passed"], json!(false));
 }
 
 /// A stage of the node's searches as its `/metrics` histogram has it:
@@ -1515,6 +1763,7 @@ fn step3_arm() {
         .expect("the global pool, made first");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_name(RUNTIME_THREADS)
         .build()
         .unwrap();
     runtime.block_on(arm(bench, running));
@@ -1586,6 +1835,7 @@ async fn arm(bench: Bench, running: Running) {
     let soak_end = started + bench.soak;
     let cpu_before = cpu_by_pool();
     let ticks_before = cpu_ticks();
+    let throttled_before = cgroup_throttled();
     let backlogged_before = node.flushing().backlogged;
     let soaking = Arc::new(AtomicBool::new(true));
     let events: Arc<Mutex<Vec<Event>>> = Arc::default();
@@ -1641,6 +1891,9 @@ async fn arm(bench: Bench, running: Running) {
                     }
                 }
                 if tick.is_multiple_of(40) {
+                    if let Some((stolen, all)) = cpu_ticks() {
+                        s.steal.push((at, stolen, all));
+                    }
                     let held = GLOBAL.held();
                     let census = node.census().holding;
                     let merges = node.merges();
@@ -1709,6 +1962,15 @@ async fn arm(bench: Bench, running: Running) {
     .unwrap();
     let merges = node.merges();
     let let_go = node.let_go();
+    let (node_nested, sections_waited, top_level_cpu) = {
+        let builds = node.merge_builds();
+        let top_level = builds.top_level_cpu().as_secs_f64();
+        (
+            builds.nested_sections(),
+            builds.sections_waited(),
+            top_level,
+        )
+    };
     let ended: BTreeMap<&str, u64> = vellev_storage::timings::MergeEnd::ALL
         .iter()
         .map(|end| (end.name(), node.timings().merges_ended(*end)))
@@ -1748,7 +2010,7 @@ async fn arm(bench: Bench, running: Running) {
     };
     let merge_builds_timed: Vec<(String, f64, f64)> = events
         .iter()
-        .filter(|event| event.timed == Timed::Merge(MergePhase::Build))
+        .filter(|event| spent_on_a_build(event.timed))
         .map(|event| {
             (
                 event.partition.clone(),
@@ -1843,6 +2105,7 @@ async fn arm(bench: Bench, running: Running) {
     // held to arm (a)'s by the comparison.
     let flush_wait = sorted(of(Timed::BuildingWait(Holder::Flush)));
     let flush_held = sorted(of(Timed::BuildingHeld(Holder::Flush)));
+    let flush_due = sorted(of(Timed::FlushDue));
     let merge_builds = sorted(of(Timed::Merge(MergePhase::Build)));
     let let_go_wait = sorted(of(Timed::LetGoFlushWait));
     let flush_wait_p99 = percentile(&flush_wait, 99.0);
@@ -1868,6 +2131,7 @@ async fn arm(bench: Bench, running: Running) {
             "wait_max_s": flush_wait.last(), "merge_build_p50_s": merge_build_p50,
             "mark": "wait p99 < 2 x held p99, and the longest wait < the median merge build",
         },
+        "flush_due": flush_due_mark(&flush_due, &flush_held, &merge_builds),
         "node_memory": {
             "passed": peak <= memory_bound,
             "peak_over_baseline_bytes": peak, "bound_bytes": memory_bound,
@@ -1890,6 +2154,7 @@ async fn arm(bench: Bench, running: Running) {
         measurement: bench.is_measurement(),
         steal,
         load_reported,
+        nested_sections: node_nested,
     }
     .invalid();
 
@@ -1931,7 +2196,16 @@ async fn arm(bench: Bench, running: Running) {
             "tenant_unflushed_peak": sampled.tenant_unflushed_peak,
         },
         "cpu_s_by_pool": cpu,
-        "steal": { "share": steal, "at_most": STEAL_AT_MOST },
+        "steal": { "share": steal, "at_most": STEAL_AT_MOST,
+                   "peaks": steal_peaks(&sampled.steal, bench.window.as_secs_f64()) },
+        "throttled_usec": throttled_before.zip(cgroup_throttled())
+            .map(|(before, after)| after.saturating_sub(before)),
+        "machine": machine(),
+        "merge_builds": {
+            "nested_sections": node_nested,
+            "sections_waited_s": sections_waited.as_secs_f64(),
+            "top_level_cpu_s": top_level_cpu,
+        },
         "memory_series": sampled.memory,
         "nice": { "checks": sampled.nice_checks, "wrong": sampled.nice_wrong },
     });
@@ -1969,6 +2243,7 @@ fn step3_load() {
 
 async fn load(bench: Bench, running: Running) {
     let schedule = Schedule::of(&bench);
+    let cpu_before = process_ticks();
     // The fixture first, so that the soak starts with nothing left to
     // load: the node gives only seconds between ready and the start.
     let queries: Arc<Vec<Vec<f32>>> = Arc::new(
@@ -2025,10 +2300,17 @@ async fn load(bench: Bench, running: Running) {
                         tokio::time::sleep(due - now).await;
                     } else {
                         let behind = (now - due).as_secs_f64();
-                        let behind_most = &mut writes.lock().unwrap().behind_most;
-                        *behind_most = behind_most.max(behind);
+                        let mut done = writes.lock().unwrap();
+                        if behind > done.behind_most {
+                            done.behind_most = behind;
+                            done.worst_lag = Some(json!({
+                                "behind_s": behind, "place": place, "batch": k,
+                                "tenant": tenant_id(schedule.tenant(place, k)).to_string(),
+                                "at_s": (now - started).as_secs_f64(),
+                            }));
+                        }
                     }
-                    if Instant::now() >= soak_end {
+                    if past_late(Instant::now(), soak_end) {
                         break;
                     }
                     let at = schedule.tenant(place, k);
@@ -2063,10 +2345,25 @@ async fn load(bench: Bench, running: Running) {
                     });
                     let body = json!({ "changes": changes.await.unwrap() });
                     let route = format!("{url}/v1/tenants/{}/changes", tenant_id(at));
+                    let sent = Instant::now();
                     loop {
                         match http_json(&http, route.clone(), &body).await {
                             Ok(answer) if answer.status().is_success() => {
+                                let now = Instant::now();
+                                let took = (now - sent).as_secs_f64();
                                 let mut done = writes.lock().unwrap();
+                                if done.slowest_batch.as_ref().is_none_or(|(most, _)| took > *most) {
+                                    done.slowest_batch = Some((took, json!({
+                                        "took_s": took, "place": place, "batch": k,
+                                        "tenant": tenant_id(at).to_string(),
+                                        "at_s": (sent - started).as_secs_f64(),
+                                    })));
+                                }
+                                if now > soak_end {
+                                    let late = (now - soak_end).as_secs_f64();
+                                    done.late += 1;
+                                    done.late_most = done.late_most.max(late);
+                                }
                                 done.rows += batch;
                                 done.batches += 1;
                                 *done.by_tenant.entry(tenant_id(at).to_string()).or_default() +=
@@ -2080,7 +2377,7 @@ async fn load(bench: Bench, running: Running) {
                                     .get("retry-after")
                                     .and_then(|wait| wait.to_str().ok()?.parse::<u64>().ok())
                                     .map_or(Duration::from_secs(1), Duration::from_secs);
-                                if Instant::now() + wait >= soak_end {
+                                if past_late(Instant::now() + wait, soak_end) {
                                     break;
                                 }
                                 tokio::time::sleep(wait).await;
@@ -2176,7 +2473,12 @@ async fn load(bench: Bench, running: Running) {
         as_the_image: running.as_the_image(),
         rows_written_a_second: writes.rows as f64 / soaked,
         rows_a_second: bench.rows_a_second,
+        reads: reads.len() as u64,
         failed_reads,
+        refused_reads: reads
+            .iter()
+            .filter(|read| read.answered == Answered::Refused)
+            .count() as u64,
     }
     .invalid();
     let mut by_tenant = schedule.rows_by_tenant();
@@ -2188,12 +2490,16 @@ async fn load(bench: Bench, running: Running) {
         "process": process(&bench),
         "sha": bench.sha,
         "bench": bench.config(),
+        "cpu_s": cpu_before.zip(process_ticks())
+            .map(|(before, after)| after.saturating_sub(before) as f64 / 100.0),
         "reads": reads_summary(&reads, soaked, bench.window.as_secs_f64()),
         "read_failures": read_failures.lock().unwrap().report(),
         "writes": {
             "rows": writes.rows, "rows_a_second": writes.rows as f64 / soaked,
             "batches": writes.batches, "refused": writes.refused, "failed": writes.failed,
-            "behind_most_s": writes.behind_most,
+            "behind_most_s": writes.behind_most, "worst_lag": writes.worst_lag,
+            "slowest_batch": writes.slowest_batch.as_ref().map(|(_, batch)| batch),
+            "batches_late": writes.late, "late_most_s": writes.late_most,
             "by_tenant": by_tenant, "scheduled_by_tenant": schedule.rows_by_tenant(),
             "failures": writes.failures.report(),
         },
@@ -2248,6 +2554,9 @@ fn not_compared(runs: &[ArmRun]) -> BTreeMap<String, Vec<String>> {
         if sha.is_empty() {
             why.push("no commit stamped".into());
         }
+        if sha.ends_with("-dirty") {
+            why.push("built from a tree with uncommitted changes".into());
+        }
         match &run.load {
             None => why.push("no load generator report".into()),
             Some(load) => {
@@ -2278,6 +2587,9 @@ fn not_compared(runs: &[ArmRun]) -> BTreeMap<String, Vec<String>> {
             }
             if other.node["sha"] != run.node["sha"] {
                 why.push(format!("built from another commit than arm {}", other.name));
+            }
+            if other.node["machine"] != run.node["machine"] {
+                why.push(format!("run on another machine than arm {}", other.name));
             }
         }
         let scale = config["scale"].as_f64().unwrap_or(f64::NAN);
@@ -2315,7 +2627,7 @@ fn a_run(name: &str) -> ArmRun {
     ArmRun {
         name: name.into(),
         node: json!({ "bench": bench.config(), "sha": "abc", "invalid": [],
-                      "preloaded": preloaded }),
+                      "preloaded": preloaded, "machine": { "cpu_model": "same" } }),
         load: Some(
             json!({ "bench": bench.config(), "sha": "abc", "invalid": [],
                            "writes": { "by_tenant": schedule.rows_by_tenant(),
@@ -2369,6 +2681,25 @@ fn arms_are_compared_only_if_run_alike() {
         run.load.as_mut().unwrap()["sha"] = json!("");
     }
     assert!(not_compared(&unstamped)["a"].contains(&"no commit stamped".to_string()));
+
+    let mut dirty = runs();
+    for run in &mut dirty {
+        run.node["sha"] = json!("abc-dirty");
+        run.load.as_mut().unwrap()["sha"] = json!("abc-dirty");
+    }
+    let found = not_compared(&dirty);
+    assert_eq!(
+        found["a"],
+        vec!["built from a tree with uncommitted changes"]
+    );
+
+    let mut machines = runs();
+    machines[2].node["machine"]["cpu_model"] = json!("another");
+    let found = not_compared(&machines);
+    assert!(
+        found["c"].iter().any(|why| why.contains("another machine")),
+        "{found:?}"
+    );
 
     let mut short = runs();
     short[1].load.as_mut().unwrap()["writes"]["by_tenant"]["t3"] = json!(299_900);
@@ -2465,6 +2796,7 @@ fn all_marks(marks: &Value, backlog_within_a: Option<bool>) -> Option<bool> {
     let passed = |mark: &str| marks[mark]["passed"].as_bool().unwrap_or(false);
     let alone = passed("merge_debt")
         && passed("flush_wait")
+        && passed("flush_due")
         && passed("node_memory")
         && passed("eviction_flush");
     match (alone, backlog_within_a) {
@@ -2483,45 +2815,78 @@ struct Compared {
     end_segments: f64,
 }
 
+/// How an arm stands against (b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Beats {
+    Yes,
+    No,
+    /// By §3's margin, but by no more than (b) lies from itself.
+    WithinNoise,
+    Undecided,
+}
+
+impl Beats {
+    fn said(self) -> &'static str {
+        match self {
+            Beats::Yes => "yes",
+            Beats::No => "no",
+            Beats::WithinNoise => "within noise",
+            Beats::Undecided => "undecided",
+        }
+    }
+}
+
 /// Whether `arm` beats (b): read p99 at least 15% better and end-of-soak
 /// segments a tenant within 10% of (b)'s, with every mark met. (b) need
 /// only be valid, not meet every mark: §3 holds the arm, not (b), to them.
-/// `None`, undecided, if either is missing or not compared, or the arm's
-/// marks rest on a backlog bound there is none of (review of #169).
-fn beats_b(arm: Option<Compared>, b: Option<Compared>) -> Option<bool> {
-    let (arm, b) = (arm?, b?);
+/// Undecided if either is missing or not compared, or the arm's marks rest
+/// on a backlog bound there is none of. A margin no greater than `spread`,
+/// how far (b) lies from itself run again, is within noise; with no spread
+/// to go by, a margin says nothing, and it is undecided (review of #169).
+fn beats_b(arm: Option<Compared>, b: Option<Compared>, spread: Option<f64>) -> Beats {
+    let (Some(arm), Some(b)) = (arm, b) else {
+        return Beats::Undecided;
+    };
     if !arm.valid || !b.valid {
-        return None;
+        return Beats::Undecided;
     }
     let better =
         arm.read_p99_ms <= 0.85 * b.read_p99_ms && arm.end_segments <= 1.10 * b.end_segments;
-    match arm.all_marks? {
-        false => Some(false),
-        true => Some(better),
+    match (arm.all_marks, better) {
+        (None, _) => Beats::Undecided,
+        (Some(false), _) | (Some(true), false) => Beats::No,
+        (Some(true), true) => match spread {
+            None => Beats::Undecided,
+            Some(spread) if (b.read_p99_ms - arm.read_p99_ms) / b.read_p99_ms <= spread => {
+                Beats::WithinNoise
+            }
+            Some(_) => Beats::Yes,
+        },
     }
 }
 
 /// The winner by §3: an arm that beats (b), the better of two that both
-/// do; (b) if neither does; undecided if either is undecided.
-fn winner(c: Option<bool>, d: Option<bool>, p99_c: f64, p99_d: f64) -> &'static str {
+/// do; (b) if neither does and (b) met every mark itself, as no arm that
+/// failed its marks is named; undecided if an arm or (b)'s own marks are.
+fn winner(c: Beats, d: Beats, p99_c: f64, p99_d: f64, b_marks: Option<bool>) -> &'static str {
     match (c, d) {
-        (Some(true), Some(true)) => {
-            if p99_c <= p99_d {
-                "c"
-            } else {
-                "d"
-            }
-        }
-        (Some(true), Some(false)) => "c",
-        (Some(false), Some(true)) => "d",
-        (Some(false), Some(false)) => "b",
-        _ => "undecided",
+        (Beats::Undecided, _) | (_, Beats::Undecided) => "undecided",
+        (Beats::Yes, Beats::Yes) if p99_c <= p99_d => "c",
+        (Beats::Yes, Beats::Yes) => "d",
+        (Beats::Yes, _) => "c",
+        (_, Beats::Yes) => "d",
+        _ => match b_marks {
+            Some(true) => "b",
+            Some(false) => "none met every mark",
+            None => "undecided",
+        },
     }
 }
 
-/// "Beats (b)" asks (b) to be valid, not to meet every mark; and what
-/// cannot be decided is said to be undecided, never (b) by default
-/// (review of #169).
+/// "Beats (b)" asks (b) to be valid, not to meet every mark; a margin is
+/// held to (b)'s spread from itself; and what cannot be decided is said to
+/// be undecided, never (b) by default, as (b) is never named having failed
+/// its marks (reviews of #169).
 #[test]
 fn beats_b_asks_b_be_valid_not_that_it_pass_and_says_undecided() {
     let run = |valid, all_marks, read_p99_ms| Compared {
@@ -2530,47 +2895,70 @@ fn beats_b_asks_b_be_valid_not_that_it_pass_and_says_undecided() {
         read_p99_ms,
         end_segments: 10.0,
     };
+    let quiet = Some(0.05);
     // (b) valid but failing a mark: (c), 20% better and meeting every
     // mark, beats it.
     let b = run(true, Some(false), 100.0);
-    assert_eq!(
-        beats_b(Some(run(true, Some(true), 80.0)), Some(b)),
-        Some(true)
-    );
-    assert_eq!(
-        beats_b(Some(run(true, Some(true), 90.0)), Some(b)),
-        Some(false)
-    );
-    assert_eq!(
-        beats_b(Some(run(true, Some(false), 50.0)), Some(b)),
-        Some(false)
-    );
+    let beats = |arm| beats_b(Some(arm), Some(b), quiet);
+    assert_eq!(beats(run(true, Some(true), 80.0)), Beats::Yes);
+    assert_eq!(beats(run(true, Some(true), 90.0)), Beats::No);
+    assert_eq!(beats(run(true, Some(false), 50.0)), Beats::No);
+    // A margin no greater than (b)'s spread from itself is noise, and with
+    // no spread at all it says nothing.
+    let fast = run(true, Some(true), 80.0);
+    assert_eq!(beats_b(Some(fast), Some(b), Some(0.25)), Beats::WithinNoise);
+    assert_eq!(beats_b(Some(fast), Some(b), None), Beats::Undecided);
     // Undecided: (b) or the arm not compared, missing, or resting on no
     // backlog bound.
     let fast = run(true, Some(true), 50.0);
+    let invalid_b = run(false, Some(true), 100.0);
     assert_eq!(
-        beats_b(Some(fast), Some(run(false, Some(true), 100.0))),
-        None
+        beats_b(Some(fast), Some(invalid_b), quiet),
+        Beats::Undecided
     );
-    assert_eq!(beats_b(Some(run(false, Some(true), 50.0)), Some(b)), None);
-    assert_eq!(beats_b(None, Some(b)), None);
-    assert_eq!(beats_b(Some(fast), None), None);
-    assert_eq!(beats_b(Some(run(true, None, 50.0)), Some(b)), None);
-    // The winner.
-    assert_eq!(winner(Some(true), Some(true), 70.0, 80.0), "c");
-    assert_eq!(winner(Some(false), Some(true), 70.0, 80.0), "d");
-    assert_eq!(winner(Some(false), Some(false), 70.0, 80.0), "b");
-    assert_eq!(winner(Some(true), None, 70.0, 80.0), "undecided");
-    assert_eq!(winner(None, None, 70.0, 80.0), "undecided");
+    assert_eq!(
+        beats_b(Some(run(false, Some(true), 50.0)), Some(b), quiet),
+        Beats::Undecided
+    );
+    assert_eq!(beats_b(None, Some(b), quiet), Beats::Undecided);
+    assert_eq!(beats_b(Some(fast), None, quiet), Beats::Undecided);
+    assert_eq!(
+        beats_b(Some(run(true, None, 50.0)), Some(b), quiet),
+        Beats::Undecided
+    );
+    // The winner: never a (b) that failed its marks.
+    let met = Some(true);
+    assert_eq!(winner(Beats::Yes, Beats::Yes, 70.0, 80.0, met), "c");
+    assert_eq!(winner(Beats::Yes, Beats::Yes, 90.0, 80.0, met), "d");
+    assert_eq!(winner(Beats::No, Beats::Yes, 70.0, 80.0, met), "d");
+    assert_eq!(winner(Beats::No, Beats::No, 70.0, 80.0, met), "b");
+    assert_eq!(winner(Beats::WithinNoise, Beats::No, 70.0, 80.0, met), "b");
+    assert_eq!(
+        winner(Beats::No, Beats::No, 70.0, 80.0, Some(false)),
+        "none met every mark"
+    );
+    assert_eq!(winner(Beats::No, Beats::No, 70.0, 80.0, None), "undecided");
+    assert_eq!(
+        winner(Beats::Yes, Beats::Undecided, 70.0, 80.0, met),
+        "undecided"
+    );
+    assert_eq!(
+        winner(Beats::Undecided, Beats::Undecided, 70.0, 80.0, met),
+        "undecided"
+    );
     // No backlog bound, as when (a) is not compared: an arm meeting every
     // other mark is undecided, one failing another is not.
     let marks = json!({ "merge_debt": { "passed": true }, "flush_wait": { "passed": true },
-                        "node_memory": { "passed": true }, "eviction_flush": { "passed": true } });
+                        "flush_due": { "passed": true }, "node_memory": { "passed": true },
+                        "eviction_flush": { "passed": true } });
     assert_eq!(all_marks(&marks, None), None);
     assert_eq!(all_marks(&marks, Some(true)), Some(true));
     let mut failing = marks.clone();
     failing["flush_wait"]["passed"] = json!(false);
     assert_eq!(all_marks(&failing, None), Some(false));
+    let mut late = marks.clone();
+    late["flush_due"]["passed"] = json!(false);
+    assert_eq!(all_marks(&late, Some(true)), Some(false));
 }
 
 /// The arms side by side (§9.6): each mark, arm (a) as the backlog's
@@ -2619,8 +3007,16 @@ fn step3_compare() {
         let why = &invalid[&run.name];
         let idle = &run.node["idle_merge_builds"];
         idle_builds.push(format!(
-            "{}: {} of {} builds, {} of the seconds",
-            run.name, idle["idle"], idle["builds"], idle["idle_share_of_build_s"]
+            "{}: {} of {} builds, {} of the seconds{}",
+            run.name,
+            idle["idle"],
+            idle["builds"],
+            idle["idle_share_of_build_s"],
+            if idle["large"] == json!(true) {
+                " (large: read its flush marks with care)"
+            } else {
+                ""
+            },
         ));
         compared.insert(
             run.name.clone(),
@@ -2640,7 +3036,7 @@ fn step3_compare() {
                 .to_string()
         };
         rows.push(format!(
-            "| {} | {} | {:.1} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {:.1} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} |",
             run.name,
             run.node["merge_pool"].as_str().unwrap_or("?"),
             p99(run),
@@ -2649,6 +3045,7 @@ fn step3_compare() {
             run.node["end_segments_mean"].as_f64().unwrap_or(f64::NAN),
             mark(passed("merge_debt")),
             mark(passed("flush_wait")),
+            mark(passed("flush_due")),
             backlog.map_or("undecided", mark),
             mark(passed("node_memory")),
             mark(passed("eviction_flush")),
@@ -2664,32 +3061,34 @@ fn step3_compare() {
             json!({ "all_marks": all, "backlog_within_a": backlog, "invalid": why }),
         );
     }
-    let (c, d) = (
-        beats_b(compared.get("c").copied(), compared.get("b").copied()),
-        beats_b(compared.get("d").copied(), compared.get("b").copied()),
-    );
-    let p99_of = |name: &str| compared.get(name).map_or(f64::NAN, |arm| arm.read_p99_ms);
-    let winner = winner(c, d, p99_of("c"), p99_of("d"));
-    // The noise floor: (b) against itself, deciding nothing.
+    // The noise floor: (b) against itself, deciding only what a margin
+    // inside it is worth.
     let noise = noise_floor(compared.get("b").copied(), compared.get("b2").copied());
-    let said = |beats: Option<bool>| match beats {
-        Some(true) => "yes",
-        Some(false) => "no",
-        None => "undecided",
-    };
+    let spread = noise["read_p99_spread"].as_f64();
+    let (b, against_b) = (compared.get("b").copied(), |arm: &str| {
+        beats_b(
+            compared.get(arm).copied(),
+            compared.get("b").copied(),
+            spread,
+        )
+    });
+    let (c, d) = (against_b("c"), against_b("d"));
+    let p99_of = |name: &str| compared.get(name).map_or(f64::NAN, |arm| arm.read_p99_ms);
+    let b_marks = b.filter(|b| b.valid).and_then(|b| b.all_marks);
+    let winner = winner(c, d, p99_of("c"), p99_of("d"), b_marks);
     let mut summary = String::from(
-        "| arm | merge pool | read p99 ms | server queue p99 s | server read p99 s | end segments/tenant | merge debt | flush wait | backlog <= (a) | node memory | eviction flush | all marks | run |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| arm | merge pool | read p99 ms | server queue p99 s | server read p99 s | end segments/tenant | merge debt | flush wait | flush due | backlog <= (a) | node memory | eviction flush | all marks | run |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     summary.push_str(&rows.join("\n"));
     summary.push_str(&format!(
         "\n\n(c) beats (b): {}. (d) beats (b): {}. Winner by §3: **{winner}**.\n\nNoise floor, (b) against (b) run again: {noise}. The server's stages are from its histogram's buckets, and decide nothing.\n\nMerge builds on idle tenants, which the flush-wait mark is to be read against (§9.5), deciding nothing: {}.\n",
-        said(c),
-        said(d),
+        c.said(),
+        d.said(),
         idle_builds.join("; "),
     ));
     std::fs::write(out.join("summary.md"), &summary).unwrap();
-    let verdict = json!({ "arms": verdicts, "c_beats_b": c, "d_beats_b": d, "winner": winner,
-                          "noise_floor": noise });
+    let verdict = json!({ "arms": verdicts, "c_beats_b": c.said(), "d_beats_b": d.said(),
+                          "winner": winner, "noise_floor": noise });
     std::fs::write(
         out.join("verdict.json"),
         serde_json::to_string_pretty(&verdict).unwrap(),

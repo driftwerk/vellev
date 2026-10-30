@@ -967,7 +967,7 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
         );
         assert!(waited.is_some(), "{holder}: {text}");
     }
-    for phase in ["turn", "gather", "build", "upload", "load"] {
+    for phase in ["turn", "gather", "build", "build_stopped", "upload", "load"] {
         let count = sample(
             &text,
             "vellev_merge_phase_seconds_count",

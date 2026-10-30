@@ -81,7 +81,9 @@ fn a_build_given_a_pool_runs_every_pass_there_and_comes_out_the_same() {
         assert!(names.contains(&name), "{name} not among {names:?}");
     }
     assert!(
-        clustered.iter().all(|(_, t)| t.starts_with("vellev-merge-")),
+        clustered
+            .iter()
+            .all(|(_, t)| t.starts_with("vellev-merge-")),
         "{clustered:?}"
     );
 

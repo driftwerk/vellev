@@ -80,7 +80,11 @@ async fn a_clustered_merges_sections_run_on_its_pool_and_a_flushs_never_do() {
             "{section} never ran among {merges:?}"
         );
     }
-    assert_eq!(builds.nested_sections(), 0, "a section begun inside another");
+    assert_eq!(
+        builds.nested_sections(),
+        0,
+        "a section begun inside another"
+    );
     assert!(
         builds.top_level_cpu() > Duration::ZERO,
         "what a build does on its own thread not counted"

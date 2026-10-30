@@ -25,8 +25,8 @@ use vellev_core::Distance;
 
 use crate::curve::{Curve, Source};
 use crate::fastscan::{chosen, Blocks, Tables, BLOCK};
-use crate::rotation::{Random, Rotation};
 use crate::pool::{CallersPool, Passes};
+use crate::rotation::{Random, Rotation};
 use crate::stop::{Stage, Stop, Stopped};
 use crate::vector::{
     allowed, as_far_from_every_vector, dot, in_row_order, measurable, nearest, normalised,
@@ -1015,7 +1015,8 @@ impl ClusteredIndex {
                     let rotated = rotated(vector);
                     let cluster = nearest_centroid(&centroids, width, &rotated);
                     let centroid = &centroids[cluster * width..][..width];
-                    let residual: Vec<f32> = rotated.iter().zip(centroid).map(|(v, c)| v - c).collect();
+                    let residual: Vec<f32> =
+                        rotated.iter().zip(centroid).map(|(v, c)| v - c).collect();
                     let norm = dot(&residual, &residual).sqrt();
                     let code: Vec<u64> = residual
                         .chunks_exact(64)
@@ -1028,7 +1029,8 @@ impl ClusteredIndex {
                     let factor = match norm > 0.0 {
                         true => Factor {
                             norm,
-                            align: residual.iter().map(|value| value.abs()).sum::<f32>() * scale / norm,
+                            align: residual.iter().map(|value| value.abs()).sum::<f32>() * scale
+                                / norm,
                             along: dot(&residual, centroid) / norm,
                         },
                         false => Factor {

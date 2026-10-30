@@ -17,8 +17,8 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use vellev_core::{Distance, SQUARED_LENGTH_UNDER};
 
-use crate::rotation::{Random, Rotation};
 use crate::pool::{CallersPool, Passes};
+use crate::rotation::{Random, Rotation};
 use crate::stop::{Stage, Stop, Stopped};
 
 const LANES: usize = 16;

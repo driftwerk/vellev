@@ -3115,6 +3115,7 @@ impl Writer {
             Some(build.clone()),
         );
         let Some(built) = built.await? else {
+            self.timed(Timed::Merge(MergePhase::BuildStopped), building.elapsed());
             return Ok(Ended::Dropped(MergeEnd::Stopped));
         };
         self.timed(Timed::Merge(MergePhase::Build), building.elapsed());
