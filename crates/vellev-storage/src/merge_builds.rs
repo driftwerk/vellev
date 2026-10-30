@@ -82,9 +82,6 @@ pub struct MergeBuilds {
     /// and once its rows were gathered.
     last_planned: AtomicUsize,
     last_reckoned: AtomicUsize,
-    /// How many rows' tokens the last build to index its rows held at
-    /// once, at the most.
-    last_tokenized_at_once: AtomicUsize,
     /// Whether each build's output carries a [`Probe`], as a test asks.
     probing: AtomicBool,
     /// How the builds stood as the last probe was dropped.
@@ -185,7 +182,6 @@ impl MergeBuilds {
             held_at_most: Mutex::new(STORE_HELD_AT_MOST),
             last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
-            last_tokenized_at_once: AtomicUsize::new(0),
             probing: AtomicBool::new(false),
             probed: Mutex::default(),
         })
@@ -294,13 +290,6 @@ impl MergeBuilds {
     #[doc(hidden)]
     pub fn last_planned(&self) -> usize {
         self.last_planned.load(Ordering::SeqCst)
-    }
-
-    /// How many rows' tokens the last build to index its rows held at
-    /// once, at the most. For tests that hold it to what it may.
-    #[doc(hidden)]
-    pub fn last_tokenized_at_once(&self) -> usize {
-        self.last_tokenized_at_once.load(Ordering::SeqCst)
     }
 
     /// Have what each build makes from now on carry a probe, or not. For
@@ -484,12 +473,6 @@ impl MergeBuild {
     /// Reckon the build to hold `bytes` at its peak, from now on.
     pub(crate) fn reckon(&self, bytes: usize) {
         self.counted.reckoned.bytes.store(bytes, Ordering::SeqCst);
-    }
-
-    /// Note that the build held `rows` rows' tokens at once, at the most.
-    pub(crate) fn tokenized_at_once(&self, rows: usize) {
-        let builds = &self.counted.builds;
-        builds.last_tokenized_at_once.store(rows, Ordering::SeqCst);
     }
 
     /// A probe for what the build makes to carry, if a test asks: see

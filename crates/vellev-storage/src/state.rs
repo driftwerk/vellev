@@ -362,6 +362,9 @@ pub(crate) struct Loaded {
     /// How many threads split its rows' text at once, at the most, as its
     /// indexes were built here: 0 if they were not.
     pub tokenized_on: usize,
+    /// How many of its rows' tokens were held at once, at the most, as its
+    /// indexes were built here: 0 if they were not.
+    pub tokenized_at_once: usize,
     /// What its rows and indexes come to, if worked out as they were built.
     pub parts: Option<Parts>,
 }
@@ -374,6 +377,7 @@ impl Loaded {
             indexes: None,
             stored,
             tokenized_on: 0,
+            tokenized_at_once: 0,
             parts: None,
         }
     }
@@ -381,10 +385,11 @@ impl Loaded {
     /// The segment with its indexes built, under the collections of
     /// `catalog`, so that building them need not wait for other segments.
     pub fn indexed_now(self, key: &str, catalog: &Catalog) -> Result<Self> {
-        let (indexes, tokenized_on) = self.indexed_on(key, catalog)?;
+        let (indexes, tokenized_on, tokenized_at_once) = self.indexed_on(key, catalog)?;
         Ok(Self {
             indexes: Some(indexes),
             tokenized_on,
+            tokenized_at_once,
             ..self
         })
     }
@@ -397,12 +402,13 @@ impl Loaded {
     /// the collection back: they are then built again, keeping whatever
     /// clustered indexes they had.
     fn indexed(&self, key: &str, catalog: &Catalog) -> Result<Arc<Indexes>> {
-        self.indexed_on(key, catalog).map(|(indexes, _)| indexes)
+        self.indexed_on(key, catalog).map(|(indexes, ..)| indexes)
     }
 
     /// As [`Self::indexed`], with how many threads split the rows' text at
-    /// once, at the most, if they were built here.
-    fn indexed_on(&self, key: &str, catalog: &Catalog) -> Result<(Arc<Indexes>, usize)> {
+    /// once, at the most, and how many rows' tokens were held at once, if
+    /// they were built here.
+    fn indexed_on(&self, key: &str, catalog: &Catalog) -> Result<(Arc<Indexes>, usize, usize)> {
         if self.vectors.len() != self.file.rows.len() {
             return Err(StorageError::corrupt(
                 key,
@@ -421,13 +427,17 @@ impl Loaded {
                     "a segment's stored index is not used"
                 );
             };
-            let (indexes, threads) =
-                indexed_on(catalog, &self.file.rows, column, stored, unused, None);
-            (Arc::new(indexes), threads)
+            let indexed = indexed_on(catalog, &self.file.rows, column, stored, unused, None);
+            let threads = indexed.tokenized_on;
+            (
+                Arc::new(indexed.indexes),
+                threads,
+                indexed.tokenized_at_once,
+            )
         };
         Ok(match &self.indexes {
             Some(indexes) if self.lacking(indexes, catalog) => built(&stored(key, indexes).into()),
-            Some(indexes) => (indexes.clone(), 0),
+            Some(indexes) => (indexes.clone(), 0, 0),
             None => built(&self.stored),
         })
     }
@@ -1168,8 +1178,7 @@ impl Snapshot {
     }
 }
 
-/// As [`indexed_stopping`], which nothing stops, with how many threads split
-/// the rows' text at once, at the most.
+/// As [`indexed_stopping`], which nothing stops.
 pub(crate) fn indexed_on<'a>(
     catalog: &Catalog,
     rows: &'a [Row],
@@ -1177,7 +1186,7 @@ pub(crate) fn indexed_on<'a>(
     stored: &Stored,
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
-) -> (Indexes, usize) {
+) -> Indexed {
     let never = Stopping::never();
     match indexed_stopping(
         catalog,
@@ -1188,7 +1197,7 @@ pub(crate) fn indexed_on<'a>(
         clustered_above,
         &never,
     ) {
-        Some(indexed) => (indexed.indexes, indexed.tokenized_on),
+        Some(indexed) => indexed,
         None => unreachable!("indexing nothing stops is never stopped"),
     }
 }
@@ -1197,7 +1206,11 @@ pub(crate) fn indexed_on<'a>(
 /// between askings of its stop.
 const ROWS_BETWEEN_ASKING: usize = 4_096;
 
-/// How many rows' text a build holds tokenized at once, at the most.
+/// How many rows' text a build holds tokenized at once, at the most. A
+/// bound in rows, not bytes: a chunk of long documents holds what they come
+/// to, which the reckoning counts. For tests that hold it to that, not for
+/// use.
+#[doc(hidden)]
 pub const TOKENIZED_AT_ONCE: usize = 16_384;
 
 /// A segment's rows indexed, and how their text went.
@@ -1207,7 +1220,9 @@ pub(crate) struct Indexed {
     /// How many threads split the rows' text at once, at the most.
     pub tokenized_on: usize,
     /// How many rows' tokens were held at once, at the most: split and not
-    /// yet indexed.
+    /// yet indexed. The rows the build counts in, which is its chunks' size:
+    /// it cannot see tokens kept on after they are indexed, as the counting
+    /// allocator of `flush_memory` does.
     pub tokenized_at_once: usize,
 }
 
@@ -1924,6 +1939,7 @@ impl State {
                 indexes: Some(segment.indexes.clone()),
                 stored: Stored::default(),
                 tokenized_on: 0,
+                tokenized_at_once: 0,
                 parts: Some(segment.parts.clone()),
             };
             (segment.meta.key.as_str(), loaded)
@@ -3138,7 +3154,8 @@ mod tests {
 
     /// Rows of two collections with text to search, and of one dropped
     /// since, which go unindexed: a word of their own and a few each shares,
-    /// some in a text array as well, and some with no text at all.
+    /// some in a text array as well, some with no text at all, and two in
+    /// three with a vector.
     fn texts(rows: usize) -> (Catalog, Vec<Row>) {
         let created = |id: u64, name: &str| Op::CreateCollection {
             id: CollectionId(id),
@@ -3171,7 +3188,7 @@ mod tests {
                 let object = Object {
                     id: oid(n as u128),
                     properties,
-                    vector: None,
+                    vector: (n % 3 != 0).then(|| vec![n as f32 + 1.0, 1.0]),
                 };
                 Row { collection, object }
             })
@@ -3179,43 +3196,78 @@ mod tests {
         (built.state.catalog.clone(), rows)
     }
 
-    /// `rows`' text indexed as `stopping` has it, which nothing else in
-    /// the build then differs for.
+    /// `rows` indexed as `stopping` has them, their vectors with them.
     fn indexed_as(catalog: &Catalog, rows: &[Row], stopping: &Stopping) -> Option<Indexed> {
-        let no_vector = |_: usize| None;
+        let vector_of = |row: usize| rows[row].object.vector.as_deref();
         let unused = |_: CollectionId, _: Unfit| {};
         let stored = Stored::default();
-        indexed_stopping(catalog, rows, no_vector, &stored, unused, None, stopping)
+        indexed_stopping(catalog, rows, vector_of, &stored, unused, None, stopping)
     }
 
-    /// M1-R2. Text tokenized and indexed a chunk at a time makes, whatever
-    /// the chunk's size, the very index each row inserted in turn makes,
-    /// the last chunk short of the rest and rows with no text and of a
-    /// dropped collection among them; and no more rows' tokens are held at
-    /// once than a chunk's.
+    /// The vectors of an index built, by a digest of their codes and rows.
+    fn digest(index: &LayerIndex) -> Option<u64> {
+        match &index.vectors {
+            Some(Vectors::Binary(codes)) => Some(codes.digest()),
+            _ => None,
+        }
+    }
+
+    /// M1-R2. Indexing a chunk at a time makes, whatever the chunk's size,
+    /// the very indexes each row taken in turn makes: its text, filter
+    /// values and vector codes, numbered as the rows lie, the last chunk
+    /// short of the rest and rows with no text and of a dropped collection
+    /// among them; and no more rows' tokens are held at once than a chunk's.
     #[test]
-    fn text_indexed_a_chunk_at_a_time_is_what_inserting_each_row_in_turn_makes() {
-        const ROWS: usize = 10_007;
+    fn indexes_made_a_chunk_at_a_time_are_what_taking_each_row_in_turn_makes() {
+        const ROWS: usize = 20_011;
         let (catalog, rows) = texts(ROWS);
         let mut in_turn: HashMap<CollectionId, TextIndex> = HashMap::new();
+        let mut filters: HashMap<CollectionId, RowIndex> = HashMap::new();
+        let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
         for (at, Row { collection, object }) in rows.iter().enumerate() {
             if let Some(schema) = catalog.schema(*collection) {
                 let text = in_turn.entry(*collection).or_default();
                 text.insert(schema, at as u32, object);
+                let values = filters.entry(*collection).or_default();
+                values.insert(schema, at as u32, object);
+                if let Some(vector) = object.vector.as_deref() {
+                    vectors
+                        .entry(*collection)
+                        .or_default()
+                        .push((at as u32, vector));
+                }
             }
         }
+        filters.values_mut().for_each(RowIndex::summarise);
+        let codes: HashMap<CollectionId, u64> = vectors
+            .iter()
+            .map(|(collection, vectors)| {
+                let metric = catalog.schema(*collection).unwrap().distance;
+                let index = BinaryIndex::build(metric, vectors).unwrap();
+                (*collection, index.digest())
+            })
+            .collect();
         assert_eq!(in_turn.len(), 2);
-        // Flushes and opens, which nothing asks otherwise of, as a merge.
-        assert_eq!(Stopping::never().tokenized_at_once(), TOKENIZED_AT_ONCE);
+        assert!(vectors.values().all(|them| them.len() > SHORTLIST_ABOVE));
         for at_once in [1, 7, 4_096, ROWS] {
             let stopping = Stopping::never().tokenizing(at_once);
             let indexed = indexed_as(&catalog, &rows, &stopping).unwrap();
             assert_eq!(indexed.indexes.len(), 2);
             for (collection, text) in &in_turn {
+                let index = &indexed.indexes[collection];
                 // Not `assert_eq!`: the indexes are too long to print.
                 assert!(
-                    indexed.indexes[collection].text == *text,
-                    "{at_once} rows at a time made another index of {collection:?}"
+                    index.text == *text,
+                    "{at_once} rows at a time made another text index of {collection:?}"
+                );
+                assert!(
+                    index.rows == filters[collection],
+                    "{at_once} rows at a time made another filter index of {collection:?}"
+                );
+                assert_eq!(
+                    digest(index),
+                    Some(codes[collection]),
+                    "{at_once} rows at a time coded other rows of {collection:?}"
                 );
             }
             assert!(
@@ -3224,6 +3276,13 @@ mod tests {
                 indexed.tokenized_at_once
             );
         }
+    }
+
+    /// Flushes and opens ask nothing of how they tokenize: they take the
+    /// chunks a merge does, unless a test asks otherwise of all three.
+    #[test]
+    fn a_build_nothing_asks_of_tokenizes_a_chunk_at_a_time() {
+        assert_eq!(Stopping::never().tokenized_at_once(), TOKENIZED_AT_ONCE);
     }
 
     /// Rows and a chunk's size for the two rules below: chunks of more
@@ -3269,6 +3328,24 @@ mod tests {
         // Every row of the two chunks is asked of, stopped or not, so a
         // further chunk begun would ask far more.
         let at_most = 2 * ASKED_AT_ONCE + asked_in_row_order();
+        let times = asked.times.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(times <= at_most, "asked {times} times, not {at_most}");
+    }
+
+    /// M1-R4. A stop that comes as a chunk's rows are indexed ends both
+    /// their passes at the next asking, within `ROWS_BETWEEN_ASKING` rows,
+    /// not at the chunk's end: neither asks again.
+    #[test]
+    fn a_stop_while_a_chunk_is_indexed_ends_it_within_a_few_thousand_rows() {
+        let (catalog, rows) = texts(ASKED_ROWS);
+        // One chunk of all the rows: each row split asks once, row 0 asks
+        // twice, each pass's own, and row 4,096 stops whichever comes first.
+        let (stopping, asked) = Stopping::never()
+            .tokenizing(ASKED_ROWS)
+            .counted(ASKED_ROWS + 3);
+        assert!(indexed_as(&catalog, &rows, &stopping).is_none());
+        // The other pass's row 4,096, and no more.
+        let at_most = ASKED_ROWS + 4;
         let times = asked.times.load(std::sync::atomic::Ordering::SeqCst);
         assert!(times <= at_most, "asked {times} times, not {at_most}");
     }

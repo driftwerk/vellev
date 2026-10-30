@@ -78,6 +78,8 @@ struct Built {
     column: Bytes,
     /// What its rows and indexes come to, for a later merge's reckoning.
     parts: state::Parts,
+    /// How many rows' tokens indexing it held at once, at the most.
+    tokenized_at_once: usize,
     /// Carried as a test asks: see [`MergeBuilds::probe`].
     _probe: Option<Probe>,
 }
@@ -137,9 +139,6 @@ fn segment_built(
     else {
         return Ok(None);
     };
-    if let Some(build) = build {
-        build.tokenized_at_once(tokenized_at_once);
-    }
     if stopping.stopped(MergeStage::Encoding) {
         return Ok(None);
     }
@@ -161,6 +160,7 @@ fn segment_built(
         segment,
         column,
         parts,
+        tokenized_at_once,
         _probe: probe,
     }))
 }
@@ -212,6 +212,10 @@ pub struct Replayed {
     /// How many threads split rows' text into tokens at once, at the most,
     /// to index them: as a segment was loaded, or commits replayed.
     pub tokenized_on_threads: usize,
+    /// How many of one segment's rows' tokens were held at once, at the
+    /// most, as it was loaded. Each segment's own: an open loads many at
+    /// once, each holding its chunk.
+    pub tokenized_at_once: usize,
 }
 
 use crate::state::REPLAYED_TOGETHER;
@@ -902,9 +906,15 @@ impl Partition {
             .map(|loaded: &Loaded| loaded.tokenized_on)
             .max()
             .unwrap_or(0);
+        let tokenized_at_once = segments
+            .iter()
+            .map(|loaded: &Loaded| loaded.tokenized_at_once)
+            .max()
+            .unwrap_or(0);
         {
             let mut replayed = self.replayed.lock().expect("replayed lock");
             replayed.tokenized_on_threads = replayed.tokenized_on_threads.max(tokenized_on);
+            replayed.tokenized_at_once = replayed.tokenized_at_once.max(tokenized_at_once);
         }
         let replay = try_join_all(manifest.replay.iter().map(|key| async move {
             let log: LogSegment = decode(key, Kind::Log, &self.fetch(key).await?)?;
@@ -1145,9 +1155,9 @@ pub struct Writer {
     /// Whether each merge's build panics, as a test asks: see
     /// [`Self::panic_merges_in_build`].
     merge_panics: AtomicBool,
-    /// How many rows' text each merge's build holds tokenized at once, at
-    /// the most: see [`Self::tokenize_merges_at_once`].
-    merge_tokenized_at_once: AtomicUsize,
+    /// How many rows' tokens the last flush or merge held at once, at the
+    /// most, as it indexed its rows.
+    last_tokenized_at_once: AtomicUsize,
     /// How many merges were stopped only once they had loaded back what
     /// they built, past where a stop ends them.
     stops_past_loading: AtomicU64,
@@ -1325,7 +1335,7 @@ impl Writer {
             merge_stop_at: std::sync::Mutex::new(None),
             merges_stopped: AtomicU64::new(0),
             merge_panics: AtomicBool::new(false),
-            merge_tokenized_at_once: AtomicUsize::new(state::TOKENIZED_AT_ONCE),
+            last_tokenized_at_once: AtomicUsize::new(0),
             stops_past_loading: AtomicU64::new(0),
             merge_past_loading: AtomicBool::new(false),
             merge_builds: MergeBuilds::new(MERGE_BUILDS),
@@ -2574,7 +2584,12 @@ impl Writer {
             };
             (built, build)
         });
-        built.await?.0
+        let built = built.await?.0?;
+        if let Some((built, _)) = &built {
+            let held = built.tokenized_at_once;
+            self.last_tokenized_at_once.store(held, Ordering::SeqCst);
+        }
+        Ok(built)
     }
 
     /// A built segment as `meta` names it, with its index file's frame if
@@ -2689,6 +2704,7 @@ impl Writer {
             indexes: Some(Arc::new(built.indexes)),
             stored: Stored::default(),
             tokenized_on: 0,
+            tokenized_at_once: 0,
             parts: Some(built.parts),
         };
         Ok((meta, loaded))
@@ -2862,8 +2878,7 @@ impl Writer {
         // from here to the end of loading back what it built: it then gives
         // up where it is, and leaves nothing (merge note, step 3).
         let panics = self.merge_panics.load(Ordering::SeqCst);
-        let tokenizing = self.merge_tokenized_at_once.load(Ordering::SeqCst);
-        let stopping = Stopping::merge(*lock(&self.merge_stop_at), panics).tokenizing(tokenizing);
+        let stopping = Stopping::merge(*lock(&self.merge_stop_at), panics);
         {
             let mut under_way = lock(&self.merge_stop);
             self.merge_past_loading.store(false, Ordering::SeqCst);
@@ -3174,12 +3189,13 @@ impl Writer {
         self.merge_panics.store(panics, Ordering::SeqCst);
     }
 
-    /// Have each merge's build from now on hold `rows` rows' text tokenized
-    /// at once, at the most. For tests that weigh a build tokenized in
-    /// chunks against one tokenized all at once.
+    /// How many rows' tokens the last flush or merge held at once, at the
+    /// most, as it indexed its rows: split and not yet indexed. Counts what
+    /// the build says it holds; only the allocator tells of tokens kept
+    /// after they are indexed. For tests.
     #[doc(hidden)]
-    pub fn tokenize_merges_at_once(&self, rows: usize) {
-        self.merge_tokenized_at_once.store(rows, Ordering::SeqCst);
+    pub fn last_tokenized_at_once(&self) -> usize {
+        self.last_tokenized_at_once.load(Ordering::SeqCst)
     }
 
     /// How many stops came too late: to a merge already past loading back

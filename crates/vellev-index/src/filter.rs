@@ -352,7 +352,7 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct PropertyIndex {
     values: BTreeMap<Key, RoaringBitmap>,
     present: RoaringBitmap,
@@ -366,7 +366,7 @@ const RUN: usize = 256;
 /// range over many values unions a few of these and the values at its
 /// edges. Level 0 unions `run` values, and each level above unions `run`
 /// runs of the level below.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Runs {
     run: usize,
     /// The first value of each run of level 0.
@@ -489,7 +489,7 @@ impl PropertyIndex {
 /// Every distinct value of a filterable property is kept as a key, so a
 /// property holding long, mostly unique text is cheaper declared not
 /// filterable.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RowIndex {
     rows: RoaringBitmap,
     properties: HashMap<String, PropertyIndex>,

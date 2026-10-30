@@ -2,11 +2,27 @@
 //! end of loading what it built back, it asks its stop in each long stage,
 //! and gives up, leaving nothing behind, once it is stopped.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use vellev_index::stop::{Stage, Stop};
 
 use crate::state::TOKENIZED_AT_ONCE;
+
+/// How many rows' text a build holds tokenized at once, at the most, as a
+/// test asks: see [`tokenize_at_once`].
+static ASKED_AT_ONCE: AtomicUsize = AtomicUsize::new(TOKENIZED_AT_ONCE);
+
+/// Have every merge, flush and open from now on hold `rows` rows' text
+/// tokenized at once, at the most. For rules that weigh a build tokenized in
+/// chunks against one tokenized all at once, in a binary of their own, one
+/// measurement at a time: it is the process's, as an open has no writer to
+/// ask, and what it weighs, the allocator's count, is the process's too. Not
+/// for use.
+#[doc(hidden)]
+pub fn tokenize_at_once(rows: usize) {
+    ASKED_AT_ONCE.store(rows.max(1), Ordering::SeqCst);
+}
 
 /// The stages of a merge in which it asks its stop. Named for tests that
 /// show each one asks; not for use.
@@ -49,7 +65,8 @@ pub(crate) struct Stopping {
     /// Whether the build panics, as a test asks.
     panics: bool,
     /// How many rows' text the build holds tokenized at once, at the most:
-    /// [`TOKENIZED_AT_ONCE`], unless a test asks otherwise.
+    /// [`TOKENIZED_AT_ONCE`], unless a test asks otherwise. Rows, not bytes:
+    /// a chunk of long documents holds what they come to.
     tokenized_at_once: usize,
     /// Its askings, counted as a test asks.
     #[cfg(test)]
@@ -61,7 +78,7 @@ pub(crate) struct Stopping {
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct Asked {
-    pub times: std::sync::atomic::AtomicUsize,
+    pub times: AtomicUsize,
     pub stops_at: usize,
 }
 
@@ -77,7 +94,7 @@ impl Stopping {
             stop,
             at,
             panics,
-            tokenized_at_once: TOKENIZED_AT_ONCE,
+            tokenized_at_once: ASKED_AT_ONCE.load(Ordering::SeqCst),
             #[cfg(test)]
             asked: None,
         }
@@ -89,14 +106,15 @@ impl Stopping {
             stop: Stop::new(),
             at: None,
             panics: false,
-            tokenized_at_once: TOKENIZED_AT_ONCE,
+            tokenized_at_once: ASKED_AT_ONCE.load(Ordering::SeqCst),
             #[cfg(test)]
             asked: None,
         }
     }
 
     /// As this, holding `rows` rows' text tokenized at once, at the most,
-    /// and at least one: how a test weighs a build against another.
+    /// and at least one.
+    #[cfg(test)]
     pub(crate) fn tokenizing(self, rows: usize) -> Self {
         Self {
             tokenized_at_once: rows.max(1),
@@ -108,7 +126,7 @@ impl Stopping {
     #[cfg(test)]
     pub(crate) fn counted(self, stops_at: usize) -> (Self, std::sync::Arc<Asked>) {
         let asked = std::sync::Arc::new(Asked {
-            times: std::sync::atomic::AtomicUsize::new(0),
+            times: AtomicUsize::new(0),
             stops_at,
         });
         let stopping = Self {
@@ -130,9 +148,7 @@ impl Stopping {
         }
         #[cfg(test)]
         if let Some(asked) = &self.asked {
-            let times = asked
-                .times
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let times = asked.times.fetch_add(1, Ordering::SeqCst);
             if times + 1 >= asked.stops_at {
                 self.stop.stop();
             }
