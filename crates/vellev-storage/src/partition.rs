@@ -2970,11 +2970,8 @@ impl Writer {
             return Ok(None);
         };
         let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
+        // Kept from here, and let go by the merge: see `Staged::keep`.
         staged.keep();
-        // Kept from here: committed, or left for cleaning up should the
-        // commit fail, the partition's either way, and no longer what the
-        // merge holds.
-        uploading.let_go();
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, |state| {
             state.compacted(&merge, merged);
@@ -3683,8 +3680,14 @@ struct Staged {
 
 impl Staged {
     /// Keep the files: the commit that names them is about to be tried.
+    /// They are the partition's from here, committed or left for cleaning
+    /// up should the commit fail, and no longer what a merge holds: its
+    /// share in them is let go.
     fn keep(&mut self) {
         self.keys.clear();
+        if let Some(carrying) = self.carrying.take() {
+            carrying.let_go();
+        }
     }
 }
 
@@ -3696,7 +3699,8 @@ impl Drop for Staged {
         // going up for nothing.
         let putting = std::mem::take(&mut self.putting);
         putting.iter().for_each(tokio::task::JoinHandle::abort);
-        // Let go here, should nothing be left to delete what went up.
+        // Let go here should nothing be left to delete what went up, or
+        // nothing went up.
         let carrying = self.carrying.take().map(UnlessDeleted::new);
         let (false, Ok(runtime)) = (self.keys.is_empty(), tokio::runtime::Handle::try_current())
         else {
