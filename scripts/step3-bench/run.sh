@@ -125,6 +125,9 @@ for arm in "${arms[@]}"; do
   fi
   if [ "$first" = "$node" ]; then rest=$load; else rest=$node; fi
   wait "$rest" || ok=0
+  # Its store, whatever became of the arm: one killed part way leaves its
+  # store behind, and the next arm would run out of disk.
+  as_root rm -rf "$data/arm-$arm"
   tail -n 30 "$out/arm-$arm.log" "$out/load-$arm.log" || true
   if [ "$ok" = 0 ]; then failed+=("$arm"); fi
 done

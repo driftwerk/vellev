@@ -191,6 +191,29 @@ async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
 }
 
+/// A build stopped before it was done is timed as long as it ran, apart
+/// from those that finished: a merge stopped again and again spends real
+/// CPU, and an arm's idle share of its build seconds must count it (review
+/// of #169). No finished build is timed for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_build_is_timed_apart_from_those_that_finished() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    for round in 0..2 {
+        writer.commit(notes(round * 10, 10)).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    writer.stop_merges_at(Some(vellev_storage::MergeStage::Encoding));
+    assert_eq!(writer.merge().await.unwrap(), None);
+    let events = timings.drain_events();
+    assert_eq!(
+        kept(&events, Timed::Merge(MergePhase::BuildStopped)).len(),
+        1
+    );
+    assert_eq!(kept(&events, Timed::Merge(MergePhase::Build)).len(), 0);
+}
+
 /// Rule 3. A spell at the backlog runs from the rows unflushed coming to
 /// it until the commit that takes the tenant below it: not from the flush
 /// that does so beginning, which comes a while later, nor to it.

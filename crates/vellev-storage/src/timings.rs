@@ -65,6 +65,9 @@ pub enum MergePhase {
     /// Building the merged segment: indexing and encoding it, without the
     /// lock.
     Build,
+    /// As long as a build ran that was stopped before it was done: work
+    /// spent, though no merge came of it.
+    BuildStopped,
     /// Uploading its files.
     Upload,
     /// Loading it back, and seeing it fit to adopt.
@@ -72,10 +75,11 @@ pub enum MergePhase {
 }
 
 impl MergePhase {
-    pub const ALL: [MergePhase; 5] = [
+    pub const ALL: [MergePhase; 6] = [
         MergePhase::Turn,
         MergePhase::Gather,
         MergePhase::Build,
+        MergePhase::BuildStopped,
         MergePhase::Upload,
         MergePhase::Load,
     ];
@@ -85,6 +89,7 @@ impl MergePhase {
             MergePhase::Turn => "turn",
             MergePhase::Gather => "gather",
             MergePhase::Build => "build",
+            MergePhase::BuildStopped => "build_stopped",
             MergePhase::Upload => "upload",
             MergePhase::Load => "load",
         }
@@ -370,6 +375,10 @@ impl Timings {
 #[derive(Debug, Default)]
 pub(crate) struct Lag {
     state: Mutex<LagState>,
+    /// Where a note of rows applied waits, before it is made, while a test
+    /// asks for a checkpoint beside it.
+    #[cfg(test)]
+    pub(crate) paused: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
 }
 
 #[derive(Debug, Default)]
@@ -417,6 +426,14 @@ impl Lag {
 
     /// Rows were applied, and the partition holds `unflushed`.
     pub(crate) fn applied(&self, unflushed: usize) {
+        #[cfg(test)]
+        {
+            let paused = self.paused.lock().unwrap().take();
+            if let Some(paused) = paused {
+                paused.wait();
+                paused.wait();
+            }
+        }
         self.state().saw(unflushed, Instant::now());
     }
 

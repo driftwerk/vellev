@@ -763,8 +763,13 @@ indexed. A merge reckons what its build holds from them.
 New, additive: `pool::merge_builds(threads, nice)`, a pool for merges to
 build on apart from the global one: `threads` threads named
 `vellev-merge-N`, each run `nice` lower than the process on Linux, made
-after the read, tuning and passes pools. `pool::tune` asked from a worker
-of another rayon pool, as a build on such a pool is, now waits for the
-tuning pool on a thread of its own, `vellev-tune-wait`, instead of taking
-on that pool's other work meanwhile: two builds on one merge pool could
-otherwise wait on each other for good.
+after the read, tuning and passes pools.
+
+New, additive: `ClusteredIndex::build_stopping_on` and
+`BinaryIndex::build_stopping_on`, as `build_stopping`, each parallel pass
+where a `pool::Passes` says, and the rest on the calling thread, which must
+be on no pool that builds. `pool::CallersPool` runs each pass on the pool
+of the calling thread, as `build_stopping` does.
+
+New, additive: `pool::thread_cpu`, the CPU time the calling thread has
+spent so far, where the system says.

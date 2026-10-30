@@ -122,7 +122,12 @@ impl Drop for Turn {
 /// goes, if it was given it.
 ///
 /// Never called from the tuning pool's own thread, nor from work done in
-/// a turn: that would wait for a turn its own caller holds, for ever.
+/// a turn: that would wait for a turn its own caller holds, for ever. Nor
+/// from a worker of a pool that builds: waiting for the tuning pool, that
+/// worker would take on its own pool's other work, and another build among
+/// it would then wait for its turn behind this one's, for good. A build
+/// given [`Passes`] asks from the thread that called it, which is on no
+/// pool.
 pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, Stopped> {
     let (turns, turned) = turns();
     let mut now = taken(turns);
@@ -141,23 +146,53 @@ pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, 
     drop(now);
     let _turn = Turn(ticket);
     stop.check(Stage::Tuning)?;
-    if rayon::current_thread_index().is_none() {
-        return Ok(tuning().install(work));
+    Ok(tuning().install(work))
+}
+
+/// The CPU time the calling thread has spent so far, if the system says.
+pub fn thread_cpu() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let mut spent = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `spent` is a timespec of this process's, for the call
+        // to fill in.
+        let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spent) };
+        (read == 0).then(|| {
+            Duration::new(
+                u64::try_from(spent.tv_sec).unwrap_or(0),
+                u32::try_from(spent.tv_nsec).unwrap_or(0),
+            )
+        })
     }
-    // On a worker of another pool, as a merge's build on a pool of its own
-    // is ([`merge_builds`]): asked from there, the tuning pool would have
-    // this thread take on its own pool's other work while it waited,
-    // another merge's build among it, which would then wait for its turn
-    // here behind this one's for good, this turn let go only once that
-    // work had returned. A thread of its own waits instead, doing nothing
-    // else. It runs as the thread it is made from does, which is all it
-    // does, and is named for what it waits on.
-    let tuned = std::thread::scope(|scope| {
-        let waiting = std::thread::Builder::new().name("vellev-tune-wait".into());
-        let waiting = waiting.spawn_scoped(scope, || tuning().install(work));
-        waiting.expect("a thread to wait for tuning on").join()
-    });
-    Ok(tuned.unwrap_or_else(|panicked| std::panic::resume_unwind(panicked)))
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Where a build runs each of its parallel passes. A build asks this from
+/// the thread that called it, which keeps the build's serial work and its
+/// turn to tune: only the passes go wherever this says. So a build given a
+/// pool never has a thread of that pool waiting for anything but a pass.
+///
+/// A pass names what it is, for whoever keeps track.
+pub trait Passes: Copy + Send + Sync {
+    /// Run `pass`, named `name`, and give back what it gives.
+    fn pass<R: Send>(self, name: &'static str, pass: impl FnOnce() -> R + Send) -> R;
+}
+
+/// Each pass on the pool of the thread that asks: rayon's global one, off
+/// any pool.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CallersPool;
+
+impl Passes for CallersPool {
+    fn pass<R: Send>(self, _: &'static str, pass: impl FnOnce() -> R + Send) -> R {
+        pass()
+    }
 }
 
 /// A pool for merges to build on, apart from rayon's global one, which
