@@ -2328,6 +2328,67 @@ fn arms_are_compared_only_if_run_alike() {
     );
 }
 
+/// The backlog refusals every arm is held to: arm (a)'s, only if (a) is
+/// compared. An invalid (a)'s refusals bound nothing (review of #169).
+fn backlog_bound(runs: &[ArmRun], invalid: &BTreeMap<String, Vec<String>>) -> Option<u64> {
+    let valid = invalid.get("a").is_some_and(Vec::is_empty);
+    runs.iter()
+        .find(|run| run.name == "a")
+        .filter(|_| valid)
+        .and_then(|a| a.node["marks"]["backlog_refusals"]["refused"].as_u64())
+}
+
+#[test]
+fn an_invalid_arm_as_refusals_bound_nothing() {
+    let mut a = a_run("a");
+    a.node["marks"] = json!({ "backlog_refusals": { "refused": 7 } });
+    let runs = vec![a, a_run("b")];
+    let mut invalid = BTreeMap::from([("a".to_string(), vec![]), ("b".to_string(), vec![])]);
+    assert_eq!(backlog_bound(&runs, &invalid), Some(7));
+    invalid.insert(
+        "a".to_string(),
+        vec!["a smoke, not the measurement".to_string()],
+    );
+    assert_eq!(backlog_bound(&runs, &invalid), None);
+    assert_eq!(backlog_bound(&runs[1..], &BTreeMap::new()), None);
+}
+
+/// The noise floor: how far (b) lies from itself run again, as a share of
+/// (b). Null unless both runs are valid: a spread from a run not compared
+/// is no floor. It decides nothing (review of #169).
+fn noise_floor(b: Option<Compared>, b2: Option<Compared>) -> Value {
+    match (b, b2) {
+        (Some(b), Some(b2)) if b.valid && b2.valid => json!({
+            "read_p99_spread": (b.read_p99_ms - b2.read_p99_ms).abs() / b.read_p99_ms,
+            "end_segments_spread": (b.end_segments - b2.end_segments).abs() / b.end_segments,
+        }),
+        _ => json!(null),
+    }
+}
+
+#[test]
+fn the_noise_floor_is_bs_spread_from_itself_when_both_runs_count() {
+    let run = |valid, read_p99_ms, end_segments| Compared {
+        valid,
+        all_marks: Some(true),
+        read_p99_ms,
+        end_segments,
+    };
+    let floor = noise_floor(Some(run(true, 100.0, 10.0)), Some(run(true, 90.0, 12.0)));
+    assert_eq!(floor["read_p99_spread"], json!(0.1), "{floor}");
+    assert_eq!(floor["end_segments_spread"], json!(0.2), "{floor}");
+    let invalid = Some(run(false, 90.0, 12.0));
+    assert_eq!(
+        noise_floor(Some(run(true, 100.0, 10.0)), invalid),
+        json!(null)
+    );
+    assert_eq!(
+        noise_floor(invalid, Some(run(true, 100.0, 10.0))),
+        json!(null)
+    );
+    assert_eq!(noise_floor(Some(run(true, 100.0, 10.0)), None), json!(null));
+}
+
 /// Whether an arm met every mark: `None` if that rests on the backlog
 /// bound and there is none, as when arm (a) is not compared.
 fn all_marks(marks: &Value, backlog_within_a: Option<bool>) -> Option<bool> {
@@ -2466,8 +2527,6 @@ fn step3_compare() {
         .collect();
     assert!(!runs.is_empty(), "no arm-*.json in {}", out.display());
     let invalid = not_compared(&runs);
-    let valid = |name: &str| invalid.get(name).is_some_and(Vec::is_empty);
-    let run_of = |name: &str| runs.iter().find(|run| run.name == name);
     let p99 = |run: &ArmRun| {
         run.load
             .as_ref()
@@ -2475,9 +2534,7 @@ fn step3_compare() {
             .unwrap_or(f64::NAN)
     };
     // Backlog refusals are held to arm (a)'s only if (a) is compared.
-    let control_refused = run_of("a")
-        .filter(|_| valid("a"))
-        .and_then(|a| a.node["marks"]["backlog_refusals"]["refused"].as_u64());
+    let control_refused = backlog_bound(&runs, &invalid);
     let mut rows = Vec::new();
     let mut verdicts = serde_json::Map::new();
     let mut compared: BTreeMap<String, Compared> = BTreeMap::new();
@@ -2538,17 +2595,7 @@ fn step3_compare() {
     let p99_of = |name: &str| compared.get(name).map_or(f64::NAN, |arm| arm.read_p99_ms);
     let winner = winner(c, d, p99_of("c"), p99_of("d"));
     // The noise floor: (b) against itself, deciding nothing.
-    let noise = match (
-        valid("b") && valid("b2"),
-        compared.get("b"),
-        compared.get("b2"),
-    ) {
-        (true, Some(b), Some(b2)) => json!({
-            "read_p99_spread": (b.read_p99_ms - b2.read_p99_ms).abs() / b.read_p99_ms,
-            "end_segments_spread": (b.end_segments - b2.end_segments).abs() / b.end_segments,
-        }),
-        _ => json!(null),
-    };
+    let noise = noise_floor(compared.get("b").copied(), compared.get("b2").copied());
     let said = |beats: Option<bool>| match beats {
         Some(true) => "yes",
         Some(false) => "no",
