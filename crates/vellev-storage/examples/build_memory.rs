@@ -8,11 +8,11 @@
 //!
 //! A counting allocator measures each peak, above what was held before it.
 //! A thread reads the count every millisecond, and each crest it saw is
-//! printed, in MB, in the order they came: for a merge of passages, the rows
-//! gathered, each chunk's tokens beside the index so far, the vectors, and
-//! encoding. Stages are told from one another by that order alone, so that
-//! nothing is marked in the code measured. Printed to stdout, for a job's
-//! log to keep.
+//! printed, in MB, in the order they came, and the most held in each of 60
+//! even lengths of the work: for a merge of passages, the rows gathered, each
+//! chunk's tokens beside the index so far, the vectors, and encoding. Stages
+//! are told from one another by that order alone, so that nothing is marked
+//! in the code measured. Printed to stdout, for a job's log to keep.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -231,9 +231,10 @@ async fn measured<T>(what: &str, work: impl std::future::Future<Output = T>) -> 
     SAMPLING.store(false, Ordering::SeqCst);
     let samples = sampler.join().unwrap();
     println!(
-        "{what}: peak {:.1} MB, crests {:?}",
+        "{what}: peak {:.1} MB, crests {:?}, held {:?}",
         peak.saturating_sub(before) as f64 / MB,
-        crests(&samples, before, peak)
+        crests(&samples, before, peak),
+        held(&samples, before)
     );
     done
 }
@@ -262,6 +263,16 @@ fn crests(samples: &[usize], before: usize, peak: usize) -> Vec<f64> {
         crests.push(in_mb(high));
     }
     crests
+}
+
+/// The most `samples` hold, in whole MB above `before`, over each of 60 even
+/// lengths of them.
+fn held(samples: &[usize], before: usize) -> Vec<u64> {
+    let in_mb = |held: usize| (held.saturating_sub(before) as f64 / MB) as u64;
+    samples
+        .chunks(samples.len().div_ceil(60).max(1))
+        .map(|length| length.iter().copied().max().map_or(0, in_mb))
+        .collect()
 }
 
 /// A flush of all the rows, and an open of the one segment it wrote.

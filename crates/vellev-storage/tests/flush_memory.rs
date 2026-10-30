@@ -157,12 +157,14 @@ enum Text {
     Passage,
     /// The rows from `from` up to `to` of the run, however its segments
     /// fall, hold `words` words drawn evenly from 50,000, as a bulk import of
-    /// long documents does; of the rest, one in two holds "row" and its
-    /// number and the other no text at all.
+    /// long documents does, or if `short`, of four letters drawn from 65,536,
+    /// whose tokens outweigh their text the more; of the rest, one in two
+    /// holds "row" and its number and the other no text at all.
     Block {
         from: usize,
         to: usize,
         words: usize,
+        short: bool,
     },
     /// "row" and its number, and a body of 800 words, each found in this row
     /// alone, in a property neither searched nor filtered on.
@@ -195,8 +197,16 @@ impl Text {
                     .collect::<Vec<_>>()
                     .join(" ")
             }
-            Self::Block { from, to, words } if (from..to).contains(&n) => (0..words)
-                .map(|_| format!("e{}", (Self::drawn(random) * 50_000.0) as usize))
+            Self::Block {
+                from,
+                to,
+                words,
+                short,
+            } if (from..to).contains(&n) => (0..words)
+                .map(|_| match short {
+                    true => format!("{:04x}", (Self::drawn(random) * 65_536.0) as usize),
+                    false => format!("e{}", (Self::drawn(random) * 50_000.0) as usize),
+                })
                 .collect::<Vec<_>>()
                 .join(" "),
             Self::Block { .. } if n.is_multiple_of(2) => String::new(),
@@ -499,7 +509,7 @@ fn within_bounds(shape: &str, peak: usize, reckoned: usize, planned: usize) {
 }
 
 /// The merges the reckoning is held to.
-const RECKONED: [Shape; 26] = [
+const RECKONED: [Shape; 27] = [
     Shape::of(FEWER, WIDE, Text::Short),
     Shape::of(MORE, WIDE, Text::Short),
     Shape::of(FEWER, NARROW, Text::Short),
@@ -533,6 +543,7 @@ const RECKONED: [Shape; 26] = [
             from: CHUNKED - AT_ONCE,
             to: CHUNKED,
             words: 200,
+            short: false,
         },
     ),
     Shape::of(
@@ -542,6 +553,7 @@ const RECKONED: [Shape; 26] = [
             from: 16_000,
             to: 16_000 + AT_ONCE,
             words: 200,
+            short: false,
         },
     ),
     Shape::of(
@@ -551,6 +563,19 @@ const RECKONED: [Shape; 26] = [
             from: CHUNKED_MORE - AT_ONCE,
             to: CHUNKED_MORE,
             words: 800,
+            short: false,
+        },
+    ),
+    // Tokens far past what encoding comes to, so that a chunk's are what
+    // the peak is, and spread over the run they would be missed.
+    Shape::of(
+        CHUNKED_MORE,
+        NARROW,
+        Text::Block {
+            from: CHUNKED_MORE - AT_ONCE,
+            to: CHUNKED_MORE,
+            words: 800,
+            short: true,
         },
     ),
     // Rows mostly of what nothing indexes, and encoded all the same.

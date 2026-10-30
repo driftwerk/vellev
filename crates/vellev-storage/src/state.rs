@@ -794,12 +794,15 @@ const INDEXED_EACH_ROW: f64 = 345.0;
 /// see [`coded_bytes`].
 const CODE_EACH_ROW: f64 = 24.0;
 const FACTORS_EACH_ROW: f64 = 60.0;
-/// The most a segment's encoding holds, for each byte of its frame. Not
-/// fitted: its body is grown by doubling, to less than twice its length, and
-/// `frame` copies it, the two then held together, so that it comes to two
-/// to three times the frame, by where the doubling falls: 2.03 to 2.48
-/// measured. The most it can be, as the reckoning would sooner count over.
-const ENCODED_AT_PEAK: f64 = 3.0;
+/// What a segment's encoding holds at its crest, for each byte of its frame.
+/// Not fitted: its body is grown by doubling, to between one and two times
+/// its length, and `frame` copies it, the two then held together, so that it
+/// comes to two to three times the frame. Which, nothing here can tell: the
+/// doubling starts from the first rows' lengths. So the middle, off by half a
+/// frame at the most either way, which keeps any shape inside the rule's
+/// bounds, where three would pass 30% on rows mostly of frame as the doubling
+/// fell (2.03 to 2.48 measured, all of them counted over).
+const ENCODED_AT_PEAK: f64 = 2.5;
 
 impl Reckoning {
     /// About how many bytes the merge holds at its peak.
