@@ -794,11 +794,13 @@ async fn flush_and_open(rows: usize, dimensions: usize, text: Text, at_once: usi
 
 /// The flushes and opens measured, and how much of a flush's peak and an
 /// open's chunks must save: a flush of passages encodes, as a merge does,
-/// and saves next to nothing; of what was measured, an open saved 25.5–28.0%,
-/// and a flush of Wide text 20.2%.
+/// and saves next to nothing. The floors sit under the least measured over
+/// six runs, as the all-at-once arm's own peak spreads: an open saved
+/// 21.7–25.7% at 100,000 rows, 26.6–28.7% at 200,000 and 25.0–27.7% of Wide
+/// text, and a flush of Wide text 17.9–20.2%.
 const FLUSHED_AND_OPENED: [(usize, usize, Text, f64, f64); 3] = [
-    (100_000, WIDE, Text::Passage, 0.0, 0.22),
-    (200_000, WIDE, Text::Passage, 0.0, 0.22),
+    (100_000, WIDE, Text::Passage, 0.0, 0.19),
+    (200_000, WIDE, Text::Passage, 0.0, 0.24),
     (CHUNKED, NARROW, Text::Wide, 0.15, 0.22),
 ];
 
