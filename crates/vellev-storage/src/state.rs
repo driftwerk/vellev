@@ -616,7 +616,7 @@ pub(crate) struct Reckoning {
 /// 24 merges, of 4,000 to 200,000 rows, of 8 and 768 dimensions, with short
 /// text, passages, text of words each found in one row, text over a large
 /// vocabulary and over a small one, and with their vectors clustered, to
-/// within a quarter of each (`flush_memory`'s
+/// within 26% of each (`flush_memory`'s
 /// `a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent`,
 /// which holds the reckoning to within 30%).
 ///
@@ -635,10 +635,12 @@ const VECTORS_AT_PEAK: f64 = 1.3;
 /// Its text index, or a chunk's tokens, whichever comes to more, never the
 /// two together: each row's tokens go as they are indexed, those new to the
 /// index into it, so that a merge's tokens are at their most before its
-/// index has grown, and the index at its largest once they have gone.
-/// The index's maps and postings grown beyond what they keep count for the
-/// fraction over one.
-const TEXT_AT_PEAK: f64 = 1.05;
+/// index has grown, and the index at its largest once they have gone. The
+/// run's indexes are added up, though the vocabulary they share is held
+/// once in what is merged; more over a wide vocabulary, then, and the rule
+/// holds it from both sides: 1.05 reckoned a merge of it 30% over when its
+/// threads happened to meet at a lower peak, one run in twenty.
+const TEXT_AT_PEAK: f64 = 1.0;
 const TOKENIZED_AT_PEAK: f64 = 1.0;
 const FILTERS_AT_PEAK: f64 = 1.0;
 const TRAINING_AT_PEAK: f64 = 0.8;
