@@ -4,25 +4,41 @@
 //! under way, to tell what it costs to wait from what each takes anyway.
 //! The building lock and the state's are all a gather can keep them behind.
 //!
+//! Then a merge is let commit, with reads and writes going on beside it, to
+//! show what is left: the commit's walk of the run's rows under the read
+//! lock, and of the live map under the write lock, which no gather's change
+//! moves (node memory note, §2.9). The log's `adopting` is how long the
+//! write lock was held; the longest read and write are what that and the
+//! walk under the read lock cost them.
+//!
 //!   cargo run --release -p vellev-storage --example gather_hold
 //!
 //! Environment: ROWS (100000, a segment), SEGMENTS (4), DIMS (768),
 //! RUNS (5).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use object_store::memory::InMemory;
 use serde_json::json;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, NodeId,
     ObjectId, Property, TenantId,
 };
 use vellev_storage::blobs::{Blobs, ObjectBlobs};
 use vellev_storage::coordinator::{Acquired, Coordinator, MemoryCoordinator, PartitionKey};
-use vellev_storage::{MergeBuilds, Merging, Mutation, Writer};
+use vellev_storage::{MergeBuilds, Merging, Mutation, State, Writer};
 
 const PER_COMMIT: usize = 500;
+
+/// Whether what a checkpoint held the write lock for is logged: only for
+/// the merge let commit.
+static LOGGING: AtomicBool = AtomicBool::new(false);
 
 fn setting(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -99,6 +115,12 @@ async fn flush_and_commit(writer: &Writer, n: u64, dims: usize) -> (Duration, Du
 
 #[tokio::main]
 async fn main() {
+    let adopted = filter_fn(|meta| {
+        LOGGING.load(Ordering::SeqCst) && meta.fields().field("adopting").is_some()
+    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(adopted))
+        .init();
     let (rows, segments, dims, runs) = (
         setting("ROWS", 100_000),
         setting("SEGMENTS", 4),
@@ -120,8 +142,11 @@ async fn main() {
     else {
         panic!("a fresh partition is free to take")
     };
+    // Not clustered: the merge let commit is timed at its commit, not its
+    // tuning.
     let merging = Merging {
         fanout: segments,
+        clustered_above: usize::MAX,
         ..Merging::default()
     };
     let builds = MergeBuilds::new(1);
@@ -175,4 +200,57 @@ async fn main() {
              with none, flush {flush_alone:?}, commit {commit_alone:?}"
         );
     }
+
+    // The commit, with a write at a time and reads going on beside it.
+    let gate = writer.hold_merges_before_commit();
+    let merge = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    gate.reached.notified().await;
+    println!("the merge is built, at {:?}", began.elapsed());
+    let going = Arc::new(AtomicBool::new(true));
+    let reading = std::thread::spawn({
+        let (going, partition) = (going.clone(), writer.partition().clone());
+        move || {
+            let mut longest = Duration::ZERO;
+            while going.load(Ordering::SeqCst) {
+                let asked = Instant::now();
+                partition.read(State::rows);
+                longest = longest.max(asked.elapsed());
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            longest
+        }
+    });
+    let writing = tokio::spawn({
+        let (going, writer) = (going.clone(), writer.clone());
+        let mut n = n + 1;
+        async move {
+            let mut longest = Duration::ZERO;
+            let mut random = Random(n | 1);
+            while going.load(Ordering::SeqCst) {
+                n += 1;
+                let written = note(n, dims, &mut random);
+                let asked = Instant::now();
+                writer.commit(vec![written]).await.unwrap();
+                longest = longest.max(asked.elapsed());
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+            longest
+        }
+    });
+    LOGGING.store(true, Ordering::SeqCst);
+    let released = Instant::now();
+    gate.release.notify_one();
+    let committed = merge.await.unwrap().unwrap();
+    let commit_took = released.elapsed();
+    LOGGING.store(false, Ordering::SeqCst);
+    assert!(committed.is_some(), "the merge commits");
+    going.store(false, Ordering::SeqCst);
+    let (longest_read, longest_write) = (reading.join().unwrap(), writing.await.unwrap());
+    println!(
+        "the commit took {commit_took:?}; beside it the longest read took {longest_read:?}, \
+         the longest write {longest_write:?}"
+    );
 }

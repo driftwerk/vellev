@@ -3048,7 +3048,8 @@ impl Writer {
     /// lock held, so that flushes, commits and searches go on through it,
     /// and no async thread waits on it. Copied a chunk at a time, it gives
     /// up within a chunk of a stop, or of a restore that has begun or been
-    /// made since the plan, which would only drop the merge at its commit.
+    /// made since the plan, which would only drop the merge at its commit:
+    /// and, last of all, before its frame is sealed.
     fn gathered(
         &self,
         run: Run,
@@ -3062,7 +3063,7 @@ impl Writer {
         let (epoch, restoring) = (self.epoch.clone(), self.restoring.clone());
         let above = self.merging.clustered_above;
         move |stopping, build| {
-            let goes_on = |rows| {
+            let mut goes_on = |rows| {
                 if let Some(build) = build {
                     build.gathering(rows, stopping);
                 }
@@ -3070,9 +3071,14 @@ impl Writer {
                     && !restoring.load(Ordering::SeqCst)
                     && epoch.load(Ordering::SeqCst) == planned
             };
-            let (file, vectors, copied) = run.merged(named_at, GATHERED_AT_ONCE, goes_on)?;
+            let (file, vectors, copied) = run.merged(named_at, GATHERED_AT_ONCE, &mut goes_on)?;
             let tombstones = file.tombstones.len();
             let shape = Shape::of_gathered(&catalog, &file.rows, &vectors, tombstones, above);
+            // Asked once more, as what comes next, sealing the frame, sums
+            // every vector with nothing to ask it.
+            if !goes_on(file.rows.len()) {
+                return None;
+            }
             if let Some(build) = build {
                 let reckoning = reckoning.gathered(file.rows.len(), copied, &vectors);
                 build.reckon(reckoning.peak());

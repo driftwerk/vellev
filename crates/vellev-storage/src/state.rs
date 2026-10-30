@@ -524,7 +524,11 @@ pub(crate) struct DeadRows {
 /// gather their rows from with no lock held: their files and vectors, which
 /// are never changed in place, and their marks as they stood. Rows that die
 /// after are carried out at the commit, as those that die as it builds are.
-/// It holds the segments only as long as the gather runs.
+/// It holds the segments until its gather ends, from the plan on: so through
+/// the wait for the gather's turn among the work off the async threads too,
+/// and a restore that replaces them meanwhile leaves them held for that
+/// wait, then for at most a chunk. What it held is freed off those threads,
+/// however it is let go.
 #[derive(Debug)]
 pub(crate) struct Run {
     segments: Vec<(Arc<SegmentFile>, Arc<Column>)>,
@@ -537,12 +541,28 @@ pub(crate) struct Run {
 }
 
 impl Drop for Run {
+    /// Let go ungathered, as by a merge stopped before its gather begins,
+    /// or one dropped: on an async thread, it may be the last to hold a
+    /// replaced segment of a million rows. Sent off without a turn among
+    /// the work there, and not waited for: what lets it go may have given
+    /// up waiting for that very turn, or be past waiting for anything.
     fn drop(&mut self) {
         let segments = std::mem::take(&mut self.segments);
-        drop(segments);
+        if segments.is_empty() {
+            return;
+        }
         #[cfg(test)]
-        if let Some(freed_on) = self.freed_on.take() {
-            let _ = freed_on.send(std::thread::current().id());
+        let freed_on = self.freed_on.take();
+        let free = move || {
+            drop(segments);
+            #[cfg(test)]
+            if let Some(freed_on) = freed_on {
+                let _ = freed_on.send(std::thread::current().id());
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(free)),
+            Err(_) => free(),
         }
     }
 }
@@ -588,6 +608,18 @@ impl Run {
                 }
             }
         }
+        // Before the rows, so that what asks next comes after them.
+        let tombstones: Vec<RowKey> = match self.tombstones_act {
+            false => Vec::new(),
+            true => {
+                let mut seen = HashSet::new();
+                segments
+                    .iter()
+                    .flat_map(|(file, _)| file.tombstones.iter().copied())
+                    .filter(|key| seen.insert(*key))
+                    .collect()
+            }
+        };
         let mut rows: Vec<Row> = Vec::with_capacity(count);
         let mut vectors = Gathering::with_capacity(values, count);
         // What the rows copied come to, as they are, for the reckoning.
@@ -613,17 +645,6 @@ impl Run {
                 }
             }
         }
-        let tombstones: Vec<RowKey> = match self.tombstones_act {
-            false => Vec::new(),
-            true => {
-                let mut seen = HashSet::new();
-                segments
-                    .iter()
-                    .flat_map(|(file, _)| file.tombstones.iter().copied())
-                    .filter(|key| seen.insert(*key))
-                    .collect()
-            }
-        };
         let file = SegmentFile {
             position,
             rows,
