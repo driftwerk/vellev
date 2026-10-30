@@ -248,7 +248,8 @@ impl Bench {
 #[test]
 fn a_run_off_any_workload_value_is_a_smoke() {
     assert!(Bench::measured().is_measurement());
-    let moved: [(&str, fn(&mut Bench)); 9] = [
+    type Moving = fn(&mut Bench);
+    let moved: [(&str, Moving); 9] = [
         ("soak", |b| b.soak = Duration::from_secs(1_799)),
         ("scale", |b| b.scale = 0.5),
         ("rate", |b| b.rows_a_second = 999),
@@ -262,7 +263,10 @@ fn a_run_off_any_workload_value_is_a_smoke() {
     for (what, moving) in moved {
         let mut bench = Bench::measured();
         moving(&mut bench);
-        assert!(!bench.is_measurement(), "{what} moved, and still the measurement");
+        assert!(
+            !bench.is_measurement(),
+            "{what} moved, and still the measurement"
+        );
     }
 }
 
@@ -302,7 +306,11 @@ impl Schedule {
             );
             of / by
         };
-        let every = whole(batch * active * 1_000_000_000, rate, "a place's batch interval");
+        let every = whole(
+            batch * active * 1_000_000_000,
+            rate,
+            "a place's batch interval",
+        );
         Schedule {
             every: Duration::from_nanos(every),
             a_turn: whole(bench.rotate.as_secs() * rate, batch * active, "a turn"),
@@ -340,7 +348,9 @@ impl Schedule {
             .collect();
         for place in 0..self.active {
             for k in 0..self.batches {
-                *rows.get_mut(tenant_id(self.tenant(place, k)).as_str()).unwrap() += self.batch;
+                *rows
+                    .get_mut(tenant_id(self.tenant(place, k)).as_str())
+                    .unwrap() += self.batch;
             }
         }
         rows
@@ -683,9 +693,7 @@ async fn preload(
             clustered_rows: figures.clustered_rows,
             plain: figures.plain,
             plain_rows: figures.plain_rows,
-            segments: held_segments
-                .remove(tenant.as_str())
-                .unwrap_or_default(),
+            segments: held_segments.remove(tenant.as_str()).unwrap_or_default(),
         })
         .collect();
     preloaded.sort_by(|a, b| a.tenant.cmp(&b.tenant));
@@ -1018,7 +1026,11 @@ fn reads_refused_or_failed_are_in_the_p99_at_what_they_took() {
     let summary = reads_summary(&reads, 100.0, 50.0);
     assert_eq!(summary["count"], 100);
     assert_eq!(
-        (&summary["answered"], &summary["refused"], &summary["failed"]),
+        (
+            &summary["answered"],
+            &summary["refused"],
+            &summary["failed"]
+        ),
         (&json!(98), &json!(1), &json!(1))
     );
     assert_eq!(summary["p99_ms"], json!(500.0), "{summary}");
@@ -1245,7 +1257,13 @@ fn merge_debt_is_carried_forward_from_samples_at_or_before_each_point() {
     let series = carried(&[(10.0, 5.0), (13.0, 7.0), (25.0, 9.0)], 4.0, 40.0);
     assert_eq!(
         series,
-        vec![(0.0, 4.0), (10.0, 5.0), (20.0, 7.0), (30.0, 9.0), (40.0, 9.0)]
+        vec![
+            (0.0, 4.0),
+            (10.0, 5.0),
+            (20.0, 7.0),
+            (30.0, 9.0),
+            (40.0, 9.0)
+        ]
     );
 }
 
@@ -1284,8 +1302,7 @@ fn stage_summary(metrics: &str, stage: &str) -> Value {
     let target = (0.99 * count).ceil();
     let last_bound = buckets
         .iter()
-        .filter(|(le, _)| le != "+Inf")
-        .next_back()
+        .rfind(|(le, _)| le != "+Inf")
         .map(|(le, _)| le.clone());
     let p99 = buckets
         .iter()
@@ -1981,7 +1998,8 @@ async fn load(bench: Bench, running: Running) {
     let mut readers = Vec::new();
     for (reader, done) in reads.iter().enumerate() {
         readers.push(tokio::spawn({
-            let (http, url, done, queries) = (http.clone(), url.clone(), done.clone(), queries.clone());
+            let (http, url, done, queries) =
+                (http.clone(), url.clone(), done.clone(), queries.clone());
             let mut random = Random(bench.seed ^ (reader as u64 + 1).wrapping_mul(0x9e37_79b9));
             async move {
                 tokio::time::sleep_until(started.into()).await;
@@ -2174,9 +2192,11 @@ fn a_run(name: &str) -> ArmRun {
         name: name.into(),
         node: json!({ "bench": bench.config(), "sha": "abc", "invalid": [],
                       "preloaded": preloaded }),
-        load: Some(json!({ "bench": bench.config(), "sha": "abc", "invalid": [],
+        load: Some(
+            json!({ "bench": bench.config(), "sha": "abc", "invalid": [],
                            "writes": { "by_tenant": schedule.rows_by_tenant(),
-                                       "scheduled_by_tenant": schedule.rows_by_tenant() } })),
+                                       "scheduled_by_tenant": schedule.rows_by_tenant() } }),
+        ),
     }
 }
 
@@ -2196,8 +2216,14 @@ fn arms_are_compared_only_if_run_alike() {
     flush_rows[2].node["bench"]["flush_rows"] = json!(50_000);
     flush_rows[2].load.as_mut().unwrap()["bench"]["flush_rows"] = json!(50_000);
     let found = not_compared(&flush_rows);
-    assert!(found["c"].iter().any(|why| why.contains("flush_rows")), "{found:?}");
-    assert!(found["b"].iter().any(|why| why.contains("unlike arm c")), "{found:?}");
+    assert!(
+        found["c"].iter().any(|why| why.contains("flush_rows")),
+        "{found:?}"
+    );
+    assert!(
+        found["b"].iter().any(|why| why.contains("unlike arm c")),
+        "{found:?}"
+    );
 
     let mut threads = runs();
     threads[1].node["bench"]["threads"] = json!(16);
@@ -2209,7 +2235,10 @@ fn arms_are_compared_only_if_run_alike() {
     commit[3].node["sha"] = json!("def");
     commit[3].load.as_mut().unwrap()["sha"] = json!("def");
     let found = not_compared(&commit);
-    assert!(found["d"].iter().any(|why| why.contains("another commit")), "{found:?}");
+    assert!(
+        found["d"].iter().any(|why| why.contains("another commit")),
+        "{found:?}"
+    );
     let mut unstamped = runs();
     for run in &mut unstamped {
         run.node["sha"] = json!("");
@@ -2220,14 +2249,22 @@ fn arms_are_compared_only_if_run_alike() {
     let mut short = runs();
     short[1].load.as_mut().unwrap()["writes"]["by_tenant"]["t3"] = json!(299_900);
     let found = not_compared(&short);
-    assert!(found["b"].iter().any(|why| why.contains("not the schedule's")), "{found:?}");
+    assert!(
+        found["b"]
+            .iter()
+            .any(|why| why.contains("not the schedule's")),
+        "{found:?}"
+    );
     assert!(found["c"].is_empty(), "{found:?}");
 
     let mut preload = runs();
     preload[0].node["preloaded"][2]["segments"][0]["rows"] = json!(79_999);
     let found = not_compared(&preload);
     assert_eq!(found["a"], vec!["its preload is not §9.5's"]);
-    assert!(found["b"].is_empty(), "held to arm (a)'s preload: {found:?}");
+    assert!(
+        found["b"].is_empty(),
+        "held to arm (a)'s preload: {found:?}"
+    );
 
     let mut unreported = runs();
     unreported[4].load = None;
@@ -2271,7 +2308,8 @@ fn beats_b(arm: Option<Compared>, b: Option<Compared>) -> Option<bool> {
     if !arm.valid || !b.valid {
         return None;
     }
-    let better = arm.read_p99_ms <= 0.85 * b.read_p99_ms && arm.end_segments <= 1.10 * b.end_segments;
+    let better =
+        arm.read_p99_ms <= 0.85 * b.read_p99_ms && arm.end_segments <= 1.10 * b.end_segments;
     match arm.all_marks? {
         false => Some(false),
         true => Some(better),
@@ -2310,13 +2348,25 @@ fn beats_b_asks_b_be_valid_not_that_it_pass_and_says_undecided() {
     // (b) valid but failing a mark: (c), 20% better and meeting every
     // mark, beats it.
     let b = run(true, Some(false), 100.0);
-    assert_eq!(beats_b(Some(run(true, Some(true), 80.0)), Some(b)), Some(true));
-    assert_eq!(beats_b(Some(run(true, Some(true), 90.0)), Some(b)), Some(false));
-    assert_eq!(beats_b(Some(run(true, Some(false), 50.0)), Some(b)), Some(false));
+    assert_eq!(
+        beats_b(Some(run(true, Some(true), 80.0)), Some(b)),
+        Some(true)
+    );
+    assert_eq!(
+        beats_b(Some(run(true, Some(true), 90.0)), Some(b)),
+        Some(false)
+    );
+    assert_eq!(
+        beats_b(Some(run(true, Some(false), 50.0)), Some(b)),
+        Some(false)
+    );
     // Undecided: (b) or the arm not compared, missing, or resting on no
     // backlog bound.
     let fast = run(true, Some(true), 50.0);
-    assert_eq!(beats_b(Some(fast), Some(run(false, Some(true), 100.0))), None);
+    assert_eq!(
+        beats_b(Some(fast), Some(run(false, Some(true), 100.0))),
+        None
+    );
     assert_eq!(beats_b(Some(run(false, Some(true), 50.0)), Some(b)), None);
     assert_eq!(beats_b(None, Some(b)), None);
     assert_eq!(beats_b(Some(fast), None), None);
@@ -2379,7 +2429,9 @@ fn step3_compare() {
     let mut compared: BTreeMap<String, Compared> = BTreeMap::new();
     for run in &runs {
         let marks = &run.node["marks"];
-        let refused = marks["backlog_refusals"]["refused"].as_u64().unwrap_or(u64::MAX);
+        let refused = marks["backlog_refusals"]["refused"]
+            .as_u64()
+            .unwrap_or(u64::MAX);
         let backlog = control_refused.map(|control| refused <= control);
         let all = all_marks(marks, backlog);
         let why = &invalid[&run.name];
@@ -2432,7 +2484,11 @@ fn step3_compare() {
     let p99_of = |name: &str| compared.get(name).map_or(f64::NAN, |arm| arm.read_p99_ms);
     let winner = winner(c, d, p99_of("c"), p99_of("d"));
     // The noise floor: (b) against itself, deciding nothing.
-    let noise = match (valid("b") && valid("b2"), compared.get("b"), compared.get("b2")) {
+    let noise = match (
+        valid("b") && valid("b2"),
+        compared.get("b"),
+        compared.get("b2"),
+    ) {
         (true, Some(b), Some(b2)) => json!({
             "read_p99_spread": (b.read_p99_ms - b2.read_p99_ms).abs() / b.read_p99_ms,
             "end_segments_spread": (b.end_segments - b2.end_segments).abs() / b.end_segments,
