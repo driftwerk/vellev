@@ -196,12 +196,9 @@ fn nothing_waits_on_a_gather_on(workers: usize) {
     reading.abort();
     assert_eq!(held, 1, "the gather was held throughout");
     assert!(
-        timer <= FIRES_WITHIN,
-        "a {TIMER:?} timer took {timer:?} to fire on {workers} workers"
-    );
-    assert!(
-        renewal <= RENEWED_EVERY + FIRES_WITHIN,
-        "another tenant's lease went {renewal:?} unrenewed on {workers} workers"
+        timer <= FIRES_WITHIN && renewal <= RENEWED_EVERY + FIRES_WITHIN,
+        "on {workers} workers, a {TIMER:?} timer took {timer:?} to fire, and another \
+         tenant's lease went {renewal:?} unrenewed"
     );
     assert!(committed, "the commit went through, on {workers} workers");
     runtime.block_on(async {
