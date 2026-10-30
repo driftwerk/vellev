@@ -6,7 +6,7 @@ name: Step 3 bench (scratch)
 # a smoke or the measurement.
 on:
   push:
-    branches: [scratch-step3-bench]
+    branches: [scratch-step3-bench, scratch-step3-bench-timing]
 
 permissions:
   contents: read
@@ -23,9 +23,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       # A smoke: set to 1800 and 1 to measure (§9.5).
-      STEP3_SOAK_SECS: '120'
-      STEP3_SCALE: '0.05'
-      ARMS: 'a b c d'
+      STEP3_SOAK_SECS: '300'
+      STEP3_SCALE: '1'
+      ARMS: 'b'
     steps:
       - uses: actions/checkout@v5
       - name: Disk cleanup
