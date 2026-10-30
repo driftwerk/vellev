@@ -1,0 +1,74 @@
+name: Step 3 bench (scratch)
+
+# The step 3 bench (merge note, §3 and §9) on the 4-vCPU runner: every
+# arm one after another in this one job, as scripts/step3-bench/run.sh
+# runs them. Not for merging. The settings below are pushed to choose
+# a smoke or the measurement.
+on:
+  push:
+    branches: [scratch-step3-bench]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  FIXTURE: fixture-bench-wiki1m-bge-base-v1
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # A smoke: set to 1800 and 1 to measure (§9.5).
+      STEP3_SOAK_SECS: '120'
+      STEP3_SCALE: '0.05'
+      ARMS: 'a b c d'
+    steps:
+      - uses: actions/checkout@v5
+      - name: Disk cleanup
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          docker image prune -af > /dev/null
+          df -h /
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the fixture and check it
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/download" "$F/text" "$F/vectors"
+          cd "$F/download"
+          wanted="passages.jsonl.zst queries.jsonl warmup.jsonl vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst"
+          for asset in $wanted; do
+            gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+            grep "  $asset\$" "$GITHUB_WORKSPACE/scripts/bench-fixture/SHA256SUMS" >> wanted.sha256
+          done
+          test "$(wc -l < wanted.sha256)" -eq "$(echo $wanted | wc -w)"
+          sha256sum --check --strict wanted.sha256
+          zstd -q -d --long=31 passages.jsonl.zst -o "$F/text/passages.jsonl"
+          mv queries.jsonl warmup.jsonl "$F/text/"
+          for part in vectors-*.tar.zst; do
+            zstd -q -dc "$part" | tar -C "$F/vectors" -xf - --exclude='._*' --warning=no-unknown-keyword
+            rm "$part"
+          done
+          rm -rf "$F/download"
+          test "$(ls "$F/vectors/passages" | wc -l)" -eq 100
+          df -h /
+      - name: Bench
+        run: scripts/step3-bench/run.sh "$RUNNER_TEMP/fixture" "$RUNNER_TEMP/step3" "$RUNNER_TEMP/step3-data" $ARMS
+      - if: always()
+        run: cat "$RUNNER_TEMP/step3/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: step3-bench
+          path: |
+            ${{ runner.temp }}/step3/*.json
+            ${{ runner.temp }}/step3/*.txt
+            ${{ runner.temp }}/step3/*.log
+            ${{ runner.temp }}/step3/*.md
+          retention-days: 90
+          if-no-files-found: ignore
