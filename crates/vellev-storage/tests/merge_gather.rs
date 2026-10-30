@@ -323,6 +323,27 @@ async fn a_gather_ended_by_a_restore_made_is_counted_stale() {
     assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
 }
 
+/// A gather both a restore and a stop came to is counted stale: the merge
+/// could not have committed whether it was stopped or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gather_a_restore_and_a_stop_both_ended_is_counted_stale() {
+    let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let writer = two_large(&cluster, &builds).await;
+    let committed = cluster.committed().await;
+    let (head, position) = (committed.manifest.unwrap(), committed.log_position);
+    written(&writer, vec![upsert_as(0, -1)]).await;
+    let (held, merging) = gather_held(&writer, &builds).await;
+    let restoring = writer.restore(Some(&head), position);
+    within(LONG, "the restore went through", restoring)
+        .await
+        .unwrap();
+    writer.stop_merges();
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
+}
+
 /// A merge's gather is timed for the copy, however long it runs, and its
 /// build begins after it ends: neither counts the other (§9.7 rule 5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
