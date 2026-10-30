@@ -2500,9 +2500,10 @@ impl State {
 
     /// What a merge of `merge`'s run is reckoned to hold at its peak, as it
     /// is planned, before any row is gathered: the live rows' share of what
-    /// the run's segments hold of each part, their vectors wherever they
-    /// lie, and the training of a clustered index for each collection
-    /// whose vectors are clustered, more than `clustered_above` of them.
+    /// the run's segments hold, their vectors wherever they lie, what their
+    /// text comes to together, and the training of an index for each
+    /// collection with more vectors than a shortlist takes, clustered past
+    /// `clustered_above`.
     /// From each segment's [`Parts`], worked out as it was built or loaded:
     /// a walk over the run's segments, not their rows. Refined by
     /// [`Reckoning::gathered`] once the rows are gathered.
@@ -3587,6 +3588,22 @@ mod tests {
         // All of each, and one chunk's tokens: the last chunk's crest.
         let expected = field.dictionary() + 3_000_000.0 + 300_000.0 + 1_000_000.0;
         assert!((crest - expected).abs() < 1.0, "{crest}, not {expected}");
+    }
+
+    /// A map holds its old table beside its new as it doubles: what a text
+    /// of few repeats comes to at its crest, past where it ends.
+    #[test]
+    fn indexing_is_reckoned_with_both_tables_as_a_map_doubles() {
+        let field = RunField {
+            segments: 1,
+            most_tokens: 1_000_000,
+            tokens: 1_000_000,
+            token_bytes: 8_000_000,
+            ..RunField::default()
+        };
+        let crest = indexing_crest(&[(10.0, 1.0)], std::slice::from_ref(&field), 0.0);
+        let table = table_bytes(1_000_000) as f64;
+        assert!(crest >= 1.5 * table, "{crest}, of a table of {table}");
     }
 
     /// A partition in memory, with the writer's part of flushing and

@@ -623,8 +623,8 @@ const WHOLE_BUILDS: [Shape; 4] = [
 ];
 
 /// How much of a merge whose tokens set its peak the chunks must save, of
-/// the 17.5–19.9% measured: a third of a chunk's worth of tokens kept on
-/// would take it under.
+/// the 17.5–20.1% measured: a quarter of a chunk's tokens kept on would take
+/// it under.
 const MERGE_SAVES_AT_LEAST: f64 = 0.15;
 
 /// How much two builds' peaks may differ with nothing to tell them by: see
@@ -637,7 +637,7 @@ const PEAK_TOLD_TO: f64 = 0.001;
 /// row at once, as it did before it took chunks (node memory note, §2.1).
 ///
 /// What this holds of the tokens themselves differs by shape, and only Wide
-/// text's peak tells of them. At 768 dimensions, passages lose a fifth from
+/// text's peak tells of them. At 768 dimensions, passages lose a quarter from
 /// the stage that indexes them, but encoding the segment, with its body and
 /// its frame both held, comes to as much as that stage held before, and sets
 /// the peak now, so that a build keeping a chunk's tokens on for longer
@@ -767,21 +767,23 @@ async fn flush_and_open(rows: usize, dimensions: usize, text: Text, at_once: usi
     }
 }
 
-/// The flushes and opens measured, and how much of an open's peak chunks
-/// must save and of a flush's: a flush of passages encodes, as a merge does,
-/// and saves nothing; of what was measured, an open saved 21.7–24.2%, and a
-/// flush of Wide text 16.7%.
+/// The flushes and opens measured, and how much of a flush's peak and an
+/// open's chunks must save: a flush of passages encodes, as a merge does,
+/// and saves next to nothing; of what was measured, an open saved 25.5–28.0%,
+/// and a flush of Wide text 20.2%.
 const FLUSHED_AND_OPENED: [(usize, usize, Text, f64, f64); 3] = [
-    (100_000, WIDE, Text::Passage, 0.0, 0.2),
-    (200_000, WIDE, Text::Passage, 0.0, 0.2),
-    (CHUNKED, NARROW, Text::Wide, 0.13, 0.2),
+    (100_000, WIDE, Text::Passage, 0.0, 0.22),
+    (200_000, WIDE, Text::Passage, 0.0, 0.22),
+    (CHUNKED, NARROW, Text::Wide, 0.15, 0.22),
 ];
 
 /// M1-R5. A flush and an open tokenize a chunk at a time, as a merge does,
 /// each of an open's segments its own chunk. An open encodes nothing, so its
-/// peak is the stage that indexes its rows, and a fifth of it goes with the
+/// peak is the stage that indexes its rows, and a quarter goes with the
 /// tokens, at passages as at Wide text: the allocator's count of what the
-/// count of rows above takes on trust. A flush saves where a merge does.
+/// count of rows above takes on trust. A flush saves where a merge does. An
+/// open's saving is each segment's, and each of those it loads at once
+/// holds its own chunk.
 ///
 /// As the reckoning's rule: run optimised, in CI's Test job, as
 /// `cargo test --release -p vellev-storage --test flush_memory -- --ignored`.
