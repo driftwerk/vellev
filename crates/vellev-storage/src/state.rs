@@ -1368,6 +1368,10 @@ pub struct Figures {
     /// The rest, and their rows as written.
     pub plain: usize,
     pub plain_rows: u64,
+    /// Segments as a flush or a restore wrote them, which no merge has
+    /// taken in yet, and their rows as written: the rows awaiting a merge.
+    pub unmerged: usize,
+    pub unmerged_rows: u64,
     /// As [`State::probes`].
     pub probes: Probes,
 }
@@ -1392,6 +1396,10 @@ impl State {
 impl Figures {
     /// Count the segment `meta` names: clustered if it has an index file.
     pub fn count(&mut self, meta: &SegmentMeta) {
+        if !crate::blobs::merged_segment(&meta.key) {
+            self.unmerged += 1;
+            self.unmerged_rows += meta.rows;
+        }
         match meta.index.is_some() {
             true => {
                 self.clustered += 1;

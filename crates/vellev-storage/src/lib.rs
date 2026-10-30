@@ -46,4 +46,5 @@ pub use stopping::MergeStage;
 pub use vellev_index::curve;
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;
+pub use vellev_index::pool::merge_builds as merge_pool;
 pub use work::Work;
