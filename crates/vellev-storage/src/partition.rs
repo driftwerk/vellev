@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -30,8 +30,9 @@ use crate::merge_builds::{
     MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
+use crate::published::Published;
 use crate::state::{
-    self, Discarded, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
+    self, Discarded, Figures, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
 };
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Refusal, Result, StorageError};
@@ -173,7 +174,8 @@ pub struct Partition {
     /// follows it into another.
     incarnation: Incarnation,
     blobs: Arc<dyn Blobs>,
-    state: RwLock<State>,
+    /// The state, changed only so that what it comes to is published.
+    state: Published,
     /// Serialises catch-up, and remembers the newest coordinator generation
     /// seen so an older reading of the committed state is recognised as stale.
     seen: Mutex<Generation>,
@@ -369,7 +371,26 @@ impl Partition {
     /// Run `f` against a consistent view of the partition. The lock is a
     /// blocking one and is never held across an await.
     pub fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {
-        f(&self.state.read().expect("partition lock"))
+        self.state.read(f)
+    }
+
+    /// What the partition comes to, as it was last changed: read without
+    /// its lock, so never waiting on a change under way, as a node reads it
+    /// of every tenant for its metrics and its memory budget.
+    pub fn figures(&self) -> Figures {
+        self.state.figures()
+    }
+
+    /// Change the state as `f` does, publishing all it then comes to: see
+    /// [`Published::changing`].
+    fn changing<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        self.state.changing(f)
+    }
+
+    /// Apply a commit as `f` does, publishing what it changes: see
+    /// [`Published::applying`].
+    fn applying<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        self.state.applying(f)
     }
 
     async fn load(key: PartitionKey, blobs: Arc<dyn Blobs>, committed: &Committed) -> Result<Self> {
@@ -410,7 +431,7 @@ impl Partition {
             key,
             incarnation,
             blobs,
-            state: RwLock::new(State::default()),
+            state: Published::default(),
             seen: Mutex::new(Generation(0)),
             commits: None,
             replayed: std::sync::Mutex::default(),
@@ -733,7 +754,7 @@ impl Partition {
                 let mut state = self.restore(&key, manifest, held, reloading).await?;
                 let together = state.apply_together(&tail.logs)?;
                 self.replayed_together(together);
-                *self.state.write().expect("partition lock") = state;
+                self.changing(|now| *now = state);
             }
             None => {
                 // A run of logs at a time, the codes of each made together
@@ -751,8 +772,7 @@ impl Partition {
                         prepared
                     });
                     for ((key, log), prepared) in run.iter().zip(prepared) {
-                        let mut state = self.state.write().expect("partition lock");
-                        state.apply_prepared(key, log, prepared)?;
+                        self.applying(|state| state.apply_prepared(key, log, prepared))?;
                     }
                 }
             }
@@ -1660,8 +1680,7 @@ impl Writer {
                     // Coded first, while readers may still read; the apply
                     // under the lock then only stores the codes.
                     let prepared = partition.read(|state| state.prepared(&log));
-                    let mut state = partition.state.write().expect("partition lock");
-                    state.apply_prepared(&applied, &log, prepared)
+                    partition.applying(|state| state.apply_prepared(&applied, &log, prepared))
                 })
                 .await??;
                 tracing::debug!(
@@ -1836,7 +1855,7 @@ impl Writer {
                 self.publish(&turn, key, frame, position, None, None)
                     .await?;
                 let adopting = Instant::now();
-                let adopted = adopt(&mut self.partition.state.write().expect("partition lock"));
+                let adopted = self.partition.changing(adopt);
                 tracing::debug!(
                     partition = %self.lease.key,
                     ?position,
@@ -1985,10 +2004,7 @@ impl Writer {
             .attempt(async {
                 self.publish(&turn, &key, frame, restored, restore, adopting)
                     .await?;
-                let replaced = std::mem::replace(
-                    &mut *self.partition.state.write().expect("partition lock"),
-                    state,
-                );
+                let replaced = self.partition.changing(|now| std::mem::replace(now, state));
                 self.epoch.fetch_add(1, Ordering::SeqCst);
                 Ok(replaced)
             })
@@ -3035,22 +3051,26 @@ impl Writer {
     /// block of rows it comes to, or at once if it waits on the store or the
     /// disk, and leaves nothing behind. One past loading back what it built
     /// commits, or is dropped, as it would have been. A merge begun after
-    /// this is not stopped.
-    pub fn stop_merges(&self) {
+    /// this is not stopped. Returns whether a merge was under way to stop.
+    pub fn stop_merges(&self) -> bool {
         self.merges_stopped.fetch_add(1, Ordering::SeqCst);
-        if let Some(stop) = &*lock(&self.merge_stop) {
+        let under_way = if let Some(stop) = &*lock(&self.merge_stop) {
             // Too late for one past loading back: counted, for tests that
             // tell a stop too late from one not heeded.
             if self.merge_past_loading.load(Ordering::SeqCst) {
                 self.stops_past_loading.fetch_add(1, Ordering::SeqCst);
             }
             stop.stop();
-        }
+            true
+        } else {
+            false
+        };
         // A place kept among those waiting for a turn, or a turn kept for
         // the next merge, is given up: once stopped, so that a merge giving
         // way meanwhile, which keeps its place only unstopped, as it sees
         // under this lock, leaves none behind.
         lock(&self.merge_place).take();
+        under_way
     }
 
     /// Have each merge's build panic from now on, or not. For tests that
@@ -3966,10 +3986,9 @@ impl RestoreFrom<'_> {
                 writer
                     .publish(&turn, &key, frame, restored, Some(restore), adopting)
                     .await?;
-                let replaced = std::mem::replace(
-                    &mut *writer.partition.state.write().expect("partition lock"),
-                    state,
-                );
+                let replaced = writer
+                    .partition
+                    .changing(|now| std::mem::replace(now, state));
                 writer.epoch.fetch_add(1, Ordering::SeqCst);
                 Ok(replaced)
             })
@@ -4290,7 +4309,7 @@ mod tests {
         gated.waiting.notified().await;
         let moved = following(committed.log_position).unwrap();
         let state = &writer.partition.state;
-        state.write().unwrap().moved_to(moved);
+        state.unpublished(|state| state.moved_to(moved));
         gated.go_on.notify_one();
 
         let refused = restoring.await.unwrap().unwrap_err();

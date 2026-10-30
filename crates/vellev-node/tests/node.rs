@@ -8652,7 +8652,17 @@ async fn writes_are_refused_while_four_flushes_of_rows_wait_and_taken_once_one_g
         40,
         "nothing taken past the backlog"
     );
-    assert!(node.flushing().failed >= 1);
+    // The flush that failed is counted by the tenant's maintenance, on a
+    // task of its own: once it has been tried, not by the time the backlog
+    // refuses a write, which a busy machine can reach first.
+    let counted = std::time::Instant::now() + Duration::from_secs(10);
+    while node.flushing().failed == 0 {
+        assert!(
+            std::time::Instant::now() < counted,
+            "no failed flush counted within 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(node.flushing().unflushed_rows, 40);
     assert!(node.flushing().unflushed_bytes > 0);
 

@@ -24,6 +24,58 @@ impl Allocator {
     }
 }
 
+/// What jemalloc holds, as its statistics say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Held {
+    /// Bytes allocated by the process's Rust code and not yet freed. Only
+    /// what goes through this allocator: a library that calls the C
+    /// library's `malloc`, as onnxruntime does for the model, is not in
+    /// it, since jemalloc's names here are prefixed (`_rjem_`).
+    pub allocated: usize,
+    /// Bytes in the pages jemalloc holds resident for it: allocated, its
+    /// own metadata, and freed pages not yet given back.
+    pub resident: usize,
+}
+
+impl Allocator {
+    /// What jemalloc holds now. Its statistics are a snapshot it refreshes
+    /// only when asked, so each read asks first (an `epoch` advance, which
+    /// merges each arena's counts: microseconds, for a scrape, never a
+    /// path a request takes). None if they cannot be read.
+    pub fn held(&self) -> Option<Held> {
+        tikv_jemalloc_ctl::epoch::advance().ok()?;
+        Some(Held {
+            allocated: tikv_jemalloc_ctl::stats::allocated::read().ok()?,
+            resident: tikv_jemalloc_ctl::stats::resident::read().ok()?,
+        })
+    }
+}
+
+impl Allocator {
+    /// Whether this is the process's global allocator: whether 4 MiB this
+    /// thread allocates shows in what jemalloc says this thread has ever
+    /// allocated (`thread.allocatedp`), a count of its own that no other
+    /// thread's allocating or freeing moves. jemalloc linked but not the
+    /// global allocator counts some of its own allocations, so a count of
+    /// the process's as a whole does not say. None if its statistics
+    /// cannot be read at all.
+    pub fn is_global(&self) -> Option<bool> {
+        const PROBE: u64 = 4 * 1024 * 1024;
+        let ever = tikv_jemalloc_ctl::thread::allocatedp::read().ok()?;
+        let before = ever.get();
+        let probe = std::hint::black_box(vec![1u8; PROBE as usize]);
+        let after = ever.get();
+        drop(probe);
+        Some(after.saturating_sub(before) >= PROBE)
+    }
+}
+
+impl std::fmt::Debug for Allocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Allocator(jemalloc)")
+    }
+}
+
 impl Default for Allocator {
     fn default() -> Self {
         Self::new()

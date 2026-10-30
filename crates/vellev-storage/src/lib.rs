@@ -19,6 +19,7 @@ mod merge_builds;
 mod mutation;
 mod partition;
 pub mod prefix;
+mod published;
 mod search;
 pub mod shipper;
 mod state;
@@ -39,7 +40,7 @@ pub use mutation::{
 };
 pub use partition::{Embedded, Follower, MergeGate, Partition, RestoreFrom, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
-pub use state::{Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM};
+pub use state::{Figures, Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM};
 pub use stopping::MergeStage;
 pub use vellev_index::curve;
 pub use vellev_index::filter::{Filter, FilterError};

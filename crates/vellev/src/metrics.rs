@@ -33,6 +33,8 @@ use prometheus_client::registry::Registry;
 use vellev_node::Node;
 use vellev_storage::Work;
 
+use crate::allocator::Allocator;
+use crate::memory::{Memory, MemoryFiles};
 use crate::server::App;
 use crate::turns::Turns;
 
@@ -129,10 +131,37 @@ fn shares() -> Histogram {
     Histogram::new([0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0])
 }
 
+/// Where a node reads what memory it really holds: the allocator it runs
+/// on, if it was told, and the process's and its cgroup's files.
+#[derive(Debug, Clone)]
+pub(crate) struct Sources {
+    pub allocator: Option<&'static Allocator>,
+    pub files: MemoryFiles,
+}
+
+impl Default for Sources {
+    fn default() -> Self {
+        Self {
+            allocator: None,
+            files: MemoryFiles::of_this_process(),
+        }
+    }
+}
+
+/// What the process and its cgroup held as the node started, before it
+/// opened any tenant: what its tenants' memory comes on top of.
+#[derive(Debug, Clone, Default)]
+struct Baseline {
+    memory: Memory,
+    allocated: Option<usize>,
+}
+
 /// The node's measures.
 #[derive(Debug)]
 pub struct Metrics {
     registry: Registry,
+    sources: Sources,
+    baseline: Arc<OnceLock<Baseline>>,
     requests: Histograms<RequestLabels>,
     stages: Histograms<StageLabels>,
     work: Histograms<WorkLabels>,
@@ -142,7 +171,7 @@ pub struct Metrics {
 impl Metrics {
     /// The measures of a node to be served from `node` once there is
     /// one, its reads taking `turns`.
-    pub(crate) fn new(node: Arc<OnceLock<Arc<Node>>>, turns: Arc<Turns>) -> Self {
+    pub(crate) fn new(node: Arc<OnceLock<Arc<Node>>>, turns: Arc<Turns>, sources: Sources) -> Self {
         let requests = Histograms::new_with_constructor(seconds as fn() -> Histogram);
         let stages = Histograms::new_with_constructor(seconds as fn() -> Histogram);
         let work = Histograms::new_with_constructor(counts as fn() -> Histogram);
@@ -168,14 +197,36 @@ impl Metrics {
             "The share of the rows a filtered search searched that its filter allowed",
             selectivity.clone(),
         );
-        registry.register_collector(Box::new(Counted { node, turns }));
+        let baseline = Arc::<OnceLock<Baseline>>::default();
+        registry.register_collector(Box::new(Counted {
+            node,
+            turns,
+            sources: sources.clone(),
+            baseline: baseline.clone(),
+        }));
         Self {
             registry,
+            sources,
+            baseline,
             requests,
             stages,
             work,
             selectivity,
         }
+    }
+
+    /// Keep what the process and its cgroup hold now as the node's
+    /// baseline: called as the node starts, before it opens any tenant.
+    /// Only the first call keeps anything.
+    pub(crate) fn started(&self) {
+        let _ = self.baseline.set(Baseline {
+            memory: self.sources.files.read(),
+            allocated: self
+                .sources
+                .allocator
+                .and_then(Allocator::held)
+                .map(|held| held.allocated),
+        });
     }
 
     /// Everything measured, in Prometheus' text format.
@@ -228,6 +279,134 @@ impl Metrics {
 struct Counted {
     node: Arc<OnceLock<Arc<Node>>>,
     turns: Arc<Turns>,
+    sources: Sources,
+    baseline: Arc<OnceLock<Baseline>>,
+}
+
+/// A gauge of `value`, as large as a gauge goes if it is larger.
+fn gauge_of(value: impl TryInto<i64>) -> ConstGauge<i64> {
+    ConstGauge::new(value.try_into().unwrap_or(i64::MAX))
+}
+
+impl Counted {
+    /// What the process, its cgroup and its allocator hold, and held as the
+    /// node started, as far as each can be read: what cannot is left out.
+    fn memory(&self, encoder: &mut DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        if let Some(held) = self.sources.allocator.and_then(Allocator::held) {
+            for (name, help, value) in [
+                (
+                    "allocator_allocated_bytes",
+                    "Bytes the node's Rust code has allocated through jemalloc and not freed; not what libraries allocate through the C library's malloc, as the local embedding model does",
+                    held.allocated,
+                ),
+                (
+                    "allocator_resident_bytes",
+                    "Bytes in the pages jemalloc holds resident: allocated, its metadata, and freed pages not yet given back",
+                    held.resident,
+                ),
+            ] {
+                let gauge = gauge_of(value);
+                gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+            }
+        }
+        let memory = self.sources.files.read();
+        labelled(
+            encoder,
+            "process_resident_bytes",
+            "The process's resident memory, as Linux says: anonymous (RssAnon), and backed by files (RssFile), which mapped vectors are",
+            "kind",
+            [("anon", memory.anon), ("file", memory.file)],
+        )?;
+        for (name, help, value) in [
+            (
+                "cgroup_memory_bytes",
+                "The memory the node's cgroup holds now (memory.current): what its limit is held to",
+                memory.current,
+            ),
+            (
+                "cgroup_memory_peak_bytes",
+                "The most memory the node's cgroup has held (memory.peak), where the kernel keeps it",
+                memory.peak,
+            ),
+            (
+                "cgroup_memory_max_bytes",
+                "The node's cgroup's own memory limit (memory.max), if it has one: the leaf's, not a lower one an ancestor may set, which binds it too",
+                memory.max,
+            ),
+            (
+                "cgroup_memory_high_bytes",
+                "The node's cgroup's own high mark (memory.high), past which it is throttled and reclaimed from, if it has one",
+                memory.high,
+            ),
+        ] {
+            if let Some(value) = value {
+                let gauge = gauge_of(value);
+                gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+            }
+        }
+        if !memory.events.is_empty() {
+            let counter = ConstCounter::new(0u64);
+            let mut family = encoder.encode_descriptor(
+                "cgroup_memory_events",
+                "Times the node's cgroup was throttled over its high mark (high), met its limit (max), ran out (oom), and had a process killed for it (oom_kill), as memory.events says",
+                None,
+                counter.metric_type(),
+            )?;
+            for (event, count) in &memory.events {
+                ConstCounter::new(*count).encode(family.encode_family(&[("event", *event)])?)?;
+            }
+        }
+        labelled(
+            encoder,
+            "cgroup_memory_stat_bytes",
+            "The node's cgroup's anonymous and file-backed memory, as memory.stat says",
+            "kind",
+            memory
+                .stat
+                .iter()
+                .map(|(kind, bytes)| (*kind, Some(*bytes))),
+        )?;
+        if let Some(baseline) = self.baseline.get() {
+            labelled(
+                encoder,
+                "memory_baseline_bytes",
+                "What the process and its cgroup held as the node started, before it opened any tenant: its cgroup's memory, the process's anonymous memory, and what it had allocated through jemalloc. The local embedding model is loaded when first used, so it is not in these: see vellev_local_models_loaded",
+                "kind",
+                [
+                    ("cgroup", baseline.memory.current),
+                    ("process_anon", baseline.memory.anon),
+                    (
+                        "allocator_allocated",
+                        baseline.allocated.map(|bytes| bytes as u64),
+                    ),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A family of gauges `name`, one for each value there is, labelled
+/// `label`; none at all if there is no value.
+fn labelled(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    label: &str,
+    values: impl IntoIterator<Item = (&'static str, Option<u64>)>,
+) -> Result<(), std::fmt::Error> {
+    let present: Vec<(&str, u64)> = values
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, value?)))
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    let mut family = encoder.encode_descriptor(name, help, None, gauge_of(0).metric_type())?;
+    for (key, value) in present {
+        gauge_of(value).encode(family.encode_family(&[(label, key)])?)?;
+    }
+    Ok(())
 }
 
 impl Collector for Counted {
@@ -261,9 +440,55 @@ impl Collector for Counted {
             ConstGauge::new(i64::try_from(count).unwrap_or(i64::MAX))
                 .encode(family.encode_family(&[("pool", pool)])?)?;
         }
+        self.memory(&mut encoder)?;
         let Some(node) = self.node.get() else {
             return Ok(());
         };
+        // As the last sweep found the node, which reading holds no tenant
+        // for: a sweep lets go only what nothing else holds.
+        let census = node.census();
+        let holding = census.holding;
+        let age = ConstGauge::new(node.census_age().as_secs_f64());
+        age.encode(encoder.encode_descriptor(
+            "census_age_seconds",
+            "How long ago the last sweep took the census the tenant gauges come from, or since the node started if none has: a sweep that has stopped, and with it the memory budget, shows as this grows",
+            None,
+            age.metric_type(),
+        )?)?;
+        let gauge0 = ConstGauge::new(0i64);
+        let mut family = encoder.encode_descriptor(
+            "tenants_open",
+            "Tenants this node holds open, as their writer or as a copy to read from, as the last sweep found them",
+            None,
+            gauge0.metric_type(),
+        )?;
+        for (kind, count) in [("writer", holding.writers), ("copy", holding.copies)] {
+            gauge_of(count).encode(family.encode_family(&[("kind", kind)])?)?;
+        }
+        for (name, help, value) in [
+            (
+                "tenants_resident_bytes",
+                "About how many bytes the tenants this node holds take in memory together, as the node reckons them for its memory budget, by how it reckons them (rows: from each row's size), as the last sweep found them: the figure it held to the budget",
+                holding.resident,
+            ),
+            (
+                "tenant_resident_largest_bytes",
+                "About how many bytes the one tenant this node holds that takes the most takes, reckoned as for the memory budget, as the last sweep found it",
+                holding.largest,
+            ),
+        ] {
+            let mut family = encoder.encode_descriptor(name, help, None, gauge0.metric_type())?;
+            gauge_of(value).encode(family.encode_family(&[("by", "rows")])?)?;
+        }
+        if let Some(budget) = node.memory_budget() {
+            let gauge = gauge_of(budget);
+            gauge.encode(encoder.encode_descriptor(
+                "memory_budget_bytes",
+                "About how many bytes the tenants this node holds may take in memory together, as it reckons them, before it lets the least recently used go",
+                None,
+                gauge.metric_type(),
+            )?)?;
+        }
         let gauge = ConstGauge::new(i64::try_from(node.unsettled()).unwrap_or(i64::MAX));
         gauge.encode(encoder.encode_descriptor(
             "tenants_unsettled",
@@ -335,6 +560,34 @@ impl Collector for Counted {
             ConstCounter::new(count).encode(family.encode_family(&[("kind", kind)])?)?;
         }
         let merges = node.merges();
+        let counter = ConstCounter::new(node.sweeps());
+        counter.encode(encoder.encode_descriptor(
+            "sweeps",
+            "Sweeps begun: those asked for while one ran are coalesced into one more",
+            None,
+            counter.metric_type(),
+        )?)?;
+        let counter = ConstCounter::new(node.tenants_kept_by_sweeps());
+        counter.encode(encoder.encode_descriptor(
+            "sweep_tenants_kept",
+            "Tenants a sweep chose to let go, for being idle or for the memory budget, but found something else holding, as a request or a merge does: let go at a later round",
+            None,
+            counter.metric_type(),
+        )?)?;
+        let counter = ConstCounter::new(merges.stopped_for_budget);
+        counter.encode(encoder.encode_descriptor(
+            "merges_stopped_for_budget",
+            "Merges sweeps stopped, each under way when asked, so that a tenant over the memory budget, held by something else as it merged, could be let go",
+            None,
+            counter.metric_type(),
+        )?)?;
+        let gauge = gauge_of(node.local_models_loaded());
+        gauge.encode(encoder.encode_descriptor(
+            "local_models_loaded",
+            "Local embedding models loaded or loading: each takes memory outside jemalloc, which shows as a step in the process's anonymous memory as it loads",
+            None,
+            gauge.metric_type(),
+        )?)?;
         let counter = ConstCounter::new(merges.held_let_go);
         counter.encode(encoder.encode_descriptor(
             "merge_turns_let_go",

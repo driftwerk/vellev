@@ -329,7 +329,9 @@ async fn main() -> Result<ExitCode> {
             tracing_subscriber::fmt().json().init();
             let (limits, store) = config.checked()?;
             let trusted = vellev::identity::IdentityKeys::parse(&config.identity_keys)?;
-            let app = App::new(config.keys()?, limits).trusting(trusted);
+            let app = App::new(config.keys()?, limits)
+                .trusting(trusted)
+                .running_on(&GLOBAL);
             let listener = TcpListener::bind(listen).await?;
             tracing::info!(%listen, version = env!("CARGO_PKG_VERSION"), "vellev listening");
             let port = listener.local_addr()?.port();

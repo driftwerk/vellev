@@ -1343,6 +1343,62 @@ pub(crate) fn curves(indexes: &Indexes) -> Vec<SegmentCurve> {
     curves
 }
 
+/// What a state comes to, for what is read of a partition without its
+/// lock: what it holds in memory, what waits for a flush, and its
+/// segments by whether they are clustered, with their rows and where their
+/// probes come from. Worked out as each change is made, and published by
+/// the partition with it (see [`crate::Partition::figures`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Figures {
+    /// As [`State::resident`].
+    pub resident: usize,
+    /// As [`State::unflushed`].
+    pub unflushed: usize,
+    /// As [`State::unflushed_bytes`].
+    pub unflushed_bytes: usize,
+    /// Segments with an index file, and their rows as written.
+    pub clustered: usize,
+    pub clustered_rows: u64,
+    /// The rest, and their rows as written.
+    pub plain: usize,
+    pub plain_rows: u64,
+    /// As [`State::probes`].
+    pub probes: Probes,
+}
+
+impl State {
+    /// What the state comes to: a walk over its segments, not its rows.
+    pub fn figures(&self) -> Figures {
+        let mut figures = Figures {
+            resident: self.resident(),
+            unflushed: self.unflushed(),
+            unflushed_bytes: self.unflushed_bytes(),
+            probes: self.probes(),
+            ..Figures::default()
+        };
+        for meta in self.segments() {
+            figures.count(meta);
+        }
+        figures
+    }
+}
+
+impl Figures {
+    /// Count the segment `meta` names: clustered if it has an index file.
+    pub fn count(&mut self, meta: &SegmentMeta) {
+        match meta.index.is_some() {
+            true => {
+                self.clustered += 1;
+                self.clustered_rows += meta.rows;
+            }
+            false => {
+                self.plain += 1;
+                self.plain_rows += meta.rows;
+            }
+        }
+    }
+}
+
 impl State {
     /// How the text of the upserts this state applied was split into
     /// tokens: see [`TextsApplied`].

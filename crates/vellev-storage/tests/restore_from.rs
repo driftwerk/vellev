@@ -498,6 +498,11 @@ async fn a_restore_into_a_partition_that_never_committed_rests_on_nothing() {
     let restored = restored_from(&target, &writer, &frozen).await.unwrap();
 
     assert_eq!(restored, frozen.at.next().unwrap());
+    // What the partition publishes of itself is what it now holds (delta
+    // review of #165): the segments put back.
+    let partition = writer.partition();
+    assert_eq!(partition.figures(), partition.read(State::figures));
+    assert!(partition.figures().plain + partition.figures().clustered > 0);
     let head = target.committed().await.manifest.unwrap().0;
     let manifest = read_manifest(&*target.blobs, &head).await;
     assert_eq!(manifest.position, restored);
