@@ -1046,13 +1046,15 @@ pub(crate) struct Indexed {
 /// property never changes once added, and neither a property nor a
 /// collection added since has anything in an older layer.
 ///
-/// The rows' text is split on several threads first, and then indexed in
-/// row order, which is what indexing each row in turn makes.
+/// The rows' text is split on several threads and then indexed in row
+/// order, [`TOKENIZED_AT_ONCE`] rows at a time, which is what indexing each
+/// row in turn makes, and holds their tokens a chunk at a time, however
+/// many rows there are.
 ///
 /// Gives up, `None`, once `stopping` is stopped: asked as each row's text
 /// is split, at every [`ROWS_BETWEEN_ASKING`] rows of the values and text
 /// indexed in row order, and by the vector indexes' builds in their own
-/// passes.
+/// passes. No chunk is begun once it is.
 pub(crate) fn indexed_stopping<'a>(
     catalog: &Catalog,
     rows: &'a [Row],
@@ -1067,23 +1069,11 @@ pub(crate) fn indexed_stopping<'a>(
     let asked = |row: usize| {
         row.is_multiple_of(ROWS_BETWEEN_ASKING) && stopping.stopped(MergeStage::Indexing)
     };
-    let tokenized: Vec<Option<Tokenized>> = rows
-        .par_iter()
-        .map(|Row { collection, object }| {
-            if stopping.stopped(MergeStage::Indexing) {
-                return None;
-            }
-            let schema = catalog.schema(*collection)?;
-            Some(threads.on(|| TextIndex::tokenize(schema, object)))
-        })
-        .collect();
-    if stopping.is_stopped() {
-        return None;
-    }
-    let tokenized_at_once = tokenized.iter().flatten().count();
     // The filterable values and vectors on one thread, the text on
-    // another: each in row order, as indexing each row in turn makes them.
-    let ((mut indexes, vectors), texts) = rayon::join(
+    // another: each in row order, as indexing each row in turn makes them,
+    // the text's tokens split on the threads free, a chunk at a time, and
+    // dropped as they are indexed.
+    let ((mut indexes, vectors), (texts, tokenized_at_once)) = rayon::join(
         || {
             let mut indexes = Indexes::new();
             let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
@@ -1106,19 +1096,44 @@ pub(crate) fn indexed_stopping<'a>(
         },
         || {
             let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
-            for ((row, Row { collection, .. }), tokenized) in rows.iter().enumerate().zip(tokenized)
-            {
-                if asked(row) {
+            let (mut held, mut most_held) = (0, 0);
+            let at_once = stopping.tokenized_at_once();
+            for (chunk, chunk_rows) in rows.chunks(at_once).enumerate() {
+                if stopping.is_stopped() {
                     break;
                 }
-                if let Some(tokenized) = tokenized {
-                    texts
-                        .entry(*collection)
-                        .or_default()
-                        .insert_tokenized(row as u32, tokenized);
+                let tokenized: Vec<Option<Tokenized>> = chunk_rows
+                    .par_iter()
+                    .map(|Row { collection, object }| {
+                        if stopping.stopped(MergeStage::Indexing) {
+                            return None;
+                        }
+                        let schema = catalog.schema(*collection)?;
+                        Some(threads.on(|| TextIndex::tokenize(schema, object)))
+                    })
+                    .collect();
+                if stopping.is_stopped() {
+                    break;
+                }
+                held += tokenized.iter().flatten().count();
+                most_held = most_held.max(held);
+                let first = chunk * at_once;
+                for ((row, Row { collection, .. }), tokenized) in
+                    (first..).zip(chunk_rows).zip(tokenized)
+                {
+                    if asked(row) {
+                        break;
+                    }
+                    if let Some(tokenized) = tokenized {
+                        held -= 1;
+                        texts
+                            .entry(*collection)
+                            .or_default()
+                            .insert_tokenized(row as u32, tokenized);
+                    }
                 }
             }
-            texts
+            (texts, most_held)
         },
     );
     if stopping.is_stopped() {

@@ -140,6 +140,11 @@ impl Stopping {
         self.stop.is_stopped()
     }
 
+    /// How many rows' text the build holds tokenized at once, at the most.
+    pub(crate) fn tokenized_at_once(&self) -> usize {
+        self.tokenized_at_once
+    }
+
     /// Whether the build is to panic, as a test asks.
     pub(crate) fn panics(&self) -> bool {
         self.panics
