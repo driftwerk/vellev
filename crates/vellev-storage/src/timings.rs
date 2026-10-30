@@ -211,31 +211,35 @@ pub const BOUNDS: [f64; 22] = {
 #[derive(Debug, Default)]
 struct Histogram {
     /// How many fell in each bucket: at most its bound and over the one
-    /// before. Those over every bound are in `count` alone.
-    buckets: [AtomicU64; BOUNDS.len()],
-    count: AtomicU64,
+    /// before; the last, past every bound. The count is their sum, worked
+    /// out as they are read, so that a read made while one is observed
+    /// never counts it in the whole and not in a bucket (review of #169).
+    buckets: [AtomicU64; BOUNDS.len() + 1],
     micros: AtomicU64,
 }
 
 impl Histogram {
     fn observe(&self, took: Duration) {
         let seconds = took.as_secs_f64();
-        if let Some(bucket) = BOUNDS.iter().position(|bound| seconds <= *bound) {
-            self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
-        }
-        self.count.fetch_add(1, Ordering::Relaxed);
+        let bucket = BOUNDS
+            .iter()
+            .position(|bound| seconds <= *bound)
+            .unwrap_or(BOUNDS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
         self.micros.fetch_add(micros, Ordering::Relaxed);
     }
 
     fn read(&self) -> Seconds {
+        let each: [u64; BOUNDS.len() + 1] =
+            std::array::from_fn(|bucket| self.buckets[bucket].load(Ordering::Relaxed));
         let mut cumulative = 0;
         let buckets = std::array::from_fn(|bucket| {
-            cumulative += self.buckets[bucket].load(Ordering::Relaxed);
+            cumulative += each[bucket];
             (BOUNDS[bucket], cumulative)
         });
         Seconds {
-            count: self.count.load(Ordering::Relaxed),
+            count: each.iter().sum(),
             sum: self.micros.load(Ordering::Relaxed) as f64 / 1e6,
             buckets,
         }
@@ -486,6 +490,46 @@ mod tests {
         // Over the last bound: in the whole alone.
         assert_eq!(read.buckets[BOUNDS.len() - 1].1, 2);
         assert!((read.sum - 4_000.003_5).abs() < 1e-6);
+    }
+
+    /// Review of #169: a histogram read while durations are observed on
+    /// other threads is whole every time: its count is never less than its
+    /// last bucket, and neither ever falls between reads.
+    #[test]
+    fn a_histogram_read_while_observed_is_always_whole() {
+        let timings = std::sync::Arc::new(Timings::default());
+        let observing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let observers: Vec<_> = (0..4)
+            .map(|n| {
+                let (timings, observing) = (timings.clone(), observing.clone());
+                std::thread::spawn(move || {
+                    let mut i = 0u64;
+                    while observing.load(Ordering::Relaxed) {
+                        // Past every bound now and then, as a spell may be.
+                        let took = match i % 7 {
+                            0 => Duration::from_secs(5_000),
+                            k => Duration::from_millis(k * (n + 1)),
+                        };
+                        timings.record(Timed::Backlog, "p", took);
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+        let mut last = (0, 0);
+        for _ in 0..200_000 {
+            let read = timings.seconds(Timed::Backlog);
+            let in_buckets = read.buckets[BOUNDS.len() - 1].1;
+            assert!(read.count >= in_buckets, "{read:?}");
+            assert!(
+                read.count >= last.0 && in_buckets >= last.1,
+                "{read:?} after {last:?}"
+            );
+            last = (read.count, in_buckets);
+        }
+        observing.store(false, Ordering::Relaxed);
+        observers.into_iter().for_each(|o| o.join().unwrap());
+        assert!(last.0 > 0);
     }
 
     #[test]
