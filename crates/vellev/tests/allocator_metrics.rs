@@ -45,9 +45,9 @@ async fn what_the_allocator_holds_is_reported_as_it_is_when_read() {
         let text = app.metrics().encoded();
         sample(&text, name).unwrap_or_else(|| panic!("no {name}: {text}"))
     };
-    let before = read("vellev_allocated_bytes");
+    let before = read("vellev_allocator_allocated_bytes");
     let held = vec![1u8; 64 * MIB];
-    let allocated = read("vellev_allocated_bytes");
+    let allocated = read("vellev_allocator_allocated_bytes");
     let resident = read("vellev_allocator_resident_bytes");
     assert!(
         allocated - before >= (63 * MIB) as f64,
@@ -62,7 +62,7 @@ async fn what_the_allocator_holds_is_reported_as_it_is_when_read() {
         64 * MIB
     );
     drop(held);
-    let after = read("vellev_allocated_bytes");
+    let after = read("vellev_allocator_allocated_bytes");
     assert!(
         after <= allocated - (63 * MIB) as f64,
         "64 MiB freed, but reported {allocated} then {after}"

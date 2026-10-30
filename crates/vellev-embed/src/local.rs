@@ -647,6 +647,21 @@ mod tests {
 
     use super::*;
 
+    /// Review of #165: how many local models are loaded is what has a
+    /// place now, counted outside tests, as /metrics reports it.
+    #[test]
+    fn the_models_loaded_are_counted_as_they_take_and_lose_their_places() {
+        let room = Room::new(2, Duration::from_secs(60), None);
+        assert_eq!(room.count(), 0);
+        let one = room.place("one").unwrap();
+        let two = room.place("two").unwrap();
+        assert_eq!(room.count(), 2);
+        drop(one);
+        assert_eq!(room.count(), 1);
+        drop(two);
+        assert_eq!(room.count(), 0);
+    }
+
     /// Room for one model, kept however long it goes unused.
     fn alone() -> Arc<Room> {
         Room::new(1, Duration::MAX, None)

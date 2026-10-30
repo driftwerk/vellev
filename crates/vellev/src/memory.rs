@@ -120,6 +120,43 @@ fn keyed(text: &str, wanted: &[&'static str]) -> Vec<(&'static str, u64)> {
 mod tests {
     use super::*;
 
+    /// Review of #165, M2: where a process's cgroup v2 directory is, from
+    /// what `/proc/self/cgroup` says, under the cgroup v2 mount `root`.
+    #[test]
+    fn the_cgroup_directory_is_found_only_where_memory_is_on_cgroup_v2() {
+        let root = Path::new("/sys/fs/cgroup");
+        // A container in a cgroup namespace of its own.
+        assert_eq!(cgroup_dir(root, "0::/\n"), Some(root.to_path_buf()));
+        // A systemd service or scope, as on a host.
+        assert_eq!(
+            cgroup_dir(root, "0::/system.slice/x.scope\n"),
+            Some(root.join("system.slice/x.scope"))
+        );
+        // A hybrid host: v2 is mounted beside v1, but memory is v1's, so
+        // v2 has no memory files to read.
+        let hybrid = "12:memory:/user.slice\n11:cpu,cpuacct:/user.slice\n0::/user.slice/x.scope\n";
+        assert_eq!(cgroup_dir(root, hybrid), None);
+        // A host with v1 alone.
+        let v1 = "12:memory:/docker/abc\n4:pids:/docker/abc\n1:name=systemd:/docker/abc\n";
+        assert_eq!(cgroup_dir(root, v1), None);
+        // Nothing said.
+        assert_eq!(cgroup_dir(root, ""), None);
+    }
+
+    /// On Linux, this process's own files are read: its anonymous and
+    /// file-backed memory always, and its cgroup's memory where cgroup v2
+    /// is mounted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_is_read_as_linux_has_it() {
+        let memory = MemoryFiles::of_this_process().read();
+        assert!(memory.anon.is_some_and(|bytes| bytes > 0), "{memory:?}");
+        assert!(memory.file.is_some(), "{memory:?}");
+        if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            assert!(memory.current.is_some_and(|bytes| bytes > 0), "{memory:?}");
+        }
+    }
+
     #[test]
     fn the_cgroup_v2_path_is_the_line_of_hierarchy_zero() {
         assert_eq!(v2_cgroup("0::/\n"), Some("/"));

@@ -251,17 +251,32 @@ impl Cluster {
     /// A node that reads the process's and its cgroup's memory from
     /// `files`, standing for Linux's.
     pub async fn serve_reading_memory_from(&self, files: MemoryFiles) -> Served {
+        self.serve_made(|settings| settings, |app| app.reading_memory_from(files))
+            .await
+    }
+
+    /// A node of settings `adjusted`, its app as `made` makes it, started
+    /// as one is run: sweeping, warming and the rest.
+    pub async fn serve_made(
+        &self,
+        adjusted: impl FnOnce(Settings) -> Settings,
+        made: impl FnOnce(App) -> App,
+    ) -> Served {
         let served = self
-            .unstarted_as(
-                &[],
-                None,
-                &[],
-                Default::default(),
-                |settings| settings,
-                |app| app.reading_memory_from(files),
-            )
+            .unstarted_as(&[], None, &[], Default::default(), adjusted, made)
             .await;
         served.app.start(served.node.clone());
+        served
+    }
+
+    /// A node of settings `adjusted` that does nothing of its own accord:
+    /// no sweeping, no warming, no backups. A test sweeps it when it will.
+    pub async fn serve_unstarted_with(
+        &self,
+        adjusted: impl FnOnce(Settings) -> Settings,
+    ) -> Served {
+        let served = self.unstarted_with(&[], None, &[], adjusted).await;
+        assert!(served.app.serve_from(served.node.clone()));
         served
     }
 

@@ -3,10 +3,15 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::http::{Method, StatusCode};
 use common::*;
 use serde_json::{json, Value};
 use vellev::metrics::{self, Stage};
+use vellev_node::Settings;
 
 const HYBRID: &str = "/v1/tenants/{tenant}/collections/{collection}/hybrid";
 const LIST: &str = "/v1/tenants/{tenant}/collections/{collection}/list";
@@ -266,6 +271,8 @@ async fn the_stages_of_a_request_do_not_overlap() {
 #[tokio::test]
 async fn what_waits_for_a_flush_and_flushes_that_failed_are_reported() {
     let (served, _key) = embedded().await;
+    // What waits for a flush is as the last sweep found it.
+    served.node.sweep_now().await;
     let text = served.app.metrics().encoded();
     let value = |name: &str| {
         text.lines()
@@ -317,6 +324,7 @@ async fn the_thread_pools_and_reads_at_once_are_reported_as_they_are() {
 #[tokio::test]
 async fn tenants_with_a_flush_or_merge_due_are_counted() {
     let (served, _) = embedded().await;
+    served.node.sweep_now().await;
     let text = served.app.metrics().encoded();
     assert_eq!(
         sample(&text, "vellev_tenants_unsettled", &[]),
@@ -331,6 +339,7 @@ async fn tenants_with_a_flush_or_merge_due_are_counted() {
 #[tokio::test]
 async fn segments_are_reported_by_whether_they_are_clustered() {
     let (served, _) = embedded().await;
+    served.node.sweep_now().await;
     let text = served.app.metrics().encoded();
     for index in ["clustered", "plain"] {
         assert_eq!(
@@ -354,25 +363,42 @@ async fn segments_are_reported_by_whether_they_are_clustered() {
     served.stop().await;
 }
 
-/// A node with a memory budget of `budget` bytes, and two tenants: `acme`
-/// with three notes and `beta` with one, written with vectors supplied.
+/// Write `acme` three notes and `beta` one, with vectors supplied.
+async fn two_tenants(served: &Served) {
+    served.with_notes(supplied()).await;
+    for n in 1..=3 {
+        let note = json!({ "properties": { "title": format!("note {n}"), "n": n }, "vector": [1.0, n as f64] });
+        served.ok(Method::PUT, &object(n), Some(note)).await;
+    }
+    note_in(served, "beta", 1).await;
+}
+
+/// Write `tenant` one note, numbered `n`, creating it and its notes
+/// first if it has none.
+async fn note_in(served: &Served, tenant: &str, n: u64) {
+    let notes = format!("/v1/tenants/{tenant}/collections/notes");
+    if n == 1 {
+        served
+            .ok(Method::PUT, &format!("/v1/tenants/{tenant}"), None)
+            .await;
+        served
+            .ok(Method::PUT, &notes, Some(common::notes(supplied())))
+            .await;
+    }
+    let note = json!({ "properties": { "title": format!("note {n}"), "n": n }, "vector": [1.0, n as f64] });
+    let path = format!("{notes}/objects/{}", id(n));
+    served.ok(Method::PUT, &path, Some(note)).await;
+}
+
+/// A node with a memory budget of `budget` bytes, if any, and two
+/// tenants: `acme` with three notes and `beta` with one.
 async fn holding(budget: Option<usize>) -> Served {
     let cluster = Cluster::new();
     let served = match budget {
         Some(bytes) => cluster.serve_within_memory(bytes).await,
         None => cluster.serve().await,
     };
-    served.with_notes(supplied()).await;
-    for n in 1..=3 {
-        let note = json!({ "properties": { "title": format!("note {n}"), "n": n }, "vector": [1.0, n as f64] });
-        served.ok(Method::PUT, &object(n), Some(note)).await;
-    }
-    let beta = "/v1/tenants/beta/collections/notes";
-    served.ok(Method::PUT, "/v1/tenants/beta", None).await;
-    served.ok(Method::PUT, beta, Some(notes(supplied()))).await;
-    let note = json!({ "properties": { "title": "note 1", "n": 1 }, "vector": [1.0, 1.0] });
-    let path = format!("{beta}/objects/{}", id(1));
-    served.ok(Method::PUT, &path, Some(note)).await;
+    two_tenants(&served).await;
     served
 }
 
@@ -384,14 +410,13 @@ async fn holding(budget: Option<usize>) -> Served {
 async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
     const BUDGET: usize = 64 * 1024 * 1024;
     let served = holding(Some(BUDGET)).await;
-    let before = served.node.resident();
+    served.node.sweep_now().await;
     let text = served.app.metrics().encoded();
-    let after = served.node.resident();
-    assert!(before > 0, "two tenants with notes hold something");
-    assert_eq!(before, after, "nothing was let go meanwhile");
+    let resident = served.node.resident();
+    assert!(resident > 0, "two tenants with notes hold something");
     assert_eq!(
         sample(&text, "vellev_tenants_resident_bytes", &[("by", "rows")]),
-        Some(before as f64),
+        Some(resident as f64),
         "{text}"
     );
     assert_eq!(
@@ -418,8 +443,116 @@ async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
     )
     .unwrap_or_else(|| panic!("no largest: {text}"));
     assert!(
-        largest > before as f64 / 2.0 && largest < before as f64,
-        "the most one of two tenants holds is {largest} of {before}: {text}"
+        largest > resident as f64 / 2.0 && largest < resident as f64,
+        "the most one of two tenants holds is {largest} of {resident}: {text}"
+    );
+    served.stop().await;
+}
+
+/// What the tenants hold, how many are open, and what waits for a flush
+/// are reported as the last sweep found them: the figures the memory
+/// budget was last held to, read without holding any tenant. Rows written
+/// since show once the node next sweeps.
+#[tokio::test]
+async fn what_the_tenants_hold_is_reported_as_the_last_sweep_found_it() {
+    let served = Cluster::new()
+        .serve_unstarted_with(|settings| Settings {
+            memory: Some(64 * 1024 * 1024),
+            ..settings
+        })
+        .await;
+    note_in(&served, "acme", 1).await;
+    served.node.sweep_now().await;
+    let swept = served.app.metrics().encoded();
+    let resident = |text: &str| sample(text, "vellev_tenants_resident_bytes", &[("by", "rows")]);
+    let unflushed = |text: &str| sample(text, "vellev_unflushed_rows", &[]);
+    assert_eq!(unflushed(&swept), Some(1.0), "{swept}");
+    let first = resident(&swept).unwrap_or_else(|| panic!("{swept}"));
+    note_in(&served, "acme", 2).await;
+    note_in(&served, "beta", 1).await;
+    let unswept = served.app.metrics().encoded();
+    assert_eq!(resident(&unswept), Some(first), "as last swept: {unswept}");
+    assert_eq!(unflushed(&unswept), Some(1.0), "as last swept: {unswept}");
+    assert_eq!(
+        sample(&unswept, "vellev_tenants_open", &[("kind", "writer")]),
+        Some(1.0),
+        "as last swept: {unswept}"
+    );
+    served.node.sweep_now().await;
+    let again = served.app.metrics().encoded();
+    assert!(
+        resident(&again).is_some_and(|bytes| bytes > first),
+        "{again}"
+    );
+    assert_eq!(unflushed(&again), Some(3.0), "{again}");
+    assert_eq!(
+        sample(&again, "vellev_tenants_open", &[("kind", "writer")]),
+        Some(2.0),
+        "{again}"
+    );
+    served.stop().await;
+}
+
+/// Review of #165, M1: reading the metrics never changes what the node
+/// does. A sweep lets a tenant go only if nothing but the node holds it,
+/// and over the budget stops the merges of those it must keep; a scrape
+/// that held the tenants as it read them would keep them, and have their
+/// merges stopped. Scraped without let-up while eight idle tenants put
+/// the node over its budget, every one is let go and no merge is stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scraping_never_keeps_a_tenant_from_being_let_go() {
+    let served = Cluster::new()
+        .serve_made(
+            |settings| Settings {
+                memory: Some(1),
+                // Swept every second.
+                tenant_idle: Duration::from_secs(4),
+                ..settings
+            },
+            |app| app,
+        )
+        .await;
+    let tenants: Vec<String> = (0..8).map(|n| format!("t{n}")).collect();
+    for tenant in &tenants {
+        note_in(&served, tenant, 1).await;
+    }
+    let scraping = Arc::new(AtomicBool::new(true));
+    let scrapers: Vec<_> = (0..2)
+        .map(|_| {
+            let (app, scraping) = (served.app.clone(), scraping.clone());
+            std::thread::spawn(move || {
+                let mut scrapes = 0u64;
+                while scraping.load(Ordering::Relaxed) {
+                    std::hint::black_box(app.metrics().encoded());
+                    scrapes += 1;
+                }
+                scrapes
+            })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    // Let go, and a sweep since that found none.
+    while served.node.census().holding.writers > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tenants still held: {:?}",
+            served.node.census().holding
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    scraping.store(false, Ordering::Relaxed);
+    let scrapes: u64 = scrapers.into_iter().map(|s| s.join().unwrap()).sum();
+    assert!(scrapes > 100, "scraped only {scrapes} times");
+    assert_eq!(
+        served.node.merges().stopped_for_budget,
+        0,
+        "a sweep stopped merges of tenants it found held: by the scrapes"
+    );
+    let text = served.app.metrics().encoded();
+    assert_eq!(
+        sample(&text, "vellev_merges_stopped_for_budget_total", &[]),
+        Some(0.0),
+        "{text}"
     );
     served.stop().await;
 }
@@ -430,6 +563,7 @@ async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
 #[tokio::test]
 async fn a_node_without_a_memory_budget_reports_none() {
     let served = holding(None).await;
+    served.node.sweep_now().await;
     let text = served.app.metrics().encoded();
     assert!(
         !text.contains("vellev_memory_budget_bytes"),
@@ -443,6 +577,11 @@ async fn a_node_without_a_memory_budget_reports_none() {
     served.stop().await;
 }
 
+const ALLOCATOR_COUNTS: [&str; 2] = [
+    "vellev_allocator_allocated_bytes",
+    "vellev_allocator_resident_bytes",
+];
+
 /// The allocator's own counts are reported only by a node told which
 /// allocator it runs on: this test binary runs on the system's, where
 /// jemalloc's counts would say nothing of the process.
@@ -450,16 +589,50 @@ async fn a_node_without_a_memory_budget_reports_none() {
 async fn a_node_not_told_its_allocator_reports_no_allocator_counts() {
     let served = holding(None).await;
     let text = served.app.metrics().encoded();
-    for name in ["vellev_allocated_bytes", "vellev_allocator_resident_bytes"] {
+    for name in ALLOCATOR_COUNTS {
         assert!(!text.contains(name), "{name} reported: {text}");
     }
     served.stop().await;
 }
 
+/// jemalloc, linked but not the allocator this test binary runs on.
+static NOT_GLOBAL: vellev::allocator::Allocator = vellev::allocator::Allocator::new();
+
+/// Review of #165, M5: a node told it runs on jemalloc when it does not
+/// finds jemalloc has allocated nothing, and reports none of its counts
+/// rather than counts that say nothing of the process.
+#[tokio::test]
+async fn a_node_told_an_allocator_it_does_not_run_on_reports_no_allocator_counts() {
+    let served = Cluster::new()
+        .serve_made(|settings| settings, |app| app.running_on(&NOT_GLOBAL))
+        .await;
+    let text = served.app.metrics().encoded();
+    for name in ALLOCATOR_COUNTS {
+        assert!(!text.contains(name), "{name} reported: {text}");
+    }
+    served.stop().await;
+}
+
+/// The local embedding models loaded are counted, so that the step in the
+/// process's memory as one loads, outside jemalloc, can be told from what
+/// tenants hold. This node has none.
+#[tokio::test]
+async fn the_local_models_loaded_are_counted() {
+    let served = holding(None).await;
+    let text = served.app.metrics().encoded();
+    assert_eq!(
+        sample(&text, "vellev_local_models_loaded", &[]),
+        Some(0.0),
+        "{text}"
+    );
+    served.stop().await;
+}
+
 /// Linux's memory files as a container has them: the process's status,
-/// and its cgroup's (v2) memory, its limit, its events and its kinds of
-/// memory, with `current` as the cgroup's memory now.
-fn linux_files(current: u64, max: &str) -> (tempfile::TempDir, MemoryFiles) {
+/// and its cgroup's (v2) memory, its limit and its high mark (`max` for
+/// none), its peak, its events and its kinds of memory, with `current` as
+/// the cgroup's memory now.
+fn linux_files(current: u64, max: &str, high: &str) -> (tempfile::TempDir, MemoryFiles) {
     let dir = tempfile::tempdir().unwrap();
     let status = dir.path().join("status");
     std::fs::write(
@@ -472,6 +645,8 @@ fn linux_files(current: u64, max: &str) -> (tempfile::TempDir, MemoryFiles) {
     let write = |name: &str, text: &str| std::fs::write(cgroup.join(name), text).unwrap();
     write("memory.current", &format!("{current}\n"));
     write("memory.max", &format!("{max}\n"));
+    write("memory.high", &format!("{high}\n"));
+    write("memory.peak", "6000000\n");
     write("memory.events", "low 0\nhigh 3\nmax 4\noom 1\noom_kill 2\n");
     write(
         "memory.stat",
@@ -482,12 +657,12 @@ fn linux_files(current: u64, max: &str) -> (tempfile::TempDir, MemoryFiles) {
 }
 
 /// Resident accounting PR 1: the process's resident memory, anonymous and
-/// file-backed apart, and its cgroup's memory, limit, events and kinds of
-/// memory are on /metrics as Linux's files say: what the node is really
-/// held to, beside what it reckons its tenants hold.
+/// file-backed apart, and its cgroup's memory, peak, limit, high mark,
+/// events and kinds of memory are on /metrics as Linux's files say: what
+/// the node is really held to, beside what it reckons its tenants hold.
 #[tokio::test]
 async fn the_process_and_its_cgroups_memory_are_reported_as_linux_says() {
-    let (_dir, files) = linux_files(5_000_000, "2147483648");
+    let (_dir, files) = linux_files(5_000_000, "2147483648", "1500000000");
     let served = Cluster::new().serve_reading_memory_from(files).await;
     let text = served.app.metrics().encoded();
     let value = |name: &str, labels: &[(&str, &str)]| sample(&text, name, labels);
@@ -508,8 +683,18 @@ async fn the_process_and_its_cgroups_memory_are_reported_as_linux_says() {
         "{text}"
     );
     assert_eq!(
+        value("vellev_cgroup_memory_peak_bytes", &[]),
+        Some(6_000_000.0),
+        "{text}"
+    );
+    assert_eq!(
         value("vellev_cgroup_memory_max_bytes", &[]),
         Some(2_147_483_648.0),
+        "{text}"
+    );
+    assert_eq!(
+        value("vellev_cgroup_memory_high_bytes", &[]),
+        Some(1_500_000_000.0),
         "{text}"
     );
     let events = "vellev_cgroup_memory_events_total";
@@ -533,7 +718,8 @@ async fn the_process_and_its_cgroups_memory_are_reported_as_linux_says() {
 
 /// Where there are no such files, as on macOS, or no cgroup v2, nothing
 /// of them is reported: no figure at all, never a figure of nothing. A
-/// cgroup with no limit reports its memory but no limit.
+/// cgroup with no limit or high mark reports neither; one too old to keep
+/// its peak reports none; and a figure too large to be one is left out.
 #[tokio::test]
 async fn memory_linux_does_not_say_is_not_reported() {
     let dir = tempfile::tempdir().unwrap();
@@ -542,10 +728,7 @@ async fn memory_linux_does_not_say_is_not_reported() {
     let text = served.app.metrics().encoded();
     for name in [
         "vellev_process_resident_bytes",
-        "vellev_cgroup_memory_bytes",
-        "vellev_cgroup_memory_max_bytes",
-        "vellev_cgroup_memory_events_total",
-        "vellev_cgroup_memory_stat_bytes",
+        "vellev_cgroup_memory",
         "vellev_memory_baseline_bytes",
     ] {
         assert!(!text.contains(name), "{name} reported: {text}");
@@ -556,7 +739,13 @@ async fn memory_linux_does_not_say_is_not_reported() {
     let text = served.app.metrics().encoded();
     assert!(!text.contains("vellev_cgroup_memory"), "{text}");
     served.stop().await;
-    let (_dir, unlimited) = linux_files(5_000_000, "max");
+    let (unlimited_dir, unlimited) = linux_files(5_000_000, "max", "max");
+    std::fs::remove_file(unlimited_dir.path().join("cgroup/memory.peak")).unwrap();
+    std::fs::write(
+        unlimited_dir.path().join("status"),
+        format!("RssAnon:\t{} kB\nRssFile:\t900 kB\n", u64::MAX / 1000),
+    )
+    .unwrap();
     let served = Cluster::new().serve_reading_memory_from(unlimited).await;
     let text = served.app.metrics().encoded();
     assert_eq!(
@@ -564,7 +753,20 @@ async fn memory_linux_does_not_say_is_not_reported() {
         Some(5_000_000.0),
         "{text}"
     );
-    assert!(!text.contains("vellev_cgroup_memory_max_bytes"), "{text}");
+    for name in [
+        "vellev_cgroup_memory_max_bytes",
+        "vellev_cgroup_memory_high_bytes",
+        "vellev_cgroup_memory_peak_bytes",
+    ] {
+        assert!(!text.contains(name), "{name} reported: {text}");
+    }
+    let resident = "vellev_process_resident_bytes";
+    assert_eq!(sample(&text, resident, &[("kind", "anon")]), None, "{text}");
+    assert_eq!(
+        sample(&text, resident, &[("kind", "file")]),
+        Some(921_600.0),
+        "{text}"
+    );
     served.stop().await;
 }
 
@@ -573,7 +775,7 @@ async fn memory_linux_does_not_say_is_not_reported() {
 /// which what its tenants hold comes on top of.
 #[tokio::test]
 async fn the_memory_held_as_the_node_started_is_kept_as_its_baseline() {
-    let (dir, files) = linux_files(5_000_000, "max");
+    let (dir, files) = linux_files(5_000_000, "max", "max");
     let served = Cluster::new().serve_reading_memory_from(files).await;
     std::fs::write(dir.path().join("cgroup/memory.current"), "7000000\n").unwrap();
     std::fs::write(
@@ -590,12 +792,12 @@ async fn the_memory_held_as_the_node_started_is_kept_as_its_baseline() {
     );
     let baseline = "vellev_memory_baseline_bytes";
     assert_eq!(
-        value(baseline, &[("of", "cgroup")]),
+        value(baseline, &[("kind", "cgroup")]),
         Some(5_000_000.0),
         "{text}"
     );
     assert_eq!(
-        value(baseline, &[("of", "process_anon")]),
+        value(baseline, &[("kind", "process_anon")]),
         Some(2_048_000.0),
         "{text}"
     );
