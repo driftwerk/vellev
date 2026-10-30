@@ -1255,6 +1255,10 @@ pub struct FlushTimes {
     pub held: Option<Duration>,
 }
 
+/// The rows a build is of, ready to index, with what else their making
+/// says: `None` if there are to be none, as a merge's gather given up.
+type RowsToBuild<T> = Option<(SegmentFile, Option<Gathering>, T)>;
+
 /// A merge as it was planned, with all it takes of the state to build.
 struct MergePlanned {
     merge: Merge,
@@ -2694,13 +2698,7 @@ impl Writer {
     /// ends, whoever stops waiting for it.
     async fn built_stopping<T: Send + 'static>(
         &self,
-        rows: impl FnOnce(
-                &Stopping,
-                Option<&MergeBuild>,
-                OnPool<'_>,
-            ) -> Option<(SegmentFile, Option<Gathering>, T)>
-            + Send
-            + 'static,
+        rows: impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<T> + Send + 'static,
         catalog: Catalog,
         stopping: &Stopping,
         build: Option<Arc<MergeBuild>>,
@@ -3313,13 +3311,8 @@ impl Writer {
         named_at: LogPosition,
         catalog: Catalog,
         restored: Arc<AtomicBool>,
-    ) -> impl FnOnce(
-        &Stopping,
-        Option<&MergeBuild>,
-        OnPool<'_>,
-    ) -> Option<(SegmentFile, Option<Gathering>, Shape)>
-           + Send
-           + 'static {
+    ) -> impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<Shape> + Send + 'static
+    {
         let (epoch, restoring) = (self.epoch.clone(), self.restoring.clone());
         let above = self.merging.clustered_above;
         let (timings, key) = (self.timings.clone(), self.lease.key.clone());
