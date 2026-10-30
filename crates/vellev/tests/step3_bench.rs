@@ -808,6 +808,7 @@ fn a_spell_of_steal_shows_in_its_windows_peak() {
         (0.0, 0, 0),
         (10.0, 0, 1_000),
         (20.0, 300, 2_000),
+        (30.0, 300, 3_000),
         (310.0, 300, 31_000),
     ];
     let peaks = steal_peaks(&samples, 300.0);
