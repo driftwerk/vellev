@@ -102,6 +102,9 @@ const TRAINED: usize = 6_000;
 /// Rows merged whose tokens are held a chunk at a time, not all at once:
 /// well past a chunk, and few enough to be a measure of seconds.
 const CHUNKED: usize = 3 * vellev_storage::TOKENIZED_AT_ONCE;
+/// Rows merged of which a chunk is a small share: where every row's tokens
+/// reckoned at once would be far more than the merge ever held.
+const CHUNKED_MORE: usize = 6 * vellev_storage::TOKENIZED_AT_ONCE;
 /// The width measured, and one so narrow that its vectors cost next to
 /// nothing: the difference between their peaks is what the vectors cost,
 /// whatever each row costs besides.
@@ -398,7 +401,7 @@ async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
         // Past a chunk, so that most of the tokens are never held together.
         (CHUNKED, NARROW, Text::Short, false, false),
         (CHUNKED, NARROW, Text::Few, false, false),
-        (CHUNKED, NARROW, Text::Wide, false, false),
+        (CHUNKED_MORE, NARROW, Text::Wide, false, false),
         (CHUNKED, NARROW, Text::Passage, false, false),
         (CHUNKED, WIDE, Text::Passage, false, false),
         (CHUNKED, NARROW, Text::Unique, false, false),
@@ -440,14 +443,33 @@ async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
     }
 }
 
-/// The rows a merge's whole build is measured at, of passages.
-const PASSAGES: [usize; 3] = [20_000, 100_000, 200_000];
+/// The merges whose whole build is measured: passages at three sizes, and
+/// text of 200 words over a large vocabulary, whose tokens hold more than
+/// what later stages come to, past a chunk, so that it is measured to save
+/// them.
+const WHOLE_BUILDS: [(usize, usize, Text); 4] = [
+    (20_000, WIDE, Text::Passage),
+    (100_000, WIDE, Text::Passage),
+    (200_000, WIDE, Text::Passage),
+    (CHUNKED, NARROW, Text::Wide),
+];
+
+/// How much of a build whose tokens set its peak the chunks must save.
+const SAVED_AT_LEAST: f64 = 0.1;
+
+/// How much a build's peak may differ with nothing to tell it by: a stage
+/// after the tokens sets it, in both, to within a few bytes as its threads
+/// free things in another order.
+const PEAK_TOLD_TO: f64 = 0.001;
 
 /// M1-R1. A merge's build holds at most `TOKENIZED_AT_ONCE` rows' tokens at
 /// once, however many it merges, and over the whole of it, stage by stage,
-/// holds no more at its peak for that than tokenizing every row at once
-/// held (node memory note, §2.1). What it saves is what the build's later
-/// stages leave of the tokens' share, printed here for the PR to say.
+/// holds no more at its peak for that than the same build tokenizing every
+/// row at once, as it did before it took chunks (node memory note, §2.1).
+/// What it saves is what the later stages leave of the tokens' share,
+/// printed for the PR to say: nothing, for passages of 768 dimensions,
+/// whose encoding sets the peak, and at least a tenth where the tokens do.
+/// Each holds its reckoning's bounds too.
 ///
 /// As the reckoning's rule: run optimised, in CI's Test job, as
 /// `cargo test --release -p vellev-storage --test flush_memory -- --ignored`.
@@ -457,31 +479,58 @@ async fn a_merge_holds_a_chunk_of_tokens_at_once_and_its_whole_build_no_more_for
     let _alone = ALONE.lock().await;
     let at_once = vellev_storage::TOKENIZED_AT_ONCE;
     let mut measured = Vec::new();
-    for rows in PASSAGES {
-        let all = merge_measured(rows, WIDE, Text::Passage, false, false, usize::MAX).await;
-        let chunked = merge_measured(rows, WIDE, Text::Passage, false, false, at_once).await;
+    for (rows, dimensions, text) in WHOLE_BUILDS {
+        let all = merge_measured(rows, dimensions, text, false, false, usize::MAX).await;
+        let chunked = merge_measured(rows, dimensions, text, false, false, at_once).await;
+        let saved = (all.peak as f64 - chunked.peak as f64) / all.peak as f64;
+        let off = |by: usize| (by as f64 - chunked.peak as f64) / chunked.peak as f64 * 100.0;
         eprintln!(
-            "a merge of {rows} passages held {} bytes at its peak all at once ({} rows' tokens \
-             at a time), {} in chunks ({} rows' tokens at a time): {:+.1}%",
+            "a merge of {rows} rows of {dimensions}, {text:?} text, held {} bytes at its peak \
+             with every row tokenized at once ({} rows' tokens held), {} in chunks ({} rows' \
+             tokens held), {:.1}% less, reckoned {} ({:+.0}%), planned {} ({:+.0}%)",
             all.peak,
             all.tokenized_at_once,
             chunked.peak,
             chunked.tokenized_at_once,
-            (chunked.peak as f64 - all.peak as f64) / all.peak as f64 * 100.0,
+            saved * 100.0,
+            chunked.reckoned,
+            off(chunked.reckoned),
+            chunked.planned,
+            off(chunked.planned),
         );
-        measured.push((rows, all, chunked));
+        measured.push((rows, text, all, chunked, saved));
     }
-    for (rows, all, chunked) in measured {
+    for (rows, text, all, chunked, saved) in measured {
         assert!(
             chunked.tokenized_at_once <= at_once,
             "a merge of {rows} rows held {} rows' tokens at once",
             chunked.tokenized_at_once
         );
         assert!(
-            chunked.peak <= all.peak,
+            chunked.peak as f64 <= all.peak as f64 * (1.0 + PEAK_TOLD_TO),
             "a merge of {rows} rows held {} bytes in chunks, {} tokenizing every row at once",
             chunked.peak,
             all.peak
+        );
+        if matches!(text, Text::Wide) {
+            assert!(
+                saved >= SAVED_AT_LEAST,
+                "a merge of {rows} rows saved {:.1}% of its peak, its tokens setting it",
+                saved * 100.0
+            );
+        }
+        let off = |by: usize| (by as f64 - chunked.peak as f64).abs() / chunked.peak as f64;
+        assert!(
+            off(chunked.reckoned) <= 0.3,
+            "a merge of {rows} rows reckoned {} bytes, held {}",
+            chunked.reckoned,
+            chunked.peak
+        );
+        assert!(
+            off(chunked.planned) <= 0.5,
+            "a merge of {rows} rows was planned at {} bytes, held {}",
+            chunked.planned,
+            chunked.peak
         );
     }
 }
