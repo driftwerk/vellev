@@ -38,7 +38,10 @@ jobs:
       - name: Fetch the fixture and check it
         run: |
           set -euo pipefail
-          F="$RUNNER_TEMP/fixture"
+          # Under /mnt, which uid 10001 can reach and which has the room;
+          # $RUNNER_TEMP is in a home it may not enter.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/step3
+          F=/mnt/step3/fixture
           mkdir -p "$F/download" "$F/text" "$F/vectors"
           cd "$F/download"
           wanted="passages.jsonl.zst queries.jsonl warmup.jsonl vectors-queries.tar.zst vectors-passages-0.tar.zst vectors-passages-1.tar.zst vectors-passages-2.tar.zst"
@@ -56,19 +59,19 @@ jobs:
           done
           rm -rf "$F/download"
           test "$(ls "$F/vectors/passages" | wc -l)" -eq 100
-          df -h /
+          df -h / /mnt
       - name: Bench
-        run: scripts/step3-bench/run.sh "$RUNNER_TEMP/fixture" "$RUNNER_TEMP/step3" "$RUNNER_TEMP/step3-data" $ARMS
+        run: scripts/step3-bench/run.sh /mnt/step3/fixture /mnt/step3/out /mnt/step3/data $ARMS
       - if: always()
-        run: cat "$RUNNER_TEMP/step3/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat /mnt/step3/out/summary.md >> "$GITHUB_STEP_SUMMARY" || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: step3-bench
           path: |
-            ${{ runner.temp }}/step3/*.json
-            ${{ runner.temp }}/step3/*.txt
-            ${{ runner.temp }}/step3/*.log
-            ${{ runner.temp }}/step3/*.md
+            /mnt/step3/out/*.json
+            /mnt/step3/out/*.txt
+            /mnt/step3/out/*.log
+            /mnt/step3/out/*.md
           retention-days: 90
           if-no-files-found: ignore
