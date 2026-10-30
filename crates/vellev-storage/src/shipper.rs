@@ -284,9 +284,11 @@ impl Shipper {
     }
 
     /// As this shipper, its links' frames inline up to `bytes` with their
-    /// header, and spilled beside them past that: [`link::INLINE_MOST`]
-    /// unless set, and never more than the backup store creates. Apart
-    /// from what the store creates, which bounds a link's header too.
+    /// header, and spilled beside them past that. The threshold is at most
+    /// [`link::INLINE_MOST`] and what the backup store creates, so this can
+    /// only lower the default, never raise it; it is apart from what the
+    /// store creates, which bounds a link's header too. Only tests set it
+    /// today, to make frames spill in a store that creates far more.
     pub fn inlining_at_most(self, bytes: usize) -> Self {
         Self {
             inline_most: bytes,
