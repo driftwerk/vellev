@@ -161,7 +161,8 @@ fn slots(tokens: usize) -> usize {
         0 => 0,
         1..=3 => 4,
         4..=7 => 8,
-        _ => (tokens * 8 / 7 + 1).next_power_of_two(),
+        8..=14 => 16,
+        _ => (tokens * 8 / 7).next_power_of_two(),
     }
 }
 
