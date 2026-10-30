@@ -233,7 +233,7 @@ std::thread_local! {
 /// their threads. A background thread has no async runtime to start a
 /// blocking thread on.
 fn lowered_by(nice: i32) {
-    if nice <= 0 {
+    if nice <= 1_000 {
         return;
     }
     LOWERED.with(|lowered| lowered.set(true));
