@@ -55,6 +55,13 @@ async fn what_a_partition_publishes_is_its_state_after_every_change() {
     let (figures, state) = published(copy.partition());
     assert_eq!(figures, state, "as a copy catches up");
     assert_eq!(figures.unflushed, 1);
+    // Past a checkpoint made since: the copy loads it afresh.
+    writer.flush().await.unwrap();
+    writer.commit(vec![upsert("notes", 101, 1)]).await.unwrap();
+    copy.catch_up(&cluster.committed().await).await.unwrap();
+    let (figures, state) = published(copy.partition());
+    assert_eq!(figures, state, "as a copy catches up past a checkpoint");
+    assert_eq!((figures.plain, figures.unflushed), (2, 1));
 
     writer
         .restore(Some(&restore_to.0), restore_to.1)

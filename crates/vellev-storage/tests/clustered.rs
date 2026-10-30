@@ -529,6 +529,11 @@ async fn curves_committed_for_a_segment_are_kept_and_a_replaced_one_gets_none() 
         .await
         .unwrap();
     assert!(committed.is_some(), "a curve for a segment that is there");
+    // What the partition publishes of itself is what it now holds (delta
+    // review of #165): the curve from questions, and the segment flushed.
+    let partition = writer.partition();
+    assert_eq!(partition.figures(), partition.read(State::figures));
+    assert_eq!(partition.figures().probes.queries, 1);
     let kept = segments_of(&cluster).await;
     assert_eq!(kept.len(), 2, "the memtable was flushed along: {kept:?}");
     assert_eq!(kept[0].key, segment.key);
