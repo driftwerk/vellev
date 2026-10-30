@@ -53,6 +53,11 @@ impl Published {
             unflushed_bytes: state.unflushed_bytes(),
             ..*figures
         };
+        debug_assert_eq!(
+            *figures,
+            state.figures(),
+            "applying a commit changed what only a change of segments may"
+        );
         changed
     }
 
