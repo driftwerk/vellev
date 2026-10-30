@@ -27,12 +27,13 @@ use crate::format::{
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
 use crate::merge_builds::{
-    MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
+    HeldAt, MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::published::Published;
 use crate::state::{
-    self, Discarded, Figures, Fit, Indexes, Loaded, Merging, Names, Shape, Snapshot, State, Stored,
+    self, Discarded, Figures, Fit, Indexes, Loaded, Merge, Merging, Names, Reckoning, Run, Shape,
+    Snapshot, State, Stored,
 };
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Refusal, Result, StorageError};
@@ -59,6 +60,12 @@ const CLEANING_AT_ONCE: usize = 16;
 /// from a store that answers as stores do, and no longer than anything
 /// that waits for it can well wait.
 const CLEANING_WITHIN: Duration = Duration::from_secs(60);
+
+/// How many of a segment's rows a merge gathers between one asking of its
+/// stop and the next: so that it gives up within this many rows, however
+/// large the segment. For tests that hold it to that, not for use.
+#[doc(hidden)]
+pub const GATHERED_AT_ONCE: usize = 4_096;
 
 /// A segment built and ready to write: its file without the rows'
 /// vectors, which the column holds, its indexes, and the frames of the
@@ -98,7 +105,7 @@ fn segment_built(
     let probe = build.and_then(MergeBuild::probe);
     let mut file = file;
     if let Some(build) = build {
-        build.held_here(stopping, false);
+        build.held_here(stopping, HeldAt::Start);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
     let vectors = vectors.map(|gathered| gathered.finish(format));
@@ -137,7 +144,7 @@ fn segment_built(
     // Here, off the async threads and the state's lock, once.
     let parts = state::Parts::of(&file, &indexes);
     if let Some(build) = build {
-        build.held_here(stopping, true);
+        build.held_here(stopping, HeldAt::Built);
     }
     Ok(Some(Built {
         file,
@@ -1089,11 +1096,14 @@ pub struct Writer {
     writing: Mutex<()>,
     /// Set for good once an attempt fails or is given up part way.
     closed: AtomicBool,
-    /// Held while a flush or a merge builds its segment without `writing`,
-    /// so that one never builds on a state the other is about to replace.
+    /// Held while a flush builds its segment without `writing`, and while
+    /// a merge plans and while it commits, so that what replaces segments
+    /// goes one at a time, and a flush never builds on a state a merge is
+    /// about to replace.
     building: Mutex<()>,
-    /// Set while a restore runs, when writes are refused.
-    restoring: AtomicBool,
+    /// Set while a restore runs, when writes are refused. Shared with a
+    /// gather, which a restore ends.
+    restoring: Arc<AtomicBool>,
     /// When the turn now held, if any, was taken, and how long it may be
     /// held in all.
     held: Arc<std::sync::Mutex<Option<Holding>>>,
@@ -1101,8 +1111,9 @@ pub struct Writer {
     /// it: what every file this writer puts is stamped as.
     format: Arc<AtomicU16>,
     /// How many times this writer's state has been put back wholesale or
-    /// merged: see [`Self::epoch`].
-    epoch: AtomicU64,
+    /// merged: see [`Self::epoch`]. Shared with a gather, which a change
+    /// of it ends.
+    epoch: Arc<AtomicU64>,
     /// Held while a merge plans, builds and commits, so that a partition
     /// builds one merge at a time, as it did when merges held `building`
     /// throughout: what bounds the memory merges take in it.
@@ -1172,6 +1183,18 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct MergeGate {
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+}
+
+/// A merge as it was planned, with all it takes of the state to build.
+struct MergePlanned {
+    merge: Merge,
+    /// Its run, to gather from with no lock held.
+    run: Run,
+    /// What it is reckoned to hold at its peak, as it is planned.
+    reckoning: Reckoning,
+    /// The position its files are named at, and its rows taken at.
+    named_at: LogPosition,
+    catalog: Catalog,
 }
 
 /// A merge's uploads kept from [`Writer::clean`] while it is under way,
@@ -1280,10 +1303,10 @@ impl Writer {
             writing: Mutex::new(()),
             closed: AtomicBool::new(false),
             building: Mutex::new(()),
-            restoring: AtomicBool::new(false),
+            restoring: Arc::default(),
             held: Arc::default(),
             format: Arc::new(AtomicU16::new(DEFAULT_MAX_FORMAT)),
-            epoch: AtomicU64::new(0),
+            epoch: Arc::default(),
             merge_build: Mutex::new(()),
             keeping: Arc::default(),
             merge_gate: std::sync::Mutex::new(None),
@@ -2476,27 +2499,32 @@ impl Writer {
         vectors: Option<Gathering>,
         catalog: Catalog,
     ) -> Result<Built> {
+        let rows = move |_: &Stopping, _: Option<&MergeBuild>| Some((file, vectors, ()));
         match self
-            .built_stopping(file, vectors, catalog, &Stopping::never(), None)
+            .built_stopping(rows, catalog, &Stopping::never(), None)
             .await?
         {
-            Some(built) => Ok(built),
+            Some((built, ())) => Ok(built),
             None => unreachable!("a build nothing stops is never stopped"),
         }
     }
 
-    /// As [`Self::built`], giving up, `None`, once `stopping` is stopped:
-    /// asked as the rows are indexed, and before and after they are
-    /// encoded. A merge's `build` is held by the work until it ends,
-    /// whoever stops waiting for it.
-    async fn built_stopping(
+    /// As [`Self::built`], of the rows `rows` comes to, with what else it
+    /// says, giving up, `None`, if it comes to none, or once `stopping` is
+    /// stopped: asked as the rows are indexed, and before and after they
+    /// are encoded. `rows` is the work's first step, in the same turn off
+    /// the async threads, with no lock held: a merge gathers there, where
+    /// nothing waits on it. A merge's `build` is held by the work until it
+    /// ends, whoever stops waiting for it.
+    async fn built_stopping<T: Send + 'static>(
         &self,
-        file: SegmentFile,
-        vectors: Option<Gathering>,
+        rows: impl FnOnce(&Stopping, Option<&MergeBuild>) -> Option<(SegmentFile, Option<Gathering>, T)>
+            + Send
+            + 'static,
         catalog: Catalog,
         stopping: &Stopping,
         build: Option<Arc<MergeBuild>>,
-    ) -> Result<Option<Built>> {
+    ) -> Result<Option<(Built, T)>> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
         // Its turn among the work off the async threads is waited for as
@@ -2518,16 +2546,20 @@ impl Writer {
         // it. Never left to the closure's captures, whose order is not set.
         let built = at_once(move || {
             let build = build;
-            let built = segment_built(
-                turn,
-                file,
-                vectors,
-                &catalog,
-                &stopping,
-                build.as_deref(),
-                above,
-                format,
-            );
+            let built = match rows(&stopping, build.as_deref()) {
+                Some((file, vectors, with)) => segment_built(
+                    turn,
+                    file,
+                    vectors,
+                    &catalog,
+                    &stopping,
+                    build.as_deref(),
+                    above,
+                    format,
+                )
+                .map(|built| built.map(|built| (built, with))),
+                None => Ok(None),
+            };
             (built, build)
         });
         built.await?.0
@@ -2860,7 +2892,7 @@ impl Writer {
             return may_merge.map(|_| None);
         }
         // Its turn among the node's merge builds, and then the building
-        // lock, under which it plans and gathers its rows; built, uploaded
+        // lock, under which it plans, in moments; gathered, built, uploaded
         // and loaded without the lock, so that flushes go on meanwhile;
         // committed under it again, only if nothing put the partition back
         // since and the run is as it was (merge note, step 2). The turn is
@@ -2872,41 +2904,29 @@ impl Writer {
         };
         let build = Arc::new(build);
         let planned = planned.unwrap_or_else(|| self.epoch());
-        let Some(merge) = self.partition.read(|state| state.merge_plan(&self.merging)) else {
+        let Some(plan) = self.merge_planned() else {
             return Ok(None);
         };
-        let above = self.merging.clustered_above;
-        let reckoning = self
-            .partition
-            .read(|state| state.merge_reckoning(&merge, above));
-        build.reckon_planned(reckoning.peak());
-        let Some((file, vectors, copied, shape, named_at, alive)) = self.partition.read(|state| {
-            let named_at = state.position();
-            let (file, vectors, copied) = state.merged(&merge, named_at, &stopping)?;
-            let tombstones = file.tombstones.len();
-            let shape =
-                Shape::of_gathered(state.catalog(), &file.rows, &vectors, tombstones, above);
-            Some((file, vectors, copied, shape, named_at, state.alive(&merge)))
-        }) else {
-            return Ok(None);
-        };
-        let catalog = self.partition.read(|state| state.catalog().clone());
         drop(planning);
-        let reckoning = reckoning.gathered(file.rows.len(), copied, &vectors);
-        build.reckon(reckoning.peak());
+        let MergePlanned {
+            merge,
+            run,
+            reckoning,
+            named_at,
+            catalog,
+        } = plan;
+        build.reckon_planned(reckoning.peak());
         // A merge planned at another epoch than this is dropped before any
         // work is spent on it, and again at its commit below.
         if self.stale(planned) {
             return Ok(None);
         }
-        let built = self.built_stopping(
-            file,
-            Some(vectors),
-            catalog.clone(),
-            &stopping,
-            Some(build.clone()),
-        );
-        let Some(built) = built.await? else {
+        let dead = run.dead();
+        let gather = self.gathered(run, planned, reckoning, named_at, catalog.clone());
+        let built = self.built_stopping(gather, catalog.clone(), &stopping, Some(build.clone()));
+        let Some((built, shape)) = built.await? else {
+            // Said if a restore is what ended it.
+            self.stale(planned);
             return Ok(None);
         };
         // Both segments, however large, are uploaded without the writer,
@@ -2970,7 +2990,7 @@ impl Writer {
         // moves the epoch, and the building lock is held.
         if !self
             .partition
-            .read(|state| state.covers(&merge, &alive, &merged))
+            .read(|state| state.covers(&merge, &dead, &merged))
         {
             tracing::error!(
                 "a merged segment lacks a row its run holds live; the merge is dropped"
@@ -3004,6 +3024,67 @@ impl Writer {
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
         Ok(Some(position))
+    }
+
+    /// The merge most worth doing, as the state stands, with all it takes
+    /// of the state: all a merge does under the building lock and the
+    /// state's before it commits, a walk of its run's segments.
+    fn merge_planned(&self) -> Option<MergePlanned> {
+        self.partition.read(|state| {
+            let merge = state.merge_plan(&self.merging)?;
+            Some(MergePlanned {
+                run: state.merge_run(&merge),
+                reckoning: state.merge_reckoning(&merge, self.merging.clustered_above),
+                named_at: state.position(),
+                catalog: state.catalog().clone(),
+                merge,
+            })
+        })
+    }
+
+    /// The work of gathering `run`'s rows at `named_at`, with what they
+    /// come to in a segment's shape, for a merge planned at the epoch
+    /// `planned`: for the merge's own work off the async threads, with no
+    /// lock held, so that flushes, commits and searches go on through it,
+    /// and no async thread waits on it. Copied a chunk at a time, it gives
+    /// up within a chunk of a stop, or of a restore that has begun or been
+    /// made since the plan, which would only drop the merge at its commit:
+    /// and, last of all, before its frame is sealed.
+    fn gathered(
+        &self,
+        run: Run,
+        planned: u64,
+        reckoning: Reckoning,
+        named_at: LogPosition,
+        catalog: Catalog,
+    ) -> impl FnOnce(&Stopping, Option<&MergeBuild>) -> Option<(SegmentFile, Option<Gathering>, Shape)>
+           + Send
+           + 'static {
+        let (epoch, restoring) = (self.epoch.clone(), self.restoring.clone());
+        let above = self.merging.clustered_above;
+        move |stopping, build| {
+            let mut goes_on = |rows| {
+                if let Some(build) = build {
+                    build.gathering(rows, stopping);
+                }
+                !stopping.stopped(MergeStage::Gathering)
+                    && !restoring.load(Ordering::SeqCst)
+                    && epoch.load(Ordering::SeqCst) == planned
+            };
+            let (file, vectors, copied) = run.merged(named_at, GATHERED_AT_ONCE, &mut goes_on)?;
+            let tombstones = file.tombstones.len();
+            let shape = Shape::of_gathered(&catalog, &file.rows, &vectors, tombstones, above);
+            // Asked once more, as what comes next, sealing the frame, sums
+            // every vector with nothing to ask it.
+            if !goes_on(file.rows.len()) {
+                return None;
+            }
+            if let Some(build) = build {
+                let reckoning = reckoning.gathered(file.rows.len(), copied, &vectors);
+                build.reckon(reckoning.peak());
+            }
+            Some((file, Some(vectors), shape))
+        }
     }
 
     /// A merge's turn among the node's merge builds, then the building lock
@@ -3247,9 +3328,9 @@ impl Writer {
     ///   while their files wait to be published, and log commits do not move
     ///   the checkpoint this deletes below: their files sit at or past the
     ///   latest checkpoint, never below it.
-    /// - A merge does not: it plans under the building lock, builds,
-    ///   uploads and loads its segment without it, and takes it again only to
-    ///   commit (merge note, step 2). Meanwhile flushes commit checkpoints
+    /// - A merge does not: it plans under the building lock, gathers,
+    ///   builds, uploads and loads its segment without it, and takes it
+    ///   again only to commit (merge note, step 2). Meanwhile flushes commit checkpoints
     ///   past the position its files are named at, so they can sit below the
     ///   latest checkpoint, and this could reach them. Two things keep them:
     ///   while the merge is under way its files are in the writer's
@@ -4289,6 +4370,34 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<()> {
             self.inner.delete(key).await
         }
+    }
+
+    /// M4-G6: what a merge takes with the building lock and the state's
+    /// held comes to a walk of the run's segments and a copy of their
+    /// marks' words: no row of them is touched, however many there are.
+    #[tokio::test]
+    async fn a_merge_is_planned_touching_no_row() {
+        let (writer, _) = writer_on(Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))).await;
+        let merging = Merging {
+            fanout: 2,
+            ..Merging::default()
+        };
+        let writer = writer.merging_with(merging);
+        writer.commit(vec![create()]).await.unwrap();
+        for segment in 0..2 {
+            let rows = (0..100).map(|n| upsert(segment * 100 + n));
+            writer.commit(rows.collect()).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        let gone = Mutation::Delete {
+            collection: notes(),
+            id: ObjectId(uuid::Uuid::from_u128(3)),
+            only_if_version: None,
+        };
+        writer.commit(vec![gone]).await.unwrap();
+        let (planned, touched) = state::touching(|| writer.merge_planned());
+        assert!(planned.is_some(), "there is a merge to plan");
+        assert_eq!(touched, 0, "the plan touched {touched} rows");
     }
 
     #[tokio::test]
