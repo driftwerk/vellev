@@ -141,7 +141,47 @@ pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, 
     drop(now);
     let _turn = Turn(ticket);
     stop.check(Stage::Tuning)?;
-    Ok(tuning().install(work))
+    if rayon::current_thread_index().is_none() {
+        return Ok(tuning().install(work));
+    }
+    // On a worker of another pool, as a merge's build on a pool of its own
+    // is ([`merge_builds`]): asked from there, the tuning pool would have
+    // this thread take on its own pool's other work while it waited,
+    // another merge's build among it, which would then wait for its turn
+    // here behind this one's for good, this turn let go only once that
+    // work had returned. A thread of its own waits instead, doing nothing
+    // else.
+    let tuned = std::thread::scope(|scope| scope.spawn(|| tuning().install(work)).join());
+    Ok(tuned.unwrap_or_else(|panicked| std::panic::resume_unwind(panicked)))
+}
+
+/// A pool for merges to build on, apart from rayon's global one, which
+/// builds flushes and loads: `threads` threads, named `vellev-merge-N`,
+/// each run `nice` lower than the rest of the process (merge note, §3). A
+/// pool smaller than the global one leaves cores to reads and flushes
+/// while merges build; one lower in priority yields them the CPU while
+/// they want it. Made after the read, tuning and passes pools, so that
+/// none of those is ever made from one of its threads and runs lower too.
+///
+/// On Linux a thread's priority is its own, and lowering it needs no
+/// privilege; raising it back would, so it is never asked. Elsewhere, and
+/// where Linux refuses, the threads run as the process does: whoever needs
+/// to know reads each thread's priority back, as the merge bench does.
+///
+/// # Panics
+///
+/// If `threads` is 0, or the pool's threads cannot be started.
+pub fn merge_builds(threads: usize, nice: i32) -> ThreadPool {
+    assert!(threads >= 1, "a merge pool has a thread at least");
+    reads();
+    tuning();
+    passes();
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|n| format!("vellev-merge-{n}"))
+        .start_handler(move |_| lowered_by(nice))
+        .build()
+        .expect("the merge pool's threads")
 }
 
 /// The pool a rows pass makes its curve on (recall note, R9.5): one
@@ -159,7 +199,7 @@ pub fn passes() -> &'static ThreadPool {
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-pass".to_string())
-            .start_handler(|_| lowered())
+            .start_handler(|_| lowered_by(BACKGROUND_NICE))
             .build()
             .expect("the rows passes' pool's thread")
     })
@@ -177,15 +217,20 @@ std::thread_local! {
     static LOWERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Lower the calling thread's priority by [`BACKGROUND_NICE`], from where
-/// the process runs, to 19 at the most. Nothing elsewhere, nor if Linux
-/// refuses, as the thread then runs as it would have.
+/// Lower the calling thread's priority by `nice`, from where the process
+/// runs, to 19 at the most; by nothing at all, as a merge pool at the
+/// normal priority asks. Nothing elsewhere, nor if Linux refuses, as the
+/// thread then runs as it would have.
 ///
 /// A thread such a thread makes would run lower too, for good, and do
 /// whatever work it is given: so the read and tuning pools are made before
-/// the passes' pool, and are said never to be made from its thread. A background thread has no async runtime to start a blocking
-/// thread on.
-fn lowered() {
+/// the passes' pool and any merge pool, and are said never to be made from
+/// their threads. A background thread has no async runtime to start a
+/// blocking thread on.
+fn lowered_by(nice: i32) {
+    if nice <= 0 {
+        return;
+    }
     LOWERED.with(|lowered| lowered.set(true));
     #[cfg(target_os = "linux")]
     {
@@ -193,7 +238,7 @@ fn lowered() {
         if let Some(now) = priority_of(tid) {
             // SAFETY: setpriority takes and gives plain numbers.
             unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, tid, (now + BACKGROUND_NICE).min(19));
+                libc::setpriority(libc::PRIO_PROCESS, tid, (now + nice).min(19));
             }
         }
     }

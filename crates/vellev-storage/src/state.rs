@@ -954,6 +954,12 @@ impl State {
 }
 
 impl Snapshot {
+    /// How many rows the memtable held as it was taken: what the
+    /// checkpoint takes out of memory.
+    pub(crate) fn held(&self) -> usize {
+        self.held
+    }
+
     /// The taken rows' vectors as gathered, taken out of the snapshot, to
     /// be sealed into their column where nothing waits on it.
     pub(crate) fn gathered(&mut self) -> Gathering {

@@ -24,6 +24,7 @@ mod search;
 pub mod shipper;
 mod state;
 mod stopping;
+pub mod timings;
 mod work;
 
 pub use answers::KEPT_FOR as ANSWERS_KEPT_FOR;
@@ -38,7 +39,7 @@ pub use merge_builds::{Holding, MergeBuilds, Probed, MERGE_BUILDS};
 pub use mutation::{
     Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
 };
-pub use partition::{Embedded, Follower, MergeGate, Partition, RestoreFrom, Writer};
+pub use partition::{Embedded, FlushTimes, Follower, MergeGate, Partition, RestoreFrom, Writer};
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::{Figures, Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM};
 pub use stopping::MergeStage;

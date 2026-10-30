@@ -27,6 +27,9 @@ use crate::Result;
 /// the node's merges hold at most this many times the largest.
 pub const MERGE_BUILDS: usize = 2;
 
+/// How many builds' threads are kept for [`MergeBuilds::builds_ran_on`].
+const RAN_ON_KEPT: usize = 64;
+
 /// The longest a build waits where a test holds it, were the test never to
 /// let it go.
 const HELD_AT_MOST: Duration = Duration::from_secs(60);
@@ -84,6 +87,15 @@ pub struct MergeBuilds {
     probing: AtomicBool,
     /// How the builds stood as the last probe was dropped.
     probed: Mutex<Option<Probed>>,
+    /// The pool merges build on, if not rayon's global one: see
+    /// [`Self::building_on`].
+    pool: Option<Arc<rayon::ThreadPool>>,
+    /// The most any build was reckoned to hold at its peak, since the node
+    /// started.
+    largest: AtomicUsize,
+    /// The names of the threads builds ran on, as a test asks: see
+    /// [`Self::builds_ran_on`].
+    ran_on: Mutex<Option<Vec<String>>>,
 }
 
 /// What one build under way is reckoned to hold, and the stop of its merge.
@@ -151,6 +163,21 @@ impl MergeBuilds {
     ///
     /// If `at_once` is 0: no merge would ever be built.
     pub fn new(at_once: usize) -> Arc<Self> {
+        Self::made(at_once, None)
+    }
+
+    /// As [`Self::new`], each merge's build run on `pool`, all of it: its
+    /// indexing, its encoding and the rest, but for the turns its clustered
+    /// indexes take to tune, on the one tuning thread. Flushes, loads and
+    /// what a merge does around its build stay where they are: on rayon's
+    /// global pool, and on the async runtime's threads. A pool smaller, or
+    /// lower in priority, than the global one leaves the rest of the box
+    /// to reads and flushes while merges build (merge note, §3).
+    pub fn building_on(at_once: usize, pool: Arc<rayon::ThreadPool>) -> Arc<Self> {
+        Self::made(at_once, Some(pool))
+    }
+
+    fn made(at_once: usize, pool: Option<Arc<rayon::ThreadPool>>) -> Arc<Self> {
         assert!(at_once >= 1, "merges are built at least one at a time");
         Arc::new(Self {
             turns: Arc::new(Semaphore::new(at_once)),
@@ -167,7 +194,40 @@ impl MergeBuilds {
             last_reckoned: AtomicUsize::new(0),
             probing: AtomicBool::new(false),
             probed: Mutex::default(),
+            pool,
+            largest: AtomicUsize::new(0),
+            ran_on: Mutex::new(Some(Vec::new())),
         })
+    }
+
+    /// The pool merges build on, if not rayon's global one.
+    pub(crate) fn pool(&self) -> Option<&Arc<rayon::ThreadPool>> {
+        self.pool.as_ref()
+    }
+
+    /// About how many bytes the largest build since the node started was
+    /// reckoned to hold at its peak: what the node's memory, past its
+    /// budget, may hold [`MERGE_BUILDS`] times over (merge note, §2.4).
+    pub fn largest_reckoned(&self) -> usize {
+        self.largest.load(Ordering::SeqCst)
+    }
+
+    /// Note that a build ran on the calling thread.
+    pub(crate) fn ran_here(&self) {
+        if let Some(ran_on) = lock(&self.ran_on).as_mut() {
+            if ran_on.len() < RAN_ON_KEPT {
+                let name = std::thread::current().name().unwrap_or("").to_string();
+                ran_on.push(name);
+            }
+        }
+    }
+
+    /// The names of the threads the builds so far ran on, the first
+    /// [`RAN_ON_KEPT`] of them. For tests that show which pool builds run
+    /// on.
+    #[doc(hidden)]
+    pub fn builds_ran_on(&self) -> Vec<String> {
+        lock(&self.ran_on).clone().unwrap_or_default()
     }
 
     /// About how many bytes the merges stopped and not yet ended hold:
@@ -449,6 +509,13 @@ impl MergeBuild {
     /// Reckon the build to hold `bytes` at its peak, from now on.
     pub(crate) fn reckon(&self, bytes: usize) {
         self.counted.reckoned.bytes.store(bytes, Ordering::SeqCst);
+        let builds = &self.counted.builds;
+        builds.largest.fetch_max(bytes, Ordering::SeqCst);
+    }
+
+    /// The node's merge builds this is one of.
+    pub(crate) fn builds(&self) -> &Arc<MergeBuilds> {
+        &self.counted.builds
     }
 
     /// A probe for what the build makes to carry, if a test asks: see
