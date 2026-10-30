@@ -153,6 +153,10 @@ async fn over_its_budget_a_node_stops_a_tenant_s_merge_and_lets_it_go_once_the_b
         0,
         "a stopped merge that has ended is counted as draining"
     );
+    assert!(
+        node.merges().stopped_for_budget >= 1,
+        "the merge stopped for the budget was not counted"
+    );
     until(10, "the tenant was never let go", || node.resident() == 0).await;
 }
 
@@ -204,6 +208,14 @@ async fn a_tenant_a_request_holds_is_not_let_go_while_its_merge_is_stopped() {
         node.resident() > 0,
         "a tenant was let go while a request held it"
     );
+    // Re-review of #165, L2: one merge was stopped, though every round
+    // since found the tenant held and asked again.
+    assert_eq!(
+        node.merges().stopped_for_budget,
+        1,
+        "stops counted that stopped no merge"
+    );
+    assert!(node.tenants_kept_by_sweeps() >= 3, "kept round after round");
     go_on.notify_one();
     let written = within(10, "the request never ended", request)
         .await

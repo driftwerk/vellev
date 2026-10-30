@@ -180,7 +180,12 @@ mod tests {
         let memory = MemoryFiles::of_this_process().read();
         assert!(memory.anon.is_some_and(|bytes| bytes > 0), "{memory:?}");
         assert!(memory.file.is_some(), "{memory:?}");
-        if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        // Not in the root cgroup, which has no memory.current of its own.
+        let own = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|named| cgroup_dir(Path::new("/sys/fs/cgroup"), &named))
+            .map(|dir| dir.join("memory.current"));
+        if own.is_some_and(|current| current.exists()) {
             assert!(memory.current.is_some_and(|bytes| bytes > 0), "{memory:?}");
         }
     }

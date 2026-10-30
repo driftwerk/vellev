@@ -499,9 +499,10 @@ async fn what_the_tenants_hold_is_reported_as_the_last_sweep_found_it() {
 /// does. A sweep lets a tenant go only if nothing but the node holds it,
 /// and over the budget stops the merges of those it must keep; a scrape
 /// that held the tenants as it read them would keep them, and have their
-/// merges stopped. Scraped without let-up from four threads while 32 idle
+/// merges stopped. So would asking what the node holds, as warming does.
+/// Scraped and asked without let-up from four threads while 32 idle
 /// tenants put the node over its budget, three times over, every one is
-/// let go each time and no merge is stopped.
+/// let go each time: no sweep finds one held, and no merge is stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scraping_never_keeps_a_tenant_from_being_let_go() {
     let served = Cluster::new()
@@ -520,10 +521,13 @@ async fn scraping_never_keeps_a_tenant_from_being_let_go() {
     let scrapers: Vec<_> = (0..4)
         .map(|_| {
             let (app, scraping) = (served.app.clone(), scraping.clone());
+            let node = served.node.clone();
             std::thread::spawn(move || {
                 let mut scrapes = 0u64;
                 while scraping.load(Ordering::Relaxed) {
                     std::hint::black_box(app.metrics().encoded());
+                    // What warming asks before each copy it opens.
+                    std::hint::black_box(node.resident());
                     scrapes += 1;
                 }
                 scrapes
@@ -550,16 +554,103 @@ async fn scraping_never_keeps_a_tenant_from_being_let_go() {
     let scrapes: u64 = scrapers.into_iter().map(|s| s.join().unwrap()).sum();
     assert!(scrapes > 100, "scraped only {scrapes} times");
     assert_eq!(
-        served.node.merges().stopped_for_budget,
+        served.node.tenants_kept_by_sweeps(),
         0,
-        "a sweep stopped merges of tenants it found held: by the scrapes"
+        "a sweep found tenants held that nothing but the scrapes held"
     );
     let text = served.app.metrics().encoded();
+    assert_eq!(
+        sample(&text, "vellev_sweep_tenants_kept_total", &[]),
+        Some(0.0),
+        "{text}"
+    );
     assert_eq!(
         sample(&text, "vellev_merges_stopped_for_budget_total", &[]),
         Some(0.0),
         "{text}"
     );
+    served.stop().await;
+}
+
+/// Re-review of #165, L4: sweeps never overlap. Two at once would each
+/// hold what the other must find held by nothing else, and so keep the
+/// tenants both would let go. Swept without let-up, as a test does, beside
+/// the node's own sweeps and those opening a tenant over the budget asks
+/// for, 32 idle tenants are let go, three times over, and none is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweeps_never_overlap() {
+    let served = Cluster::new()
+        .serve_made(
+            |settings| Settings {
+                memory: Some(1),
+                tenant_idle: Duration::from_secs(4),
+                ..settings
+            },
+            |app| app,
+        )
+        .await;
+    let tenants: Vec<String> = (0..32).map(|n| format!("t{n}")).collect();
+    let sweeping = Arc::new(AtomicBool::new(true));
+    let sweepers: Vec<_> = (0..2)
+        .map(|_| {
+            let (node, sweeping) = (served.node.clone(), sweeping.clone());
+            tokio::spawn(async move {
+                let mut sweeps = 0u64;
+                while sweeping.load(Ordering::Relaxed) {
+                    node.sweep_now().await;
+                    sweeps += 1;
+                    tokio::task::yield_now().await;
+                }
+                sweeps
+            })
+        })
+        .collect();
+    for round in 1..=3u64 {
+        for tenant in &tenants {
+            note_in(&served, tenant, round).await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while served.node.census().holding.writers > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "round {round}: tenants still held: {:?}",
+                served.node.census().holding
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    sweeping.store(false, Ordering::Relaxed);
+    let mut sweeps = 0;
+    for sweeper in sweepers {
+        sweeps += sweeper.await.unwrap();
+    }
+    assert!(sweeps > 10, "swept only {sweeps} times");
+    assert_eq!(
+        served.node.tenants_kept_by_sweeps(),
+        0,
+        "a sweep found tenants held that only another sweep held"
+    );
+    served.stop().await;
+}
+
+/// Re-review of #165, L3: how long ago the census was taken is reported,
+/// from the node's start until its first sweep, so that a sweep that has
+/// stopped, and with it the budget, shows.
+#[tokio::test]
+async fn how_old_the_census_is_is_reported() {
+    let served = Cluster::new()
+        .serve_unstarted_with(|settings| settings)
+        .await;
+    let age = |served: &Served| {
+        let text = served.app.metrics().encoded();
+        sample(&text, "vellev_census_age_seconds", &[]).unwrap_or_else(|| panic!("{text}"))
+    };
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(age(&served) >= 1.0, "never swept, as old as the node");
+    served.node.sweep_now().await;
+    assert!(age(&served) < 0.5, "just swept");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(age(&served) >= 1.0, "a second since the sweep");
     served.stop().await;
 }
 
