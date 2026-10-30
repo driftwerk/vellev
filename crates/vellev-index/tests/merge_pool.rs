@@ -97,6 +97,13 @@ fn a_merge_pools_threads_run_at_its_nice_and_no_other_pools_do() {
     assert_eq!(niced, vec![5; 3], "the merge pool's threads");
     let reads = nice_of_threads("vellev-read");
     assert_eq!(reads.len(), pool::reads().current_num_threads());
-    assert!(reads.iter().all(|nice| *nice == 0), "the read pool's: {reads:?}");
-    assert_eq!(nice_of_threads("vellev-tune"), vec![0], "the tuning thread's");
+    assert!(
+        reads.iter().all(|nice| *nice == 0),
+        "the read pool's: {reads:?}"
+    );
+    assert_eq!(
+        nice_of_threads("vellev-tune"),
+        vec![0],
+        "the tuning thread's"
+    );
 }

@@ -106,21 +106,18 @@ pub enum MergeEnd {
     Uncovered,
     /// Stopped: its tenant let go, its lease lost, or the node stopping.
     Stopped,
-    /// Its lease taken by another writer before it began.
-    LeaseLost,
     /// Failed with an error.
     Failed,
 }
 
 impl MergeEnd {
-    pub const ALL: [MergeEnd; 8] = [
+    pub const ALL: [MergeEnd; 7] = [
         MergeEnd::Committed,
         MergeEnd::Nothing,
         MergeEnd::Stale,
         MergeEnd::Changed,
         MergeEnd::Uncovered,
         MergeEnd::Stopped,
-        MergeEnd::LeaseLost,
         MergeEnd::Failed,
     ];
 
@@ -132,7 +129,6 @@ impl MergeEnd {
             MergeEnd::Changed => "changed",
             MergeEnd::Uncovered => "uncovered",
             MergeEnd::Stopped => "stopped",
-            MergeEnd::LeaseLost => "lease_lost",
             MergeEnd::Failed => "failed",
         }
     }
@@ -362,8 +358,7 @@ impl LagState {
     /// Note the rows unflushed as `unflushed`, at `now`.
     fn saw(&mut self, unflushed: usize, now: Instant) {
         let taken = self.taking.map_or(0, |(taken, _)| taken);
-        if self.due_at > 0 && self.due.is_none() && unflushed.saturating_sub(taken) >= self.due_at
-        {
+        if self.due_at > 0 && self.due.is_none() && unflushed.saturating_sub(taken) >= self.due_at {
             self.due = Some(now);
         }
         if self.backlog > 0 && self.capped.is_none() && unflushed >= self.backlog {
@@ -490,7 +485,7 @@ mod tests {
         assert_eq!(read.buckets[2].1, 2);
         // Over the last bound: in the whole alone.
         assert_eq!(read.buckets[BOUNDS.len() - 1].1, 2);
-        assert!((read.sum - 4_000.0035).abs() < 1e-6);
+        assert!((read.sum - 4_000.003_5).abs() < 1e-6);
     }
 
     #[test]

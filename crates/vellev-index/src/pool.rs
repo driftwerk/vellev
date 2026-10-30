@@ -150,8 +150,13 @@ pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, 
     // another merge's build among it, which would then wait for its turn
     // here behind this one's for good, this turn let go only once that
     // work had returned. A thread of its own waits instead, doing nothing
-    // else.
-    let tuned = std::thread::scope(|scope| scope.spawn(|| tuning().install(work)).join());
+    // else. It runs as the thread it is made from does, which is all it
+    // does, and is named for what it waits on.
+    let tuned = std::thread::scope(|scope| {
+        let waiting = std::thread::Builder::new().name("vellev-tune-wait".into());
+        let waiting = waiting.spawn_scoped(scope, || tuning().install(work));
+        waiting.expect("a thread to wait for tuning on").join()
+    });
     Ok(tuned.unwrap_or_else(|panicked| std::panic::resume_unwind(panicked)))
 }
 

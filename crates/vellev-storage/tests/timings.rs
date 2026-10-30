@@ -107,7 +107,10 @@ async fn rows_due_while_a_merge_builds_are_timed_to_the_merge_that_takes_them() 
     writer.commit(notes(100, DUE)).await.unwrap();
     tokio::time::sleep(HELD).await;
     builds.hold(None);
-    assert!(merging.await.unwrap().unwrap().is_some(), "the merge commits");
+    assert!(
+        merging.await.unwrap().unwrap().is_some(),
+        "the merge commits"
+    );
     let waited = due.elapsed();
     assert_eq!(writer.partition().read(State::unflushed), 0);
     let flushed = kept(&timings.drain_events(), Timed::FlushDue);
@@ -264,13 +267,25 @@ async fn a_merges_gather_is_timed_apart_from_its_build() {
     let gather = kept(&events, Timed::Merge(MergePhase::Gather));
     let build = kept(&events, Timed::Merge(MergePhase::Build));
     let commit = kept(&events, Timed::BuildingHeld(Holder::MergeCommit));
-    assert_eq!((plan.len(), gather.len(), build.len()), (1, 1, 1), "{events:?}");
+    assert_eq!(
+        (plan.len(), gather.len(), build.len()),
+        (1, 1, 1),
+        "{events:?}"
+    );
     assert_eq!(commit.len(), 1, "{events:?}");
     assert!(plan[0] < HELD / 2, "the plan held the lock {:?}", plan[0]);
-    assert!(gather[0] <= plan[0], "the gather {:?} is within the plan", gather[0]);
+    assert!(
+        gather[0] <= plan[0],
+        "the gather {:?} is within the plan",
+        gather[0]
+    );
     assert!(build[0] >= HELD, "the build took {:?}", build[0]);
     for phase in [MergePhase::Turn, MergePhase::Upload, MergePhase::Load] {
-        assert_eq!(kept(&events, Timed::Merge(phase)).len(), 1, "{phase:?}: {events:?}");
+        assert_eq!(
+            kept(&events, Timed::Merge(phase)).len(),
+            1,
+            "{phase:?}: {events:?}"
+        );
     }
 }
 

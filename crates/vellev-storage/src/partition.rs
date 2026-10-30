@@ -1431,6 +1431,17 @@ impl Writer {
         }
     }
 
+    /// What has been committed since the last checkpoint, as a checkpoint
+    /// that flushes it along takes it ([`State::taken`]), and the note
+    /// that it is taken, made under the same lock.
+    fn taken_noted(&self) -> (Snapshot, Taking<'_>) {
+        self.partition.read(|state| {
+            let snapshot = state.taken();
+            let taking = self.lag.taking(snapshot.held());
+            (snapshot, taking)
+        })
+    }
+
     /// Count `took` as `timed` of this writer's partition.
     fn timed(&self, timed: Timed, took: Duration) {
         let partition = self.lease.key.to_string();
@@ -1923,10 +1934,16 @@ impl Writer {
 
     /// What [`Self::flush`] does once it holds the building lock.
     async fn flushing_held(&self) -> Result<LogPosition> {
-        let Some(snapshot) = self.partition.read(State::snapshot) else {
+        // Noted under the lock it is taken under, so that no rows are
+        // applied between: the rows it takes are exactly those it notes.
+        let taken = self.partition.read(|state| {
+            let snapshot = state.snapshot()?;
+            let taking = self.lag.taking(snapshot.held());
+            Some((snapshot, taking))
+        });
+        let Some((snapshot, taking)) = taken else {
             return Ok(self.partition.read(State::position));
         };
-        let taking = self.lag.taking(snapshot.held());
         let mut staged = self.staging();
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
         let turn = self.turn().await?;
@@ -2867,8 +2884,7 @@ impl Writer {
             )));
         }
         let mut staged = self.staging();
-        let snapshot = self.partition.read(State::taken);
-        let taking = self.lag.taking(snapshot.held());
+        let (snapshot, taking) = self.taken_noted();
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
@@ -3151,8 +3167,7 @@ impl Writer {
             );
             return Ok(Ended::Dropped(MergeEnd::Uncovered));
         }
-        let snapshot = self.partition.read(State::taken);
-        let taking = self.lag.taking(snapshot.held());
+        let (snapshot, taking) = self.taken_noted();
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
@@ -4177,9 +4192,7 @@ impl RestoreFrom<'_> {
                     .partition
                     .changing(|now| std::mem::replace(now, state));
                 writer.epoch.fetch_add(1, Ordering::SeqCst);
-                writer
-                    .lag
-                    .put_back(writer.partition.read(State::unflushed));
+                writer.lag.put_back(writer.partition.read(State::unflushed));
                 Ok(replaced)
             })
             .await?;

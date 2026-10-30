@@ -39,6 +39,7 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 
 [dev-dependencies]
+vellev-bench = { path = "../vellev-bench" }
 async-trait.workspace = true
 bytes.workspace = true
 ring.workspace = true

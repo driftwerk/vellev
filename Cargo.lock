@@ -4306,6 +4306,7 @@ dependencies = [
  "utoipa-axum",
  "uuid",
  "vellev-api",
+ "vellev-bench",
  "vellev-client",
  "vellev-core",
  "vellev-embed",

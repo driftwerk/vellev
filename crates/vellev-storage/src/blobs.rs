@@ -274,7 +274,6 @@ pub(crate) fn named_as_checkpoint(key: &str) -> bool {
     key.ends_with(".manifest")
 }
 
-
 /// Whether `key` names a segment file a merge wrote, `-merged` as
 /// [`Layout::nonced`] marks it, rather than a flush or a restore.
 pub(crate) fn merged_segment(key: &str) -> bool {

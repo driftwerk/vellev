@@ -759,3 +759,12 @@ New, additive: `TextIndex::resident` and `RowIndex::resident`, about how
 many bytes each index takes in memory, and `TextIndex::tokenized_resident`,
 about how many its rows take tokenized all at once before they are
 indexed. A merge reckons what its build holds from them.
+
+New, additive: `pool::merge_builds(threads, nice)`, a pool for merges to
+build on apart from the global one: `threads` threads named
+`vellev-merge-N`, each run `nice` lower than the process on Linux, made
+after the read, tuning and passes pools. `pool::tune` asked from a worker
+of another rayon pool, as a build on such a pool is, now waits for the
+tuning pool on a thread of its own, `vellev-tune-wait`, instead of taking
+on that pool's other work meanwhile: two builds on one merge pool could
+otherwise wait on each other for good.

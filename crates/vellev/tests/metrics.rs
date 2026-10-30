@@ -944,7 +944,11 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
     served.node.sweep_now().await;
     let text = served.app.metrics().encoded();
     let held = |holder: &str| {
-        let count = sample(&text, "vellev_building_held_seconds_count", &[("holder", holder)]);
+        let count = sample(
+            &text,
+            "vellev_building_held_seconds_count",
+            &[("holder", holder)],
+        );
         let past_all = sample(
             &text,
             "vellev_building_held_seconds_bucket",
@@ -956,30 +960,64 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
     assert_eq!(held("flush"), Some(1.0), "{text}");
     for holder in ["merge_plan", "merge_commit", "curves", "clean", "restore"] {
         assert!(held(holder).is_some(), "{holder}: {text}");
-        let waited = sample(&text, "vellev_building_wait_seconds_count", &[("holder", holder)]);
+        let waited = sample(
+            &text,
+            "vellev_building_wait_seconds_count",
+            &[("holder", holder)],
+        );
         assert!(waited.is_some(), "{holder}: {text}");
     }
     for phase in ["turn", "gather", "build", "upload", "load"] {
-        let count = sample(&text, "vellev_merge_phase_seconds_count", &[("phase", phase)]);
+        let count = sample(
+            &text,
+            "vellev_merge_phase_seconds_count",
+            &[("phase", phase)],
+        );
         assert!(count.is_some(), "{phase}: {text}");
     }
-    for outcome in ["committed", "nothing", "stale", "changed", "uncovered", "stopped", "failed"] {
+    for outcome in [
+        "committed",
+        "nothing",
+        "stale",
+        "changed",
+        "uncovered",
+        "stopped",
+        "failed",
+    ] {
         let ended = sample(&text, "vellev_merges_ended_total", &[("outcome", outcome)]);
         assert!(ended.is_some(), "{outcome}: {text}");
     }
     for part in ["wait", "held"] {
-        let count = sample(&text, "vellev_flush_to_let_go_seconds_count", &[("part", part)]);
+        let count = sample(
+            &text,
+            "vellev_flush_to_let_go_seconds_count",
+            &[("part", part)],
+        );
         assert_eq!(count, Some(0.0), "{part}: {text}");
     }
     for reason in ["idle", "budget"] {
         let let_go = sample(&text, "vellev_tenants_let_go_total", &[("reason", reason)]);
         assert_eq!(let_go, Some(0.0), "{reason}: {text}");
     }
-    for name in ["vellev_flush_due_seconds_count", "vellev_backlog_seconds_count"] {
+    for name in [
+        "vellev_flush_due_seconds_count",
+        "vellev_backlog_seconds_count",
+    ] {
         assert!(sample(&text, name, &[]).is_some(), "{name}: {text}");
     }
-    assert_eq!(sample(&text, "vellev_merge_build_largest_bytes", &[]), Some(0.0));
-    assert_eq!(sample(&text, "vellev_segments_unmerged", &[]), Some(1.0), "{text}");
-    assert_eq!(sample(&text, "vellev_segment_rows_unmerged", &[]), Some(3.0), "{text}");
+    assert_eq!(
+        sample(&text, "vellev_merge_build_largest_bytes", &[]),
+        Some(0.0)
+    );
+    assert_eq!(
+        sample(&text, "vellev_segments_unmerged", &[]),
+        Some(1.0),
+        "{text}"
+    );
+    assert_eq!(
+        sample(&text, "vellev_segment_rows_unmerged", &[]),
+        Some(3.0),
+        "{text}"
+    );
     served.stop().await;
 }
