@@ -37,6 +37,15 @@ const HELD_AT_MOST: Duration = Duration::from_secs(60);
 /// by a writer whose rounds have stopped, is let go.
 const PARKED_AT_MOST: Duration = Duration::from_secs(60);
 
+/// How long what a store keeps of a stopped or failed merge's bytes holds
+/// its turn at most: longer than any store's own write of them may take, a
+/// cache's local copy of three gigabytes on a disk at 20 MiB a second and
+/// its turn for a thread included, so that only a write that will not end
+/// is let go of early. Then the turn goes, and what the write holds is no
+/// longer counted, said in the log: a writer's merges would otherwise wait
+/// behind it for good.
+const STORE_HELD_AT_MOST: Duration = Duration::from_secs(10 * 60);
+
 /// How often a build a test holds asks whether to go on, and a merge
 /// waiting for its turn whether a flush is due.
 const ASKS_EVERY: Duration = Duration::from_millis(20);
@@ -60,6 +69,9 @@ pub struct MergeBuilds {
     /// How long a turn granted to a merge that gave way to a flush is kept
     /// for its next attempt: see [`Self::park_for`].
     parked_at_most: Mutex<Duration>,
+    /// How long what a store keeps of a stopped or failed merge's bytes
+    /// holds its turn at most: see [`Self::let_go_held_after`].
+    held_at_most: Mutex<Duration>,
     /// What the last build to end was reckoned to hold, as it was planned
     /// and once its rows were gathered.
     last_planned: AtomicUsize,
@@ -144,6 +156,7 @@ impl MergeBuilds {
             held: AtomicUsize::new(0),
             released: AtomicUsize::new(0),
             parked_at_most: Mutex::new(PARKED_AT_MOST),
+            held_at_most: Mutex::new(STORE_HELD_AT_MOST),
             last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
             probing: AtomicBool::new(false),
@@ -203,6 +216,13 @@ impl MergeBuilds {
     #[doc(hidden)]
     pub fn under_way_for(&self, key: &PartitionKey) -> bool {
         lock(&self.under_way).iter().any(|build| &build.key == key)
+    }
+
+    /// Let a turn held by what a store keeps of a stopped or failed merge's
+    /// bytes go after `held`, instead of [`STORE_HELD_AT_MOST`]. For tests.
+    #[doc(hidden)]
+    pub fn let_go_held_after(&self, held: Duration) {
+        *lock(&self.held_at_most) = held;
     }
 
     /// Keep a turn granted to a merge that gave way to a flush for its next
@@ -511,26 +531,45 @@ impl Uploading {
         lock(&self.share).take();
     }
 
-    /// Say in the log, a minute on and each minute after, while a store
-    /// still holds the bytes, and with them the turn, once the merge that
-    /// uploaded them has given up and its deletes are done.
+    /// Watch, from now on, as the merge that uploaded the bytes has given
+    /// up, what a store still keeps of them, and with them the turn: said in
+    /// the log a minute on and each minute after, and let go once kept
+    /// longer than [`STORE_HELD_AT_MOST`], when only a write that will not
+    /// end can be keeping them.
     pub(crate) fn watched(self: Arc<Self>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let held_at_most = match &*lock(&self.share) {
+            Some(build) => *lock(&build.counted.builds.held_at_most),
+            None => return,
+        };
         let watching = Arc::downgrade(&self);
         drop(self);
         runtime.spawn(async move {
+            let since = tokio::time::Instant::now();
             loop {
-                tokio::time::sleep(STILL_HELD_EVERY).await;
+                let left = held_at_most.saturating_sub(since.elapsed());
+                tokio::time::sleep(STILL_HELD_EVERY.min(left)).await;
                 let Some(uploading) = watching.upgrade() else {
                     return;
                 };
                 if lock(&uploading.share).is_none() {
                     return;
                 }
+                let bytes = uploading.bytes.load(Ordering::SeqCst);
+                if since.elapsed() >= held_at_most {
+                    tracing::error!(
+                        bytes,
+                        "a store has held what a stopped merge uploaded for longer than any \
+                         write of it may take: its merge turn is let go, and what it holds is \
+                         no longer counted"
+                    );
+                    uploading.let_go();
+                    return;
+                }
                 tracing::warn!(
-                    bytes = uploading.bytes.load(Ordering::SeqCst),
+                    bytes,
                     "a store still holds what a stopped merge uploaded, and with it one of \
                      the node's merge turns: a write stuck, as on a local disk that has \
                      stopped answering"
@@ -556,12 +595,9 @@ impl UnlessDeleted {
         Self(Some(uploading))
     }
 
-    /// The deletes are done: what is left of the bytes is a store's own,
-    /// watched from now on.
+    /// The deletes are done: what is left of the bytes is a store's own.
     pub(crate) fn deleted(mut self) {
-        if let Some(uploading) = self.0.take() {
-            uploading.watched();
-        }
+        self.0.take();
     }
 }
 

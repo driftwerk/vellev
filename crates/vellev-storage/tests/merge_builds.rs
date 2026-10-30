@@ -907,3 +907,66 @@ fn a_merge_dropped_with_its_runtime_gives_its_turn_back() {
     );
     drop(store);
 }
+
+/// A store that, once armed, keeps the merged vectors it is given and
+/// answers that the write failed: as a write that will land late, or a
+/// thread that never ends.
+#[derive(Debug)]
+struct Keeping {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    kept: Mutex<Vec<Bytes>>,
+}
+
+#[async_trait]
+impl Blobs for Keeping {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if self.armed.load(Ordering::SeqCst) && key.contains("-merged.vectors") {
+            self.kept.lock().unwrap().push(bytes);
+            return Err(StorageError::Blob {
+                key: key.into(),
+                source: "connection reset".into(),
+            });
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// What a store keeps of a failed merge's upload holds the merge's turn,
+/// but not for good: once held longer than any store's write of it may
+/// take, the turn is let go, so that a writer's merges never wait forever
+/// behind a write that will not end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_held_by_what_a_store_keeps_of_a_failed_merge_is_let_go_in_time() {
+    let builds = MergeBuilds::new(1);
+    builds.let_go_held_after(Duration::from_millis(300));
+    let mut cluster = Cluster::new().await;
+    let keeping = Arc::new(Keeping {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+        kept: Mutex::default(),
+    });
+    cluster.blobs = keeping.clone();
+    let writer = flushed(&cluster, &builds, 2).await;
+    keeping.armed.store(true, Ordering::SeqCst);
+    let failed = within(60, "the merge never ended", writer.merge()).await;
+    assert!(failed.is_err(), "a merge whose upload failed committed");
+    assert_eq!(keeping.kept.lock().unwrap().len(), 1);
+    keeping.armed.store(false, Ordering::SeqCst);
+    let next = within(
+        10,
+        "a merge waited for good behind what a store keeps of a failed one",
+        writer.merge(),
+    )
+    .await;
+    assert!(next.unwrap().is_some());
+}

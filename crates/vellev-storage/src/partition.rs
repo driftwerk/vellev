@@ -3701,11 +3701,18 @@ impl Drop for Staged {
         putting.iter().for_each(tokio::task::JoinHandle::abort);
         // Let go here should nothing be left to delete what went up, or
         // nothing went up.
-        let carrying = self.carrying.take().map(UnlessDeleted::new);
+        let carrying = self.carrying.take();
         let (false, Ok(runtime)) = (self.keys.is_empty(), tokio::runtime::Handle::try_current())
         else {
+            drop(carrying.map(UnlessDeleted::new));
             return;
         };
+        // What a store keeps of the bytes from now on, whatever comes of
+        // the deletes, is watched, and let go of in time.
+        if let Some(carrying) = &carrying {
+            carrying.clone().watched();
+        }
+        let carrying = carrying.map(UnlessDeleted::new);
         let (blobs, keys) = (self.blobs.clone(), std::mem::take(&mut self.keys));
         // Counted as on its way, as an upload's abort is, so that a
         // process that stops waits for the deletes for as long as it gives
