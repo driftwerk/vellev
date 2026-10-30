@@ -1046,10 +1046,11 @@ pub(crate) struct Indexed {
 /// property never changes once added, and neither a property nor a
 /// collection added since has anything in an older layer.
 ///
-/// The rows' text is split on several threads and then indexed in row
-/// order, [`TOKENIZED_AT_ONCE`] rows at a time, which is what indexing each
-/// row in turn makes, and holds their tokens a chunk at a time, however
-/// many rows there are.
+/// The rows go through [`TOKENIZED_AT_ONCE`] at a time: their text split on
+/// several threads, and then indexed in row order, which is what indexing
+/// each row in turn makes, its tokens dropped before the next chunk's are
+/// made, so that a chunk's are what is held of them, however many rows
+/// there are.
 ///
 /// Gives up, `None`, once `stopping` is stopped: asked as each row's text
 /// is split, at every [`ROWS_BETWEEN_ASKING`] rows of the values and text
@@ -1069,58 +1070,54 @@ pub(crate) fn indexed_stopping<'a>(
     let asked = |row: usize| {
         row.is_multiple_of(ROWS_BETWEEN_ASKING) && stopping.stopped(MergeStage::Indexing)
     };
-    // The filterable values and vectors on one thread, the text on
-    // another: each in row order, as indexing each row in turn makes them,
-    // the text's tokens split on the threads free, a chunk at a time, and
-    // dropped as they are indexed.
-    let ((mut indexes, vectors), (texts, tokenized_at_once)) = rayon::join(
-        || {
-            let mut indexes = Indexes::new();
-            let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
-            for (row, Row { collection, object }) in rows.iter().enumerate() {
-                if asked(row) {
-                    break;
+    let mut indexes = Indexes::new();
+    let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
+    let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
+    let (mut held, mut tokenized_at_once) = (0, 0);
+    let at_once = stopping.tokenized_at_once();
+    for (chunk, chunk_rows) in rows.chunks(at_once).enumerate() {
+        if stopping.is_stopped() {
+            return None;
+        }
+        let tokenized: Vec<Option<Tokenized>> = chunk_rows
+            .par_iter()
+            .map(|Row { collection, object }| {
+                if stopping.stopped(MergeStage::Indexing) {
+                    return None;
                 }
-                if let Some(schema) = catalog.schema(*collection) {
-                    let index = indexes.entry(*collection).or_default();
-                    index.rows.insert(schema, row as u32, object);
-                    if let Some(vector) = vector_of(row) {
-                        vectors
-                            .entry(*collection)
-                            .or_default()
-                            .push((row as u32, vector));
+                let schema = catalog.schema(*collection)?;
+                Some(threads.on(|| TextIndex::tokenize(schema, object)))
+            })
+            .collect();
+        if stopping.is_stopped() {
+            return None;
+        }
+        held += tokenized.iter().flatten().count();
+        tokenized_at_once = tokenized_at_once.max(held);
+        let numbered = || (chunk * at_once..).zip(chunk_rows);
+        // The filterable values and vectors on one thread, the text on
+        // another: each in row order, as indexing each row in turn makes
+        // them.
+        rayon::join(
+            || {
+                for (row, Row { collection, object }) in numbered() {
+                    if asked(row) {
+                        break;
+                    }
+                    if let Some(schema) = catalog.schema(*collection) {
+                        let index = indexes.entry(*collection).or_default();
+                        index.rows.insert(schema, row as u32, object);
+                        if let Some(vector) = vector_of(row) {
+                            vectors
+                                .entry(*collection)
+                                .or_default()
+                                .push((row as u32, vector));
+                        }
                     }
                 }
-            }
-            (indexes, vectors)
-        },
-        || {
-            let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
-            let (mut held, mut most_held) = (0, 0);
-            let at_once = stopping.tokenized_at_once();
-            for (chunk, chunk_rows) in rows.chunks(at_once).enumerate() {
-                if stopping.is_stopped() {
-                    break;
-                }
-                let tokenized: Vec<Option<Tokenized>> = chunk_rows
-                    .par_iter()
-                    .map(|Row { collection, object }| {
-                        if stopping.stopped(MergeStage::Indexing) {
-                            return None;
-                        }
-                        let schema = catalog.schema(*collection)?;
-                        Some(threads.on(|| TextIndex::tokenize(schema, object)))
-                    })
-                    .collect();
-                if stopping.is_stopped() {
-                    break;
-                }
-                held += tokenized.iter().flatten().count();
-                most_held = most_held.max(held);
-                let first = chunk * at_once;
-                for ((row, Row { collection, .. }), tokenized) in
-                    (first..).zip(chunk_rows).zip(tokenized)
-                {
+            },
+            || {
+                for ((row, Row { collection, .. }), tokenized) in numbered().zip(tokenized) {
                     if asked(row) {
                         break;
                     }
@@ -1132,10 +1129,9 @@ pub(crate) fn indexed_stopping<'a>(
                             .insert_tokenized(row as u32, tokenized);
                     }
                 }
-            }
-            (texts, most_held)
-        },
-    );
+            },
+        );
+    }
     if stopping.is_stopped() {
         return None;
     }
