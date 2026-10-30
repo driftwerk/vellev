@@ -176,6 +176,18 @@ impl Cluster {
         served
     }
 
+    /// A node whose tenants may hold about `bytes` in memory together.
+    pub async fn serve_within_memory(&self, bytes: usize) -> Served {
+        let served = self
+            .unstarted_with(&[], None, &[], |settings| Settings {
+                memory: Some(bytes),
+                ..settings
+            })
+            .await;
+        served.app.start(served.node.clone());
+        served
+    }
+
     /// A node that serves these tenants and no other, backing them up to
     /// `backups` if anywhere when it is asked to.
     pub async fn serve_serving(&self, tenants: &[&str], backups: Option<Arc<dyn Blobs>>) -> Served {

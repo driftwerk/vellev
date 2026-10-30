@@ -353,3 +353,76 @@ async fn segments_are_reported_by_whether_they_are_clustered() {
     }
     served.stop().await;
 }
+
+/// A node with a memory budget of `budget` bytes, and `acme`'s notes, three
+/// of them, written with vectors supplied.
+async fn holding(budget: Option<usize>) -> Served {
+    let cluster = Cluster::new();
+    let served = match budget {
+        Some(bytes) => cluster.serve_within_memory(bytes).await,
+        None => cluster.serve().await,
+    };
+    served.with_notes(supplied()).await;
+    for n in 1..=3 {
+        let note = json!({ "properties": { "title": format!("note {n}"), "n": n }, "vector": [1.0, n as f64] });
+        served.ok(Method::PUT, &object(n), Some(note)).await;
+    }
+    served
+}
+
+/// Resident accounting PR 1: what the node reckons its tenants hold, the
+/// figure its memory budget is held to, is on /metrics with that budget,
+/// so that the two can be seen beside what the allocator holds.
+#[tokio::test]
+async fn what_the_tenants_hold_and_the_memory_budget_are_reported() {
+    const BUDGET: usize = 64 * 1024 * 1024;
+    let served = holding(Some(BUDGET)).await;
+    let before = served.node.resident();
+    let text = served.app.metrics().encoded();
+    let after = served.node.resident();
+    assert!(before > 0, "a tenant with three notes holds something");
+    assert_eq!(before, after, "nothing was let go meanwhile");
+    assert_eq!(
+        sample(&text, "vellev_tenants_resident_bytes", &[("by", "rows")]),
+        Some(before as f64),
+        "{text}"
+    );
+    assert_eq!(
+        sample(&text, "vellev_memory_budget_bytes", &[]),
+        Some(BUDGET as f64),
+        "{text}"
+    );
+    served.stop().await;
+}
+
+/// A node with no memory budget says so by having no budget to report,
+/// not a budget of nothing; what its tenants hold is reported all the
+/// same.
+#[tokio::test]
+async fn a_node_without_a_memory_budget_reports_none() {
+    let served = holding(None).await;
+    let text = served.app.metrics().encoded();
+    assert!(
+        !text.contains("vellev_memory_budget_bytes"),
+        "no budget, so none reported: {text}"
+    );
+    assert!(
+        sample(&text, "vellev_tenants_resident_bytes", &[("by", "rows")])
+            .is_some_and(|bytes| bytes > 0.0),
+        "{text}"
+    );
+    served.stop().await;
+}
+
+/// The allocator's own counts are reported only by a node told which
+/// allocator it runs on: this test binary runs on the system's, where
+/// jemalloc's counts would say nothing of the process.
+#[tokio::test]
+async fn a_node_not_told_its_allocator_reports_no_allocator_counts() {
+    let served = holding(None).await;
+    let text = served.app.metrics().encoded();
+    for name in ["vellev_allocated_bytes", "vellev_allocator_resident_bytes"] {
+        assert!(!text.contains(name), "{name} reported: {text}");
+    }
+    served.stop().await;
+}
