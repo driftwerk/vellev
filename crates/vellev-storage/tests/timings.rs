@@ -159,6 +159,38 @@ async fn rows_due_while_a_flush_builds_are_timed_from_when_they_fell_due() {
     );
 }
 
+/// A flush that finds nothing to flush builds nothing, so its hold of the
+/// building lock is no flush's build and is not timed as one: the flush
+/// wait mark sets the wait against a flush's own build, which a run of
+/// empty holds would make look shorter than it is (review of #169). Its
+/// wait for the lock is real, and is timed as any flush's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    writer.commit(notes(0, 3)).await.unwrap();
+    writer.flush().await.unwrap();
+    timings.drain_events();
+    // Nothing written since: nothing to flush.
+    let (_, times) = writer.flush_timed().await.unwrap();
+    assert_eq!(times.held, None, "{times:?}");
+    let events = timings.drain_events();
+    assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 1);
+    assert_eq!(
+        kept(&events, Timed::BuildingHeld(Holder::Flush)),
+        Vec::<Duration>::new(),
+        "an empty flush timed as a flush's hold"
+    );
+    // One that flushes is held, and timed so.
+    writer.commit(notes(10, 3)).await.unwrap();
+    let (_, times) = writer.flush_timed().await.unwrap();
+    assert!(times.held.is_some(), "{times:?}");
+    let events = timings.drain_events();
+    assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 1);
+    assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
+}
+
 /// Rule 3. A spell at the backlog runs from the rows unflushed coming to
 /// it until the commit that takes the tenant below it: not from the flush
 /// that does so beginning, which comes a while later, nor to it.

@@ -1054,7 +1054,9 @@ impl Tenant {
         let timings = self.writer.timings();
         let partition = &self.writer.lease().key;
         timings.record(Timed::LetGoFlushWait, partition, times.waited);
-        timings.record(Timed::LetGoFlushHeld, partition, times.held);
+        if let Some(held) = times.held {
+            timings.record(Timed::LetGoFlushHeld, partition, held);
+        }
         Ok(position)
     }
 

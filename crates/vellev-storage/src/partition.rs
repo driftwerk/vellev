@@ -1219,6 +1219,9 @@ struct Building<'a> {
     holder: Holder,
     since: Instant,
     writer: &'a Writer,
+    /// Whether its hold is timed as it is let go: not when it built
+    /// nothing, as a flush with nothing to flush.
+    timed: bool,
 }
 
 impl Building<'_> {
@@ -1226,12 +1229,19 @@ impl Building<'_> {
     fn held(&self) -> Duration {
         self.since.elapsed()
     }
+
+    /// It built nothing: its hold is not timed as one of its holder's.
+    fn built_nothing(&mut self) {
+        self.timed = false;
+    }
 }
 
 impl Drop for Building<'_> {
     fn drop(&mut self) {
-        let held = self.since.elapsed();
-        self.writer.timed(Timed::BuildingHeld(self.holder), held);
+        if self.timed {
+            let held = self.since.elapsed();
+            self.writer.timed(Timed::BuildingHeld(self.holder), held);
+        }
     }
 }
 
@@ -1242,11 +1252,12 @@ enum Ended {
 }
 
 /// How long a flush waited for its partition's building lock, and then
-/// held it: its whole build and commit.
+/// held it: its whole build and commit, or `None` if it found nothing to
+/// flush and so built nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlushTimes {
     pub waited: Duration,
-    pub held: Duration,
+    pub held: Option<Duration>,
 }
 
 /// A merge's uploads kept from [`Writer::clean`] while it is under way,
@@ -1460,6 +1471,7 @@ impl Writer {
             holder,
             since: Instant::now(),
             writer: self,
+            timed: true,
         }
     }
 
@@ -1959,15 +1971,16 @@ impl Writer {
     /// lets a tenant go.
     pub async fn flush_timed(&self) -> Result<(LogPosition, FlushTimes)> {
         let asked = Instant::now();
-        let building = self.building(Holder::Flush).await;
+        let mut building = self.building(Holder::Flush).await;
         let waited = asked.elapsed().saturating_sub(building.held());
-        let position = self.flushing_held().await?;
-        let held = building.held();
+        let position = self.flushing_held(&mut building).await?;
+        let held = building.timed.then(|| building.held());
         Ok((position, FlushTimes { waited, held }))
     }
 
-    /// What [`Self::flush`] does once it holds the building lock.
-    async fn flushing_held(&self) -> Result<LogPosition> {
+    /// What [`Self::flush`] does once it holds the building lock, as
+    /// `building`: which, if there is nothing to flush, built nothing.
+    async fn flushing_held(&self, building: &mut Building<'_>) -> Result<LogPosition> {
         // Noted under the lock it is taken under, so that no rows are
         // applied between: the rows it takes are exactly those it notes.
         let taken = self.partition.read(|state| {
@@ -1976,6 +1989,7 @@ impl Writer {
             Some((snapshot, taking))
         });
         let Some((snapshot, taking)) = taken else {
+            building.built_nothing();
             return Ok(self.partition.read(State::position));
         };
         let mut staged = self.staging();
@@ -3271,6 +3285,7 @@ impl Writer {
                     holder: Holder::MergePlan,
                     since: Instant::now(),
                     writer: self,
+                    timed: true,
                 };
                 return Ok(Some((build, planning)));
             }
