@@ -560,6 +560,10 @@ pub struct Tenant {
     backlog_rows: usize,
     /// See [`Settings::flush_backoff`].
     flush_backoff: Duration,
+    /// See [`Settings::clean_at_least_every`].
+    clean_at_least_every: Duration,
+    /// When it was last cleaned up all through, or opened.
+    cleaned_at: Mutex<Instant>,
     /// Failed flushes in a row, and when the next may be tried.
     backoff: Mutex<(u32, Option<Instant>)>,
     /// The node's counts of flushes failed and writes refused for them.
@@ -1003,7 +1007,8 @@ impl Tenant {
     /// of that window names, and that is the caller's breach. What that
     /// floor does not cover is said at [`LEAST_GRACE`].
     pub async fn compact(&self, grace: Duration) -> Result<usize> {
-        self.compacted(grace, &|| false).await
+        let compacted = self.compacted(grace, &|| false).await?;
+        Ok(compacted.unwrap_or(0))
     }
 
     /// As [`Self::compact`], each merge giving way to a flush that falls due
@@ -1011,11 +1016,13 @@ impl Tenant {
     /// ([`Writer::merge_giving_way`]): so that the tenant's maintenance,
     /// which flushes it, is never held behind other tenants' merges, and
     /// its writes are never refused for a backlog those let pile up.
+    /// Returns how many files were deleted, or `None` if cleaning up was
+    /// left for a later round.
     async fn compacted(
         &self,
         grace: Duration,
         flush_due: &(dyn Fn() -> bool + Sync),
-    ) -> Result<usize> {
+    ) -> Result<Option<usize>> {
         while self
             .writer
             .merge_giving_way(flush_due)
@@ -1024,9 +1031,12 @@ impl Tenant {
             .is_some()
         {}
         // Given way to a flush, or one is due: cleaning up, which waits on
-        // the store, waits for a later round, and the flush goes first.
-        if flush_due() {
-            return Ok(0);
+        // the store, waits for a later round, and the flush goes first;
+        // but not for longer than [`Settings::clean_at_least_every`], or
+        // writes that never let up would leave it undone for good.
+        let cleaned_lately = self.cleaned_at().elapsed() < self.clean_at_least_every;
+        if flush_due() && cleaned_lately {
+            return Ok(None);
         }
         let mut deleted = 0;
         loop {
@@ -1034,9 +1044,15 @@ impl Tenant {
             let more = cleaned.map_err(|error| self.failed(error))?;
             deleted += more;
             if more < Writer::CLEANED_AT_ONCE {
-                return Ok(deleted);
+                *self.cleaned_at() = Instant::now();
+                return Ok(Some(deleted));
             }
         }
+    }
+
+    /// When the tenant was last cleaned up all through, or opened.
+    fn cleaned_at(&self) -> std::sync::MutexGuard<'_, Instant> {
+        self.cleaned_at.lock().expect("cleaned lock")
     }
 
     /// Forget the commits the tenant can no longer go back to, then merge
@@ -1053,14 +1069,14 @@ impl Tenant {
         let window = restore_window(coordinator, &self.id, default_window).await?;
         coordinator.forget_history(&key(&self.id), window).await?;
         let flush_due = || self.flush_due();
-        let deleted = self
+        let compacted = self
             .compacted(window.saturating_add(grace), &flush_due)
             .await?;
-        // The round ends here once a flush is due: the flush goes first,
-        // and the rest is done at a later round.
-        if flush_due() {
-            return Ok(deleted);
-        }
+        // The round ends here if cleaning up was left for a later round:
+        // the flush due goes first, and the rest is done then.
+        let Some(deleted) = compacted else {
+            return Ok(0);
+        };
         // One pass at a time on the node: another tenant's next round
         // takes its turn. What is missing is worked out afresh each time,
         // so a pass skipped or cut short is made at a later round.
@@ -2161,6 +2177,8 @@ impl Inner {
             flush_rows: *flush_rows,
             backlog_rows: self.settings.backlog(),
             flush_backoff: *flush_backoff,
+            clean_at_least_every: self.settings.clean_at_least_every,
+            cleaned_at: Mutex::new(Instant::now()),
             backoff: Mutex::new((0, None)),
             flushing: self.flushing.clone(),
             flushes,

@@ -89,7 +89,12 @@ jobs:
       # measures over a dozen merges and more: built for debugging, the
       # merges take minutes, so the rule is left out above and run here.
       - name: Merge reckoning, optimised
-        run: cargo test --release --locked -p vellev-storage --test flush_memory -- --ignored --nocapture
+        run: |
+          cargo test --release --locked -p vellev-storage --test flush_memory -- \
+            --ignored --nocapture --exact a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent \
+            | tee reckoning.log
+          # The rule ran, and alone: not left out by its name or its ignore.
+          grep -q "test result: ok. 1 passed" reckoning.log
 
   # The benchmark fixture's tools, on tiny hand-made data.
   fixture-scripts:

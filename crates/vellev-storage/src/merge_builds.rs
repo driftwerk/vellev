@@ -173,13 +173,16 @@ impl MergeBuilds {
     /// About how many bytes the merges stopped and not yet ended hold:
     /// what each was reckoned to hold at its peak, until the last of its
     /// work has ended. Merges running unstopped are not counted, nor any
-    /// stopped once past where a stop ends it, which commits instead.
+    /// stopped once past where a stop ends it, which commits instead. With
+    /// what stores keep of merges whose turns were let go for it
+    /// ([`Self::abandoned`]).
     pub fn draining(&self) -> usize {
-        lock(&self.under_way)
+        let stopped: usize = lock(&self.under_way)
             .iter()
             .filter(|build| build.stop.is_stopped() && !build.committing.load(Ordering::SeqCst))
             .map(|build| build.bytes.load(Ordering::SeqCst))
-            .sum()
+            .sum();
+        stopped + self.abandoned()
     }
 
     /// How many builds are under way: each from its turn to the end of the
@@ -310,9 +313,14 @@ impl MergeBuilds {
             match stopping.unless_stopped(MergeStage::Queued, waited).await {
                 // Stopped: its place, or the turn granted it, is given up.
                 None => return Ok(None),
-                // A flush first: its place is kept for its next attempt.
+                // A flush first: its place is kept for its next attempt,
+                // unless it was stopped meanwhile, seen under the lock a
+                // stop gives the place up under.
                 Some(None) => {
-                    *lock(kept) = Some(reservation);
+                    let mut place = lock(kept);
+                    if !stopping.is_stopped() {
+                        *place = Some(reservation);
+                    }
                     return Ok(None);
                 }
                 Some(Some(Some(turn))) => break turn,
@@ -522,6 +530,19 @@ pub(crate) struct Uploading {
     share: Mutex<Option<Arc<MergeBuild>>>,
     /// How many bytes were handed to the store carrying the share.
     bytes: AtomicUsize,
+    /// What its build was reckoned to hold, counted as abandoned once the
+    /// share was let go as a store held the bytes too long, until the last
+    /// copy goes: see [`MergeBuilds::abandoned`].
+    abandoned: Mutex<Option<(Arc<MergeBuilds>, usize)>>,
+}
+
+impl Drop for Uploading {
+    /// The last copy of the bytes is gone: what was abandoned is no more.
+    fn drop(&mut self) {
+        if let Some((builds, bytes)) = lock(&self.abandoned).take() {
+            builds.abandoned.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Uploading {
@@ -529,6 +550,7 @@ impl Uploading {
         Arc::new(Self {
             share: Mutex::new(Some(build)),
             bytes: AtomicUsize::new(0),
+            abandoned: Mutex::new(None),
         })
     }
 
@@ -539,6 +561,20 @@ impl Uploading {
             bytes: bytes.clone(),
             _uploading: self.clone(),
         })
+    }
+
+    /// Let the share go, as a store held the bytes too long, counting what
+    /// its build was reckoned to hold as abandoned until the last copy of
+    /// the bytes goes, so that it is counted against the budget still.
+    fn abandon(&self) {
+        let Some(build) = lock(&self.share).take() else {
+            return;
+        };
+        let builds = build.counted.builds.clone();
+        let bytes = build.counted.reckoned.bytes.load(Ordering::SeqCst);
+        builds.abandoned.fetch_add(bytes, Ordering::SeqCst);
+        builds.held_let_go.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.abandoned) = Some((builds, bytes));
     }
 
     /// Let the share go, whatever still holds the bytes: the merge keeps
@@ -581,9 +617,9 @@ impl Uploading {
                         bytes,
                         "a store has held what a stopped merge uploaded for longer than any \
                          write of it may take: its merge turn is let go, and what it holds is \
-                         no longer counted"
+                         counted as abandoned until the store lets it go"
                     );
-                    uploading.let_go();
+                    uploading.abandon();
                     return;
                 }
                 tracing::warn!(

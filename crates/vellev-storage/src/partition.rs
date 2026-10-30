@@ -2811,29 +2811,37 @@ impl Writer {
         let _stopped = MergeStopped {
             under_way: self.merge_stop.clone(),
         };
-        // Stopped while it waited its turn: the stop is looked for once
-        // this merge's own is where a stop finds it, so none is missed.
-        if self.merges_stopped.load(Ordering::SeqCst) != asked {
-            return Ok(None);
-        }
-        if stopping.stopped(MergeStage::Planning) {
-            return Ok(None);
-        }
-        // A lease another writer holds now: the merge could never commit,
-        // and is not built for nothing.
-        if !self.still_leased().await? {
-            tracing::warn!("a merge is not made on a lease another writer has taken");
-            return Ok(None);
-        }
-        // A merge with nothing to do waits for no turn among the node's
-        // merge builds. One that finds work plans it again under the
-        // building lock, as the partition may have changed meanwhile.
-        if self
-            .partition
-            .read(|state| state.merge_plan(&self.merging))
-            .is_none()
-        {
-            return Ok(None);
+        let may_merge = async {
+            // Stopped while it waited its turn: the stop is looked for once
+            // this merge's own is where a stop finds it, so none is missed.
+            if self.merges_stopped.load(Ordering::SeqCst) != asked {
+                return Ok(false);
+            }
+            if stopping.stopped(MergeStage::Planning) {
+                return Ok(false);
+            }
+            // A lease another writer holds now: the merge could never
+            // commit, and is not built for nothing.
+            if !self.still_leased().await? {
+                tracing::warn!("a merge is not made on a lease another writer has taken");
+                return Ok(false);
+            }
+            // A merge with nothing to do waits for no turn among the node's
+            // merge builds. One that finds work plans it again under the
+            // building lock, as the partition may have changed meanwhile.
+            Ok::<_, StorageError>(
+                self.partition
+                    .read(|state| state.merge_plan(&self.merging))
+                    .is_some(),
+            )
+        };
+        // Ended before it asks for its turn, however it ends: the place
+        // kept for this writer's merges, and a turn kept there, are given
+        // up, not left idle until they are let go.
+        let may_merge = may_merge.await;
+        if !matches!(may_merge, Ok(true)) {
+            lock(&self.merge_place).take();
+            return may_merge.map(|_| None);
         }
         // Its turn among the node's merge builds, and then the building
         // lock, under which it plans and gathers its rows; built, uploaded
@@ -3030,9 +3038,6 @@ impl Writer {
     /// this is not stopped.
     pub fn stop_merges(&self) {
         self.merges_stopped.fetch_add(1, Ordering::SeqCst);
-        // A place kept among those waiting for a turn, or a turn kept for
-        // the next merge, is given up.
-        lock(&self.merge_place).take();
         if let Some(stop) = &*lock(&self.merge_stop) {
             // Too late for one past loading back: counted, for tests that
             // tell a stop too late from one not heeded.
@@ -3041,6 +3046,11 @@ impl Writer {
             }
             stop.stop();
         }
+        // A place kept among those waiting for a turn, or a turn kept for
+        // the next merge, is given up: once stopped, so that a merge giving
+        // way meanwhile, which keeps its place only unstopped, as it sees
+        // under this lock, leaves none behind.
+        lock(&self.merge_place).take();
     }
 
     /// Have each merge's build panic from now on, or not. For tests that

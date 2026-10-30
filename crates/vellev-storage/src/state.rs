@@ -432,6 +432,21 @@ impl Loaded {
         })
     }
 
+    /// What the segment's rows and `indexes` come to: those worked out as
+    /// it was built, if `indexes` are still the ones it was built with,
+    /// and otherwise afresh, as for indexes rebuilt for a collection a
+    /// restore brought back.
+    fn parts_of(&self, indexes: &Arc<Indexes>) -> Parts {
+        let built = self
+            .indexes
+            .as_ref()
+            .is_some_and(|built| Arc::ptr_eq(built, indexes));
+        match (&self.parts, built) {
+            (Some(parts), true) => parts.clone(),
+            _ => Parts::of(&self.file, indexes),
+        }
+    }
+
     /// Whether `indexes` have nothing of a collection of `catalog` that the
     /// segment has rows of.
     fn lacking(&self, indexes: &Indexes, catalog: &Catalog) -> bool {
@@ -449,13 +464,8 @@ impl Loaded {
     /// built already.
     pub fn fit(self, meta: SegmentMeta, catalog: &Catalog) -> Result<Fit> {
         let indexes = self.indexed(&meta.key, catalog)?;
-        let Loaded {
-            file,
-            vectors,
-            parts,
-            ..
-        } = self;
-        let parts = parts.unwrap_or_else(|| Parts::of(&file, &indexes));
+        let parts = self.parts_of(&indexes);
+        let Loaded { file, vectors, .. } = self;
         Ok(Fit {
             meta,
             file,
@@ -1758,13 +1768,8 @@ impl State {
     /// changed, so on error the state is as it was.
     fn attach(&mut self, meta: SegmentMeta, loaded: Loaded) -> Result<()> {
         let indexes = loaded.indexed(&meta.key, &self.catalog)?;
-        let Loaded {
-            file,
-            vectors,
-            parts,
-            ..
-        } = loaded;
-        let parts = parts.unwrap_or_else(|| Parts::of(&file, &indexes));
+        let parts = loaded.parts_of(&indexes);
+        let Loaded { file, vectors, .. } = loaded;
         let corrupt = |reason: &str| StorageError::corrupt(&meta.key, reason);
         if u32::try_from(file.rows.len()).is_err() {
             return Err(corrupt("more rows than a segment can number"));
