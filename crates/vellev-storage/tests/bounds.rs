@@ -2893,8 +2893,11 @@ async fn a_stopped_merges_upload_is_aborted_and_nothing_is_left() {
 /// sums nothing and opens, rather than needing an attempt for each file.
 ///
 /// The disk is made slow, not hoped slow: each piece of a check takes two
-/// seconds, twice the longest the load waits for one, so every check
-/// misses, however quickly the machine reads a file it has just written.
+/// seconds, twice the longest the load waits for one, so every check is
+/// given up at its first look having got no further, however quickly the
+/// machine reads a file it has just written. A check given up for its
+/// pace instead is covered by blobs.rs's unit tests of a step's pace,
+/// whose steps are driven a piece at a time (`Told`).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn on_a_slow_disk_every_check_under_way_when_a_load_fails_is_remembered() {
@@ -2937,7 +2940,8 @@ async fn on_a_slow_disk_every_check_under_way_when_a_load_fails_is_remembered() 
         copy.set_modified(earlier).unwrap();
     }
     // A disk a load waits a second for, each piece of whose checks takes
-    // two: every check misses, and the first given up fails the load.
+    // two: every check is given up having got no further, and the first
+    // given up fails the load.
     let slow = Disk::new(Duration::from_secs(1), 1_000_000_000_000, 4)
         .loading_at_once(4)
         .unwrap()

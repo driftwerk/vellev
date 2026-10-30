@@ -744,10 +744,12 @@ impl Disk {
         .fetching(&Transfers::default())
     }
 
-    /// As this disk, each piece a step on it tells of taking at least
-    /// `taking`, before it is told of: a disk slower than any machine's
-    /// cache of a file just written, for tests that need a step to miss
-    /// its pace whatever the machine. Not for use.
+    /// As this disk, each piece a step run on its own thread, such as the
+    /// check of a vectors file, tells of taking at least `taking`,
+    /// slept on that thread before it is told of: a disk slower than any
+    /// machine's cache of a file just written, for tests that need a step
+    /// to be given up at its bound whatever the machine. It blocks the
+    /// disk's thread, never an async one. Not for use.
     #[doc(hidden)]
     pub fn each_piece_taking(self, taking: Duration) -> Self {
         Self {
@@ -919,7 +921,7 @@ impl Disk {
 
     /// Word of how far a step with a turn at a large file has got.
     pub(crate) fn progress(&self) -> Progress {
-        Progress(Arc::default(), self.moved.clone(), self.piece_takes)
+        Progress(Arc::default(), self.moved.clone(), Duration::ZERO)
     }
 
     /// How many whole large files this disk reads or writes at once.
@@ -942,7 +944,9 @@ impl Disk {
         let within = self.within(piece);
         let thread = self.thread(within).await?;
         let (threads, number) = (self.threads.clone(), thread.step);
-        let progress = self.progress();
+        // Only a step on the disk's own thread is slowed by the test hook,
+        // never one told of from an async task.
+        let progress = Progress(Arc::default(), self.moved.clone(), self.piece_takes);
         let (done, mut waited) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("vellev-disk".into())
