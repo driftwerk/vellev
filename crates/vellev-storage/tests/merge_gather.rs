@@ -27,8 +27,13 @@ fn vector(n: u32) -> Vec<f32> {
 
 /// Row `n` as `value`.
 fn upsert_as(n: u32, value: i64) -> Mutation {
+    upsert_in("notes", n, value)
+}
+
+/// Row `n` of `collection` as `value`.
+fn upsert_in(collection: &str, n: u32, value: i64) -> Mutation {
     Mutation::Upsert {
-        collection: name("notes"),
+        collection: name(collection),
         id: row(n),
         properties: json!({ "title": format!("note {n} of many"), "n": value })
             .as_object()
@@ -134,11 +139,11 @@ async fn gather_held(
     (held, merging)
 }
 
-/// The rows as `state` holds them.
-fn rows_of(state: &State) -> BTreeMap<ObjectId, i64> {
-    let (notes, mut rows, mut after) = (name("notes"), BTreeMap::new(), None);
+/// The rows of `collection` as `state` holds them.
+fn rows_of(state: &State, collection: &str) -> BTreeMap<ObjectId, i64> {
+    let (of, mut rows, mut after) = (name(collection), BTreeMap::new(), None);
     loop {
-        let page = state.list(&notes, None, after, 1_000).unwrap();
+        let page = state.list(&of, None, after, 1_000).unwrap();
         let Some(last) = page.last() else {
             return rows;
         };
@@ -156,25 +161,41 @@ fn rows_of(state: &State) -> BTreeMap<ObjectId, i64> {
     }
 }
 
-/// `state` holds just the rows `truth` does, each once, a scan finding as
-/// many as a walk and the marks of each segment being what the rows that
-/// are live leave, and a search finds no row `truth` lacks.
-fn holds_just(state: &State, truth: &BTreeMap<u32, i64>, deleted: &[u32]) {
+/// `state` holds just the rows `truth` does of `collection`, each once, a
+/// scan finding as many as a walk.
+fn holds_in(state: &State, collection: &str, truth: &BTreeMap<u32, i64>) {
     let want: BTreeMap<ObjectId, i64> = truth.iter().map(|(n, value)| (row(*n), *value)).collect();
-    let rows = rows_of(state);
+    let rows = rows_of(state, collection);
     let wrong = want
         .iter()
         .filter(|(id, value)| rows.get(id) != Some(*value));
     assert_eq!(wrong.count(), 0, "a row is lost, or as it was");
     assert_eq!(rows.len(), want.len(), "a row is brought back");
-    assert_eq!(state.count(&name("notes")), want.len());
-    assert!(state.dead_rows_agree(), "the marks are not the live rows'");
-    for n in deleted {
-        let near = vector(*n);
-        let hits = state
-            .search(&name("notes"), &Query::nearest(&near, 3))
-            .unwrap();
-        assert!(hits.iter().all(|hit| hit.object.id != row(*n)), "{n} found");
+    assert_eq!(state.count(&name(collection)), want.len());
+}
+
+/// What a merge's writer is to hold: the rows of each collection, and the
+/// rows of the notes deleted.
+struct Truth {
+    notes: BTreeMap<u32, i64>,
+    extra: BTreeMap<u32, i64>,
+    deleted: Vec<u32>,
+}
+
+impl Truth {
+    /// `state` holds just these, the marks of each segment being what the
+    /// rows that are live leave, and a search finds no row deleted.
+    fn held_by(&self, state: &State) {
+        holds_in(state, "notes", &self.notes);
+        holds_in(state, "extra", &self.extra);
+        assert!(state.dead_rows_agree(), "the marks are not the live rows'");
+        for n in &self.deleted {
+            let near = vector(*n);
+            let hits = state
+                .search(&name("notes"), &Query::nearest(&near, 3))
+                .unwrap();
+            assert!(hits.iter().all(|hit| hit.object.id != row(*n)), "{n} found");
+        }
     }
 }
 
@@ -203,7 +224,9 @@ async fn a_flush_commits_while_a_gather_is_held() {
     held.let_go();
     let merged = within(LONG, "the merge ended", merging).await;
     assert!(merged.unwrap().unwrap().is_some(), "the merge commits");
-    let got = writer.partition().read(|state| rows_of(state)[&row(0)]);
+    let got = writer
+        .partition()
+        .read(|state| rows_of(state, "notes")[&row(0)]);
     assert_eq!(got, -1);
 }
 
@@ -368,6 +391,32 @@ async fn a_stop_mid_segment_ends_a_gather_within_a_chunk() {
     assert!(next.unwrap().is_some(), "the next one commits");
 }
 
+/// M4-G4, at the end of the copy: a stop that comes once the last chunk is
+/// copied ends the gather before its frame is sealed, a sum over every
+/// vector: no build begins, held where it would begin were it to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_after_the_last_chunk_ends_a_gather_before_any_build() {
+    let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let writer = two_large(&cluster, &builds).await;
+    let before = cluster.committed().await;
+    let (held, merging) = gather_held(&writer, &builds).await;
+    let whole = 2 * ROWS as usize;
+    while builds.last_gathered() < whole {
+        let copied = builds.last_gathered();
+        builds.let_one_go();
+        let next = || builds.last_gathered() > copied && builds.held() == 1;
+        until(10 * SECOND, "the gather asked at its next chunk", next).await;
+    }
+    builds.hold(Some(Holding::UntilLetGo));
+    assert!(writer.stop_merges(), "a merge was under way");
+    builds.let_one_go();
+    let merged = within(10 * SECOND, "the merge ended, unbuilt", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    assert_eq!(builds.held(), 0, "and no build began");
+    assert_eq!(cluster.committed().await.manifest, before.manifest);
+    drop(held);
+}
+
 /// A merge dropped mid-gather ends the gather within a chunk, and the
 /// gather holds the merge's turn to its end: what it has copied is held,
 /// though nobody waits for it.
@@ -395,39 +444,110 @@ async fn a_merge_dropped_mid_gather_holds_its_turn_until_the_gather_ends() {
     );
 }
 
+/// Rows of the second collection in each segment of the run.
+const EXTRA: u32 = 300;
+/// Where the rows of a segment older than the run lie, and how many: too
+/// many for it to be merged in, under [`RUN_AT_MOST`].
+const OLDER_FROM: u32 = 3 * ROWS;
+const OLDER: u32 = 20_000;
+const RUN_AT_MOST: usize = 30_000;
+
 /// M4-G7: what is written while a gather copies goes where it would had the
 /// merge not been under way, whichever side of the copy it falls, flushed
-/// or not: the merge commits, and no row is lost, or comes back, or is
-/// found as it was, in the writer or in a copy loaded afresh, then or after
-/// a further merge.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn writes_during_a_gather_are_neither_lost_nor_brought_back() {
+/// or not, a collection dropped and made again among it: the merge commits,
+/// and no row is lost, or comes back, or is found as it was, in the writer
+/// or in a copy loaded afresh, then or after a further merge. With a segment
+/// `older` than the run, the run's tombstones for its rows are kept.
+async fn writes_during_a_gather_stay_as_written(older: bool) {
     let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
-    let writer = two_large(&cluster, &builds).await;
-    let mut truth: BTreeMap<u32, i64> = (0..2 * ROWS).map(|n| (n, i64::from(n))).collect();
-    let mut deleted = Vec::new();
+    let merging = Merging {
+        fanout: 2,
+        rows: RUN_AT_MOST,
+        ..Merging::default()
+    };
+    let writer = cluster
+        .writer()
+        .await
+        .merging_with(merging)
+        .merging_among(builds.clone());
+    let writer = Arc::new(writer);
+    let mut truth = Truth {
+        notes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+        deleted: Vec::new(),
+    };
+    within(LONG, "the writer was written", async {
+        writer
+            .commit(vec![create("notes"), create("extra")])
+            .await
+            .unwrap();
+        if older {
+            for from in (OLDER_FROM..OLDER_FROM + OLDER).step_by(WRITTEN_AT_ONCE as usize) {
+                let to = (from + WRITTEN_AT_ONCE).min(OLDER_FROM + OLDER);
+                let rows = (from..to).map(|n| upsert_as(n, i64::from(n)));
+                writer.commit(rows.collect()).await.unwrap();
+                truth.notes.extend((from..to).map(|n| (n, i64::from(n))));
+            }
+            writer.flush().await.unwrap();
+        }
+        for segment in 0..2 {
+            for from in (0..ROWS).step_by(WRITTEN_AT_ONCE as usize) {
+                let to = (from + WRITTEN_AT_ONCE).min(ROWS);
+                let rows = (from..to).map(|n| segment * ROWS + n);
+                let rows = rows.map(|n| upsert_as(n, i64::from(n)));
+                writer.commit(rows.collect()).await.unwrap();
+            }
+            let notes = segment * ROWS..(segment + 1) * ROWS;
+            truth.notes.extend(notes.map(|n| (n, i64::from(n))));
+            let extra = segment * EXTRA..(segment + 1) * EXTRA;
+            let rows = extra.clone().map(|n| upsert_in("extra", n, i64::from(n)));
+            writer.commit(rows.collect()).await.unwrap();
+            truth.extra.extend(extra.map(|n| (n, i64::from(n))));
+            if older {
+                // Rows of the older segment the run's tombstones kill.
+                let (over, gone_too) = (OLDER_FROM + segment * 2, OLDER_FROM + segment * 2 + 1);
+                let mutations = vec![upsert_as(over, -7), gone(gone_too)];
+                writer.commit(mutations).await.unwrap();
+                truth.notes.insert(over, -7);
+                truth.notes.remove(&gone_too);
+                truth.deleted.push(gone_too);
+            }
+            writer.flush().await.unwrap();
+        }
+    })
+    .await;
     // Rows dead as it is planned, one of which is written again under it.
     let (dead, again) = (20, 21);
     written(&writer, vec![gone(dead), gone(again)]).await;
-    truth.remove(&dead);
-    truth.remove(&again);
-    deleted.push(dead);
+    truth.notes.remove(&dead);
+    truth.notes.remove(&again);
+    truth.deleted.push(dead);
     let (held, merging) = gather_held(&writer, &builds).await;
 
     // In each of the rows it has copied (under 4,096), those it is yet to
-    // in the same segment, and those of the next.
+    // in the same segment, and those of the next, and those of the segment
+    // older than it.
     let copied = 0..10;
     let to_copy = 9_000..9_010;
     let next = ROWS..ROWS + 10;
-    for n in copied.clone().chain(to_copy.clone()).chain(next.clone()) {
+    let outside = if older {
+        OLDER_FROM + 100..OLDER_FROM + 110
+    } else {
+        0..0
+    };
+    let rows = || {
+        let all = copied.clone().chain(to_copy.clone()).chain(next.clone());
+        all.chain(outside.clone())
+    };
+    for n in rows() {
         let mutation = match n % 3 {
             0 => {
-                truth.remove(&n);
-                deleted.push(n);
+                truth.notes.remove(&n);
+                truth.deleted.push(n);
                 gone(n)
             }
             1 => {
-                truth.insert(n, -i64::from(n) - 1);
+                truth.notes.insert(n, -i64::from(n) - 1);
                 upsert_as(n, -i64::from(n) - 1)
             }
             _ => continue,
@@ -436,50 +556,62 @@ async fn writes_during_a_gather_are_neither_lost_nor_brought_back() {
     }
     let (new, reborn) = (2 * ROWS, again);
     written(&writer, vec![upsert_as(new, 1), upsert_as(reborn, 2)]).await;
-    truth.insert(new, 1);
-    truth.insert(reborn, 2);
+    truth.notes.insert(new, 1);
+    truth.notes.insert(reborn, 2);
+    // A collection the run holds rows of goes.
+    written(&writer, vec![Mutation::DropCollection(name("extra"))]).await;
     let flushed = within(5 * SECOND, "the flush committed", writer.flush());
     flushed.await.unwrap();
-    // And over what that flush took, the rest left in memory.
-    for n in copied.chain(to_copy).chain(next) {
+    // And over what that flush took, the rest left in memory; the
+    // collection made again, under the name and with some of the ids of
+    // the one that went.
+    for n in rows() {
         let mutation = match n % 3 {
             1 => {
-                truth.insert(n, 1_000 + i64::from(n));
+                truth.notes.insert(n, 1_000 + i64::from(n));
                 upsert_as(n, 1_000 + i64::from(n))
             }
             2 => {
-                truth.remove(&n);
-                deleted.push(n);
+                truth.notes.remove(&n);
+                truth.deleted.push(n);
                 gone(n)
             }
             _ => continue,
         };
         written(&writer, vec![mutation]).await;
     }
+    written(&writer, vec![create("extra")]).await;
+    let again_in_extra = (0..5).map(|n| upsert_in("extra", n, 50 + i64::from(n)));
+    written(&writer, again_in_extra.collect()).await;
+    truth.extra = (0..5).map(|n| (n, 50 + i64::from(n))).collect();
     assert_eq!(builds.held(), 1, "the gather is held still");
-    holds_just(&writer.partition().read(State::clone), &truth, &deleted);
+    truth.held_by(&writer.partition().read(State::clone));
 
     held.let_go();
     let merged = within(LONG, "the merge ended", merging).await;
     assert!(merged.unwrap().unwrap().is_some(), "the merge commits");
-    writer
-        .partition()
-        .read(|state| holds_just(state, &truth, &deleted));
+    writer.partition().read(|state| truth.held_by(state));
     let loaded = within(LONG, "a copy was loaded", cluster.open()).await;
-    loaded
-        .partition()
-        .read(|state| holds_just(state, &truth, &deleted));
+    loaded.partition().read(|state| truth.held_by(state));
 
     within(LONG, "the flush committed", writer.flush())
         .await
         .unwrap();
     let further = within(LONG, "the further merge ended", writer.merge()).await;
     assert!(further.unwrap().is_some(), "a further merge commits");
-    writer
-        .partition()
-        .read(|state| holds_just(state, &truth, &deleted));
+    writer.partition().read(|state| truth.held_by(state));
     let loaded = within(LONG, "a copy was loaded", cluster.open()).await;
-    loaded
-        .partition()
-        .read(|state| holds_just(state, &truth, &deleted));
+    loaded.partition().read(|state| truth.held_by(state));
+}
+
+/// M4-G7, of a run from the first segment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_during_a_gather_are_neither_lost_nor_brought_back() {
+    writes_during_a_gather_stay_as_written(false).await;
+}
+
+/// M4-G7, of a run past the first segment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_during_a_gather_of_a_later_run_are_neither_lost_nor_brought_back() {
+    writes_during_a_gather_stay_as_written(true).await;
 }

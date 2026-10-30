@@ -531,6 +531,20 @@ pub(crate) struct Run {
     dead: Arc<[DeadRows]>,
     /// Whether anything older is left for the run's tombstones to act on.
     tombstones_act: bool,
+    /// Told which thread freed it, as a test asks.
+    #[cfg(test)]
+    freed_on: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        let segments = std::mem::take(&mut self.segments);
+        drop(segments);
+        #[cfg(test)]
+        if let Some(freed_on) = self.freed_on.take() {
+            let _ = freed_on.send(std::thread::current().id());
+        }
+    }
 }
 
 impl Run {
@@ -551,16 +565,13 @@ impl Run {
     /// it, `goes_on` is told how many are copied so far: `None` as soon as
     /// it says not, so that nothing runs on for more than a chunk past it.
     pub(crate) fn merged(
-        self,
+        mut self,
         position: LogPosition,
         chunk: usize,
         mut goes_on: impl FnMut(usize) -> bool,
     ) -> Option<(SegmentFile, Gathering, usize)> {
-        let Self {
-            segments,
-            dead,
-            tombstones_act,
-        } = self;
+        let segments = std::mem::take(&mut self.segments);
+        let dead = self.dead.clone();
         let of = |rows: usize| {
             let chunks = (0..rows).step_by(chunk);
             chunks.map(move |from| from..(from + chunk).min(rows))
@@ -602,7 +613,7 @@ impl Run {
                 }
             }
         }
-        let tombstones: Vec<RowKey> = match tombstones_act {
+        let tombstones: Vec<RowKey> = match self.tombstones_act {
             false => Vec::new(),
             true => {
                 let mut seen = HashSet::new();
@@ -624,12 +635,20 @@ impl Run {
 
 #[cfg(test)]
 std::thread_local! {
-    /// How many rows this thread has asked the marks of.
+    /// How many rows this thread has read, by [`touch`].
     static TOUCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// What `work` comes to, and how many rows it asked the marks of: what a
-/// test holds a plan to, as every walk over rows asks them.
+/// Count a row read, for a test that holds a walk over rows to where it may
+/// run: said by what reads a row's marks, or its size, or which collection
+/// it is of. Nothing outside a test.
+#[inline(always)]
+fn touch() {
+    #[cfg(test)]
+    TOUCHED.with(|touched| touched.set(touched.get() + 1));
+}
+
+/// What `work` comes to, and how many rows it read.
 #[cfg(test)]
 pub(crate) fn touching<T>(work: impl FnOnce() -> T) -> (T, usize) {
     let before = TOUCHED.with(std::cell::Cell::get);
@@ -655,8 +674,7 @@ impl DeadRows {
     /// Whether `row` is dead; a row past the last is not.
     #[inline(always)]
     pub(crate) fn is_dead(&self, row: usize) -> bool {
-        #[cfg(test)]
-        TOUCHED.with(|touched| touched.set(touched.get() + 1));
+        touch();
         self.words
             .get(row / 64)
             .is_some_and(|word| word >> (row % 64) & 1 == 1)
@@ -819,6 +837,7 @@ impl Parts {
 /// and each property's name and value, its text once. What a merge gathers
 /// of it, where [`row_bytes`] counts what indexes it besides.
 fn copied_bytes(Row { object, .. }: &Row) -> usize {
+    touch();
     const ROW: usize = 96;
     let properties: usize = object
         .properties
@@ -865,6 +884,7 @@ fn indexes_bytes(indexes: &Indexes) -> usize {
 /// live rows and what the filter and keyword indexes hold of it: about as
 /// much again as its text, and a little for each value.
 fn row_bytes(Row { object, .. }: &Row) -> usize {
+    touch();
     const ROW: usize = 160 + 64;
     let properties: usize = object
         .properties
@@ -1319,6 +1339,7 @@ pub(crate) fn clustered(
 ) -> bool {
     let mut counts: HashMap<CollectionId, usize> = HashMap::new();
     for (row, Row { collection, .. }) in rows.iter().enumerate() {
+        touch();
         if has_vector(row) && catalog.schema(*collection).is_some() {
             *counts.entry(*collection).or_default() += 1;
         }
@@ -2247,6 +2268,8 @@ impl State {
                 .collect(),
             dead: run.iter().map(|segment| segment.dead.clone()).collect(),
             tombstones_act: merge.run.start > 0,
+            #[cfg(test)]
+            freed_on: None,
         }
     }
 
@@ -3633,6 +3656,27 @@ mod tests {
         let state = std::mem::take(&mut built.state);
         published.changing(|now| *now = state);
         published.applying(|state| state.segments[0].meta.rows += 1);
+    }
+
+    /// A run let go on an async thread, as a merge stopped before it gathers
+    /// lets its go, is freed off it: it may be the last to hold a replaced
+    /// segment of a million rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_let_go_on_an_async_thread_is_freed_off_it() {
+        let mut built = Built::new(&["notes"]);
+        built.commit((1..=4).map(|n| upsert(0, n, n as i64)).collect());
+        built.flush();
+        built.commit((5..=8).map(|n| upsert(0, n, n as i64)).collect());
+        built.flush();
+        let (plan, _) = built.planned();
+        let mut run = built.state.merge_run(&plan);
+        let (told, freed) = std::sync::mpsc::channel();
+        run.freed_on = Some(told);
+        drop(run);
+        let on = freed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the run freed within 10 s");
+        assert_ne!(on, std::thread::current().id(), "freed on an async thread");
     }
 
     /// A merged segment is taken to cover its run only if it holds every
