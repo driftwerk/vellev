@@ -70,7 +70,7 @@ fn note(n: u128) -> Mutation {
     }
 }
 
-/// `limit`'s end from now, when `holds` comes to hold.
+/// Wait until `holds`, at most `limit`.
 fn until(limit: Duration, what: &str, holds: impl Fn() -> bool) {
     let by = Instant::now() + limit;
     while !holds() {
@@ -214,15 +214,31 @@ fn nothing_waits_on_a_gather_on(workers: usize) {
     runtime.shutdown_timeout(Duration::from_secs(30));
 }
 
+/// The rule on `workers`, on a thread of its own, within two minutes: what
+/// bounds all it waits for, the runtime's own timers among what it may stop.
+fn within_two_minutes_on(workers: usize) {
+    let (ended, end) = std::sync::mpsc::channel();
+    let rule = std::thread::spawn(move || {
+        nothing_waits_on_a_gather_on(workers);
+        ended.send(()).unwrap();
+    });
+    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+        end.recv_timeout(Duration::from_secs(120))
+    {
+        panic!("the rule ended within two minutes on {workers} workers");
+    }
+    rule.join().unwrap();
+}
+
 /// M4-G5: on two workers, with a commit and reads of the tenant queued.
 #[test]
 fn a_gather_held_on_two_workers_holds_up_no_timer_and_no_lease() {
-    nothing_waits_on_a_gather_on(2);
+    within_two_minutes_on(2);
 }
 
 /// M4-G5: on one worker, which a copy on an async thread would take, with
 /// no lock held and nothing else waiting.
 #[test]
 fn a_gather_held_on_one_worker_holds_up_no_timer_and_no_lease() {
-    nothing_waits_on_a_gather_on(1);
+    within_two_minutes_on(1);
 }
