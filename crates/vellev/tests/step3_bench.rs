@@ -1302,6 +1302,59 @@ fn merge_debt_is_carried_forward_from_samples_at_or_before_each_point() {
     );
 }
 
+/// How much of an arm's merge building was on tenants outside the active
+/// set when the build began, from `builds`: each one's partition, the
+/// seconds into the soak it ended, and how long it took. A 5-minute
+/// restore window has a tenant looked after every minute where production
+/// waits an hour (§9.5), so that idle tenants build merges production
+/// would not yet; those take CPU from others' flushes, whose holds are the
+/// flush-wait mark's measure. It decides nothing: it says how far to trust
+/// that mark.
+fn idle_merge_builds(builds: &[(String, f64, f64)], schedule: &Schedule) -> Value {
+    let (mut idle, mut idle_s, mut all_s) = (0, 0.0, 0.0);
+    for (partition, ended, took) in builds {
+        all_s += took;
+        let tenant = partition.split('/').next().unwrap_or(partition);
+        let began = Duration::from_secs_f64((ended - took).max(0.0));
+        let active = schedule.active_at(began);
+        if !active.iter().any(|at| tenant_id(*at).as_str() == tenant) {
+            idle += 1;
+            idle_s += took;
+        }
+    }
+    json!({
+        "builds": builds.len(), "idle": idle, "build_s": all_s, "idle_build_s": idle_s,
+        "idle_share_of_build_s": (all_s > 0.0).then(|| idle_s / all_s),
+    })
+}
+
+/// A build counts as idle by when it began: one begun on an active tenant
+/// that ends after the set has moved on was asked for by a flush, not the
+/// timer; one begun off the set was not (review of #169).
+#[test]
+fn a_merge_build_is_idle_by_whether_its_tenant_was_active_as_it_began() {
+    let schedule = Schedule::of(&Bench::measured());
+    let builds = [
+        // Begun at 50 s, with t0 active, and ended at 130 s, with it not.
+        ("t0/0".to_string(), 130.0, 80.0),
+        // Begun at 10 s, with t3 idle, and ended at 70 s, with it active.
+        ("t3/0".to_string(), 70.0, 60.0),
+        // Active throughout.
+        ("t1/0".to_string(), 40.0, 20.0),
+    ];
+    let found = idle_merge_builds(&builds, &schedule);
+    assert_eq!(found["builds"], 3, "{found}");
+    assert_eq!(found["idle"], 1, "{found}");
+    assert_eq!(found["idle_build_s"], json!(60.0), "{found}");
+    assert_eq!(
+        found["idle_share_of_build_s"],
+        json!(60.0 / 160.0),
+        "{found}"
+    );
+    let none = idle_merge_builds(&[], &schedule);
+    assert_eq!(none["idle_share_of_build_s"], json!(null));
+}
+
 /// A stage of the node's searches as its `/metrics` histogram has it:
 /// reported beside the client's p99, deciding nothing. Worked out from
 /// buckets, its p99 is the bound of the bucket it falls in, or past the
@@ -1472,7 +1525,7 @@ async fn arm(bench: Bench, running: Running) {
     let _ = std::fs::remove_file(ready_path(&bench));
     let _ = std::fs::remove_file(load_path(&bench));
     // Refused before anything is preloaded, if the schedule is not whole.
-    Schedule::of(&bench);
+    let schedule = Schedule::of(&bench);
     let data = bench.data.join(format!("arm-{}", bench.arm.name()));
     let _ = std::fs::remove_dir_all(&data);
     std::fs::create_dir_all(&data).unwrap();
@@ -1693,6 +1746,17 @@ async fn arm(bench: Bench, running: Running) {
             .map(|event| event.took.as_secs_f64())
             .collect()
     };
+    let merge_builds_timed: Vec<(String, f64, f64)> = events
+        .iter()
+        .filter(|event| event.timed == Timed::Merge(MergePhase::Build))
+        .map(|event| {
+            (
+                event.partition.clone(),
+                (event.at - started).as_secs_f64(),
+                event.took.as_secs_f64(),
+            )
+        })
+        .collect();
     let mut timings = serde_json::Map::new();
     for holder in Holder::ALL {
         timings.insert(
@@ -1850,6 +1914,7 @@ async fn arm(bench: Bench, running: Running) {
         "end_segments_mean": ends.iter().sum::<f64>() / ends.len() as f64,
         "timings": timings,
         "merges_ended": ended,
+        "idle_merge_builds": idle_merge_builds(&merge_builds_timed, &schedule),
         "clustered_merges_seen": sampled.clustered_merges_seen,
         "let_go": { "idle": let_go.idle, "budget": let_go.for_budget },
         "memory": {
@@ -1904,6 +1969,19 @@ fn step3_load() {
 
 async fn load(bench: Bench, running: Running) {
     let schedule = Schedule::of(&bench);
+    // The fixture first, so that the soak starts with nothing left to
+    // load: the node gives only seconds between ready and the start.
+    let queries: Arc<Vec<Vec<f32>>> = Arc::new(
+        Fixture::at(&bench.fixture)
+            .queries("queries")
+            .expect("the fixture's queries")
+            .into_iter()
+            .map(|query| query.vector)
+            .collect(),
+    );
+    let passages_of: Vec<Passages> = (0..bench.active)
+        .map(|_| Passages::of(&bench.fixture))
+        .collect();
     let ready = appeared(&ready_path(&bench), bench.ready_within)
         .await
         .unwrap_or_else(|| panic!("the node was not ready within {:?}", bench.ready_within));
@@ -1912,14 +1990,6 @@ async fn load(bench: Bench, running: Running) {
         (ready.soak_s, ready.sha.as_str()),
         (bench.soak.as_secs(), bench.sha.as_str()),
         "the node and the load generator were not set alike"
-    );
-    let queries: Arc<Vec<Vec<f32>>> = Arc::new(
-        Fixture::at(&bench.fixture)
-            .queries("queries")
-            .expect("the fixture's queries")
-            .into_iter()
-            .map(|query| query.vector)
-            .collect(),
     );
     let rows_of = Arc::new(ready.rows_of);
     let http = reqwest::Client::builder()
@@ -1940,8 +2010,8 @@ async fn load(bench: Bench, running: Running) {
     // end leaves its tenant short, and the arm is not compared.
     let writes = Arc::new(Mutex::new(WritesDone::default()));
     let mut writers = Vec::new();
-    for place in 0..bench.active {
-        let passages = Arc::new(Mutex::new(Passages::of(&bench.fixture)));
+    for (place, passages) in passages_of.into_iter().enumerate() {
+        let passages = Arc::new(Mutex::new(passages));
         writers.push(tokio::spawn({
             let (bench, http, url, writes) = (bench.clone(), http.clone(), url.clone(), writes.clone());
             let rows_of = rows_of.clone();
@@ -2328,6 +2398,67 @@ fn arms_are_compared_only_if_run_alike() {
     );
 }
 
+/// The backlog refusals every arm is held to: arm (a)'s, only if (a) is
+/// compared. An invalid (a)'s refusals bound nothing (review of #169).
+fn backlog_bound(runs: &[ArmRun], invalid: &BTreeMap<String, Vec<String>>) -> Option<u64> {
+    let valid = invalid.get("a").is_some_and(Vec::is_empty);
+    runs.iter()
+        .find(|run| run.name == "a")
+        .filter(|_| valid)
+        .and_then(|a| a.node["marks"]["backlog_refusals"]["refused"].as_u64())
+}
+
+#[test]
+fn an_invalid_arm_as_refusals_bound_nothing() {
+    let mut a = a_run("a");
+    a.node["marks"] = json!({ "backlog_refusals": { "refused": 7 } });
+    let runs = vec![a, a_run("b")];
+    let mut invalid = BTreeMap::from([("a".to_string(), vec![]), ("b".to_string(), vec![])]);
+    assert_eq!(backlog_bound(&runs, &invalid), Some(7));
+    invalid.insert(
+        "a".to_string(),
+        vec!["a smoke, not the measurement".to_string()],
+    );
+    assert_eq!(backlog_bound(&runs, &invalid), None);
+    assert_eq!(backlog_bound(&runs[1..], &BTreeMap::new()), None);
+}
+
+/// The noise floor: how far (b) lies from itself run again, as a share of
+/// (b). Null unless both runs are valid: a spread from a run not compared
+/// is no floor. It decides nothing (review of #169).
+fn noise_floor(b: Option<Compared>, b2: Option<Compared>) -> Value {
+    match (b, b2) {
+        (Some(b), Some(b2)) if b.valid && b2.valid => json!({
+            "read_p99_spread": (b.read_p99_ms - b2.read_p99_ms).abs() / b.read_p99_ms,
+            "end_segments_spread": (b.end_segments - b2.end_segments).abs() / b.end_segments,
+        }),
+        _ => json!(null),
+    }
+}
+
+#[test]
+fn the_noise_floor_is_bs_spread_from_itself_when_both_runs_count() {
+    let run = |valid, read_p99_ms, end_segments| Compared {
+        valid,
+        all_marks: Some(true),
+        read_p99_ms,
+        end_segments,
+    };
+    let floor = noise_floor(Some(run(true, 100.0, 10.0)), Some(run(true, 90.0, 12.0)));
+    assert_eq!(floor["read_p99_spread"], json!(0.1), "{floor}");
+    assert_eq!(floor["end_segments_spread"], json!(0.2), "{floor}");
+    let invalid = Some(run(false, 90.0, 12.0));
+    assert_eq!(
+        noise_floor(Some(run(true, 100.0, 10.0)), invalid),
+        json!(null)
+    );
+    assert_eq!(
+        noise_floor(invalid, Some(run(true, 100.0, 10.0))),
+        json!(null)
+    );
+    assert_eq!(noise_floor(Some(run(true, 100.0, 10.0)), None), json!(null));
+}
+
 /// Whether an arm met every mark: `None` if that rests on the backlog
 /// bound and there is none, as when arm (a) is not compared.
 fn all_marks(marks: &Value, backlog_within_a: Option<bool>) -> Option<bool> {
@@ -2466,8 +2597,6 @@ fn step3_compare() {
         .collect();
     assert!(!runs.is_empty(), "no arm-*.json in {}", out.display());
     let invalid = not_compared(&runs);
-    let valid = |name: &str| invalid.get(name).is_some_and(Vec::is_empty);
-    let run_of = |name: &str| runs.iter().find(|run| run.name == name);
     let p99 = |run: &ArmRun| {
         run.load
             .as_ref()
@@ -2475,10 +2604,9 @@ fn step3_compare() {
             .unwrap_or(f64::NAN)
     };
     // Backlog refusals are held to arm (a)'s only if (a) is compared.
-    let control_refused = run_of("a")
-        .filter(|_| valid("a"))
-        .and_then(|a| a.node["marks"]["backlog_refusals"]["refused"].as_u64());
+    let control_refused = backlog_bound(&runs, &invalid);
     let mut rows = Vec::new();
+    let mut idle_builds = Vec::new();
     let mut verdicts = serde_json::Map::new();
     let mut compared: BTreeMap<String, Compared> = BTreeMap::new();
     for run in &runs {
@@ -2489,6 +2617,11 @@ fn step3_compare() {
         let backlog = control_refused.map(|control| refused <= control);
         let all = all_marks(marks, backlog);
         let why = &invalid[&run.name];
+        let idle = &run.node["idle_merge_builds"];
+        idle_builds.push(format!(
+            "{}: {} of {} builds, {} of the seconds",
+            run.name, idle["idle"], idle["builds"], idle["idle_share_of_build_s"]
+        ));
         compared.insert(
             run.name.clone(),
             Compared {
@@ -2538,17 +2671,7 @@ fn step3_compare() {
     let p99_of = |name: &str| compared.get(name).map_or(f64::NAN, |arm| arm.read_p99_ms);
     let winner = winner(c, d, p99_of("c"), p99_of("d"));
     // The noise floor: (b) against itself, deciding nothing.
-    let noise = match (
-        valid("b") && valid("b2"),
-        compared.get("b"),
-        compared.get("b2"),
-    ) {
-        (true, Some(b), Some(b2)) => json!({
-            "read_p99_spread": (b.read_p99_ms - b2.read_p99_ms).abs() / b.read_p99_ms,
-            "end_segments_spread": (b.end_segments - b2.end_segments).abs() / b.end_segments,
-        }),
-        _ => json!(null),
-    };
+    let noise = noise_floor(compared.get("b").copied(), compared.get("b2").copied());
     let said = |beats: Option<bool>| match beats {
         Some(true) => "yes",
         Some(false) => "no",
@@ -2559,9 +2682,10 @@ fn step3_compare() {
     );
     summary.push_str(&rows.join("\n"));
     summary.push_str(&format!(
-        "\n\n(c) beats (b): {}. (d) beats (b): {}. Winner by §3: **{winner}**.\n\nNoise floor, (b) against (b) run again: {noise}. The server's stages are from its histogram's buckets, and decide nothing.\n",
+        "\n\n(c) beats (b): {}. (d) beats (b): {}. Winner by §3: **{winner}**.\n\nNoise floor, (b) against (b) run again: {noise}. The server's stages are from its histogram's buckets, and decide nothing.\n\nMerge builds on idle tenants, which the flush-wait mark is to be read against (§9.5), deciding nothing: {}.\n",
         said(c),
         said(d),
+        idle_builds.join("; "),
     ));
     std::fs::write(out.join("summary.md"), &summary).unwrap();
     let verdict = json!({ "arms": verdicts, "c_beats_b": c, "d_beats_b": d, "winner": winner,
