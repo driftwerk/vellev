@@ -3571,6 +3571,55 @@ mod tests {
         assert_eq!(chunks.last().map(|(rows, _)| *rows), Some(at_once / 2.0));
     }
 
+    /// A plan counts a block of long rows as the chunk it falls in, not
+    /// spread over a run of which it is the third part: rows stay in order
+    /// through a merge. Past what the rule of what a merge holds can tell,
+    /// as encoding's frames hold the reckoning up over rows of long text.
+    #[test]
+    fn a_block_of_long_rows_is_reckoned_as_the_chunk_it_falls_in() {
+        let created = Op::CreateCollection {
+            id: CollectionId(0),
+            schema: Box::new(Collection {
+                properties: vec![Property::new("title", DataType::Text).searchable()],
+                ..schema("texts")
+            }),
+        };
+        let mut built = Built::new(&[]);
+        built.commit(vec![created]);
+        for segment in 0..3u128 {
+            let rows = (0..TOKENIZED_AT_ONCE as u128).map(|n| {
+                let words: Vec<String> = (0..40).map(|at| format!("w{}", n + at)).collect();
+                let title = match segment {
+                    2 => words.join(" "),
+                    _ => "row".to_string(),
+                };
+                Op::Upsert {
+                    collection: CollectionId(0),
+                    object: Object {
+                        id: oid(segment << 32 | n),
+                        properties: BTreeMap::from([("title".to_string(), Value::Text(title))]),
+                        vector: None,
+                    },
+                }
+            });
+            built.commit(rows.collect());
+            built.flush();
+        }
+        let merging = Merging {
+            fanout: 3,
+            ..Merging::default()
+        };
+        let plan = built.state.merge_plan(&merging).unwrap();
+        let reckoning = built.state.merge_reckoning(&plan, CLUSTERED_ABOVE);
+        let block: usize = built.state.segments[2].parts.text.tokens.iter().sum();
+        let beside = reckoning.indexing - reckoning.indexed;
+        let off = (beside - block as f64).abs() / block as f64;
+        assert!(
+            off < 0.05,
+            "{beside} beside the indexes, of {block} in the block"
+        );
+    }
+
     /// What indexing holds at its crest: the last chunk's tokens beside the
     /// indexes of those before it, not whichever is more.
     #[test]
