@@ -4891,6 +4891,30 @@ mod tests {
         flushed.expect("a flush beside the free answered").unwrap();
     }
 
+    /// Nor does a merge's commit wait for a turn among the work off the
+    /// async threads, with the building lock held, for what it frees: every
+    /// turn may be kept by what is being loaded and built on the node.
+    #[tokio::test]
+    async fn a_replaced_segment_is_freed_without_a_turn_among_the_work() {
+        let writer = two_segments().await;
+        let seen = seeing(&writer, |_| ());
+        let gate = writer.hold_merges_before_commit();
+        let merge = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        gate.reached.notified().await;
+        // Only from here: the merge's own build took one of its own.
+        let turns = working().acquire_many_owned(WORKING_AT_ONCE as u32);
+        let turns = turns.await.unwrap();
+        gate.release.notify_one();
+        let merged = tokio::time::timeout(ANSWERED, merge).await;
+        let merged = merged.expect("the merge ended with no turn free");
+        merged.unwrap().unwrap().expect("a merge");
+        both_freed(&seen);
+        drop(turns);
+    }
+
     /// A replaced segment is freed off the async threads: on one, a read
     /// beside it there would wait for the free, as would all else it runs.
     #[tokio::test(flavor = "current_thread")]
