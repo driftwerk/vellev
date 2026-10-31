@@ -1206,6 +1206,14 @@ struct MergeStopped {
     under_way: Arc<std::sync::Mutex<Option<Stop>>>,
 }
 
+/// What asking merges to stop found.
+struct MergesStopping {
+    /// A merge was under way.
+    under_way: bool,
+    /// This stopped it.
+    stopped: bool,
+}
+
 impl Drop for MergeStopped {
     /// The merge's stop is stopped too, however the merge ended: work it
     /// leaves running, as a build whose merge was dropped unstopped, gives
@@ -3516,14 +3524,23 @@ impl Writer {
     /// block of rows it comes to, or at once if it waits on the store or the
     /// disk, and leaves nothing behind. One past loading back what it built
     /// commits, or is dropped, as it would have been. A merge begun after
-    /// this is not stopped. Returns whether this stopped a merge: one was
-    /// under way, not stopped already nor past where a stop ends it, so
-    /// that a merge is counted as stopped once, however often it is asked.
-    /// An attempt that has yet to find out there is nothing to merge is
-    /// under way too, for the moment it takes to.
+    /// this is not stopped. Returns whether a merge was under way to stop.
     pub fn stop_merges(&self) -> bool {
+        self.stopping_merges().under_way
+    }
+
+    /// As [`Self::stop_merges`], for whoever counts merges stopped. Returns
+    /// whether this stopped a merge: one was under way, not stopped already
+    /// nor past where a stop ends it, so that a merge is counted once,
+    /// however often it is asked. An attempt that has yet to find out there
+    /// is nothing to merge is under way too, for the moment it takes to.
+    pub fn stop_merges_counted(&self) -> bool {
+        self.stopping_merges().stopped
+    }
+
+    fn stopping_merges(&self) -> MergesStopping {
         self.merges_stopped.fetch_add(1, Ordering::SeqCst);
-        let stopped = if let Some(stop) = &*lock(&self.merge_stop) {
+        let stopping = if let Some(stop) = &*lock(&self.merge_stop) {
             // Too late for one past loading back: counted, for tests that
             // tell a stop too late from one not heeded.
             let too_late = self.merge_past_loading.load(Ordering::SeqCst);
@@ -3532,20 +3549,26 @@ impl Writer {
             }
             let stopped_already = stop.is_stopped();
             stop.stop();
-            !stopped_already && !too_late
+            MergesStopping {
+                under_way: true,
+                stopped: !stopped_already && !too_late,
+            }
         } else {
-            false
+            MergesStopping {
+                under_way: false,
+                stopped: false,
+            }
         };
         // A place kept among those waiting for a turn, or a turn kept for
         // the next merge, is given up: once stopped, so that a merge giving
         // way meanwhile, which keeps its place only unstopped, as it sees
         // under this lock, leaves none behind.
         lock(&self.merge_place).take();
-        stopped
+        stopping
     }
 
-    /// As [`Self::stop_merges`], for a caller that is about to abort the
-    /// tasks `aborting` says, after which a stop is not all that ends a
+    /// As [`Self::stop_merges_counted`], for a caller that is about to abort
+    /// the tasks `aborting` says, after which a stop is not all that ends a
     /// merge: one past loading back what it built, on one of those tasks,
     /// is lost with it. Such a merge is lost at once, or as its commit is
     /// cut, and that may close the writer; if the commit lands first it was
@@ -3553,7 +3576,7 @@ impl Writer {
     /// whether this stopped a merge, or is about to cut one off. A merge on
     /// any other task, as a request's, goes on to its commit.
     pub fn stop_merges_aborting(&self, aborting: impl Fn(tokio::task::Id) -> bool) -> bool {
-        let stopped = self.stop_merges();
+        let stopped = self.stop_merges_counted();
         // Stopped now: a merge past loading stays so until it ends.
         let cut_off = lock(&self.merge_stop).is_some()
             && self.merge_past_loading.load(Ordering::SeqCst)

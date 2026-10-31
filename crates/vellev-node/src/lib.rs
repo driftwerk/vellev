@@ -2520,7 +2520,7 @@ impl Inner {
                         break;
                     }
                     tracing::debug!(tenant = %tenant.id(), "over the memory budget: a merge is stopped so that the tenant can be let go");
-                    if tenant.work.writer.stop_merges() {
+                    if tenant.work.writer.stop_merges_counted() {
                         self.stopped_for_budget.fetch_add(1, Ordering::Relaxed);
                     }
                     over = over.saturating_sub(*size);

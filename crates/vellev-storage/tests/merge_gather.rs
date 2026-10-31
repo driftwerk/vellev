@@ -575,14 +575,17 @@ async fn a_merge_stopped_again_and_again_is_stopped_once() {
     let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
     let writer = two_large(&cluster, &builds).await;
     let (held, merging) = gather_held(&writer, &builds).await;
-    let stopped = (0..20).filter(|_| writer.stop_merges()).count();
+    let stopped = (0..20).filter(|_| writer.stop_merges_counted()).count();
     assert!(writer.merge_under_way(), "the gather held is held still");
     assert_eq!(stopped, 1, "one merge, stopped 20 times over");
     held.let_go();
     let merged = within(LONG, "the merge ended", merging).await;
     assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
     let (held, merging) = gather_held(&writer, &builds).await;
-    assert!(writer.stop_merges(), "the next merge is one of its own");
+    assert!(
+        writer.stop_merges_counted(),
+        "the next merge is one of its own"
+    );
     held.let_go();
     let merged = within(LONG, "the next merge ended", merging).await;
     assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
@@ -602,7 +605,7 @@ async fn stops_asked_at_once_stop_a_merge_once() {
                 let (writer, side_by_side) = (writer.clone(), side_by_side.clone());
                 std::thread::spawn(move || {
                     side_by_side.wait();
-                    writer.stop_merges()
+                    writer.stop_merges_counted()
                 })
             })
             .collect();

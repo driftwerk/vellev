@@ -558,7 +558,10 @@ async fn a_stop_once_loaded_back_is_too_late_and_the_merge_commits() {
         async move { writer.merge().await }
     });
     within(120, "the merge was built", gate.reached.notified()).await;
-    assert!(!writer.stop_merges(), "a stop too late stops no merge");
+    assert!(
+        !writer.stop_merges_counted(),
+        "a stop too late stops no merge"
+    );
     gate.release.notify_one();
     let merged = within(60, "the merge never ended", merging).await;
     assert!(
