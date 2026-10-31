@@ -7,6 +7,7 @@
 mod common;
 
 use common::*;
+use vellev_storage::timings::{Holder, MergeEnd, MergePhase, Timed};
 use vellev_storage::{Holding, MergeBuilds, Merging, Query, GATHERED_AT_ONCE};
 
 /// Rows in each of the two segments merged: several chunks, so that a
@@ -292,6 +293,178 @@ async fn a_restore_made_during_a_gather_ends_it_within_a_chunk() {
     assert_eq!(writer.kept_while_merging(), 0);
 }
 
+/// How the writer's merges ended, those that did.
+fn ended(writer: &Writer) -> Vec<(MergeEnd, u64)> {
+    let timings = writer.timings();
+    MergeEnd::ALL
+        .iter()
+        .map(|end| (*end, timings.merges_ended(*end)))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
+/// §9.7 rule 6: a gather a restore ended is counted stale, whether the
+/// restore was made or is under way, never as a run found changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gather_ended_by_a_restore_made_is_counted_stale() {
+    let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let writer = two_large(&cluster, &builds).await;
+    let committed = cluster.committed().await;
+    let (head, position) = (committed.manifest.unwrap(), committed.log_position);
+    written(&writer, vec![upsert_as(0, -1)]).await;
+    let (held, merging) = gather_held(&writer, &builds).await;
+    let restoring = writer.restore(Some(&head), position);
+    within(LONG, "the restore went through", restoring)
+        .await
+        .unwrap();
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
+}
+
+/// A gather both a restore and a stop came to is counted stale: the merge
+/// could not have committed whether it was stopped or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gather_a_restore_and_a_stop_both_ended_is_counted_stale() {
+    let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let writer = two_large(&cluster, &builds).await;
+    let committed = cluster.committed().await;
+    let (head, position) = (committed.manifest.unwrap(), committed.log_position);
+    written(&writer, vec![upsert_as(0, -1)]).await;
+    let (held, merging) = gather_held(&writer, &builds).await;
+    let restoring = writer.restore(Some(&head), position);
+    within(LONG, "the restore went through", restoring)
+        .await
+        .unwrap();
+    writer.stop_merges();
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
+}
+
+/// A restore and a stop that come to a merge once it is built end it stale
+/// too, as at its gather: stale is asked wherever a stop is heeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_a_restore_and_a_stop_ended_once_built_is_counted_stale() {
+    let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let writer = two_large(&cluster, &builds).await;
+    let committed = cluster.committed().await;
+    let (head, position) = (committed.manifest.unwrap(), committed.log_position);
+    written(&writer, vec![upsert_as(0, -1)]).await;
+    builds.hold(Some(Holding::BuiltUntilLetGo));
+    let held = Held(builds.clone());
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    until(LONG, "no build came to be held", || builds.held() == 1).await;
+    let restoring = writer.restore(Some(&head), position);
+    within(LONG, "the restore went through", restoring)
+        .await
+        .unwrap();
+    writer.stop_merges();
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
+}
+
+/// A merge's gather is timed for the copy, however long it runs, and its
+/// build begins after it ends: neither counts the other (§9.7 rule 5).
+async fn a_gather_is_timed_as_the_copy(builds: Arc<MergeBuilds>) {
+    const HELD: Duration = Duration::from_millis(500);
+    let cluster = Cluster::new().await;
+    let writer = two_large(&cluster, &builds).await;
+    let timings = writer.timings().clone();
+    timings.keep_events(true);
+    let (held, merging) = gather_held(&writer, &builds).await;
+    tokio::time::sleep(HELD).await;
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some(), "the merge committed");
+    let events = timings.drain_events();
+    let one = |timed: Timed| {
+        let mut of = events.iter().filter(|event| event.timed == timed);
+        let event = of.next().expect("a phase timed");
+        assert!(of.next().is_none(), "{timed:?} timed twice");
+        event.clone()
+    };
+    let gather = one(Timed::Merge(MergePhase::Gather));
+    let build = one(Timed::Merge(MergePhase::Build));
+    let plan = one(Timed::BuildingHeld(Holder::MergePlan));
+    assert!(gather.took >= HELD, "the copy timed {:?}", gather.took);
+    assert!(
+        plan.took < HELD / 2,
+        "the plan held the lock through the gather: {:?}",
+        plan.took
+    );
+    assert!(
+        build.at - build.took >= gather.at,
+        "the build began before the gather ended: it took {:?}",
+        build.took
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gather_is_timed_as_the_copy_on_the_global_pool() {
+    a_gather_is_timed_as_the_copy(MergeBuilds::new(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gather_is_timed_as_the_copy_on_a_pool_of_its_own() {
+    let pools = vellev_storage::merge_slots(1, 2, 0);
+    let builds = MergeBuilds::building_on(pools.into_iter().map(Arc::new).collect());
+    a_gather_is_timed_as_the_copy(builds).await;
+}
+
+/// A restore under way, not yet made, that a stop comes to once a merge is
+/// built ends it stale too: the merge could not have committed (§9.7 rule
+/// 6, review of #169).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_once_built_with_a_restore_under_way_is_counted_stale() {
+    let (builds, mut cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let store = Arc::new(GetsHeld {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+        reached: tokio::sync::Notify::new(),
+        let_go: tokio::sync::Semaphore::new(0),
+    });
+    cluster.blobs = store.clone();
+    let writer = two_large(&cluster, &builds).await;
+    let committed = cluster.committed().await;
+    let (head, position) = (committed.manifest.unwrap(), committed.log_position);
+    written(&writer, vec![upsert_as(0, -1)]).await;
+    builds.hold(Some(Holding::BuiltUntilLetGo));
+    let held = Held(builds.clone());
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    until(LONG, "no build came to be held", || builds.held() == 1).await;
+    store.armed.store(true, Ordering::SeqCst);
+    let restoring = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.restore(Some(&head), position).await }
+    });
+    let reached = store.reached.notified();
+    within(LONG, "the restore came to the store", reached).await;
+    let epoch = writer.epoch();
+    writer.stop_merges();
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    assert_eq!(writer.epoch(), epoch, "with the restore under way still");
+    assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
+    store.armed.store(false, Ordering::SeqCst);
+    store
+        .let_go
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    let restored = within(LONG, "the restore went through", restoring).await;
+    restored.unwrap().unwrap();
+}
+
 /// A store whose gets, once armed, wait until let go.
 #[derive(Debug)]
 struct GetsHeld {
@@ -355,6 +528,7 @@ async fn a_restore_under_way_ends_a_gather_within_a_chunk() {
     let merged = within(LONG, "the merge ended", merging).await;
     assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
     assert_eq!(writer.epoch(), epoch, "with the restore under way still");
+    assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
     assert!(
         builds.last_gathered() <= 2 * GATHERED_AT_ONCE,
         "the gather went on through the restore, to {} rows",

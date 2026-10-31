@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use vellev_index::pool::Passes;
 use vellev_index::stop::Stop;
 
 use crate::coordinator::PartitionKey;
@@ -26,6 +27,99 @@ use crate::Result;
 /// its run's live rows and their vectors, is the bulk of what it holds, so
 /// the node's merges hold at most this many times the largest.
 pub const MERGE_BUILDS: usize = 2;
+
+/// Where a build's sections run: on the pool of the slot its merge holds,
+/// or, without one, on rayon's global pool. A build's top level, its serial
+/// glue, its turn to tune and the waits between its sections, stays on the
+/// thread that runs the build, never on the pool.
+///
+/// A pool serves one build at a time, the merge that holds its slot, so
+/// nothing of another build is ever queued there. On a pool shared by two,
+/// a thread waiting in one build's section would take the other's on,
+/// whatever the size of either, as rayon gives a waiting worker whatever
+/// else is queued, and the first could neither end nor heed its stop until
+/// the other's had (review of #169).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OnPool<'a> {
+    /// The merge's build, if it is one.
+    build: Option<&'a MergeBuild>,
+}
+
+/// Whether each section's thread is kept, as a test asks: see
+/// [`sections_ran_on`].
+static RECORDING: AtomicBool = AtomicBool::new(false);
+static RAN_ON: Mutex<Vec<SectionRan>> = Mutex::new(Vec::new());
+
+/// A section as [`sections_ran_on`] kept it.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionRan {
+    /// The merge whose build it was, numbered as they took their turns; a
+    /// flush's or a load's has none.
+    pub merge: Option<u64>,
+    pub thread: String,
+    pub name: &'static str,
+}
+
+/// Keep, from now on, the thread each build's section runs on and the
+/// merge whose build it was, or stop keeping them; and give back those
+/// kept so far. For tests that show which pool each build's sections run
+/// on.
+#[doc(hidden)]
+pub fn sections_ran_on(keep: bool) -> Vec<SectionRan> {
+    RECORDING.store(keep, Ordering::SeqCst);
+    std::mem::take(&mut *lock(&RAN_ON))
+}
+
+impl<'a> OnPool<'a> {
+    /// For a build that is no merge's, a flush's or a load's: its sections
+    /// on rayon's global pool.
+    pub(crate) fn global() -> Self {
+        Self { build: None }
+    }
+
+    /// For `build`, a merge's: its sections on its slot's pool if it holds
+    /// one.
+    pub(crate) fn merge(build: &'a MergeBuild) -> Self {
+        Self { build: Some(build) }
+    }
+
+    /// Run the section `section`, named `name`, where this says.
+    pub(crate) fn section<R: Send>(
+        self,
+        name: &'static str,
+        section: impl FnOnce() -> R + Send,
+    ) -> R {
+        let merge = self.build.map(MergeBuild::number);
+        let noted = move || {
+            if RECORDING.load(Ordering::SeqCst) {
+                lock(&RAN_ON).push(SectionRan {
+                    merge,
+                    thread: std::thread::current().name().unwrap_or("").to_string(),
+                    name,
+                });
+            }
+            section()
+        };
+        match self.build.and_then(MergeBuild::pool) {
+            Some(pool) => {
+                debug_assert_eq!(
+                    rayon::current_thread_index(),
+                    None,
+                    "a section asked for from a pool's thread"
+                );
+                pool.install(noted)
+            }
+            None => noted(),
+        }
+    }
+}
+
+impl Passes for OnPool<'_> {
+    fn pass<R: Send>(self, name: &'static str, pass: impl FnOnce() -> R + Send) -> R {
+        self.section(name, pass)
+    }
+}
 
 /// The longest a build waits where a test holds it, were the test never to
 /// let it go.
@@ -86,6 +180,23 @@ pub struct MergeBuilds {
     probing: AtomicBool,
     /// How the builds stood as the last probe was dropped.
     probed: Mutex<Option<Probed>>,
+    /// The pools merges build on, one for each turn, if not rayon's global
+    /// one: see [`Self::building_on`].
+    pools: Vec<Arc<rayon::ThreadPool>>,
+    /// Those no merge holds. Every turn finds one: a slot goes back before
+    /// the turn that held it is let go.
+    slots_free: Mutex<Vec<usize>>,
+    /// How many merges have taken a turn: each one's number.
+    numbered: AtomicU64,
+    /// How many turns were free as the last slot went back: none more than
+    /// before, as a slot goes back before the turn that held it.
+    #[cfg(test)]
+    turns_free_at_slot: AtomicUsize,
+    /// The most any build was reckoned to hold at its peak, since the node
+    /// started.
+    largest: AtomicUsize,
+    /// The CPU builds spent on their own threads, in microseconds.
+    top_level_cpu: AtomicU64,
 }
 
 /// What one build under way is reckoned to hold, and the stop of its merge.
@@ -167,6 +278,30 @@ impl MergeBuilds {
     ///
     /// If `at_once` is 0: no merge would ever be built.
     pub fn new(at_once: usize) -> Arc<Self> {
+        Self::made(at_once, Vec::new())
+    }
+
+    /// Builds of merges one to each of `pools`, as many at a time, each
+    /// merge's build run in sections on the pool of the slot it holds with
+    /// its turn: every parallel pass, and the long serial steps, gathering,
+    /// finishing the gathered vectors, encoding and working out the parts.
+    /// The rest stays on the build's own thread, off the pool and at the
+    /// process's priority: the serial glue between sections, a clustered
+    /// index's assembly, and its wait for a turn to tune, on the one tuning
+    /// thread. Flushes, loads and what a merge does around its build stay
+    /// where they are: on rayon's global pool, and on the async runtime's
+    /// threads. Pools smaller, or lower in priority, than the global one
+    /// leave the rest of the box to reads and flushes while merges build
+    /// (merge note, §3).
+    ///
+    /// # Panics
+    ///
+    /// If `pools` is empty: no merge would ever be built.
+    pub fn building_on(pools: Vec<Arc<rayon::ThreadPool>>) -> Arc<Self> {
+        Self::made(pools.len(), pools)
+    }
+
+    fn made(at_once: usize, pools: Vec<Arc<rayon::ThreadPool>>) -> Arc<Self> {
         assert!(at_once >= 1, "merges are built at least one at a time");
         Arc::new(Self {
             turns: Arc::new(Semaphore::new(at_once)),
@@ -184,7 +319,38 @@ impl MergeBuilds {
             last_reckoned: AtomicUsize::new(0),
             probing: AtomicBool::new(false),
             probed: Mutex::default(),
+            slots_free: Mutex::new((0..pools.len()).rev().collect()),
+            pools,
+            numbered: AtomicU64::new(0),
+            #[cfg(test)]
+            turns_free_at_slot: AtomicUsize::new(usize::MAX),
+            largest: AtomicUsize::new(0),
+            top_level_cpu: AtomicU64::new(0),
         })
+    }
+
+    /// About how many bytes the largest build since the node started was
+    /// reckoned to hold at its peak: what the node's memory, past its
+    /// budget, may hold [`MERGE_BUILDS`] times over (merge note, §2.4).
+    pub fn largest_reckoned(&self) -> usize {
+        self.largest.load(Ordering::SeqCst)
+    }
+
+    /// The CPU merge builds have spent on their own threads, off any pool,
+    /// since the node started: on the blocking thread each runs on, at the
+    /// process's priority whatever pool they build on, from the start of
+    /// its gather to the end of its build. Without pools of their own that
+    /// is their sections too, the work rayon's global pool does for them
+    /// apart; with them, it is the serial glue and what waits for a turn to
+    /// tune. Nothing where a thread's CPU cannot be read.
+    pub fn top_level_cpu(&self) -> Duration {
+        Duration::from_micros(self.top_level_cpu.load(Ordering::SeqCst))
+    }
+
+    /// Note `spent`, CPU on a build's own thread.
+    pub(crate) fn spent_on_top(&self, spent: Duration) {
+        let spent = u64::try_from(spent.as_micros()).unwrap_or(u64::MAX);
+        self.top_level_cpu.fetch_add(spent, Ordering::SeqCst);
     }
 
     /// About how many bytes the merges stopped and not yet ended hold:
@@ -306,6 +472,15 @@ impl MergeBuilds {
         *lock(&self.probed)
     }
 
+    /// A slot for a merge that has its turn, if there are pools to hold.
+    fn slot_taken(&self) -> Option<usize> {
+        if self.pools.is_empty() {
+            return None;
+        }
+        let slot = lock(&self.slots_free).pop();
+        Some(slot.expect("a slot goes back before the turn that held it"))
+    }
+
     /// A turn to build the merge of `key`'s partition that `stopping`
     /// stops, once one is free; `None` if the merge is stopped first, or
     /// `flush_due` says its writer's flush is due first, when it never
@@ -360,10 +535,13 @@ impl MergeBuilds {
             committing: AtomicBool::new(false),
         });
         lock(&self.under_way).push(reckoned.clone());
+        let slot = self.slot_taken();
         Ok(Some(MergeBuild {
             counted: Counted {
                 builds: self.clone(),
                 reckoned,
+                slot,
+                number: self.numbered.fetch_add(1, Ordering::SeqCst),
             },
             _turn: turn,
         }))
@@ -473,6 +651,24 @@ impl MergeBuild {
     /// Reckon the build to hold `bytes` at its peak, from now on.
     pub(crate) fn reckon(&self, bytes: usize) {
         self.counted.reckoned.bytes.store(bytes, Ordering::SeqCst);
+        let builds = &self.counted.builds;
+        builds.largest.fetch_max(bytes, Ordering::SeqCst);
+    }
+
+    /// The node's merge builds this is one of.
+    pub(crate) fn builds(&self) -> &Arc<MergeBuilds> {
+        &self.counted.builds
+    }
+
+    /// The pool of the slot this merge holds, if merges build on their own.
+    fn pool(&self) -> Option<&rayon::ThreadPool> {
+        let slot = self.counted.slot?;
+        Some(&*self.counted.builds.pools[slot])
+    }
+
+    /// This merge's number, as it took its turn.
+    fn number(&self) -> u64 {
+        self.counted.number
     }
 
     /// A probe for what the build makes to carry, if a test asks: see
@@ -716,6 +912,10 @@ impl AsRef<[u8]> for Carried {
 struct Counted {
     builds: Arc<MergeBuilds>,
     reckoned: Arc<Reckoned>,
+    /// The slot it holds, if merges build on pools of their own.
+    slot: Option<usize>,
+    /// Its number, as it took its turn.
+    number: u64,
 }
 
 impl Drop for Counted {
@@ -725,6 +925,15 @@ impl Drop for Counted {
         self.builds.last_planned.store(planned, Ordering::SeqCst);
         self.builds.last_reckoned.store(bytes, Ordering::SeqCst);
         lock(&self.builds.under_way).retain(|build| !Arc::ptr_eq(build, &self.reckoned));
+        // Before the turn is let go, which comes after: so that every turn
+        // finds a slot.
+        if let Some(slot) = self.slot {
+            lock(&self.builds.slots_free).push(slot);
+            #[cfg(test)]
+            self.builds
+                .turns_free_at_slot
+                .store(self.builds.turns.available_permits(), Ordering::SeqCst);
+        }
     }
 }
 
@@ -734,4 +943,107 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod nesting {
+    use super::*;
+    use vellev_core::{Partition as PartitionNumber, TenantId};
+
+    /// `count` pools of `threads` threads each, named as a node's are.
+    fn pools(count: usize, threads: usize) -> Vec<Arc<rayon::ThreadPool>> {
+        vellev_index::pool::merge_slots(count, count * threads, 0)
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
+
+    async fn turn_of(builds: &Arc<MergeBuilds>, tenant: &str) -> MergeBuild {
+        let key = PartitionKey {
+            tenant: TenantId::new(tenant).unwrap(),
+            partition: PartitionNumber::DEFAULT,
+        };
+        let (kept, stopping) = (Mutex::new(None), Stopping::never());
+        let turn = builds.turn(&key, &stopping, &|| false, &kept);
+        turn.await.unwrap().expect("a turn free")
+    }
+
+    /// Review of #169 (HIGH): a build whose own work is half a second, in
+    /// a section of two halves, ends in about that though a section of
+    /// three seconds of a second build is asked for while it waits in its
+    /// own. Were the second queued on the first's pool, the thread waiting
+    /// in the first would take it on, and the first build would end, or
+    /// heed its stop, only once the second's section had.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_build_waiting_in_its_section_never_takes_on_anothers_section() {
+        let builds = MergeBuilds::building_on(pools(2, 2));
+        let (one, other) = (turn_of(&builds, "one").await, turn_of(&builds, "two").await);
+        let first = std::thread::spawn(move || {
+            let began = Instant::now();
+            OnPool::merge(&one).section("first", || {
+                rayon::join(
+                    || std::thread::sleep(Duration::from_millis(50)),
+                    || std::thread::sleep(Duration::from_millis(500)),
+                )
+            });
+            began.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let second = std::thread::spawn(move || {
+            OnPool::merge(&other).section("second", || {
+                std::thread::sleep(Duration::from_secs(3));
+            });
+        });
+        let took = first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            took < Duration::from_millis(1_500),
+            "the first build took {took:?}, its own work half a second"
+        );
+    }
+
+    /// Every turn finds a slot of its own, and the slot of a merge let go
+    /// is free before its turn is: taken and let go over and over, two at
+    /// a time, none is ever without one and none is shared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_merge_holds_a_slot_of_its_own_until_it_is_let_go() {
+        let builds = MergeBuilds::building_on(pools(2, 1));
+        for _ in 0..50 {
+            let (one, two) = (turn_of(&builds, "one").await, turn_of(&builds, "two").await);
+            assert!(one.counted.slot.is_some() && two.counted.slot.is_some());
+            assert_ne!(one.counted.slot, two.counted.slot);
+        }
+        assert_eq!(lock(&builds.slots_free).len(), 2);
+        // Off pools of their own, there are none to hold.
+        let global = MergeBuilds::new(2);
+        assert_eq!(turn_of(&global, "one").await.counted.slot, None);
+    }
+
+    /// A slot goes back before the turn that held it, so that a turn
+    /// granted at once to a merge waiting finds it: told from the turns
+    /// free as it goes back, none with the only one still held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slot_goes_back_before_its_turn() {
+        let builds = MergeBuilds::building_on(pools(1, 1));
+        drop(turn_of(&builds, "one").await);
+        assert_eq!(builds.turns_free_at_slot.load(Ordering::SeqCst), 0);
+    }
+
+    /// A section that panics unwinds to its build, and leaves the slot
+    /// usable by the merge that holds it next (review of #169).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_section_leaves_its_slot_usable() {
+        let builds = MergeBuilds::building_on(pools(1, 2));
+        let build = turn_of(&builds, "one").await;
+        let panicked = tokio::task::spawn_blocking(move || {
+            OnPool::merge(&build).section("panics", || panic!("as a test asks"));
+        });
+        assert!(panicked.await.is_err(), "the panic did not reach the build");
+        let next = tokio::time::timeout(Duration::from_secs(5), turn_of(&builds, "two"));
+        let next = next.await.expect("the slot not given back");
+        let ran = tokio::task::spawn_blocking(move || {
+            OnPool::merge(&next).section("after", || rayon::join(|| 1, || 2))
+        });
+        assert_eq!(ran.await.unwrap(), (1, 2));
+    }
 }
