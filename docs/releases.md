@@ -398,6 +398,13 @@ and say what the caller then answers for.
 - **Vectors are never held in memory by a node with a cache directory.**
   A tenant whose vectors the cache cannot take, or whose disk does not
   answer, does not open, and is `unavailable` until it does.
+- **A merge gathers its vectors in the cache directory**, in a file of its
+  own that becomes the merged segment's copy: what it holds in memory falls
+  by its vectors' bytes at every stage, and the disk is written as it
+  gathers, not after it uploads. Nothing stored changes, and a node with no
+  cache directory gathers in memory as before. `vellev-storage`'s `Blobs`
+  gains `spills` and `put_spilled`, which a store over another forwards for
+  its merges to gather on disk; one that does not gathers in memory.
 - **Every object read carries `version`**: 32 hexadecimal characters, a
   hash of its properties and vector (docs/compatibility.md says exactly
   how), from `GET …/objects/{id}`, `/list`, `/nearest`, `/keyword` and

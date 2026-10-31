@@ -1,16 +1,324 @@
-//! A merge's vectors gathered on local disk (node memory note, M8).
+//! A merge's vectors gathered on local disk (node memory note, M8): in a
+//! file of the store's cache, under a name of its own, written a piece at a
+//! time and, once whole, read in place. So the frame is on the heap at no
+//! stage of the build, and, taken up by the cache as the file's copy once
+//! the store has it, is written once.
+//!
+//! Its name lasts as long as anything may read it: the last to let a
+//! [`Spill`] go takes it away, on whichever thread and however it ends. A
+//! process that dies never does, so a spill is held locked from its first
+//! moment, as the system lets go of a dead process's locks: whoever opens
+//! the cache next finds one nobody holds, and removes it at once, however
+//! new, leaving alone those of another process sharing the directory.
+//!
+//! A file is never read part written. It is written through the file, all of
+//! it, and only then mapped: a disk that fills is told of by the write, as
+//! an error the merge fails on, never by a fault in a mapping. Nothing
+//! writes to it once it is mapped. It is only ever renamed or unlinked,
+//! either of which leaves a mapping on it as it was, which is why spills are
+//! made on Unix alone, as [`Column::map`] maps on Unix alone.
+//!
+//! [`Column::map`]: crate::column::Column::map
 
-use std::sync::atomic::AtomicU64;
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-/// Where a store's frames are gathered on local disk.
+use tokio::runtime::Handle;
+
+use crate::blobs::Disk;
+use crate::format::{self, Kind, BODY};
+use crate::freed::off_the_async_threads;
+use crate::stopping::{MergeStage, Stopping};
+use crate::{Result, StorageError};
+
+/// How a spill's name ends, by which [`left_behind`] is asked of it.
+pub(crate) const SPILL_EXTENSION: &str = "spill";
+
+/// How many bytes of a frame are held in memory as it is written, at the
+/// most: a step on the disk for each, so that a slow disk is told of as soon
+/// as any other write to it would be, and a stop waits for no more than one.
+pub(crate) const SPILLED_AT_ONCE: usize = 4 * 1024 * 1024;
+
+/// Where a store's frames may be gathered on local disk: a directory of the
+/// same file system as the store's copies, so that a copy is taken up by
+/// renaming it, and the disk every step there is run on.
 #[derive(Debug, Clone)]
-pub struct Spills;
+pub struct Spills {
+    dir: PathBuf,
+    disk: Disk,
+}
 
-/// What a test has a disk do to what is spilled to it. Not for use.
+impl Spills {
+    pub(crate) fn in_dir(dir: PathBuf, disk: Disk) -> Self {
+        Self { dir, disk }
+    }
+
+    /// As asked of by a merge whose gather blocks on `runtime` for each
+    /// step, for as long as `stopping` lets it.
+    pub(crate) fn asked(self, runtime: Handle, stopping: Stopping) -> SpillAsked {
+        SpillAsked {
+            spills: self,
+            runtime,
+            stopping,
+        }
+    }
+}
+
+/// What is needed to begin a spill, for a gather that does not know yet
+/// whether it has any vectors to spill.
+#[derive(Debug)]
+pub(crate) struct SpillAsked {
+    spills: Spills,
+    runtime: Handle,
+    stopping: Stopping,
+}
+
+/// A name in the cache, taken away as this goes. A file that nothing refers
+/// to by name any more is the system's to free, once what has it open or
+/// mapped has let it go.
+#[derive(Debug, Default)]
+struct Name(Option<PathBuf>);
+
+impl Drop for Name {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            if let Err(error) = std::fs::remove_file(&path) {
+                // Already gone, as by a cache emptied under it.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(?path, %error, "a spill could not be removed");
+                }
+            }
+        }
+    }
+}
+
+fn unwritten(path: &Path, error: std::io::Error) -> StorageError {
+    StorageError::Blob {
+        key: path.display().to_string(),
+        source: error.into(),
+    }
+}
+
+/// A frame being written to its spill, in order, from its first byte: its
+/// header's room, then its body.
+#[derive(Debug)]
+pub(crate) struct Spilling {
+    file: Arc<File>,
+    name: Name,
+    disk: Disk,
+    runtime: Handle,
+    stopping: Stopping,
+    /// How much of the frame is written.
+    written: u64,
+    /// The sum of what of its body is written.
+    body: crc32fast::Hasher,
+}
+
+impl SpillAsked {
+    /// A spill begun under a name drawn at random, locked before anyone can
+    /// have reason to look at it: `None` if the merge is stopped first.
+    pub(crate) fn begin(self) -> Result<Option<Spilling>> {
+        let Self {
+            spills: Spills { dir, disk },
+            runtime,
+            stopping,
+        } = self;
+        let name = format!("{}.{SPILL_EXTENSION}", uuid::Uuid::new_v4().simple());
+        let path = dir.join(name);
+        // On one step, which goes on to its end whoever stops waiting: all
+        // it made goes with what it returns, should nobody take that.
+        let begun = {
+            let path = path.clone();
+            move || {
+                std::fs::create_dir_all(&dir)?;
+                let file = File::options()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                let name = Name(Some(path));
+                match file.try_lock() {
+                    Ok(()) => Ok((file, name)),
+                    // A file system with no locks: spills left behind there
+                    // go as anything left part written does, once stale.
+                    Err(std::fs::TryLockError::Error(_)) => Ok((file, name)),
+                    // One opening the cache got there first: it takes the
+                    // name away, not knowing this is not left behind.
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    }
+                }
+            }
+        };
+        let waited = stopping.unless_stopped(MergeStage::Gathering, disk.run(0, begun));
+        let Some(begun) = runtime.block_on(waited) else {
+            return Ok(None);
+        };
+        let (file, name) = begun.map_err(|error| unwritten(&path, error))?;
+        Ok(Some(Spilling {
+            file: Arc::new(file),
+            name,
+            disk,
+            runtime,
+            stopping,
+            written: 0,
+            body: crc32fast::Hasher::new(),
+        }))
+    }
+}
+
+impl Spilling {
+    fn path(&self) -> PathBuf {
+        self.name.0.clone().unwrap_or_default()
+    }
+
+    /// The frame's next `words`, written and taken out of it, its room kept
+    /// for the next: `false` if the merge is stopped first. The step the
+    /// wait for it gives up runs on with what it was given, and may write
+    /// on to a file that has lost its name, which is nothing to anyone.
+    pub(crate) fn written(&mut self, words: &mut Vec<u32>) -> Result<bool> {
+        let bytes = words.len() * 4;
+        let piece = std::mem::take(words);
+        let frame: &[u8] = bytemuck::cast_slice(&piece);
+        // The header goes in last, over the room left for it.
+        let header = BODY.saturating_sub(self.written as usize).min(bytes);
+        self.body.update(&frame[header..]);
+        let (file, told) = (self.file.clone(), self.disk.spills_are_told());
+        let end = self.written + bytes as u64;
+        let step = move || {
+            if let Some(told) = told {
+                told.writes(end)?;
+            }
+            (&*file).write_all(bytemuck::cast_slice(&piece))?;
+            Ok(piece)
+        };
+        let run = self.disk.run(bytes, step);
+        let waited = self.stopping.unless_stopped(MergeStage::Gathering, run);
+        let Some(stepped) = self.runtime.block_on(waited) else {
+            return Ok(false);
+        };
+        let mut piece = stepped.map_err(|error| unwritten(&self.path(), error))?;
+        piece.clear();
+        *words = piece;
+        self.written = end;
+        Ok(true)
+    }
+
+    /// The frame, all of it written, sealed as format `version` and read in
+    /// place from now on: `None` if the merge is stopped first.
+    pub(crate) fn sealed(mut self, version: u16) -> Result<Option<Spill>> {
+        let length = self.written as usize - BODY;
+        let header = format::header(Kind::Vectors, version, length, &self.body);
+        let file = self.file.clone();
+        let step = move || {
+            let mut to = &*file;
+            to.seek(SeekFrom::Start(0))?;
+            to.write_all(&header)?;
+            // SAFETY: nothing writes to the file from here on: the only
+            // write given up on would have failed the gather before this,
+            // and whatever else comes to it by name only renames or unlinks
+            // it, either of which leaves the mapping as it is.
+            unsafe { memmap2::Mmap::map(&*file) }
+        };
+        let run = self.disk.run(0, step);
+        let waited = self.stopping.unless_stopped(MergeStage::Gathering, run);
+        let Some(mapped) = self.runtime.block_on(waited) else {
+            return Ok(None);
+        };
+        let map = mapped.map_err(|error| unwritten(&self.path(), error))?;
+        Ok(Some(Spill {
+            map: Some(map),
+            version,
+            file: Some(self.file),
+            name: Mutex::new(std::mem::take(&mut self.name)),
+        }))
+    }
+}
+
+/// A frame gathered in its spill: written whole, and read in place by all
+/// that holds it. The mapping and the name go with the last of those, on no
+/// async thread, however it goes: the column and the frame its build holds,
+/// the bytes a store is sent, whoever keeps those on.
+#[derive(Debug)]
+pub struct Spill {
+    map: Option<memmap2::Mmap>,
+    version: u16,
+    /// Open for as long as it is mapped, with the lock that says so.
+    file: Option<Arc<File>>,
+    /// Where it lies, until a cache takes it up, when it is the cache's.
+    name: Mutex<Name>,
+}
+
+/// The name held, whoever panicked holding it: a rename or a removal, of
+/// which either leaves it as it says.
+fn named(name: &Mutex<Name>) -> std::sync::MutexGuard<'_, Name> {
+    name.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Spill {
+    /// The frame.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.map.as_deref().expect("mapped until dropped")
+    }
+
+    /// The format it is sealed as.
+    pub(crate) fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// The file's name from now on is `path`, whatever was there: it is
+    /// no spill any more, and is left there as this goes.
+    pub(crate) fn renamed_to(&self, path: &Path) -> std::io::Result<()> {
+        let mut name = named(&self.name);
+        let from = name.0.as_ref().ok_or(std::io::ErrorKind::NotFound)?;
+        std::fs::rename(from, path)?;
+        name.0 = None;
+        Ok(())
+    }
+}
+
+impl Drop for Spill {
+    /// Off the async threads: the name's removal is a step on a disk that
+    /// may not answer, and a mapping of gigabytes takes as long to let go
+    /// as what was freed before it. Should that thread never come, as the
+    /// runtime goes, these go with the work unrun, and the name with them.
+    fn drop(&mut self) {
+        let map = self.map.take();
+        let file = self.file.take();
+        let name = std::mem::take(&mut *named(&self.name));
+        off_the_async_threads(move || {
+            drop(map);
+            drop(file);
+            drop(name);
+        });
+    }
+}
+
+/// Whether the spill at `path` was left by a process that is gone: nobody
+/// holds its lock. On a file system with no locks, nothing tells: it is
+/// left to `stale`, as a file left part written is.
+pub(crate) fn left_behind(path: &Path, stale: impl FnOnce() -> bool) -> bool {
+    let Ok(file) = File::options().read(true).write(true).open(path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => true,
+        Err(std::fs::TryLockError::WouldBlock) => false,
+        Err(std::fs::TryLockError::Error(_)) => stale(),
+    }
+}
+
+/// What a test has a disk do to what is spilled to it, as a disk that fills
+/// or stops answering would. Not for use.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct SpillsTold {
-    /// How many bytes of each spill the disk takes before it is full.
+    /// How many bytes of a spill the disk takes before it is full.
     pub at_most: AtomicU64,
     /// How long, in milliseconds, each write takes at the least.
     pub taking: AtomicU64,
@@ -25,5 +333,131 @@ impl Default for SpillsTold {
             taking: AtomicU64::new(0),
             taken_up_in: AtomicU64::new(0),
         }
+    }
+}
+
+impl SpillsTold {
+    /// A spill about to be taken up, as told.
+    pub(crate) fn taken_up(&self) {
+        let taking = self.taken_up_in.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(taking));
+    }
+
+    /// A write that comes to `end` bytes of its spill, as told.
+    fn writes(&self, end: u64) -> std::io::Result<()> {
+        let taking = self.taking.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(taking));
+        match end > self.at_most.load(Ordering::SeqCst) {
+            true => Err(std::io::ErrorKind::StorageFull.into()),
+            false => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spill of a few words in `dir`, sealed, made on a thread that may
+    /// wait on the disk.
+    async fn spill_in(dir: &Path) -> Arc<Spill> {
+        let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone());
+        let asked = spills.asked(Handle::current(), Stopping::never());
+        let made = tokio::task::spawn_blocking(move || {
+            let mut spilling = asked.begin().unwrap().unwrap();
+            let mut words = vec![0; 16];
+            assert!(spilling.written(&mut words).unwrap());
+            spilling.sealed(1).unwrap().unwrap()
+        });
+        Arc::new(made.await.unwrap())
+    }
+
+    fn names(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    /// The name goes with the last that holds the spill, on whichever thread
+    /// that is, and not before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spill_s_name_goes_with_the_last_that_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = spill_in(dir.path()).await;
+        let other = spill.clone();
+        drop(spill);
+        assert_eq!(names(dir.path()), 1);
+        drop(other);
+        let wait = async {
+            while names(dir.path()) > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("the name stays");
+    }
+
+    /// One let go as the runtime shuts down, when nothing is left to do
+    /// work off the async threads, leaves its name no more than any other.
+    #[test]
+    fn a_spill_let_go_as_its_runtime_goes_leaves_no_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let spill = runtime.block_on(spill_in(dir.path()));
+        let held = runtime.spawn(async move {
+            let _spill = spill;
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(names(dir.path()), 1);
+        drop(held);
+        drop(runtime);
+        assert_eq!(names(dir.path()), 0, "left as the runtime went");
+    }
+
+    /// A step given up on, and a stop, leave nothing, and whatever is
+    /// written to a file that has lost its name is nothing to anyone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spill_nobody_goes_on_with_leaves_no_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let spills = Spills::in_dir(dir.path().to_path_buf(), Disk::shared().clone());
+        let asked = spills.asked(Handle::current(), Stopping::never());
+        let begun = tokio::task::spawn_blocking(move || asked.begin().unwrap().unwrap());
+        let spilling = begun.await.unwrap();
+        assert_eq!(names(dir.path()), 1);
+        drop(spilling);
+        assert_eq!(names(dir.path()), 0);
+    }
+
+    /// A spill whose file a lock cannot be had of is one nobody holds only
+    /// as what is left part written is: once stale. A file system with locks
+    /// says at once. A file not there is left behind by nobody.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_spill_nobody_holds_is_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = spill_in(dir.path()).await;
+        let path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(!left_behind(&path, || true), "held");
+        let held = std::fs::File::open(&path).unwrap();
+        drop(spill);
+        let wait = async {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("the name stays");
+        drop(held);
+        assert!(!left_behind(&path, || true), "not there");
+        std::fs::write(&path, b"left").unwrap();
+        assert!(left_behind(&path, || false), "nobody holds it");
     }
 }

@@ -27,6 +27,7 @@ use crate::format::{
 use crate::freed::off_the_async_threads;
 use crate::merge_builds::OnPool;
 use crate::published::FreesHeld;
+use crate::spill::{SpillAsked, SPILLED_AT_ONCE};
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
 
@@ -639,12 +640,18 @@ impl Run {
     /// Before each `chunk` of a segment's rows, in sizing it and in copying
     /// it, `goes_on` is told how many are copied so far: `None` as soon as
     /// it says not, so that nothing runs on for more than a chunk past it.
+    ///
+    /// With `spill`, the vectors go to local disk as they are copied, if
+    /// there are any: rows with none have no vectors file to take a spill
+    /// up. A disk that fails it fails the merge: nothing the merge was
+    /// planned on is left to go on from.
     pub(crate) fn merged(
         mut self,
         position: LogPosition,
         chunk: usize,
+        spill: Option<SpillAsked>,
         mut goes_on: impl FnMut(usize) -> bool,
-    ) -> Option<(SegmentFile, Gathering, usize)> {
+    ) -> Result<Option<(SegmentFile, Gathering, usize)>> {
         let segments = std::mem::take(&mut self.segments);
         let dead = self.dead.clone();
         let of = |rows: usize| {
@@ -655,7 +662,7 @@ impl Run {
         for ((file, column), dead) in segments.iter().zip(dead.iter()) {
             for rows in of(file.rows.len()) {
                 if !goes_on(0) {
-                    return None;
+                    return Ok(None);
                 }
                 for row in rows.filter(|row| !dead.is_dead(*row)) {
                     count += 1;
@@ -676,17 +683,27 @@ impl Run {
             }
         };
         let mut rows: Vec<Row> = Vec::with_capacity(count);
-        let mut vectors = Gathering::with_capacity(values, count);
+        let mut vectors = match spill.filter(|_| values > 0) {
+            None => Gathering::with_capacity(values, count),
+            Some(asked) => match asked.begin()? {
+                Some(spilling) => Gathering::spilled(values, count, spilling),
+                None => return Ok(None),
+            },
+        };
         // What the rows copied come to, as they are, for the reckoning.
         let mut copied = 0;
         for ((file, column), dead) in segments.iter().zip(dead.iter()) {
             for at in of(file.rows.len()) {
                 if !goes_on(rows.len()) {
-                    return None;
+                    return Ok(None);
                 }
                 for row in at.filter(|row| !dead.is_dead(*row)) {
                     let Row { collection, object } = &file.rows[row];
-                    vectors.push(column.get(row));
+                    let vector = column.get(row);
+                    if !vectors.with_room_for(vector.map_or(0, <[f32]>::len))? {
+                        return Ok(None);
+                    }
+                    vectors.push(vector);
                     let row = Row {
                         collection: *collection,
                         object: Object {
@@ -705,7 +722,7 @@ impl Run {
             rows,
             tombstones,
         };
-        Some((file, vectors, copied))
+        Ok(Some((file, vectors, copied)))
     }
 }
 
@@ -814,8 +831,11 @@ fn segment_bytes(rows: &[Row], vectors: &Column) -> usize {
 pub(crate) struct Reckoning {
     /// The rows copied, as [`copied_bytes`] counts them.
     pub rows: f64,
-    /// Their vectors.
+    /// Their vectors, of what is held in memory through the build: all of
+    /// them gathered there; gathered on disk, only where each row's start.
     pub vectors: f64,
+    /// A vectors frame's last piece, gone once written, gathered on disk.
+    pub piece: f64,
     /// What the run's tombstones take, if they are carried on.
     pub tombstones: f64,
     /// Their segment's frame, as [`encoded_bytes`] counts it.
@@ -852,7 +872,8 @@ impl Reckoning {
     /// About how many bytes the merge holds at its peak.
     pub(crate) fn peak(&self) -> usize {
         let built = self.indexed + self.training.max(self.encoded * ENCODED_AT_PEAK);
-        (self.rows + self.vectors + self.tombstones + self.indexing.max(built)) as usize
+        let staged = self.piece.max(self.indexing).max(built);
+        (self.rows + self.vectors + self.tombstones + staged) as usize
     }
 
     /// As reckoned at plan, its rows and vectors now what was gathered:
@@ -867,6 +888,7 @@ impl Reckoning {
         Self {
             rows: copied as f64,
             vectors: vectors.bytes() as f64,
+            piece: vectors.piece_bytes() as f64,
             encoded: self.encoded * by,
             indexed: self.indexed * by,
             indexing: self.indexing * by,
@@ -1529,7 +1551,7 @@ impl Drop for Discarded {
 /// What a flush takes from the state to build its segment while commits go
 /// on: the memtable's live rows and tombstones at `position`, and where
 /// each row lies in the memtable.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Snapshot {
     pub position: LogPosition,
     pub checkpoint: Option<String>,
@@ -2800,8 +2822,15 @@ impl State {
     /// `clustered_above`.
     /// From each segment's [`Parts`], worked out as it was built or loaded:
     /// a walk over the run's segments, not their rows. Refined by
-    /// [`Reckoning::gathered`] once the rows are gathered.
-    pub(crate) fn merge_reckoning(&self, merge: &Merge, clustered_above: usize) -> Reckoning {
+    /// [`Reckoning::gathered`] once the rows are gathered. If `spilled`, its
+    /// vectors are to be gathered on local disk, and held by nothing here
+    /// but where each row's start, and a piece at a time.
+    pub(crate) fn merge_reckoning(
+        &self,
+        merge: &Merge,
+        clustered_above: usize,
+        spilled: bool,
+    ) -> Reckoning {
         let Some(run) = self.segments.get(merge.run.clone()) else {
             return Reckoning::default();
         };
@@ -2836,7 +2865,12 @@ impl State {
             let live_rows = parts.count - segment.dead.count();
             let live = live_rows as f64 / parts.count as f64;
             reckoning.rows += copied;
+            let values = segment.vectors.values_bytes() as f64 * live;
             reckoning.vectors += segment.vectors.bytes() as f64 * live;
+            if spilled {
+                reckoning.vectors -= values;
+                reckoning.piece += values;
+            }
             besides += parts.filters as f64 * copied / parts.copied.max(1) as f64;
             // Deaths may all be one collection's, and the marks don't say
             // whose: each is reckoned as many of its rows as can be live.
@@ -2874,6 +2908,7 @@ impl State {
                 false => coding_bytes(rows, dimensions),
             });
         }
+        reckoning.piece = reckoning.piece.min(SPILLED_AT_ONCE as f64);
         let fields: Vec<RunField> = fields.into_values().collect();
         let text: f64 = fields
             .iter()
@@ -3947,7 +3982,7 @@ mod tests {
                 run: 0..1,
                 keys: Vec::new(),
             };
-            built.state.merge_reckoning(&plan, CLUSTERED_ABOVE)
+            built.state.merge_reckoning(&plan, CLUSTERED_ABOVE, false)
         };
         let (long, short) = (plan_with(at_once..2 * at_once), plan_with(0..at_once));
         // Reckoned alike were each block given one share of the segment.
@@ -3977,9 +4012,9 @@ mod tests {
             run: 0..1,
             keys: Vec::new(),
         };
-        let all = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE);
+        let all = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE, false);
         built.commit((0..7_372).map(|n| delete(0, n)).collect());
-        let tenth = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE);
+        let tenth = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE, false);
         // 820 tokens' map, not 8,192's, which is most of what they hold.
         assert!(tenth.indexed < 0.2 * all.indexed, "{tenth:?}, of {all:?}");
     }
@@ -3999,7 +4034,7 @@ mod tests {
             run: 0..1,
             keys: Vec::new(),
         };
-        let reckoning = built.state.merge_reckoning(&plan, CLUSTERED_ABOVE);
+        let reckoning = built.state.merge_reckoning(&plan, CLUSTERED_ABOVE, false);
         assert_eq!(reckoning.peak(), 0, "{reckoning:?}");
     }
 
@@ -4045,7 +4080,7 @@ mod tests {
                 run: 0..1,
                 keys: Vec::new(),
             };
-            built.state.merge_reckoning(&plan, CLUSTERED_ABOVE)
+            built.state.merge_reckoning(&plan, CLUSTERED_ABOVE, false)
         };
         let (dropped, untexted) = (reckoned(true), reckoned(false));
         assert!(dropped.indexed > 0.0, "{dropped:?}");
@@ -4068,7 +4103,7 @@ mod tests {
             run: 1..2,
             keys: Vec::new(),
         };
-        let reckoning = built.state.merge_reckoning(&plan, CLUSTERED_ABOVE);
+        let reckoning = built.state.merge_reckoning(&plan, CLUSTERED_ABOVE, false);
         assert!(reckoning.peak() > 0, "{reckoning:?}");
         assert!(reckoning.tombstones > 0.0, "{reckoning:?}");
     }
@@ -4102,6 +4137,50 @@ mod tests {
             ..field(28_000)
         };
         assert_eq!(own.tabled_tokens(), own.most_tokens);
+    }
+
+    /// A plan to gather on local disk reckons nothing of the vectors' values
+    /// through the build, but where each row's start, and a piece written
+    /// at a time: as much as the same plan held in memory takes for its
+    /// values, less. What is dead is no more reckoned than in memory.
+    #[test]
+    fn a_plan_to_gather_on_disk_reckons_its_vectors_at_where_each_row_starts() {
+        let mut built = Built::new(&[]);
+        built.commit(vec![long_text_collection()]);
+        let rows = (0..2_048).map(|n| Op::Upsert {
+            collection: CollectionId(0),
+            object: Object {
+                id: oid(n),
+                properties: BTreeMap::new(),
+                vector: Some(vec![0.5; 4]),
+            },
+        });
+        built.commit(rows.collect());
+        built.flush();
+        built.commit((0..1_024).map(|n| delete(0, n)).collect());
+        let whole = Merge {
+            run: 0..1,
+            keys: Vec::new(),
+        };
+        let held = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE, false);
+        let spilled = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE, true);
+        let (values, offsets) = (1_024.0 * 4.0 * 4.0, 2_049.0 * 8.0 / 2.0);
+        assert!((held.vectors - values - offsets).abs() < 8.0, "{held:?}");
+        assert!((spilled.vectors - offsets).abs() < 8.0, "{spilled:?}");
+        assert_eq!(held.piece, 0.0);
+        assert_eq!(spilled.piece, values);
+        assert_eq!(spilled.indexed, held.indexed);
+        assert_eq!(spilled.encoded, held.encoded);
+        // A piece is held alone, gone before any stage it could add to.
+        assert!(spilled.peak() < held.peak());
+        let alone = Reckoning {
+            rows: 1.0,
+            piece: 100.0,
+            indexing: 40.0,
+            indexed: 30.0,
+            ..Reckoning::default()
+        };
+        assert_eq!(alone.peak(), 101);
     }
 
     /// What is planned of indexes and encoding moves with what was gathered.
@@ -4202,7 +4281,7 @@ mod tests {
             ..Merging::default()
         };
         let plan = built.state.merge_plan(&merging).unwrap();
-        let reckoning = built.state.merge_reckoning(&plan, CLUSTERED_ABOVE);
+        let reckoning = built.state.merge_reckoning(&plan, CLUSTERED_ABOVE, false);
         let blocks = &built.state.segments[2].parts.walked.blocks;
         let block: usize = blocks.iter().map(|block| block.tokens).sum();
         let beside = reckoning.indexing - reckoning.indexed;
@@ -4367,8 +4446,9 @@ mod tests {
         /// its rows' vectors put back.
         fn gathered(&self, plan: &Merge, chunk: usize) -> SegmentFile {
             let run = self.state.merge_run(plan);
-            let (mut file, gathered, _) =
-                run.merged(self.state.position(), chunk, |_| true).unwrap();
+            let position = self.state.position();
+            let merged = run.merged(position, chunk, None, |_| true);
+            let (mut file, gathered, _) = merged.unwrap().unwrap();
             for (row, at) in file.rows.iter_mut().zip(0..) {
                 row.object.vector = gathered.get(at).map(<[f32]>::to_vec);
             }
