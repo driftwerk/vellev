@@ -459,6 +459,20 @@ and say what the caller then answers for.
   neither its rate nor a bench's `stopped_for_budget` across the change.
   `vellev_merges_stopped_total{reason}` is new: merges stopped or cut off
   as a hold on a tenant is lost, each once, by why.
+- **A tenant's flushes no longer wait behind its merges.** They run on a
+  task of their own, so a flush due while the tenant's merge builds
+  commits in a flush's own time, where it waited for the build. A merge
+  flushes what is due before its commit, so `vellev_building_held_seconds`
+  reads less for `merge_commit` and more for `flush`.
+  `vellev_merge_phase_seconds{phase="turn_idle"}` is new: each wait for the
+  building lock with a merge turn held, 10 s at the most, after which the
+  turn goes back. `vellev_merge_draining_bytes` now also counts a merge
+  that gave its turn back to wait to commit, so it can read above zero
+  with no merge stopped, and what merges are reckoned to hold can exceed
+  `MERGE_BUILDS` builds by that merge until it commits.
+  `vellev_tenants_given_up_total` counts a panic on either task, two at
+  once on one tenant counting twice, and the line logged for it now reads
+  "a tenant's task panicked" with the task named.
 
 ### Numbers are read exactly
 
