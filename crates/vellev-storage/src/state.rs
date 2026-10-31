@@ -499,6 +499,10 @@ enum Location {
 
 #[derive(Debug, Clone)]
 struct Segment {
+    /// Told as the segment is let go and freed, as a test asks. First of
+    /// its fields, so that a test that holds it here holds the free.
+    #[cfg(test)]
+    probe: Option<Arc<Probe>>,
     meta: SegmentMeta,
     file: Arc<SegmentFile>,
     vectors: Arc<Column>,
@@ -508,6 +512,34 @@ struct Segment {
     resident: usize,
     /// What its rows and indexes come to, for a merge's reckoning.
     parts: Parts,
+}
+
+/// Where a segment a test probes has come to.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Probed {
+    /// Let go by what held it, on that thread: it may be freed elsewhere.
+    LetGo,
+    /// Being freed, its last holder gone.
+    Freed,
+}
+
+/// Tells a test where a segment has come to, on the thread that does it.
+#[cfg(test)]
+pub(crate) struct Probe(Arc<dyn Fn(Probed) + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for Probe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Probe")
+    }
+}
+
+#[cfg(test)]
+impl Drop for Probe {
+    fn drop(&mut self) {
+        (self.0)(Probed::Freed);
+    }
 }
 
 /// Which of a segment's rows are dead, a bit a row (row `n` bit `n % 64`
@@ -1106,6 +1138,18 @@ pub(crate) struct Snapshot {
 
 #[cfg(test)]
 impl State {
+    /// Have each segment held now tell `told` where it comes to.
+    pub(crate) fn probe_segments(&mut self, told: Arc<dyn Fn(Probed) + Send + Sync>) {
+        for segment in &mut self.segments {
+            segment.probe = Some(Arc::new(Probe(told.clone())));
+        }
+    }
+
+    /// What the segments held now are counted to take.
+    pub(crate) fn segments_held(&self) -> usize {
+        self.segments.iter().map(|segment| segment.resident).sum()
+    }
+
     /// Move the state on to `position` with nothing committed there, as
     /// nothing a writer lets happen does.
     pub(crate) fn moved_to(&mut self, position: LogPosition) {
@@ -2027,6 +2071,8 @@ impl State {
             })
             .collect();
         self.segments.push(Segment {
+            #[cfg(test)]
+            probe: None,
             resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
             meta,
             file,
@@ -2599,6 +2645,8 @@ impl State {
         self.segments.splice(
             run.clone(),
             [Segment {
+                #[cfg(test)]
+                probe: None,
                 resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
                 meta,
                 file,
@@ -2809,6 +2857,8 @@ impl State {
                 })
                 .collect();
             self.segments.push(Segment {
+                #[cfg(test)]
+                probe: None,
                 resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
                 meta,
                 file,

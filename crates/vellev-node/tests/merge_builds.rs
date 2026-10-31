@@ -116,6 +116,23 @@ async fn four_flushes(node: &Node, name: &str) {
     }
 }
 
+/// What a merge replaced and has not yet freed is held still: a node counts
+/// it among what its tenants hold, in the figure warming reads and in the
+/// one its sweep holds to its budget, until it is freed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_a_tenant_has_yet_to_free_counts_among_what_the_node_holds() {
+    const FREEING: usize = 1 << 20;
+    let node = node(|_| {});
+    node.create_tenant(&tenant("freeing")).await.unwrap();
+    let held = node.tenant(&tenant("freeing")).await.unwrap();
+    held.write(vec![notes()]).await.unwrap();
+    let before = node.resident();
+    held.partition().count_as_freeing(FREEING);
+    assert_eq!(node.resident(), before + FREEING);
+    node.sweep_now().await;
+    assert_eq!(node.census().holding.resident, before + FREEING);
+}
+
 /// Rule 4b: over its memory budget, a node stops the merge of a tenant it
 /// would let go but cannot yet, as its maintenance holds it; the build
 /// ends at once, not when it would have, and the node lets the tenant go

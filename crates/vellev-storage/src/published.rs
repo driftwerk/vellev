@@ -2,7 +2,8 @@
 //! is published with the change: read without the state's lock, by a node
 //! for its metrics and its memory budget, it is never behind a change made.
 
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::state::{Figures, State};
 
@@ -13,6 +14,9 @@ use crate::state::{Figures, State};
 pub(crate) struct Published {
     state: RwLock<State>,
     figures: Mutex<Figures>,
+    /// What segments taken out of the state still hold, until they are
+    /// freed: see [`Self::freeing`].
+    freeing: Arc<AtomicUsize>,
 }
 
 impl Published {
@@ -26,6 +30,18 @@ impl Published {
     /// lock, so never waiting on a change under way.
     pub(crate) fn figures(&self) -> Figures {
         *self.figures.lock().expect("figures lock")
+    }
+
+    /// What segments taken out of the state are counted to hold until they
+    /// are freed, which is not counted in what the state comes to. Read
+    /// without its lock.
+    pub(crate) fn freeing(&self) -> usize {
+        self.freeing.load(Ordering::SeqCst)
+    }
+
+    /// Count `bytes` as being freed, for good: for a test.
+    pub(crate) fn count_as_freeing(&self, bytes: usize) {
+        self.freeing.fetch_add(bytes, Ordering::SeqCst);
     }
 
     /// Change the state as `f` does, under its lock, and publish all it
@@ -59,6 +75,14 @@ impl Published {
             "applying a commit changed what only a change of segments may"
         );
         changed
+    }
+
+    /// Whether a change holds the state's lock now, as a test asks of a
+    /// state nothing else is writing to.
+    #[cfg(test)]
+    pub(crate) fn being_changed(&self) -> bool {
+        use std::sync::TryLockError;
+        matches!(self.state.try_read(), Err(TryLockError::WouldBlock))
     }
 
     /// Change the state without publishing it: only for a test that sets
