@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 
 use crate::format::{self, framed, Kind, Row, BODY};
+use crate::spill::{Spill, Spilling, SPILLED_AT_ONCE};
 use crate::{Result, StorageError};
 
 const _: () = assert!(
@@ -36,6 +37,8 @@ enum Values {
     Mapped(memmap2::Mmap, Range<usize>),
     /// In the frame they are written as, gathered there: see [`Gathering`].
     Framed(std::sync::Arc<Frame>, Range<usize>),
+    /// In that frame on local disk, gathered there, read in place.
+    Spilled(std::sync::Arc<Spill>, Range<usize>),
 }
 
 /// A vectors frame held in memory as whole words, so that its values,
@@ -61,18 +64,30 @@ impl AsRef<[u8]> for FrameBytes {
     }
 }
 
+/// A spilled frame as the bytes it uploads as, read where it lies: its
+/// mapping and its file go with the last copy of these.
+struct SpilledBytes(std::sync::Arc<Spill>);
+
+impl AsRef<[u8]> for SpilledBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+
 /// The words before a frame's values: its header and the padding that
 /// starts the values on a word.
 const AHEAD: usize = (BODY + PADDING) / 4;
 
 /// A column gathered row by row straight into the frame it is written as,
 /// sized exactly beforehand: so that its vectors are held once, as the
-/// column a segment keeps and the file it uploads both.
-#[derive(Debug, Clone)]
+/// column a segment keeps and the file it uploads both. Spilled, that frame
+/// goes to local disk as it comes, and `words` holds only its next piece.
+#[derive(Debug)]
 pub(crate) struct Gathering {
     words: Vec<u32>,
     offsets: Vec<u64>,
     values: usize,
+    spilling: Option<Spilling>,
 }
 
 impl Gathering {
@@ -86,6 +101,38 @@ impl Gathering {
             words,
             offsets,
             values: 0,
+            spilling: None,
+        }
+    }
+
+    /// As [`Self::with_capacity`], the frame going to `spilling` as it comes,
+    /// a piece of at most [`SPILLED_AT_ONCE`] at a time: see
+    /// [`Self::with_room_for`].
+    pub fn spilled(values: usize, rows: usize, spilling: Spilling) -> Self {
+        let frame = AHEAD + values + 2 * (rows + 1) + 2;
+        let mut words = Vec::with_capacity(frame.min(SPILLED_AT_ONCE / 4));
+        words.resize(AHEAD, 0);
+        let mut offsets = Vec::with_capacity(rows + 1);
+        offsets.push(0);
+        Self {
+            words,
+            offsets,
+            values: 0,
+            spilling: Some(spilling),
+        }
+    }
+
+    /// Room made for a vector of `values` values, a spilled frame's piece
+    /// written if that is what it takes: `false` if the merge is stopped
+    /// first. Nothing to do for a frame in memory, whose room was made
+    /// beforehand.
+    pub fn with_room_for(&mut self, values: usize) -> Result<bool> {
+        let Some(spilling) = &mut self.spilling else {
+            return Ok(true);
+        };
+        match self.words.len() + values <= self.words.capacity() {
+            true => Ok(true),
+            false => spilling.written(&mut self.words),
         }
     }
 
@@ -114,31 +161,82 @@ impl Gathering {
         (start < end).then(|| bytemuck::cast_slice(&self.words[AHEAD + start..AHEAD + end]))
     }
 
-    /// About how many bytes the gathering holds: room for every value and
-    /// where each row's start, made beforehand.
+    /// About how many bytes the gathering holds through the build: room for
+    /// every value and where each row's start, made beforehand; of a spilled
+    /// frame, only where each row's start.
     pub fn bytes(&self) -> usize {
-        self.words.capacity() * 4 + self.offsets.capacity() * 8
+        let frame = match self.spilling {
+            Some(_) => 0,
+            None => self.words.capacity() * 4,
+        };
+        frame + self.offsets.capacity() * 8
+    }
+
+    /// How many bytes a spilled frame holds as it is written, gone once it
+    /// is: none of a frame in memory.
+    pub fn piece_bytes(&self) -> usize {
+        match self.spilling {
+            Some(_) => self.words.capacity() * 4,
+            None => 0,
+        }
+    }
+
+    /// How many bytes its frame comes to whole, where each row's start and
+    /// its header among them.
+    pub fn frame_bytes(&self) -> usize {
+        (AHEAD + self.values + 2 * self.offsets.len() + 2) * 4
+    }
+
+    /// How many bytes of values went to local disk.
+    pub fn spilled_bytes(&self) -> usize {
+        match self.spilling {
+            Some(_) => self.values * 4,
+            None => 0,
+        }
     }
 
     /// The gathered rows as a column whose values lie in its frame, stamped
-    /// as format `version`.
-    pub fn finish(self, version: u16) -> Column {
+    /// as format `version`: `None` if the merge is stopped before a spilled
+    /// frame is whole. A frame in memory only fails to come to a column if
+    /// it has none of these.
+    pub fn finish(self, version: u16) -> Result<Option<Column>> {
         let Self {
             mut words,
             offsets,
             values,
+            spilling,
         } = self;
         let rows = offsets.len() - 1;
+        if let Some(mut spilling) = spilling {
+            for word in offsets.iter().chain([&(rows as u64)]) {
+                if words.len() + 2 > words.capacity() && !spilling.written(&mut words)? {
+                    return Ok(None);
+                }
+                words.push(*word as u32);
+                words.push((*word >> 32) as u32);
+            }
+            if !spilling.written(&mut words)? {
+                return Ok(None);
+            }
+            let Some(spill) = spilling.sealed(version)? else {
+                return Ok(None);
+            };
+            let values = AHEAD * 4..(AHEAD + values) * 4;
+            return Ok(Some(Column {
+                values: Values::Spilled(std::sync::Arc::new(spill), values),
+                offsets,
+            }));
+        }
         for word in offsets.iter().chain([&(rows as u64)]) {
             words.push(*word as u32);
             words.push((*word >> 32) as u32);
         }
         format::seal(Kind::Vectors, version, bytemuck::cast_slice_mut(&mut words));
         let frame = std::sync::Arc::new(Frame { words, version });
-        Column {
+        Ok(Some(Column {
             values: Values::Framed(frame, AHEAD..AHEAD + values),
             offsets,
-        }
+        }))
     }
 }
 
@@ -169,7 +267,7 @@ impl Column {
     pub fn resident(&self) -> usize {
         let values = match &self.values {
             Values::Memory(values) => values.len() * 4,
-            Values::Mapped(..) => 0,
+            Values::Mapped(..) | Values::Spilled(..) => 0,
             Values::Framed(frame, _) => frame.words.len() * 4,
         };
         values + self.offsets.len() * 8
@@ -178,7 +276,20 @@ impl Column {
     /// About how many bytes the column's vectors and offsets take wherever
     /// they lie: what a copy of it in memory would take.
     pub fn bytes(&self) -> usize {
-        self.values().len() * 4 + self.offsets.len() * 8
+        self.values_bytes() + self.offsets.len() * 8
+    }
+
+    /// How many bytes its vectors take wherever they lie.
+    pub fn values_bytes(&self) -> usize {
+        self.values().len() * 4
+    }
+
+    /// The spill its frame lies in, if it was gathered in one.
+    pub fn spill(&self) -> Option<std::sync::Arc<Spill>> {
+        match &self.values {
+            Values::Spilled(spill, _) => Some(spill.clone()),
+            _ => None,
+        }
     }
 
     pub fn get(&self, row: usize) -> Option<&[f32]> {
@@ -194,6 +305,7 @@ impl Column {
             Values::Memory(values) => values,
             Values::Mapped(map, range) => bytemuck::cast_slice(&map[range.clone()]),
             Values::Framed(frame, range) => bytemuck::cast_slice(&frame.words[range.clone()]),
+            Values::Spilled(spill, range) => bytemuck::cast_slice(&spill.bytes()[range.clone()]),
         }
     }
 
@@ -205,10 +317,14 @@ impl Column {
 
     /// As [`Self::encode`], stamped as format `version`.
     pub fn encode_as(&self, version: u16) -> Bytes {
-        if let Values::Framed(frame, _) = &self.values {
-            if frame.version == version {
+        match &self.values {
+            Values::Framed(frame, _) if frame.version == version => {
                 return Bytes::from_owner(FrameBytes(frame.clone()));
             }
+            Values::Spilled(spill, _) if spill.version() == version => {
+                return Bytes::from_owner(SpilledBytes(spill.clone()));
+            }
+            _ => {}
         }
         let values = self.values();
         let length = PADDING + values.len() * 4 + self.offsets.len() * 8 + 8;
@@ -548,6 +664,86 @@ mod tests {
     use crate::format::CollectionId;
     use vellev_core::{Object, ObjectId};
 
+    /// `vectors` gathered into a spill in `dir`, as a merge does, as a
+    /// column read in place, on a thread that may wait on the disk.
+    async fn spilled_in(dir: &Path, vectors: Vec<Option<Vec<f32>>>) -> Column {
+        use crate::blobs::Disk;
+        use crate::spill::Spills;
+        use crate::stopping::Stopping;
+        let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone());
+        let runtime = tokio::runtime::Handle::current();
+        let asked = spills.asked(runtime, Stopping::never(), "k".into());
+        tokio::task::spawn_blocking(move || {
+            let values = vectors.iter().flatten().map(Vec::len).sum();
+            let spilling = asked.begin().unwrap().unwrap();
+            let mut gathering = Gathering::spilled(values, vectors.len(), spilling);
+            for vector in &vectors {
+                let width = vector.as_ref().map_or(0, Vec::len);
+                assert!(gathering.with_room_for(width).unwrap());
+                gathering.push(vector.as_deref());
+            }
+            gathering.finish(format::FORMAT_VERSION).unwrap().unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A frame gathered in a spill is the frame gathered in memory, byte
+    /// for byte, wherever its pieces fall: among its values, among its
+    /// offsets, or both, rows with no vector among them, and whatever the
+    /// vectors' widths. Each row reads back in place, and it uploads as the
+    /// same bytes, none of them copied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frame_gathered_in_a_spill_is_the_one_gathered_in_memory_wherever_its_pieces_fall() {
+        let piece = SPILLED_AT_ONCE / 4;
+        let of = |rows: usize, width: usize| -> Vec<Option<Vec<f32>>> {
+            let row = |n: usize| {
+                let vector = (0..width).map(|at| (n * 7 + at) as f32);
+                (!n.is_multiple_of(5)).then(|| vector.collect())
+            };
+            (0..rows).map(row).collect()
+        };
+        for vectors in [
+            of(1, 3),
+            of(10, 2),
+            // Its values come to a piece, and the offsets go to the next.
+            of(piece / 64 + 1, 64),
+            // Its values are one piece and part of another.
+            of(3 * piece / 64, 64),
+            // Few values and many rows: a piece ends among the offsets.
+            of(piece / 2, 1),
+            // Every row without a vector but the one that makes it a spill.
+            [of(1, 3), vec![None; 2 * piece / 3]].concat(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let spilled = spilled_in(dir.path(), vectors.clone()).await;
+            let expected = gathered(&vectors).encode_as(format::FORMAT_VERSION);
+            let frame = spilled.encode_as(format::FORMAT_VERSION);
+            assert!(frame == expected, "{} rows", vectors.len());
+            let mapped = spilled.spill().expect("spilled");
+            assert_eq!(frame.as_ptr(), mapped.bytes().as_ptr(), "copied");
+            format::verify("k", &frame).unwrap();
+            for (n, vector) in vectors.iter().enumerate() {
+                assert_eq!(spilled.get(n), vector.as_deref(), "row {n}");
+            }
+            assert_eq!(spilled.resident(), spilled.offsets.len() * 8);
+            assert_eq!(spilled.len(), vectors.len());
+            drop((spilled, mapped, frame));
+        }
+    }
+
+    /// Asked for as another format, a spilled frame is framed afresh, as
+    /// any column is, and read as the same vectors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spilled_frame_asked_for_as_another_version_is_encoded_afresh() {
+        let vectors = vec![Some(vec![1.0, 2.0]), None, Some(vec![3.0])];
+        let dir = tempfile::tempdir().unwrap();
+        let spilled = spilled_in(dir.path(), vectors.clone()).await;
+        let older = format::FORMAT_VERSION - 1;
+        let afresh = spilled.encode_as(older);
+        assert_eq!(afresh, gathered(&vectors).encode_as(older));
+    }
+
     fn row(vector: Option<Vec<f32>>) -> Row {
         Row {
             collection: CollectionId(1),
@@ -577,7 +773,10 @@ mod tests {
         for vector in vectors {
             gathering.push(vector.as_deref());
         }
-        gathering.finish(format::FORMAT_VERSION)
+        gathering
+            .finish(format::FORMAT_VERSION)
+            .expect("a frame in memory")
+            .expect("nothing stops it")
     }
 
     #[test]

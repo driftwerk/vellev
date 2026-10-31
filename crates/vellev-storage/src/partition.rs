@@ -8,12 +8,15 @@ use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
 use futures::StreamExt;
 use serde::Serialize;
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
 
 use crate::backups::Held;
-use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Linked, Listed, Local, Transfers};
+use crate::blobs::{
+    is_plain, Author, Blobs, Disk, Layout, Linked, Listed, Local, Spills, Transfers,
+};
 use crate::catalog::Catalog;
 use crate::column::{self, Column, Gathering};
 use crate::coordinator::{
@@ -114,7 +117,14 @@ fn segment_built(
         build.held_here(stopping, HeldAt::Start);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
-    let vectors = vectors.map(|gathered| on.section("finishing", || gathered.finish(format)));
+    // Sealed and, spilled, read in place from here on, or given up.
+    let vectors = match vectors {
+        Some(gathered) => match on.section("finishing", || gathered.finish(format))? {
+            Some(column) => Some(column),
+            None => return Ok(None),
+        },
+        None => None,
+    };
     let indexed = match &vectors {
         Some(column) => state::indexed_stopping(
             catalog,
@@ -1201,6 +1211,8 @@ pub struct Writer {
     /// How many rows' tokens the last flush or merge held at once, at the
     /// most, as it indexed its rows.
     last_tokenized_at_once: AtomicUsize,
+    /// How many bytes of vectors the last merge gathered on local disk.
+    last_spilled: Arc<AtomicUsize>,
     /// How many merges were stopped only once they had loaded back what
     /// they built, past where a stop ends them.
     stops_past_loading: AtomicU64,
@@ -1313,7 +1325,7 @@ pub struct FlushTimes {
 
 /// The rows a build is of, ready to index, with what else their making
 /// says: `None` if there are to be none, as a merge's gather given up.
-type RowsToBuild<T> = Option<(SegmentFile, Option<Gathering>, T)>;
+type RowsToBuild<T> = Result<Option<(SegmentFile, Option<Gathering>, T)>>;
 
 /// A merge as it was planned, with all it takes of the state to build.
 struct MergePlanned {
@@ -1451,6 +1463,7 @@ impl Writer {
             merges_stopped: AtomicU64::new(0),
             merge_panics: AtomicBool::new(false),
             last_tokenized_at_once: AtomicUsize::new(0),
+            last_spilled: Arc::default(),
             stops_past_loading: AtomicU64::new(0),
             merge_past_loading: AtomicBool::new(false),
             merge_task: std::sync::Mutex::new(None),
@@ -2773,8 +2786,9 @@ impl Writer {
         vectors: Option<Gathering>,
         catalog: Catalog,
     ) -> Result<Built> {
-        let rows =
-            move |_: &Stopping, _: Option<&MergeBuild>, _: OnPool<'_>| Some((file, vectors, ()));
+        let rows = move |_: &Stopping, _: Option<&MergeBuild>, _: OnPool<'_>| {
+            Ok(Some((file, vectors, ())))
+        };
         match self
             .built_stopping(rows, catalog, &Stopping::never(), None)
             .await?
@@ -2835,7 +2849,7 @@ impl Writer {
             };
             let cpu = vellev_index::pool::thread_cpu();
             let built = match rows(&stopping, build.as_deref(), on) {
-                Some((file, vectors, with)) => {
+                Ok(Some((file, vectors, with))) => {
                     let building = Instant::now();
                     let built = segment_built(
                         turn,
@@ -2857,7 +2871,8 @@ impl Writer {
                     }
                     built.map(|built| built.map(|built| (built, with)))
                 }
-                None => Ok(None),
+                Ok(None) => Ok(None),
+                Err(unbuilt) => Err(unbuilt),
             };
             if let (Some(build), Some(before), Some(after)) =
                 (&build, cpu, vellev_index::pool::thread_cpu())
@@ -2915,20 +2930,26 @@ impl Writer {
     /// discarded ([`crate::Transfers`]); those that went up are deleted
     /// as `staged` is dropped. A merge's bytes go up `carrying` its share
     /// of its build, held by every copy of them.
-    async fn upload_stopping(
+    async fn upload_stopping<'a>(
         &self,
-        prepared: &Prepared,
+        prepared: &'a Prepared,
         staged: &mut Staged,
         stopping: &Stopping,
         carrying: Option<&Arc<Uploading>>,
     ) -> Result<bool> {
         let Prepared { meta, built, index } = prepared;
+        let file = |key: &'a str, bytes: &'a Bytes| (key, bytes, None);
         let files = [
-            meta.vectors.as_deref().map(|key| (key, &built.column)),
-            meta.index.as_deref().zip(index.as_ref()),
-            Some((meta.key.as_str(), &built.segment)),
+            meta.vectors
+                .as_deref()
+                .map(|key| (key, &built.column, built.vectors.spill())),
+            meta.index
+                .as_deref()
+                .zip(index.as_ref())
+                .map(|(key, bytes)| file(key, bytes)),
+            Some(file(meta.key.as_str(), &built.segment)),
         ];
-        for (key, bytes) in files.into_iter().flatten() {
+        for (key, bytes, spill) in files.into_iter().flatten() {
             if stopping.stopped(MergeStage::Uploading) {
                 return Ok(false);
             }
@@ -2941,9 +2962,12 @@ impl Writer {
                 None => bytes.clone(),
             };
             let (blobs, owned) = (self.partition.blobs.clone(), key.to_string());
-            staged
-                .putting
-                .push(tokio::spawn(async move { blobs.put(&owned, bytes).await }));
+            staged.putting.push(tokio::spawn(async move {
+                match spill {
+                    Some(spill) => blobs.put_spilled(&owned, bytes, spill).await,
+                    None => blobs.put(&owned, bytes).await,
+                }
+            }));
             let put = staged.putting.last_mut().expect("just pushed");
             match stopping.unless_stopped(MergeStage::Uploading, put).await {
                 Some(Ok(put)) => {
@@ -3295,7 +3319,15 @@ impl Writer {
             return Ok(Ended::Dropped(MergeEnd::Stale));
         }
         let dead = run.dead();
-        let gather = self.gathered(run, planned, reckoning, named_at, catalog.clone());
+        let names = self.named(named_at, "-merged");
+        let gather = self.gathered(
+            run,
+            planned,
+            reckoning,
+            named_at,
+            names.vectors.clone(),
+            catalog.clone(),
+        );
         let built = self.built_stopping(gather, catalog.clone(), stopping, Some(build.clone()));
         let Some((built, shape)) = built.await? else {
             return Ok(self.given_up(planned));
@@ -3305,11 +3337,7 @@ impl Writer {
         // `clean` leaves the merge's while it is under way.
         let mut staged = self.staging();
         let encoding = Instant::now();
-        let merged = Self::prepared(
-            self.named(named_at, "-merged").meta(shape),
-            built,
-            self.writes(),
-        );
+        let merged = Self::prepared(names.meta(shape), built, self.writes());
         self.phase_ended(MergePhase::Encode, merged.is_ok(), encoding);
         let merged = merged?;
         #[cfg(test)]
@@ -3422,11 +3450,14 @@ impl Writer {
     /// of the state: all a merge does under the building lock and the
     /// state's before it commits, a walk of its run's segments.
     fn merge_planned(&self) -> Option<MergePlanned> {
+        let spills = self.partition.blobs.spills();
+        let spilled = spills.as_ref().map(Spills::held_going_up);
         self.partition.read(|state| {
             let merge = state.merge_plan(&self.merging)?;
+            let above = self.merging.clustered_above;
             Some(MergePlanned {
                 run: state.merge_run(&merge),
-                reckoning: state.merge_reckoning(&merge, self.merging.clustered_above),
+                reckoning: state.merge_reckoning(&merge, above, spilled),
                 named_at: state.position(),
                 catalog: state.catalog().clone(),
                 merge,
@@ -3441,19 +3472,25 @@ impl Writer {
     /// and no async thread waits on it. Copied a chunk at a time, it gives
     /// up within a chunk of a stop, or of a restore that has begun or been
     /// made since the plan, which would only drop the merge at its commit:
-    /// and, last of all, before its frame is sealed.
+    /// and, last of all, before its frame is sealed. Its vectors go into
+    /// the store's cache if it has one, each write waited for where a stop
+    /// finds it, and a disk that fails one fails the merge, whose plan
+    /// counted on their not being held.
     fn gathered(
         &self,
         run: Run,
         planned: u64,
         reckoning: Reckoning,
         named_at: LogPosition,
+        vectors_key: String,
         catalog: Catalog,
     ) -> impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<Shape> + Send + 'static
     {
         let (epoch, restoring) = (self.epoch.clone(), self.restoring.clone());
         let above = self.merging.clustered_above;
         let (timings, key) = (self.timings.clone(), self.lease.key.clone());
+        let (spills, runtime) = (self.partition.blobs.spills(), Handle::current());
+        let last_spilled = self.last_spilled.clone();
         move |stopping, build, on| {
             // On the pool of the merge's slot, as the rest of the build is,
             // and timed as the copy.
@@ -3472,25 +3509,30 @@ impl Writer {
                     let phase = Timed::MergeGivenUp(MergePhase::Gather);
                     timings.record(phase, &key, gathering.elapsed());
                 };
-                let merged = run.merged(named_at, GATHERED_AT_ONCE, &mut goes_on);
-                let Some((file, vectors, copied)) = merged else {
+                let spill =
+                    spills.map(|spills| spills.asked(runtime, stopping.clone(), vectors_key));
+                let merged = run.merged(named_at, GATHERED_AT_ONCE, spill, &mut goes_on);
+                if !matches!(merged, Ok(Some(_))) {
                     given_up(gathering);
-                    return None;
+                }
+                let Some((file, vectors, copied)) = merged? else {
+                    return Ok(None);
                 };
+                last_spilled.store(vectors.spilled_bytes(), Ordering::SeqCst);
                 let tombstones = file.tombstones.len();
                 let shape = Shape::of_gathered(&catalog, &file.rows, &vectors, tombstones, above);
                 // Asked once more, as what comes next, sealing the frame,
                 // sums every vector with nothing to ask it.
                 if !goes_on(file.rows.len()) {
                     given_up(gathering);
-                    return None;
+                    return Ok(None);
                 }
                 if let Some(build) = build {
                     let reckoning = reckoning.gathered(copied, &vectors);
                     build.reckon(reckoning.peak());
                 }
                 timings.record(Timed::Merge(MergePhase::Gather), &key, gathering.elapsed());
-                Some((file, Some(vectors), shape))
+                Ok(Some((file, Some(vectors), shape)))
             })
         }
     }
@@ -3618,6 +3660,13 @@ impl Writer {
     #[doc(hidden)]
     pub fn panic_merges_in_build(&self, panics: bool) {
         self.merge_panics.store(panics, Ordering::SeqCst);
+    }
+
+    /// How many bytes of vectors the last merge this writer gathered on
+    /// local disk, none if it gathered them in memory. For tests.
+    #[doc(hidden)]
+    pub fn last_spilled(&self) -> usize {
+        self.last_spilled.load(Ordering::SeqCst)
     }
 
     /// How many rows' tokens the last flush or merge held at once, at the
@@ -5035,6 +5084,66 @@ mod tests {
             kept.await.unwrap();
             committing.await.unwrap().unwrap();
             assert!(!writer.is_closed() && !writer.stalled());
+        });
+    }
+
+    /// A merge reads its vectors from a mapped spill as one reads them from
+    /// the heap: its filter and text indexes, and the binary codes that are
+    /// never written, as they hold them whoever loads them, are the same.
+    /// Its clustered index, written, is held to that by byte in
+    /// `merge_spill`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_merge_gathered_on_disk_indexes_what_one_gathered_in_memory_does() {
+        fn rows(from: u32, to: u32) -> Vec<Mutation> {
+            let row = |n: u32| Mutation::Upsert {
+                collection: notes(),
+                id: ObjectId(uuid::Uuid::from_u128(u128::from(n))),
+                properties: serde_json::Map::from_iter([("n".to_string(), n.into())]),
+                vector: Some(vec![(n as f32).sin(), (n as f32).cos()]),
+                only_if_version: None,
+            };
+            (from..to).map(row).collect()
+        }
+        async fn merged(blobs: Arc<dyn Blobs>) -> Writer {
+            let (writer, _) = writer_on(blobs).await;
+            writer.commit(vec![create()]).await.unwrap();
+            let past_a_shortlist = state::SHORTLIST_ABOVE as u32 + 1_000;
+            for round in 0..2 {
+                let from = round * past_a_shortlist;
+                writer
+                    .commit(rows(from, from + past_a_shortlist))
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+            }
+            writer.merge().await.unwrap().expect("the segments merge");
+            writer
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let cached = crate::blobs::CachedBlobs::new(memory, dir.path());
+        let spilled = merged(Arc::new(cached)).await;
+        assert!(spilled.last_spilled() > 0, "gathered in memory");
+        let held = merged(Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())))).await;
+        assert_eq!(held.last_spilled(), 0);
+        spilled.partition.read(|spilled| {
+            held.partition.read(|held| {
+                let last = |state: &'_ State| {
+                    let held = state.layers().filter(|layer| !layer.rows.is_empty());
+                    let layers: Vec<_> = held.collect();
+                    assert_eq!(layers.len(), 1, "the merged segment alone");
+                    layers[0].indexes.values().next().expect("an index").clone()
+                };
+                let (spilled, held) = (last(spilled), last(held));
+                assert!(spilled.text == held.text, "another text index");
+                assert!(spilled.rows == held.rows, "another filter index");
+                let codes = |index: &state::LayerIndex| match &index.vectors {
+                    Some(state::Vectors::Binary(codes)) => codes.digest(),
+                    _ => panic!("no binary codes"),
+                };
+                assert_eq!(codes(&spilled), codes(&held), "other codes");
+            })
         });
     }
 

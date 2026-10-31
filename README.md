@@ -761,6 +761,19 @@ dead connection passes to another node rather than waiting with it:
   second time reads nothing through.
   A node whose cache directory cannot be written does not open tenants
   that have vectors.
+- A merge gathers its vectors in the cache directory, not in memory, in a
+  file of its own named `<id>.spill`, each 4 MiB write a step as above. It
+  takes the disk the merged segment's copy would take anyway, sooner: once
+  the store has the file it becomes that copy, by a rename, and is not
+  written again. So a node with its cache on a disk it can fill needs room
+  for the vectors of each merge building at once, on top of the segments
+  they replace, from the start of the merge. A disk that fills or stops
+  answering fails the merge where it gathers, leaves the file gone and
+  commits nothing, and the merge is tried again in its time. A merge
+  stopped, dropped or failed takes its file with it; one left by a node that
+  was killed goes as a node next starts on the directory, however new,
+  and a file another process is still writing is left alone. A node with no
+  cache directory gathers in memory.
 - A flush's, a merge's and a restore's segments are built and go up before
   writes wait on them; a failure there commits nothing, leaves the writer
   as it was and deletes what went up. Writes wait only while a commit is

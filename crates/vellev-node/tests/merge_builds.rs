@@ -16,7 +16,7 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{MergesStopped, Node, NodeError, Settings};
-use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
 use vellev_storage::{Holding, MergeGate, Mutation, State, MERGE_BUILDS};
 
@@ -834,6 +834,43 @@ async fn a_merge_stopped_by_a_lease_lost_or_a_shutdown_is_counted_as_that() {
     within(30, "the request never ended", shutting)
         .await
         .unwrap();
+}
+
+/// The spills in the cache directory `dir`.
+fn spills(dir: &std::path::Path) -> usize {
+    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    let spill =
+        |entry: &std::fs::DirEntry| entry.path().extension().is_some_and(|it| it == "spill");
+    entries.filter(spill).count()
+}
+
+/// M8. A tenant's writer is given the node's store as it is: a merge a node
+/// runs over a cache gathers its vectors there, whatever else the storage
+/// rules say of a store that spills. A store put between them that says
+/// nothing of spills would leave every node gathering on the heap, with every
+/// rule of the storage crate still passing. And what is gathered goes, with
+/// the merge, as the node shuts down.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_s_merge_gathers_in_its_store_s_cache_and_a_shutdown_leaves_nothing_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ObjectBlobs::new(Arc::new(object_store::memory::InMemory::new()));
+    let cached: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(Arc::new(store), dir.path()));
+    let node = node_on(cached, |settings| {
+        settings.flush_rows = NOTES as usize;
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::GatheringUntilLetGo));
+    four_flushes(&node, "merging").await;
+    until(30, "the merge never gathered", || builds.held() == 1).await;
+    assert_eq!(spills(dir.path()), 1, "gathered on the heap");
+    node.shutdown().await;
+    builds.hold(None);
+    builds.let_one_go();
+    until(30, "a stopped merge's spill stays", || {
+        spills(dir.path()) == 0 && builds.under_way() == 0
+    })
+    .await;
 }
 
 /// M7-R4, for the sweep's own stop: every sweep that finds the tenant held

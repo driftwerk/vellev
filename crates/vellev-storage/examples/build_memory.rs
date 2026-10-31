@@ -4,7 +4,9 @@
 //!   cargo run --release -p vellev-storage --example build_memory
 //!
 //! Environment: ROWS (200000), DIMS (768), TEXT (passage, or wide: 200 words
-//! over a large vocabulary), CLUSTERED (0; 1 clusters what is merged).
+//! over a large vocabulary), CLUSTERED (0; 1 clusters what is merged), CACHED
+//! (0; 1 keeps a cache over the store, as a node does, so that a merge's
+//! vectors are gathered there).
 //!
 //! A counting allocator measures each peak, above what was held before it.
 //! A thread reads the count every millisecond, and each crest it saw is
@@ -25,7 +27,7 @@ use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, NodeId,
     ObjectId, Property, TenantId,
 };
-use vellev_storage::blobs::{Blobs, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Acquired, Coordinator, MemoryCoordinator, PartitionKey};
 use vellev_storage::{tokenize_at_once, Follower, Merging, Mutation, Writer, TOKENIZED_AT_ONCE};
 
@@ -121,11 +123,13 @@ struct Shape {
     dimensions: usize,
     wide: bool,
     clustered: bool,
+    cached: bool,
 }
 
 /// A writer and a store on local disk, as a node's cache is.
 struct Store {
     _dir: tempfile::TempDir,
+    _cache: tempfile::TempDir,
     key: PartitionKey,
     blobs: Arc<dyn Blobs>,
     coordinator: Arc<MemoryCoordinator>,
@@ -134,8 +138,13 @@ struct Store {
 
 async fn store(shape: Shape) -> Store {
     let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
     let local = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::on_disk(Arc::new(local), dir.path()));
+    let blobs: Arc<dyn Blobs> = match shape.cached {
+        true => Arc::new(CachedBlobs::new(blobs, cache.path())),
+        false => blobs,
+    };
     let coordinator = Arc::new(MemoryCoordinator::default());
     let key = PartitionKey {
         tenant: TenantId::new("t").unwrap(),
@@ -182,6 +191,7 @@ async fn store(shape: Shape) -> Store {
     writer.commit(vec![create]).await.unwrap();
     Store {
         _dir: dir,
+        _cache: cache,
         key,
         blobs,
         coordinator,
@@ -320,6 +330,7 @@ async fn main() {
         dimensions: setting("DIMS", 768),
         wide: std::env::var("TEXT").is_ok_and(|text| text == "wide"),
         clustered: setting("CLUSTERED", 0) == 1,
+        cached: setting("CACHED", 0) == 1,
     };
     for (arm, at_once) in [
         ("all at once", usize::MAX),
