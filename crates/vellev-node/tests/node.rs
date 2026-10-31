@@ -1297,6 +1297,14 @@ fn ten_notes(from: u64) -> Vec<Mutation> {
     (from..from + 10).map(|n| note(n, "owl", None)).collect()
 }
 
+/// As [`ten_notes`], with vectors: their flush writes a vectors file, and
+/// then its segment.
+fn ten_with_vectors(from: u64) -> Vec<Mutation> {
+    (from..from + 10)
+        .map(|n| note(n, "owl", Some(vec![n as f32, 1.0])))
+        .collect()
+}
+
 /// A hold that lapses, as renewals go unanswered for longer than the lease,
 /// is not a hold lost: renewing goes on, and once one is answered the tenant
 /// is held again, and is the one requests are handed. Its maintenance is
@@ -1587,7 +1595,7 @@ async fn a_flush_landing_in_a_lapse_has_its_round_after_it() {
         .await
         .unwrap();
     cluster.store.fault(Some(("vectors", Fault::Gated)));
-    held.write(ten_notes(0)).await.unwrap();
+    held.write(ten_with_vectors(0)).await.unwrap();
     let began = async {
         while cluster.store.vectors_written.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1636,7 +1644,7 @@ async fn a_flush_held_part_way(cluster: &Cluster, node: &Node, tenant: &TenantId
         .await
         .unwrap();
     cluster.store.fault(Some(("vectors", Fault::Gated)));
-    held.write(ten_notes(0)).await.unwrap();
+    held.write(ten_with_vectors(0)).await.unwrap();
     let began = async {
         while cluster.store.vectors_written.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1729,7 +1737,7 @@ async fn a_tenant_let_go_flushes_no_more() {
         .await
         .unwrap();
     cluster.store.fault(Some(("vectors", Fault::Fails)));
-    held.write(ten_notes(0)).await.unwrap();
+    held.write(ten_with_vectors(0)).await.unwrap();
     let failed = async {
         while node.flushing().failed == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
