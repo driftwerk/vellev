@@ -537,6 +537,13 @@ impl std::fmt::Debug for Probe {
 }
 
 #[cfg(test)]
+impl Probe {
+    pub(crate) fn new(told: Arc<dyn Fn(Probed) + Send + Sync>) -> Self {
+        Self(told)
+    }
+}
+
+#[cfg(test)]
 impl Drop for Probe {
     fn drop(&mut self) {
         (self.0)(Probed::Freed);
@@ -1112,6 +1119,9 @@ pub struct TextsApplied {
 /// replaced segments, most of what a merge's commit would hold the state's
 /// write lock for (node memory note, §2.9).
 pub(crate) struct Discarded {
+    /// Told as it is freed, as a test asks.
+    #[cfg(test)]
+    pub(crate) probe: Option<Arc<Probe>>,
     rows: Vec<Row>,
     indexes: Indexes,
     segments: Vec<Segment>,
@@ -1168,10 +1178,14 @@ impl Drop for Discarded {
         let indexes = std::mem::take(&mut self.indexes);
         let segments = std::mem::take(&mut self.segments);
         let counted = self.counted.take();
+        #[cfg(test)]
+        let probe = self.probe.take();
         if rows.is_empty() && indexes.is_empty() && segments.is_empty() {
             return;
         }
         let free = move || {
+            #[cfg(test)]
+            drop(probe);
             drop((segments, rows, indexes));
             drop(counted);
         };
@@ -2725,6 +2739,8 @@ impl State {
             parts,
         };
         Discarded {
+            #[cfg(test)]
+            probe: None,
             rows: Vec::new(),
             indexes: Indexes::new(),
             segments: self.segments.splice(run, [merged]).collect(),
@@ -3015,6 +3031,8 @@ impl State {
             ..
         } = &mut self.memtable;
         let discarded = Discarded {
+            #[cfg(test)]
+            probe: None,
             rows: rows.drain(..held).collect(),
             indexes: std::mem::take(indexes),
             segments: Vec::new(),

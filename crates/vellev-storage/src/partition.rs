@@ -1154,6 +1154,10 @@ pub struct Writer {
     /// memory, if a test has set one: where one may be dropped.
     #[cfg(test)]
     adopted_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
+    /// A probe for what the next checkpoint takes out of memory, if a test
+    /// has set one.
+    #[cfg(test)]
+    discarded_probe: std::sync::Mutex<Option<Arc<state::Probe>>>,
     /// The stop of the merge under way, if one is: see
     /// [`Self::stop_merges`].
     merge_stop: Arc<std::sync::Mutex<Option<Stop>>>,
@@ -1342,6 +1346,8 @@ impl Writer {
             merge_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             adopted_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            discarded_probe: std::sync::Mutex::new(None),
             merge_stop: Arc::default(),
             merge_stop_at: std::sync::Mutex::new(None),
             merges_stopped: AtomicU64::new(0),
@@ -1925,7 +1931,10 @@ impl Writer {
             })
             .await?;
         #[cfg(test)]
+        let mut discarded = discarded;
+        #[cfg(test)]
         {
+            discarded.probe = self.discarded_probe.lock().expect("probe lock").take();
             let gate = self.adopted_gate.lock().expect("gate lock").clone();
             if let Some(gate) = gate {
                 gate.reached.notify_one();
@@ -4823,6 +4832,37 @@ mod tests {
             all.push(seen.recv_timeout(ANSWERED).expect(&what));
         }
         all
+    }
+
+    /// A flush ends with what it took out of memory freed, however few
+    /// rows that is: what comes after it, a test's measure of a merge's
+    /// peak among them, finds them gone. Only a merge's free, of whole
+    /// segments, is left to run on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flush_ends_with_what_it_took_out_freed() {
+        let writer = Arc::new(writer().await);
+        writer.commit(vec![create(), upsert(0)]).await.unwrap();
+        let (let_go, held) = std::sync::mpsc::channel::<()>();
+        let (reached, at_free) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let probe = state::Probe::new(Arc::new(move |_| {
+            let _ = reached.send(());
+            let _ = held.lock().unwrap().recv_timeout(FREE_HELD);
+        }));
+        *writer.discarded_probe.lock().unwrap() = Some(Arc::new(probe));
+        let mut flush = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.flush().await.map(|_| ()) }
+        });
+        at_free.recv_timeout(FREE_HELD).expect("the free began");
+        let ended = tokio::time::timeout(Duration::from_secs(1), &mut flush).await;
+        assert!(ended.is_err(), "the flush ended before its free");
+        drop(let_go);
+        let flushed = tokio::time::timeout(ANSWERED, flush).await;
+        flushed
+            .expect("the flush ended once freed")
+            .unwrap()
+            .unwrap();
     }
 
     /// The state's write lock is free when a replaced segment is let go,
