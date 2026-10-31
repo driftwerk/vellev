@@ -1370,6 +1370,9 @@ async fn a_lapse_that_ends_in_a_refusal_loses_the_hold_with_no_round_run_on_it()
     until_lapsed(&held).await;
     let rounds = coordinator.history_forgotten.load(Ordering::SeqCst);
     held.write(ten_notes(0)).await.unwrap();
+    // Time for what was asked to be done, were it to be. With the tenant
+    // taken over at once, any flush would be refused, and show nothing.
+    tokio::time::sleep(lease / 2).await;
     cluster.clock.advance(lease * 2);
     cluster.node().tenant(&acme).await.unwrap();
     coordinator.failing.store(false, Ordering::SeqCst);
