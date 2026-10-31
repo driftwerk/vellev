@@ -1116,6 +1116,143 @@ async fn a_restore_that_fails_as_it_commits_has_the_tenant_opened_afresh() {
     assert_eq!(reopened.read(count), 3);
 }
 
+/// `acme` on `node` that may be restored for an hour back, with a merge a
+/// request makes held where it builds: the tenant, the receipt of its first
+/// write, and the request.
+async fn merged_by_a_request(
+    node: &Node,
+    acme: &TenantId,
+) -> (
+    Arc<Tenant>,
+    vellev_storage::Receipt,
+    tokio::task::JoinHandle<()>,
+) {
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilLetGo));
+    let kept = restorable(node, acme).await;
+    let opened = node.tenant(acme).await.unwrap();
+    for n in 3..7 {
+        opened.write(vec![note(n, "owl", None)]).await.unwrap();
+        opened.flush().await.unwrap();
+    }
+    let request = tokio::spawn({
+        let opened = opened.clone();
+        async move {
+            // Whatever it answers once the merge is stopped: it answers.
+            let _ = opened.compact(Duration::from_secs(60 * 60)).await;
+        }
+    });
+    let begun = async {
+        while builds.held() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), begun)
+        .await
+        .expect("the request's merge came to build");
+    (opened, kept, request)
+}
+
+/// Let a merge held by [`merged_by_a_request`] end.
+async fn ended(node: &Node, request: tokio::task::JoinHandle<()>) {
+    node.merge_builds().hold(None);
+    tokio::time::timeout(Duration::from_secs(30), request)
+        .await
+        .expect("the request ended")
+        .unwrap();
+}
+
+const LEASE_LOST: vellev_node::MergesStopped = vellev_node::MergesStopped {
+    let_go: 0,
+    lease: 1,
+    drop: 0,
+    shutdown: 0,
+};
+
+/// A write that fails closes the writer, and the hold goes with it, as the
+/// write learns: a merge under way is stopped, and counted as a lease lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_by_a_write_that_closed_the_writer_is_counted_as_the_lease() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let (opened, _, request) = merged_by_a_request(&node, &tenant("acme")).await;
+    cluster.store.fault(Some(("log", Fault::Fails)));
+    assert!(opened.write(vec![note(7, "owl", None)]).await.is_err());
+    cluster.store.fault(None);
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    ended(&node, request).await;
+}
+
+/// A restore that fails as it commits closes the writer, and the hold goes
+/// with it as the restore's task ends: the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_by_a_restore_that_closed_the_writer_is_counted_as_the_lease() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    let (_opened, kept, request) = merged_by_a_request(&node, &acme).await;
+    cluster.store.fault(Some(("manifest", Fault::Fails)));
+    assert!(node
+        .restore(&acme, Point::Position(kept.position), RequestId::generate())
+        .await
+        .is_err());
+    cluster.store.fault(None);
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    ended(&node, request).await;
+}
+
+/// A hold run out, with renewals failing but not refused, is lost only as
+/// the tenant is next asked for: the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_as_a_tenant_whose_hold_ran_out_is_asked_for_is_counted_as_the_lease() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let lease = Duration::from_millis(500);
+    let node = node_leasing(&cluster, coordinator.clone(), lease);
+    let acme = tenant("acme");
+    let (_opened, _, request) = merged_by_a_request(&node, &acme).await;
+    coordinator.failing.store(true, Ordering::SeqCst);
+    tokio::time::sleep(lease * 2).await;
+    assert_eq!(node.merges().stopped, Default::default(), "lost by itself");
+    let _ = node.tenant(&acme).await;
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    ended(&node, request).await;
+}
+
+/// A writer stuck in a commit is given up as the hold is next renewed: the
+/// same, with no failure for anything else to learn of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_as_a_stuck_writer_is_given_up_is_counted_as_the_lease() {
+    let cluster = Cluster::new();
+    // How long a commit may be held comes of the store's bounds.
+    let node = cluster.node_from(Settings {
+        lease: Duration::from_millis(600),
+        transfers: Transfers {
+            request_within: Duration::from_millis(100),
+            ..Transfers::default()
+        },
+        ..cluster.settings()
+    });
+    let (opened, _, request) = merged_by_a_request(&node, &tenant("acme")).await;
+    cluster.store.fault(Some(("log", Fault::NeverAnswers)));
+    let stuck = tokio::spawn(async move { opened.write(vec![note(7, "owl", None)]).await });
+    let given_up = async {
+        while node.merges().stopped == Default::default() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(120), given_up)
+        .await
+        .expect("the stuck writer was given up");
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    cluster.store.fault(None);
+    ended(&node, request).await;
+    stuck.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_tenant_is_held_while_its_node_lives_and_passes_to_another_when_it_dies() {
     let cluster = Cluster::new();

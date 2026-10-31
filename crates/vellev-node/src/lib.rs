@@ -850,6 +850,13 @@ impl Tenant {
         self.work.held()
     }
 
+    /// Hold the tenant's merges, past loading back what they built, until
+    /// let go. For tests.
+    #[doc(hidden)]
+    pub fn hold_merges_before_commit(&self) -> Arc<vellev_storage::MergeGate> {
+        self.work.writer.hold_merges_before_commit()
+    }
+
     /// When the hold on the tenant runs out unless renewed: each renewal
     /// moves it on. For tests.
     #[doc(hidden)]
