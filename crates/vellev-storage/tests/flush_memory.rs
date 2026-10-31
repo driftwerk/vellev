@@ -380,6 +380,8 @@ struct Shape {
     dying: (usize, usize),
     /// How many collections the rows go to.
     collections: usize,
+    /// A collection whose rows are spared if a row dying is of another.
+    sparing: Option<usize>,
 }
 
 impl Shape {
@@ -394,6 +396,7 @@ impl Shape {
             shares: &[1, 1, 1, 1],
             dying: (0, 0),
             collections: 1,
+            sparing: None,
         }
     }
 
@@ -418,6 +421,15 @@ impl Shape {
     const fn dying(self, from: usize, to: usize) -> Self {
         Self {
             dying: (from, to),
+            ..self
+        }
+    }
+
+    /// Every collection's rows dying, but for the first's.
+    const fn sparing_one(self) -> Self {
+        Self {
+            dying: (0, self.rows),
+            sparing: Some(0),
             ..self
         }
     }
@@ -518,6 +530,7 @@ async fn merge_measured(shape: Shape, at_once: usize) -> Measured {
             dying.extend(these.map(|at| (at - place + writes.first, writes)));
             place += rows;
         }
+        dying.retain(|(n, writes)| shape.sparing != Some(n % writes.collections));
         for batch in dying.chunks(500) {
             let deletes = batch.iter().map(|(n, writes)| Mutation::Delete {
                 collection: docs(n % writes.collections),
@@ -705,7 +718,13 @@ const RECKONED_RUNS: [Shape; 4] = [
 ];
 
 /// Rows that die together, not evenly, and a stale segment's rewrite.
-const RECKONED_DEATHS: [Shape; 6] = [
+const RECKONED_DEATHS: [Shape; 7] = [
+    // All the deaths one collection's but for the first: what is left is
+    // coded and trained as a whole collection, not a share of each of eight.
+    Shape::of(40_000, WIDE, Text::Short)
+        .over(8)
+        .shared(&[1])
+        .sparing_one(),
     // Long rows stay as short rows die, whose run is a third long at plan.
     Shape::of(CHUNKED, NARROW, LONG_FIRST)
         .shared(&[1])

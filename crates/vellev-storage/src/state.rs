@@ -1140,6 +1140,18 @@ fn framed_text(length: usize) -> usize {
         }
 }
 
+/// How long a date is as text in a frame: to the second, and in threes of
+/// digits past it as far as it has them.
+fn framed_date(date: &chrono::DateTime<chrono::Utc>) -> usize {
+    use chrono::Timelike;
+    20 + match date.nanosecond() {
+        0 => 0,
+        nanos if nanos.is_multiple_of(1_000_000) => 4,
+        nanos if nanos.is_multiple_of(1_000) => 7,
+        _ => 10,
+    }
+}
+
 /// How many bytes an integer takes in a frame, with its header.
 fn framed_int(value: i64) -> usize {
     match value {
@@ -1181,8 +1193,7 @@ fn row_sizes(Row { object, .. }: &Row) -> (usize, usize) {
             Value::Int(value) => 1 + framed_text(3) + framed_int(*value),
             Value::Number(_) => 1 + framed_text(6) + 9,
             Value::Bool(_) => 1 + framed_text(4) + 1,
-            // Written out to the second, as they mostly are.
-            Value::Date(_) => 1 + framed_text(4) + framed_text(20),
+            Value::Date(date) => 1 + framed_text(4) + framed_text(framed_date(date)),
         };
     }
     (copied, encoded)
@@ -2800,22 +2811,29 @@ impl State {
                 tokens_all += block.tokens as f64;
                 tokens.push((live as f64, block.tokens as f64 * share));
             }
-            let live = (parts.count - segment.dead.count()) as f64 / parts.count as f64;
+            let live_rows = parts.count - segment.dead.count();
+            let live = live_rows as f64 / parts.count as f64;
             reckoning.rows += copied;
             reckoning.vectors += segment.vectors.bytes() as f64 * live;
             besides += parts.filters as f64 * copied / parts.copied.max(1) as f64;
+            // Deaths may all be one collection's, and the marks don't say
+            // whose: each is reckoned as many of its rows as can be live.
             for (collection, rows) in &parts.collections {
-                *rows_of.entry(*collection).or_default() += *rows as f64 * live;
+                *rows_of.entry(*collection).or_default() += (*rows).min(live_rows) as f64;
             }
             let live_tokens = match tokens_all > 0.0 {
                 true => tokens_live / tokens_all,
                 false => live,
             };
             for (collection, name, shape) in &parts.walked.fields {
-                fields
-                    .entry((*collection, name.as_str()))
-                    .or_default()
-                    .add(shape, live_tokens);
+                // Its rows are dead, but a share of the segment's would
+                // count them, were another collection's rows beside them.
+                if self.catalog.schema(*collection).is_some() {
+                    fields
+                        .entry((*collection, name.as_str()))
+                        .or_default()
+                        .add(shape, live_tokens);
+                }
             }
         }
         for (collection, rows) in rows_of {
@@ -3844,7 +3862,9 @@ mod tests {
             let properties = &mut row.object.properties;
             properties.insert("score".to_string(), Value::Number(at as f64 / 3.0));
             properties.insert("kept".to_string(), Value::Bool(at % 2 == 0));
-            let date = chrono::DateTime::from_timestamp(at as i64, 0).unwrap();
+            // Whole seconds, and to the milli, micro and nanosecond.
+            let nanos = [0, 7_000_000, 7_000, 7][at % 4];
+            let date = chrono::DateTime::from_timestamp(at as i64, nanos).unwrap();
             properties.insert("at".to_string(), Value::Date(date));
             properties.insert("big".to_string(), Value::Int((at as i64) << 34));
         }
@@ -3863,6 +3883,12 @@ mod tests {
         let reckoned = rows + file.tombstones.len() * FRAMED_TOMBSTONE;
         let off = (reckoned as f64 - frame) / frame;
         assert!(off.abs() < 0.01, "{reckoned} bytes, of a frame of {frame}");
+        // A date's text is what it is to the byte, however fine.
+        for nanos in [0, 7_000_000, 7_000, 7] {
+            let date = chrono::DateTime::from_timestamp(5, nanos).unwrap();
+            let text = serde_json::to_string(&date).unwrap();
+            assert_eq!(framed_date(&date), text.len() - 2, "{text}");
+        }
     }
 
     /// A row's map is what a `BTreeMap` built in order allocates, and a
@@ -3950,6 +3976,55 @@ mod tests {
         };
         let reckoning = built.state.merge_reckoning(&plan, CLUSTERED_ABOVE);
         assert_eq!(reckoning.peak(), 0, "{reckoning:?}");
+    }
+
+    /// A collection dropped beside a live one in a segment counts for
+    /// nothing of its text, though the segment's rows are not all dead.
+    #[test]
+    fn a_dropped_collection_beside_a_live_one_reckons_none_of_its_text() {
+        let reckoned = |dropped: bool| {
+            let mut built = Built::new(&["other"]);
+            built.commit(vec![Op::CreateCollection {
+                id: CollectionId(5),
+                schema: Box::new(Collection {
+                    properties: vec![Property::new("title", DataType::Text).searchable()],
+                    ..schema("texts")
+                }),
+            }]);
+            let rows = (0..2_000u128).map(|n| Op::Upsert {
+                collection: CollectionId(5),
+                object: Object {
+                    id: oid(n),
+                    properties: BTreeMap::from([(
+                        "title".to_string(),
+                        Value::Text(format!("o{n}")),
+                    )]),
+                    vector: None,
+                },
+            });
+            built.commit(rows.collect());
+            built.commit(
+                (0..2_000)
+                    .map(|n| upsert(0, 10_000 + n, n as i64))
+                    .collect(),
+            );
+            built.flush();
+            if dropped {
+                built.commit(vec![Op::DropCollection {
+                    collection: CollectionId(5),
+                }]);
+            }
+            let plan = Merge {
+                run: 0..1,
+                keys: Vec::new(),
+            };
+            built.state.merge_reckoning(&plan, CLUSTERED_ABOVE)
+        };
+        let (live, dropped) = (reckoned(false), reckoned(true));
+        assert!(
+            dropped.indexed < 0.6 * live.indexed,
+            "{dropped:?}, {live:?}"
+        );
     }
 
     /// A run of tombstones alone is what they take, when anything older is
