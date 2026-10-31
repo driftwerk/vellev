@@ -1343,6 +1343,10 @@ async fn a_merge_that_gave_its_turn_back_holds_none_of_its_spill() {
     assert!(cached.writer.last_spilled() > 0, "gathered in memory");
     let holding = cached.builds.waiting_to_commit();
     assert!(holding > 0, "what it holds is not counted");
+    // Not only less than the same merge in memory, which an error on both
+    // sides would pass: rows and indexes are all it holds, and at this width
+    // they come to less than its vectors alone.
+    assert!(holding < frame, "{holding} held, of a frame of {frame}");
     assert!(
         in_memory - holding >= frame * 9 / 10,
         "{holding} held, {in_memory} in memory, of a frame of {frame}"
