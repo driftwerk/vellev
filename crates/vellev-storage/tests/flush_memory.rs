@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use common::*;
+use serde_json::{Map, Value as JsonValue};
 
 /// The system allocator, counting what is held now and at most since the
 /// peak was last reset.
@@ -115,13 +116,29 @@ const NARROW: usize = 8;
 const WRITTEN_WITHIN: u64 = 600;
 const MERGED_WITHIN: u64 = 600;
 
-fn collection(dimensions: usize) -> Mutation {
-    let mut schema = schema("docs");
+/// The most properties a row here holds besides those of `schema`.
+const WIDEST_SCHEMA: usize = 30;
+
+/// The name of the `of`th collection written to.
+fn docs(of: usize) -> CollectionName {
+    name(&format!("docs{of}"))
+}
+
+fn collection(of: usize, dimensions: usize) -> Mutation {
+    let mut schema = schema(&format!("docs{of}"));
     schema.embedding.dimensions = dimensions as u32;
     schema.properties.push(Property {
         filterable: false,
         ..Property::new("body", DataType::Text)
     });
+    schema.properties.push(Property {
+        filterable: false,
+        ..Property::new("notes", DataType::Text).searchable()
+    });
+    for property in 0..WIDEST_SCHEMA {
+        let name = format!("p{property}");
+        schema.properties.push(Property::new(&name, DataType::Int));
+    }
     Mutation::CreateCollection(Box::new(schema))
 }
 
@@ -158,17 +175,26 @@ enum Text {
     /// The rows from `from` up to `to` of the run, however its segments
     /// fall, hold `words` words drawn evenly from 50,000, as a bulk import of
     /// long documents does, or if `short`, of four letters drawn from 65,536,
-    /// whose tokens outweigh their text the more; of the rest, one in two
-    /// holds "row" and its number and the other no text at all.
+    /// whose tokens outweigh their text the more, and if `unfiltered`, in a
+    /// property searched on and not filtered on, so that tokens are most of
+    /// all such a row comes to; of the rest, one in two holds "row" and its
+    /// number and the other no text at all.
     Block {
         from: usize,
         to: usize,
         words: usize,
         short: bool,
+        unfiltered: bool,
     },
     /// "row" and its number, and a body of 800 words, each found in this row
     /// alone, in a property neither searched nor filtered on.
     Bodied,
+    /// "row" and its number, and this many properties of a number found in
+    /// this row alone, each filtered on.
+    Properties(usize),
+    /// "row" and its number, and a text array of this many tags, each found
+    /// in this row alone and filtered on.
+    Tags(usize),
 }
 
 impl Text {
@@ -178,7 +204,9 @@ impl Text {
             (0..200).map(word).collect::<Vec<_>>().join(" ")
         };
         match self {
-            Self::Short | Self::Bodied => format!("row {n}"),
+            Self::Short | Self::Bodied | Self::Properties(_) | Self::Tags(_) => {
+                format!("row {n}")
+            }
             Self::Unique => words(&mut |at| format!("u{n}x{at}")),
             Self::Wide => words(&mut |_| format!("w{}", Self::ranked(random))),
             Self::Few => words(&mut |_| format!("f{}", (Self::drawn(random) * 20.0) as usize)),
@@ -202,6 +230,7 @@ impl Text {
                 to,
                 words,
                 short,
+                ..
             } if (from..to).contains(&n) => (0..words)
                 .map(|_| match short {
                     true => format!("{:04x}", (Self::drawn(random) * 65_536.0) as usize),
@@ -214,10 +243,33 @@ impl Text {
         }
     }
 
-    /// What row `n` holds that nothing searches or filters on.
-    fn body(self, n: usize) -> Option<String> {
-        let word = |at| format!("b{n}x{at}");
-        matches!(self, Self::Bodied).then(|| (0..800).map(word).collect::<Vec<_>>().join(" "))
+    /// The properties of the row at `place` of the run, numbered `n`.
+    fn properties(self, place: usize, n: usize, random: &mut Random) -> Map<String, JsonValue> {
+        let mut properties = json!({ "n": n }).as_object().unwrap().clone();
+        let title = self.of(place, random);
+        let in_notes = matches!(self, Self::Block { from, to, unfiltered: true, .. }
+            if (from..to).contains(&place));
+        if !title.is_empty() {
+            let name = if in_notes { "notes" } else { "title" };
+            properties.insert(name.to_string(), json!(title));
+        }
+        match self {
+            Self::Bodied => {
+                let words: Vec<String> = (0..800).map(|at| format!("b{n}x{at}")).collect();
+                properties.insert("body".to_string(), json!(words.join(" ")));
+            }
+            Self::Properties(many) => {
+                for property in 0..many {
+                    properties.insert(format!("p{property}"), json!(n * WIDEST_SCHEMA + property));
+                }
+            }
+            Self::Tags(many) => {
+                let tags: Vec<String> = (0..many).map(|at| format!("t{n}x{at}")).collect();
+                properties.insert("tags".to_string(), json!(tags));
+            }
+            _ => {}
+        }
+        properties
     }
 
     /// A draw from 0 up to 1.
@@ -246,32 +298,31 @@ struct Writes {
     /// If given, every fourth row rewrites the one this many rows before
     /// it, which dies.
     rewriting: Option<usize>,
+    /// How many collections the rows go to, each taking every so many rows.
+    collections: usize,
+}
+
+impl Writes {
+    /// The id of the row numbered `n`.
+    fn id(&self, n: usize) -> ObjectId {
+        let n = match self.rewriting {
+            Some(back) if n % 4 == 3 && n >= back => n - back,
+            _ => n,
+        };
+        ObjectId(uuid::Uuid::from_u128(n as u128))
+    }
 }
 
 /// Commit `writes`.
 async fn committed(writer: &Writer, random: &mut Random, writes: Writes) {
-    let id = |n: usize| match writes.rewriting {
-        Some(back) if n % 4 == 3 && n >= back => {
-            ObjectId(uuid::Uuid::from_u128((n - back) as u128))
-        }
-        _ => ObjectId(uuid::Uuid::from_u128(n as u128)),
-    };
     for batch in (0..writes.rows).step_by(500) {
         let commit = (batch..(batch + 500).min(writes.rows))
             .map(|at| {
                 let n = writes.first + at;
-                let title = writes.text.of(writes.place + at, random);
-                let mut properties = json!({ "n": n }).as_object().unwrap().clone();
-                if !title.is_empty() {
-                    properties.insert("title".to_string(), json!(title));
-                }
-                if let Some(body) = writes.text.body(n) {
-                    properties.insert("body".to_string(), json!(body));
-                }
                 Mutation::Upsert {
-                    collection: name("docs"),
-                    id: id(n),
-                    properties,
+                    collection: docs(n % writes.collections),
+                    id: writes.id(n),
+                    properties: writes.text.properties(writes.place + at, n, random),
                     vector: Some(random.vector(writes.dimensions)),
                     only_if_version: None,
                 }
@@ -295,9 +346,13 @@ async fn flush_peak(rows: usize, dimensions: usize) -> usize {
         place: 0,
         text: Text::Short,
         rewriting: None,
+        collections: 1,
     };
     let written = async {
-        writer.commit(vec![collection(dimensions)]).await.unwrap();
+        writer
+            .commit(vec![collection(0, dimensions)])
+            .await
+            .unwrap();
         committed(&writer, &mut random, writes).await;
     };
     within(WRITTEN_WITHIN, "the rows written", written).await;
@@ -320,6 +375,11 @@ struct Shape {
     rewriting: bool,
     /// Each segment's share of the rows.
     shares: &'static [usize],
+    /// The rows, by their place in the run, deleted before it is merged:
+    /// from this one up to that one.
+    dying: (usize, usize),
+    /// How many collections the rows go to.
+    collections: usize,
 }
 
 impl Shape {
@@ -332,6 +392,8 @@ impl Shape {
             clustered: false,
             rewriting: false,
             shares: &[1, 1, 1, 1],
+            dying: (0, 0),
+            collections: 1,
         }
     }
 
@@ -351,6 +413,20 @@ impl Shape {
 
     const fn shared(self, shares: &'static [usize]) -> Self {
         Self { shares, ..self }
+    }
+
+    const fn dying(self, from: usize, to: usize) -> Self {
+        Self {
+            dying: (from, to),
+            ..self
+        }
+    }
+
+    const fn over(self, collections: usize) -> Self {
+        Self {
+            collections,
+            ..self
+        }
     }
 }
 
@@ -420,11 +496,10 @@ async fn merge_measured(shape: Shape, at_once: usize) -> Measured {
         .merging_among(builds.clone());
     let mut random = Random(11);
     let written = async {
-        writer
-            .commit(vec![collection(shape.dimensions)])
-            .await
-            .unwrap();
+        let collections = (0..shape.collections).map(|of| collection(of, shape.dimensions));
+        writer.commit(collections.collect()).await.unwrap();
         let (mut place, all) = (0, shape.shares.iter().sum::<usize>());
+        let mut dying = Vec::new();
         for (segment, share) in shape.shares.iter().enumerate() {
             let rows = shape.rows * share / all;
             let writes = Writes {
@@ -434,10 +509,22 @@ async fn merge_measured(shape: Shape, at_once: usize) -> Measured {
                 place,
                 text: shape.text,
                 rewriting: shape.rewriting.then_some(shape.rows),
+                collections: shape.collections,
             };
             committed(&writer, &mut random, writes).await;
             writer.flush().await.unwrap();
+            let (from, to) = shape.dying;
+            let these = from.max(place)..to.min(place + rows);
+            dying.extend(these.map(|at| (at - place + writes.first, writes)));
             place += rows;
+        }
+        for batch in dying.chunks(500) {
+            let deletes = batch.iter().map(|(n, writes)| Mutation::Delete {
+                collection: docs(n % writes.collections),
+                id: writes.id(*n),
+                only_if_version: None,
+            });
+            writer.commit(deletes.collect()).await.unwrap();
         }
     };
     within(WRITTEN_WITHIN, "the rows written and flushed", written).await;
@@ -509,7 +596,7 @@ fn within_bounds(shape: &str, peak: usize, reckoned: usize, planned: usize) {
 }
 
 /// The merges the reckoning is held to.
-const RECKONED: [Shape; 27] = [
+const RECKONED: [Shape; 28] = [
     Shape::of(FEWER, WIDE, Text::Short),
     Shape::of(MORE, WIDE, Text::Short),
     Shape::of(FEWER, NARROW, Text::Short),
@@ -544,6 +631,7 @@ const RECKONED: [Shape; 27] = [
             to: CHUNKED,
             words: 200,
             short: false,
+            unfiltered: false,
         },
     ),
     Shape::of(
@@ -554,6 +642,7 @@ const RECKONED: [Shape; 27] = [
             to: 16_000 + AT_ONCE,
             words: 200,
             short: false,
+            unfiltered: false,
         },
     ),
     Shape::of(
@@ -564,11 +653,9 @@ const RECKONED: [Shape; 27] = [
             to: CHUNKED_MORE,
             words: 800,
             short: false,
+            unfiltered: false,
         },
     ),
-    // Tokens far past what encoding comes to. Spread evenly over the run
-    // they are still reckoned within the bounds here: what tells that from a
-    // block is the plan's own rule, in `state`.
     Shape::of(
         CHUNKED_MORE,
         NARROW,
@@ -577,12 +664,36 @@ const RECKONED: [Shape; 27] = [
             to: CHUNKED_MORE,
             words: 800,
             short: true,
+            unfiltered: false,
+        },
+    ),
+    // Tokens far past all else a row comes to, in a property no filter
+    // holds: a chunk's are what the peak is, which reckoned spread evenly
+    // over the run, or not at all, fall past the bound.
+    Shape::of(
+        CHUNKED_MORE,
+        NARROW,
+        Text::Block {
+            from: CHUNKED_MORE - AT_ONCE,
+            to: CHUNKED_MORE,
+            words: 800,
+            short: true,
+            unfiltered: true,
         },
     ),
     // Rows mostly of what nothing indexes, and encoded all the same.
     Shape::of(TEXTS, NARROW, Text::Bodied),
     Shape::of(MORE, WIDE, Text::Bodied),
 ];
+
+/// Long rows, a chunk of them, at the head of what follows.
+const LONG_FIRST: Text = Text::Block {
+    from: 0,
+    to: AT_ONCE,
+    words: 800,
+    short: false,
+    unfiltered: false,
+};
 
 /// Runs of other than four equal segments, whose indexes add up otherwise.
 const RECKONED_RUNS: [Shape; 4] = [
@@ -592,6 +703,43 @@ const RECKONED_RUNS: [Shape; 4] = [
     Shape::of(CHUNKED, NARROW, Text::Passage).shared(&[6, 1, 1]),
 ];
 
+/// Rows that die together, not evenly, and a stale segment's rewrite.
+const RECKONED_DEATHS: [Shape; 6] = [
+    // Long rows stay as short rows die, whose run is a third long at plan.
+    Shape::of(CHUNKED, NARROW, LONG_FIRST)
+        .shared(&[1])
+        .dying(AT_ONCE, CHUNKED),
+    Shape::of(2 * AT_ONCE, NARROW, LONG_FIRST)
+        .shared(&[1])
+        .dying(AT_ONCE, 2 * AT_ONCE),
+    // Long rows die as short rows stay.
+    Shape::of(CHUNKED, NARROW, LONG_FIRST)
+        .shared(&[1])
+        .dying(0, AT_ONCE),
+    Shape::of(2 * AT_ONCE, NARROW, LONG_FIRST)
+        .shared(&[1])
+        .dying(0, AT_ONCE),
+    // Half and nine tenths of a segment of its own words gone: its map is
+    // what its live rows hold, not what the segment did.
+    Shape::of(8_192, NARROW, Text::Unique)
+        .shared(&[1])
+        .dying(0, 4_096),
+    Shape::of(8_192, NARROW, Text::Unique)
+        .shared(&[1])
+        .dying(0, 7_373),
+];
+
+/// Collections, of which a build trains one at a time, and rows of many
+/// properties and many values filtered on, which hold what their maps do.
+const RECKONED_WIDE: [Shape; 6] = [
+    Shape::of(15_000, WIDE, Text::Short).over(3),
+    Shape::of(40_000, WIDE, Text::Short).over(8),
+    Shape::of(FEWER, NARROW, Text::Properties(WIDEST_SCHEMA)),
+    Shape::of(FEWER, NARROW, Text::Properties(12)),
+    Shape::of(2_000, NARROW, Text::Tags(100)),
+    Shape::of(FEWER, NARROW, Text::Tags(12)),
+];
+
 /// A merge reckons what it holds at its peak to within 30% of what it is
 /// measured to hold once its rows are gathered, and to within half as it
 /// is planned, from what its run's segments hold (merge note, §7.6 and
@@ -599,8 +747,12 @@ const RECKONED_RUNS: [Shape; 4] = [
 /// draining, until it has ended. Over short text and long, passages, text
 /// of words each in one row, over a large vocabulary, drawn by rank or
 /// evenly, and a small one, long documents all together, rows mostly of
-/// what nothing indexes, vectors clustered or not, and runs of other than
-/// four equal segments, up to and past what a build tokenizes at once.
+/// what nothing indexes, vectors clustered or not, runs of other than four
+/// equal segments, rows dying together, several collections, many properties
+/// and values filtered on, up to and past what a build tokenizes at once.
+///
+/// What the bounds cover is these shapes: the note's §2.1 says what lies
+/// outside them.
 ///
 /// A score of merges and more, too slow built for debugging: run optimised,
 /// in CI's Test job, as
@@ -610,7 +762,12 @@ const RECKONED_RUNS: [Shape; 4] = [
 async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
     let _alone = ALONE.lock().await;
     let mut measured = Vec::new();
-    for shape in RECKONED.iter().chain(&RECKONED_RUNS) {
+    let shapes = RECKONED
+        .iter()
+        .chain(&RECKONED_RUNS)
+        .chain(&RECKONED_DEATHS)
+        .chain(&RECKONED_WIDE);
+    for shape in shapes {
         let merge = merge_measured(*shape, AT_ONCE).await;
         let off = |by: usize| (by as f64 - merge.peak as f64) / merge.peak as f64 * 100.0;
         eprintln!(
@@ -649,7 +806,7 @@ const WHOLE_BUILDS: [Shape; 4] = [
 ];
 
 /// How much of a merge whose tokens set its peak the chunks must save, of
-/// the 17.5–20.1% measured: a quarter of a chunk's tokens kept on would take
+/// the 17.5–21.3% measured: a quarter of a chunk's tokens kept on would take
 /// it under.
 const MERGE_SAVES_AT_LEAST: f64 = 0.15;
 
@@ -715,7 +872,7 @@ async fn a_merge_holds_a_chunk_of_tokens_at_once_and_its_whole_build_no_more_for
     for (shape, all, chunked, saved) in measured {
         let rows = shape.rows;
         assert!(
-            chunked.tokenized_at_once <= AT_ONCE,
+            (AT_ONCE.min(rows / 2)..=AT_ONCE).contains(&chunked.tokenized_at_once),
             "a merge of {rows} rows held {} rows' tokens at once",
             chunked.tokenized_at_once
         );
@@ -769,9 +926,13 @@ async fn flush_and_open(rows: usize, dimensions: usize, text: Text, at_once: usi
         place: 0,
         text,
         rewriting: None,
+        collections: 1,
     };
     let written = async {
-        writer.commit(vec![collection(dimensions)]).await.unwrap();
+        writer
+            .commit(vec![collection(0, dimensions)])
+            .await
+            .unwrap();
         committed(&writer, &mut random, writes).await;
     };
     within(WRITTEN_WITHIN, "the rows written", written).await;
@@ -793,25 +954,25 @@ async fn flush_and_open(rows: usize, dimensions: usize, text: Text, at_once: usi
     }
 }
 
-/// The flushes and opens measured, and how much of a flush's peak and an
-/// open's chunks must save: a flush of passages encodes, as a merge does,
-/// and saves next to nothing. The floors sit under the least measured over
-/// six runs, as the all-at-once arm's own peak spreads: an open saved
-/// 21.8–27.3% at 100,000 rows, 24.3–28.7% at 200,000 and 25.0–27.7% of Wide
-/// text, and a flush of Wide text 17.9–20.2%.
-const FLUSHED_AND_OPENED: [(usize, usize, Text, f64, f64); 3] = [
-    (100_000, WIDE, Text::Passage, 0.0, 0.19),
-    (200_000, WIDE, Text::Passage, 0.0, 0.22),
-    (CHUNKED, NARROW, Text::Wide, 0.15, 0.22),
+const MB: usize = 1_000_000;
+
+/// The flushes and opens measured, and what each may hold at its peak in
+/// chunks: a ceiling, 2% over what was measured, where a chunk's peak
+/// repeats to a few hundred kilobytes. A ratio to the all-at-once arm would
+/// carry that arm's spread of a tenth, and leave room for tokens kept on:
+/// a chunk of passages' tokens is 42 MB, past each of these.
+const FLUSHED_AND_OPENED: [(usize, usize, Text, usize, usize); 3] = [
+    (100_000, WIDE, Text::Passage, 868 * MB, 471 * MB),
+    (200_000, WIDE, Text::Passage, 1_727 * MB, 917 * MB),
+    (CHUNKED, NARROW, Text::Wide, 385 * MB, 386 * MB),
 ];
 
 /// M1-R5. A flush and an open tokenize a chunk at a time, as a merge does,
-/// each of an open's segments its own chunk. An open encodes nothing, so its
-/// peak is the stage that indexes its rows, and a quarter goes with the
-/// tokens, at passages as at Wide text: the allocator's count of what the
-/// count of rows above takes on trust. A flush saves where a merge does. An
-/// open's saving is each segment's, and each of those it loads at once
-/// holds its own chunk.
+/// each of an open's segments its own chunk, and hold no more than their
+/// ceilings. An open encodes nothing, so its peak is the stage that indexes
+/// its rows: the allocator's count of what the count of rows above takes on
+/// trust, at passages as at Wide text. What an open saves is each segment's,
+/// and each of those it loads at once holds its own chunk.
 ///
 /// As the reckoning's rule: run optimised, in CI's Test job, as
 /// `cargo test --release -p vellev-storage --test flush_memory -- --ignored`.
@@ -820,56 +981,44 @@ const FLUSHED_AND_OPENED: [(usize, usize, Text, f64, f64); 3] = [
 async fn a_flush_and_an_open_hold_a_chunk_of_tokens_at_once_and_an_open_saves_them() {
     let _alone = ALONE.lock().await;
     let mut measured = Vec::new();
-    for (rows, dimensions, text, flush_saves, open_saves) in FLUSHED_AND_OPENED {
+    for (rows, dimensions, text, flush_at_most, open_at_most) in FLUSHED_AND_OPENED {
         let all = flush_and_open(rows, dimensions, text, usize::MAX).await;
         let chunked = flush_and_open(rows, dimensions, text, AT_ONCE).await;
-        let saved = |all: usize, chunked: usize| (all as f64 - chunked as f64) / all as f64;
-        let flush_saved = saved(all.flush_peak, chunked.flush_peak);
-        let open_saved = saved(all.open_peak, chunked.open_peak);
+        let saved = |all: usize, chunked: usize| (all as f64 - chunked as f64) / all as f64 * 100.0;
         eprintln!(
             "{rows} rows of {dimensions}, {text:?} text: a flush held {} bytes at its peak with \
              every row tokenized at once, {} in chunks, {:.1}% less; an open {}, {}, {:.1}% less",
             all.flush_peak,
             chunked.flush_peak,
-            flush_saved * 100.0,
+            saved(all.flush_peak, chunked.flush_peak),
             all.open_peak,
             chunked.open_peak,
-            open_saved * 100.0,
+            saved(all.open_peak, chunked.open_peak),
         );
-        measured.push((
-            rows,
-            all,
-            chunked,
-            flush_saves,
-            open_saves,
-            flush_saved,
-            open_saved,
-        ));
+        measured.push((rows, all, chunked, flush_at_most, open_at_most));
     }
-    for (rows, all, chunked, flush_saves, open_saves, flush_saved, open_saved) in measured {
+    for (rows, all, chunked, flush_at_most, open_at_most) in measured {
         assert_eq!(all.flush_tokens, rows, "the flush tokenized all at once");
         assert_eq!(all.open_tokens, rows, "the open tokenized all at once");
         assert!(
-            chunked.flush_tokens <= AT_ONCE,
+            (1..=AT_ONCE).contains(&chunked.flush_tokens),
             "a flush of {rows} rows held {} rows' tokens at once",
             chunked.flush_tokens
         );
         assert!(
-            chunked.open_tokens <= AT_ONCE,
+            (1..=AT_ONCE).contains(&chunked.open_tokens),
             "an open of {rows} rows held {} rows' tokens at once",
             chunked.open_tokens
         );
         assert!(
-            flush_saved >= flush_saves - PEAK_TOLD_TO,
-            "a flush of {rows} rows saved {:.1}% of its peak, not {:.1}%",
-            flush_saved * 100.0,
-            flush_saves * 100.0
+            chunked.flush_peak <= flush_at_most,
+            "a flush of {rows} rows held {}, past {flush_at_most}",
+            chunked.flush_peak
         );
         assert!(
-            open_saved >= open_saves,
-            "an open of {rows} rows saved {:.1}% of its peak, not {:.1}%",
-            open_saved * 100.0,
-            open_saves * 100.0
+            chunked.open_peak <= open_at_most,
+            "an open of {rows} rows held {}, past {open_at_most}",
+            chunked.open_peak
         );
     }
 }
