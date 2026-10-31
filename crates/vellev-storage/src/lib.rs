@@ -43,8 +43,8 @@ pub use mutation::{
     Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
 };
 pub use partition::{
-    Embedded, FlushFirst, FlushTimes, Follower, MergeGate, Partition, RestoreFrom, Writer,
-    GATHERED_AT_ONCE,
+    BuildingHeld, Embedded, FlushFirst, FlushTimes, Follower, MergeGate, Partition, RestoreFrom,
+    Writer, GATHERED_AT_ONCE,
 };
 pub use published::FreesHeld;
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
