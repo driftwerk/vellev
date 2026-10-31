@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use vellev_core::{
     Bm25, Collection, CollectionName, DataType, Distance, Embedding, EmbeddingProvider, NodeId,
-    ObjectId, Property, TenantId,
+    ObjectId, Property, RequestId, TenantId,
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{Node, Settings};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
-use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
+use vellev_storage::coordinator::{Coordinator, MemoryCoordinator, Point};
 use vellev_storage::timings::{Holder, Timed};
 use vellev_storage::{Mutation, State};
 
@@ -285,6 +285,79 @@ async fn a_sweep_asked_for_now_never_waits_on_the_spacing() {
         asked.elapsed() < SWEEPS_SPACED / 2,
         "a sweep asked for now waited {:?} on the spacing",
         asked.elapsed()
+    );
+}
+
+/// M7-R7: a restore holds its tenant, as a request does, with no request
+/// waiting for it and no merge, however far over the budget the node is.
+/// The sweeps that find it so leave it be until the restore ends, and the
+/// restore lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_a_restore_holds_is_not_let_go_until_the_restore_ends() {
+    let store = Arc::new(HeldPuts {
+        inner: memory(),
+        armed: AtomicBool::new(false),
+        held: AtomicBool::new(false),
+    });
+    let node = node_on(store.clone(), |settings| {
+        settings.memory = Some(1);
+        // Flushed only as it is let go; never let go for being idle.
+        settings.flush_rows = 1_000_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let acme = tenant("restored");
+    node.create_tenant(&acme).await.unwrap();
+    let window = Some(Duration::from_secs(60 * 60));
+    assert!(node.set_restore_window(&acme, window).await.unwrap());
+    let held = node.tenant(&acme).await.unwrap();
+    let kept = held.write(vec![notes(), note(1)]).await.unwrap();
+    held.write(vec![note(2)]).await.unwrap();
+    drop(held);
+
+    store.armed.store(true, Ordering::SeqCst);
+    let point = Point::Position(kept.position);
+    let restoring = tokio::spawn({
+        let (node, acme) = (node.clone(), acme.clone());
+        async move { node.restore(&acme, point, RequestId::generate()).await }
+    });
+    until(5, "the restore never came to write", || {
+        store.held.load(Ordering::SeqCst)
+    })
+    .await;
+    // Whoever asked stops waiting: the restore goes on, and only it holds
+    // the tenant. Unused for longer than any tenant is kept regardless.
+    restoring.abort();
+    let _ = restoring.await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let before = node.tenants_kept_by_sweeps();
+    // The census is taken as a sweep begins: a second one finds what the
+    // first let go. Bounded: a sweep that took the tenant out would wait in
+    // its flush, on the puts held here, for good.
+    let sweeps = async {
+        node.sweep_now().await;
+        node.sweep_now().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), sweeps)
+        .await
+        .expect("a sweep took out the tenant mid-restore, and is held in its flush");
+    assert_eq!(node.census().holding.writers, 1, "let go mid-restore");
+    assert!(node.tenants_kept_by_sweeps() > before, "no sweep looked");
+    assert_eq!(node.opens().writers, 1, "opened afresh mid-restore");
+    store.armed.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while node.resident() > 0 {
+            node.sweep_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the tenant was never let go once the restore ended");
+    let opened = node.tenant(&acme).await.unwrap();
+    let collection = CollectionName::new("notes").unwrap();
+    assert_eq!(
+        opened.read(|state| state.count(&collection)),
+        1,
+        "the restore did not land"
     );
 }
 

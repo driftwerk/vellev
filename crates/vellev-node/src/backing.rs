@@ -363,13 +363,16 @@ impl Node {
         // the store client gives one up: see `Within`.
         let source: Arc<dyn Blobs> = Arc::new(backups.source(backup)?);
         let told = |error: StorageError| match claimed(error) {
-            NodeError::Storage(error) => opened.told(error),
+            NodeError::Storage(error) => opened.work.told(error),
             lost => lost,
         };
-        let preparing =
-            opened
-                .writer
-                .restore_from(source, head.as_ref(), restore.clone(), adopting, claim);
+        let preparing = opened.work.writer.restore_from(
+            source,
+            head.as_ref(),
+            restore.clone(),
+            adopting,
+            claim,
+        );
         let prepared = claim
             .during(async { preparing.await.map_err(told) })
             .await?;
@@ -386,7 +389,7 @@ impl Node {
         let position = prepared.commit().await.map_err(told)?;
         let restored = Restored {
             restore,
-            incarnation: opened.writer.partition().incarnation(),
+            incarnation: opened.work.writer.partition().incarnation(),
             position,
         };
         tracing::info!(%tenant, backup = %id, ?restored, "restored from a backup");

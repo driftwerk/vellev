@@ -659,6 +659,164 @@ async fn scraping_never_keeps_a_tenant_from_being_let_go() {
     served.stop().await;
 }
 
+/// M7-R4: merges stopped are on /metrics by why, each reason there from the
+/// start, so that a rate over one reads from nothing: a tenant dropped
+/// mid-merge shows as that, and a node shut down mid-merge as that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merges_stopped_are_reported_by_why() {
+    let stopped = |served: &Served, reason: &str| {
+        let text = served.app.metrics().encoded();
+        let labels = [("reason", reason)];
+        sample(&text, "vellev_merges_stopped_total", &labels)
+            .unwrap_or_else(|| panic!("no count for {reason}\n{text}"))
+    };
+    let served = holding(None).await;
+    for reason in ["let_go", "lease", "drop", "shutdown"] {
+        assert_eq!(stopped(&served, reason), 0.0, "{reason}");
+    }
+    let builds = served.node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilLetGo));
+    for (name, drops) in [("acme", true), ("beta", false)] {
+        let id = TenantId::new(name).unwrap();
+        let tenant = served.node.tenant(&id).await.unwrap();
+        tenant.flush().await.unwrap();
+        for n in 10..13 {
+            note_in(&served, name, n).await;
+            tenant.flush().await.unwrap();
+        }
+        let merge = tokio::spawn(async move {
+            let _ = tenant.compact(Duration::from_secs(60 * 60)).await;
+        });
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while builds.held() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a merge came to build");
+        match drops {
+            true => assert!(served.node.drop_tenant(&id).await.unwrap()),
+            false => served.node.shutdown().await,
+        }
+        builds.hold(None);
+        merge.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while builds.under_way() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the merge stopped ended");
+        builds.hold(Some(vellev_storage::Holding::UntilLetGo));
+    }
+    builds.hold(None);
+    assert_eq!(stopped(&served, "drop"), 1.0);
+    assert_eq!(stopped(&served, "shutdown"), 1.0);
+    assert_eq!(stopped(&served, "lease"), 0.0);
+    assert_eq!(stopped(&served, "let_go"), 0.0);
+    served.stop().await;
+}
+
+/// A store whose puts, once armed, wait until they are let go.
+#[derive(Debug)]
+struct HeldPuts {
+    inner: Arc<dyn vellev_storage::blobs::Blobs>,
+    armed: AtomicBool,
+    held: AtomicBool,
+    let_go: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl vellev_storage::blobs::Blobs for HeldPuts {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        if self.armed.load(Ordering::SeqCst) {
+            self.held.store(true, Ordering::SeqCst);
+            let _let_go = self.let_go.acquire().await;
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> vellev_storage::Result<Vec<vellev_storage::blobs::Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// M7-R4, `let_go`, the one way this reaches it while a round keeps its
+/// tenant: taken out between rounds, the tenant is flushed before it is let
+/// go, and held there, its maintenance's next round comes up on time and
+/// begins a merge. The sweep's let-go stops that merge, and it shows as
+/// `let_go`, not as a lease lost.
+#[tokio::test]
+async fn a_merge_stopped_as_its_tenant_is_let_go_is_reported_as_that() {
+    let store = Arc::new(HeldPuts {
+        inner: memory(),
+        armed: AtomicBool::new(false),
+        held: AtomicBool::new(false),
+        let_go: tokio::sync::Semaphore::new(0),
+    });
+    let cluster = Cluster::new().through(store.clone());
+    let served = cluster
+        .serve_unstarted_with(|settings| Settings {
+            memory: Some(1),
+            flush_rows: 1_000_000,
+            tenant_idle: Duration::from_secs(60 * 60),
+            // Looked after every minute, the most often it can be.
+            restore_window: Duration::ZERO,
+            ..settings
+        })
+        .await;
+    let id = TenantId::new("acme").unwrap();
+    let tenant = {
+        note_in(&served, "acme", 1).await;
+        served.node.tenant(&id).await.unwrap()
+    };
+    tenant.flush().await.unwrap();
+    for n in 2..5 {
+        note_in(&served, "acme", n).await;
+        tenant.flush().await.unwrap();
+    }
+    // Rows to flush as it is let go, where the sweep is to be held.
+    note_in(&served, "acme", 5).await;
+    drop(tenant);
+    tokio::time::pause();
+    // Unused for longer than any tenant is kept regardless.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    store.armed.store(true, Ordering::SeqCst);
+    let sweep = tokio::spawn({
+        let node = served.node.clone();
+        async move { node.sweep_now().await }
+    });
+    while !store.held.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Time for its next round, which finds the flush holding `building`.
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    store.armed.store(false, Ordering::SeqCst);
+    store
+        .let_go
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    sweep.await.unwrap();
+    tokio::time::resume();
+    let text = served.app.metrics().encoded();
+    for (reason, count) in [("let_go", 1.0), ("lease", 0.0), ("drop", 0.0)] {
+        let labels = [("reason", reason)];
+        assert_eq!(
+            sample(&text, "vellev_merges_stopped_total", &labels),
+            Some(count),
+            "{reason}\n{text}"
+        );
+    }
+    served.stop().await;
+}
+
 /// Re-review of #165, L3: how long ago the census was taken is reported,
 /// from the node's start until its first sweep, so that a sweep that has
 /// stopped, and with it the budget, shows.
