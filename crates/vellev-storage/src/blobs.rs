@@ -193,9 +193,12 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     }
     /// Put `bytes`, which are all of `spill`, under `key`, as [`Self::put`]
     /// does, and make the spill the store's copy of the file if the store
-    /// keeps copies, once and only if the file is there. As [`Self::put`] by
-    /// default, for a store over another that forwards [`Self::spills`]
-    /// alone: a spill not taken up goes when the last of it does.
+    /// keeps copies, once and only if the file is there. A store that sends
+    /// a file from the async threads reads it with [`Spill::pieces`], not
+    /// from `bytes`, which read the mapping where they are touched. As
+    /// [`Self::put`] by default, for a store over another that forwards
+    /// [`Self::spills`] alone: a spill not taken up goes when the last of
+    /// it does.
     async fn put_spilled(&self, key: &str, bytes: Bytes, _spill: Arc<Spill>) -> Result<()> {
         self.put(key, bytes).await
     }
@@ -599,6 +602,8 @@ pub struct Disk {
     piece_takes: Duration,
     /// None but for tests (see [`Self::spills_told`]).
     spills_told: Option<Arc<SpillsTold>>,
+    /// How large a part of a file going to or from a store is.
+    part_bytes: usize,
 }
 
 /// How many turns at a large file are had on a disk, and how many times
@@ -769,6 +774,7 @@ impl Disk {
             loads: Arc::default(),
             piece_takes: Duration::ZERO,
             spills_told: None,
+            part_bytes: 0,
         }
         .fetching(&Transfers::default())
     }
@@ -823,8 +829,15 @@ impl Disk {
             .saturating_add(written.max(transfers.request_within));
         Self {
             still_for: part.saturating_add(LOADING_STILL_BEYOND),
+            part_bytes: transfers.part_bytes,
             ..self
         }
+    }
+
+    /// How large a part of a file going to or from a store is, as
+    /// [`Self::fetching`] was told.
+    pub(crate) fn part_bytes(&self) -> usize {
+        self.part_bytes
     }
 
     /// How long those waiting for a turn at a large file go on waiting
@@ -1188,6 +1201,22 @@ impl ObjectBlobs {
         }
     }
 
+    /// Whether a file of `bytes` fits in as many parts as go up: one that
+    /// does not is refused before any of it does.
+    fn fits(&self, key: &str, bytes: usize) -> Result<()> {
+        if self.transfers.parts(bytes) > MOST_PARTS {
+            return Err(StorageError::Blob {
+                key: key.to_string(),
+                source: format!(
+                    "{bytes} bytes need more than {MOST_PARTS} parts of {}",
+                    self.transfers.part_bytes
+                )
+                .into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Bring `reading` of the file under `key` as far as `upto`, or its end
     /// if that comes first, with at most [`RANGE_TRIES`] requests, each
     /// going on from the bytes already received. A file not there is told
@@ -1517,17 +1546,7 @@ impl Blobs for ObjectBlobs {
     /// goes up.
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
         let path = ObjectPath::from(key);
-        if self.transfers.parts(bytes.len()) > MOST_PARTS {
-            return Err(StorageError::Blob {
-                key: key.to_string(),
-                source: format!(
-                    "{} bytes need more than {MOST_PARTS} parts of {}",
-                    bytes.len(),
-                    self.transfers.part_bytes
-                )
-                .into(),
-            });
-        }
+        self.fits(key, bytes.len())?;
         if bytes.len() > self.transfers.part_bytes {
             return self.put_in_parts(key, &path, bytes).await;
         }
@@ -1536,6 +1555,16 @@ impl Blobs for ObjectBlobs {
         bounded(key, within, self.store.put(&path, payload))
             .await
             .map(|_| ())
+    }
+
+    /// Read a piece at a time off the async threads, where a store's client
+    /// reads what it is given, a whole part at once as it signs it, and
+    /// where a page of the mapping gone from memory would hold a thread
+    /// for as long as the disk took. `bytes`, unread, hold what they hold
+    /// until the put ends.
+    async fn put_spilled(&self, key: &str, bytes: Bytes, spill: Arc<Spill>) -> Result<()> {
+        self.fits(key, bytes.len())?;
+        self.put_parts(key, spill.pieces(key)).await
     }
 
     /// One request, which `object_store` makes create only: on S3 with
@@ -2084,7 +2113,7 @@ impl Blobs for CachedBlobs {
     /// [`Self::put`] writes one: no file is ever kept under a key the store
     /// did not take.
     async fn put_spilled(&self, key: &str, bytes: Bytes, spill: Arc<Spill>) -> Result<()> {
-        self.inner.put(key, bytes).await?;
+        self.inner.put_spilled(key, bytes, spill.clone()).await?;
         self.take_up(key, spill).await;
         Ok(())
     }

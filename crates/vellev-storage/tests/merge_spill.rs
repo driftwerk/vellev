@@ -704,9 +704,10 @@ async fn a_cache_that_cannot_begin_a_spill_fails_the_merge_before_it_builds_anyt
     std::fs::write(&cache, b"in the way").unwrap();
     let failed = within(LONG, "the merge", writer.merge()).await;
     assert!(
-        matches!(&failed, Err(StorageError::Blob { key, .. }) if !key.contains("-merged")),
-        "at the gather, not once built and uploaded: {failed:?}"
+        matches!(&failed, Err(StorageError::Blob { key, .. }) if key.ends_with("-merged.vectors")),
+        "{failed:?}"
     );
+    // At the gather, not once built and uploaded.
     let uploaded = store.list(&Layout(&cluster.key).prefix()).await.unwrap();
     assert!(!uploaded.iter().any(|file| file.key.contains("-merged")));
     std::fs::remove_file(&cache).unwrap();

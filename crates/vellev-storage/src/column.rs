@@ -181,6 +181,12 @@ impl Gathering {
         }
     }
 
+    /// How many bytes its frame comes to whole, where each row's start and
+    /// its header among them.
+    pub fn frame_bytes(&self) -> usize {
+        (AHEAD + self.values + 2 * self.offsets.len() + 2) * 4
+    }
+
     /// How many bytes of values went to local disk.
     pub fn spilled_bytes(&self) -> usize {
         match self.spilling {
@@ -665,7 +671,8 @@ mod tests {
         use crate::spill::Spills;
         use crate::stopping::Stopping;
         let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone());
-        let asked = spills.asked(tokio::runtime::Handle::current(), Stopping::never());
+        let runtime = tokio::runtime::Handle::current();
+        let asked = spills.asked(runtime, Stopping::never(), "k".into());
         tokio::task::spawn_blocking(move || {
             let values = vectors.iter().flatten().map(Vec::len).sum();
             let spilling = asked.begin().unwrap().unwrap();

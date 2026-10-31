@@ -14,7 +14,9 @@ use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
 
 use crate::backups::Held;
-use crate::blobs::{is_plain, Author, Blobs, Disk, Layout, Linked, Listed, Local, Transfers};
+use crate::blobs::{
+    is_plain, Author, Blobs, Disk, Layout, Linked, Listed, Local, Spills, Transfers,
+};
 use crate::catalog::Catalog;
 use crate::column::{self, Column, Gathering};
 use crate::coordinator::{
@@ -3317,7 +3319,15 @@ impl Writer {
             return Ok(Ended::Dropped(MergeEnd::Stale));
         }
         let dead = run.dead();
-        let gather = self.gathered(run, planned, reckoning, named_at, catalog.clone());
+        let names = self.named(named_at, "-merged");
+        let gather = self.gathered(
+            run,
+            planned,
+            reckoning,
+            named_at,
+            names.vectors.clone(),
+            catalog.clone(),
+        );
         let built = self.built_stopping(gather, catalog.clone(), stopping, Some(build.clone()));
         let Some((built, shape)) = built.await? else {
             return Ok(self.given_up(planned));
@@ -3327,11 +3337,7 @@ impl Writer {
         // `clean` leaves the merge's while it is under way.
         let mut staged = self.staging();
         let encoding = Instant::now();
-        let merged = Self::prepared(
-            self.named(named_at, "-merged").meta(shape),
-            built,
-            self.writes(),
-        );
+        let merged = Self::prepared(names.meta(shape), built, self.writes());
         self.phase_ended(MergePhase::Encode, merged.is_ok(), encoding);
         let merged = merged?;
         #[cfg(test)]
@@ -3444,7 +3450,8 @@ impl Writer {
     /// of the state: all a merge does under the building lock and the
     /// state's before it commits, a walk of its run's segments.
     fn merge_planned(&self) -> Option<MergePlanned> {
-        let spilled = self.partition.blobs.spills().is_some();
+        let spills = self.partition.blobs.spills();
+        let spilled = spills.as_ref().map(Spills::held_going_up);
         self.partition.read(|state| {
             let merge = state.merge_plan(&self.merging)?;
             let above = self.merging.clustered_above;
@@ -3475,6 +3482,7 @@ impl Writer {
         planned: u64,
         reckoning: Reckoning,
         named_at: LogPosition,
+        vectors_key: String,
         catalog: Catalog,
     ) -> impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<Shape> + Send + 'static
     {
@@ -3501,7 +3509,8 @@ impl Writer {
                     let phase = Timed::MergeGivenUp(MergePhase::Gather);
                     timings.record(phase, &key, gathering.elapsed());
                 };
-                let spill = spills.map(|spills| spills.asked(runtime, stopping.clone()));
+                let spill =
+                    spills.map(|spills| spills.asked(runtime, stopping.clone(), vectors_key));
                 let merged = run.merged(named_at, GATHERED_AT_ONCE, spill, &mut goes_on);
                 if !matches!(merged, Ok(Some(_))) {
                     given_up(gathering);
