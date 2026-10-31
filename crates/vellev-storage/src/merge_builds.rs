@@ -131,6 +131,14 @@ const HELD_AT_MOST: Duration = Duration::from_secs(60);
 /// by a writer whose rounds have stopped, is let go.
 const PARKED_AT_MOST: Duration = Duration::from_secs(60);
 
+/// How long a merge holding its turn waits for its partition's building
+/// lock, at the most, while nothing else may use the turn: about five times
+/// a healthy flush's 99th percentile, so that it comes through its own
+/// tenant's flush with its turn, and far short of a restore. Past that it
+/// gives the turn back. With one turn on a node this idles every merge
+/// there: timed as [`crate::timings::MergePhase::TurnIdle`].
+pub const TURN_IDLE_AT_MOST: Duration = Duration::from_secs(10);
+
 /// How long what a store keeps of a stopped or failed merge's bytes holds
 /// its turn at most: longer than any store's own write of them may take, a
 /// cache's local copy of three gigabytes on a disk at 20 MiB a second and
@@ -169,6 +177,9 @@ pub struct MergeBuilds {
     /// How long a turn granted to a merge that gave way to a flush is kept
     /// for its next attempt: see [`Self::park_for`].
     parked_at_most: Mutex<Duration>,
+    /// How long a merge holding its turn waits for its partition's
+    /// building lock, at the most: see [`Self::idle_for`].
+    idle_at_most: Mutex<Duration>,
     /// How long what a store keeps of a stopped or failed merge's bytes
     /// holds its turn at most: see [`Self::let_go_held_after`].
     held_at_most: Mutex<Duration>,
@@ -314,6 +325,7 @@ impl MergeBuilds {
             released: AtomicUsize::new(0),
             last_gathered: AtomicUsize::new(0),
             parked_at_most: Mutex::new(PARKED_AT_MOST),
+            idle_at_most: Mutex::new(TURN_IDLE_AT_MOST),
             held_at_most: Mutex::new(STORE_HELD_AT_MOST),
             last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
@@ -423,6 +435,13 @@ impl MergeBuilds {
     #[doc(hidden)]
     pub fn park_for(&self, parked: Duration) {
         *lock(&self.parked_at_most) = parked;
+    }
+
+    /// Have a merge holding its turn wait for its partition's building
+    /// lock for at most `idle`, instead of [`TURN_IDLE_AT_MOST`]. For tests.
+    #[doc(hidden)]
+    pub fn idle_for(&self, idle: Duration) {
+        *lock(&self.idle_at_most) = idle;
     }
 
     /// How many times what a store kept of a stopped or failed merge's

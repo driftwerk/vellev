@@ -9,7 +9,8 @@ mod common;
 use common::*;
 use vellev_storage::backups::Held;
 use vellev_storage::coordinator::{Clock, Restore};
-use vellev_storage::{Holding, MergeBuilds, MergeStage, Merging};
+use vellev_storage::timings::{Holder, MergeEnd, MergePhase, Timed};
+use vellev_storage::{Holding, MergeBuilds, MergeGate, MergeStage, Merging, TURN_IDLE_AT_MOST};
 
 /// Notes in each segment merged.
 const NOTES: u32 = 300;
@@ -30,6 +31,17 @@ fn note(n: u32, random: &mut Random) -> Mutation {
 /// A writer among `builds` of `segments` flushed segments, which merge
 /// into one once there are two.
 async fn flushed(cluster: &Cluster, builds: &Arc<MergeBuilds>, segments: u32) -> Arc<Writer> {
+    flushed_due_at(cluster, builds, segments, 0).await
+}
+
+/// As [`flushed`], its flushes falling due at `due` rows, a tenant's backlog
+/// four times that, as a node has them; none, at no rows.
+async fn flushed_due_at(
+    cluster: &Cluster,
+    builds: &Arc<MergeBuilds>,
+    segments: u32,
+    due: usize,
+) -> Arc<Writer> {
     let merging = Merging {
         fanout: 2,
         ..Merging::default()
@@ -38,7 +50,8 @@ async fn flushed(cluster: &Cluster, builds: &Arc<MergeBuilds>, segments: u32) ->
         .writer()
         .await
         .merging_with(merging)
-        .merging_among(builds.clone());
+        .merging_among(builds.clone())
+        .flushing_due_at(due, 4 * due);
     let writer = Arc::new(writer);
     writer.commit(vec![create("notes")]).await.unwrap();
     let mut random = Random(7);
@@ -371,12 +384,13 @@ async fn a_merge_dropped_unstopped_stops_its_build() {
     assert!(next.unwrap().is_some());
 }
 
-/// A merge never holds a turn while it waits for its partition's building
-/// lock, as a flush or a restore holds it for long: it gives the turn back
-/// meanwhile, and another tenant's merge takes it. Once the lock is free,
-/// it takes a turn again and commits.
+/// M5-R6, and #164's rule with its bound moved: a merge holds its turn while
+/// it waits for its partition's building lock for no longer than
+/// [`TURN_IDLE_AT_MOST`], as a flush or a restore may hold the lock for long:
+/// it then gives the turn back, and another tenant's merge takes it. Once the
+/// lock is free, it takes a turn again and commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_turn_is_not_held_while_its_partition_s_building_lock_is() {
+async fn a_turn_is_held_idle_for_its_partition_s_building_lock_no_longer_than_its_bound() {
     let builds = MergeBuilds::new(1);
     let (mut one, other) = (Cluster::new().await, Cluster::new().await);
     let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
@@ -391,6 +405,7 @@ async fn a_turn_is_not_held_while_its_partition_s_building_lock_is() {
     });
     one.blobs = held.clone();
     let first = flushed(&one, &builds, 2).await;
+    first.timings().keep_events(true);
     let mut random = Random(11);
     let more = (0..NOTES).map(|n| note(10 * NOTES + n, &mut random));
     first.commit(more.collect()).await.unwrap();
@@ -401,20 +416,24 @@ async fn a_turn_is_not_held_while_its_partition_s_building_lock_is() {
         async move { first.flush().await }
     });
     within(60, "the flush's vectors never began to go up", put.recv()).await;
+    let second = flushed(&other, &builds, 2).await;
     let waiting = tokio::spawn({
         let first = first.clone();
         async move { first.merge().await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!waiting.is_finished());
-    let second = flushed(&other, &builds, 2).await;
+    let key = first.lease().key.clone();
+    until(10, "the merge never took its turn", || {
+        builds.under_way_for(&key)
+    })
+    .await;
     let merged = within(
-        10,
+        TURN_IDLE_AT_MOST.as_secs() + 1,
         "a merge waited for a turn another held while waiting for its own building lock",
         second.merge(),
     )
     .await;
     assert!(merged.unwrap().is_some());
+    assert!(!waiting.is_finished());
     held.armed.store(false, Ordering::SeqCst);
     held.let_go.notify_one();
     within(60, "the held flush never ended", flushing)
@@ -425,6 +444,717 @@ async fn a_turn_is_not_held_while_its_partition_s_building_lock_is() {
     assert!(merged.unwrap().unwrap().is_some());
     assert_eq!(builds.under_way(), 0);
     assert_eq!(builds.turns_free(), 1);
+    // A8: each wait with a turn, however it ended, timed, within its bound.
+    let idle: Vec<Duration> = first
+        .timings()
+        .drain_events()
+        .iter()
+        .filter(|event| event.timed == Timed::Merge(MergePhase::TurnIdle))
+        .map(|event| event.took)
+        .collect();
+    assert!(
+        idle.iter().any(|idle| *idle >= TURN_IDLE_AT_MOST / 2),
+        "the wait that ran out was not timed: {idle:?}"
+    );
+    let bound = TURN_IDLE_AT_MOST + Duration::from_secs(1);
+    assert!(idle.iter().all(|idle| *idle <= bound), "{idle:?}");
+}
+
+/// A store whose listings, once armed, wait until it is disarmed: as a
+/// clean, which holds the building lock, waits on a slow store.
+#[derive(Debug)]
+struct HeldListing {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    listing: AtomicBool,
+}
+
+impl HeldListing {
+    fn over(inner: Arc<dyn Blobs>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            armed: AtomicBool::new(false),
+            listing: AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl Blobs for HeldListing {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        while self.armed.load(Ordering::SeqCst) {
+            self.listing.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// M5-R5: a tenant's flush holds its building lock, slowly, as its merge is
+/// granted a turn, with a second tenant's merge queued behind. The first
+/// keeps its turn, takes the lock as the flush ends, and builds first: it
+/// does not lose its place to the second on each flush of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_keeps_its_turn_through_its_own_flush_and_builds_before_the_next() {
+    let builds = MergeBuilds::new(1);
+    let (mut one, other) = (Cluster::new().await, Cluster::new().await);
+    let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
+    let held = Arc::new(HeldUpload {
+        inner: one.blobs.clone(),
+        kind: |key| key.ends_with(".vectors") && !key.contains("-merged"),
+        builds: builds.clone(),
+        armed: AtomicBool::new(false),
+        putting,
+        let_go: tokio::sync::Notify::new(),
+        ended: Arc::default(),
+    });
+    one.blobs = held.clone();
+    let first = flushed(&one, &builds, 2).await;
+    let second = flushed(&other, &builds, 2).await;
+    let mut random = Random(11);
+    let more = (0..NOTES).map(|n| note(10 * NOTES + n, &mut random));
+    first.commit(more.collect()).await.unwrap();
+    builds.hold(Some(Holding::UntilLetGo));
+    held.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let first = first.clone();
+        async move { first.flush().await }
+    });
+    within(60, "the flush's vectors never began to go up", put.recv()).await;
+    let merging = tokio::spawn({
+        let first = first.clone();
+        async move { first.merge().await }
+    });
+    let key = first.lease().key.clone();
+    until(10, "the merge never took its turn", || {
+        builds.under_way_for(&key)
+    })
+    .await;
+    let behind = tokio::spawn({
+        let second = second.clone();
+        async move { second.merge().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    held.armed.store(false, Ordering::SeqCst);
+    held.let_go.notify_one();
+    within(60, "the held flush never ended", flushing)
+        .await
+        .unwrap()
+        .unwrap();
+    until(10, "no merge came to build", || builds.held() == 1).await;
+    assert!(
+        builds.under_way_for(&key),
+        "a merge lost its turn to one queued behind it, for a flush of its own"
+    );
+    assert!(!builds.under_way_for(&second.lease().key));
+    builds.hold(None);
+    let merged = within(60, "the first merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    let merged = within(60, "the second merge never ended", behind).await;
+    assert!(merged.unwrap().unwrap().is_some());
+}
+
+/// M5-R5 with a clean as the holder: cleaning up beside a tenant's merges
+/// holds its building lock, and the merge comes through that as it comes
+/// through a flush, its turn kept, its place ahead of the merge behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_keeps_its_turn_through_its_own_clean_and_builds_before_the_next() {
+    let builds = MergeBuilds::new(1);
+    let (mut one, other) = (Cluster::new().await, Cluster::new().await);
+    let held = HeldListing::over(one.blobs.clone());
+    one.blobs = held.clone();
+    let first = flushed(&one, &builds, 2).await;
+    let second = flushed(&other, &builds, 2).await;
+    builds.hold(Some(Holding::UntilLetGo));
+    held.armed.store(true, Ordering::SeqCst);
+    let cleaning = tokio::spawn({
+        let first = first.clone();
+        async move { first.clean(Duration::ZERO).await }
+    });
+    until(10, "the clean never began", || {
+        held.listing.load(Ordering::SeqCst)
+    })
+    .await;
+    let merging = tokio::spawn({
+        let first = first.clone();
+        async move { first.merge().await }
+    });
+    let key = first.lease().key.clone();
+    until(10, "the merge never took its turn", || {
+        builds.under_way_for(&key)
+    })
+    .await;
+    let behind = tokio::spawn({
+        let second = second.clone();
+        async move { second.merge().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    held.armed.store(false, Ordering::SeqCst);
+    within(60, "the held clean never ended", cleaning)
+        .await
+        .unwrap()
+        .unwrap();
+    until(10, "no merge came to build", || builds.held() == 1).await;
+    assert!(
+        builds.under_way_for(&key),
+        "a merge lost its turn to one queued behind it, for a clean of its own"
+    );
+    assert!(!builds.under_way_for(&second.lease().key));
+    builds.hold(None);
+    let merged = within(60, "the first merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    let merged = within(60, "the second merge never ended", behind).await;
+    assert!(merged.unwrap().unwrap().is_some());
+}
+
+/// A merge stopped while it waits for the lock with its turn gives the turn
+/// back at once, and is counted as one that had a turn and was stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_stopped_as_it_waits_with_its_turn_gives_the_turn_back_at_once() {
+    let builds = MergeBuilds::new(1);
+    let mut cluster = Cluster::new().await;
+    let held = HeldListing::over(cluster.blobs.clone());
+    cluster.blobs = held.clone();
+    let writer = flushed(&cluster, &builds, 2).await;
+    held.armed.store(true, Ordering::SeqCst);
+    let cleaning = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.clean(Duration::ZERO).await }
+    });
+    until(10, "the clean never began", || {
+        held.listing.load(Ordering::SeqCst)
+    })
+    .await;
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    let key = writer.lease().key.clone();
+    until(10, "the merge never took its turn", || {
+        builds.under_way_for(&key)
+    })
+    .await;
+    assert!(writer.stop_merges());
+    let merged = within(2, "a merge stopped with its turn went on waiting", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None);
+    assert_eq!(builds.turns_free(), 1);
+    assert_eq!(builds.under_way(), 0);
+    assert_eq!(writer.timings().merges_ended(MergeEnd::Stopped), 1);
+    held.armed.store(false, Ordering::SeqCst);
+    within(60, "the clean never ended", cleaning)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// A restore that has begun ends a merge's wait with its turn at once: it
+/// holds the lock for far longer than the wait, and only drops what a merge
+/// planned before it. The merge asked for its turn as the restore began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_under_way_sends_a_turn_waiting_for_its_lock_back_at_once() {
+    let builds = MergeBuilds::new(1);
+    let (cluster, other) = (Cluster::new().await, Cluster::new().await);
+    builds.hold(Some(Holding::UntilLetGo));
+    let writer = flushed(&cluster, &builds, 2).await;
+    let holder = flushed(&other, &builds, 2).await;
+    let holding = tokio::spawn({
+        let holder = holder.clone();
+        async move { holder.merge().await }
+    });
+    until(60, "the other merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    // Past its look for a restore, in the queue for the turn the other holds.
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let at = cluster.committed().await;
+    let restore = Restore {
+        request: RequestId::generate(),
+        asked: [0; 32],
+        from: at.log_position,
+        from_at: cluster.clock.now(),
+    };
+    let restoring = writer
+        .restore_from(
+            cluster.blobs.clone(),
+            at.manifest.as_ref(),
+            restore,
+            None,
+            &Claimed,
+        )
+        .await
+        .unwrap();
+    builds.hold(None);
+    within(60, "the other merge never ended", holding)
+        .await
+        .unwrap()
+        .unwrap();
+    until(3, "a turn stayed idle behind a restore", || {
+        builds.turns_free() == 1 && builds.under_way() == 0
+    })
+    .await;
+    assert!(!merging.is_finished());
+    drop(restoring);
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    assert_eq!(builds.turns_free(), 1);
+}
+
+/// A store whose writes of flushed vectors, once armed, each take
+/// `slowly`: flushes that take longer than a merge waits with its turn.
+#[derive(Debug)]
+struct SlowFlushes {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    slowly: Duration,
+}
+
+#[async_trait]
+impl Blobs for SlowFlushes {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if self.armed.load(Ordering::SeqCst)
+            && key.ends_with(".vectors")
+            && !key.contains("-merged")
+        {
+            tokio::time::sleep(self.slowly).await;
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// Flushes each longer than a merge waits with its turn, back to back, one
+/// always queued behind the one under way, never starve a merge. It waits
+/// with its turn and gives it back, and keeps its place for the lock without
+/// one; holding the lock it takes a turn that is free, there and then: let
+/// go to ask for one, the next flush would have the lock again, and the merge
+/// would see the start of a flush each time, with a turn idling each time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flushes_longer_than_a_turn_waits_back_to_back_never_starve_a_merge() {
+    let builds = MergeBuilds::new(1);
+    builds.idle_for(Duration::from_millis(100));
+    let mut cluster = Cluster::new().await;
+    let slow = Arc::new(SlowFlushes {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+        slowly: Duration::from_millis(300),
+    });
+    cluster.blobs = slow.clone();
+    let writer = flushed(&cluster, &builds, 2).await;
+    slow.armed.store(true, Ordering::SeqCst);
+    let flushing = Arc::new(AtomicBool::new(true));
+    let flushers: Vec<_> = (0..2)
+        .map(|flusher| {
+            let (writer, flushing) = (writer.clone(), flushing.clone());
+            tokio::spawn(async move {
+                let mut random = Random(100 + flusher);
+                let mut n = 100 * NOTES + flusher as u32 * 100_000;
+                while flushing.load(Ordering::SeqCst) {
+                    writer.commit(vec![note(n, &mut random)]).await.unwrap();
+                    n += 1;
+                    writer.flush().await.unwrap();
+                }
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let merged = within(
+        15,
+        "flushes back to back starved a merge",
+        writer.merge_planned_at(None),
+    )
+    .await;
+    flushing.store(false, Ordering::SeqCst);
+    for flusher in flushers {
+        within(30, "a flush never ended", flusher).await.unwrap();
+    }
+    assert!(merged.unwrap().is_some());
+    assert_eq!(builds.turns_free(), 1);
+}
+
+/// A merge held past loading back what it built, on a writer of `builds`:
+/// its gate, and the merge.
+async fn at_its_gate(writer: &Arc<Writer>) -> (Arc<MergeGate>, tokio::task::JoinHandle<Merged>) {
+    let gate = writer.hold_merges_before_commit();
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    within(
+        60,
+        "the merge never came to its commit",
+        gate.reached.notified(),
+    )
+    .await;
+    (gate, merging)
+}
+
+type Merged = vellev_storage::Result<Option<LogPosition>>;
+
+/// `rows` more notes, numbered from `from`, committed a thousand at a time.
+async fn more_notes(writer: &Writer, from: u32, rows: u32) {
+    let mut random = Random(13);
+    for chunk in (from..from + rows).collect::<Vec<u32>>().chunks(1_000) {
+        let notes = chunk.iter().map(|n| note(*n, &mut random)).collect();
+        writer.commit(notes).await.unwrap();
+    }
+}
+
+/// How long each hold of the lock by `holder` kept since last asked.
+fn holds(events: &[vellev_storage::timings::Event], holder: Holder) -> Vec<Duration> {
+    events
+        .iter()
+        .filter(|event| event.timed == Timed::BuildingHeld(holder))
+        .map(|event| event.took)
+        .collect()
+}
+
+/// How many rows each segment of `writer` holds, with the merged one's among
+/// them.
+fn rows_by_segment(writer: &Writer) -> Vec<u64> {
+    writer
+        .partition()
+        .read(|state| state.segments().map(|segment| segment.rows).collect())
+}
+
+/// M5-R7: with 40k rows unflushed as a merge comes to commit, its commit's
+/// hold of the building lock is under a flush of 4k rows. Those rows go
+/// first, as a plain flush of their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_flushes_first_and_its_commit_holds_the_lock_for_no_flush_of_them() {
+    let builds = MergeBuilds::new(1);
+    let cluster = Cluster::new().await;
+    let writer = flushed_due_at(&cluster, &builds, 2, 10_000).await;
+    writer.timings().keep_events(true);
+    let (gate, merging) = at_its_gate(&writer).await;
+    more_notes(&writer, 1_000_000, 4_000).await;
+    writer.flush().await.unwrap();
+    let four_thousand = holds(&writer.timings().drain_events(), Holder::Flush)[0];
+    more_notes(&writer, 2_000_000, 40_000).await;
+    let before = rows_by_segment(&writer).len();
+    gate.release.notify_one();
+    let merged = within(120, "the merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    let events = writer.timings().drain_events();
+    let commit = holds(&events, Holder::MergeCommit);
+    assert_eq!(commit.len(), 1, "{commit:?}");
+    assert!(
+        commit[0] < four_thousand,
+        "a commit held the lock {:?}, a flush of 4k rows {four_thousand:?}",
+        commit[0]
+    );
+    assert_eq!(
+        holds(&events, Holder::Flush).len(),
+        1,
+        "the 40k were not flushed first, on their own"
+    );
+    let rows = rows_by_segment(&writer);
+    assert!(rows.contains(&40_000), "{rows:?}");
+    // The two merged into one, and the 40k: nothing else went up.
+    assert_eq!(rows.len(), before, "{rows:?}");
+    assert_eq!(writer.partition().read(State::unflushed), 0);
+}
+
+/// Fewer rows than a flush are left to the commit, in one checkpoint, as
+/// they were: flushed first they would make two small segments of each
+/// commit made under writes. So what a commit flushes under its hold stays
+/// under a flush, unless its flush first could not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_leaves_fewer_rows_than_a_flush_to_its_commit() {
+    let builds = MergeBuilds::new(1);
+    let cluster = Cluster::new().await;
+    let writer = flushed_due_at(&cluster, &builds, 2, 1_000).await;
+    writer.timings().keep_events(true);
+    let (gate, merging) = at_its_gate(&writer).await;
+    more_notes(&writer, 1_000_000, 999).await;
+    gate.release.notify_one();
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    let events = writer.timings().drain_events();
+    assert_eq!(holds(&events, Holder::Flush), [], "flushed first, undue");
+    let rows = rows_by_segment(&writer);
+    assert!(rows.contains(&999), "{rows:?}");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+}
+
+/// A store whose next write of flushed vectors, once armed, fails.
+#[derive(Debug)]
+struct FlushFails {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+}
+
+#[async_trait]
+impl Blobs for FlushFails {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if key.ends_with(".vectors")
+            && !key.contains("-merged")
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::Blob {
+                key: key.into(),
+                source: "connection reset".into(),
+            });
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A flush first that fails costs nothing: the merge commits with the whole
+/// flush along, as it would have, and every row is in what it committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_first_that_fails_leaves_its_rows_to_the_commit() {
+    let builds = MergeBuilds::new(1);
+    let mut cluster = Cluster::new().await;
+    let fails = Arc::new(FlushFails {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+    });
+    cluster.blobs = fails.clone();
+    let writer = flushed_due_at(&cluster, &builds, 2, 1_000).await;
+    writer.timings().keep_events(true);
+    let (gate, merging) = at_its_gate(&writer).await;
+    more_notes(&writer, 1_000_000, 2_000).await;
+    fails.armed.store(true, Ordering::SeqCst);
+    gate.release.notify_one();
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    assert!(
+        !fails.armed.load(Ordering::SeqCst),
+        "no flush first was made"
+    );
+    let rows = rows_by_segment(&writer);
+    assert!(rows.contains(&2_000), "{rows:?}");
+    assert_eq!(writer.partition().read(State::unflushed), 0);
+}
+
+/// A flush first's wait for the lock running out costs nothing but the
+/// commit's hold: the merge gives its turn back, as it would at its commit,
+/// and flushes along. A flush first under way is never cut: only the wait is
+/// bounded, or what it had built would run on, with a second build of the
+/// same rows beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_first_is_bounded_in_its_wait_and_never_in_its_flush() {
+    let builds = MergeBuilds::new(1);
+    builds.idle_for(Duration::from_millis(100));
+    let mut cluster = Cluster::new().await;
+    let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
+    let held = Arc::new(HeldUpload {
+        inner: cluster.blobs.clone(),
+        kind: |key| key.ends_with(".vectors") && !key.contains("-merged"),
+        builds: builds.clone(),
+        armed: AtomicBool::new(false),
+        putting,
+        let_go: tokio::sync::Notify::new(),
+        ended: Arc::default(),
+    });
+    cluster.blobs = held.clone();
+    let writer = flushed_due_at(&cluster, &builds, 2, 1_000).await;
+    let (gate, merging) = at_its_gate(&writer).await;
+    more_notes(&writer, 1_000_000, 2_000).await;
+    held.armed.store(true, Ordering::SeqCst);
+    gate.release.notify_one();
+    within(60, "the flush first never began to go up", put.recv()).await;
+    // Well past the bound, and no second flush begins.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(put.try_recv().is_err(), "a second flush beside the first");
+    held.armed.store(false, Ordering::SeqCst);
+    held.let_go.notify_one();
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    let rows = rows_by_segment(&writer);
+    assert!(rows.contains(&2_000), "{rows:?}");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+}
+
+/// What flushes goes up one flush at a time, whoever asks: a flush asked for
+/// by a request or a tenant's flush task, a merge's flush first, a flush
+/// before letting go, and a merge's flush along. Each holds a flush's bytes,
+/// and a node reckons one flush to a tenant.
+#[derive(Debug)]
+struct OneAtATime {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    going_up: AtomicUsize,
+    most: AtomicUsize,
+    uploads: AtomicUsize,
+}
+
+#[async_trait]
+impl Blobs for OneAtATime {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if !key.ends_with(".vectors") || key.contains("-merged") {
+            return self.inner.put(key, bytes).await;
+        }
+        let going_up = self.going_up.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(going_up, Ordering::SeqCst);
+        self.uploads.fetch_add(1, Ordering::SeqCst);
+        while self.armed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let put = self.inner.put(key, bytes).await;
+        self.going_up.fetch_sub(1, Ordering::SeqCst);
+        put
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// Two flushes' worth of a tenant's bytes never overlap: with a flush held
+/// part way, a merge's flush first and a flush before letting go wait behind
+/// it, and the merge's flush along behind those, each with rows to flush.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_flushes_one_at_a_time_whoever_asks() {
+    let builds = MergeBuilds::new(1);
+    let mut cluster = Cluster::new().await;
+    let store = Arc::new(OneAtATime {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+        going_up: AtomicUsize::new(0),
+        most: AtomicUsize::new(0),
+        uploads: AtomicUsize::new(0),
+    });
+    cluster.blobs = store.clone();
+    let writer = flushed_due_at(&cluster, &builds, 2, 100).await;
+    let before = store.uploads.load(Ordering::SeqCst);
+    let (gate, merging) = at_its_gate(&writer).await;
+    more_notes(&writer, 1_000_000, 200).await;
+    store.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    let uploads = || store.uploads.load(Ordering::SeqCst) - before;
+    until(10, "the flush never began to go up", || uploads() == 1).await;
+    more_notes(&writer, 2_000_000, 200).await;
+    gate.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let letting_go = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush_timed().await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(uploads(), 1, "a flush went up beside another");
+    store.armed.store(false, Ordering::SeqCst);
+    within(60, "the flush never ended", flushing)
+        .await
+        .unwrap()
+        .unwrap();
+    within(60, "the flush before letting go never ended", letting_go)
+        .await
+        .unwrap()
+        .unwrap();
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    assert_eq!(store.most.load(Ordering::SeqCst), 1, "two flushes at once");
+    assert!(uploads() >= 2, "only one flushed anything");
+}
+
+/// A commit waits for the building lock with what it built held. Behind a
+/// long hold, as a clean's of up to two minutes on a slow store, it holds
+/// its turn no longer than a merge waiting to plan does: the turn goes back
+/// and another tenant's merge takes it. It keeps its place for the lock, and
+/// what it holds stays counted, as draining, against the node's budget, as
+/// no turn stands for it now, until it commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_behind_a_long_hold_gives_its_turn_back_and_stays_counted() {
+    let builds = MergeBuilds::new(1);
+    let (mut one, other) = (Cluster::new().await, Cluster::new().await);
+    let held = HeldListing::over(one.blobs.clone());
+    one.blobs = held.clone();
+    let first = flushed(&one, &builds, 2).await;
+    first.timings().keep_events(true);
+    let (gate, committing) = at_its_gate(&first).await;
+    assert_eq!(builds.turns_free(), 0);
+    assert_eq!(builds.draining(), 0, "a merge under way is no draining");
+    held.armed.store(true, Ordering::SeqCst);
+    let cleaning = tokio::spawn({
+        let first = first.clone();
+        async move { first.clean(Duration::ZERO).await }
+    });
+    until(10, "the clean never began", || {
+        held.listing.load(Ordering::SeqCst)
+    })
+    .await;
+    gate.release.notify_one();
+    let waited = std::time::Instant::now();
+    let bound = TURN_IDLE_AT_MOST.as_secs() + 1;
+    until(bound, "a commit held its turn behind a clean", || {
+        builds.turns_free() == 1
+    })
+    .await;
+    assert!(
+        waited.elapsed() >= TURN_IDLE_AT_MOST / 2,
+        "the turn went back at once, after {:?}",
+        waited.elapsed()
+    );
+    let reckoned = builds.largest_reckoned();
+    assert!(reckoned > 0);
+    assert_eq!(builds.draining(), reckoned, "what it holds is not counted");
+    assert_eq!(builds.under_way(), 0, "counted among the turns held");
+    let second = flushed(&other, &builds, 2).await;
+    let merged = within(60, "no other merge took the turn", second.merge()).await;
+    assert!(merged.unwrap().is_some());
+    assert_eq!(builds.draining(), reckoned, "let go before it committed");
+    held.armed.store(false, Ordering::SeqCst);
+    within(60, "the clean never ended", cleaning)
+        .await
+        .unwrap()
+        .unwrap();
+    let merged = within(60, "the commit never ended", committing).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    assert_eq!(builds.draining(), 0, "still counted after it committed");
+    assert_eq!(builds.turns_free(), 1);
+    let idle: Vec<Duration> = first
+        .timings()
+        .drain_events()
+        .iter()
+        .filter(|event| event.timed == Timed::Merge(MergePhase::TurnIdle))
+        .map(|event| event.took)
+        .collect();
+    let bound = TURN_IDLE_AT_MOST + Duration::from_secs(1);
+    assert!(
+        idle.iter().any(|idle| *idle >= TURN_IDLE_AT_MOST / 2),
+        "{idle:?}"
+    );
+    assert!(idle.iter().all(|idle| *idle <= bound), "{idle:?}");
 }
 
 /// A store that hands a copy of each merged vectors file it is given, once

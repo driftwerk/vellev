@@ -657,6 +657,8 @@ struct Settling {
     /// round that went through. A round merges until a merge finds nothing
     /// to do, so once it has followed every flush, no merge is due.
     maintained: AtomicU64,
+    /// Passes over its segments' rows made.
+    rows_passes: AtomicU64,
 }
 
 /// A node's hold on a tenant, as everything that works on the tenant sees
@@ -939,6 +941,19 @@ impl Tenant {
     #[doc(hidden)]
     pub fn hold_merges_before_commit(&self) -> Arc<vellev_storage::MergeGate> {
         self.work.writer.hold_merges_before_commit()
+    }
+
+    /// Stop the tenant's merges, as a sweep does. For tests.
+    #[doc(hidden)]
+    pub fn stop_merges(&self) {
+        self.work.writer.stop_merges();
+    }
+
+    /// How many passes over its segments' rows its maintenance has made.
+    /// For tests.
+    #[doc(hidden)]
+    pub fn rows_passes(&self) -> u64 {
+        self.work.settling.rows_passes.load(Ordering::SeqCst)
     }
 
     /// When the hold on the tenant runs out unless renewed: each renewal
@@ -1450,6 +1465,7 @@ impl TenantWork {
         // takes its turn. What is missing is worked out afresh each time,
         // so a pass skipped or cut short is made at a later round.
         if let Ok(_one) = ROWS_PASSES.try_acquire() {
+            self.settling.rows_passes.fetch_add(1, Ordering::SeqCst);
             if let Err(error) = self.writer.rows_pass().await {
                 tracing::warn!(tenant = %self.id, %error, "the curves of segments' rows were not made");
             }

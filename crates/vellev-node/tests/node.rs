@@ -44,6 +44,9 @@ enum Fault {
     Gated,
     /// The next write panics, and then they go right again.
     Panics,
+    /// The next write waits for a permit from [`Store::gate`] and fails,
+    /// and then they go right again.
+    GatedFailsOnce,
 }
 
 /// Object storage whose writes can be made to fail.
@@ -66,6 +69,11 @@ struct Store {
     vectors_written: std::sync::Mutex<Vec<tokio::time::Instant>>,
     /// Permits for [`Fault::Gated`] writes, none to begin with.
     gate: tokio::sync::Semaphore,
+    /// Whether the next write of a file of a merge's panics.
+    merged_panics: AtomicBool,
+    /// How many writes of a segment were asked for, right or wrong: as a
+    /// flush comes to them once its vectors are up.
+    segments_written: AtomicUsize,
 }
 
 impl Store {
@@ -83,16 +91,23 @@ impl Store {
                 .unwrap()
                 .push(tokio::time::Instant::now());
         }
+        if key.ends_with(".segment") {
+            self.segments_written.fetch_add(1, Ordering::SeqCst);
+        }
         let fault = {
             let mut faulty = self.faulty.lock().unwrap();
             let fault = faulty
                 .filter(|(kind, _)| key.ends_with(&format!(".{kind}")))
                 .map(|(_, fault)| fault);
-            if let Some(Fault::FailsOnce | Fault::Panics) = fault {
+            if let Some(Fault::FailsOnce | Fault::Panics | Fault::GatedFailsOnce) = fault {
                 *faulty = None;
             }
             fault
         };
+        assert!(
+            !(key.contains("-merged") && self.merged_panics.swap(false, Ordering::SeqCst)),
+            "a merge's write panics, as a test asks"
+        );
         assert!(
             !matches!(fault, Some(Fault::Panics)),
             "a write panics, as a test asks"
@@ -100,7 +115,7 @@ impl Store {
         if let Some(Fault::NeverAnswers) = fault {
             std::future::pending::<()>().await;
         }
-        if let Some(Fault::Gated) = fault {
+        if let Some(Fault::Gated | Fault::GatedFailsOnce) = fault {
             self.gate.acquire().await.expect("gate open").forget();
         }
         let failed = fault.is_some_and(|fault| !matches!(fault, Fault::Gated | Fault::Panics));
@@ -186,6 +201,8 @@ impl Cluster {
                 forgotten: std::sync::Mutex::default(),
                 vectors_written: std::sync::Mutex::default(),
                 gate: tokio::sync::Semaphore::new(0),
+                merged_panics: AtomicBool::new(false),
+                segments_written: AtomicUsize::new(0),
             }),
         }
     }
@@ -1502,6 +1519,288 @@ async fn a_tenant_whose_maintenance_panicked_is_given_up() {
     tokio::time::timeout(Duration::from_secs(10), flushed)
         .await
         .expect("flushed by the tenant opened afresh");
+}
+
+/// A round of maintenance can panic too, on its own task: a merge's upload
+/// that panics is raised again where the merge waits for it. That task has
+/// its own hold on the tenant's fate: the tenant is given up, and counted
+/// once, its flush task with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_whose_merge_panicked_is_given_up() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let node = node_flushing(&cluster, coordinator, LEASE);
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.merged_panics.store(true, Ordering::SeqCst);
+    for flush in 0..4 {
+        held.write(ten_notes(flush * 10)).await.unwrap();
+        let flushed = async {
+            while held.read(State::unflushed) > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), flushed)
+            .await
+            .expect("the tenant was flushed");
+    }
+    let given_up = async {
+        while Arc::ptr_eq(&held, &node.tenant(&acme).await.unwrap()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), given_up)
+        .await
+        .expect("a tenant whose merge panicked lived on");
+    assert!(
+        !cluster.store.merged_panics.load(Ordering::SeqCst),
+        "no merge's write panicked: the rule is of a merge that did"
+    );
+    assert_eq!(node.tenants_given_up(), 1, "given up with nothing to show");
+    let opened = node.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 40, "its rows were lost");
+}
+
+/// A flush that lands during a lapse asks for a round, and a round is no more
+/// to be run on a hold that may be lost than a flush begun: it comes once
+/// the hold is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_landing_in_a_lapse_has_its_round_after_it() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let lease = Duration::from_secs(3);
+    let node = node_flushing(&cluster, coordinator.clone(), lease);
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Gated)));
+    held.write(ten_notes(0)).await.unwrap();
+    let began = async {
+        while cluster.store.vectors_written.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), began)
+        .await
+        .expect("the flush began");
+    coordinator.failing.store(true, Ordering::SeqCst);
+    until_lapsed(&held).await;
+    let rounds = coordinator.history_forgotten.load(Ordering::SeqCst);
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    let flushed = async {
+        while held.read(State::unflushed) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), flushed)
+        .await
+        .expect("the flush landed");
+    tokio::time::sleep(lease / 2).await;
+    assert_eq!(
+        coordinator.history_forgotten.load(Ordering::SeqCst),
+        rounds,
+        "a round ran through the lapse"
+    );
+    coordinator.failing.store(false, Ordering::SeqCst);
+    let followed = async {
+        while coordinator.history_forgotten.load(Ordering::SeqCst) == rounds {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), followed)
+        .await
+        .expect("no round followed the flush once the hold was back");
+    assert_eq!(node.tenants_given_up(), 0, "nothing panicked");
+}
+
+/// A tenant with ten notes, a flush's worth on [`node_flushing`], and its
+/// flush held part way, its vectors going up and its segment not yet.
+async fn a_flush_held_part_way(cluster: &Cluster, node: &Node, tenant: &TenantId) -> Arc<Tenant> {
+    node.create_tenant(tenant).await.unwrap();
+    let held = node.tenant(tenant).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Gated)));
+    held.write(ten_notes(0)).await.unwrap();
+    let began = async {
+        while cluster.store.vectors_written.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), began)
+        .await
+        .expect("the flush began");
+    held
+}
+
+/// The flush held by [`a_flush_held_part_way`] let go: nothing more of it
+/// goes up, as the hold ended it.
+async fn no_flush_goes_on(cluster: &Cluster) {
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        cluster.store.segments_written.load(Ordering::SeqCst),
+        0,
+        "a flush went on past the hold"
+    );
+}
+
+/// M5-R4: dropping a tenant ends its flush, wherever it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_dropped_flushes_no_more() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    let acme = tenant("acme");
+    let _held = a_flush_held_part_way(&cluster, &node, &acme).await;
+    assert!(node.drop_tenant(&acme).await.unwrap());
+    no_flush_goes_on(&cluster).await;
+}
+
+/// M5-R4: a hold lost ends its tenant's flush, wherever it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_whose_lease_was_lost_flushes_no_more() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let node = node_flushing(&cluster, coordinator, Duration::from_secs(1));
+    let acme = tenant("acme");
+    let held = a_flush_held_part_way(&cluster, &node, &acme).await;
+    assert!(cluster.node().drop_tenant(&acme).await.unwrap());
+    let lost = async {
+        while held.write(vec![note(99, "owl", None)]).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), lost)
+        .await
+        .expect("the hold was never lost");
+    no_flush_goes_on(&cluster).await;
+}
+
+/// M5-R4: shutting down ends a flush under way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_shut_down_flushes_no_more() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    let acme = tenant("acme");
+    let _held = a_flush_held_part_way(&cluster, &node, &acme).await;
+    node.shutdown().await;
+    no_flush_goes_on(&cluster).await;
+}
+
+/// M5-R4: a tenant is let go between rounds, so no flush of its is under way;
+/// but its flush task may come to one as it goes, a failed flush being tried
+/// again behind the flush before letting go. Should that fail too, the rows
+/// are left for the next opener, and the flush behind it, which holds no
+/// tenant, must not go on: no flush runs after the hold is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_let_go_flushes_no_more() {
+    let cluster = Cluster::new();
+    let idle = Duration::from_millis(300);
+    let backoff = Duration::from_secs(3);
+    let node = cluster.node_from(Settings {
+        flush_rows: 10,
+        flush_backoff: backoff,
+        tenant_idle: idle,
+        ..cluster.settings()
+    });
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    held.write(ten_notes(0)).await.unwrap();
+    let failed = async {
+        while node.flushing().failed == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), failed)
+        .await
+        .expect("the flush failed");
+    let retried_at = tokio::time::Instant::now() + backoff;
+    let asked = cluster.store.vectors_written.lock().unwrap().len();
+    cluster
+        .store
+        .fault(Some(("vectors", Fault::GatedFailsOnce)));
+    drop(held);
+    tokio::time::sleep(idle + Duration::from_millis(100)).await;
+    let segments = cluster.store.segments_written.load(Ordering::SeqCst);
+    let letting_go = async {
+        while cluster.store.vectors_written.lock().unwrap().len() == asked {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Its flush task's next try comes, and waits behind this flush.
+        tokio::time::sleep_until(retried_at + Duration::from_millis(300)).await;
+        cluster.store.gate.add_permits(1);
+    };
+    let swept = async { tokio::join!(node.sweep_now(), letting_go) };
+    tokio::time::timeout(Duration::from_secs(20), swept)
+        .await
+        .expect("the tenant was let go");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(node.resident(), 0, "not let go");
+    assert_eq!(
+        cluster.store.segments_written.load(Ordering::SeqCst),
+        segments,
+        "a flush went on past the hold"
+    );
+    let opened = node.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 10, "its rows were lost");
+}
+
+/// A flush under way keeps its tenant, as a round does: a sweep takes out
+/// only a tenant between rounds, and letting go of one mid-flush would wait
+/// for it with no bound (node memory note, M7b).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_is_kept_while_its_flush_is_under_way() {
+    let cluster = Cluster::new();
+    let idle = Duration::from_millis(200);
+    let node = cluster.node_from(Settings {
+        flush_rows: 10,
+        tenant_idle: idle,
+        ..cluster.settings()
+    });
+    let acme = tenant("acme");
+    drop(a_flush_held_part_way(&cluster, &node, &acme).await);
+    tokio::time::sleep(idle + Duration::from_millis(100)).await;
+    // The census is taken as a sweep begins: a second one finds what the
+    // first let go.
+    node.sweep_now().await;
+    node.sweep_now().await;
+    assert_eq!(node.census().holding.writers, 1, "let go mid-flush");
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    let let_go = async {
+        while node.resident() > 0 {
+            node.sweep_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), let_go)
+        .await
+        .expect("the tenant was never let go once its flush ended");
+    assert_eq!(cluster.store.segments_written.load(Ordering::SeqCst), 1);
 }
 
 /// L5: a flush that failed leaves its backoff set, and maintenance, which
