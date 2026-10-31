@@ -258,7 +258,7 @@ async fn over_its_budget_a_node_stops_a_tenant_s_merge_and_lets_it_go_once_the_b
     until(10, "the tenant was never let go", || node.resident() == 0).await;
 }
 
-/// A sweep cannot tell a request's hold on a tenant from its maintenance's:
+/// A sweep takes a request's hold on a tenant as it does its maintenance's:
 /// over its budget it stops a merge the request makes, but never takes the
 /// tenant out from under the request, however many rounds go by. Once the
 /// request ends, the tenant is let go.
