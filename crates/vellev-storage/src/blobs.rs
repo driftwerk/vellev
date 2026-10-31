@@ -2031,9 +2031,10 @@ pub fn disk_room(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         let stats = nix::sys::statvfs::statvfs(path).ok()?;
-        let block = u64::from(stats.fragment_size());
-        let free = u64::from(stats.blocks_available()).saturating_mul(block);
-        let size = u64::from(stats.blocks()).saturating_mul(block);
+        // Each of its own width on each system.
+        let block = stats.fragment_size() as u64;
+        let free = (stats.blocks_available() as u64).saturating_mul(block);
+        let size = (stats.blocks() as u64).saturating_mul(block);
         Some((free, size))
     }
     #[cfg(not(unix))]
