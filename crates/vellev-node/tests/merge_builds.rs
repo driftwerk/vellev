@@ -16,9 +16,10 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{MergesStopped, Node, NodeError, Settings};
-use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs, SpillsTold};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
-use vellev_storage::{Holding, MergeGate, Mutation, State, MERGE_BUILDS};
+use vellev_storage::timings::MergeEnd;
+use vellev_storage::{Disk, Holding, MergeGate, Mutation, State, MERGE_BUILDS};
 
 /// Notes written between flushes: as many as a flush is made at.
 const NOTES: u128 = 10;
@@ -871,6 +872,75 @@ async fn a_node_s_merge_gathers_in_its_store_s_cache_and_a_shutdown_leaves_nothi
         spills(dir.path()) == 0 && builds.under_way() == 0
     })
     .await;
+}
+
+/// A store under a cache, counting what is deleted from it.
+#[derive(Debug)]
+struct DeletesCounted {
+    inner: Arc<dyn Blobs>,
+    deletes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Blobs for DeletesCounted {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete(key).await
+    }
+}
+
+/// M8-R15. Cleaning up is the one thing that frees a disk a merge has no room
+/// on, so a round whose merge fails, or is skipped for want of that room,
+/// goes on to clean all the same.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_round_whose_merge_fails_or_is_skipped_still_cleans_up() {
+    for skipped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(DeletesCounted {
+            inner: Arc::new(ObjectBlobs::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            ))),
+            deletes: deletes.clone(),
+        });
+        let told = Arc::new(SpillsTold::default());
+        let disk =
+            Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8).spills_told(told.clone());
+        let cached = CachedBlobs::new(store, dir.path()).on(disk);
+        match skipped {
+            true => told.free.store(0, Ordering::SeqCst),
+            false => told.at_most.store(0, Ordering::SeqCst),
+        }
+        let node = node_on(Arc::new(cached), |settings| {
+            settings.flush_rows = NOTES as usize;
+            settings.restore_window = Duration::ZERO;
+            settings.grace = Duration::ZERO;
+        });
+        four_flushes(&node, "merging").await;
+        let end = match skipped {
+            true => MergeEnd::NoRoom,
+            false => MergeEnd::Failed,
+        };
+        until(30, "no merge ended so", || {
+            node.timings().merges_ended(end) > 0
+        })
+        .await;
+        until(30, "a round that merged nothing cleaned nothing", || {
+            deletes.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        node.shutdown().await;
+    }
 }
 
 /// M7-R4, for the sweep's own stop: every sweep that finds the tenant held

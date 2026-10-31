@@ -31,7 +31,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +64,11 @@ pub struct Spills {
 impl Spills {
     pub(crate) fn in_dir(dir: PathBuf, disk: Disk) -> Self {
         Self { dir, disk }
+    }
+
+    /// What has been spilled here, so far.
+    pub fn figures(&self) -> SpillFigures {
+        SpillFigures::default()
     }
 
     /// How many bytes of a frame are in memory as it goes up, at the most: a
@@ -99,11 +104,14 @@ pub(crate) struct SpillAsked {
 /// to by name any more is the system's to free, once what has it open or
 /// mapped has let it go.
 #[derive(Debug, Default)]
-struct Name(Option<PathBuf>);
+struct Name(Option<PathBuf>, Option<Arc<SpillsTold>>);
 
 impl Drop for Name {
     fn drop(&mut self) {
         if let Some(path) = self.0.take() {
+            if let Some(told) = self.1.take() {
+                told.unlinks();
+            }
             if let Err(error) = std::fs::remove_file(&path) {
                 // Already gone, as by a cache emptied under it.
                 if error.kind() != std::io::ErrorKind::NotFound {
@@ -152,6 +160,7 @@ impl SpillAsked {
         let path = dir.join(name);
         // On one step, which goes on to its end whoever stops waiting: all
         // it made goes with what it returns, should nobody take that.
+        let told = disk.spills_are_told();
         let begun = {
             move || {
                 std::fs::create_dir_all(&dir)?;
@@ -160,7 +169,7 @@ impl SpillAsked {
                     .write(true)
                     .create_new(true)
                     .open(&path)?;
-                let name = Name(Some(path));
+                let name = Name(Some(path), told);
                 match file.try_lock() {
                     Ok(()) => Ok((file, name)),
                     // A file system with no locks: spills left behind there
@@ -247,6 +256,11 @@ impl Spilling {
             return Ok(None);
         };
         let map = mapped.map_err(|error| unwritten(&self.key, error))?;
+        if let Some(told) = self.disk.spills_are_told() {
+            let from = map.as_ptr() as usize;
+            told.mapped_from.store(from, Ordering::SeqCst);
+            told.mapped_to.store(from + map.len(), Ordering::SeqCst);
+        }
         Ok(Some(Spill {
             map: Some(map),
             version,
@@ -372,6 +386,18 @@ fn nobody_holds(
     }
 }
 
+/// What is spilled to a disk, as a node reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpillFigures {
+    /// How many bytes of spills are on the disk now, each as much as its
+    /// frame comes to whole, from the moment it begins.
+    pub bytes: u64,
+    /// How many merges have not spilled for want of room, and were skipped.
+    pub skipped: u64,
+    /// How many spills the disk has failed.
+    pub failed: u64,
+}
+
 /// What a test has a disk do to what is spilled to it, as a disk that fills
 /// or stops answering would. Not for use.
 #[doc(hidden)]
@@ -386,6 +412,19 @@ pub struct SpillsTold {
     /// How long, in milliseconds, each piece of a spill takes to read as it
     /// goes up.
     pub reading: AtomicU64,
+    /// How many bytes have been written to spills.
+    pub written: AtomicU64,
+    /// How long, in milliseconds, a spill's name takes to remove.
+    pub unlinking: AtomicU64,
+    /// How long, in milliseconds, a cache goes before it looks again, once
+    /// it has taken a spill up.
+    pub looks_again_in: AtomicU64,
+    /// How many bytes the disk says are free, if not [`Self::ASK_THE_DISK`].
+    pub free: AtomicU64,
+    /// Where the last spill made is mapped, and where it ends: for a store
+    /// a test has read as a mapping is read.
+    pub mapped_from: AtomicUsize,
+    pub mapped_to: AtomicUsize,
 }
 
 impl Default for SpillsTold {
@@ -395,11 +434,38 @@ impl Default for SpillsTold {
             taking: AtomicU64::new(0),
             taken_up_in: AtomicU64::new(0),
             reading: AtomicU64::new(0),
+            written: AtomicU64::new(0),
+            unlinking: AtomicU64::new(0),
+            looks_again_in: AtomicU64::new(0),
+            free: AtomicU64::new(Self::ASK_THE_DISK),
+            mapped_from: AtomicUsize::new(0),
+            mapped_to: AtomicUsize::new(0),
         }
     }
 }
 
 impl SpillsTold {
+    /// That the disk is asked how much is free, as if told nothing.
+    pub const ASK_THE_DISK: u64 = u64::MAX;
+
+    /// Whether `bytes` lies in the last spill's mapping.
+    pub fn maps(&self, bytes: *const u8) -> bool {
+        let from = self.mapped_from.load(Ordering::SeqCst);
+        (from..self.mapped_to.load(Ordering::SeqCst)).contains(&(bytes as usize))
+    }
+
+    /// A spill's name about to be removed, as told.
+    fn unlinks(&self) {
+        let taking = self.unlinking.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(taking));
+    }
+
+    /// A cache about to look again at a spill it took up, as told.
+    pub(crate) fn looks_again(&self) {
+        let taking = self.looks_again_in.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(taking));
+    }
+
     /// A piece about to be read as it goes up, as told.
     fn read(&self) {
         let taking = self.reading.load(Ordering::SeqCst);
@@ -416,6 +482,7 @@ impl SpillsTold {
     fn writes(&self, end: u64) -> std::io::Result<()> {
         let taking = self.taking.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(taking));
+        self.written.store(end, Ordering::SeqCst);
         match end > self.at_most.load(Ordering::SeqCst) {
             true => Err(std::io::ErrorKind::StorageFull.into()),
             false => Ok(()),

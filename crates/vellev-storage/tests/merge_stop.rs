@@ -330,10 +330,11 @@ async fn a_merge_gathered_on_disk_stopped_at_any_moment_gives_up_within_two_seco
     let mut cluster = Cluster::new().await;
     let cache = tempfile::tempdir().unwrap();
     cluster.blobs = Arc::new(CachedBlobs::new(cluster.blobs.clone(), cache.path()));
-    stopped_at_any_moment(cluster).await;
+    let writer = stopped_at_any_moment(cluster).await;
+    assert!(writer.last_spilled() > 0, "gathered in memory");
 }
 
-async fn stopped_at_any_moment(cluster: Cluster) {
+async fn stopped_at_any_moment(cluster: Cluster) -> Arc<Writer> {
     let rows: u32 = std::env::var("VELLEV_STOP_ROWS")
         .ok()
         .and_then(|rows| rows.parse().ok())
@@ -419,6 +420,7 @@ async fn stopped_at_any_moment(cluster: Cluster) {
     );
     assert!(stopped >= 5, "too few stops to say: {stopped}");
     assert!(worst <= Duration::from_secs(2), "a stop took {worst:?}");
+    writer
 }
 
 /// A merge waiting its turn behind another when merges are stopped is

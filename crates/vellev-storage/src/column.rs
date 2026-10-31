@@ -662,6 +662,7 @@ mod tests {
         assert_eq!(read, 0, "it read on");
     }
     use crate::format::CollectionId;
+    use std::sync::Arc;
     use vellev_core::{Object, ObjectId};
 
     /// `vectors` gathered into a spill in `dir`, as a merge does, as a
@@ -729,6 +730,50 @@ mod tests {
             assert_eq!(spilled.resident(), spilled.offsets.len() * 8);
             assert_eq!(spilled.len(), vectors.len());
             drop((spilled, mapped, frame));
+        }
+    }
+
+    /// A frame goes up as it lies, whatever the store's parts and however
+    /// they fall on the pieces it is read in: of a whole number of pieces, of
+    /// a part exactly, or more than a part by a byte's worth, in parts that
+    /// are a whole number of pieces, and not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spill_goes_up_as_it_lies_wherever_its_parts_fall_on_its_pieces() {
+        use crate::blobs::{Blobs, ObjectBlobs, Transfers};
+        const MIB: usize = 1024 * 1024;
+        /// Rows of 1,000 values that come to a frame of exactly `bytes`.
+        fn framed_at(bytes: usize) -> Vec<Option<Vec<f32>>> {
+            let rows = bytes / 4_008;
+            let widths = 4 + 2 * (rows + 1) + 2 + 1;
+            let values = bytes / 4 - widths;
+            let mut vectors: Vec<Option<Vec<f32>>> = (0..rows)
+                .map(|row| Some(vec![row as f32; (values / rows).max(1)]))
+                .collect();
+            let last = vectors.last_mut().unwrap().as_mut().unwrap();
+            last.resize(last.len() + values % rows, 1.5);
+            vectors
+        }
+        for frame in [8 * MIB, 12 * MIB, 8 * MIB + 4] {
+            let vectors = framed_at(frame);
+            let dir = tempfile::tempdir().unwrap();
+            let spilled = spilled_in(dir.path(), vectors.clone()).await;
+            let spill = spilled.spill().expect("spilled");
+            assert_eq!(spill.bytes().len(), frame);
+            for part in [4 * MIB, 8 * MIB, 5 * MIB, 7 * MIB] {
+                let transfers = Transfers {
+                    part_bytes: part,
+                    ..Transfers::default()
+                };
+                let store = ObjectBlobs::new(Arc::new(object_store::memory::InMemory::new()))
+                    .transferring(transfers);
+                let bytes = spilled.encode_as(format::FORMAT_VERSION);
+                store
+                    .put_spilled("t/1/v", bytes, spill.clone())
+                    .await
+                    .unwrap();
+                let went_up = store.get("t/1/v").await.unwrap();
+                assert!(went_up == spill.bytes(), "{frame} in parts of {part}");
+            }
         }
     }
 

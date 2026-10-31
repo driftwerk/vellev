@@ -38,7 +38,7 @@ use object_store::{
 use crate::coordinator::{Generation, LogPosition, PartitionKey};
 use crate::format::verify;
 use crate::spill::{left_behind, SPILL_EXTENSION};
-pub use crate::spill::{Spill, Spills, SpillsTold};
+pub use crate::spill::{Spill, SpillFigures, Spills, SpillsTold};
 use crate::{Result, StorageError};
 
 /// Every call must end: whatever a store waits on, another machine or a
@@ -1947,7 +1947,7 @@ impl CachedBlobs {
         };
         let (given_up, told) = (taking.given_up.clone(), self.disk.spills_are_told());
         let taken = self.disk.run(0, move || {
-            if let Some(told) = told {
+            if let Some(told) = &told {
                 told.taken_up();
             }
             let given_up = || given_up.load(Ordering::SeqCst);
@@ -1961,6 +1961,9 @@ impl CachedBlobs {
             }
             crate::column::forget_summed(&path);
             spill.renamed_to(&path)?;
+            if let Some(told) = told {
+                told.looks_again();
+            }
             if given_up() {
                 let _ = std::fs::remove_file(&path);
                 return Err(gone());
@@ -1972,6 +1975,13 @@ impl CachedBlobs {
             Err(error) => tracing::warn!(key, %error, "could not keep a spill as a file's copy"),
         }
     }
+}
+
+/// How much room there is on the file system of `path`, as far as a process
+/// with no privilege may use it, and how large it is, if the system says.
+#[doc(hidden)]
+pub fn disk_room(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// A file being fetched into the cache under a name of its own, removed

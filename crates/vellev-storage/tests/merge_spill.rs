@@ -13,9 +13,15 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::*;
+use futures::stream::BoxStream;
+use object_store::path::Path as StorePath;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
+};
 use vellev_index::stop::Stage;
-use vellev_storage::blobs::SpillsTold;
-use vellev_storage::{Disk, Holding, MergeBuilds, MergeStage, Merging};
+use vellev_storage::blobs::{disk_room, SpillsTold};
+use vellev_storage::{Disk, Holding, MergeBuilds, MergeStage, Merging, Transfers};
 
 /// Rows in each of the two segments merged, of [`WIDTH`] dimensions: their
 /// vectors are several of the pieces a spill is written in.
@@ -251,6 +257,150 @@ fn vector_in(state: &State, n: u32) -> Option<Vec<f32>> {
     live.vector.map(<[f32]>::to_vec)
 }
 
+/// A store that reads what it is given where a store's client reads it, on
+/// the async thread that sends it, and counts the parts of each vectors
+/// file. A page of a spill's mapping gone from memory would hold that thread
+/// for as long as the disk takes: so what lies in the mapping is taken to
+/// be such a page, for as long as `told` says reading it takes.
+#[derive(Debug)]
+struct Client {
+    inner: InMemory,
+    told: Arc<SpillsTold>,
+    parts: Arc<AtomicUsize>,
+}
+
+impl Client {
+    fn over(told: Arc<SpillsTold>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemory::new(),
+            told,
+            parts: Arc::default(),
+        })
+    }
+}
+
+impl std::fmt::Display for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a client")
+    }
+}
+
+/// Read what `payload` holds as `told` says the disk takes to.
+fn read_as_told(told: &SpillsTold, payload: &PutPayload) {
+    if payload.iter().any(|chunk| told.maps(chunk.as_ptr())) {
+        let taking = told.reading.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(taking));
+    }
+}
+
+#[async_trait]
+impl ObjectStore for Client {
+    async fn put_opts(
+        &self,
+        location: &StorePath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        read_as_told(&self.told, &payload);
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &StorePath,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(ClientParts {
+            inner,
+            told: self.told.clone(),
+            parts: location
+                .as_ref()
+                .ends_with(".vectors")
+                .then(|| self.parts.clone()),
+        }))
+    }
+    async fn get_opts(
+        &self,
+        location: &StorePath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    async fn delete(&self, location: &StorePath) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+    fn list(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy(&self, from: &StorePath, to: &StorePath) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+    async fn copy_if_not_exists(
+        &self,
+        from: &StorePath,
+        to: &StorePath,
+    ) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[derive(Debug)]
+struct ClientParts {
+    inner: Box<dyn MultipartUpload>,
+    told: Arc<SpillsTold>,
+    parts: Option<Arc<AtomicUsize>>,
+}
+
+#[async_trait]
+impl MultipartUpload for ClientParts {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        read_as_told(&self.told, &data);
+        if let Some(parts) = &self.parts {
+            parts.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.put_part(data)
+    }
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        self.inner.complete().await
+    }
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
+    }
+}
+
+/// The merged files by what they are, as their names say. An index
+/// names its segment, a name drawn at random, as any two merges'
+/// differ: that name, and the checksum that sums it, are left blank.
+async fn merged_files(store: &dyn Blobs, cluster: &Cluster) -> BTreeMap<String, Vec<u8>> {
+    let listed = store.list(&Layout(&cluster.key).prefix()).await.unwrap();
+    let keys = listed.into_iter().map(|file| file.key);
+    let keys: Vec<String> = keys.filter(|key| key.contains("-merged")).collect();
+    let segment = keys.iter().find(|key| key.ends_with(".segment")).unwrap();
+    let mut frames = BTreeMap::new();
+    for key in &keys {
+        let kind = key.rsplit('.').next().unwrap().to_string();
+        let mut frame = store.get(key).await.unwrap().to_vec();
+        if kind == "index" {
+            let name = segment.as_bytes();
+            let at = frame.windows(name.len()).position(|bytes| bytes == name);
+            let at = at.expect("an index names its segment");
+            frame[at..at + name.len()].fill(0);
+            frame[15..19].fill(0);
+        }
+        frames.insert(kind, frame);
+    }
+    frames
+}
+
 /// M8-R1, and that nothing persisted changes. The frames a merge uploads,
 /// gathered on disk, are byte for byte those it uploads gathered in memory:
 /// its vectors, its segment and its index, at 768 and 8 dimensions, rows
@@ -272,36 +422,13 @@ async fn a_merge_gathered_on_disk_uploads_the_frames_it_would_in_memory_byte_for
             ..holes
         },
     ];
-    /// The merged files by what they are, as their names say. An index
-    /// names its segment, a name drawn at random, as any two merges'
-    /// differ: that name, and the checksum that sums it, are left blank.
-    async fn merged(store: &dyn Blobs, cluster: &Cluster) -> BTreeMap<String, Vec<u8>> {
-        let listed = store.list(&Layout(&cluster.key).prefix()).await.unwrap();
-        let keys = listed.into_iter().map(|file| file.key);
-        let keys: Vec<String> = keys.filter(|key| key.contains("-merged")).collect();
-        let segment = keys.iter().find(|key| key.ends_with(".segment")).unwrap();
-        let mut frames = BTreeMap::new();
-        for key in &keys {
-            let kind = key.rsplit('.').next().unwrap().to_string();
-            let mut frame = store.get(key).await.unwrap().to_vec();
-            if kind == "index" {
-                let name = segment.as_bytes();
-                let at = frame.windows(name.len()).position(|bytes| bytes == name);
-                let at = at.expect("an index names its segment");
-                frame[at..at + name.len()].fill(0);
-                frame[15..19].fill(0);
-            }
-            frames.insert(kind, frame);
-        }
-        frames
-    }
     for shape in shapes {
         let cluster = Cluster::new().await;
         let builds = MergeBuilds::new(1);
         let writer = written_on(cluster.writer().await, &builds, shape).await;
         within(LONG, "the merge", writer.merge()).await.unwrap();
         assert_eq!(writer.last_spilled(), 0, "gathered on no disk");
-        let expected = merged(&*cluster.blobs, &cluster).await;
+        let expected = merged_files(&*cluster.blobs, &cluster).await;
         assert!(expected.contains_key("vectors"), "{:?}", expected.keys());
 
         let cached = Cached::of(shape).await;
@@ -309,8 +436,8 @@ async fn a_merge_gathered_on_disk_uploads_the_frames_it_would_in_memory_byte_for
         assert!(merge.unwrap().is_some());
         assert!(cached.writer.last_spilled() > 0, "gathered in memory");
         let (cluster, store) = (&cached.cluster, &*cached.store);
-        let uploaded = merged(store, cluster).await;
-        let copied = merged(&*cluster.blobs, cluster).await;
+        let uploaded = merged_files(store, cluster).await;
+        let copied = merged_files(&*cluster.blobs, cluster).await;
         assert_eq!(
             uploaded.keys().collect::<Vec<_>>(),
             expected.keys().collect::<Vec<_>>()
@@ -319,6 +446,56 @@ async fn a_merge_gathered_on_disk_uploads_the_frames_it_would_in_memory_byte_for
             // Not `assert_eq!`: a frame is far too long to print.
             assert!(uploaded[kind] == *frame, "the uploaded {kind} differs");
             assert!(copied[kind] == *frame, "the cache's {kind} differs");
+        }
+        cached.all_there(shape).await;
+    }
+}
+
+/// M8-R1 as production takes it: a frame larger than a part goes up in
+/// parts, the store's own client reading them, byte for byte what a merge in
+/// memory uploads, as a part lands on a whole number of the pieces it is read
+/// in, and as it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_larger_than_a_part_goes_up_in_parts_byte_for_byte() {
+    const MIB: usize = 1024 * 1024;
+    let shape = Written {
+        clustered_above: Some(4_000),
+        ..Written::of(3_000, 768)
+    };
+    let cluster = Cluster::new().await;
+    let builds = MergeBuilds::new(1);
+    let writer = written_on(cluster.writer().await, &builds, shape).await;
+    within(LONG, "the merge", writer.merge()).await.unwrap();
+    let expected = merged_files(&*cluster.blobs, &cluster).await;
+    let frame = expected["vectors"].len();
+    for part in [4 * MIB, 8 * MIB, 5 * MIB, 7 * MIB] {
+        assert!(frame > part, "{frame} bytes in parts of {part}");
+        let transfers = Transfers {
+            part_bytes: part,
+            ..Transfers::default()
+        };
+        let told = Arc::new(SpillsTold::default());
+        let client = Client::over(told.clone());
+        let store: Arc<dyn Blobs> =
+            Arc::new(ObjectBlobs::new(client.clone()).transferring(transfers));
+        let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8)
+            .fetching(&Transfers {
+                part_bytes: part,
+                ..Transfers::default()
+            })
+            .spills_told(told);
+        let cached = Cached::over(Cluster::new().await, store, shape, Some(disk)).await;
+        let merge = within(LONG, "the merge", cached.writer.merge()).await;
+        assert!(merge.unwrap().is_some());
+        assert!(cached.writer.last_spilled() > 0, "gathered in memory");
+        assert_eq!(
+            client.parts.load(Ordering::SeqCst),
+            frame.div_ceil(part),
+            "{frame} bytes in parts of {part}"
+        );
+        let uploaded = merged_files(&*cached.store, &cached.cluster).await;
+        for (kind, frame) in &expected {
+            assert!(uploaded[kind] == *frame, "the uploaded {kind} differs");
         }
         cached.all_there(shape).await;
     }
@@ -530,6 +707,11 @@ async fn a_file_is_taken_up_by_the_cache_only_once_the_store_has_it() {
     );
     assert_eq!(looking.puts.load(Ordering::SeqCst), 1);
     assert!(writer.last_spilled() > 0, "gathered in memory");
+    assert_eq!(
+        spills(looking.cache.path()).len(),
+        1,
+        "bytes kept hold the spill they are of"
+    );
     looking.kept.lock().unwrap().clear();
     settled("a file refused stays in the cache", || {
         files(looking.cache.path()) == before
@@ -648,6 +830,9 @@ async fn a_full_disk_fails_the_merge_where_it_gathers_and_leaves_nothing() {
 /// below.
 const SMALL_DISK: &str = "VELLEV_SMALL_DISK";
 
+/// The most a file system may hold for the rule below to fill it.
+const SMALL_AT_MOST: u64 = 1024 * 1024 * 1024;
+
 /// M8-R6, on a file system that really fills: the write tells of it, as the
 /// error the merge fails on, never as a fault in a mapping, and the room it
 /// took comes back with its file. Run in CI's Test job, on a tmpfs.
@@ -657,8 +842,17 @@ async fn a_disk_that_really_fills_fails_the_merge_and_leaves_nothing() {
     use std::io::Write;
     let small = std::env::var(SMALL_DISK).expect("a small file system to fill");
     let cache = tempfile::tempdir_in(&small).unwrap();
+    // This fills what it is told to, so it is told only of what is small.
+    let (_, size) = disk_room(cache.path()).expect("a file system that says how large it is");
+    assert!(
+        size <= SMALL_AT_MOST,
+        "{small} is no small disk: {size} bytes"
+    );
     let mut cluster = Cluster::new().await;
-    cluster.blobs = Arc::new(CachedBlobs::new(cluster.blobs.clone(), cache.path()));
+    let store = cluster.blobs.clone();
+    let told = Arc::new(SpillsTold::default());
+    let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8).spills_told(told.clone());
+    cluster.blobs = Arc::new(CachedBlobs::new(store, cache.path()).on(disk));
     let builds = MergeBuilds::new(1);
     let written = Written::of(ROWS, WIDTH);
     let writer = written_on(cluster.writer().await, &builds, written).await;
@@ -672,7 +866,20 @@ async fn a_disk_that_really_fills_fails_the_merge_and_leaves_nothing() {
     filling.set_len(filled - 2 * 1024 * 1024).unwrap();
     drop(filling);
 
+    // Asked, the disk says so, and nothing is written to it.
     let manifest = cluster.committed().await.manifest;
+    let skipped = within(LONG, "the merge with no room", writer.merge()).await;
+    assert_eq!(skipped.unwrap(), None, "nothing to gather its vectors on");
+    assert_eq!(
+        told.written.load(Ordering::SeqCst),
+        0,
+        "written to a full disk"
+    );
+    assert_eq!(files(cache.path()), before);
+
+    // Told otherwise, as one that fills after it is asked, the write says.
+    told.free.store(u64::MAX - 1, Ordering::SeqCst);
+
     let full = within(LONG, "the merge on a full disk", writer.merge()).await;
     let error = full.expect_err("nothing to gather its vectors on");
     assert!(
@@ -682,6 +889,7 @@ async fn a_disk_that_really_fills_fails_the_merge_and_leaves_nothing() {
     settled("what it wrote stays", || files(cache.path()) == before).await;
     assert_eq!(cluster.committed().await.manifest, manifest);
 
+    told.free.store(SpillsTold::ASK_THE_DISK, Ordering::SeqCst);
     std::fs::remove_file(&ballast).unwrap();
     let merged = within(LONG, "the merge with room", writer.merge()).await;
     assert!(merged.unwrap().is_some());
@@ -770,6 +978,139 @@ async fn a_merge_stopped_while_a_write_waits_on_the_disk_gives_up_at_once() {
     assert_eq!(files(cached.dir()), before);
 }
 
+/// M8-R13. Nothing waits for a spill's name to go. Removing it is a step on
+/// a disk that may have stopped, and a build's thread blocked on that would
+/// hold the build, which is waited for to its end, and with it a turn among
+/// the node's merges: a disk that stops would stop every merge, and neither
+/// a write's bound nor a stop would be kept. So the merge ends, and its turn
+/// is free, with the unlink still stalled, as it fails and as it is stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disk_that_stops_answering_as_a_spill_is_removed_holds_up_no_merge() {
+    let told = Arc::new(SpillsTold::default());
+    let disk = Disk::new(Duration::from_secs(2), 1 << 40, 8).spills_told(told.clone());
+    let written = Written::of(ROWS, WIDTH);
+    let cached = Cached::on(written, Some(disk)).await;
+    let before = files(cached.dir());
+    told.unlinking.store(6_000, Ordering::SeqCst);
+
+    // The merge fails, and the name goes with it, stalled.
+    told.at_most.store(1024 * 1024, Ordering::SeqCst);
+    let begun = std::time::Instant::now();
+    let failed = within(LONG, "the merge", cached.writer.merge()).await;
+    let took = begun.elapsed();
+    assert!(
+        matches!(&failed, Err(StorageError::Blob { .. })),
+        "{failed:?}"
+    );
+    assert!(took < Duration::from_secs(4), "held up for {took:?}");
+    assert_eq!(cached.builds.under_way(), 0, "its turn is held");
+
+    // Stopped while a write waits, with the name to go too.
+    told.at_most.store(u64::MAX, Ordering::SeqCst);
+    told.taking.store(6_000, Ordering::SeqCst);
+    let merging = cached.merging();
+    let dir = cached.dir().to_path_buf();
+    settled("no spill begun", move || !spills(&dir).is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    cached.writer.stop_merges();
+    let asked = std::time::Instant::now();
+    let merged = within(LONG, "the stopped merge", merging).await;
+    let took = asked.elapsed();
+    assert_eq!(merged.unwrap().unwrap(), None);
+    assert!(took < GIVEN_UP_WITHIN, "a stop took {took:?}");
+
+    told.unlinking.store(0, Ordering::SeqCst);
+    told.taking.store(0, Ordering::SeqCst);
+    settled("a name stalled never went", || {
+        files(cached.dir()) == before
+    })
+    .await;
+}
+
+/// M8-R14. A merge with no room for its vectors, and something to spare, is
+/// skipped before anything is written: a full disk is what fails a tenant's
+/// open or a flush's copy, and what a merge spills it holds for the whole of
+/// its build. Told apart from a failure, it is tried again next round, and
+/// what it would have held is reported as it is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_with_no_room_for_its_vectors_is_skipped_and_writes_nothing() {
+    let told = Arc::new(SpillsTold::default());
+    let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8).spills_told(told.clone());
+    let written = Written::of(ROWS, WIDTH);
+    let cached = Cached::on(written, Some(disk)).await;
+    let before = files(cached.dir());
+    let manifest = cached.cluster.committed().await.manifest;
+    let figures = || cached.cluster.blobs.spills().unwrap().figures();
+    // Vectors, where each starts and the rows' count, and a frame's header.
+    let frame = u64::from(2 * ROWS) * (4 * u64::from(WIDTH) + 8) + 36;
+
+    told.free.store(frame, Ordering::SeqCst);
+    let skipped = within(LONG, "the merge with no room", cached.writer.merge()).await;
+    assert_eq!(skipped.unwrap(), None);
+    assert_eq!(
+        told.written.load(Ordering::SeqCst),
+        0,
+        "written all the same"
+    );
+    assert_eq!(figures().skipped, 1);
+    assert_eq!(figures().failed, 0, "no failure");
+    assert_eq!(figures().bytes, 0);
+    assert_eq!(files(cached.dir()), before);
+    assert_eq!(cached.cluster.committed().await.manifest, manifest);
+    cached.all_there(written).await;
+
+    told.free.store(SpillsTold::ASK_THE_DISK, Ordering::SeqCst);
+    cached.builds.hold(Some(Holding::GatheringUntilLetGo));
+    let merging = cached.merging();
+    cached.held().await;
+    assert_eq!(
+        figures().bytes,
+        frame,
+        "what it will come to, from its start"
+    );
+    cached.builds.hold(None);
+    cached.builds.let_one_go();
+    let merged = within(LONG, "the merge with room", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    assert_eq!(figures().bytes, 0, "the cache's, once taken up");
+    assert_eq!(figures().skipped, 1);
+    cached.all_there(written).await;
+}
+
+/// M8-R4. A rename given up takes back only what it put there: a copy of the
+/// file that has since taken its place is left, as a link given up leaves
+/// one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_given_up_leaves_a_copy_put_in_its_place() {
+    let told = Arc::new(SpillsTold::default());
+    let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8).spills_told(told.clone());
+    let cached = Cached::on(STOPPED, Some(disk)).await;
+    told.looks_again_in.store(2_000, Ordering::SeqCst);
+    let merging = cached.merging();
+    let copy = |dir: &Path| -> Option<String> {
+        let all = files(dir).into_iter();
+        all.into_iter()
+            .find(|file| file.ends_with("-merged.vectors"))
+    };
+    let dir = cached.dir().to_path_buf();
+    let taken = {
+        let dir = dir.clone();
+        move || copy(&dir).is_some()
+    };
+    settled("the spill was never taken up", taken).await;
+    let key = copy(&dir).unwrap();
+    merging.abort();
+    let _ = merging.await;
+    settled("what was uploaded stays", || !dir.join(&key).exists()).await;
+    std::fs::create_dir_all(dir.join(&key).parent().unwrap()).unwrap();
+    std::fs::write(dir.join(&key), b"another copy, by a fetch since").unwrap();
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert!(
+        dir.join(&key).exists(),
+        "taken back though it was not its own"
+    );
+}
+
 /// M8-R12. No async thread waits on the disk for what goes up: a page of a
 /// mapping gone from memory is a read from disk on whichever thread touches
 /// it, which nothing can give up. So the pieces of a file going up are read
@@ -781,7 +1122,8 @@ async fn a_disk_that_stops_answering_as_a_file_goes_up_holds_up_no_async_thread(
     let told = Arc::new(SpillsTold::default());
     let disk = Disk::new(Duration::from_secs(2), 1 << 40, 8).spills_told(told.clone());
     let written = Written::of(ROWS, WIDTH);
-    let cached = Cached::on(written, Some(disk)).await;
+    let store: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Client::over(told.clone())));
+    let cached = Cached::over(Cluster::new().await, store, written, Some(disk)).await;
     let before = files(cached.dir());
     let manifest = cached.cluster.committed().await.manifest;
     let latest = Arc::new(AtomicUsize::new(0));
@@ -801,10 +1143,10 @@ async fn a_disk_that_stops_answering_as_a_file_goes_up_holds_up_no_async_thread(
     let slow = within(LONG, "the merge on a slow disk", cached.writer.merge()).await;
     let took = begun.elapsed();
     timing.abort();
-    assert!(matches!(&slow, Err(StorageError::Blob { .. })), "{slow:?}");
-    assert!(took < Duration::from_secs(7), "given up after {took:?}");
     let late = latest.load(Ordering::SeqCst);
     assert!(late <= 250, "a timer came {late} ms late");
+    assert!(matches!(&slow, Err(StorageError::Blob { .. })), "{slow:?}");
+    assert!(took < Duration::from_secs(7), "given up after {took:?}");
     assert_eq!(cached.cluster.committed().await.manifest, manifest);
     told.reading.store(0, Ordering::SeqCst);
     settled("what it wrote stays", || files(cached.dir()) == before).await;
@@ -937,18 +1279,10 @@ async fn bytes_a_store_keeps_read_as_they_did_past_everything_else_that_held_the
     drop(writer);
     let kept = std::mem::take(&mut *looking.kept.lock().unwrap());
     assert_eq!(kept.len(), 1);
-    assert!(
-        spills(cache).len() <= 1,
-        "held on by the bytes, a spill is still the one"
-    );
+    assert!(spills(cache).is_empty(), "taken up, then deleted");
     for (key, bytes) in &kept {
         format::verify(key, bytes).unwrap();
     }
-    drop(kept);
-    settled("the spill stays past its bytes", || {
-        spills(cache).is_empty()
-    })
-    .await;
 }
 
 /// M8-R10. A store with no cache, or one over a cache that does not say so,

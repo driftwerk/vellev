@@ -495,7 +495,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     let counter = ConstCounter::new(0u64);
     let mut family = encoder.encode_descriptor(
         "merges_ended",
-        "Merges that had a turn among the node's merge builds, by how they ended: committed; with nothing to merge once planned again; dropped as a restore came between (stale), as the run was not as planned (changed), or as a row it held live was missing from what was built (uncovered); stopped; or failed",
+        "Merges that had a turn among the node's merge builds, by how they ended: committed; with nothing to merge once planned again; dropped as a restore came between (stale), as the run was not as planned (changed), or as a row it held live was missing from what was built (uncovered); stopped; skipped for want of room for its vectors on local disk (no_room); or failed",
         None,
         counter.metric_type(),
     )?;
