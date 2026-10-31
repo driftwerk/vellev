@@ -790,13 +790,28 @@ impl StopCounts {
 
 /// Held by a task whose end is the end of the hold, however it comes: every
 /// way it means to end, the hold is lost or the tenant gone already, and a
-/// panic is the one that would leave the tenant open with no such task.
+/// panic is the one that would leave the tenant open with no such task. A
+/// merge lost to a panic is in no count of merges stopped, and nothing else
+/// names the tenant, so that a panic is logged here and counted.
 #[derive(Debug)]
-struct GivesUp(Arc<Hold>);
+struct GivesUp {
+    hold: Arc<Hold>,
+    tenant: TenantId,
+    /// The node's count of tenants given up for a panic.
+    given_up: Arc<AtomicU64>,
+}
 
 impl Drop for GivesUp {
     fn drop(&mut self) {
-        self.0.lose(Lost::Lease);
+        if std::thread::panicking() {
+            tracing::error!(tenant = %self.tenant, "maintenance panicked; the tenant is given up");
+            self.given_up.fetch_add(1, Ordering::Relaxed);
+        }
+        // Lost already, what stopped it said why: a second `lose` would
+        // count a merge begun since as a lease lost.
+        if !self.hold.is_lost() {
+            self.hold.lose(Lost::Lease);
+        }
     }
 }
 
@@ -1650,6 +1665,8 @@ struct Inner {
     /// idle, and those let go for the memory budget.
     let_go_idle: AtomicU64,
     let_go_for_budget: AtomicU64,
+    /// How many tenants were given up as their maintenance panicked.
+    given_up: Arc<AtomicU64>,
     /// Where every writer this node opens times its background work.
     timings: Arc<Timings>,
 }
@@ -1894,6 +1911,7 @@ impl Node {
             merges_stopped: Arc::default(),
             let_go_idle: AtomicU64::new(0),
             let_go_for_budget: AtomicU64::new(0),
+            given_up: Arc::default(),
             timings: Arc::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
@@ -2014,7 +2032,7 @@ impl Node {
 
     /// How many tenants were given up as their maintenance panicked.
     pub fn tenants_given_up(&self) -> u64 {
-        0
+        self.0.given_up.load(Ordering::Relaxed)
     }
 
     /// How many tenants sweeps chose to let go, for being idle or for the
@@ -2848,7 +2866,11 @@ impl Inner {
         let lapsed_every = self.settings.lease / 3;
         let coordinator = self.coordinator.clone();
         let hold = work.hold.clone();
-        let ends = GivesUp(hold.clone());
+        let ends = GivesUp {
+            hold: hold.clone(),
+            tenant: work.id.clone(),
+            given_up: self.given_up.clone(),
+        };
         let work = Arc::downgrade(work);
         let maintaining = tokio::spawn(async move {
             let _ends = ends;
