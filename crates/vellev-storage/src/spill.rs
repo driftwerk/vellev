@@ -306,7 +306,15 @@ pub(crate) fn left_behind(path: &Path, stale: impl FnOnce() -> bool) -> bool {
     let Ok(file) = File::options().read(true).write(true).open(path) else {
         return false;
     };
-    match file.try_lock() {
+    nobody_holds(file.try_lock(), stale)
+}
+
+/// What the lock of a spill came to says of it: see [`left_behind`].
+fn nobody_holds(
+    locked: std::result::Result<(), std::fs::TryLockError>,
+    stale: impl FnOnce() -> bool,
+) -> bool {
+    match locked {
         Ok(()) => true,
         Err(std::fs::TryLockError::WouldBlock) => false,
         Err(std::fs::TryLockError::Error(_)) => stale(),
@@ -324,6 +332,9 @@ pub struct SpillsTold {
     pub taking: AtomicU64,
     /// How long, in milliseconds, a cache takes to take a spill up.
     pub taken_up_in: AtomicU64,
+    /// How long, in milliseconds, each piece of a spill takes to read as it
+    /// goes up.
+    pub reading: AtomicU64,
 }
 
 impl Default for SpillsTold {
@@ -332,6 +343,7 @@ impl Default for SpillsTold {
             at_most: AtomicU64::new(u64::MAX),
             taking: AtomicU64::new(0),
             taken_up_in: AtomicU64::new(0),
+            reading: AtomicU64::new(0),
         }
     }
 }
@@ -355,12 +367,12 @@ impl SpillsTold {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A spill of a few words in `dir`, sealed, made on a thread that may
     /// wait on the disk.
-    async fn spill_in(dir: &Path) -> Arc<Spill> {
+    pub(crate) async fn spill_in(dir: &Path) -> Arc<Spill> {
         let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone());
         let asked = spills.asked(Handle::current(), Stopping::never());
         let made = tokio::task::spawn_blocking(move || {
@@ -459,5 +471,18 @@ mod tests {
         assert!(!left_behind(&path, || true), "not there");
         std::fs::write(&path, b"left").unwrap();
         assert!(left_behind(&path, || false), "nobody holds it");
+    }
+
+    /// Where a file system has no locks, nothing says who holds a spill: it
+    /// goes as what is left part written goes, once stale, and not before.
+    /// Where it has, what the lock says is all that is asked.
+    #[test]
+    fn a_file_system_with_no_locks_leaves_a_spill_until_it_is_stale() {
+        use std::fs::TryLockError::{Error, WouldBlock};
+        let unsupported = || Err(Error(std::io::ErrorKind::Unsupported.into()));
+        assert!(!nobody_holds(unsupported(), || false));
+        assert!(nobody_holds(unsupported(), || true));
+        assert!(!nobody_holds(Err(WouldBlock), || true), "held");
+        assert!(nobody_holds(Ok(()), || panic!("the lock says")));
     }
 }

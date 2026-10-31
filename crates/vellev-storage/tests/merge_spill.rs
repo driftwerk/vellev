@@ -578,6 +578,7 @@ async fn a_merge_dropped_as_its_spill_is_taken_up_leaves_no_copy() {
         }
     })
     .await;
+    assert!(cached.writer.last_spilled() > 0, "gathered in memory");
     merging.abort();
     let _ = merging.await;
     settled("no spill goes", || spills(cached.dir()).is_empty()).await;
@@ -766,6 +767,48 @@ async fn a_merge_stopped_while_a_write_waits_on_the_disk_gives_up_at_once() {
     told.taking.store(0, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(6_000)).await;
     assert_eq!(files(cached.dir()), before);
+}
+
+/// M8-R12. No async thread waits on the disk for what goes up: a page of a
+/// mapping gone from memory is a read from disk on whichever thread touches
+/// it, which nothing can give up. So the pieces of a file going up are read
+/// by the disk's own steps: a disk that stops answering then fails the merge
+/// at its bound, and on a runtime of one thread a timer never comes more
+/// than a moment late, as lease renewals must not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_disk_that_stops_answering_as_a_file_goes_up_holds_up_no_async_thread() {
+    let told = Arc::new(SpillsTold::default());
+    let disk = Disk::new(Duration::from_secs(2), 1 << 40, 8).spills_told(told.clone());
+    let written = Written::of(ROWS, WIDTH);
+    let cached = Cached::on(written, Some(disk)).await;
+    let before = files(cached.dir());
+    let manifest = cached.cluster.committed().await.manifest;
+    let latest = Arc::new(AtomicUsize::new(0));
+    let timing = tokio::spawn({
+        let latest = latest.clone();
+        async move {
+            loop {
+                let asked = std::time::Instant::now();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let late = asked.elapsed().as_millis() as usize;
+                latest.fetch_max(late.saturating_sub(50), Ordering::SeqCst);
+            }
+        }
+    });
+    told.reading.store(8_000, Ordering::SeqCst);
+    let begun = std::time::Instant::now();
+    let slow = within(LONG, "the merge on a slow disk", cached.writer.merge()).await;
+    let took = begun.elapsed();
+    timing.abort();
+    assert!(matches!(&slow, Err(StorageError::Blob { .. })), "{slow:?}");
+    assert!(took < Duration::from_secs(7), "given up after {took:?}");
+    let late = latest.load(Ordering::SeqCst);
+    assert!(late <= 250, "a timer came {late} ms late");
+    assert_eq!(cached.cluster.committed().await.manifest, manifest);
+    told.reading.store(0, Ordering::SeqCst);
+    settled("what it wrote stays", || files(cached.dir()) == before).await;
+    let merged = within(LONG, "the next merge", cached.writer.merge()).await;
+    assert!(merged.unwrap().is_some());
 }
 
 /// The cache directory a process killed part way through a gather is to

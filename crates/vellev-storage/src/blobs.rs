@@ -2474,6 +2474,23 @@ mod tests {
         assert_ne!(one, other);
     }
 
+    /// A store sends what it is given from the async threads, where a
+    /// mapped page that has gone from memory would be read from disk with
+    /// nothing to bound it. So what goes up of a spill is read from it by the
+    /// disk's own steps, and what the mapping's bytes come to is not read at
+    /// all: here they are not the frame, and the frame is what goes up, in
+    /// parts where it takes them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_goes_up_of_a_spill_is_read_from_it_not_from_its_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = crate::spill::tests::spill_in(dir.path()).await;
+        let frame = Bytes::copy_from_slice(spill.bytes());
+        let not_read = Bytes::from_static(b"the mapping, which is not to be read here");
+        let store = ObjectBlobs::new(Arc::new(InMemory::new()));
+        store.put_spilled("t/1/v", not_read, spill).await.unwrap();
+        assert_eq!(store.get("t/1/v").await.unwrap(), frame);
+    }
+
     #[tokio::test]
     async fn room_is_made_for_all_of_a_file_once_its_size_is_known() {
         let store = InMemory::new();
