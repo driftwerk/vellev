@@ -1878,6 +1878,7 @@ async fn a_release_that_hangs_holds_up_no_sweep() {
         held.write(vec![schema(EmbeddingProvider::None)])
             .await
             .unwrap();
+        held.write(ten_notes(0)).await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     coordinator
