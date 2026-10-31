@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/column.rs b/crates/vellev-storage/src/column.rs
+index 3ea430b..b1d7df6 100644
+--- a/crates/vellev-storage/src/column.rs
++++ b/crates/vellev-storage/src/column.rs
+@@ -171,7 +171,7 @@ impl Gathering {
+     /// frame, only where each row's start.
+     pub fn bytes(&self) -> usize {
+         let frame = match self.spilling {
+-            Some(_) => 0,
++            Some(_) => self.values * 4,
+             None => self.words.capacity() * 4,
+         };
+         frame + self.offsets.capacity() * 8

@@ -1,0 +1,16 @@
+diff --git a/crates/vellev-storage/src/blobs.rs b/crates/vellev-storage/src/blobs.rs
+index 41841dd..83c571a 100644
+--- a/crates/vellev-storage/src/blobs.rs
++++ b/crates/vellev-storage/src/blobs.rs
+@@ -1603,9 +1603,8 @@ impl Blobs for ObjectBlobs {
+     /// where a page of the mapping gone from memory would hold a thread
+     /// for as long as the disk took. `bytes`, unread, hold what they hold
+     /// until the put ends.
+-    async fn put_spilled(&self, key: &str, bytes: Bytes, spill: Arc<Spill>) -> Result<()> {
+-        self.fits(key, bytes.len())?;
+-        self.put_parts(key, spill.pieces(key)).await
++    async fn put_spilled(&self, key: &str, bytes: Bytes, _spill: Arc<Spill>) -> Result<()> {
++        self.put(key, bytes).await
+     }
+ 
+     /// One request, which `object_store` makes create only: on S3 with

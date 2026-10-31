@@ -1,0 +1,19 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..8721933 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -422,7 +422,13 @@ impl Spill {
+                     if let Some(told) = told {
+                         told.read();
+                     }
+-                    Ok(Bytes::copy_from_slice(&spill.bytes()[at..end]))
++                    struct Held(Arc<Spill>);
++                    impl AsRef<[u8]> for Held {
++                        fn as_ref(&self) -> &[u8] {
++                            self.0.bytes()
++                        }
++                    }
++                    Ok(Bytes::from_owner(Held(spill)).slice(at..end))
+                 });
+                 let piece = read.await.map_err(|error| {
+                     counted.failed();

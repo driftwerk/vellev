@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/blobs.rs b/crates/vellev-storage/src/blobs.rs
+index 41841dd..06cd1f1 100644
+--- a/crates/vellev-storage/src/blobs.rs
++++ b/crates/vellev-storage/src/blobs.rs
+@@ -2018,7 +2018,7 @@ impl CachedBlobs {
+         });
+         match taken.await {
+             Ok(()) => taking.answered = true,
+-            Err(error) => tracing::warn!(key, %error, "could not keep a spill as a file's copy"),
++            Err(error) => panic!("could not keep a spill as a file's copy: {error}"),
+         }
+     }
+ }

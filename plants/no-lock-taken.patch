@@ -1,0 +1,23 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..5c92c34 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -248,17 +248,7 @@ impl SpillAsked {
+                     disk: Some(of_disk),
+                     frame,
+                 };
+-                match file.try_lock() {
+-                    Ok(()) => Ok(Ok((file, name))),
+-                    // A file system with no locks: spills left behind there
+-                    // go as anything left part written does, once stale.
+-                    Err(std::fs::TryLockError::Error(_)) => Ok(Ok((file, name))),
+-                    // One opening the cache got there first: it takes the
+-                    // name away, not knowing this is not left behind.
+-                    Err(std::fs::TryLockError::WouldBlock) => {
+-                        Err(std::io::ErrorKind::WouldBlock.into())
+-                    }
+-                }
++                Ok(Ok((file, name)))
+             }
+         };
+         let waited = stopping.unless_stopped(MergeStage::Gathering, disk.run(0, begun));

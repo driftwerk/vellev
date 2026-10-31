@@ -1,0 +1,12 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..1a04845 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -242,7 +242,6 @@ impl SpillAsked {
+                     .write(true)
+                     .create_new(true)
+                     .open(&path)?;
+-                of_disk.spills_counted().began(frame);
+                 let name = Name {
+                     path: Some(path),
+                     disk: Some(of_disk),

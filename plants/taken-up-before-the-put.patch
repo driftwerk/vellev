@@ -1,0 +1,16 @@
+diff --git a/crates/vellev-storage/src/blobs.rs b/crates/vellev-storage/src/blobs.rs
+index 41841dd..373590f 100644
+--- a/crates/vellev-storage/src/blobs.rs
++++ b/crates/vellev-storage/src/blobs.rs
+@@ -2183,9 +2183,8 @@ impl Blobs for CachedBlobs {
+     /// [`Self::put`] writes one: no file is ever kept under a key the store
+     /// did not take.
+     async fn put_spilled(&self, key: &str, bytes: Bytes, spill: Arc<Spill>) -> Result<()> {
+-        self.inner.put_spilled(key, bytes, spill.clone()).await?;
+-        self.take_up(key, spill).await;
+-        Ok(())
++        self.take_up(key, spill.clone()).await;
++        self.inner.put_spilled(key, bytes, spill).await
+     }
+ 
+     /// Handed to the store as it comes, and no copy of it made: one is

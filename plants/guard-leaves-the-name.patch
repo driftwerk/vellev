@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..fe92c58 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -170,7 +170,7 @@ impl Drop for Name {
+             if let Some(told) = told {
+                 told.unlinks();
+             }
+-            match std::fs::remove_file(&path) {
++            match std::fs::metadata(&path).map(|_| ()) {
+                 Ok(()) => {}
+                 // Already gone, as by a cache emptied under it.
+                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

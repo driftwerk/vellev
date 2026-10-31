@@ -1,0 +1,15 @@
+diff --git a/crates/vellev-storage/src/column.rs b/crates/vellev-storage/src/column.rs
+index 3ea430b..a52c3fc 100644
+--- a/crates/vellev-storage/src/column.rs
++++ b/crates/vellev-storage/src/column.rs
+@@ -227,8 +227,9 @@ impl Gathering {
+                 return Ok(None);
+             };
+             let values = AHEAD * 4..(AHEAD + values) * 4;
++            let held: Vec<f32> = bytemuck::cast_slice(&spill.bytes()[values]).to_vec();
+             return Ok(Some(Column {
+-                values: Values::Spilled(std::sync::Arc::new(spill), values),
++                values: Values::Memory(held),
+                 offsets,
+             }));
+         }

@@ -1,0 +1,14 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..a9a3238 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -306,7 +306,8 @@ impl Spilling {
+         let frame: &[u8] = bytemuck::cast_slice(&piece);
+         // The header goes in last, over the room left for it.
+         let header = BODY.saturating_sub(self.written as usize).min(bytes);
+-        self.body.update(&frame[header..]);
++        let _ = header;
++        self.body.update(frame);
+         let (file, told) = (self.file.clone(), self.disk.spills_are_told());
+         let end = self.written + bytes as u64;
+         let step = move || {

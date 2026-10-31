@@ -1,0 +1,19 @@
+diff --git a/crates/vellev-storage/src/blobs.rs b/crates/vellev-storage/src/blobs.rs
+index 41841dd..dd3bc06 100644
+--- a/crates/vellev-storage/src/blobs.rs
++++ b/crates/vellev-storage/src/blobs.rs
+@@ -2007,11 +2007,9 @@ impl CachedBlobs {
+                 told.looks_again();
+             }
+             if given_up() {
+-                let here = crate::column::seen(&path);
+-                if here.is_ok_and(|here| here.same_file(&taken)) {
+-                    crate::column::forget_summed(&path);
+-                    let _ = std::fs::remove_file(&path);
+-                }
++                let _ = taken;
++                crate::column::forget_summed(&path);
++                let _ = std::fs::remove_file(&path);
+                 return Err(gone());
+             }
+             Ok(())

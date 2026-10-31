@@ -1,0 +1,21 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..a83c0a2 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -411,6 +411,7 @@ impl Spill {
+         let key = key.to_string();
+         let pieces = futures::stream::try_unfold(0, move |at| {
+             let (spill, key) = (self.clone(), key.clone());
++            let spill_end = spill.bytes().len();
+             async move {
+                 let end = (at + SPILLED_AT_ONCE).min(spill.bytes().len());
+                 if at == end {
+@@ -428,7 +429,7 @@ impl Spill {
+                     counted.failed();
+                     unwritten(&key, error)
+                 })?;
+-                Ok(Some((piece, end)))
++                Ok(Some((piece, (end + 1).min(spill_end))))
+             }
+         });
+         pieces.boxed()

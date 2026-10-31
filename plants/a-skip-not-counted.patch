@@ -1,0 +1,12 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..4da77d1 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -268,7 +268,6 @@ impl SpillAsked {
+         let (file, name) = match begun {
+             Ok(Ok(begun)) => begun,
+             Ok(Err((free, wanted))) => {
+-                disk.spills_counted().skipped();
+                 return Err(StorageError::NoRoom { key, free, wanted });
+             }
+             Err(error) => {

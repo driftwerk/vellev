@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-node/src/lib.rs b/crates/vellev-node/src/lib.rs
+index 6d6ffa4..22f2dd0 100644
+--- a/crates/vellev-node/src/lib.rs
++++ b/crates/vellev-node/src/lib.rs
+@@ -1399,7 +1399,7 @@ impl TenantWork {
+             match self.writer.merge_giving_way(flush_due).await {
+                 Ok(Some(_)) => {}
+                 Ok(None) => break Ok(()),
+-                Err(error) => break Err(self.failed(error)),
++                Err(error) => return Err(self.failed(error)),
+             }
+         };
+         if self.writer.is_closed() {

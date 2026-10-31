@@ -1,0 +1,29 @@
+diff --git a/crates/vellev-storage/src/blobs.rs b/crates/vellev-storage/src/blobs.rs
+index 41841dd..0234497 100644
+--- a/crates/vellev-storage/src/blobs.rs
++++ b/crates/vellev-storage/src/blobs.rs
+@@ -1998,22 +1998,12 @@ impl CachedBlobs {
+                 .parent()
+                 .ok_or_else(|| std::io::Error::other("cache path has no parent"))?;
+             std::fs::create_dir_all(parent)?;
+-            if given_up() {
+-                return Err(gone());
+-            }
++            let _ = (given_up, gone);
+             crate::column::forget_summed(&path);
+-            let taken = spill.renamed_to(&path)?;
++            let _taken = spill.renamed_to(&path)?;
+             if let Some(told) = told {
+                 told.looks_again();
+             }
+-            if given_up() {
+-                let here = crate::column::seen(&path);
+-                if here.is_ok_and(|here| here.same_file(&taken)) {
+-                    crate::column::forget_summed(&path);
+-                    let _ = std::fs::remove_file(&path);
+-                }
+-                return Err(gone());
+-            }
+             Ok(())
+         });
+         match taken.await {

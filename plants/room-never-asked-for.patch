@@ -1,0 +1,15 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..f091bba 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -234,9 +234,7 @@ impl SpillAsked {
+                 std::fs::create_dir_all(&dir)?;
+                 let free = room_on(&dir, told.as_deref());
+                 let wanted = frame.saturating_add(room_spared(frame));
+-                if free < wanted {
+-                    return Ok(Err((free, wanted)));
+-                }
++                let _ = (free, wanted);
+                 let file = File::options()
+                     .read(true)
+                     .write(true)

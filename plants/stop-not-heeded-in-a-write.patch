@@ -1,0 +1,16 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..26a57fe 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -317,10 +317,7 @@ impl Spilling {
+             Ok(piece)
+         };
+         let run = self.disk.run(bytes, step);
+-        let waited = self.stopping.unless_stopped(MergeStage::Gathering, run);
+-        let Some(stepped) = self.runtime.block_on(waited) else {
+-            return Ok(false);
+-        };
++        let stepped = self.runtime.block_on(run);
+         let mut piece = stepped.map_err(|error| self.failed(error))?;
+         piece.clear();
+         *words = piece;

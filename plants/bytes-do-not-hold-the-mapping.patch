@@ -1,0 +1,15 @@
+diff --git a/crates/vellev-storage/src/column.rs b/crates/vellev-storage/src/column.rs
+index 3ea430b..66a9663 100644
+--- a/crates/vellev-storage/src/column.rs
++++ b/crates/vellev-storage/src/column.rs
+@@ -327,7 +327,9 @@ impl Column {
+                 return Bytes::from_owner(FrameBytes(frame.clone()));
+             }
+             Values::Spilled(spill, _) if spill.version() == version => {
+-                return Bytes::from_owner(SpilledBytes(spill.clone()));
++                // SAFETY: none: read past the mapping, as the plant has it.
++                let bytes: &'static [u8] = unsafe { std::mem::transmute(spill.bytes()) };
++                return Bytes::from_static(bytes);
+             }
+             _ => {}
+         }

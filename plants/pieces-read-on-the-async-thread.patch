@@ -1,0 +1,27 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..180888b 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -417,17 +417,11 @@ impl Spill {
+                     return Ok(None);
+                 }
+                 let (disk, told) = (spill.disk.clone(), spill.disk.spills_are_told());
+-                let counted = disk.spills_counted();
+-                let read = disk.run(end - at, move || {
+-                    if let Some(told) = told {
+-                        told.read();
+-                    }
+-                    Ok(Bytes::copy_from_slice(&spill.bytes()[at..end]))
+-                });
+-                let piece = read.await.map_err(|error| {
+-                    counted.failed();
+-                    unwritten(&key, error)
+-                })?;
++                let _ = (&disk, &key);
++                if let Some(told) = told {
++                    told.read();
++                }
++                let piece = Bytes::copy_from_slice(&spill.bytes()[at..end]);
+                 Ok(Some((piece, end)))
+             }
+         });

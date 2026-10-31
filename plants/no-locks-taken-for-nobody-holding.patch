@@ -1,0 +1,16 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..3d202cf 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -482,7 +482,10 @@ fn nobody_holds(
+     match locked {
+         Ok(()) => true,
+         Err(std::fs::TryLockError::WouldBlock) => false,
+-        Err(std::fs::TryLockError::Error(_)) => stale(),
++        Err(std::fs::TryLockError::Error(_)) => {
++            let _ = stale;
++            true
++        }
+     }
+ }
+ 

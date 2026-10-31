@@ -1,0 +1,14 @@
+diff --git a/crates/vellev-storage/src/partition.rs b/crates/vellev-storage/src/partition.rs
+index bae689d..837e908 100644
+--- a/crates/vellev-storage/src/partition.rs
++++ b/crates/vellev-storage/src/partition.rs
+@@ -3466,7 +3466,8 @@ impl Writer {
+     /// state's before it commits, a walk of its run's segments.
+     fn merge_planned(&self) -> Option<MergePlanned> {
+         let spills = self.partition.blobs.spills();
+-        let spilled = spills.as_ref().map(Spills::held_going_up);
++        drop(spills);
++        let spilled = None;
+         self.partition.read(|state| {
+             let merge = state.merge_plan(&self.merging)?;
+             let above = self.merging.clustered_above;

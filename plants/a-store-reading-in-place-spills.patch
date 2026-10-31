@@ -1,0 +1,16 @@
+diff --git a/crates/vellev-storage/src/blobs.rs b/crates/vellev-storage/src/blobs.rs
+index 41841dd..10f590a 100644
+--- a/crates/vellev-storage/src/blobs.rs
++++ b/crates/vellev-storage/src/blobs.rs
+@@ -1582,6 +1582,11 @@ fn blob_error(key: &str, error: object_store::Error) -> StorageError {
+ 
+ #[async_trait]
+ impl Blobs for ObjectBlobs {
++    fn spills(&self) -> Option<Spills> {
++        let root = self.root.clone()?;
++        Some(Spills::in_dir(root, Disk::shared().clone()))
++    }
++
+     /// A file larger than [`Transfers::part_bytes`] goes up in parts. One
+     /// too large for [`MOST_PARTS`] of them is refused before any of it
+     /// goes up.

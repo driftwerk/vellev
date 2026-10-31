@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/column.rs b/crates/vellev-storage/src/column.rs
+index 3ea430b..64c8570 100644
+--- a/crates/vellev-storage/src/column.rs
++++ b/crates/vellev-storage/src/column.rs
+@@ -226,7 +226,7 @@ impl Gathering {
+             let Some(spill) = spilling.sealed(version)? else {
+                 return Ok(None);
+             };
+-            let values = AHEAD * 4..(AHEAD + values) * 4;
++            let values = (AHEAD + 1) * 4..(AHEAD + values) * 4;
+             return Ok(Some(Column {
+                 values: Values::Spilled(std::sync::Arc::new(spill), values),
+                 offsets,

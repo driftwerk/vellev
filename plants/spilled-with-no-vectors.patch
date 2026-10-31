@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/state.rs b/crates/vellev-storage/src/state.rs
+index 3c0968a..a050f71 100644
+--- a/crates/vellev-storage/src/state.rs
++++ b/crates/vellev-storage/src/state.rs
+@@ -683,7 +683,7 @@ impl Run {
+             }
+         };
+         let mut rows: Vec<Row> = Vec::with_capacity(count);
+-        let mut vectors = match spill.filter(|_| values > 0) {
++        let mut vectors = match spill {
+             None => Gathering::with_capacity(values, count),
+             Some(asked) => match asked.begin(frame_bytes(values, count) as u64)? {
+                 Some(spilling) => Gathering::spilled(values, count, spilling),

@@ -1,0 +1,21 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..e00ba67 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -455,11 +455,14 @@ impl Drop for Spill {
+     fn drop(&mut self) {
+         let map = self.map.take();
+         let file = self.file.take();
+-        let name = std::mem::take(&mut *named(&self.name));
++        let mut name = std::mem::take(&mut *named(&self.name));
++        let path = name.path.take();
+         off_the_async_threads(move || {
+             drop(map);
+             drop(file);
+-            drop(name);
++            if let Some(path) = path {
++                let _ = std::fs::remove_file(path);
++            }
+         });
+     }
+ }

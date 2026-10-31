@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/partition.rs b/crates/vellev-storage/src/partition.rs
+index bae689d..5ec94af 100644
+--- a/crates/vellev-storage/src/partition.rs
++++ b/crates/vellev-storage/src/partition.rs
+@@ -3340,7 +3340,7 @@ impl Writer {
+                     wanted,
+                     "a merge is skipped: no room on local disk"
+                 );
+-                return Ok(Ended::Dropped(MergeEnd::NoRoom));
++                return Err(StorageError::NoRoom { key, free, wanted });
+             }
+             built => built?,
+         };

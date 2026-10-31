@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..7209674 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -121,7 +121,7 @@ impl Spills {
+ 
+ /// See [`Spills::held_going_up`].
+ fn held_of_parts(part: usize) -> usize {
+-    part.next_multiple_of(SPILLED_AT_ONCE) + SPILLED_AT_ONCE
++    part + SPILLED_AT_ONCE
+ }
+ 
+ /// What is needed to begin a spill, for a gather that does not know yet

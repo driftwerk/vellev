@@ -1,0 +1,24 @@
+diff --git a/crates/vellev-storage/src/column.rs b/crates/vellev-storage/src/column.rs
+index 3ea430b..13ed1d5 100644
+--- a/crates/vellev-storage/src/column.rs
++++ b/crates/vellev-storage/src/column.rs
+@@ -69,8 +69,7 @@ pub(crate) fn frame_bytes(values: usize, rows: usize) -> usize {
+     (AHEAD + values + 2 * (rows + 1) + 2) * 4
+ }
+ 
+-/// A spilled frame as the bytes it uploads as, read where it lies: its
+-/// mapping and its file go with the last copy of these.
++#[allow(dead_code)]
+ struct SpilledBytes(std::sync::Arc<Spill>);
+ 
+ impl AsRef<[u8]> for SpilledBytes {
+@@ -326,9 +325,6 @@ impl Column {
+             Values::Framed(frame, _) if frame.version == version => {
+                 return Bytes::from_owner(FrameBytes(frame.clone()));
+             }
+-            Values::Spilled(spill, _) if spill.version() == version => {
+-                return Bytes::from_owner(SpilledBytes(spill.clone()));
+-            }
+             _ => {}
+         }
+         let values = self.values();

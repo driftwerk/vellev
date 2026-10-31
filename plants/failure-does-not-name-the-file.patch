@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..dcc5999 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -183,7 +183,7 @@ impl Drop for Name {
+ 
+ fn unwritten(key: &str, error: std::io::Error) -> StorageError {
+     StorageError::Blob {
+-        key: key.to_string(),
++        key: key.replace("vectors", "spill"),
+         source: error.into(),
+     }
+ }

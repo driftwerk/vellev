@@ -1,0 +1,38 @@
+none-control | | every rule passes | -p vellev-storage --test merge_spill --; -p vellev-storage --lib -- spill what_goes_up a_header_made a_frame_gathered a_spilled_frame a_spill_goes_up a_merge_gathered_on_disk a_plan_to_gather; -p vellev-node --test merge_builds -- a_node_s_merge_gathers a_round_whose_merge
+header-after-values | header-after-values | R1 | -p vellev-storage --test merge_spill -- a_merge_gathered_on_disk_uploads; -p vellev-storage --lib -- a_frame_gathered
+sum-takes-in-header | sum-takes-in-header | R1 | -p vellev-storage --test merge_spill -- a_merge_gathered_on_disk_uploads; -p vellev-storage --lib -- a_frame_gathered
+values-a-word-off | values-a-word-off | R1, clustered, coded | -p vellev-storage --test merge_spill -- a_merge_gathered_on_disk_uploads; -p vellev-storage --lib -- a_frame_gathered a_merge_gathered_on_disk
+guard-leaves-the-name | guard-leaves-the-name | R3 | -p vellev-storage --test merge_spill -- a_merge_stopped_part_way; -p vellev-storage --lib -- a_spill_nobody_goes_on
+sealed-spill-leaves-its-name | sealed-spill-leaves-its-name | R3 | -p vellev-storage --test merge_spill -- a_merge_stopped_at_any_stage a_merge_dropped_leaves a_merge_whose_build_panics; -p vellev-storage --lib -- a_spill_s_name_goes
+taken-up-before-the-put | taken-up-before-the-put | R4 | -p vellev-storage --test merge_spill -- a_file_is_taken_up
+written-again-not-taken-up | written-again-not-taken-up | R4, written once | -p vellev-storage --test merge_spill -- the_cache_s_copy
+rename-given-up-not-looked-at | rename-given-up-not-looked-at | R4 given up | -p vellev-storage --test merge_spill -- a_merge_dropped_as_its_spill
+piece-left-out-of-the-peak | piece-left-out-of-the-peak | reckoning unit | -p vellev-storage --lib -- a_plan_to_gather
+failed-write-carried-on-from | failed-write-carried-on-from | R6 | -p vellev-storage --test merge_spill -- a_full_disk
+write-unbounded-on-the-gather-s-thread | write-unbounded-on-the-gather-s-thread | R7 | -p vellev-storage --test merge_spill -- a_disk_that_stops_answering
+stop-not-heeded-in-a-write | stop-not-heeded-in-a-write | R7 | -p vellev-storage --test merge_spill -- a_merge_stopped_while_a_write
+swept-only-once-stale | swept-only-once-stale | R8 | -p vellev-storage --test merge_spill -- a_spill_left_by
+swept-whoever-holds-it | swept-whoever-holds-it | R8 | -p vellev-storage --test merge_spill -- a_spill_under_way
+no-lock-taken | no-lock-taken | R8 | -p vellev-storage --test merge_spill -- a_spill_under_way
+bytes-do-not-hold-the-mapping | bytes-do-not-hold-the-mapping | R9 | -p vellev-storage --test merge_spill -- bytes_a_store_keeps
+a-store-reading-in-place-spills | a-store-reading-in-place-spills | R10 | -p vellev-storage --test merge_spill -- a_store_with_no_local_cache
+spilled-with-no-vectors | spilled-with-no-vectors | R11 | -p vellev-storage --test merge_spill -- a_merge_of_rows_without
+a-store-put-between-node-and-writer | a-store-put-between-node-and-writer | node | -p vellev-node --test merge_builds -- a_node_s_merge_gathers
+name-taken-only-if-the-work-runs | name-taken-only-if-the-work-runs | shutdown | -p vellev-storage --lib -- a_spill_let_go
+mapping-handed-to-the-store | mapping-handed-to-the-store | R12 | -p vellev-storage --test merge_spill -- a_disk_that_stops_answering_as_a_file; -p vellev-storage --lib -- what_goes_up_of_a_spill_is_read
+pieces-read-on-the-async-thread | pieces-read-on-the-async-thread | R12 | -p vellev-storage --test merge_spill -- a_disk_that_stops_answering_as_a_file
+pieces-hold-the-spill | pieces-hold-the-spill | stuck store pins nothing | -p vellev-storage --lib -- what_goes_up_of_a_spill_holds_nothing
+no-locks-taken-for-nobody-holding | no-locks-taken-for-nobody-holding | R8 no locks | -p vellev-storage --lib -- a_file_system_with_no_locks
+part-left-out-of-the-peak | part-left-out-of-the-peak | reckoning unit | -p vellev-storage --lib -- a_plan_to_gather
+failure-does-not-name-the-file | failure-does-not-name-the-file | existing rule | -p vellev-storage --test vectors -- a_merge_whose_copy
+name-removed-where-it-is-let-go | name-removed-where-it-is-let-go | R13 | -p vellev-storage --test merge_spill -- a_disk_that_stops_answering_as_a_spill
+room-never-asked-for | room-never-asked-for | R14 | -p vellev-storage --test merge_spill -- a_merge_with_no_room
+no-room-is-a-failure | no-room-is-a-failure | R14 | -p vellev-storage --test merge_spill -- a_merge_with_no_room
+a-skip-not-counted | a-skip-not-counted | R14 figures | -p vellev-storage --test merge_spill -- a_merge_with_no_room
+a-spill-not-counted-as-it-begins | a-spill-not-counted-as-it-begins | R14 figures | -p vellev-storage --test merge_spill -- a_merge_with_no_room
+a-failed-merge-takes-the-clean-with-it | a-failed-merge-takes-the-clean-with-it | R15 | -p vellev-node --test merge_builds -- a_round_whose_merge
+a-byte-lost-between-pieces | a-byte-lost-between-pieces | R1 in parts | -p vellev-storage --test merge_spill -- a_frame_larger_than_a_part; -p vellev-storage --lib -- a_spill_goes_up
+rename-undone-whatever-is-there | rename-undone-whatever-is-there | R4 | -p vellev-storage --test merge_spill -- a_rename_given_up
+going-up-reckoned-at-a-part-and-a-piece | going-up-reckoned-at-a-part-and-a-piece | reckoning unit | -p vellev-storage --lib -- what_goes_up_is_reckoned
+a-name-gone-fails-the-merge | a-name-gone-fails-the-merge | R9 | -p vellev-storage --test merge_spill -- a_spill_whose_name_goes
+spill-that-cannot-begin-falls-back-to-the-heap | spill-that-cannot-begin-falls-back-to-the-heap | R6 no fallback | -p vellev-storage --test merge_spill -- a_cache_that_cannot_begin

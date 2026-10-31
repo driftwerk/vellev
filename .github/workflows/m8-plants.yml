@@ -1,0 +1,52 @@
+name: M8 plants (scratch)
+on:
+  push:
+    branches: [scratch-m8-plants2]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  RUST_BACKTRACE: 0
+jobs:
+  plants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 280
+    strategy:
+      fail-fast: false
+      matrix:
+        list: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Toolchain
+        run: rustup show
+      - name: Plants
+        run: bash plants/run.sh plants/${{ matrix.list }}.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: plant-logs-${{ matrix.list }}
+          path: plant-logs
+  timed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show
+      - name: Each rule alone, in turn
+        run: |
+          mkdir -p timed
+          for run in 1 2 3; do
+            for rule in a_merge_stopped_at_any_moment_gives_up_within_two_seconds a_merge_gathered_on_disk_stopped_at_any_moment_gives_up_within_two_seconds; do
+              cargo test --release --locked -p vellev-storage --test merge_stop -- --ignored --nocapture --exact --test-threads=1 $rule > timed/$rule-$run.log 2>&1 || true
+              grep -E "stops, the slowest|^test a_" timed/$rule-$run.log | tee -a "$GITHUB_STEP_SUMMARY" || true
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timed
+          path: timed

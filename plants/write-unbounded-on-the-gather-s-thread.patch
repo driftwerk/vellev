@@ -1,0 +1,17 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..dfabf03 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -316,11 +316,7 @@ impl Spilling {
+             (&*file).write_all(bytemuck::cast_slice(&piece))?;
+             Ok(piece)
+         };
+-        let run = self.disk.run(bytes, step);
+-        let waited = self.stopping.unless_stopped(MergeStage::Gathering, run);
+-        let Some(stepped) = self.runtime.block_on(waited) else {
+-            return Ok(false);
+-        };
++        let stepped: std::io::Result<Vec<u32>> = step();
+         let mut piece = stepped.map_err(|error| self.failed(error))?;
+         piece.clear();
+         *words = piece;

@@ -1,0 +1,22 @@
+diff --git a/crates/vellev-storage/src/blobs.rs b/crates/vellev-storage/src/blobs.rs
+index 41841dd..dfea757 100644
+--- a/crates/vellev-storage/src/blobs.rs
++++ b/crates/vellev-storage/src/blobs.rs
+@@ -1091,15 +1091,8 @@ impl Disk {
+                 _thread: thread,
+             }
+         });
+-        let spawned = std::thread::Builder::new()
+-            .name("vellev-disk".into())
+-            .spawn(move || {
+-                let _stepping = stepping;
+-                step();
+-            });
+-        if let Err(error) = spawned {
+-            tracing::warn!(%error, "a step on local disk is left undone");
+-        }
++        let _stepping = stepping;
++        step();
+     }
+ 
+     /// Run `step`, which works on `bytes` on local disk, waiting for it at

@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/tests/flush_memory.rs b/crates/vellev-storage/tests/flush_memory.rs
+index 2a9afd0..59f7ec9 100644
+--- a/crates/vellev-storage/tests/flush_memory.rs
++++ b/crates/vellev-storage/tests/flush_memory.rs
+@@ -600,7 +600,7 @@ async fn merge_measured(shape: Shape, at_once: usize, gathered: Gathered) -> Mea
+         }
+     };
+     within(WRITTEN_WITHIN, "the rows written and flushed", written).await;
+-    count_settled().await;
++    let _ = count_settled;
+     COUNTING.reset_peak();
+     let before = COUNTING.now();
+     let merged = within(MERGED_WITHIN, "the merge ended", writer.merge()).await;

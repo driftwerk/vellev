@@ -1,0 +1,17 @@
+diff --git a/crates/vellev-storage/src/spill.rs b/crates/vellev-storage/src/spill.rs
+index 7bebdad..26605be 100644
+--- a/crates/vellev-storage/src/spill.rs
++++ b/crates/vellev-storage/src/spill.rs
+@@ -321,7 +321,11 @@ impl Spilling {
+         let Some(stepped) = self.runtime.block_on(waited) else {
+             return Ok(false);
+         };
+-        let mut piece = stepped.map_err(|error| self.failed(error))?;
++        let Ok(mut piece) = stepped else {
++            self.written = end;
++            *words = Vec::with_capacity(SPILLED_AT_ONCE / 4);
++            return Ok(true);
++        };
+         piece.clear();
+         *words = piece;
+         self.written = end;
