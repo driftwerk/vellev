@@ -672,6 +672,18 @@ impl Drop for Tenant {
     }
 }
 
+/// Held by a task whose end is the end of the hold, however it comes: every
+/// way it means to end, the hold is lost or the tenant gone already, and a
+/// panic is the one that would leave the tenant open with no such task.
+#[derive(Debug)]
+struct GivesUp(Arc<Hold>);
+
+impl Drop for GivesUp {
+    fn drop(&mut self) {
+        self.0.lose();
+    }
+}
+
 /// A restore running on a tenant: as it was asked for, and what ends as
 /// the restore ends.
 #[derive(Debug)]
@@ -2525,7 +2537,9 @@ impl Inner {
     /// it, and losing the hold stops it wherever it is. A hold that has run
     /// out is not lost: renewing goes on trying, and may yet bring it back,
     /// so the task waits, looking as often as a hold is renewed, and does
-    /// then what it was asked to meanwhile.
+    /// then what it was asked to meanwhile. However the task ends, as by a
+    /// panic in a round, the hold ends with it, so that no tenant is left
+    /// open with nothing looking after it.
     fn maintaining(&self, tenant: &Arc<Tenant>, mut wanted: mpsc::Receiver<()>) {
         let Settings {
             restore_window,
@@ -2538,7 +2552,9 @@ impl Inner {
         let coordinator = self.coordinator.clone();
         let hold = tenant.hold.clone();
         let tenant = Arc::downgrade(tenant);
+        let ends = GivesUp(hold.clone());
         let maintaining = tokio::spawn(async move {
+            let _ends = ends;
             // A flush a write asked for, not yet looked at.
             let mut asked = false;
             loop {
