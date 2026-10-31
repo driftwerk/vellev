@@ -330,9 +330,15 @@ async fn a_tenant_a_restore_holds_is_not_let_go_until_the_restore_ends() {
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let before = node.tenants_kept_by_sweeps();
     // The census is taken as a sweep begins: a second one finds what the
-    // first let go.
-    node.sweep_now().await;
-    node.sweep_now().await;
+    // first let go. Bounded: a sweep that took the tenant out would wait in
+    // its flush, on the puts held here, for good.
+    let sweeps = async {
+        node.sweep_now().await;
+        node.sweep_now().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), sweeps)
+        .await
+        .expect("a sweep took out the tenant mid-restore, and is held in its flush");
     assert_eq!(node.census().holding.writers, 1, "let go mid-restore");
     assert!(node.tenants_kept_by_sweeps() > before, "no sweep looked");
     assert_eq!(node.opens().writers, 1, "opened afresh mid-restore");
