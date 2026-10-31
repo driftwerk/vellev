@@ -3108,7 +3108,7 @@ impl Writer {
                 return None;
             }
             if let Some(build) = build {
-                let reckoning = reckoning.gathered(file.rows.len(), copied, &vectors);
+                let reckoning = reckoning.gathered(copied, &vectors);
                 build.reckon(reckoning.peak());
             }
             Some((file, Some(vectors), shape))

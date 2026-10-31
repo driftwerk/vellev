@@ -63,9 +63,12 @@ struct Block {
     min_length: u32,
 }
 
-/// How many registers a [`Vocabulary`] keeps: about 3% off, as a sketch of
-/// this size is.
+/// How many registers a [`Vocabulary`] keeps.
 const REGISTERS: usize = 1 << 10;
+
+/// How far a [`Vocabulary`]'s estimate can be off: two standard errors of a
+/// sketch of [`REGISTERS`], 1.04 over their root.
+pub const VOCABULARY_OFF: f64 = 0.065;
 
 /// About how many different tokens have been seen, kept in a kilobyte
 /// however many there are: a HyperLogLog. Sketches of two sets of tokens
@@ -90,7 +93,7 @@ impl Vocabulary {
     /// Count `token`. The hash is the same in every process, as FNV-1a is,
     /// its bits then mixed as Murmur3 finishes, so that sketches come
     /// together with those of any other segment.
-    fn add(&mut self, token: &str) {
+    pub fn add(&mut self, token: &str) {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         for byte in token.bytes() {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
@@ -140,6 +143,9 @@ pub struct FieldShape {
     /// How many different tokens it holds, and the bytes of their text.
     pub tokens: usize,
     pub token_bytes: usize,
+    /// How many times each is held, all told: at most this many different
+    /// ones are left of it when rows die.
+    pub holders: usize,
     /// What it holds past [`dictionary_bytes`]: postings past their least,
     /// and its rows and lengths.
     pub postings: usize,
@@ -400,39 +406,30 @@ impl TextIndex {
             .sum()
     }
 
-    /// What a merge's reckoning takes of each property: a walk over every
-    /// token.
-    pub fn shapes(&self) -> impl Iterator<Item = (&str, FieldShape)> + '_ {
-        self.fields.iter().map(|(name, field)| {
+    /// What a merge's reckoning takes of each property, adding to `tokens`
+    /// about how many bytes each `every` rows take tokenized, as
+    /// [`Self::tokenized_resident`] counts them, their share going by how
+    /// many words each row has. Bytes for rows past its end are left out. A
+    /// walk over every token and every row holding text, once.
+    pub fn shapes(&self, every: usize, tokens: &mut [usize]) -> Vec<(&str, FieldShape)> {
+        const HELD: usize = std::mem::size_of::<(String, u32)>();
+        let shape = |field: &Field| {
             let mut shape = FieldShape {
                 tokens: field.postings.len(),
                 ..FieldShape::default()
             };
             let mut postings = field.rows.capacity() * 4 + field.lengths.capacity() * 4;
-            for (token, held) in &field.postings {
+            let mut held = 0;
+            for (token, of) in &field.postings {
                 shape.vocabulary.add(token);
                 shape.token_bytes += token.len();
-                postings += held.holders.capacity() * 4
-                    + held.frequencies.capacity() * 4
-                    + held.blocks.capacity() * std::mem::size_of::<Block>();
+                shape.holders += of.holders.len();
+                held += of.holders.len() * (HELD + token.len());
+                postings += of.holders.capacity() * 4
+                    + of.frequencies.capacity() * 4
+                    + of.blocks.capacity() * std::mem::size_of::<Block>();
             }
             shape.postings = postings.saturating_sub(shape.tokens * LEAST_POSTINGS);
-            (name.as_str(), shape)
-        })
-    }
-
-    /// Add to `tokens` about how many bytes each `every` rows take
-    /// tokenized, as [`Self::tokenized_resident`] counts them, their share
-    /// of it going by how many words each row has: a walk over every row
-    /// holding text. Bytes for rows past its end are left out.
-    pub fn tokenized_by_rows(&self, every: usize, tokens: &mut [usize]) {
-        const HELD: usize = std::mem::size_of::<(String, u32)>();
-        for field in self.fields.values() {
-            let held: usize = field
-                .postings
-                .iter()
-                .map(|(token, postings)| postings.holders.len() * (HELD + token.len()))
-                .sum();
             let words: u64 = field.lengths.iter().map(|words| u64::from(*words)).sum();
             let each = held as f64 / words.max(1) as f64;
             for (row, words) in field.rows.iter().zip(&field.lengths) {
@@ -440,7 +437,14 @@ impl TextIndex {
                     *tokens += (f64::from(*words) * each) as usize;
                 }
             }
+            shape
+        };
+        let mut shapes = Vec::with_capacity(self.fields.len());
+        let mut shape = shape;
+        for (name, field) in &self.fields {
+            shapes.push((name.as_str(), shape(field)));
         }
+        shapes
     }
 
     /// `object`'s searchable text as [`Self::insert`] would index it.
@@ -557,6 +561,11 @@ mod tests {
         let mut twice = sketch(0..50_000);
         twice.union(&sketch(0..50_000));
         assert_eq!(twice, sketch(0..50_000));
+        // Nothing seen comes to nothing, as a field with no tokens does.
+        assert_eq!(Vocabulary::default().estimate(), 0.0);
+        let mut empty = Vocabulary::default();
+        empty.union(&Vocabulary::default());
+        assert_eq!(empty.estimate(), 0.0);
         let mut overlapping = sketch(0..50_000);
         overlapping.union(&sketch(40_000..90_000));
         let off = (overlapping.estimate() / 90_000.0 - 1.0).abs();
