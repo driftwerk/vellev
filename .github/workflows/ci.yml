@@ -104,6 +104,18 @@ jobs:
             | tee reckoning.log
           # The rules ran, all five: not left out by their names or their ignore.
           grep -q "test result: ok. 5 passed" reckoning.log
+      # A merge gathering its vectors on a file system that really fills.
+      - name: A merge on a full disk
+        env:
+          VELLEV_SMALL_DISK: /mnt/small
+        run: |
+          sudo mkdir -p "$VELLEV_SMALL_DISK"
+          sudo mount -t tmpfs -o size=64m tmpfs "$VELLEV_SMALL_DISK"
+          sudo chmod 777 "$VELLEV_SMALL_DISK"
+          cargo test --locked -p vellev-storage --test merge_spill -- \
+            --ignored --exact a_disk_that_really_fills_fails_the_merge_and_leaves_nothing \
+            | tee full-disk.log
+          grep -q "test result: ok. 1 passed" full-disk.log
 
   # The benchmark fixture's tools, on tiny hand-made data.
   fixture-scripts:

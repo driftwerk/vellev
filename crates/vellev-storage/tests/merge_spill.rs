@@ -643,6 +643,50 @@ async fn a_full_disk_fails_the_merge_where_it_gathers_and_leaves_nothing() {
     cached.all_there(written).await;
 }
 
+/// Where CI's Test job mounts a small file system of its own for the rule
+/// below.
+const SMALL_DISK: &str = "VELLEV_SMALL_DISK";
+
+/// M8-R6, on a file system that really fills: the write tells of it, as the
+/// error the merge fails on, never as a fault in a mapping, and the room it
+/// took comes back with its file. Run in CI's Test job, on a tmpfs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "on a small file system of its own, as CI's Test job mounts"]
+async fn a_disk_that_really_fills_fails_the_merge_and_leaves_nothing() {
+    use std::io::Write;
+    let small = std::env::var(SMALL_DISK).expect("a small file system to fill");
+    let cache = tempfile::tempdir_in(&small).unwrap();
+    let mut cluster = Cluster::new().await;
+    cluster.blobs = Arc::new(CachedBlobs::new(cluster.blobs.clone(), cache.path()));
+    let builds = MergeBuilds::new(1);
+    let written = Written::of(ROWS, WIDTH);
+    let writer = written_on(cluster.writer().await, &builds, written).await;
+    let before = files(cache.path());
+    // All but 2 MiB of the rest taken, far less than the merge's vectors.
+    let ballast = Path::new(&small).join("ballast");
+    let mut filling = std::fs::File::create(&ballast).unwrap();
+    let mebibyte = vec![1u8; 1024 * 1024];
+    while filling.write_all(&mebibyte).is_ok() {}
+    let filled = filling.metadata().unwrap().len();
+    filling.set_len(filled - 2 * 1024 * 1024).unwrap();
+    drop(filling);
+
+    let manifest = cluster.committed().await.manifest;
+    let full = within(LONG, "the merge on a full disk", writer.merge()).await;
+    let error = full.expect_err("nothing to gather its vectors on");
+    assert!(
+        matches!(&error, StorageError::Blob { source, .. } if source.to_string().contains("space")),
+        "{error}"
+    );
+    settled("what it wrote stays", || files(cache.path()) == before).await;
+    assert_eq!(cluster.committed().await.manifest, manifest);
+
+    std::fs::remove_file(&ballast).unwrap();
+    let merged = within(LONG, "the merge with room", writer.merge()).await;
+    assert!(merged.unwrap().is_some());
+    assert!(writer.last_spilled() > 0, "gathered in memory");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cache_that_cannot_begin_a_spill_fails_the_merge_before_it_builds_anything() {
     let mut cluster = Cluster::new().await;
