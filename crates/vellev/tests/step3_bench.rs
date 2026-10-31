@@ -1917,15 +1917,14 @@ fn a_rising_debt_is_not_halved_by_the_tail_it_is_averaged_over() {
 /// runs on past it runs beside nothing that was timed, and would read as
 /// time alone; a build cut off so is no lone build. It decides nothing.
 fn slot_use(spans: &[(bool, f64, f64)], slots: Option<usize>, soak_s: f64) -> Value {
-    let whole = spans.iter().filter(|span| span.1 <= soak_s).count();
     let spans: Vec<(bool, f64, f64)> = spans
         .iter()
+        .filter(|(_, ended, took)| ended - took < soak_s)
         .map(|(build, ended, took)| {
             let clipped = ended.min(soak_s);
             (*build, clipped, took - (ended - clipped))
         })
         .collect();
-    debug_assert!(whole <= spans.len());
     let mut edges: Vec<(f64, i64)> = spans
         .iter()
         .flat_map(|(_, ended, took)| [(ended - took, 1), (*ended, -1)])
@@ -1981,6 +1980,13 @@ fn slot_use_says_how_long_a_build_ran_alone_and_the_pools_stood_idle() {
     assert_eq!(cut["busy_s"], json!(25.0), "{cut}");
     assert_eq!(cut["lone_s"], json!(15.0), "{cut}");
     assert_eq!(cut["lone_builds"]["count"], json!(0), "{cut}");
+    // Alone, and cut off by the soak's end: alone as far as it went, and no
+    // lone build, as how long it took is not known. What began after the
+    // soak is none of it.
+    let alone = slot_use(&[(true, 30.0, 10.0), (true, 40.0, 5.0)], Some(2), 25.0);
+    assert_eq!(alone["lone_s"], json!(5.0), "{alone}");
+    assert_eq!(alone["busy_s"], json!(5.0), "{alone}");
+    assert_eq!(alone["lone_builds"]["count"], json!(0), "{alone}");
     // Arm (a) has no slots, so nothing of them stands idle: its figure
     // would mean nothing, though its builds are still timed.
     let global = slot_use(&spans, None, 100.0);
