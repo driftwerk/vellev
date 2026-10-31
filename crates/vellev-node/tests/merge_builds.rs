@@ -116,6 +116,104 @@ async fn four_flushes(node: &Node, name: &str) {
     }
 }
 
+/// The tenants a sweep during a free finds: "freeing", held, with what its
+/// merge replaced waiting to be freed; "merging", with a merge of its own
+/// under way, held where it builds; and "idle", which nothing holds.
+struct Freeing {
+    held: Arc<vellev_node::Tenant>,
+    frees: Arc<vellev_storage::FreesHeld>,
+}
+
+impl Drop for Freeing {
+    fn drop(&mut self) {
+        self.frees.let_go();
+    }
+}
+
+/// `node`'s three tenants, as [`Freeing`] says.
+async fn freeing_beside_a_merge(node: &Node) -> Freeing {
+    let builds = node.merge_builds();
+    node.create_tenant(&tenant("idle")).await.unwrap();
+    let idle = node.tenant(&tenant("idle")).await.unwrap();
+    idle.write(vec![notes(), note(1)]).await.unwrap();
+    drop(idle);
+    node.create_tenant(&tenant("freeing")).await.unwrap();
+    let held = node.tenant(&tenant("freeing")).await.unwrap();
+    let frees = held.partition().hold_frees();
+    let freeing = Freeing { held, frees };
+    freeing.held.write(vec![notes()]).await.unwrap();
+    for flush in 0..4 {
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(flush * NOTES + n)).collect();
+        freeing.held.write(batch).await.unwrap();
+        let flushed = || freeing.held.read(State::unflushed) == 0;
+        until(30, "the node never flushed the tenant", flushed).await;
+    }
+    until(30, "the merge's free never began", || {
+        freeing.frees.reached() > 0
+    })
+    .await;
+    builds.hold(Some(Holding::UntilLetGo));
+    four_flushes(node, "merging").await;
+    until(30, "the other merge never began", || builds.held() == 1).await;
+    freeing
+}
+
+/// What a tenant has yet to free leaves by itself: a sweep during a free
+/// neither lets a tenant go nor stops a merge for it, though it would put
+/// the node over its budget were it counted in what the tenants hold. The
+/// budget here lies between the two, worked out on a node of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_during_a_free_stops_nothing_and_lets_nothing_go() {
+    let set = |settings: &mut Settings| settings.flush_rows = NOTES as usize;
+    let measured = node(set);
+    let freeing = freeing_beside_a_merge(&measured).await;
+    let to_free = measured.freeing();
+    assert!(to_free > 0, "nothing counted as being freed");
+    assert_eq!(to_free, freeing.held.partition().freeing());
+    let mut held = 0;
+    for name in ["idle", "freeing", "merging"] {
+        let tenant = measured.tenant(&tenant(name)).await.unwrap();
+        held += tenant.partition().figures().resident;
+    }
+    measured.merge_builds().hold(None);
+    drop(freeing);
+
+    let node = node(|settings| {
+        set(settings);
+        settings.memory = Some(held + to_free / 2);
+    });
+    let freeing = freeing_beside_a_merge(&node).await;
+    let builds = node.merge_builds().clone();
+    // Past the least a tenant is kept for, so that it could be let go: all
+    // but "freeing", used now, which were it among those chosen would cover
+    // what is over, and leave the other merge be.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    node.tenant(&tenant("freeing")).await.unwrap();
+    node.sweep_now().await;
+    // The census is taken as a sweep begins: a second one finds what the
+    // first let go.
+    node.sweep_now().await;
+    let merges = node.merges();
+    assert_eq!(
+        (node.census().holding.writers, merges.stopped_for_budget),
+        (3, 0),
+        "tenants held and merges stopped"
+    );
+    assert_eq!(merges.draining, 0, "a merge was stopped");
+    assert_eq!(builds.held(), 1, "the other merge did not go on");
+    assert!(node.freeing() > 0, "the free is over");
+    // Nor does warming see it: what the tenants hold is what their states
+    // come to.
+    let mut figures = 0;
+    for name in ["idle", "freeing", "merging"] {
+        let tenant = node.tenant(&tenant(name)).await.unwrap();
+        figures += tenant.partition().figures().resident;
+    }
+    assert_eq!(node.resident(), figures);
+    builds.hold(None);
+    drop(freeing);
+}
+
 /// Rule 4b: over its memory budget, a node stops the merge of a tenant it
 /// would let go but cannot yet, as its maintenance holds it; the build
 /// ends at once, not when it would have, and the node lets the tenant go

@@ -9,12 +9,20 @@
 //! lock, and of the live map under the write lock, which no gather's change
 //! moves (node memory note, §2.9). The log's `adopting` is how long the
 //! write lock was held; the longest read and write are what that and the
-//! walk under the read lock cost them.
+//! walk under the read lock cost them. They go on for AFTER_MERGE seconds
+//! after the merge returns, so that they see what it replaced being freed,
+//! which it no longer waits for. A plain flush follows, for its own
+//! `adopting`, as what is left walks the tenant's live rows as well.
+//!
+//! For a small merge in a large tenant, LARGE_SEGMENTS of LARGE_ROWS rows
+//! each go first, too large to merge: the hold then follows the tenant, not
+//! the merge. WORDS keeps those rows' text small enough to hold.
 //!
 //!   cargo run --release -p vellev-storage --example gather_hold
 //!
 //! Environment: ROWS (100000, a segment), SEGMENTS (4), DIMS (768),
-//! RUNS (5).
+//! RUNS (5), AFTER_MERGE (5), WORDS (80), LARGE_SEGMENTS (0),
+//! LARGE_ROWS (1000000).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -81,9 +89,10 @@ fn notes(dimensions: u32) -> Mutation {
     }))
 }
 
-/// A note of about 700 bytes of text, as the bench's passages are.
-fn note(n: u64, dims: usize, random: &mut Random) -> Mutation {
-    let text: Vec<String> = (0..80)
+/// A note of `words` words of text: about 700 bytes of it at 80, as the
+/// bench's passages are.
+fn note(n: u64, dims: usize, words: usize, random: &mut Random) -> Mutation {
+    let text: Vec<String> = (0..words)
         .map(|_| format!("w{:06}", random.next() % 200_000))
         .collect();
     Mutation::Upsert {
@@ -99,7 +108,12 @@ fn note(n: u64, dims: usize, random: &mut Random) -> Mutation {
 }
 
 /// A flush and a commit, side by side, each timed.
-async fn flush_and_commit(writer: &Writer, n: u64, dims: usize) -> (Duration, Duration) {
+async fn flush_and_commit(
+    writer: &Writer,
+    n: u64,
+    dims: usize,
+    words: usize,
+) -> (Duration, Duration) {
     let asked = Instant::now();
     let flushing = async {
         writer.flush().await.unwrap();
@@ -107,7 +121,7 @@ async fn flush_and_commit(writer: &Writer, n: u64, dims: usize) -> (Duration, Du
     };
     let committing = async {
         let mut random = Random(n | 1);
-        let written = note(n, dims, &mut random);
+        let written = note(n, dims, words, &mut random);
         writer.commit(vec![written]).await.unwrap();
         asked.elapsed()
     };
@@ -132,6 +146,12 @@ async fn main() {
         setting("DIMS", 768),
         setting("RUNS", 5),
     );
+    let (after_merge, words) = (setting("AFTER_MERGE", 5), setting("WORDS", 80));
+    let (large_segments, large_rows) = (
+        setting("LARGE_SEGMENTS", 0),
+        setting("LARGE_ROWS", 1_000_000),
+    );
+    let large = large_segments * large_rows;
     let coordinator = Arc::new(MemoryCoordinator::default());
     let key = PartitionKey {
         tenant: TenantId::new("t").unwrap(),
@@ -164,23 +184,26 @@ async fn main() {
     writer.commit(vec![notes(dims as u32)]).await.unwrap();
     let mut random = Random(0x9e37_79b9_7f4a_7c15);
     let began = Instant::now();
-    for segment in 0..segments {
-        for from in (0..rows).step_by(PER_COMMIT) {
-            let batch = (from..(from + PER_COMMIT).min(rows))
-                .map(|n| note((segment * rows + n) as u64, dims, &mut random))
+    let sizes = std::iter::repeat_n(large_rows, large_segments);
+    let mut first = 0;
+    for (segment, size) in sizes.chain(std::iter::repeat_n(rows, segments)).enumerate() {
+        for from in (0..size).step_by(PER_COMMIT) {
+            let batch = (from..(from + PER_COMMIT).min(size))
+                .map(|n| note((first + n) as u64, dims, words, &mut random))
                 .collect();
             writer.commit(batch).await.unwrap();
         }
+        first += size;
         writer.flush().await.unwrap();
         println!("segment {segment} flushed at {:?}", began.elapsed());
     }
 
-    let mut n = (segments * rows) as u64;
+    let mut n = (large + segments * rows) as u64;
     let mut timed = |writer: &Arc<Writer>| {
         n += 1;
         let writer = writer.clone();
         let at = n;
-        async move { flush_and_commit(&writer, at, dims).await }
+        async move { flush_and_commit(&writer, at, dims, words).await }
     };
     for run in 0..runs {
         let (flush_alone, commit_alone) = timed(&writer).await;
@@ -236,7 +259,7 @@ async fn main() {
             let mut random = Random(n | 1);
             while going.load(Ordering::SeqCst) {
                 n += 1;
-                let written = note(n, dims, &mut random);
+                let written = note(n, dims, words, &mut random);
                 let asked = Instant::now();
                 writer.commit(vec![written]).await.unwrap();
                 longest = longest.max(asked.elapsed());
@@ -252,10 +275,14 @@ async fn main() {
     let commit_took = released.elapsed();
     LOGGING.store(false, Ordering::SeqCst);
     assert!(committed.is_some(), "the merge commits");
+    tokio::time::sleep(Duration::from_secs(after_merge as u64)).await;
     going.store(false, Ordering::SeqCst);
     let (longest_read, longest_write) = (reading.join().unwrap(), writing.await.unwrap());
     println!(
-        "the commit took {commit_took:?}; beside it the longest read took {longest_read:?}, \
-         the longest write {longest_write:?}"
+        "the commit took {commit_took:?}; beside it and for {after_merge} s after, the longest \
+         read took {longest_read:?}, the longest write {longest_write:?}"
     );
+    LOGGING.store(true, Ordering::SeqCst);
+    writer.flush().await.unwrap();
+    LOGGING.store(false, Ordering::SeqCst);
 }
