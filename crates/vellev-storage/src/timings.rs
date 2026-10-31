@@ -60,6 +60,10 @@ impl Holder {
 pub enum MergePhase {
     /// Waiting for a turn among the node's merge builds.
     Turn,
+    /// Waiting for the building lock with a turn held, which nothing else
+    /// may use meanwhile: each wait, however it ended, at most
+    /// [`crate::TURN_IDLE_AT_MOST`].
+    TurnIdle,
     /// Waiting, with one, for a turn among the work off the async threads.
     Working,
     /// Gathering the run's live rows, a chunk at a time with no lock held.
@@ -77,8 +81,9 @@ pub enum MergePhase {
 }
 
 impl MergePhase {
-    pub const ALL: [MergePhase; 7] = [
+    pub const ALL: [MergePhase; 8] = [
         MergePhase::Turn,
+        MergePhase::TurnIdle,
         MergePhase::Working,
         MergePhase::Gather,
         MergePhase::Build,
@@ -101,6 +106,7 @@ impl MergePhase {
     pub fn name(self) -> &'static str {
         match self {
             MergePhase::Turn => "turn",
+            MergePhase::TurnIdle => "turn_idle",
             MergePhase::Working => "working",
             MergePhase::Gather => "gather",
             MergePhase::Build => "build",
@@ -462,6 +468,13 @@ impl Lag {
         state.due_at = due_at;
         state.backlog = backlog;
         state.saw(unflushed, Instant::now());
+    }
+
+    /// Whether `unflushed` rows make a flush due: never, if nothing says
+    /// when one is.
+    pub(crate) fn due(&self, unflushed: usize) -> bool {
+        let due_at = self.state().due_at;
+        due_at > 0 && unflushed >= due_at
     }
 
     /// Rows were applied, and the partition holds `unflushed`.

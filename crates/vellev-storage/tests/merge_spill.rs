@@ -219,6 +219,27 @@ impl Cached {
         }
     }
 
+    /// As [`Self::over`], a flush falling due at `rows` rows unflushed.
+    async fn flushed_at(
+        mut cluster: Cluster,
+        store: Arc<dyn Blobs>,
+        written: Written,
+        rows: usize,
+    ) -> Self {
+        let cache = tempfile::tempdir().unwrap();
+        cluster.blobs = Arc::new(CachedBlobs::new(store.clone(), cache.path()));
+        let builds = MergeBuilds::new(1);
+        let writer = cluster.writer().await.flushing_due_at(rows, 1 << 30);
+        let writer = written_on(writer, &builds, written).await;
+        Self {
+            cluster,
+            store,
+            cache,
+            builds,
+            writer,
+        }
+    }
+
     fn dir(&self) -> &Path {
         self.cache.path()
     }
@@ -1153,6 +1174,267 @@ async fn a_disk_that_stops_answering_as_a_file_goes_up_holds_up_no_async_thread(
     settled("what it wrote stays", || files(cached.dir()) == before).await;
     let merged = within(LONG, "the next merge", cached.writer.merge()).await;
     assert!(merged.unwrap().is_some());
+}
+
+/// A store under a cache that holds a flush's vectors as they go up, and so
+/// the building lock a merge waits for to commit.
+#[derive(Debug)]
+struct FlushesHeld {
+    inner: Arc<dyn Blobs>,
+    armed: AtomicBool,
+    held: AtomicBool,
+    let_go: tokio::sync::Notify,
+}
+
+impl FlushesHeld {
+    fn over(inner: Arc<dyn Blobs>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            armed: AtomicBool::new(false),
+            held: AtomicBool::new(false),
+            let_go: tokio::sync::Notify::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl Blobs for FlushesHeld {
+    async fn put(&self, key: &str, bytes: Bytes) -> vellev_storage::Result<()> {
+        if self.armed.load(Ordering::SeqCst)
+            && key.ends_with(".vectors")
+            && !key.contains("-merged")
+        {
+            self.held.store(true, Ordering::SeqCst);
+            self.let_go.notified().await;
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn put_spilled(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        spill: Arc<vellev_storage::blobs::Spill>,
+    ) -> vellev_storage::Result<()> {
+        self.inner.put_spilled(key, bytes, spill).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// How long a commit here waits with its turn before it gives it back.
+const TURN_IDLE: Duration = Duration::from_millis(100);
+
+/// A merge past loading back what it built, on `store` under a cache, at the
+/// gate before its commit, with its turn given up after [`TURN_IDLE`].
+struct AtCommit {
+    cached: Cached,
+    gate: Arc<vellev_storage::MergeGate>,
+    merging: tokio::task::JoinHandle<vellev_storage::Result<Option<LogPosition>>>,
+}
+
+impl AtCommit {
+    async fn over(store: Arc<dyn Blobs>, written: Written) -> Self {
+        let cached = Cached::over(Cluster::new().await, store, written, None).await;
+        cached.builds.idle_for(TURN_IDLE);
+        Self::of(cached).await
+    }
+
+    async fn of(cached: Cached) -> Self {
+        let gate = cached.writer.hold_merges_before_commit();
+        let merging = cached.merging();
+        within(
+            LONG,
+            "the merge never came to its commit",
+            gate.reached.notified(),
+        )
+        .await;
+        Self {
+            cached,
+            gate,
+            merging,
+        }
+    }
+
+    /// A flush of a row written now, of `width`, begun and held where `held`
+    /// holds it, with the building lock.
+    async fn flush_held(
+        &self,
+        held: &FlushesHeld,
+        width: u32,
+    ) -> tokio::task::JoinHandle<vellev_storage::Result<()>> {
+        let writer = self.cached.writer.clone();
+        let row = upsert_of(9_000_000, Some(vector(1, width)));
+        writer.commit(vec![row]).await.unwrap();
+        held.armed.store(true, Ordering::SeqCst);
+        let flushing = tokio::spawn(async move { writer.flush().await.map(|_| ()) });
+        settled("the flush never began to go up", || {
+            held.held.load(Ordering::SeqCst)
+        })
+        .await;
+        flushing
+    }
+}
+
+/// M8-R16. A commit waiting behind a long hold gives its turn back holding
+/// what it built, and what that is, a spill gathered, is no vectors: they are
+/// the cache's copy by then, mapped, with no spill left to name. So
+/// `vellev_merge_commits_waiting_bytes` says less than the same merge in
+/// memory by what its vectors take, and it commits with nothing drained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_that_gave_its_turn_back_holds_none_of_its_spill() {
+    let written = Written::of(ROWS, 768);
+    let frame = 2 * ROWS as usize * (4 * 768 + 8);
+    // What the same merge says of itself in memory, weighed the same way.
+    let in_memory = {
+        let cluster = Cluster::new().await;
+        let held = FlushesHeld::over(cluster.blobs.clone());
+        let mut cluster = cluster;
+        cluster.blobs = held.clone();
+        let builds = MergeBuilds::new(1);
+        builds.idle_for(TURN_IDLE);
+        let writer = written_on(cluster.writer().await, &builds, written).await;
+        let gate = writer.hold_merges_before_commit();
+        let merging = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        within(LONG, "the merge in memory", gate.reached.notified()).await;
+        writer
+            .commit(vec![upsert_of(9_000_000, Some(vector(1, 768)))])
+            .await
+            .unwrap();
+        held.armed.store(true, Ordering::SeqCst);
+        let flushing = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.flush().await }
+        });
+        settled("the flush never began", || held.held.load(Ordering::SeqCst)).await;
+        gate.release.notify_one();
+        settled("the turn stayed", || builds.turns_free() == 1).await;
+        let holding = builds.waiting_to_commit();
+        held.armed.store(false, Ordering::SeqCst);
+        held.let_go.notify_one();
+        within(LONG, "the flush", flushing).await.unwrap().unwrap();
+        within(LONG, "the merge", merging).await.unwrap().unwrap();
+        holding
+    };
+
+    let held = FlushesHeld::over(Cluster::new().await.blobs.clone());
+    let at = AtCommit::over(held.clone(), written).await;
+    let cached = &at.cached;
+    let flushing = at.flush_held(&held, 768).await;
+    at.gate.release.notify_one();
+    settled("the turn stayed", || cached.builds.turns_free() == 1).await;
+    assert!(cached.writer.last_spilled() > 0, "gathered in memory");
+    let holding = cached.builds.waiting_to_commit();
+    assert!(holding > 0, "what it holds is not counted");
+    assert!(
+        in_memory - holding >= frame * 9 / 10,
+        "{holding} held, {in_memory} in memory, of a frame of {frame}"
+    );
+    assert_eq!(
+        cached.builds.draining(),
+        0,
+        "a merge going on drains nothing"
+    );
+    assert!(spills(cached.dir()).is_empty(), "taken up as it went up");
+    let all = files(cached.dir());
+    assert!(
+        all.iter().any(|file| file.ends_with("-merged.vectors")),
+        "{all:?}"
+    );
+
+    held.armed.store(false, Ordering::SeqCst);
+    held.let_go.notify_one();
+    within(LONG, "the flush", flushing).await.unwrap().unwrap();
+    let merged = within(LONG, "the merge", at.merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    settled("still counted", || cached.builds.waiting_to_commit() == 0).await;
+    assert_eq!(cached.builds.draining(), 0);
+    assert_eq!(cached.cluster.blobs.spills().unwrap().figures().bytes, 0);
+}
+
+/// M8-R16. A merge that gave its turn back and is then found stale, a restore
+/// having come between, leaves no spill's name, no file of its own in the
+/// cache, and nothing draining.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_found_stale_having_given_its_turn_back_leaves_nothing_of_its_spill() {
+    let written = Written::of(ROWS, WIDTH);
+    let held = FlushesHeld::over(Cluster::new().await.blobs.clone());
+    let at = AtCommit::over(held.clone(), written).await;
+    let cached = &at.cached;
+    let committed = cached.cluster.committed().await;
+    let restored = cached
+        .writer
+        .restore(committed.manifest.as_ref(), committed.log_position);
+    within(LONG, "the restore", restored).await.unwrap();
+    let flushing = at.flush_held(&held, WIDTH).await;
+    at.gate.release.notify_one();
+    settled("the turn stayed", || cached.builds.turns_free() == 1).await;
+    assert!(cached.builds.waiting_to_commit() > 0, "not counted");
+    assert!(cached.writer.last_spilled() > 0, "gathered in memory");
+    held.armed.store(false, Ordering::SeqCst);
+    held.let_go.notify_one();
+    within(LONG, "the flush", flushing).await.unwrap().ok();
+    let merged = within(LONG, "the merge", at.merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "stale, and dropped");
+    let cache = cached.dir();
+    settled("a stale merge's copy stays", || {
+        !files(cache).iter().any(|file| file.contains("-merged"))
+    })
+    .await;
+    assert!(spills(cache).is_empty());
+    settled("still counted", || cached.builds.waiting_to_commit() == 0).await;
+    assert_eq!(cached.builds.draining(), 0);
+    assert_eq!(cached.cluster.blobs.spills().unwrap().figures().bytes, 0);
+}
+
+/// M8-R16. A merge cut off during its flush first, its task aborted with the
+/// flush going up, leaves no spill's name, no file of its own in the cache,
+/// and nothing draining, and every row is there all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_cut_off_during_its_flush_first_leaves_nothing_of_its_spill() {
+    let written = Written::of(ROWS, WIDTH);
+    let held = FlushesHeld::over(Cluster::new().await.blobs.clone());
+    let cached = {
+        let cluster = Cluster::new().await;
+        Cached::flushed_at(cluster, held.clone(), written, 1).await
+    };
+    let builds = cached.builds.clone();
+    let at = AtCommit::of(cached).await;
+    let cached = &at.cached;
+    cached
+        .writer
+        .commit(vec![upsert_of(9_000_000, Some(vector(1, WIDTH)))])
+        .await
+        .unwrap();
+    held.armed.store(true, Ordering::SeqCst);
+    at.gate.release.notify_one();
+    settled("no flush first began", || held.held.load(Ordering::SeqCst)).await;
+    assert!(cached.writer.last_spilled() > 0, "gathered in memory");
+    at.merging.abort();
+    let _ = at.merging.await;
+    held.armed.store(false, Ordering::SeqCst);
+    held.let_go.notify_one();
+    let cache = cached.dir();
+    settled("a merge cut off leaves its copy", || {
+        !files(cache).iter().any(|file| file.contains("-merged"))
+    })
+    .await;
+    assert!(spills(cache).is_empty());
+    settled("still counted", || {
+        builds.waiting_to_commit() == 0 && builds.under_way() == 0
+    })
+    .await;
+    assert_eq!(builds.draining(), 0);
+    assert_eq!(cached.cluster.blobs.spills().unwrap().figures().bytes, 0);
 }
 
 /// The cache directory a process killed part way through a gather is to

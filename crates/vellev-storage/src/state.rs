@@ -498,6 +498,19 @@ impl Loaded {
     }
 }
 
+impl Fit {
+    /// The work of weighing what this holds, as the state will reckon it
+    /// once adopted: a walk of its rows, for off the async threads.
+    pub(crate) fn weighing(&self) -> impl FnOnce() -> usize + Send + 'static {
+        let (file, vectors, indexes) = (
+            self.file.clone(),
+            self.vectors.clone(),
+            self.indexes.clone(),
+        );
+        move || segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes)
+    }
+}
+
 /// A segment the writer built and loaded back, checked while that could
 /// still fail and change nothing: its vectors are one per row and its
 /// indexes built, so the state adopts it, once the commit that names it is

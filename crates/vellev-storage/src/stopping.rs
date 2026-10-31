@@ -33,7 +33,7 @@ pub enum MergeStage {
     /// Before it plans, once its turn to merge has come.
     Planning,
     /// Waiting for a turn among the node's merge builds, before it gathers,
-    /// or, without one, for its partition's building lock.
+    /// or, with one or without, for its partition's building lock.
     Queued,
     /// Waiting for a turn among the work done off the async threads.
     Turn,
