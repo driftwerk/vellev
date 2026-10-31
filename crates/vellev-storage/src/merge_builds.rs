@@ -398,6 +398,12 @@ impl MergeBuilds {
         under_way.iter().filter(holding_turns).count()
     }
 
+    /// How many times a merge has taken a turn, however it went. For tests.
+    #[doc(hidden)]
+    pub fn turns_taken(&self) -> u64 {
+        self.numbered.load(Ordering::SeqCst)
+    }
+
     /// How many turns are free. For tests.
     #[doc(hidden)]
     pub fn turns_free(&self) -> usize {

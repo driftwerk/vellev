@@ -530,13 +530,13 @@ async fn a_merge_keeps_its_turn_through_its_own_flush_and_builds_before_the_next
         async move { first.flush().await }
     });
     within(60, "the flush's vectors never began to go up", put.recv()).await;
+    let taken = builds.turns_taken();
     let merging = tokio::spawn({
         let first = first.clone();
         async move { first.merge().await }
     });
-    let key = first.lease().key.clone();
-    until(10, "the merge never took its turn", || {
-        builds.under_way_for(&key)
+    until(10, "the merge never took a turn", || {
+        builds.turns_taken() > taken
     })
     .await;
     let behind = tokio::spawn({
@@ -551,6 +551,11 @@ async fn a_merge_keeps_its_turn_through_its_own_flush_and_builds_before_the_next
         .unwrap()
         .unwrap();
     until(10, "no merge came to build", || builds.held() == 1).await;
+    assert_eq!(
+        builds.turns_taken(),
+        taken + 1,
+        "a merge asked for a turn twice, for a flush of its own"
+    );
     // The build held is the first's: let go, it ends, and the second's comes.
     builds.let_one_go();
     let merged = within(
@@ -591,13 +596,13 @@ async fn a_merge_keeps_its_turn_through_its_own_clean_and_builds_before_the_next
         held.listing.load(Ordering::SeqCst)
     })
     .await;
+    let taken = builds.turns_taken();
     let merging = tokio::spawn({
         let first = first.clone();
         async move { first.merge().await }
     });
-    let key = first.lease().key.clone();
-    until(10, "the merge never took its turn", || {
-        builds.under_way_for(&key)
+    until(10, "the merge never took a turn", || {
+        builds.turns_taken() > taken
     })
     .await;
     let behind = tokio::spawn({
@@ -611,6 +616,11 @@ async fn a_merge_keeps_its_turn_through_its_own_clean_and_builds_before_the_next
         .unwrap()
         .unwrap();
     until(10, "no merge came to build", || builds.held() == 1).await;
+    assert_eq!(
+        builds.turns_taken(),
+        taken + 1,
+        "a merge asked for a turn twice, for a clean of its own"
+    );
     // The build held is the first's: let go, it ends, and the second's comes.
     builds.let_one_go();
     let merged = within(
