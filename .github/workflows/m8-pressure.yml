@@ -1,0 +1,50 @@
+name: M8 under pressure (scratch)
+on:
+  push:
+    branches: [scratch-m8-pressure]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 0
+jobs:
+  pressure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        rows: [100000, 200000]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Toolchain
+        run: rustup show
+      - name: Room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h . ; free -m; nproc; stat -fc %T /sys/fs/cgroup; cat /proc/sys/vm/dirty_ratio /proc/sys/vm/dirty_background_ratio; mount | grep " / "; swapon --show
+      - name: Build the head
+        run: |
+          sed -i '/BEFORE-ONLY/d' crates/vellev/examples/merge_pressure.rs
+          cargo build --release -p vellev --example merge_pressure
+          cp target/release/examples/merge_pressure bin-after
+          git checkout -- crates/vellev/examples/merge_pressure.rs
+      - name: Build main before it
+        run: |
+          git worktree add ../before ada7a63
+          mkdir -p ../before/crates/vellev/examples
+          cp crates/vellev/examples/merge_pressure.rs ../before/crates/vellev/examples/
+          cp crates/vellev/Cargo.toml ../before/crates/vellev/Cargo.toml
+          sed -i '/AFTER-ONLY/d' ../before/crates/vellev/examples/merge_pressure.rs
+          (cd ../before && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target cargo build --release -p vellev --example merge_pressure)
+          cp target/release/examples/merge_pressure bin-before
+          sha256sum bin-before bin-after
+      - name: Measure
+        run: bash scratch/pressure.sh ${{ matrix.rows }} 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pressure-${{ matrix.rows }}
+          path: measured
