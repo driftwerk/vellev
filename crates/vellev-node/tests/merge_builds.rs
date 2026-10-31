@@ -184,14 +184,23 @@ async fn a_sweep_during_a_free_stops_nothing_and_lets_nothing_go() {
     });
     let freeing = freeing_beside_a_merge(&node).await;
     let builds = node.merge_builds().clone();
-    // Past the least a tenant is kept for, so that it could be let go.
+    // Past the least a tenant is kept for, so that it could be let go: all
+    // but "freeing", used now, which were it among those chosen would cover
+    // what is over, and leave the other merge be.
     tokio::time::sleep(Duration::from_millis(1_200)).await;
+    node.tenant(&tenant("freeing")).await.unwrap();
+    node.sweep_now().await;
+    // The census is taken as a sweep begins: a second one finds what the
+    // first let go.
     node.sweep_now().await;
     let merges = node.merges();
-    assert_eq!(merges.stopped_for_budget, 0, "a merge was stopped");
+    assert_eq!(
+        (node.census().holding.writers, merges.stopped_for_budget),
+        (3, 0),
+        "tenants held and merges stopped"
+    );
     assert_eq!(merges.draining, 0, "a merge was stopped");
     assert_eq!(builds.held(), 1, "the other merge did not go on");
-    assert_eq!(node.census().holding.writers, 3, "a tenant was let go");
     assert!(node.freeing() > 0, "the free is over");
     // Nor does warming see it: what the tenants hold is what their states
     // come to.
