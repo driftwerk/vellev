@@ -1465,10 +1465,11 @@ pub(crate) fn indexed_on<'a>(
 /// between askings of its stop.
 const ROWS_BETWEEN_ASKING: usize = 4_096;
 
-/// How many rows' text a build holds tokenized at once, at the most. A
-/// bound in rows, not bytes: a chunk of long documents holds what they come
-/// to, which the reckoning counts. For tests that hold it to that, not for
-/// use.
+/// How many rows' text a build holds tokenized at once, at the most: as a
+/// merge, a flush or a load of a segment index its rows, not as logs are
+/// replayed, which are prepared a log at a time. A bound in rows, not bytes:
+/// a chunk of long documents holds what they come to, which the reckoning
+/// counts. For tests that hold it to that, not for use.
 #[doc(hidden)]
 pub const TOKENIZED_AT_ONCE: usize = 16_384;
 
@@ -3666,7 +3667,7 @@ mod tests {
             properties.insert("kept".to_string(), Value::Bool(at % 2 == 0));
             let date = chrono::DateTime::from_timestamp(at as i64, 0).unwrap();
             properties.insert("at".to_string(), Value::Date(date));
-            properties.insert("big".to_string(), Value::Int(at as i64 * 1 << 34));
+            properties.insert("big".to_string(), Value::Int((at as i64) << 34));
         }
         let tombstones: Vec<RowKey> = (0..1_000)
             .map(|at| (CollectionId(at % 3), oid(u128::from(at))))
