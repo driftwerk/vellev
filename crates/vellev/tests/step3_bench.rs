@@ -1987,6 +1987,7 @@ fn slot_use_says_how_long_a_build_ran_alone_and_the_pools_stood_idle() {
     assert_eq!(alone["lone_s"], json!(5.0), "{alone}");
     assert_eq!(alone["busy_s"], json!(5.0), "{alone}");
     assert_eq!(alone["lone_builds"]["count"], json!(0), "{alone}");
+    assert_eq!(alone["builds"], json!(1), "{alone}");
     // Arm (a) has no slots, so nothing of them stands idle: its figure
     // would mean nothing, though its builds are still timed.
     let global = slot_use(&spans, None, 100.0);
