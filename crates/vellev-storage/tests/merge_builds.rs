@@ -1114,7 +1114,10 @@ async fn a_flush_first_whose_wait_runs_out_leaves_its_rows_to_the_commit() {
         .unwrap();
     let merged = within(60, "the merge never ended", merging).await;
     assert!(merged.unwrap().unwrap().is_some());
-    assert_eq!(builds.waiting_to_commit(), 0);
+    until(10, "still counted after it committed", || {
+        builds.waiting_to_commit() == 0
+    })
+    .await;
     let rows = rows_by_segment(&writer);
     assert!(rows.contains(&1_000), "{rows:?}");
     assert_eq!(rows.len(), 3, "{rows:?}");
@@ -1260,7 +1263,10 @@ async fn a_restore_under_way_sends_a_commit_s_turn_back_at_once() {
     drop(restoring);
     let merged = within(60, "the merge never ended", merging).await;
     assert!(merged.unwrap().is_ok());
-    assert_eq!(builds.waiting_to_commit(), 0);
+    until(10, "still counted after it ended", || {
+        builds.waiting_to_commit() == 0
+    })
+    .await;
 }
 
 /// A merge a restore has made stale makes no flush first: it will be dropped,
@@ -1324,7 +1330,11 @@ async fn a_flush_first_that_closes_its_writer_ends_the_merge_there() {
         1,
         "the rows were built again for a writer closed"
     );
-    assert_eq!(builds.turns_free(), 1);
+    // Held until what it built is freed, off the async threads.
+    until(10, "the merge's turn was never given back", || {
+        builds.turns_free() == 1
+    })
+    .await;
 }
 
 /// A restore that comes in between a flush first and its commit drops the
@@ -1537,11 +1547,10 @@ async fn a_commit_behind_a_long_hold_gives_its_turn_back_and_stays_counted() {
         .unwrap();
     let merged = within(60, "the commit never ended", committing).await;
     assert!(merged.unwrap().unwrap().is_some());
-    assert_eq!(
-        builds.waiting_to_commit(),
-        0,
-        "still counted after it committed"
-    );
+    until(10, "still counted after it committed", || {
+        builds.waiting_to_commit() == 0
+    })
+    .await;
     assert_eq!(builds.turns_free(), 1);
     let idle: Vec<Duration> = first
         .timings()
