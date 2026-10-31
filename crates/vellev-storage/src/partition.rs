@@ -26,12 +26,13 @@ use crate::format::{
     Head, Kind, LogSegment, Manifest, Op, SegmentCurve, SegmentFile, SegmentIndex, SegmentMeta,
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
+use crate::freed::{off_the_async_threads, FreedOff};
 use crate::merge_builds::{
     HeldAt, MergeBuild, MergeBuilds, OnPool, Probe, Reservation, UnlessDeleted, Uploading,
     MERGE_BUILDS,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
-use crate::published::Published;
+use crate::published::{FreesHeld, Published};
 use crate::state::{
     self, Discarded, Figures, Fit, Indexes, Loaded, Merge, Merging, Names, Reckoning, Run, Shape,
     Snapshot, State, Stored,
@@ -393,10 +394,32 @@ impl Partition {
         self.state.figures()
     }
 
+    /// About how many bytes a checkpoint took out of this partition's state
+    /// and has yet to free: a merge's replaced segments, with the rows of
+    /// the flush committed with it. Not in [`Self::figures`], and held to
+    /// no budget: it goes by itself. Read without the lock, as those are.
+    pub fn freeing(&self) -> usize {
+        self.state.freeing()
+    }
+
+    /// Hold the free of what a merge's commit takes out from now on, at the
+    /// hold given back, until it lets go. For tests that make things happen
+    /// meanwhile.
+    #[doc(hidden)]
+    pub fn hold_frees(&self) -> Arc<FreesHeld> {
+        self.state.hold_frees()
+    }
+
     /// Change the state as `f` does, publishing all it then comes to: see
     /// [`Published::changing`].
     fn changing<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
         self.state.changing(f)
+    }
+
+    /// Adopt a checkpoint as `f` does, publishing all the state then comes
+    /// to: see [`Published::adopting`].
+    fn adopting(&self, f: impl FnOnce(&mut State) -> Discarded) -> Discarded {
+        self.state.adopting(f)
     }
 
     /// Apply a commit as `f` does, publishing what it changes: see
@@ -596,12 +619,12 @@ impl Partition {
     async fn column_built(
         &self,
         key: &str,
-        held: Column,
+        held: FreedOff<Column>,
         stopping: Option<&Stopping>,
     ) -> Result<Column> {
         self.own(key)?;
         if !cfg!(unix) {
-            return Ok(held);
+            return Ok(held.into_inner());
         }
         // A merge stopped as it sums the copy gives up at once: no warning,
         // and no copy fetched afresh, as the copy is whole for all it knows.
@@ -627,8 +650,11 @@ impl Partition {
             }
         };
         match read.await {
-            Ok(Some(column)) => Ok(column),
-            Ok(None) => Ok(held),
+            Ok(Some(column)) => {
+                drop(held.into_inner());
+                Ok(column)
+            }
+            Ok(None) => Ok(held.into_inner()),
             Err(error) if stopping.is_some_and(Stopping::is_stopped) => Err(error),
             Err(error) => {
                 tracing::error!(key, %error, "a segment just built is not kept: its vectors could not be read from local disk");
@@ -766,7 +792,8 @@ impl Partition {
                 let mut state = self.restore(&key, manifest, held, reloading).await?;
                 let together = state.apply_together(&tail.logs)?;
                 self.replayed_together(together);
-                self.changing(|now| *now = state);
+                let replaced = self.changing(|now| std::mem::replace(now, state));
+                off_the_async_threads(move || drop(replaced));
             }
             None => {
                 // A run of logs at a time, the codes of each made together
@@ -1129,6 +1156,17 @@ pub struct Writer {
     /// A gate a merge waits at between its build and its commit, if a test
     /// has set one: see [`Self::hold_merges_before_commit`].
     merge_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
+    /// A gate a checkpoint waits at once adopted, with what it took out of
+    /// memory, if a test has set one: where one may be dropped.
+    #[cfg(test)]
+    adopted_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
+    /// A probe for what the next checkpoint takes out of memory, if a test
+    /// has set one.
+    #[cfg(test)]
+    discarded_probe: std::sync::Mutex<Option<Arc<state::Probe>>>,
+    /// A probe for what the next merge builds, if a test has set one.
+    #[cfg(test)]
+    built_probe: std::sync::Mutex<Option<Arc<state::Probe>>>,
     /// The stop of the merge under way, if one is: see
     /// [`Self::stop_merges`].
     merge_stop: Arc<std::sync::Mutex<Option<Stop>>>,
@@ -1371,6 +1409,12 @@ impl Writer {
             merge_build: Mutex::new(()),
             keeping: Arc::default(),
             merge_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            adopted_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            discarded_probe: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            built_probe: std::sync::Mutex::new(None),
             merge_stop: Arc::default(),
             merge_stop_at: std::sync::Mutex::new(None),
             merges_stopped: AtomicU64::new(0),
@@ -2013,8 +2057,9 @@ impl Writer {
     /// Commit the checkpoint `frame` under `key` at `position` and adopt it
     /// in memory as `adopt` does, which is all a checkpoint does while the
     /// writer is held; then give the turn back and free what the checkpoint
-    /// took out of memory. Once the commit is made nothing is left to fail:
-    /// what `adopt` adopts was seen to be fit before the writer was held.
+    /// took out of memory, off the async threads. Once the commit is made
+    /// nothing is left to fail: what `adopt` adopts was seen to be fit
+    /// before the writer was held.
     ///
     /// `taking`, the memtable's rows the checkpoint takes out of memory, is
     /// timed as it is adopted: how long those rows waited once due, and
@@ -2033,7 +2078,7 @@ impl Writer {
                 self.publish(&turn, key, frame, position, None, None)
                     .await?;
                 let adopting = Instant::now();
-                let adopted = self.partition.changing(adopt);
+                let adopted = self.partition.adopting(adopt);
                 if let Some(taking) = taking {
                     let unflushed = self.partition.read(State::unflushed);
                     let (waited, capped) = taking.committed(unflushed);
@@ -2055,8 +2100,28 @@ impl Writer {
                 Ok(adopted)
             })
             .await?;
+        #[cfg(test)]
+        let mut discarded = discarded;
+        #[cfg(test)]
+        {
+            discarded.probe = self.discarded_probe.lock().expect("probe lock").take();
+            let gate = self.adopted_gate.lock().expect("gate lock").clone();
+            if let Some(gate) = gate {
+                gate.reached.notify_one();
+                gate.release.notified().await;
+            }
+        }
         drop(turn);
-        blocking(move || drop(discarded)).await
+        // The building lock is held here. All that a merge's commit took out
+        // goes off on its own, the flushed rows with the segments: it takes
+        // seconds to free, and whatever waits for that lock is not to wait
+        // for it (see `Discarded`'s `drop`). What a plain flush took out is
+        // gone by the time it ends, with no turn among the work to wait for.
+        match discarded.replaced() {
+            true => drop(discarded),
+            false => at_once(move || discarded.free()).await?,
+        }
+        Ok(())
     }
 
     /// What a checkpoint does before the writer is held: copy the rows of
@@ -2077,7 +2142,10 @@ impl Writer {
         }
         let named_at = snapshot.position;
         let segment = match self.uploaded(&mut snapshot, named_at, staged).await? {
-            Some(prepared) => Some(self.fit(prepared, &snapshot.catalog, None).await?),
+            Some(prepared) => {
+                let prepared = FreedOff::new(prepared);
+                Some(self.fit(prepared, &snapshot.catalog, None).await?)
+            }
             None => None,
         };
         Ok((snapshot, segment))
@@ -2163,7 +2231,7 @@ impl Writer {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
                 match self.uploaded(&mut snapshot, restored, &mut staged).await? {
                     Some(prepared) => {
-                        let (meta, loaded) = self.loaded(prepared, None).await?;
+                        let (meta, loaded) = self.loaded(FreedOff::new(prepared), None).await?;
                         held.insert(meta.key.clone(), loaded);
                         Some(meta)
                     }
@@ -2855,25 +2923,37 @@ impl Writer {
     /// from local disk where the store keeps a copy.
     async fn loaded(
         &self,
-        prepared: Prepared,
+        prepared: FreedOff<Prepared>,
         stopping: Option<&Stopping>,
     ) -> Result<(SegmentMeta, Loaded)> {
-        let Prepared { meta, built, .. } = prepared;
+        let build = prepared.build();
+        let Prepared { meta, built, index } = prepared.into_inner();
+        let Built {
+            file,
+            vectors,
+            indexes,
+            segment,
+            column,
+            parts,
+            _probe,
+        } = built;
+        // What is held across the wait, sent off the async threads should
+        // the wait be given up.
+        let held = FreedOff::new((file, indexes, parts, segment, column, index, _probe));
+        let held = held.of(build.clone());
+        let vectors = FreedOff::new(vectors).of(build);
         let vectors = match &meta.vectors {
-            Some(key) => {
-                self.partition
-                    .column_built(key, built.vectors, stopping)
-                    .await?
-            }
-            None => built.vectors,
+            Some(key) => self.partition.column_built(key, vectors, stopping).await?,
+            None => vectors.into_inner(),
         };
+        let (file, indexes, parts, _segment, _column, _index, _probe) = held.into_inner();
         let loaded = Loaded {
-            file: Arc::new(built.file),
+            file: Arc::new(file),
             vectors: Arc::new(vectors),
-            indexes: Some(Arc::new(built.indexes)),
+            indexes: Some(Arc::new(indexes)),
             stored: Stored::default(),
             tokenized_on: 0,
-            parts: Some(built.parts),
+            parts: Some(parts),
         };
         Ok((meta, loaded))
     }
@@ -2883,7 +2963,7 @@ impl Writer {
     /// a segment that is not fails with nothing committed or changed.
     async fn fit(
         &self,
-        prepared: Prepared,
+        prepared: FreedOff<Prepared>,
         catalog: &Catalog,
         stopping: Option<&Stopping>,
     ) -> Result<Fit> {
@@ -3191,6 +3271,15 @@ impl Writer {
         );
         self.phase_ended(MergePhase::Encode, merged.is_ok(), encoding);
         let merged = merged?;
+        #[cfg(test)]
+        let merged = {
+            let mut merged = merged;
+            merged.built.parts.probe = self.built_probe.lock().expect("probe lock").take();
+            merged
+        };
+        // From here to its commit all it built is as large a thing to free
+        // as what it would replace, and a stop lets it go on an async thread.
+        let merged = FreedOff::new(merged).of(Some(build.clone()));
         if stopping.stopped(MergeStage::Encoding) {
             return Ok(self.given_up(planned, false));
         }
@@ -3211,6 +3300,7 @@ impl Writer {
             self.phase_ended(MergePhase::Load, false, loading);
             return Ok(self.given_up(planned, false));
         };
+        let merged = merged.map(|fit| FreedOff::new(fit).of(Some(build.clone())));
         // From here the merge commits, or is dropped by what it finds under
         // the building lock: a stop no longer ends it. Marked so under the
         // lock a stop is asked under, so that every stop is either heeded
@@ -3257,6 +3347,7 @@ impl Writer {
         }
         let (snapshot, taking) = self.taken_noted();
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let segment = FreedOff::new(segment);
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
@@ -3276,8 +3367,10 @@ impl Writer {
         staged.keep();
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, Some(taking), |state| {
-            state.compacted(&merge, merged);
-            state.flushed(&key, position, snapshot, segment, Some(kept))
+            let replaced = state.compacted(&merge, merged.into_inner());
+            let segment = segment.into_inner();
+            let flushed = state.flushed(&key, position, snapshot, segment, Some(kept));
+            flushed.and(replaced)
         })
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -4325,7 +4418,7 @@ impl RestoreFrom<'_> {
                         let named = [meta.index.as_ref(), meta.vectors.as_ref()];
                         put.extend(named.into_iter().flatten().cloned());
                         put.insert(meta.key.clone());
-                        let (meta, loaded) = writer.loaded(prepared, None).await?;
+                        let (meta, loaded) = writer.loaded(FreedOff::new(prepared), None).await?;
                         held.insert(meta.key.clone(), loaded);
                         Some(meta)
                     }
@@ -5026,6 +5119,480 @@ mod tests {
                 waited.await.unwrap().unwrap();
             }
         });
+    }
+
+    /// The longest a probed free waits to be let go: a free that should be
+    /// waited on by nothing, and is, fails its rule rather than hangs it.
+    const FREE_HELD: Duration = Duration::from_secs(30);
+
+    /// How long what goes on beside a held free has to be answered.
+    const ANSWERED: Duration = Duration::from_secs(10);
+
+    /// How a probed segment stood as it came to `stage`.
+    #[derive(Debug)]
+    struct Seen {
+        stage: state::Probed,
+        thread: std::thread::ThreadId,
+        /// Whether the state's write lock was held.
+        locked: bool,
+    }
+
+    /// A writer of two flushed segments, which a merge replaces.
+    async fn two_segments() -> Arc<Writer> {
+        let writer = Arc::new(writer().await);
+        writer.commit(vec![create()]).await.unwrap();
+        for n in 0..2 {
+            writer.commit(vec![upsert(n)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        writer
+    }
+
+    /// Have `writer`'s segments say how they stand at each stage, then do
+    /// `then` there.
+    fn seeing(
+        writer: &Writer,
+        then: impl Fn(state::Probed) + Send + Sync + 'static,
+    ) -> std::sync::mpsc::Receiver<Seen> {
+        seeing_partition(&writer.partition, then)
+    }
+
+    /// As [`seeing`], of `partition`'s segments.
+    fn seeing_partition(
+        partition: &Arc<Partition>,
+        then: impl Fn(state::Probed) + Send + Sync + 'static,
+    ) -> std::sync::mpsc::Receiver<Seen> {
+        let (telling, seen) = telling(partition, then);
+        partition
+            .state
+            .unpublished(|state| state.probe_segments(telling));
+        seen
+    }
+
+    /// What tells of how `partition` stands at each stage, then does `then`
+    /// there, and where it is told.
+    #[allow(clippy::type_complexity)]
+    fn telling(
+        partition: &Arc<Partition>,
+        then: impl Fn(state::Probed) + Send + Sync + 'static,
+    ) -> (
+        Arc<dyn Fn(state::Probed) + Send + Sync>,
+        std::sync::mpsc::Receiver<Seen>,
+    ) {
+        let (tell, seen) = std::sync::mpsc::channel();
+        let partition = partition.clone();
+        let told = Arc::new(move |stage| {
+            let thread = std::thread::current().id();
+            let locked = partition.state.being_changed();
+            let _ = tell.send(Seen {
+                stage,
+                thread,
+                locked,
+            });
+            then(stage);
+        });
+        (told, seen)
+    }
+
+    /// Have a free of `writer`'s segments held where it begins: till the
+    /// sender given back goes, as it does however a rule ends, and at most
+    /// [`FREE_HELD`]. The receiver is told it has begun.
+    fn holding_frees(
+        writer: &Writer,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<Seen>,
+    ) {
+        let (let_go, held) = std::sync::mpsc::channel::<()>();
+        let (reached, at_free) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let seen = seeing(writer, move |stage| {
+            if stage == state::Probed::Freed {
+                let _ = reached.send(());
+                let _ = held.lock().unwrap().recv_timeout(FREE_HELD);
+            }
+        });
+        (let_go, at_free, seen)
+    }
+
+    /// All that the two segments were seen as, through both being freed.
+    fn both_freed(seen: &std::sync::mpsc::Receiver<Seen>) -> Vec<Seen> {
+        freed(seen, 2)
+    }
+
+    /// All that was seen of `count` segments, through each being freed.
+    fn freed(seen: &std::sync::mpsc::Receiver<Seen>, count: usize) -> Vec<Seen> {
+        let mut all = Vec::new();
+        while all
+            .iter()
+            .filter(|seen: &&Seen| seen.stage == state::Probed::Freed)
+            .count()
+            < count
+        {
+            let what = format!("{count} freed within {ANSWERED:?}, having seen {all:?}");
+            all.push(seen.recv_timeout(ANSWERED).expect(&what));
+        }
+        all
+    }
+
+    /// Every turn among the work off the async threads, however long what
+    /// else runs holds on to them, within a limit.
+    async fn every_turn() -> tokio::sync::OwnedSemaphorePermit {
+        let turns = working().acquire_many_owned(WORKING_AT_ONCE as u32);
+        let turns = tokio::time::timeout(FREE_HELD, turns).await;
+        turns.expect("every turn taken").unwrap()
+    }
+
+    /// A flush ends with what it took out of memory freed, however few
+    /// rows that is: what comes after it, a test's measure of a merge's
+    /// peak among them, finds them gone. Only a merge's free, of whole
+    /// segments, is left to run on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flush_ends_with_what_it_took_out_freed() {
+        let writer = Arc::new(writer().await);
+        writer.commit(vec![create(), upsert(0)]).await.unwrap();
+        let (let_go, held) = std::sync::mpsc::channel::<()>();
+        let (reached, at_free) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let probe = state::Probe::new(Arc::new(move |_| {
+            let _ = reached.send(());
+            let _ = held.lock().unwrap().recv_timeout(FREE_HELD);
+        }));
+        *writer.discarded_probe.lock().unwrap() = Some(Arc::new(probe));
+        let mut flush = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.flush().await.map(|_| ()) }
+        });
+        at_free.recv_timeout(FREE_HELD).expect("the free began");
+        let ended = tokio::time::timeout(Duration::from_secs(1), &mut flush).await;
+        assert!(ended.is_err(), "the flush ended before its free");
+        drop(let_go);
+        let flushed = tokio::time::timeout(ANSWERED, flush).await;
+        flushed
+            .expect("the flush ended once freed")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Nor does a flush wait for a turn among the work to free what it took
+    /// out: only for the free, with the building lock held.
+    #[tokio::test]
+    async fn a_flush_frees_without_a_turn_among_the_work() {
+        let writer = Arc::new(writer().await);
+        writer.commit(vec![create(), upsert(0)]).await.unwrap();
+        let gate = Arc::new(MergeGate::default());
+        *writer.adopted_gate.lock().unwrap() = Some(gate.clone());
+        let flush = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.flush().await.map(|_| ()) }
+        });
+        gate.reached.notified().await;
+        let turns = every_turn().await;
+        gate.release.notify_one();
+        let flushed = tokio::time::timeout(ANSWERED, flush).await;
+        flushed
+            .expect("the flush ended with no turn free")
+            .unwrap()
+            .unwrap();
+        drop(turns);
+    }
+
+    /// The state's write lock is free when a replaced segment is let go,
+    /// and when it is freed: the free takes seconds, and every read and
+    /// write of the tenant would wait them out (node memory note, §2.9).
+    #[tokio::test]
+    async fn a_replaced_segment_is_freed_with_the_write_lock_free() {
+        let writer = two_segments().await;
+        let seen = seeing(&writer, |_| ());
+        writer.merge().await.unwrap().expect("a merge");
+        let seen = both_freed(&seen);
+        assert!(seen.iter().all(|seen| !seen.locked), "{seen:?}");
+    }
+
+    /// A read and a write beside a commit are answered while what it
+    /// replaced is being freed, however long that takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_segment_is_freed_while_a_read_beside_the_commit_is_answered() {
+        let writer = two_segments().await;
+        let (_let_go, at_free, _seen) = holding_frees(&writer);
+        let merge = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        at_free.recv_timeout(FREE_HELD).expect("the free began");
+        let partition = writer.partition.clone();
+        let read = tokio::task::spawn_blocking(move || partition.read(State::rows));
+        let rows = tokio::time::timeout(ANSWERED, read).await;
+        let rows = rows.expect("a read beside the free answered").unwrap();
+        assert_eq!(rows, 2);
+        let write = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.commit(vec![upsert(2)]).await.map(|_| ()) }
+        });
+        let written = tokio::time::timeout(ANSWERED, write).await;
+        written
+            .expect("a write beside the free answered")
+            .unwrap()
+            .unwrap();
+        drop(merge);
+    }
+
+    /// A merge ends with what it replaced still being freed, so nothing
+    /// that waits for the building lock it holds waits for that free, nor
+    /// for a turn among the work off the async threads to run it in: not a
+    /// flush, which would keep the writes refused for its backlog waiting
+    /// too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_segment_is_freed_with_the_building_lock_free() {
+        let writer = two_segments().await;
+        let (_let_go, at_free, _seen) = holding_frees(&writer);
+        let merge = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        at_free.recv_timeout(FREE_HELD).expect("the free began");
+        let merged = tokio::time::timeout(ANSWERED, merge).await;
+        let merged = merged.expect("the merge ended with its free held");
+        merged.unwrap().unwrap().expect("a merge");
+        let write = writer.commit(vec![upsert(2)]);
+        tokio::time::timeout(ANSWERED, write)
+            .await
+            .expect("a write beside the free answered")
+            .unwrap();
+        let flushed = tokio::time::timeout(ANSWERED, writer.flush()).await;
+        flushed.expect("a flush beside the free answered").unwrap();
+    }
+
+    /// Nor does a merge's commit wait for a turn among the work off the
+    /// async threads, with the building lock held, for what it frees: every
+    /// turn may be kept by what is being loaded and built on the node.
+    #[tokio::test]
+    async fn a_replaced_segment_is_freed_without_a_turn_among_the_work() {
+        let writer = two_segments().await;
+        let seen = seeing(&writer, |_| ());
+        let gate = writer.hold_merges_before_commit();
+        let merge = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        gate.reached.notified().await;
+        // Only from here: the merge's own build took one of its own.
+        let turns = every_turn().await;
+        gate.release.notify_one();
+        let merged = tokio::time::timeout(ANSWERED, merge).await;
+        let merged = merged.expect("the merge ended with no turn free");
+        merged.unwrap().unwrap().expect("a merge");
+        both_freed(&seen);
+        drop(turns);
+    }
+
+    /// A replaced segment is freed off the async threads: on one, a read
+    /// beside it there would wait for the free, as would all else it runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replaced_segment_is_freed_off_the_async_threads() {
+        let writer = two_segments().await;
+        let seen = seeing(&writer, |_| ());
+        writer.merge().await.unwrap().expect("a merge");
+        let frees = both_freed(&seen);
+        let frees = frees
+            .iter()
+            .filter(|seen| seen.stage == state::Probed::Freed);
+        for free in frees {
+            assert_ne!(free.thread, std::thread::current().id(), "{free:?}");
+        }
+    }
+
+    /// As [`a_replaced_segment_is_freed_off_the_async_threads`], of a merge
+    /// dropped once its commit is adopted, as a task aborted is: what it
+    /// took out of memory is dropped where it stood, on an async thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replaced_segment_is_freed_off_the_async_threads_by_a_merge_dropped() {
+        let writer = two_segments().await;
+        let seen = seeing(&writer, |_| ());
+        let gate = Arc::new(MergeGate::default());
+        *writer.adopted_gate.lock().unwrap() = Some(gate.clone());
+        let merge = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        gate.reached.notified().await;
+        merge.abort();
+        assert!(merge.await.unwrap_err().is_cancelled());
+        let frees = both_freed(&seen);
+        let frees = frees
+            .iter()
+            .filter(|seen| seen.stage == state::Probed::Freed);
+        for free in frees {
+            assert_ne!(free.thread, std::thread::current().id(), "{free:?}");
+        }
+    }
+
+    /// What a merge replaced is counted until it is freed: the memory it
+    /// holds is the node's until then, and only what the segments are
+    /// counted to take leaves the state's figures at the commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_segment_is_counted_until_it_is_freed() {
+        let writer = two_segments().await;
+        let replaced = writer.partition.read(State::segments_held);
+        assert!(replaced > 0);
+        let (let_go, at_free, _seen) = holding_frees(&writer);
+        let merge = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        at_free.recv_timeout(FREE_HELD).expect("the free began");
+        assert_eq!(writer.partition.freeing(), replaced);
+        let figures = writer.partition.figures();
+        assert_eq!(figures, writer.partition.read(State::figures));
+        drop(let_go);
+        tokio::time::timeout(ANSWERED, async {
+            while writer.partition.freeing() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("nothing counted once freed");
+        drop(merge);
+    }
+
+    /// What the flush committed with a merge takes out of the memtable is
+    /// counted with what the merge replaced, and goes on with it: nothing
+    /// waits for its free, as nothing waits for theirs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_merge_s_flushed_rows_are_counted_and_freed_with_what_it_replaced() {
+        let writer = two_segments().await;
+        writer.commit(vec![upsert(2)]).await.unwrap();
+        let replaced = writer.partition.read(State::segments_held);
+        let rows = writer.partition.read(State::unflushed_bytes);
+        assert!(rows > 0);
+        let (let_go, at_free, _seen) = holding_frees(&writer);
+        let merge = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        at_free.recv_timeout(FREE_HELD).expect("the free began");
+        assert_eq!(writer.partition.freeing(), replaced + rows);
+        let merged = tokio::time::timeout(ANSWERED, merge).await;
+        let merged = merged.expect("the merge ended with its free held");
+        merged.unwrap().unwrap().expect("a merge");
+        assert_eq!(writer.partition.read(State::unflushed), 0);
+        drop(let_go);
+        tokio::time::timeout(ANSWERED, async {
+            while writer.partition.freeing() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("nothing counted once freed");
+    }
+
+    /// Have the segment `writer`'s next merge builds say how it stands.
+    fn seeing_built(writer: &Writer) -> std::sync::mpsc::Receiver<Seen> {
+        let (telling, seen) = telling(&writer.partition, |_| ());
+        let probe = Arc::new(state::Probe::new(telling));
+        *writer.built_probe.lock().unwrap() = Some(probe);
+        seen
+    }
+
+    /// A merge stopped once it has built frees all it built off the async
+    /// threads, whichever stage stops it: as large a thing to free as what
+    /// it would have replaced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_merge_stopped_uploading_frees_what_it_built_off_the_async_threads() {
+        let writer = two_segments().await;
+        let seen = seeing_built(&writer);
+        writer.stop_merges_at(Some(MergeStage::Uploading));
+        assert_eq!(writer.merge().await.unwrap(), None);
+        for free in freed(&seen, 1) {
+            assert_ne!(free.thread, std::thread::current().id(), "{free:?}");
+        }
+    }
+
+    /// A stopped merge's turn is held until what it built is freed: sent off
+    /// the async threads, it has outlived the merge, and no further merge
+    /// is to gather beside it (merge note, §7.7).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_merge_stopped_uploading_holds_its_turn_until_what_it_built_is_freed() {
+        let builds = MergeBuilds::new(1);
+        builds.probe(true);
+        let writer = writer().await.merging_among(builds.clone());
+        writer.commit(vec![create()]).await.unwrap();
+        for n in 0..2 {
+            writer.commit(vec![upsert(n)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        writer.stop_merges_at(Some(MergeStage::Uploading));
+        assert_eq!(writer.merge().await.unwrap(), None);
+        tokio::time::timeout(ANSWERED, async {
+            while builds.under_way() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the build ended");
+        let probed = builds.probed().expect("what it built was dropped");
+        assert_eq!((probed.under_way, probed.turns_free), (1, 0), "{probed:?}");
+    }
+
+    /// As [`a_merge_stopped_uploading_frees_what_it_built_off_the_async_threads`],
+    /// stopped before its load back has begun, or as it goes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_merge_stopped_loading_frees_what_it_built_off_the_async_threads() {
+        let writer = two_segments().await;
+        let seen = seeing_built(&writer);
+        writer.stop_merges_at(Some(MergeStage::Loading));
+        assert_eq!(writer.merge().await.unwrap(), None);
+        for free in freed(&seen, 1) {
+            assert_ne!(free.thread, std::thread::current().id(), "{free:?}");
+        }
+    }
+
+    /// As [`a_merge_stopped_uploading_frees_what_it_built_off_the_async_threads`],
+    /// of a merge dropped at its commit, all it built loaded back, as one
+    /// planned before a restore is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_merge_dropped_at_its_commit_frees_what_it_built_off_the_async_threads() {
+        let writer = two_segments().await;
+        let seen = seeing_built(&writer);
+        let gate = writer.hold_merges_before_commit();
+        let merge = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        gate.reached.notified().await;
+        writer.epoch.fetch_add(1, Ordering::SeqCst);
+        gate.release.notify_one();
+        assert_eq!(merge.await.unwrap().unwrap(), None);
+        for free in freed(&seen, 1) {
+            assert_ne!(free.thread, std::thread::current().id(), "{free:?}");
+        }
+    }
+
+    /// A copy that catches up past a checkpoint, a merge's or a flush's,
+    /// frees the state it held off its write lock and off the async
+    /// threads: every read of it would wait, and a large one takes seconds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_copy_caught_up_past_a_checkpoint_frees_what_it_held_off_the_lock() {
+        let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
+        let (writer, coordinator) = writer_on(blobs.clone()).await;
+        writer.commit(vec![create(), upsert(0)]).await.unwrap();
+        writer.flush().await.unwrap();
+        let key = writer.lease.key.clone();
+        let committed = coordinator.committed(&key).await.unwrap().unwrap();
+        let copy = Follower::open(key.clone(), blobs, &committed)
+            .await
+            .unwrap();
+        let seen = seeing_partition(copy.partition(), |_| ());
+        writer.commit(vec![upsert(1)]).await.unwrap();
+        writer.flush().await.unwrap();
+        let committed = coordinator.committed(&key).await.unwrap().unwrap();
+        copy.catch_up(&committed).await.unwrap();
+        let frees = freed(&seen, 1);
+        for free in &frees {
+            assert!(!free.locked, "{frees:?}");
+            assert_ne!(free.thread, std::thread::current().id(), "{frees:?}");
+        }
     }
 
     #[tokio::test]

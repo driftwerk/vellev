@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use vellev_index::curve::{Curve, Source};
 
@@ -20,7 +21,9 @@ use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
     SegmentMeta,
 };
+use crate::freed::off_the_async_threads;
 use crate::merge_builds::OnPool;
+use crate::published::FreesHeld;
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
 
@@ -500,6 +503,10 @@ enum Location {
 
 #[derive(Debug, Clone)]
 struct Segment {
+    /// Told as the segment is let go and freed, as a test asks. First of
+    /// its fields, so that a test that holds it here holds the free.
+    #[cfg(test)]
+    probe: Option<Arc<Probe>>,
     meta: SegmentMeta,
     file: Arc<SegmentFile>,
     vectors: Arc<Column>,
@@ -509,6 +516,41 @@ struct Segment {
     resident: usize,
     /// What its rows and indexes come to, for a merge's reckoning.
     parts: Parts,
+}
+
+/// Where a segment a test probes has come to.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Probed {
+    /// Let go by what held it, on that thread: it may be freed elsewhere.
+    LetGo,
+    /// Being freed, its last holder gone.
+    Freed,
+}
+
+/// Tells a test where a segment has come to, on the thread that does it.
+#[cfg(test)]
+pub(crate) struct Probe(Arc<dyn Fn(Probed) + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for Probe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Probe")
+    }
+}
+
+#[cfg(test)]
+impl Probe {
+    pub(crate) fn new(told: Arc<dyn Fn(Probed) + Send + Sync>) -> Self {
+        Self(told)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Probe {
+    fn drop(&mut self) {
+        (self.0)(Probed::Freed);
+    }
 }
 
 /// Which of a segment's rows are dead, a bit a row (row `n` bit `n % 64`
@@ -544,9 +586,7 @@ pub(crate) struct Run {
 impl Drop for Run {
     /// Let go ungathered, as by a merge stopped before its gather begins,
     /// or one dropped: on an async thread, it may be the last to hold a
-    /// replaced segment of a million rows. Sent off without a turn among
-    /// the work there, and not waited for: what lets it go may have given
-    /// up waiting for that very turn, or be past waiting for anything.
+    /// replaced segment of a million rows.
     fn drop(&mut self) {
         let segments = std::mem::take(&mut self.segments);
         if segments.is_empty() {
@@ -561,10 +601,7 @@ impl Drop for Run {
                 let _ = freed_on.send(std::thread::current().id());
             }
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(free)),
-            Err(_) => free(),
-        }
+        off_the_async_threads(free);
     }
 }
 
@@ -824,6 +861,10 @@ impl Reckoning {
 /// over their rows.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Parts {
+    /// Told as the last of the segment goes, however far it got, as a test
+    /// asks: these go with it from its build on.
+    #[cfg(test)]
+    pub(crate) probe: Option<Arc<Probe>>,
     count: usize,
     /// Its rows, as [`copied_bytes`] counts them.
     copied: usize,
@@ -846,6 +887,8 @@ impl Parts {
             collections.push((*collection, index.rows.rows().len() as usize));
         }
         Self {
+            #[cfg(test)]
+            probe: None,
             count: file.rows.len(),
             copied: file.rows.iter().map(copied_bytes).sum(),
             text,
@@ -1074,11 +1117,106 @@ pub struct TextsApplied {
     pub under_lock: usize,
 }
 
-/// What a flush takes out of the memtable: freeing it takes long enough
-/// that it is better done without holding the state.
+/// What a checkpoint takes out of the state: the rows and indexes a flush
+/// takes out of the memtable, and the segments a merge replaces. Freeing it
+/// takes long enough that it is better done without holding the state: of
+/// replaced segments, most of what a merge's commit would hold the state's
+/// write lock for (node memory note, §2.9).
 pub(crate) struct Discarded {
-    _rows: Vec<Row>,
-    _indexes: Indexes,
+    /// Told as it is freed, as a test asks.
+    #[cfg(test)]
+    pub(crate) probe: Option<Arc<Probe>>,
+    /// Where a test holds its free, if it does.
+    pub(crate) held: Option<Arc<FreesHeld>>,
+    rows: Vec<Row>,
+    indexes: Indexes,
+    segments: Vec<Segment>,
+    /// About how many bytes the state's figures counted it at.
+    bytes: usize,
+    /// Those bytes as counted until they are freed, if they are.
+    counted: Option<Counted>,
+}
+
+/// `bytes` counted in `freeing` until this goes.
+struct Counted {
+    freeing: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.freeing.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+impl Discarded {
+    /// This, and the segments `replaced` holds: what a merge's commit takes
+    /// out of the state, along with what the flush committed with it does.
+    pub(crate) fn and(mut self, mut replaced: Discarded) -> Discarded {
+        self.segments.append(&mut replaced.segments);
+        self.bytes += replaced.bytes;
+        self
+    }
+
+    /// Count it in `freeing`, as it leaves what the state comes to, until
+    /// it is freed.
+    pub(crate) fn count_in(&mut self, freeing: &Arc<AtomicUsize>) {
+        let bytes = self.bytes;
+        freeing.fetch_add(bytes, Ordering::SeqCst);
+        let freeing = freeing.clone();
+        self.counted = Some(Counted { freeing, bytes });
+    }
+
+    /// Whether it holds segments a merge replaced: all of it then goes on
+    /// alone, the rows of the flush committed with them too.
+    pub(crate) fn replaced(&self) -> bool {
+        !self.segments.is_empty()
+    }
+
+    /// Free it here: for a thread off the async ones.
+    pub(crate) fn free(mut self) {
+        self.taken()();
+    }
+
+    /// What frees all it holds, which leaves it nothing to free.
+    fn taken(&mut self) -> impl FnOnce() + Send + 'static {
+        let rows = std::mem::take(&mut self.rows);
+        let indexes = std::mem::take(&mut self.indexes);
+        let segments = std::mem::take(&mut self.segments);
+        let counted = self.counted.take();
+        let held = self.held.take();
+        #[cfg(test)]
+        let probe = self.probe.take();
+        move || {
+            if let Some(held) = held {
+                held.wait();
+            }
+            #[cfg(test)]
+            drop(probe);
+            drop((segments, rows, indexes));
+            drop(counted);
+        }
+    }
+}
+
+impl Drop for Discarded {
+    /// Let go on an async thread, as a merge's commit lets it go, and as a
+    /// checkpoint dropped once adopted does where it stood: it may be the
+    /// last to hold a replaced segment of a million rows. What lets it go
+    /// holds the building lock, and whatever waits for that, as a flush
+    /// does, would wait for a turn and the free too.
+    fn drop(&mut self) {
+        #[cfg(test)]
+        for segment in &self.segments {
+            if let Some(probe) = &segment.probe {
+                (probe.0)(Probed::LetGo);
+            }
+        }
+        if self.rows.is_empty() && self.indexes.is_empty() && self.segments.is_empty() {
+            return;
+        }
+        off_the_async_threads(self.taken());
+    }
 }
 
 /// What a flush takes from the state to build its segment while commits go
@@ -1107,6 +1245,18 @@ pub(crate) struct Snapshot {
 
 #[cfg(test)]
 impl State {
+    /// Have each segment held now tell `told` where it comes to.
+    pub(crate) fn probe_segments(&mut self, told: Arc<dyn Fn(Probed) + Send + Sync>) {
+        for segment in &mut self.segments {
+            segment.probe = Some(Arc::new(Probe(told.clone())));
+        }
+    }
+
+    /// What the segments held now are counted to take.
+    pub(crate) fn segments_held(&self) -> usize {
+        self.segments.iter().map(|segment| segment.resident).sum()
+    }
+
     /// Move the state on to `position` with nothing committed there, as
     /// nothing a writer lets happen does.
     pub(crate) fn moved_to(&mut self, position: LogPosition) {
@@ -2051,6 +2201,8 @@ impl State {
             })
             .collect();
         self.segments.push(Segment {
+            #[cfg(test)]
+            probe: None,
             resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
             meta,
             file,
@@ -2582,8 +2734,9 @@ impl State {
     /// Carry out a committed merge: the run's segments go, and the merged
     /// one takes their place. A row of the run that died since the merged
     /// file was made is dead in it too. The flush committed with it is
-    /// adopted after, by [`Self::flushed`].
-    pub(crate) fn compacted(&mut self, merge: &Merge, merged: Fit) {
+    /// adopted after, by [`Self::flushed`]. Returns the run's segments, to
+    /// be freed without holding the state.
+    pub(crate) fn compacted(&mut self, merge: &Merge, merged: Fit) -> Discarded {
         let Fit {
             meta,
             file,
@@ -2620,18 +2773,28 @@ impl State {
                 }
             }
         }
-        self.segments.splice(
-            run.clone(),
-            [Segment {
-                resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
-                meta,
-                file,
-                vectors,
-                indexes,
-                dead: DeadRows::of(dead.into_iter()),
-                parts,
-            }],
-        );
+        let merged = Segment {
+            #[cfg(test)]
+            probe: None,
+            resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
+            meta,
+            file,
+            vectors,
+            indexes,
+            dead: DeadRows::of(dead.into_iter()),
+            parts,
+        };
+        let segments: Vec<Segment> = self.segments.splice(run, [merged]).collect();
+        Discarded {
+            #[cfg(test)]
+            probe: None,
+            held: None,
+            rows: Vec::new(),
+            indexes: Indexes::new(),
+            bytes: segments.iter().map(|segment| segment.resident).sum(),
+            segments,
+            counted: None,
+        }
     }
 
     /// What a flush needs to build its segment without the writer, or
@@ -2833,6 +2996,8 @@ impl State {
                 })
                 .collect();
             self.segments.push(Segment {
+                #[cfg(test)]
+                probe: None,
                 resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
                 meta,
                 file,
@@ -2914,11 +3079,18 @@ impl State {
             applied,
             ..
         } = &mut self.memtable;
-        let discarded = Discarded {
-            _rows: rows.drain(..held).collect(),
-            _indexes: std::mem::take(indexes),
+        let mut discarded = Discarded {
+            #[cfg(test)]
+            probe: None,
+            held: None,
+            rows: rows.drain(..held).collect(),
+            indexes: std::mem::take(indexes),
+            segments: Vec::new(),
+            bytes: *bytes,
+            counted: None,
         };
         *bytes = rows.iter().map(row_bytes).sum();
+        discarded.bytes -= *bytes;
         dead.drain(..held);
         *deaths -= held;
         if let Some(Kept {
