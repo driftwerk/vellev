@@ -476,9 +476,9 @@ async fn a_tenant_a_restore_holds_is_not_let_go_until_the_restore_ends() {
 
 /// Merge note, §9.7 rule 8: the flush a sweep makes before it lets a
 /// tenant go over the memory budget is timed under its own name, its wait
-/// for the building lock apart from its hold, as the bench holds that wait
-/// to a mark of its own; and the tenant is counted as let go for the
-/// budget.
+/// for one of the sweep's flushes apart from its hold, as the bench holds
+/// that wait to a mark of its own; and the tenant is counted as let go for
+/// the budget.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_flush_before_letting_a_tenant_go_is_timed_under_its_own_name() {
     let node = node_on(memory(), |settings| settings.memory = Some(1));
