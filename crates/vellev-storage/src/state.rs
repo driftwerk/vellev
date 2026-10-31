@@ -1134,7 +1134,7 @@ pub(crate) struct Discarded {
     /// About how many bytes the state's figures counted it at.
     bytes: usize,
     /// Those bytes as counted until they are freed, if they are.
-    counted: Option<Counted>,
+    counted: Vec<Counted>,
 }
 
 /// `bytes` counted in `freeing` until this goes.
@@ -1164,7 +1164,7 @@ impl Discarded {
         let bytes = self.bytes;
         freeing.fetch_add(bytes, Ordering::SeqCst);
         let freeing = freeing.clone();
-        self.counted = Some(Counted { freeing, bytes });
+        self.counted.push(Counted { freeing, bytes });
     }
 
     /// Whether it holds segments a merge replaced: all of it then goes on
@@ -1183,7 +1183,7 @@ impl Discarded {
         let rows = std::mem::take(&mut self.rows);
         let indexes = std::mem::take(&mut self.indexes);
         let segments = std::mem::take(&mut self.segments);
-        let counted = self.counted.take();
+        let counted = std::mem::take(&mut self.counted);
         let held = self.held.take();
         #[cfg(test)]
         let probe = self.probe.take();
@@ -2793,7 +2793,7 @@ impl State {
             indexes: Indexes::new(),
             bytes: segments.iter().map(|segment| segment.resident).sum(),
             segments,
-            counted: None,
+            counted: Vec::new(),
         }
     }
 
@@ -3087,7 +3087,7 @@ impl State {
             indexes: std::mem::take(indexes),
             segments: Vec::new(),
             bytes: *bytes,
-            counted: None,
+            counted: Vec::new(),
         };
         *bytes = rows.iter().map(row_bytes).sum();
         discarded.bytes -= *bytes;

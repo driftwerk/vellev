@@ -2039,16 +2039,23 @@ impl Node {
         unsettled
     }
 
-    /// About how many bytes the tenants this node writes have taken out of
-    /// their state and yet to free, as a merge's commit does what it
-    /// replaced. A figure of its own, for the eye: it goes by itself, so
+    /// About how many bytes the tenants this node writes, and any it has
+    /// let go since, have taken out of their state and yet to free, as a
+    /// merge's commit does what it replaced. A figure of its own, for the eye: it goes by itself, so
     /// neither a sweep nor warming acts on it, and [`Self::resident`] leaves
     /// it out.
     pub fn freeing(&self) -> usize {
-        let mut freeing = 0;
+        self.0.timings.freeing()
+    }
+
+    /// The waits of the tenants this node writes for that no checkpoint
+    /// has ended. For a bench, as no event times them.
+    #[doc(hidden)]
+    pub fn waits_open(&self) -> Vec<vellev_storage::timings::OpenWaits> {
+        let mut open = Vec::new();
         self.0
-            .each_writer(|tenant| freeing += tenant.partition().freeing());
-        freeing
+            .each_writer(|tenant| open.push(tenant.writer.waits_open()));
+        open
     }
 
     /// The segments the tenants this node writes hold, by whether they

@@ -41,7 +41,7 @@ use vellev_embed::Embedders;
 use vellev_node::{MergePool, Node, Settings};
 use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
-use vellev_storage::timings::{Event, Holder, MergePhase, Timed};
+use vellev_storage::timings::{Event, Holder, MergePhase, OpenWaits, Timed};
 use vellev_storage::{Disk, Mutation, Transfers, MERGE_BUILDS};
 
 /// The node's allocator, as the binary runs on it.
@@ -848,6 +848,63 @@ fn stolen_for(samples: &[(f64, u64, u64)]) -> Option<f64> {
     (all > 0.0).then(|| over / all)
 }
 
+/// `samples` with the soak's two ends, as the sampler reads every 10 s and
+/// would leave out the time before its first and after its last.
+fn with_ends(
+    samples: &[(f64, u64, u64)],
+    first: Option<(u64, u64)>,
+    last: Option<(u64, u64)>,
+    soak_s: f64,
+) -> Vec<(f64, u64, u64)> {
+    let first = first.map(|(stolen, all)| (0.0, stolen, all));
+    let last = last.map(|(stolen, all)| (soak_s, stolen, all));
+    first
+        .into_iter()
+        .chain(samples.iter().copied())
+        .chain(last)
+        .collect()
+}
+
+/// What `samples`, ends and all, say of steal: its share of the CPU over
+/// all they cover, and the share of the time over the mark.
+fn steal_read(samples: &[(f64, u64, u64)]) -> (Option<f64>, Option<f64>) {
+    let share = samples
+        .first()
+        .zip(samples.last())
+        .and_then(|(first, last)| {
+            let all = last.2.checked_sub(first.2).filter(|all| *all > 0)?;
+            Some(last.1.saturating_sub(first.1) as f64 / all as f64)
+        });
+    (share, stolen_for(samples))
+}
+
+/// Whether the kernel accounts steal here at all, from `/proc/stat`: a
+/// machine that shows none on any CPU since boot cannot be told from one
+/// that does not count it, so that a run on it has steal unmeasured.
+fn steal_accounted(stat: &str) -> Option<bool> {
+    let cpus = stat.lines().filter(|line| {
+        line.strip_prefix("cpu")
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    });
+    let stolen: Vec<u64> = cpus
+        .map(|line| line.split_whitespace().nth(8)?.parse().ok())
+        .collect::<Option<_>>()?;
+    (!stolen.is_empty()).then(|| stolen.iter().any(|ticks| *ticks > 0))
+}
+
+#[test]
+fn a_kernel_that_shows_no_steal_on_any_cpu_has_it_unmeasured() {
+    let stat = |one: u64, two: u64| {
+        format!(
+            "cpu  9 0 9 9 0 0 0 {}\ncpu0 4 0 4 4 0 0 0 {one}\ncpu1 5 0 5 5 0 0 0 {two}\n",
+            one + two
+        )
+    };
+    assert_eq!(steal_accounted(&stat(0, 0)), Some(false));
+    assert_eq!(steal_accounted(&stat(0, 3)), Some(true));
+    assert_eq!(steal_accounted("intr 1\n"), None);
+}
+
 /// A spell over the mark counts for the time it took, however small a
 /// share of the soak's CPU it comes to (review of #169).
 #[test]
@@ -1084,6 +1141,7 @@ struct Sampled {
     unflushed_bytes_peak: usize,
     tenant_unflushed_peak: usize,
     draining_peak: usize,
+    freeing_peak: usize,
     nice_checks: u64,
     nice_wrong: Vec<String>,
     /// The machine's CPU ticks every 10 s: (seconds in, stolen, all).
@@ -1280,24 +1338,34 @@ struct NodeValidity {
     nice_wrong: usize,
     as_the_image: bool,
     measurement: bool,
-    /// The share of the soak's sampled time over the mark for steal, if
-    /// read.
+    /// The share of the machine's CPU stolen through the soak, if read.
+    steal: Option<f64>,
+    /// The share of the soak's time over the mark for steal, if read.
     stolen_for: Option<f64>,
     load_reported: bool,
+    /// Whether what the marks rest on was read as the soak ended.
+    read_as_it_ended: bool,
 }
 
 impl NodeValidity {
     /// Why the run's marks don't count, if they don't.
     fn invalid(&self) -> Vec<String> {
-        let steal = match self.stolen_for {
-            None => Some("steal not read".to_string()),
-            Some(stolen_for) if stolen_for > STOLEN_FOR_AT_MOST => Some(format!(
+        // Over the soak, and for how long: a spell the first would hide, a
+        // steady theft spread under the second's mark.
+        let steal = match (self.steal, self.stolen_for) {
+            (Some(steal), Some(_)) if steal > STEAL_AT_MOST => Some(format!(
+                "steal took {:.1}% of the CPU, over {:.0}%",
+                steal * 100.0,
+                STEAL_AT_MOST * 100.0
+            )),
+            (Some(_), Some(stolen_for)) if stolen_for > STOLEN_FOR_AT_MOST => Some(format!(
                 "steal over {:.0}% for {:.1}% of the soak, over {:.0}%",
                 STEAL_AT_MOST * 100.0,
                 stolen_for * 100.0,
                 STOLEN_FOR_AT_MOST * 100.0
             )),
-            Some(_) => None,
+            (Some(_), Some(_)) => None,
+            _ => Some("steal not read".to_string()),
         };
         [
             (self.let_go_flushes == 0).then(|| "no flush before letting a tenant go".to_string()),
@@ -1310,6 +1378,7 @@ impl NodeValidity {
             (!self.measurement).then(|| "a smoke, not the measurement".to_string()),
             steal,
             (!self.load_reported).then(|| "the load generator never reported".to_string()),
+            (!self.read_as_it_ended).then(|| "the soak's end not read as it ended".to_string()),
         ]
         .into_iter()
         .flatten()
@@ -1318,25 +1387,66 @@ impl NodeValidity {
 }
 
 /// An arm is void if its host stole over the mark for more of the soak
-/// than a p99 leaves out, however low the soak's average; a spell within
-/// that is not. Steal not read at all voids it too (review of #169).
+/// than a p99 leaves out, however low the soak's average, or over it on
+/// average, however brief each spell; within both, it is not. Steal not
+/// read at all voids it too (review of #169).
 #[test]
 fn an_arm_its_host_stole_from_for_too_long_is_invalid() {
-    let run = |stolen_for: Option<f64>| NodeValidity {
+    let run = |steal: Option<f64>, stolen_for: Option<f64>| NodeValidity {
         let_go_flushes: 7,
         clustered_merges: 2,
         nice_checks: 4,
         nice_wrong: 0,
         as_the_image: true,
         measurement: true,
+        steal,
         stolen_for,
         load_reported: true,
+        read_as_it_ended: true,
     };
-    assert_eq!(run(Some(0.0)).invalid(), Vec::<String>::new());
-    assert_eq!(run(Some(0.01)).invalid(), Vec::<String>::new());
-    let stolen = run(Some(0.02)).invalid();
+    assert_eq!(run(Some(0.0), Some(0.0)).invalid(), Vec::<String>::new());
+    assert_eq!(run(Some(0.05), Some(0.01)).invalid(), Vec::<String>::new());
+    let stolen = run(Some(0.01), Some(0.02)).invalid();
     assert_eq!(stolen, vec!["steal over 5% for 2.0% of the soak, over 1%"]);
-    assert_eq!(run(None).invalid(), vec!["steal not read"]);
+    let steady = run(Some(0.06), Some(0.0)).invalid();
+    assert_eq!(steady, vec!["steal took 6.0% of the CPU, over 5%"]);
+    assert_eq!(run(None, Some(0.0)).invalid(), vec!["steal not read"]);
+    assert_eq!(run(Some(0.0), None).invalid(), vec!["steal not read"]);
+    let late = NodeValidity {
+        read_as_it_ended: false,
+        ..run(Some(0.0), Some(0.0))
+    };
+    assert_eq!(late.invalid(), vec!["the soak's end not read as it ended"]);
+}
+
+/// A steady 4.9%, under the mark in every interval, with one of 100% in a
+/// hundred, is 1% of the time and voids by the average, as the time alone
+/// would let it through (review of #169).
+#[test]
+fn a_steady_theft_with_one_bad_interval_voids_by_the_average() {
+    let mut samples = vec![(0.0, 0, 0)];
+    let (mut stolen, mut all) = (0, 0);
+    for n in 1..=100 {
+        all += 1_000;
+        stolen += if n == 50 { 1_000 } else { 49 };
+        samples.push((f64::from(n) * 10.0, stolen, all));
+    }
+    let (steal, stolen_for) = steal_read(&samples);
+    assert_eq!(stolen_for, Some(0.01));
+    assert!(steal.unwrap() > STEAL_AT_MOST, "{steal:?}");
+    let run = NodeValidity {
+        let_go_flushes: 7,
+        clustered_merges: 2,
+        nice_checks: 4,
+        nice_wrong: 0,
+        as_the_image: true,
+        measurement: true,
+        steal,
+        stolen_for,
+        load_reported: true,
+        read_as_it_ended: true,
+    };
+    assert_eq!(run.invalid().len(), 1, "{:?}", run.invalid());
 }
 
 /// What the load generator's run must have done for the arm's marks to
@@ -1638,14 +1748,46 @@ fn began_within(event: &Event, started: Instant, ended: Instant) -> bool {
     began.is_some_and(|began| began >= started && began <= ended)
 }
 
-/// What was still open as the soak ended, of `events`, which began in it.
+/// What ended after the soak, of `events`, which began in it, by what it
+/// was: a wait and a build are no one thing.
 fn open_past(events: &[Event], soak_end: Instant) -> Value {
-    let open: Vec<f64> = events
-        .iter()
-        .filter(|event| event.at > soak_end)
-        .map(|event| event.took.as_secs_f64())
-        .collect();
-    json!({ "count": open.len(), "longest_s": sorted(open).last() })
+    let mut by: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for event in events.iter().filter(|event| event.at > soak_end) {
+        let kind = format!("{:?}", event.timed);
+        by.entry(kind).or_default().push(event.took.as_secs_f64());
+    }
+    let by = by.into_iter().map(|(kind, took)| {
+        let summary = json!({ "count": took.len(), "longest_s": sorted(took).last() });
+        (kind, summary)
+    });
+    Value::Object(by.collect())
+}
+
+/// How long the waits `open` have run by `at`, flush due and backlog apart,
+/// of those that began from `started` to `ended`.
+fn open_within(
+    open: &[OpenWaits],
+    started: Instant,
+    ended: Instant,
+    at: Instant,
+) -> (Vec<f64>, Vec<f64>) {
+    let within = |began: &&Instant| **began >= started && **began <= ended;
+    let by = |began: &Instant| at.saturating_duration_since(*began).as_secs_f64();
+    let due = open.iter().flat_map(|waits| waits.flush_due.iter());
+    let capped = open.iter().flat_map(|waits| waits.backlog.iter());
+    (
+        due.filter(within).map(by).collect(),
+        capped.filter(within).map(by).collect(),
+    )
+}
+
+/// What [`open_within`] came to, for the report.
+fn open_summary(open: &(Vec<f64>, Vec<f64>)) -> Value {
+    let one = |waits: &[f64]| {
+        let longest = waits.iter().copied().fold(0.0, f64::max);
+        json!({ "count": waits.len(), "longest_s": longest })
+    };
+    json!({ "flush_due": one(&open.0), "backlog": one(&open.1) })
 }
 
 /// A wait begun in the soak and ended after it counts, and is said to have
@@ -1671,8 +1813,16 @@ fn a_wait_counts_by_when_it_began_not_when_it_ended() {
         ..long.clone()
     };
     assert!(!began_within(&before, started, soak_end));
-    let open = open_past(&[long, event(seconds(10), 5)], soak_end);
-    assert_eq!(open, json!({ "count": 1, "longest_s": 150.0 }));
+    let spell = Event {
+        timed: Timed::Backlog,
+        ..event(seconds(95), 30)
+    };
+    let open = open_past(&[long, spell, event(seconds(10), 5)], soak_end);
+    assert_eq!(
+        open,
+        json!({ "FlushDue": { "count": 1, "longest_s": 150.0 },
+                "Backlog": { "count": 1, "longest_s": 30.0 } })
+    );
 }
 
 /// How merges have ended so far, by outcome.
@@ -1704,9 +1854,18 @@ fn figures_are_of_the_soak_alone() {
     assert_eq!(over, BTreeMap::from([("committed", 3), ("stopped", 0)]));
 }
 
-/// What a tenant's segments came to on average over the tail from `from`:
-/// merges make a sawtooth of them, so that one instant at the end says
-/// more of where the tooth stood than of the arm (§9.6).
+/// Where the last whole turn of the active set round every tenant begins,
+/// in seconds into a soak: a rotation of six tenants, 360 s at §9.5's
+/// values, over which each tenant has had its turn, and no longer, as a
+/// longer tail would halve a debt that is rising (§9.5).
+fn last_cycle_from(soaked: Duration, rotate: Duration) -> f64 {
+    let cycle = rotate.as_secs_f64() * PRELOADS.len() as f64;
+    soaked.as_secs_f64() - cycle
+}
+
+/// What a tenant's segments came to on average from `from` on: merges make
+/// a sawtooth of them, so that one instant at the end says more of where
+/// the tooth stood than of the arm (§9.6).
 fn tail_mean(series: &[(f64, f64)], from: f64) -> Option<f64> {
     let tail: Vec<f64> = series
         .iter()
@@ -1729,14 +1888,44 @@ fn debt_is_the_tails_average_not_its_last_instant() {
     assert_eq!(tail_mean(&tooth, 50.0), None);
 }
 
+/// A debt rising to 19.6% worse by the end of a soak is held to the 10% of
+/// §3: over the last 20 minutes its average would come to under half of
+/// that, and pass (review of #169).
+#[test]
+fn a_rising_debt_is_not_halved_by_the_tail_it_is_averaged_over() {
+    let soak = Duration::from_secs(1_800);
+    let rising: Vec<(f64, f64)> = (0..=180)
+        .map(|n| {
+            let t = f64::from(n) * 10.0;
+            (t, 100.0 + (t - 600.0).max(0.0) * 19.6 / 1_200.0)
+        })
+        .collect();
+    let from = last_cycle_from(soak, Duration::from_secs(60));
+    assert_eq!(from, 1_440.0);
+    let held = tail_mean(&rising, from).unwrap();
+    assert!(held > 110.0, "a debt ending 19.6% worse came to {held}");
+    assert!(tail_mean(&rising, 600.0).unwrap() < 110.0);
+}
+
 /// How an arm's merge work used its slots (§9.5): the seconds any of it
 /// ran and those it ran alone, the share of the pools idle meanwhile, and
 /// how long the builds that overlapped nothing took. `spans` are whether
 /// each is a build, when it ended, and how long it took; a slot is held a
 /// while longer, through a merge's upload and load, which use no thread of
 /// its pool. `slots` is `None` for an arm with no pools of its own, where
-/// nothing of them can stand idle. It decides nothing.
-fn slot_use(spans: &[(bool, f64, f64)], slots: Option<usize>) -> Value {
+/// nothing of them can stand idle. Clipped to the soak of `soak_s`, as what
+/// runs on past it runs beside nothing that was timed, and would read as
+/// time alone; a build cut off so is no lone build. It decides nothing.
+fn slot_use(spans: &[(bool, f64, f64)], slots: Option<usize>, soak_s: f64) -> Value {
+    let whole = spans.iter().filter(|span| span.1 <= soak_s).count();
+    let spans: Vec<(bool, f64, f64)> = spans
+        .iter()
+        .map(|(build, ended, took)| {
+            let clipped = ended.min(soak_s);
+            (*build, clipped, took - (ended - clipped))
+        })
+        .collect();
+    debug_assert!(whole <= spans.len());
     let mut edges: Vec<(f64, i64)> = spans
         .iter()
         .flat_map(|(_, ended, took)| [(ended - took, 1), (*ended, -1)])
@@ -1759,7 +1948,7 @@ fn slot_use(spans: &[(bool, f64, f64)], slots: Option<usize>) -> Value {
     };
     let lone_builds: Vec<f64> = spans
         .iter()
-        .filter(|one| one.0)
+        .filter(|one| one.0 && one.1 < soak_s)
         .filter(|one| spans.iter().filter(|other| overlaps(one, other)).count() == 1)
         .map(|one| one.2)
         .collect();
@@ -1779,16 +1968,22 @@ fn slot_use(spans: &[(bool, f64, f64)], slots: Option<usize>) -> Value {
 #[test]
 fn slot_use_says_how_long_a_build_ran_alone_and_the_pools_stood_idle() {
     let spans = [(true, 20.0, 20.0), (true, 30.0, 20.0), (true, 50.0, 5.0)];
-    let used = slot_use(&spans, Some(2));
+    let used = slot_use(&spans, Some(2), 100.0);
     assert_eq!(used["busy_s"], json!(35.0), "{used}");
     assert_eq!(used["lone_s"], json!(25.0), "{used}");
     assert_eq!(used["idle_share"], json!(1.0 - 45.0 / 70.0), "{used}");
     assert_eq!(used["lone_builds"]["count"], json!(1), "{used}");
     assert_eq!(used["lone_builds"]["max"], json!(5.0), "{used}");
-    assert_eq!(slot_use(&[], Some(2))["idle_share"], json!(null));
+    assert_eq!(slot_use(&[], Some(2), 100.0)["idle_share"], json!(null));
+    // Run on past the soak of 25 s, a span is cut off there: nothing of it
+    // reads as time alone, and it is no lone build.
+    let cut = slot_use(&spans, Some(2), 25.0);
+    assert_eq!(cut["busy_s"], json!(25.0), "{cut}");
+    assert_eq!(cut["lone_s"], json!(15.0), "{cut}");
+    assert_eq!(cut["lone_builds"]["count"], json!(0), "{cut}");
     // Arm (a) has no slots, so nothing of them stands idle: its figure
     // would mean nothing, though its builds are still timed.
-    let global = slot_use(&spans, None);
+    let global = slot_use(&spans, None, 100.0);
     assert_eq!(global["idle_share"], json!(null), "{global}");
     assert_eq!(global["lone_s"], json!(25.0), "{global}");
 }
@@ -2012,6 +2207,563 @@ fn instant_at(at_unix_ms: u64) -> Instant {
     }
 }
 
+/// One read of what the node's run is held to: the same figures at the
+/// soak's start, at its end and once settled, so that which is which is
+/// plain in what uses them.
+#[derive(Clone, Debug, Default)]
+struct Reading {
+    /// When it was read: `None` only in a rule.
+    taken_at: Option<Instant>,
+    ended: BTreeMap<&'static str, u64>,
+    let_go_idle: u64,
+    let_go_budget: u64,
+    backlogged: u64,
+    top_level_cpu: Duration,
+    ticks: Option<(u64, u64)>,
+    throttled: Option<u64>,
+    cpu: BTreeMap<String, f64>,
+    largest: usize,
+    waits: Vec<OpenWaits>,
+    metrics: String,
+}
+
+impl Reading {
+    fn of(node: &Node, app: &App) -> Reading {
+        let let_go = node.let_go();
+        Reading {
+            taken_at: Some(Instant::now()),
+            ended: merges_ended(node),
+            let_go_idle: let_go.idle,
+            let_go_budget: let_go.for_budget,
+            backlogged: node.flushing().backlogged,
+            top_level_cpu: node.merge_builds().top_level_cpu(),
+            ticks: cpu_ticks(),
+            throttled: cgroup_throttled(),
+            cpu: cpu_by_pool(),
+            largest: node.merges().largest,
+            waits: node.waits_open(),
+            metrics: app.metrics().encoded(),
+        }
+    }
+}
+
+/// All the node's run came to.
+struct Soak {
+    started: Instant,
+    soak_end: Instant,
+    soaked: Duration,
+    before: Reading,
+    at_end: Reading,
+    settled: Reading,
+    shutdown_at: Instant,
+    waits_at_shutdown: Vec<OpenWaits>,
+    /// Every event kept, whenever it began.
+    events: Vec<Event>,
+    sampled: Sampled,
+    preloaded: Vec<Preloaded>,
+    preloaded_resident: usize,
+    preload_secs: f64,
+    settled_in: f64,
+    budget: usize,
+    baseline_allocated: u64,
+    baseline_rss_anon: Option<u64>,
+    load_reported: bool,
+    steal_accounted: Option<bool>,
+}
+
+/// The report of a node's run, and every event in it as timed: from what
+/// was read, so that what it takes from when can be held to a rule. When
+/// `arm` reads each [`Reading`] is not: [`read_as_it_ended`] voids a run
+/// whose end was read late.
+fn reported(
+    bench: &Bench,
+    pool: MergePool,
+    running: &Running,
+    schedule: &Schedule,
+    soak: Soak,
+) -> (Value, Vec<Value>) {
+    let Soak {
+        started,
+        soak_end,
+        soaked,
+        before,
+        at_end,
+        settled,
+        shutdown_at,
+        waits_at_shutdown,
+        events,
+        sampled,
+        preloaded,
+        preloaded_resident,
+        preload_secs,
+        settled_in,
+        budget,
+        baseline_allocated,
+        baseline_rss_anon,
+        load_reported,
+        steal_accounted,
+    } = soak;
+    let events: Vec<Event> = events
+        .into_iter()
+        .filter(|event| began_within(event, started, soak_end))
+        .collect();
+    // Every event as timed, for working out what happened when.
+    let raw: Vec<Value> = events
+        .iter()
+        .map(|event| {
+            json!({
+                "timed": format!("{:?}", event.timed),
+                "partition": event.partition,
+                "took": event.took.as_secs_f64(),
+                "at": (event.at - started).as_secs_f64(),
+            })
+        })
+        .collect();
+    let of = |timed: Timed| -> Vec<f64> {
+        events
+            .iter()
+            .filter(|event| event.timed == timed)
+            .map(|event| event.took.as_secs_f64())
+            .collect()
+    };
+    let merge_work_timed: Vec<(String, f64, f64)> = events
+        .iter()
+        .filter(|event| merge_work(event.timed))
+        .map(|event| {
+            (
+                event.partition.clone(),
+                (event.at - started).as_secs_f64(),
+                event.took.as_secs_f64(),
+            )
+        })
+        .collect();
+    let mut timings = serde_json::Map::new();
+    for holder in Holder::ALL {
+        timings.insert(
+            format!("building_wait.{}", holder.name()),
+            summary(of(Timed::BuildingWait(holder))),
+        );
+        timings.insert(
+            format!("building_held.{}", holder.name()),
+            summary(of(Timed::BuildingHeld(holder))),
+        );
+    }
+    for phase in MergePhase::ALL {
+        timings.insert(
+            format!("merge.{}", phase.name()),
+            summary(of(Timed::Merge(phase))),
+        );
+        timings.insert(
+            format!("merge_given_up.{}", phase.name()),
+            summary(of(Timed::MergeGivenUp(phase))),
+        );
+    }
+    timings.insert("flush_due".into(), summary(of(Timed::FlushDue)));
+    timings.insert("backlog".into(), summary(of(Timed::Backlog)));
+    timings.insert(
+        "let_go_flush.wait".into(),
+        summary(of(Timed::LetGoFlushWait)),
+    );
+    timings.insert(
+        "let_go_flush.held".into(),
+        summary(of(Timed::LetGoFlushHeld)),
+    );
+
+    // Merge debt: each tenant carried forward while let go, from its
+    // preload until it is first seen held.
+    let last_from = soaked.as_secs_f64() - 20.0 * 60.0;
+    let last_cycle = last_cycle_from(soaked, bench.rotate);
+    let mut debt = serde_json::Map::new();
+    let mut slopes = Vec::new();
+    let mut tails = Vec::new();
+    for preload in &preloaded {
+        let seen = sampled
+            .debt
+            .get(&preload.tenant)
+            .cloned()
+            .unwrap_or_default();
+        let start = (preload.clustered + preload.plain) as f64;
+        let points: Vec<(f64, f64)> = seen.iter().map(|point| (point.0, point.1)).collect();
+        let series = carried(&points, start, soaked.as_secs_f64());
+        let last = series.last().map_or(start, |point| point.1);
+        tails.push(tail_mean(&series, last_cycle).unwrap_or(last));
+        let tail: Vec<(f64, f64)> = series
+            .iter()
+            .filter(|(t, _)| *t >= last_from)
+            .map(|(t, segments)| (t / 60.0, *segments))
+            .collect();
+        let tenant_slope = slope(&tail);
+        slopes.push(tenant_slope.unwrap_or(f64::NAN));
+        debt.insert(
+            preload.tenant.clone(),
+            json!({
+                "start_segments": start,
+                "end_segments": last,
+                "slope_last_20_min_per_min": tenant_slope,
+                "samples_held": seen.len(),
+                "unmerged_rows_last": seen.last().map(|point| point.2),
+            }),
+        );
+    }
+    let cpu: BTreeMap<String, f64> = at_end
+        .cpu
+        .iter()
+        .map(|(pool, after)| {
+            (
+                pool.clone(),
+                after - before.cpu.get(pool).copied().unwrap_or(0.0),
+            )
+        })
+        .collect();
+    let steal_samples = with_ends(
+        &sampled.steal,
+        before.ticks,
+        at_end.ticks,
+        soaked.as_secs_f64(),
+    );
+    let (steal, stolen_for) = steal_read(&steal_samples);
+
+    // The marks this arm can be held to alone (§9.6); backlog refusals are
+    // held to arm (a)'s by the comparison.
+    let flush_wait = sorted(of(Timed::BuildingWait(Holder::Flush)));
+    let flush_held = sorted(of(Timed::BuildingHeld(Holder::Flush)));
+    let open_at_end = open_within(&at_end.waits, started, soak_end, soak_end);
+    let open_at_shutdown = open_within(&waits_at_shutdown, started, soak_end, shutdown_at);
+    // Those open at shutdown ended in no event, and are as long at least.
+    let mut flush_due = of(Timed::FlushDue);
+    flush_due.extend(&open_at_shutdown.0);
+    let flush_due = sorted(flush_due);
+    let merge_builds = sorted(of(Timed::Merge(MergePhase::Build)));
+    let let_go_wait = sorted(of(Timed::LetGoFlushWait));
+    let flush_wait_p99 = percentile(&flush_wait, 99.0);
+    let flush_held_p99 = percentile(&flush_held, 99.0);
+    let merge_build_p50 = percentile(&merge_builds, 50.0);
+    let slot_spans: Vec<(bool, f64, f64)> = events
+        .iter()
+        .filter(|event| merge_work(event.timed))
+        .map(|event| {
+            let build = matches!(
+                event.timed,
+                Timed::Merge(MergePhase::Build) | Timed::MergeGivenUp(MergePhase::Build)
+            );
+            let ended = (event.at - started).as_secs_f64();
+            (build, ended, event.took.as_secs_f64())
+        })
+        .collect();
+    let peak = sampled.allocated_peak.saturating_sub(baseline_allocated);
+    // The largest merge build as the soak ended: what the soak's peak can
+    // have come from, not what settling built after.
+    let largest_at_soak_end = at_end.largest;
+    let memory_bound = budget as u64 + (MERGE_BUILDS * largest_at_soak_end) as u64;
+    let max_slope = slopes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let marks = json!({
+        "merge_debt": {
+            "passed": slopes.iter().all(|s| s.is_finite() && *s < 0.1),
+            "max_slope_per_min": max_slope, "mark": "< 0.1 segments a minute, every tenant",
+        },
+        "flush_wait": {
+            "passed": match (flush_wait_p99, flush_held_p99, merge_build_p50) {
+                (Some(wait), Some(held), Some(build)) =>
+                    wait < 2.0 * held && flush_wait.last().copied().unwrap_or(0.0) < build,
+                _ => false,
+            },
+            "wait_p99_s": flush_wait_p99, "held_p99_s": flush_held_p99,
+            "wait_max_s": flush_wait.last(), "merge_build_p50_s": merge_build_p50,
+            "mark": "wait p99 < 2 x held p99, and the longest wait < the median merge build",
+        },
+        "flush_due": flush_due_mark(&flush_due, &flush_held, &merge_builds),
+        "node_memory": {
+            "passed": peak <= memory_bound,
+            "peak_over_baseline_bytes": peak, "bound_bytes": memory_bound,
+            "budget_bytes": budget, "largest_merge_build_bytes": largest_at_soak_end,
+            "mark": "jemalloc allocated peak over baseline <= budget + MERGE_BUILDS x largest merge build",
+        },
+        "eviction_flush": {
+            "passed": percentile(&let_go_wait, 99.0).is_some_and(|p99| p99 < 2.0),
+            "wait_p99_s": percentile(&let_go_wait, 99.0), "flushes": let_go_wait.len(),
+            "mark": "p99 wait < 2 s",
+        },
+        "backlog_refusals": { "refused": at_end.backlogged - before.backlogged, "mark": "no more than arm (a)'s" },
+    });
+    let invalid = NodeValidity {
+        let_go_flushes: let_go_wait.len(),
+        clustered_merges: sampled.clustered_merges_seen,
+        nice_checks: sampled.nice_checks,
+        nice_wrong: sampled.nice_wrong.len(),
+        as_the_image: running.as_the_image(),
+        measurement: bench.is_measurement(),
+        steal,
+        stolen_for,
+        load_reported,
+        read_as_it_ended: read_as_it_ended(at_end.taken_at, soak_end),
+    }
+    .invalid();
+
+    let report = json!({
+        "arm": bench.arm.name(),
+        "merge_pool": format!("{pool:?}"),
+        "running": running,
+        "process": process(bench),
+        "sha": bench.sha,
+        "bench": bench.config(),
+        "run": {
+            "soak_s": soaked.as_secs_f64(), "settled_in_s": settled_in, "preload_s": preload_secs,
+        },
+        "preloaded": preloaded,
+        "invalid": invalid,
+        "marks": marks,
+        "server_stages": {
+            "queue": stage_summary(&at_end.metrics, "queue"),
+            "read": stage_summary(&at_end.metrics, "read"),
+        },
+        "merge_debt": debt,
+        "tail_segments_mean": tails.iter().sum::<f64>() / tails.len() as f64,
+        "timings": timings,
+        "merges_ended": since(&before.ended, &at_end.ended),
+        "waits_open": {
+            "at_soak_end": open_summary(&open_at_end),
+            "at_shutdown": open_summary(&open_at_shutdown),
+            "ended_after_soak": open_past(&events, soak_end),
+        },
+        "idle_merge_builds": idle_merge_builds(&merge_work_timed, schedule),
+        "slot_use": slot_use(
+            &slot_spans,
+            (pool != MergePool::Global).then_some(MERGE_BUILDS),
+            soaked.as_secs_f64(),
+        ),
+        "clustered_merges_seen": sampled.clustered_merges_seen,
+        "let_go": { "idle": at_end.let_go_idle - before.let_go_idle,
+                    "budget": at_end.let_go_budget - before.let_go_budget },
+        "memory": {
+            "baseline_allocated": baseline_allocated, "allocated_peak": sampled.allocated_peak,
+            "baseline_rss_anon": baseline_rss_anon, "rss_anon_peak": sampled.rss_anon_peak,
+            "cgroup_peak_of_the_whole_process": cgroup_peak(),
+            "draining_peak": sampled.draining_peak,
+            "freeing_peak": sampled.freeing_peak,
+            "preloaded_resident": preloaded_resident,
+            "largest_merge_build_at_soak_end": largest_at_soak_end,
+            "largest_merge_build_settled": settled.largest,
+        },
+        "memtable": {
+            "unflushed_rows_peak": sampled.unflushed_rows_peak,
+            "unflushed_bytes_peak": sampled.unflushed_bytes_peak,
+            "tenant_unflushed_peak": sampled.tenant_unflushed_peak,
+        },
+        "cpu_s_by_pool": cpu,
+        "steal": { "share": steal, "at_most": STEAL_AT_MOST,
+                   "stolen_for": stolen_for, "for_at_most": STOLEN_FOR_AT_MOST,
+                   "accounted": steal_accounted,
+                   "peaks": steal_peaks(&steal_samples, bench.window.as_secs_f64()) },
+        "throttled_usec": before.throttled.zip(at_end.throttled)
+            .map(|(before, after)| after.saturating_sub(before)),
+        "machine": machine(),
+        "merge_builds": { "top_level_cpu_s": at_end.top_level_cpu.saturating_sub(before.top_level_cpu).as_secs_f64() },
+        "memory_series": sampled.memory,
+        "nice": { "checks": sampled.nice_checks, "wrong": sampled.nice_wrong },
+    });
+    (report, raw)
+}
+
+/// Whether what was read at `taken_at` was read as the soak ended, at
+/// `soak_end`. Reading a node with many tenants takes moments; a reading
+/// made after settling is out by minutes, and voids the run: no rule can
+/// see where `arm` reads, so that the run itself does.
+fn read_as_it_ended(taken_at: Option<Instant>, soak_end: Instant) -> bool {
+    taken_at.is_some_and(|at| {
+        at.saturating_duration_since(soak_end) < READ_WITHIN
+            && soak_end.saturating_duration_since(at) < READ_WITHIN
+    })
+}
+
+/// How close to the soak's end its end must be read.
+const READ_WITHIN: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+mod reported_from_what_was_read {
+    use super::*;
+
+    fn a_soak() -> Soak {
+        let started = Instant::now();
+        let soak_end = started + Duration::from_secs(1_800);
+        let at_end = Reading {
+            taken_at: Some(soak_end),
+            ..Reading::default()
+        };
+        Soak {
+            started,
+            soak_end,
+            soaked: Duration::from_secs(1_800),
+            before: Reading::default(),
+            at_end,
+            settled: Reading::default(),
+            shutdown_at: soak_end + Duration::from_secs(300),
+            waits_at_shutdown: Vec::new(),
+            events: Vec::new(),
+            sampled: Sampled::default(),
+            preloaded: Vec::new(),
+            preloaded_resident: 0,
+            preload_secs: 0.0,
+            settled_in: 0.0,
+            budget: 0,
+            baseline_allocated: 0,
+            baseline_rss_anon: None,
+            load_reported: true,
+            steal_accounted: Some(true),
+        }
+    }
+
+    fn report_of(soak: Soak) -> Value {
+        let (bench, running) = (Bench::measured(), Running::now());
+        let schedule = Schedule::of(&bench);
+        reported(&bench, MergePool::Global, &running, &schedule, soak).0
+    }
+
+    fn event(soak: &Soak, timed: Timed, began: u64, took: u64) -> Event {
+        Event {
+            timed,
+            took: Duration::from_secs(took),
+            partition: "t0/0".into(),
+            at: soak.started + Duration::from_secs(began + took),
+        }
+    }
+
+    /// The figures set against the marks are those read at the soak's start
+    /// and end: what settling adds is none of it.
+    #[test]
+    fn figures_are_those_read_at_the_soaks_two_ends() {
+        let mut soak = a_soak();
+        soak.before.ended = BTreeMap::from([("committed", 1)]);
+        soak.at_end.ended = BTreeMap::from([("committed", 4)]);
+        soak.settled.ended = BTreeMap::from([("committed", 9)]);
+        (soak.before.let_go_budget, soak.at_end.let_go_budget) = (2, 5);
+        soak.settled.let_go_budget = 9;
+        (soak.before.backlogged, soak.at_end.backlogged) = (1, 3);
+        soak.settled.backlogged = 9;
+        soak.at_end.top_level_cpu = Duration::from_secs(7);
+        soak.settled.top_level_cpu = Duration::from_secs(9);
+        (soak.at_end.largest, soak.settled.largest) = (5, 9);
+        let report = report_of(soak);
+        assert_eq!(report["merges_ended"]["committed"], 3, "{report}");
+        assert_eq!(report["let_go"]["budget"], 3, "{report}");
+        assert_eq!(
+            report["marks"]["backlog_refusals"]["refused"], 2,
+            "{report}"
+        );
+        assert_eq!(report["merge_builds"]["top_level_cpu_s"], json!(7.0));
+        let largest = &report["marks"]["node_memory"]["largest_merge_build_bytes"];
+        assert_eq!(largest, &json!(5), "{report}");
+    }
+
+    /// A wait counts by when it began, in the mark as in the report, though
+    /// it ended after the soak; and what began after it does not.
+    #[test]
+    fn a_wait_begun_in_the_soak_is_in_the_mark_though_it_ended_after() {
+        let mut soak = a_soak();
+        let long = event(&soak, Timed::FlushDue, 1_750, 150);
+        let after = event(&soak, Timed::FlushDue, 1_810, 999);
+        soak.events = vec![long, after];
+        let report = report_of(soak);
+        assert_eq!(report["marks"]["flush_due"]["due_p99_s"], json!(150.0));
+        let ended = &report["waits_open"]["ended_after_soak"]["FlushDue"];
+        assert_eq!(ended["count"], 1, "{report}");
+    }
+
+    /// A wait open at shutdown has no event, and is in the mark and the
+    /// report at what it had come to: one begun after the soak is not.
+    #[test]
+    fn a_wait_open_at_shutdown_is_in_the_mark_and_the_report() {
+        let mut soak = a_soak();
+        let in_soak = soak.started + Duration::from_secs(1_700);
+        soak.at_end.waits = vec![OpenWaits {
+            flush_due: vec![in_soak],
+            backlog: Some(in_soak),
+        }];
+        soak.waits_at_shutdown = vec![OpenWaits {
+            flush_due: vec![in_soak, soak.soak_end + Duration::from_secs(1)],
+            backlog: Some(in_soak),
+        }];
+        let report = report_of(soak);
+        assert_eq!(report["marks"]["flush_due"]["due_p99_s"], json!(400.0));
+        let open = &report["waits_open"];
+        assert_eq!(open["at_soak_end"]["flush_due"]["longest_s"], json!(100.0));
+        assert_eq!(open["at_shutdown"]["flush_due"]["count"], 1, "{open}");
+        assert_eq!(open["at_shutdown"]["backlog"]["longest_s"], json!(400.0));
+    }
+
+    /// The segments set against the 10% are those of the last rotation:
+    /// over 20 minutes this rising debt would come to under its end.
+    #[test]
+    fn the_tail_reported_is_the_last_rotations() {
+        let mut soak = a_soak();
+        soak.preloaded = vec![Preloaded {
+            tenant: "t0".into(),
+            rows: 0,
+            clustered: 0,
+            clustered_rows: 0,
+            plain: 100,
+            plain_rows: 0,
+            segments: Vec::new(),
+        }];
+        let rising = (0..=180).map(|n| {
+            let t = f64::from(n) * 10.0;
+            (t, 100.0 + (t - 600.0).max(0.0) * 19.6 / 1_200.0, 0.0)
+        });
+        soak.sampled.debt = BTreeMap::from([("t0".to_string(), rising.collect())]);
+        let report = report_of(soak);
+        let tail = report["tail_segments_mean"].as_f64().unwrap();
+        assert!(tail > 110.0, "{tail}");
+    }
+
+    /// Steal is read end to end: what comes before the sampler's first read
+    /// and after its last counts, by the soak's own two readings.
+    #[test]
+    fn steal_is_read_from_the_soaks_two_ends() {
+        let mut soak = a_soak();
+        soak.before.ticks = Some((0, 0));
+        soak.at_end.ticks = Some((2_000, 180_000));
+        soak.sampled.steal = vec![(10.0, 0, 1_000), (1_790.0, 0, 179_000)];
+        let report = report_of(soak);
+        assert_eq!(report["steal"]["stolen_for"], json!(10.0 / 1_800.0));
+    }
+
+    /// The soak's end read late voids the run, as `arm` reading it after
+    /// settling would.
+    #[test]
+    fn a_soak_end_read_late_voids_the_run() {
+        let mut soak = a_soak();
+        soak.before.ticks = Some((0, 0));
+        soak.at_end.ticks = Some((0, 1_000));
+        soak.sampled.steal = vec![(10.0, 0, 500)];
+        soak.at_end.taken_at = Some(soak.soak_end + Duration::from_secs(60));
+        let report = report_of(soak);
+        let invalid = report["invalid"].to_string();
+        assert!(invalid.contains("not read as it ended"), "{invalid}");
+    }
+
+    /// The 95% gate is held to rows within the soak: all rows written, late
+    /// ones with them, would make it empty.
+    #[test]
+    fn the_rate_is_of_the_rows_written_within_the_soak() {
+        let (bench, running) = (Bench::measured(), Running::now());
+        let schedule = Schedule::of(&bench);
+        let writes = WritesDone {
+            rows: 1_800_000,
+            rows_in_soak: 1_600_000,
+            ..WritesDone::default()
+        };
+        let load = Load {
+            reads: Vec::new(),
+            writes,
+            read_failures: json!({}),
+            readers_lost: 0,
+            cpu_s: None,
+        };
+        let report = load_report(&bench, &running, &schedule, &load);
+        let invalid = report["invalid"].to_string();
+        assert!(invalid.contains("wrote 889 rows a second"), "{invalid}");
+    }
+}
+
 /// One arm's node (§9): preload, serve through the soak while sampling
 /// itself, report. Run by `scripts/step3-bench/run.sh`, beside
 /// `step3_load`.
@@ -2109,13 +2861,7 @@ async fn arm(bench: Bench, running: Running) {
     let started = instant_at(ready.start_unix_ms);
     tokio::time::sleep_until(started.into()).await;
     let soak_end = started + bench.soak;
-    let cpu_before = cpu_by_pool();
-    let ticks_before = cpu_ticks();
-    let throttled_before = cgroup_throttled();
-    let top_level_before = node.merge_builds().top_level_cpu();
-    let backlogged_before = node.flushing().backlogged;
-    let ended_before = merges_ended(&node);
-    let let_go_before = node.let_go();
+    let before = Reading::of(&node, &app);
     let soaking = Arc::new(AtomicBool::new(true));
     let events: Arc<Mutex<Vec<Event>>> = Arc::default();
     let sampled = Arc::new(Mutex::new(Sampled::default()));
@@ -2147,6 +2893,8 @@ async fn arm(bench: Bench, running: Running) {
                 s.unflushed_rows_peak = s.unflushed_rows_peak.max(flushing.unflushed_rows);
                 s.unflushed_bytes_peak = s.unflushed_bytes_peak.max(flushing.unflushed_bytes);
                 s.draining_peak = s.draining_peak.max(node.merges().draining);
+                let freeing = node.freeing();
+                s.freeing_peak = s.freeing_peak.max(freeing);
                 let at = started.elapsed().as_secs_f64();
                 let above = vellev_storage::Merging::default().clustered_above as u64;
                 let (mut writers_resident, mut writers) = (0, 0);
@@ -2177,6 +2925,7 @@ async fn arm(bench: Bench, running: Running) {
                     let census = node.census().holding;
                     let merges = node.merges();
                     let let_go = node.let_go();
+                    let freeing_peak = s.freeing_peak;
                     s.memory.push(json!({
                         "t": at,
                         "allocated": held.map(|held| held.allocated),
@@ -2191,6 +2940,8 @@ async fn arm(bench: Bench, running: Running) {
                         "census_largest": census.largest,
                         "merge_builds_under_way": node.merge_builds().under_way(),
                         "draining": merges.draining,
+                        "freeing": freeing,
+                        "freeing_peak": freeing_peak,
                         "largest_merge_build": merges.largest,
                         "unflushed_bytes": flushing.unflushed_bytes,
                         "let_go_budget": let_go.for_budget,
@@ -2212,22 +2963,12 @@ async fn arm(bench: Bench, running: Running) {
         }
     });
 
-    // The soak runs its length; what it is held to is taken as it ends.
+    // The soak runs its length; what it is held to is read as it ends, not
+    // after settling, as the marks are windowed to the soak.
     tokio::time::sleep_until(soak_end.into()).await;
     soaking.store(false, Ordering::SeqCst);
     let soaked = started.elapsed();
-    let cpu_after = cpu_by_pool();
-    let ticks_after = cpu_ticks();
-    let largest_at_soak_end = node.merges().largest;
-    let backlogged = node.flushing().backlogged - backlogged_before;
-    // What is set against the marks is taken here, as the soak ends, not
-    // after settling, as the marks are windowed to the soak.
-    let ended_over_soak = since(&ended_before, &merges_ended(&node));
-    let throttled_after = cgroup_throttled();
-    // Of builds ended by now: each is counted as it ends.
-    let top_level_cpu = node.merge_builds().top_level_cpu() - top_level_before;
-    let let_go_after = node.let_go();
-    let metrics_at_soak_end = app.metrics().encoded();
+    let at_end = Reading::of(&node, &app);
     let _ = tokio::time::timeout(Duration::from_secs(30), sampler).await;
     events.lock().unwrap().extend(node.timings().drain_events());
     // Served until the load generator has its last answers and has
@@ -2241,277 +2982,130 @@ async fn arm(bench: Bench, running: Running) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let settled_in = settling.elapsed().as_secs_f64();
-    let metrics_text = app.metrics().encoded();
+    let settled = Reading::of(&node, &app);
     std::fs::write(
         bench.out.join(format!("metrics-{}.txt", bench.arm.name())),
-        &metrics_text,
+        &settled.metrics,
     )
     .unwrap();
-    let merges = node.merges();
+    // Shutdown flushes nothing: a wait open here ends in no event.
+    let (shutdown_at, waits_at_shutdown) = (Instant::now(), node.waits_open());
     node.shutdown().await;
-    // What was still open as the soak ended ends by here at the latest.
     events.lock().unwrap().extend(node.timings().drain_events());
     let _ = stop_serving.send(());
     let _ = serving.await;
 
-    // The report.
-    let events: Vec<Event> = std::mem::take(&mut *events.lock().unwrap())
-        .into_iter()
-        .filter(|event| began_within(event, started, soak_end))
-        .collect();
-    let open_at_soak_end = open_past(&events, soak_end);
-    // Every event as timed, for working out what happened when.
-    let raw: Vec<Value> = events
-        .iter()
-        .map(|event| {
-            json!({
-                "timed": format!("{:?}", event.timed),
-                "partition": event.partition,
-                "took": event.took.as_secs_f64(),
-                "at": (event.at - started).as_secs_f64(),
-            })
-        })
-        .collect();
+    let steal_accounted = std::fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|stat| steal_accounted(&stat));
+    let sampled = std::mem::take(&mut *sampled.lock().unwrap());
+    let events = std::mem::take(&mut *events.lock().unwrap());
+    let (report, raw) = reported(
+        &bench,
+        pool,
+        &running,
+        &schedule,
+        Soak {
+            started,
+            soak_end,
+            soaked,
+            before,
+            at_end,
+            settled,
+            shutdown_at,
+            waits_at_shutdown,
+            events,
+            sampled,
+            preloaded,
+            preloaded_resident,
+            preload_secs,
+            settled_in,
+            budget,
+            baseline_allocated,
+            baseline_rss_anon,
+            load_reported,
+            steal_accounted,
+        },
+    );
     std::fs::write(
         bench.out.join(format!("events-{}.json", bench.arm.name())),
         serde_json::to_string(&raw).unwrap(),
     )
     .unwrap();
-    let of = |timed: Timed| -> Vec<f64> {
-        events
-            .iter()
-            .filter(|event| event.timed == timed)
-            .map(|event| event.took.as_secs_f64())
-            .collect()
-    };
-    let merge_work_timed: Vec<(String, f64, f64)> = events
-        .iter()
-        .filter(|event| merge_work(event.timed))
-        .map(|event| {
-            (
-                event.partition.clone(),
-                (event.at - started).as_secs_f64(),
-                event.took.as_secs_f64(),
-            )
-        })
-        .collect();
-    let mut timings = serde_json::Map::new();
-    for holder in Holder::ALL {
-        timings.insert(
-            format!("building_wait.{}", holder.name()),
-            summary(of(Timed::BuildingWait(holder))),
-        );
-        timings.insert(
-            format!("building_held.{}", holder.name()),
-            summary(of(Timed::BuildingHeld(holder))),
-        );
-    }
-    for phase in MergePhase::ALL {
-        timings.insert(
-            format!("merge.{}", phase.name()),
-            summary(of(Timed::Merge(phase))),
-        );
-        timings.insert(
-            format!("merge_given_up.{}", phase.name()),
-            summary(of(Timed::MergeGivenUp(phase))),
-        );
-    }
-    timings.insert("flush_due".into(), summary(of(Timed::FlushDue)));
-    timings.insert("backlog".into(), summary(of(Timed::Backlog)));
-    timings.insert(
-        "let_go_flush.wait".into(),
-        summary(of(Timed::LetGoFlushWait)),
-    );
-    timings.insert(
-        "let_go_flush.held".into(),
-        summary(of(Timed::LetGoFlushHeld)),
-    );
-
-    // Merge debt: each tenant carried forward while let go, from its
-    // preload until it is first seen held.
-    let sampled = std::mem::take(&mut *sampled.lock().unwrap());
-    let last_from = soaked.as_secs_f64() - 20.0 * 60.0;
-    let mut debt = serde_json::Map::new();
-    let mut slopes = Vec::new();
-    let mut tails = Vec::new();
-    for preload in &preloaded {
-        let seen = sampled
-            .debt
-            .get(&preload.tenant)
-            .cloned()
-            .unwrap_or_default();
-        let start = (preload.clustered + preload.plain) as f64;
-        let points: Vec<(f64, f64)> = seen.iter().map(|point| (point.0, point.1)).collect();
-        let series = carried(&points, start, soaked.as_secs_f64());
-        let last = series.last().map_or(start, |point| point.1);
-        tails.push(tail_mean(&series, last_from).unwrap_or(last));
-        let tail: Vec<(f64, f64)> = series
-            .iter()
-            .filter(|(t, _)| *t >= last_from)
-            .map(|(t, segments)| (t / 60.0, *segments))
-            .collect();
-        let tenant_slope = slope(&tail);
-        slopes.push(tenant_slope.unwrap_or(f64::NAN));
-        debt.insert(
-            preload.tenant.clone(),
-            json!({
-                "start_segments": start,
-                "end_segments": last,
-                "slope_last_20_min_per_min": tenant_slope,
-                "samples_held": seen.len(),
-                "unmerged_rows_last": seen.last().map(|point| point.2),
-            }),
-        );
-    }
-    let cpu: BTreeMap<String, f64> = cpu_after
-        .iter()
-        .map(|(pool, after)| {
-            (
-                pool.clone(),
-                after - cpu_before.get(pool).copied().unwrap_or(0.0),
-            )
-        })
-        .collect();
-    let steal = match (ticks_before, ticks_after) {
-        (Some((stolen_before, all_before)), Some((stolen_after, all_after)))
-            if all_after > all_before =>
-        {
-            Some((stolen_after - stolen_before) as f64 / (all_after - all_before) as f64)
-        }
-        _ => None,
-    };
-
-    // The marks this arm can be held to alone (§9.6); backlog refusals are
-    // held to arm (a)'s by the comparison.
-    let flush_wait = sorted(of(Timed::BuildingWait(Holder::Flush)));
-    let flush_held = sorted(of(Timed::BuildingHeld(Holder::Flush)));
-    let flush_due = sorted(of(Timed::FlushDue));
-    let merge_builds = sorted(of(Timed::Merge(MergePhase::Build)));
-    let let_go_wait = sorted(of(Timed::LetGoFlushWait));
-    let flush_wait_p99 = percentile(&flush_wait, 99.0);
-    let flush_held_p99 = percentile(&flush_held, 99.0);
-    let merge_build_p50 = percentile(&merge_builds, 50.0);
-    let slot_spans: Vec<(bool, f64, f64)> = events
-        .iter()
-        .filter(|event| merge_work(event.timed))
-        .map(|event| {
-            let build = matches!(
-                event.timed,
-                Timed::Merge(MergePhase::Build) | Timed::MergeGivenUp(MergePhase::Build)
-            );
-            let ended = (event.at - started).as_secs_f64();
-            (build, ended, event.took.as_secs_f64())
-        })
-        .collect();
-    let peak = sampled.allocated_peak.saturating_sub(baseline_allocated);
-    // The largest merge build as the soak ended: what the soak's peak can
-    // have come from, not what settling built after.
-    let memory_bound = budget as u64 + (MERGE_BUILDS * largest_at_soak_end) as u64;
-    let max_slope = slopes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let marks = json!({
-        "merge_debt": {
-            "passed": slopes.iter().all(|s| s.is_finite() && *s < 0.1),
-            "max_slope_per_min": max_slope, "mark": "< 0.1 segments a minute, every tenant",
-        },
-        "flush_wait": {
-            "passed": match (flush_wait_p99, flush_held_p99, merge_build_p50) {
-                (Some(wait), Some(held), Some(build)) =>
-                    wait < 2.0 * held && flush_wait.last().copied().unwrap_or(0.0) < build,
-                _ => false,
-            },
-            "wait_p99_s": flush_wait_p99, "held_p99_s": flush_held_p99,
-            "wait_max_s": flush_wait.last(), "merge_build_p50_s": merge_build_p50,
-            "mark": "wait p99 < 2 x held p99, and the longest wait < the median merge build",
-        },
-        "flush_due": flush_due_mark(&flush_due, &flush_held, &merge_builds),
-        "node_memory": {
-            "passed": peak <= memory_bound,
-            "peak_over_baseline_bytes": peak, "bound_bytes": memory_bound,
-            "budget_bytes": budget, "largest_merge_build_bytes": largest_at_soak_end,
-            "mark": "jemalloc allocated peak over baseline <= budget + MERGE_BUILDS x largest merge build",
-        },
-        "eviction_flush": {
-            "passed": percentile(&let_go_wait, 99.0).is_some_and(|p99| p99 < 2.0),
-            "wait_p99_s": percentile(&let_go_wait, 99.0), "flushes": let_go_wait.len(),
-            "mark": "p99 wait < 2 s",
-        },
-        "backlog_refusals": { "refused": backlogged, "mark": "no more than arm (a)'s" },
-    });
-    let invalid = NodeValidity {
-        let_go_flushes: let_go_wait.len(),
-        clustered_merges: sampled.clustered_merges_seen,
-        nice_checks: sampled.nice_checks,
-        nice_wrong: sampled.nice_wrong.len(),
-        as_the_image: running.as_the_image(),
-        measurement: bench.is_measurement(),
-        stolen_for: stolen_for(&sampled.steal),
-        load_reported,
-    }
-    .invalid();
-
-    let report = json!({
-        "arm": bench.arm.name(),
-        "merge_pool": format!("{pool:?}"),
-        "running": running,
-        "process": process(&bench),
-        "sha": bench.sha,
-        "bench": bench.config(),
-        "run": {
-            "soak_s": soaked.as_secs_f64(), "settled_in_s": settled_in, "preload_s": preload_secs,
-        },
-        "preloaded": preloaded,
-        "invalid": invalid,
-        "marks": marks,
-        "server_stages": {
-            "queue": stage_summary(&metrics_at_soak_end, "queue"),
-            "read": stage_summary(&metrics_at_soak_end, "read"),
-        },
-        "merge_debt": debt,
-        "tail_segments_mean": tails.iter().sum::<f64>() / tails.len() as f64,
-        "timings": timings,
-        "merges_ended": ended_over_soak,
-        "open_at_soak_end": open_at_soak_end,
-        "idle_merge_builds": idle_merge_builds(&merge_work_timed, &schedule),
-        "slot_use": slot_use(
-            &slot_spans,
-            (pool != MergePool::Global).then_some(MERGE_BUILDS),
-        ),
-        "clustered_merges_seen": sampled.clustered_merges_seen,
-        "let_go": { "idle": let_go_after.idle - let_go_before.idle,
-                    "budget": let_go_after.for_budget - let_go_before.for_budget },
-        "memory": {
-            "baseline_allocated": baseline_allocated, "allocated_peak": sampled.allocated_peak,
-            "baseline_rss_anon": baseline_rss_anon, "rss_anon_peak": sampled.rss_anon_peak,
-            "cgroup_peak_of_the_whole_process": cgroup_peak(),
-            "draining_peak": sampled.draining_peak,
-            "preloaded_resident": preloaded_resident,
-            "largest_merge_build_at_soak_end": largest_at_soak_end,
-            "largest_merge_build_settled": merges.largest,
-        },
-        "memtable": {
-            "unflushed_rows_peak": sampled.unflushed_rows_peak,
-            "unflushed_bytes_peak": sampled.unflushed_bytes_peak,
-            "tenant_unflushed_peak": sampled.tenant_unflushed_peak,
-        },
-        "cpu_s_by_pool": cpu,
-        "steal": { "share": steal, "at_most": STEAL_AT_MOST,
-                   "stolen_for": stolen_for(&sampled.steal), "for_at_most": STOLEN_FOR_AT_MOST,
-                   "peaks": steal_peaks(&sampled.steal, bench.window.as_secs_f64()) },
-        "throttled_usec": throttled_before.zip(throttled_after)
-            .map(|(before, after)| after.saturating_sub(before)),
-        "machine": machine(),
-        "merge_builds": { "top_level_cpu_s": top_level_cpu.as_secs_f64() },
-        "memory_series": sampled.memory,
-        "nice": { "checks": sampled.nice_checks, "wrong": sampled.nice_wrong },
-    });
     let path = bench.out.join(format!("arm-{}.json", bench.arm.name()));
     written_whole(&path, &serde_json::to_string_pretty(&report).unwrap());
     eprintln!(
         "{}",
         serde_json::to_string_pretty(&report["marks"]).unwrap()
     );
-    eprintln!("invalid: {invalid:?}; written to {}", path.display());
+    eprintln!(
+        "invalid: {}; written to {}",
+        report["invalid"],
+        path.display()
+    );
     let _ = std::fs::remove_dir_all(&data);
+}
+
+/// What the load generator's run came to.
+struct Load {
+    reads: Vec<Read>,
+    writes: WritesDone,
+    read_failures: Value,
+    readers_lost: usize,
+    cpu_s: Option<f64>,
+}
+
+/// The load generator's report of what it came to.
+fn load_report(bench: &Bench, running: &Running, schedule: &Schedule, load: &Load) -> Value {
+    let Load {
+        reads,
+        writes,
+        read_failures,
+        readers_lost,
+        cpu_s,
+    } = load;
+    let soaked = bench.soak.as_secs_f64();
+    let answered = |answered: Answered| {
+        reads
+            .iter()
+            .filter(|read| read.answered == answered)
+            .count() as u64
+    };
+    let invalid = LoadValidity {
+        as_the_image: running.as_the_image(),
+        rows_written_a_second: writes.rows_in_soak as f64 / soaked,
+        rows_a_second: bench.rows_a_second,
+        reads: reads.len() as u64,
+        failed_reads: answered(Answered::Failed),
+        refused_reads: answered(Answered::Refused),
+        readers_lost: *readers_lost,
+        late_most: writes.late_most,
+    }
+    .invalid();
+    let mut by_tenant = schedule.rows_by_tenant();
+    by_tenant.values_mut().for_each(|rows| *rows = 0);
+    by_tenant.extend(writes.by_tenant.clone());
+    json!({
+        "arm": bench.arm.name(),
+        "running": running,
+        "process": process(bench),
+        "sha": bench.sha,
+        "bench": bench.config(),
+        "cpu_s": cpu_s,
+        "reads": reads_summary(reads, soaked, bench.window.as_secs_f64()),
+        "read_failures": read_failures,
+        "writes": {
+            "rows": writes.rows, "rows_in_soak": writes.rows_in_soak,
+            "rows_a_second": writes.rows_in_soak as f64 / soaked,
+            "batches": writes.batches, "refused": writes.refused, "failed": writes.failed,
+            "behind_most_s": writes.behind_most, "worst_lag": writes.worst_lag,
+            "slowest_batch": writes.slowest_batch.as_ref().map(|(_, batch)| batch),
+            "batches_late": writes.late, "late_most_s": writes.late_most,
+            "by_tenant": by_tenant, "scheduled_by_tenant": schedule.rows_by_tenant(),
+            "failures": writes.failures.report(),
+        },
+        "invalid": invalid,
+    })
 }
 
 /// One arm's load generator: told where the node serves through the file
@@ -2761,60 +3355,32 @@ async fn load(bench: Bench, running: Running) {
             readers_lost += 1;
         }
     }
-    let soaked = bench.soak.as_secs_f64();
     let reads: Vec<Read> = reads
         .iter()
         .flat_map(|done| std::mem::take(&mut *done.lock().unwrap()))
         .collect();
-    let failed_reads = reads
-        .iter()
-        .filter(|read| read.answered == Answered::Failed)
-        .count() as u64;
     let writes = std::mem::take(&mut *writes.lock().unwrap());
-    let invalid = LoadValidity {
-        as_the_image: running.as_the_image(),
-        rows_written_a_second: writes.rows_in_soak as f64 / soaked,
-        rows_a_second: bench.rows_a_second,
-        reads: reads.len() as u64,
-        failed_reads,
-        refused_reads: reads
-            .iter()
-            .filter(|read| read.answered == Answered::Refused)
-            .count() as u64,
-        readers_lost,
-        late_most: writes.late_most,
-    }
-    .invalid();
-    let mut by_tenant = schedule.rows_by_tenant();
-    by_tenant.values_mut().for_each(|rows| *rows = 0);
-    by_tenant.extend(writes.by_tenant.clone());
-    let report = json!({
-        "arm": bench.arm.name(),
-        "running": running,
-        "process": process(&bench),
-        "sha": bench.sha,
-        "bench": bench.config(),
-        "cpu_s": cpu_before.zip(process_ticks())
-            .map(|(before, after)| after.saturating_sub(before) as f64 / 100.0),
-        "reads": reads_summary(&reads, soaked, bench.window.as_secs_f64()),
-        "read_failures": read_failures.lock().unwrap().report(),
-        "writes": {
-            "rows": writes.rows, "rows_in_soak": writes.rows_in_soak,
-            "rows_a_second": writes.rows_in_soak as f64 / soaked,
-            "batches": writes.batches, "refused": writes.refused, "failed": writes.failed,
-            "behind_most_s": writes.behind_most, "worst_lag": writes.worst_lag,
-            "slowest_batch": writes.slowest_batch.as_ref().map(|(_, batch)| batch),
-            "batches_late": writes.late, "late_most_s": writes.late_most,
-            "by_tenant": by_tenant, "scheduled_by_tenant": schedule.rows_by_tenant(),
-            "failures": writes.failures.report(),
+    let cpu_s = cpu_before
+        .zip(process_ticks())
+        .map(|(before, after)| after.saturating_sub(before) as f64 / 100.0);
+    let read_failures = read_failures.lock().unwrap().report();
+    let report = load_report(
+        &bench,
+        &running,
+        &schedule,
+        &Load {
+            reads,
+            writes,
+            read_failures,
+            readers_lost,
+            cpu_s,
         },
-        "invalid": invalid,
-    });
+    );
     written_whole(
         &load_path(&bench),
         &serde_json::to_string_pretty(&report).unwrap(),
     );
-    eprintln!("load invalid: {invalid:?}");
+    eprintln!("load invalid: {}", report["invalid"]);
 }
 
 /// An arm's two reports, as compared: the node's, and the load
@@ -3266,6 +3832,32 @@ fn beats_b_asks_b_be_valid_not_that_it_pass_and_says_undecided() {
     assert_eq!(all_marks(&late, Some(true)), Some(false));
 }
 
+/// What is said of an arm's run. One on a machine that does not account
+/// steal stays valid, as §3 names that runner, and says so: nothing has
+/// shown its host took nothing.
+fn run_said(why: &[String], steal_accounted: Option<bool>) -> String {
+    let said = match why.is_empty() {
+        true => "valid".to_string(),
+        false => why.join("; "),
+    };
+    match steal_accounted {
+        Some(true) => said,
+        _ => format!("{said} (steal unmeasured)"),
+    }
+}
+
+#[test]
+fn a_run_where_steal_is_unaccounted_says_so_beside_valid() {
+    assert_eq!(run_said(&[], Some(true)), "valid");
+    assert_eq!(run_said(&[], Some(false)), "valid (steal unmeasured)");
+    assert_eq!(run_said(&[], None), "valid (steal unmeasured)");
+    let why = ["a smoke, not the measurement".to_string()];
+    assert_eq!(
+        run_said(&why, Some(false)),
+        "a smoke, not the measurement (steal unmeasured)"
+    );
+}
+
 /// The arms side by side (§9.6): each mark, arm (a) as the backlog's
 /// bound if it is compared, the noise floor from (b) run twice, and which
 /// arm wins by "beats (b)". Reads `STEP3_OUT/arm-*.json` and
@@ -3366,15 +3958,12 @@ fn step3_compare() {
             mark(passed("node_memory")),
             mark(passed("eviction_flush")),
             all.map_or("undecided", mark),
-            if why.is_empty() {
-                "valid".to_string()
-            } else {
-                why.join("; ")
-            },
+            run_said(why, run.node["steal"]["accounted"].as_bool()),
         ));
         verdicts.insert(
             run.name.clone(),
             json!({ "all_marks": all, "backlog_within_a": backlog, "invalid": why,
+                    "steal_accounted": run.node["steal"]["accounted"],
                     "idle_merge_work_large": idle["large"],
                     "slot_use": run.node["slot_use"] }),
         );

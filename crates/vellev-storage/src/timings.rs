@@ -12,8 +12,8 @@
 //! they come ([`Timings::keep_events`]).
 
 use std::fmt::Display;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Who holds a partition's building lock.
@@ -79,6 +79,17 @@ pub enum MergePhase {
 impl MergePhase {
     pub const ALL: [MergePhase; 7] = [
         MergePhase::Turn,
+        MergePhase::Working,
+        MergePhase::Gather,
+        MergePhase::Build,
+        MergePhase::Encode,
+        MergePhase::Upload,
+        MergePhase::Load,
+    ];
+
+    /// Those timed once given up: a turn given up is no work, and its wait
+    /// is told by the merge not having one.
+    pub const GIVEN_UP: [MergePhase; 6] = [
         MergePhase::Working,
         MergePhase::Gather,
         MergePhase::Build,
@@ -233,7 +244,7 @@ struct Histogram {
     /// Where an observe waits, its bucket counted and nothing else yet,
     /// while a test reads it half observed.
     #[cfg(test)]
-    paused: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    paused: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl Histogram {
@@ -302,6 +313,10 @@ pub struct Event {
 pub struct Timings {
     histograms: [Histogram; SLOTS],
     ended: [AtomicU64; MergeEnd::ALL.len()],
+    /// What checkpoints of the node's writers took out of memory and has
+    /// yet to be freed: here, not on a writer, as a tenant let go goes on
+    /// freeing.
+    freeing: Arc<AtomicUsize>,
     /// Whether a bench keeps events: looked at before anything is made
     /// for one, so that a duration timed while none does takes no lock
     /// and allocates nothing.
@@ -315,6 +330,7 @@ impl Default for Timings {
         Self {
             histograms: std::array::from_fn(|_| Histogram::default()),
             ended: std::array::from_fn(|_| AtomicU64::new(0)),
+            freeing: Arc::default(),
             keeping: AtomicBool::new(false),
             events: Mutex::new(None),
         }
@@ -340,6 +356,18 @@ impl Timings {
         if let Some(events) = events.as_mut() {
             events.push(event);
         }
+    }
+
+    /// Where what a checkpoint took out of memory is counted until freed.
+    pub(crate) fn freeing_counted(&self) -> &Arc<AtomicUsize> {
+        &self.freeing
+    }
+
+    /// About how many bytes the node's writers' checkpoints took out of
+    /// memory and have yet to free, those of tenants let go since among
+    /// them.
+    pub fn freeing(&self) -> usize {
+        self.freeing.load(Ordering::SeqCst)
     }
 
     /// Count a merge that ended as `end`.
@@ -386,7 +414,7 @@ pub(crate) struct Lag {
     /// Where a note of rows applied waits, before it is made, while a test
     /// asks for a checkpoint beside it.
     #[cfg(test)]
-    pub(crate) paused: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    pub(crate) paused: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 #[derive(Debug, Default)]
@@ -457,6 +485,16 @@ impl Lag {
         }
     }
 
+    /// The waits open now.
+    pub(crate) fn open(&self) -> OpenWaits {
+        let state = self.state();
+        let taken = state.taking.and_then(|(_, due)| due);
+        OpenWaits {
+            flush_due: taken.into_iter().chain(state.due).collect(),
+            backlog: state.capped,
+        }
+    }
+
     /// The partition was put back wholesale, holding `unflushed`: the rows
     /// that were due are not flushed but undone, and nothing is timed.
     pub(crate) fn put_back(&self, unflushed: usize) {
@@ -466,6 +504,17 @@ impl Lag {
         state.taking = None;
         state.saw(unflushed, Instant::now());
     }
+}
+
+/// The waits a writer has open: those no checkpoint has ended, so that no
+/// event times them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OpenWaits {
+    /// When the rows waiting fell due: those a checkpoint under way has
+    /// taken, and those it has not.
+    pub flush_due: Vec<Instant>,
+    /// When the spell at the backlog began.
+    pub backlog: Option<Instant>,
 }
 
 /// A checkpoint under way that takes the memtable's rows, as
@@ -553,9 +602,9 @@ mod tests {
     /// hoped for among millions of reads.
     #[test]
     fn a_histogram_read_half_observed_is_whole() {
-        let timings = std::sync::Arc::new(Timings::default());
+        let timings = Arc::new(Timings::default());
         let timed = Timed::Backlog;
-        let paused = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let paused = Arc::new(std::sync::Barrier::new(2));
         *timings.histograms[timed.slot()].paused.lock().unwrap() = Some(paused.clone());
         let observing = {
             let timings = timings.clone();

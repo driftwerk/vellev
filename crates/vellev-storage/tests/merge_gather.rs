@@ -419,6 +419,52 @@ async fn a_gather_is_timed_as_the_copy_on_a_pool_of_its_own() {
     a_gather_is_timed_as_the_copy(builds).await;
 }
 
+/// A restore under way, not yet made, that a stop comes to once a merge is
+/// built ends it stale too: the merge could not have committed (§9.7 rule
+/// 6, review of #169).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_once_built_with_a_restore_under_way_is_counted_stale() {
+    let (builds, mut cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let store = Arc::new(GetsHeld {
+        inner: cluster.blobs.clone(),
+        armed: AtomicBool::new(false),
+        reached: tokio::sync::Notify::new(),
+        let_go: tokio::sync::Semaphore::new(0),
+    });
+    cluster.blobs = store.clone();
+    let writer = two_large(&cluster, &builds).await;
+    let committed = cluster.committed().await;
+    let (head, position) = (committed.manifest.unwrap(), committed.log_position);
+    written(&writer, vec![upsert_as(0, -1)]).await;
+    builds.hold(Some(Holding::BuiltUntilLetGo));
+    let held = Held(builds.clone());
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    until(LONG, "no build came to be held", || builds.held() == 1).await;
+    store.armed.store(true, Ordering::SeqCst);
+    let restoring = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.restore(Some(&head), position).await }
+    });
+    let reached = store.reached.notified();
+    within(LONG, "the restore came to the store", reached).await;
+    let epoch = writer.epoch();
+    writer.stop_merges();
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    assert_eq!(writer.epoch(), epoch, "with the restore under way still");
+    assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
+    store.armed.store(false, Ordering::SeqCst);
+    store
+        .let_go
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    let restored = within(LONG, "the restore went through", restoring).await;
+    restored.unwrap().unwrap();
+}
+
 /// A store whose gets, once armed, wait until let go.
 #[derive(Debug)]
 struct GetsHeld {
