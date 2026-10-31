@@ -967,13 +967,21 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
         );
         assert!(waited.is_some(), "{holder}: {text}");
     }
-    for phase in ["turn", "gather", "build", "build_stopped", "upload", "load"] {
+    for phase in [
+        "turn", "working", "gather", "build", "encode", "upload", "load",
+    ] {
         let count = sample(
             &text,
             "vellev_merge_phase_seconds_count",
             &[("phase", phase)],
         );
         assert!(count.is_some(), "{phase}: {text}");
+        let given_up = sample(
+            &text,
+            "vellev_merge_given_up_seconds_count",
+            &[("phase", phase)],
+        );
+        assert!(given_up.is_some(), "{phase}: {text}");
     }
     for outcome in [
         "committed",

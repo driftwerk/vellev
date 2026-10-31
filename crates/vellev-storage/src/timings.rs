@@ -60,14 +60,16 @@ impl Holder {
 pub enum MergePhase {
     /// Waiting for a turn among the node's merge builds.
     Turn,
+    /// Waiting, with one, for a turn among the work off the async threads.
+    Working,
     /// Gathering the run's live rows, a chunk at a time with no lock held.
     Gather,
     /// Building the merged segment: indexing and encoding it, without the
     /// lock.
     Build,
-    /// As long as a build ran that was stopped before it was done: work
-    /// spent, though no merge came of it.
-    BuildStopped,
+    /// Encoding its clustered index, on an async thread and off any merge
+    /// pool, once it is built.
+    Encode,
     /// Uploading its files.
     Upload,
     /// Loading it back, and seeing it fit to adopt.
@@ -75,11 +77,12 @@ pub enum MergePhase {
 }
 
 impl MergePhase {
-    pub const ALL: [MergePhase; 6] = [
+    pub const ALL: [MergePhase; 7] = [
         MergePhase::Turn,
+        MergePhase::Working,
         MergePhase::Gather,
         MergePhase::Build,
-        MergePhase::BuildStopped,
+        MergePhase::Encode,
         MergePhase::Upload,
         MergePhase::Load,
     ];
@@ -87,9 +90,10 @@ impl MergePhase {
     pub fn name(self) -> &'static str {
         match self {
             MergePhase::Turn => "turn",
+            MergePhase::Working => "working",
             MergePhase::Gather => "gather",
             MergePhase::Build => "build",
-            MergePhase::BuildStopped => "build_stopped",
+            MergePhase::Encode => "encode",
             MergePhase::Upload => "upload",
             MergePhase::Load => "load",
         }
@@ -147,8 +151,11 @@ pub enum Timed {
     BuildingWait(Holder),
     /// Holding it.
     BuildingHeld(Holder),
-    /// A phase of a merge.
+    /// A phase of a merge, that it came through.
     Merge(MergePhase),
+    /// As long as a phase of a merge ran before it was given up, stopped or
+    /// failed: work spent, though no merge came of it.
+    MergeGivenUp(MergePhase),
     /// From a tenant's rows unflushed reaching what a flush is due at to
     /// the commit of the checkpoint that took them out of memory.
     FlushDue,
@@ -169,6 +176,7 @@ impl Timed {
         all.extend(Holder::ALL.map(Timed::BuildingWait));
         all.extend(Holder::ALL.map(Timed::BuildingHeld));
         all.extend(MergePhase::ALL.map(Timed::Merge));
+        all.extend(MergePhase::ALL.map(Timed::MergeGivenUp));
         all.extend([
             Timed::FlushDue,
             Timed::Backlog,
@@ -182,21 +190,21 @@ impl Timed {
         let holders = Holder::ALL.len();
         let phases = MergePhase::ALL.len();
         let index = |holder: Holder| Holder::ALL.iter().position(|h| *h == holder).unwrap();
+        let of = |phase: MergePhase| MergePhase::ALL.iter().position(|p| *p == phase).unwrap();
         match self {
             Timed::BuildingWait(holder) => index(holder),
             Timed::BuildingHeld(holder) => holders + index(holder),
-            Timed::Merge(phase) => {
-                2 * holders + MergePhase::ALL.iter().position(|p| *p == phase).unwrap()
-            }
-            Timed::FlushDue => 2 * holders + phases,
-            Timed::Backlog => 2 * holders + phases + 1,
-            Timed::LetGoFlushWait => 2 * holders + phases + 2,
-            Timed::LetGoFlushHeld => 2 * holders + phases + 3,
+            Timed::Merge(phase) => 2 * holders + of(phase),
+            Timed::MergeGivenUp(phase) => 2 * holders + phases + of(phase),
+            Timed::FlushDue => 2 * holders + 2 * phases,
+            Timed::Backlog => 2 * holders + 2 * phases + 1,
+            Timed::LetGoFlushWait => 2 * holders + 2 * phases + 2,
+            Timed::LetGoFlushHeld => 2 * holders + 2 * phases + 3,
         }
     }
 }
 
-const SLOTS: usize = 2 * Holder::ALL.len() + MergePhase::ALL.len() + 4;
+const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 4;
 
 /// The bucket bounds, in seconds: a millisecond, and twice as long each
 /// time, to 2,097 seconds, about 35 minutes. Past the last is counted only

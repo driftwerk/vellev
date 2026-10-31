@@ -267,30 +267,42 @@ pub enum MergePool {
     /// process's priority.
     #[default]
     Global,
-    /// A pool of their own of `threads` threads, at least one, each run
-    /// `nice` lower than the rest of the process, on Linux, from 0, which
-    /// runs them as it does, to 19, as [`Settings::check`] makes sure. A
-    /// build's clustered indexes tune on the one tuning thread whatever
-    /// this says.
+    /// Pools of their own among `threads` threads, one pool for each
+    /// merge built at once and an equal share to each, any left over
+    /// unused, each thread run `nice` lower than the rest of the process,
+    /// on Linux, from 0, which runs them as it does, to 19, as
+    /// [`Settings::check`] makes sure. A build's clustered indexes tune on
+    /// the one tuning thread whatever this says.
     Own { threads: usize, nice: i32 },
 }
 
 impl MergePool {
-    /// Why a node cannot build its merges on this pool, if it cannot: one
-    /// of no threads builds nothing, and a nice outside 0 to 19 is either
-    /// a priority above the process's, which a merge never needs and the
-    /// image's user may not take, or below the lowest there is.
-    pub fn problem(&self) -> Option<String> {
-        match *self {
-            MergePool::Global => None,
-            MergePool::Own { threads: 0, .. } => {
-                Some("a merge pool of no threads would build no merge".into())
-            }
-            MergePool::Own { nice, .. } if !(0..=19).contains(&nice) => Some(format!(
-                "a nice of {nice} for the merge pool is outside 0 to 19: a merge pool runs \
-                 at the process's priority or lower, never higher"
+    /// Why a node that builds `builds` merges at once cannot build them on
+    /// this, if it cannot: each build has its share of the threads, so
+    /// fewer than that leaves one with none; a nice below 0 would raise a
+    /// merge above the process's priority, which it never needs and the
+    /// image's user may not take; and one past 19 is lower than any there
+    /// is. [`Settings::check`] asks it, and so does whoever makes a node
+    /// without that check.
+    pub fn problem(&self, builds: usize) -> Option<String> {
+        let MergePool::Own { threads, nice } = *self else {
+            return None;
+        };
+        if threads < builds {
+            return Some(format!(
+                "a merge pool of {threads} threads cannot give each of {builds} builds at \
+                 once a thread"
+            ));
+        }
+        match nice {
+            0..=19 => None,
+            ..0 => Some(format!(
+                "a nice of {nice} for the merge pool would run merges above the process's \
+                 priority"
             )),
-            MergePool::Own { .. } => None,
+            _ => Some(format!(
+                "a nice of {nice} for the merge pool is past 19, the lowest there is"
+            )),
         }
     }
 }
@@ -365,7 +377,7 @@ impl Settings {
             .grace_problem(self.grace)
             .or_else(|| self.request_bounds.claim_problem(self.backup_claim))
             .or_else(|| self.backlog_problem())
-            .or_else(|| self.merge_pool.problem())
+            .or_else(|| self.merge_pool.problem(MERGE_BUILDS))
             .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
     }
 
@@ -1720,8 +1732,10 @@ impl Node {
             merge_builds: match settings.merge_pool {
                 MergePool::Global => MergeBuilds::new(MERGE_BUILDS),
                 MergePool::Own { threads, nice } => MergeBuilds::building_on(
-                    MERGE_BUILDS,
-                    Arc::new(vellev_storage::merge_pool(threads, nice)),
+                    vellev_storage::merge_slots(MERGE_BUILDS, threads, nice)
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect(),
                 ),
             },
             census: Mutex::default(),

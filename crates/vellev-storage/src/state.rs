@@ -1245,67 +1245,63 @@ pub(crate) fn indexed_stopping<'a>(
     let asked = |row: usize| {
         row.is_multiple_of(ROWS_BETWEEN_ASKING) && stopping.stopped(MergeStage::Indexing)
     };
-    let tokenized: Vec<Option<Tokenized>> = on
-        .section("tokenizing", || {
-            rows.par_iter()
-                .map(|Row { collection, object }| {
-                    if stopping.stopped(MergeStage::Indexing) {
-                        return None;
-                    }
-                    let schema = catalog.schema(*collection)?;
-                    Some(threads.on(|| TextIndex::tokenize(schema, object)))
-                })
-                .collect()
-        })
-        .ok()?;
+    let tokenized: Vec<Option<Tokenized>> = on.section("tokenizing", || {
+        rows.par_iter()
+            .map(|Row { collection, object }| {
+                if stopping.stopped(MergeStage::Indexing) {
+                    return None;
+                }
+                let schema = catalog.schema(*collection)?;
+                Some(threads.on(|| TextIndex::tokenize(schema, object)))
+            })
+            .collect()
+    });
     if stopping.is_stopped() {
         return None;
     }
     // The filterable values and vectors on one thread, the text on
     // another: each in row order, as indexing each row in turn makes them.
-    let ((mut indexes, vectors), texts) = on
-        .section("indexing", || {
-            rayon::join(
-                || {
-                    let mut indexes = Indexes::new();
-                    let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
-                    for (row, Row { collection, object }) in rows.iter().enumerate() {
-                        if asked(row) {
-                            break;
-                        }
-                        if let Some(schema) = catalog.schema(*collection) {
-                            let index = indexes.entry(*collection).or_default();
-                            index.rows.insert(schema, row as u32, object);
-                            if let Some(vector) = vector_of(row) {
-                                vectors
-                                    .entry(*collection)
-                                    .or_default()
-                                    .push((row as u32, vector));
-                            }
-                        }
+    let ((mut indexes, vectors), texts) = on.section("indexing", || {
+        rayon::join(
+            || {
+                let mut indexes = Indexes::new();
+                let mut vectors: HashMap<CollectionId, Vec<(u32, &[f32])>> = HashMap::new();
+                for (row, Row { collection, object }) in rows.iter().enumerate() {
+                    if asked(row) {
+                        break;
                     }
-                    (indexes, vectors)
-                },
-                || {
-                    let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
-                    for ((row, Row { collection, .. }), tokenized) in
-                        rows.iter().enumerate().zip(tokenized)
-                    {
-                        if asked(row) {
-                            break;
-                        }
-                        if let Some(tokenized) = tokenized {
-                            texts
+                    if let Some(schema) = catalog.schema(*collection) {
+                        let index = indexes.entry(*collection).or_default();
+                        index.rows.insert(schema, row as u32, object);
+                        if let Some(vector) = vector_of(row) {
+                            vectors
                                 .entry(*collection)
                                 .or_default()
-                                .insert_tokenized(row as u32, tokenized);
+                                .push((row as u32, vector));
                         }
                     }
-                    texts
-                },
-            )
-        })
-        .ok()?;
+                }
+                (indexes, vectors)
+            },
+            || {
+                let mut texts: HashMap<CollectionId, TextIndex> = HashMap::new();
+                for ((row, Row { collection, .. }), tokenized) in
+                    rows.iter().enumerate().zip(tokenized)
+                {
+                    if asked(row) {
+                        break;
+                    }
+                    if let Some(tokenized) = tokenized {
+                        texts
+                            .entry(*collection)
+                            .or_default()
+                            .insert_tokenized(row as u32, tokenized);
+                    }
+                }
+                texts
+            },
+        )
+    });
     if stopping.is_stopped() {
         return None;
     }
@@ -1342,7 +1338,7 @@ pub(crate) fn indexed_stopping<'a>(
         if stopping.stopped(MergeStage::Indexing) {
             return None;
         }
-        on.section("summarising", || index.rows.summarise()).ok()?;
+        on.section("summarising", || index.rows.summarise());
     }
     Some((indexes, threads.most()))
 }

@@ -1,18 +1,19 @@
-//! A pool for merges to build on (merge note, §9.2): a build given a pool
+//! Pools for merges to build on (merge note, §9.2): a build given a pool
 //! runs its parallel passes there and nothing else, its serial work and
 //! its turn to tune on the thread that called it, so that a pool's thread
-//! never waits for anything but a pass. A test binary of its own: the
-//! tuning pool is the process's. Its threads' priority is told in
-//! `merge_pool_nice`, alone, as other pools here would be counted.
+//! never waits for anything but a pass. Two real merges through the
+//! storage crate's pools are told in its `merge_pool_sections`. A test
+//! binary of its own: the tuning pool is the process's. Its threads'
+//! priority is told in `merge_pool_nice`, alone, as other pools here
+//! would be counted.
 
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::Mutex;
 
 use rayon::ThreadPool;
 use vellev_core::Distance;
 use vellev_index::clustered::ClusteredIndex;
 use vellev_index::pool::{self, Passes};
-use vellev_index::stop::{Stop, Stopped};
+use vellev_index::stop::Stop;
 use vellev_index::vector::BinaryIndex;
 
 /// Passes run on a pool, each kept: its name, and the thread it ran on.
@@ -23,21 +24,17 @@ struct OnPool<'a> {
 }
 
 impl Passes for OnPool<'_> {
-    fn pass<R: Send>(
-        self,
-        name: &'static str,
-        pass: impl FnOnce() -> R + Send,
-    ) -> Result<R, Stopped> {
+    fn pass<R: Send>(self, name: &'static str, pass: impl FnOnce() -> R + Send) -> R {
         assert_eq!(
             rayon::current_thread_index(),
             None,
             "{name} asked for from a pool's thread"
         );
-        Ok(self.pool.install(|| {
+        self.pool.install(|| {
             let thread = std::thread::current().name().unwrap_or("").to_string();
             self.ran.lock().unwrap().push((name, thread));
             pass()
-        }))
+        })
     }
 }
 
@@ -62,7 +59,7 @@ fn borrowed(rows: &[(u32, Vec<f32>)]) -> Vec<(u32, &[f32])> {
 /// one does. So does a binary one.
 #[test]
 fn a_build_given_a_pool_runs_every_pass_there_and_comes_out_the_same() {
-    let merges = pool::merge_builds(2, 0);
+    let merges = pool::merge_slots(1, 2, 0).pop().unwrap();
     let rows = rows(6_000, 32);
     let vectors = borrowed(&rows);
     let stop = Stop::new();
@@ -106,42 +103,19 @@ fn a_build_given_a_pool_runs_every_pass_there_and_comes_out_the_same() {
     );
 }
 
-/// Two clustered builds on a merge pool of one thread, asked for together,
-/// both finish: each waits for its turn to tune on its own thread, so
-/// neither parks the pool's one thread where the other needs it.
+/// A merge pool's threads are named for its slot, each pool as many as
+/// its share of the threads, and any left over from whole shares unused.
 #[test]
-fn two_builds_on_a_merge_pool_of_one_thread_both_finish() {
-    // Threads of their own, not scoped: were the builds to wait on each
-    // other for good, the test fails at its limit rather than hanging on
-    // them.
-    let merges = Arc::new(pool::merge_builds(1, 0));
-    let (done, finished) = mpsc::channel();
-    for build in 0..2 {
-        let (merges, done) = (merges.clone(), done.clone());
-        std::thread::spawn(move || {
-            let rows = rows(5_000 + build, 32);
-            let ran = Mutex::new(Vec::new());
-            let on = OnPool {
-                pool: &merges,
-                ran: &ran,
-            };
-            let vectors = borrowed(&rows);
-            let built =
-                ClusteredIndex::build_stopping_on(Distance::Cosine, &vectors, &Stop::new(), on);
-            done.send(built.unwrap().is_some()).unwrap();
-        });
+fn merge_slots_are_equal_shares_each_named_for_its_slot() {
+    let slots = pool::merge_slots(2, 5, 0);
+    assert_eq!(slots.len(), 2);
+    for (slot, merges) in slots.iter().enumerate() {
+        assert_eq!(merges.current_num_threads(), 2);
+        let named = merges.install(|| std::thread::current().name().map(str::to_string));
+        let named = named.unwrap();
+        assert!(
+            named.starts_with(&format!("vellev-merge-{slot}-")),
+            "{named}"
+        );
     }
-    for _ in 0..2 {
-        let one = finished.recv_timeout(Duration::from_secs(60));
-        assert!(one.expect("both built within 60 s: they wait on each other"));
-    }
-}
-
-/// A merge pool's threads are named for it, as many as it was made with.
-#[test]
-fn a_merge_pools_threads_are_named_for_it() {
-    let merges = pool::merge_builds(2, 0);
-    assert_eq!(merges.current_num_threads(), 2);
-    let named = merges.install(|| std::thread::current().name().map(str::to_string));
-    assert!(named.unwrap().starts_with("vellev-merge-"));
 }

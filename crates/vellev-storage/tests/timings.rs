@@ -191,12 +191,12 @@ async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
 }
 
-/// A build stopped before it was done is timed as long as it ran, apart
-/// from those that finished: a merge stopped again and again spends real
-/// CPU, and an arm's idle share of its build seconds must count it (review
-/// of #169). No finished build is timed for it.
+/// Merge work given up is timed apart from what finished, phase by phase:
+/// a merge stopped again and again spends real CPU, and an arm's idle
+/// share of its build seconds must count it (review of #169). A build
+/// given up is no finished build, nor a gather given up a finished one.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stopped_build_is_timed_apart_from_those_that_finished() {
+async fn work_given_up_is_timed_apart_from_what_finished() {
     let cluster = Cluster::new().await;
     let timings = Arc::new(Timings::default());
     let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
@@ -204,14 +204,50 @@ async fn a_stopped_build_is_timed_apart_from_those_that_finished() {
         writer.commit(notes(round * 10, 10)).await.unwrap();
         writer.flush().await.unwrap();
     }
-    writer.stop_merges_at(Some(vellev_storage::MergeStage::Encoding));
-    assert_eq!(writer.merge().await.unwrap(), None);
-    let events = timings.drain_events();
-    assert_eq!(
-        kept(&events, Timed::Merge(MergePhase::BuildStopped)).len(),
-        1
-    );
-    assert_eq!(kept(&events, Timed::Merge(MergePhase::Build)).len(), 0);
+    use vellev_storage::MergeStage;
+    for (stage, phase) in [
+        (MergeStage::Gathering, MergePhase::Gather),
+        (MergeStage::Encoding, MergePhase::Build),
+        (MergeStage::Uploading, MergePhase::Upload),
+        (MergeStage::Loading, MergePhase::Load),
+    ] {
+        timings.drain_events();
+        writer.stop_merges_at(Some(stage));
+        assert_eq!(writer.merge().await.unwrap(), None, "{stage:?}");
+        let events = timings.drain_events();
+        let given_up = kept(&events, Timed::MergeGivenUp(phase));
+        assert_eq!(given_up.len(), 1, "{stage:?}: {events:?}");
+        assert_eq!(kept(&events, Timed::Merge(phase)).len(), 0, "{stage:?}");
+    }
+}
+
+/// A stop too late to end a merge hides nothing of what did: one that
+/// fails to commit after it is counted failed, not stopped (review of
+/// #169).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_stop_does_not_hide_what_ended_a_merge() {
+    let mut cluster = Cluster::new().await;
+    let observed = cluster.observed();
+    cluster.blobs = observed.clone();
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    for round in 0..2 {
+        writer.commit(notes(round * 10, 10)).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    let gate = writer.hold_merges_before_commit();
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    gate.reached.notified().await;
+    assert!(writer.stop_merges(), "no merge under way");
+    assert_eq!(writer.stops_past_loading(), 1);
+    observed.fail_puts.store(true, Ordering::SeqCst);
+    gate.release.notify_one();
+    assert!(merging.await.unwrap().is_err(), "the commit went through");
+    assert_eq!(timings.merges_ended(MergeEnd::Failed), 1);
+    assert_eq!(timings.merges_ended(MergeEnd::Stopped), 0);
 }
 
 /// Rule 3. A spell at the backlog runs from the rows unflushed coming to

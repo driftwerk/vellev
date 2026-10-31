@@ -111,13 +111,7 @@ fn segment_built(
         build.held_here(stopping, HeldAt::Start);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
-    let vectors = match vectors {
-        Some(gathered) => match on.section("finishing", || gathered.finish(format)) {
-            Ok(column) => Some(column),
-            Err(_) => return Ok(None),
-        },
-        None => None,
-    };
+    let vectors = vectors.map(|gathered| on.section("finishing", || gathered.finish(format)));
     let indexes = match &vectors {
         Some(column) => state::indexed(
             catalog,
@@ -147,20 +141,13 @@ fn segment_built(
         return Ok(None);
     }
     let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
-    let Ok(segment) = on.section("encoding", || encode_as(Kind::Segment, format, &file)) else {
-        return Ok(None);
-    };
-    let segment = segment?;
+    let segment = on.section("encoding", || encode_as(Kind::Segment, format, &file))?;
     if stopping.stopped(MergeStage::Encoding) {
         return Ok(None);
     }
-    let Ok(column) = on.section("encoding_vectors", || vectors.encode_as(format)) else {
-        return Ok(None);
-    };
+    let column = on.section("encoding_vectors", || vectors.encode_as(format));
     // Here, off the async threads and the state's lock, once.
-    let Ok(parts) = on.section("parts", || state::Parts::of(&file, &indexes)) else {
-        return Ok(None);
-    };
+    let parts = on.section("parts", || state::Parts::of(&file, &indexes));
     if let Some(build) = build {
         build.held_here(stopping, HeldAt::Built);
     }
@@ -1254,6 +1241,10 @@ pub struct FlushTimes {
     pub waited: Duration,
     pub held: Option<Duration>,
 }
+
+/// The rows a build is of, ready to index, with what else their making
+/// says: `None` if there are to be none, as a merge's gather given up.
+type RowsToBuild<T> = Option<(SegmentFile, Option<Gathering>, T)>;
 
 /// A merge as it was planned, with all it takes of the state to build.
 struct MergePlanned {
@@ -2694,13 +2685,7 @@ impl Writer {
     /// ends, whoever stops waiting for it.
     async fn built_stopping<T: Send + 'static>(
         &self,
-        rows: impl FnOnce(
-                &Stopping,
-                Option<&MergeBuild>,
-                OnPool<'_>,
-            ) -> Option<(SegmentFile, Option<Gathering>, T)>
-            + Send
-            + 'static,
+        rows: impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<T> + Send + 'static,
         catalog: Catalog,
         stopping: &Stopping,
         build: Option<Arc<MergeBuild>>,
@@ -2713,8 +2698,13 @@ impl Writer {
         // runs. Once begun it is waited for to its end, which comes at the
         // stop as it asks it: so that the merge gives up only once what the
         // work holds is let go, not while it runs on unseen.
+        let waiting = Instant::now();
         let turn = working().acquire_owned();
-        let turn = match stopping.unless_stopped(MergeStage::Turn, turn).await {
+        let turn = stopping.unless_stopped(MergeStage::Turn, turn).await;
+        if build.is_some() {
+            self.phase_ended(MergePhase::Working, turn.is_some(), waiting);
+        }
+        let turn = match turn {
             Some(turn) => turn.map_err(|error| StorageError::Background(error.to_string()))?,
             None => return Ok(None),
         };
@@ -2732,7 +2722,7 @@ impl Writer {
             // it is. Its gather and its build each timed where they run, so
             // that neither counts the other.
             let on = match &build {
-                Some(build) => OnPool::merge(build.builds(), stopping.stop()),
+                Some(build) => OnPool::merge(build),
                 None => OnPool::global(),
             };
             let cpu = vellev_index::pool::thread_cpu();
@@ -2751,12 +2741,11 @@ impl Writer {
                         on,
                     );
                     let phase = match &built {
-                        Ok(Some(_)) => Some(MergePhase::Build),
-                        Ok(None) => Some(MergePhase::BuildStopped),
-                        Err(_) => None,
+                        Ok(Some(_)) => Timed::Merge(MergePhase::Build),
+                        Ok(None) | Err(_) => Timed::MergeGivenUp(MergePhase::Build),
                     };
-                    if let Some(phase) = phase.filter(|_| build.is_some()) {
-                        timings.record(Timed::Merge(phase), &key, building.elapsed());
+                    if build.is_some() {
+                        timings.record(phase, &key, building.elapsed());
                     }
                     built.map(|built| built.map(|built| (built, with)))
                 }
@@ -3010,6 +2999,15 @@ impl Writer {
         self.merging(None, flush_due).await
     }
 
+    /// Time a merge's `phase`, begun at `began`, as come through or not.
+    fn phase_ended(&self, phase: MergePhase, through: bool, began: Instant) {
+        let timed = match through {
+            true => Timed::Merge(phase),
+            false => Timed::MergeGivenUp(phase),
+        };
+        self.timed(timed, began.elapsed());
+    }
+
     /// Whether a merge planned at epoch `planned` is stale now, and so is
     /// to be dropped; said if so.
     fn stale(&self, planned: u64) -> bool {
@@ -3109,16 +3107,13 @@ impl Writer {
         let Some((build, planning)) = self.turn_and_building(&stopping, flush_due).await? else {
             return Ok(None);
         };
-        // Counted by how it ended, once it has its turn: a stop is told
-        // from a run found changed by whether the merge was stopped.
+        // Counted by what ended it, once it has its turn: a stop too late
+        // to end it, as one past loading back, hides nothing of what did.
         let ended = self
             .merged_in_turn(build, planning, planned, &stopping)
             .await;
         let end = match &ended {
             Ok(Ended::Committed(_)) => MergeEnd::Committed,
-            // First: a restore that stops a merge has still made it stale.
-            Ok(Ended::Dropped(MergeEnd::Stale)) => MergeEnd::Stale,
-            Ok(Ended::Dropped(_)) | Err(_) if stopping.is_stopped() => MergeEnd::Stopped,
             Ok(Ended::Dropped(end)) => *end,
             Err(_) => MergeEnd::Failed,
         };
@@ -3126,6 +3121,16 @@ impl Writer {
         ended.map(|ended| match ended {
             Ended::Committed(position) => Some(position),
             Ended::Dropped(_) => None,
+        })
+    }
+
+    /// How a merge planned at the epoch `planned` ended, that gave up as it
+    /// was stopped or, if `restored`, as a restore began: stale if a restore
+    /// came, as a merge stopped by one, or both, could never have committed.
+    fn given_up(&self, planned: u64, restored: bool) -> Ended {
+        Ended::Dropped(match self.stale(planned) || restored {
+            true => MergeEnd::Stale,
+            false => MergeEnd::Stopped,
         })
     }
 
@@ -3170,43 +3175,41 @@ impl Writer {
         );
         let built = self.built_stopping(gather, catalog.clone(), stopping, Some(build.clone()));
         let Some((built, shape)) = built.await? else {
-            // Said if a restore is what ended it: one that was made, or one
-            // under way that the gather gave up for, though it may have
-            // ended since.
-            let stale = self.stale(planned) || restored.load(Ordering::SeqCst);
-            return Ok(Ended::Dropped(if stale {
-                MergeEnd::Stale
-            } else {
-                MergeEnd::Stopped
-            }));
+            // A restore under way that the gather gave up for is said so,
+            // though it may have ended since.
+            return Ok(self.given_up(planned, restored.load(Ordering::SeqCst)));
         };
         // Both segments, however large, are uploaded without the writer,
         // under names of their own at the position each was built from;
         // `clean` leaves the merge's while it is under way.
         let mut staged = self.staging();
+        let encoding = Instant::now();
         let merged = Self::prepared(
             self.named(named_at, "-merged").meta(shape),
             built,
             self.writes(),
-        )?;
+        );
+        self.phase_ended(MergePhase::Encode, merged.is_ok(), encoding);
+        let merged = merged?;
         if stopping.stopped(MergeStage::Encoding) {
-            return Ok(Ended::Dropped(MergeEnd::Stopped));
+            return Ok(self.given_up(planned, false));
         }
         let _keeping = self.keep(&merged.meta);
         let uploading = Uploading::new(build.clone());
         staged.carrying = Some(uploading.clone());
         let upload = Instant::now();
-        if !self
+        let uploaded = self
             .upload_stopping(&merged, &mut staged, stopping, Some(&uploading))
-            .await?
-        {
-            return Ok(Ended::Dropped(MergeEnd::Stopped));
+            .await;
+        self.phase_ended(MergePhase::Upload, matches!(uploaded, Ok(true)), upload);
+        if !uploaded? {
+            return Ok(self.given_up(planned, false));
         }
-        self.timed(Timed::Merge(MergePhase::Upload), upload.elapsed());
         let loading = Instant::now();
         let fit = self.fit(merged, &catalog, Some(stopping));
         let Some(merged) = stopping.unless_stopped(MergeStage::Loading, fit).await else {
-            return Ok(Ended::Dropped(MergeEnd::Stopped));
+            self.phase_ended(MergePhase::Load, false, loading);
+            return Ok(self.given_up(planned, false));
         };
         // From here the merge commits, or is dropped by what it finds under
         // the building lock: a stop no longer ends it. Marked so under the
@@ -3223,11 +3226,11 @@ impl Writer {
         };
         // A stop heeded here wins over what loading back came to: a load
         // given up as it was stopped fails, and is no failure of the merge.
+        self.phase_ended(MergePhase::Load, !heeded && merged.is_ok(), loading);
         if heeded {
-            return Ok(Ended::Dropped(MergeEnd::Stopped));
+            return Ok(self.given_up(planned, false));
         }
         let merged = merged?;
-        self.timed(Timed::Merge(MergePhase::Load), loading.elapsed());
         let gate = self.merge_gate.lock().expect("gate lock").clone();
         if let Some(gate) = gate {
             gate.reached.notify_one();
@@ -3313,13 +3316,8 @@ impl Writer {
         named_at: LogPosition,
         catalog: Catalog,
         restored: Arc<AtomicBool>,
-    ) -> impl FnOnce(
-        &Stopping,
-        Option<&MergeBuild>,
-        OnPool<'_>,
-    ) -> Option<(SegmentFile, Option<Gathering>, Shape)>
-           + Send
-           + 'static {
+    ) -> impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<Shape> + Send + 'static
+    {
         let (epoch, restoring) = (self.epoch.clone(), self.restoring.clone());
         let above = self.merging.clustered_above;
         let (timings, key) = (self.timings.clone(), self.lease.key.clone());
@@ -3327,7 +3325,7 @@ impl Writer {
             // On the pool its node gives merge builds, as the rest of the
             // build is; timed from its turn there, so that the copy alone
             // is, however long it waits or is held.
-            let gathered = on.section("gathering", || {
+            on.section("gathering", || {
                 let gathering = Instant::now();
                 let mut goes_on = |rows| {
                     if let Some(build) = build {
@@ -3339,13 +3337,21 @@ impl Writer {
                     restored.fetch_or(restoring, Ordering::SeqCst);
                     !stopped && !restoring
                 };
-                let (file, vectors, copied) =
-                    run.merged(named_at, GATHERED_AT_ONCE, &mut goes_on)?;
+                let given_up = |gathering: Instant| {
+                    let phase = Timed::MergeGivenUp(MergePhase::Gather);
+                    timings.record(phase, &key, gathering.elapsed());
+                };
+                let merged = run.merged(named_at, GATHERED_AT_ONCE, &mut goes_on);
+                let Some((file, vectors, copied)) = merged else {
+                    given_up(gathering);
+                    return None;
+                };
                 let tombstones = file.tombstones.len();
                 let shape = Shape::of_gathered(&catalog, &file.rows, &vectors, tombstones, above);
                 // Asked once more, as what comes next, sealing the frame,
                 // sums every vector with nothing to ask it.
                 if !goes_on(file.rows.len()) {
+                    given_up(gathering);
                     return None;
                 }
                 if let Some(build) = build {
@@ -3354,8 +3360,7 @@ impl Writer {
                 }
                 timings.record(Timed::Merge(MergePhase::Gather), &key, gathering.elapsed());
                 Some((file, Some(vectors), shape))
-            });
-            gathered.ok().flatten()
+            })
         }
     }
 

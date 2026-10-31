@@ -760,10 +760,10 @@ many bytes each index takes in memory, and `TextIndex::tokenized_resident`,
 about how many its rows take tokenized all at once before they are
 indexed. A merge reckons what its build holds from them.
 
-New, additive: `pool::merge_builds(threads, nice)`, a pool for merges to
-build on apart from the global one: `threads` threads named
-`vellev-merge-N`, each run `nice` lower than the process on Linux, made
-after the read, tuning and passes pools.
+New, additive: `pool::merge_slots(slots, threads, nice)`, pools for merges
+to build on apart from the global one: `slots` pools of `threads / slots`
+threads, those of slot `s` named `vellev-merge-s-N`, each run `nice` lower
+than the process on Linux, made after the read, tuning and passes pools.
 
 New, additive: `ClusteredIndex::build_stopping_on` and
 `BinaryIndex::build_stopping_on`, as `build_stopping`, each parallel pass
