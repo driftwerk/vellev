@@ -3979,18 +3979,27 @@ mod tests {
     }
 
     /// A collection dropped beside a live one in a segment counts for
-    /// nothing of its text, though the segment's rows are not all dead.
+    /// nothing of its text, though the segment's rows are not all dead: it
+    /// comes to no more than if nothing of it had been searchable.
     #[test]
     fn a_dropped_collection_beside_a_live_one_reckons_none_of_its_text() {
-        let reckoned = |dropped: bool| {
-            let mut built = Built::new(&["other"]);
-            built.commit(vec![Op::CreateCollection {
-                id: CollectionId(5),
-                schema: Box::new(Collection {
-                    properties: vec![Property::new("title", DataType::Text).searchable()],
-                    ..schema("texts")
-                }),
-            }]);
+        let reckoned = |searchable: bool| {
+            let title = Property::new("title", DataType::Text);
+            let mut built = Built::new(&[]);
+            built.commit(vec![
+                long_text_collection(),
+                Op::CreateCollection {
+                    id: CollectionId(5),
+                    schema: Box::new(Collection {
+                        properties: vec![match searchable {
+                            true => title.searchable(),
+                            false => title,
+                        }],
+                        ..schema("dropped")
+                    }),
+                },
+            ]);
+            built.commit((0..2_000).map(|n| long_or_short(n, false)).collect());
             let rows = (0..2_000u128).map(|n| Op::Upsert {
                 collection: CollectionId(5),
                 object: Object {
@@ -4003,27 +4012,21 @@ mod tests {
                 },
             });
             built.commit(rows.collect());
-            built.commit(
-                (0..2_000)
-                    .map(|n| upsert(0, 10_000 + n, n as i64))
-                    .collect(),
-            );
             built.flush();
-            if dropped {
-                built.commit(vec![Op::DropCollection {
-                    collection: CollectionId(5),
-                }]);
-            }
+            built.commit(vec![Op::DropCollection {
+                collection: CollectionId(5),
+            }]);
             let plan = Merge {
                 run: 0..1,
                 keys: Vec::new(),
             };
             built.state.merge_reckoning(&plan, CLUSTERED_ABOVE)
         };
-        let (live, dropped) = (reckoned(false), reckoned(true));
+        let (dropped, untexted) = (reckoned(true), reckoned(false));
+        assert!(dropped.indexed > 0.0, "{dropped:?}");
         assert!(
-            dropped.indexed < 0.6 * live.indexed,
-            "{dropped:?}, {live:?}"
+            dropped.indexed <= untexted.indexed,
+            "{dropped:?}, {untexted:?}"
         );
     }
 
