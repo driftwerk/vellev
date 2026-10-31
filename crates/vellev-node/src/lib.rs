@@ -1717,7 +1717,8 @@ impl Node {
     /// in memory together, as of now. Read under the node's own lock and
     /// holding no tenant, as warming asks it before each copy it opens: a
     /// sweep lets go only what nothing else holds, so asking must never
-    /// hold one. Each is a read of what its state counts as it changes.
+    /// hold one. Each is a read of what its state counts as it changes,
+    /// and of what it has yet to free.
     pub fn resident(&self) -> usize {
         self.0.resident()
     }

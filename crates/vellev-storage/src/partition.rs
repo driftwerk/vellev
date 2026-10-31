@@ -1900,11 +1900,10 @@ impl Writer {
 
     /// Commit the checkpoint `frame` under `key` at `position` and adopt it
     /// in memory as `adopt` does, which is all a checkpoint does while the
-    /// writer is held; then give the turn back and let what the checkpoint
-    /// took out of memory go, to be freed off the async threads with nothing
-    /// waiting for it (see [`Discarded`]). Once the commit is made nothing
-    /// is left to fail: what `adopt` adopts was seen to be fit before the
-    /// writer was held.
+    /// writer is held; then give the turn back and free what the checkpoint
+    /// took out of memory, off the async threads. Once the commit is made
+    /// nothing is left to fail: what `adopt` adopts was seen to be fit
+    /// before the writer was held.
     async fn checkpoint(
         &self,
         turn: Turn<'_>,
@@ -1942,7 +1941,14 @@ impl Writer {
             }
         }
         drop(turn);
-        drop(discarded);
+        // The building lock is held here. Segments a merge replaced take
+        // seconds to free, and whatever waits for that lock is not to wait
+        // for them: they go off on their own (see `Discarded`'s `drop`). A
+        // flush's rows are few, and gone by the time it ends.
+        match discarded.replaced() {
+            true => drop(discarded),
+            false => blocking(move || discarded.free()).await?,
+        }
         Ok(())
     }
 

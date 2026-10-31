@@ -1158,15 +1158,41 @@ impl Discarded {
         let freeing = freeing.clone();
         self.counted = Some(Counted { freeing, bytes });
     }
+
+    /// Whether it holds segments a merge replaced.
+    pub(crate) fn replaced(&self) -> bool {
+        !self.segments.is_empty()
+    }
+
+    /// Free it here: for a thread off the async ones.
+    pub(crate) fn free(mut self) {
+        self.taken()();
+    }
+
+    /// What frees all it holds, which leaves it nothing to free.
+    fn taken(&mut self) -> impl FnOnce() + Send + 'static {
+        let rows = std::mem::take(&mut self.rows);
+        let indexes = std::mem::take(&mut self.indexes);
+        let segments = std::mem::take(&mut self.segments);
+        let counted = self.counted.take();
+        #[cfg(test)]
+        let probe = self.probe.take();
+        move || {
+            #[cfg(test)]
+            drop(probe);
+            drop((segments, rows, indexes));
+            drop(counted);
+        }
+    }
 }
 
 impl Drop for Discarded {
-    /// Let go on an async thread, as a checkpoint lets it go, and as one
-    /// dropped once adopted does where it stood: it may be the last to hold
-    /// a replaced segment of a million rows. Sent off without a turn among
-    /// the work there, and not waited for, as a [`Run`] is: what lets it go
-    /// holds the building lock, and whatever waits for that, as a flush
-    /// does, would wait for the turn and the free too.
+    /// Let go on an async thread, as a merge's commit lets it go, and as a
+    /// checkpoint dropped once adopted does where it stood: it may be the
+    /// last to hold a replaced segment of a million rows. Sent off without
+    /// a turn among the work there, and not waited for, as a [`Run`] is:
+    /// what lets it go holds the building lock, and whatever waits for
+    /// that, as a flush does, would wait for the turn and the free too.
     fn drop(&mut self) {
         #[cfg(test)]
         for segment in &self.segments {
@@ -1174,21 +1200,10 @@ impl Drop for Discarded {
                 (probe.0)(Probed::LetGo);
             }
         }
-        let rows = std::mem::take(&mut self.rows);
-        let indexes = std::mem::take(&mut self.indexes);
-        let segments = std::mem::take(&mut self.segments);
-        let counted = self.counted.take();
-        #[cfg(test)]
-        let probe = self.probe.take();
-        if rows.is_empty() && indexes.is_empty() && segments.is_empty() {
+        if self.rows.is_empty() && self.indexes.is_empty() && self.segments.is_empty() {
             return;
         }
-        let free = move || {
-            #[cfg(test)]
-            drop(probe);
-            drop((segments, rows, indexes));
-            drop(counted);
-        };
+        let free = self.taken();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => drop(runtime.spawn_blocking(free)),
             Err(_) => free(),
