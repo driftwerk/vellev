@@ -785,6 +785,13 @@ impl Collector for Counted {
                 merges.draining,
             ),
             (
+                "merge_commits_waiting_bytes",
+                "About how many bytes merges hold now that gave their turns back to wait to \
+                 commit, as of what they hold, not their peak: going on, and in no total a \
+                 sweep answers",
+                merges.waiting_to_commit,
+            ),
+            (
                 "merge_abandoned_bytes",
                 "About how many bytes stores keep of merges whose turns were let go for it",
                 merges.abandoned,

@@ -398,6 +398,12 @@ impl MergeBuilds {
         under_way.iter().filter(holding_turns).count()
     }
 
+    /// About how many bytes merges hold that gave their turns back to wait
+    /// to commit. None yet.
+    pub fn waiting_to_commit(&self) -> usize {
+        0
+    }
+
     /// How many times a merge has taken a turn, however it went. For tests.
     #[doc(hidden)]
     pub fn turns_taken(&self) -> u64 {

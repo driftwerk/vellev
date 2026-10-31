@@ -288,6 +288,11 @@ async fn what_waits_for_a_flush_and_flushes_that_failed_are_reported() {
         "{text}"
     );
     assert_eq!(value("vellev_merge_draining_bytes"), Some(0.0), "{text}");
+    assert_eq!(
+        value("vellev_merge_commits_waiting_bytes"),
+        Some(0.0),
+        "{text}"
+    );
     assert_eq!(value("vellev_merge_abandoned_bytes"), Some(0.0), "{text}");
     assert_eq!(value("vellev_tenants_freeing_bytes"), Some(0.0), "{text}");
     assert!(

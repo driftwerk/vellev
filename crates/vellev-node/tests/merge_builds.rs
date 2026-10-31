@@ -18,6 +18,7 @@ use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{MergesStopped, Node, NodeError, Settings};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
+use vellev_storage::timings::{Holder, Timed};
 use vellev_storage::{Holding, MergeGate, Mutation, State, MERGE_BUILDS};
 
 /// Notes written between flushes: as many as a flush is made at.
@@ -1153,23 +1154,14 @@ impl Blobs for SlowListing {
     }
 }
 
-/// A tenant's flushes go on whatever its round waits on. Written when a
-/// round's merge gave way to a flush, and did nothing more: since M5 no merge
-/// of a node gives way, and the round waits for its turn, cleaning up not
-/// being overdue. Giving way's own rules are in the storage crate.
+/// A tenant's flushes go on while its own merge waits for a turn, however
+/// long: they are on a task of their own, and nothing of them waits for its
+/// round.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_round_whose_merge_gives_way_to_a_flush_does_nothing_more() {
-    let slow = Arc::new(SlowListing {
-        inner: Arc::new(ObjectBlobs::new(Arc::new(
-            object_store::memory::InMemory::new(),
-        ))),
-        armed: AtomicBool::new(false),
-    });
-    let node = node_on(slow.clone(), |settings| {
+async fn a_flush_goes_on_while_its_tenant_s_merge_waits_for_a_turn() {
+    let node = node(|settings| {
         settings.flush_rows = NOTES as usize;
         settings.tenant_idle = Duration::from_secs(60 * 60);
-        // Cleaning up is not due again for an hour.
-        settings.clean_at_least_every = Duration::from_secs(60 * 60);
     });
     let builds = node.merge_builds().clone();
     builds.hold(Some(Holding::UntilLetGo));
@@ -1179,7 +1171,6 @@ async fn a_round_whose_merge_gives_way_to_a_flush_does_nothing_more() {
     four_flushes(&node, "written").await;
     let written = node.tenant(&tenant("written")).await.unwrap();
     let before = written.read(|state| state.segments().count());
-    slow.armed.store(true, Ordering::SeqCst);
     let writing = Arc::new(AtomicBool::new(true));
     let writes = steadily(written.clone(), writing.clone());
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1188,8 +1179,55 @@ async fn a_round_whose_merge_gives_way_to_a_flush_does_nothing_more() {
     let flushed = written.read(|state| state.segments().count()) - before;
     assert!(
         flushed >= 10,
-        "the tenant flushed {flushed} times while its rounds' cleaning up waited on the store"
+        "the tenant flushed {flushed} times while its merge waited for a turn"
     );
+    builds.hold(None);
+    until(60, "a build was left counted under way", || {
+        builds.under_way() == 0
+    })
+    .await;
+}
+
+/// A round starting with cleaning up long overdue plans its merge first, and
+/// the clean comes a whole interval on: it holds the lock a merge plans
+/// under, and at its start it would take that lock from the merge it is
+/// beside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_round_s_merge_plans_before_a_clean_overdue_as_the_round_begins() {
+    let slow = Arc::new(SlowListing {
+        inner: Arc::new(ObjectBlobs::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        ))),
+        armed: AtomicBool::new(false),
+    });
+    let node = node_on(slow.clone(), |settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+        settings.clean_at_least_every = Duration::from_secs(1);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    node.create_tenant(&tenant("merging")).await.unwrap();
+    let held = node.tenant(&tenant("merging")).await.unwrap();
+    held.write(vec![notes()]).await.unwrap();
+    for flush in 0..3 {
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(flush * NOTES + n)).collect();
+        held.write(batch).await.unwrap();
+        until(30, "the node never flushed the tenant", || {
+            held.read(State::unflushed) == 0
+        })
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    slow.armed.store(true, Ordering::SeqCst);
+    let batch: Vec<Mutation> = (0..NOTES).map(|n| note(3 * NOTES + n)).collect();
+    held.write(batch).await.unwrap();
+    until(
+        5,
+        "a clean took the lock from the merge it is beside",
+        || builds.held() == 1,
+    )
+    .await;
     slow.armed.store(false, Ordering::SeqCst);
     builds.hold(None);
     until(60, "a build was left counted under way", || {
@@ -1198,10 +1236,53 @@ async fn a_round_whose_merge_gives_way_to_a_flush_does_nothing_more() {
     .await;
 }
 
+/// A flush task woken while another flush has rows taken, not yet adopted,
+/// looks again once it has the lock: what was due has gone, and the few left
+/// wait for the flush they will make, not a small segment of their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_task_behind_a_flush_that_took_its_rows_flushes_nothing() {
+    let store = failing_flushes();
+    let node = node_on(store.clone(), |settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    node.create_tenant(&tenant("written")).await.unwrap();
+    let held = node.tenant(&tenant("written")).await.unwrap();
+    held.write(vec![notes()]).await.unwrap();
+    let batch: Vec<Mutation> = (0..NOTES - 1).map(note).collect();
+    held.write(batch).await.unwrap();
+    store.holding.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let held = held.clone();
+        async move { held.flush().await }
+    });
+    until(10, "the flush never began to go up", || {
+        store.held.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // Comes to a flush's worth, counting what that flush has taken.
+    held.write(vec![note(1_000), note(1_001)]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    store.holding.store(false, Ordering::SeqCst);
+    within(30, "the flush never ended", flushing)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        held.read(|state| state.segments().count()),
+        1,
+        "a flush behind a flush made a small segment of what was left"
+    );
+    assert_eq!(held.read(State::unflushed), 2);
+}
+
 /// A store that counts its listings: cleaning up lists the partition.
 #[derive(Debug)]
 struct CountedListing {
     inner: Arc<dyn Blobs>,
+    /// The tenant whose listings are counted: others' rounds list too.
+    tenant: &'static str,
     listed: AtomicUsize,
 }
 
@@ -1214,7 +1295,9 @@ impl Blobs for CountedListing {
         self.inner.get(key).await
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
-        self.listed.fetch_add(1, Ordering::SeqCst);
+        if prefix.starts_with(self.tenant) {
+            self.listed.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
@@ -1230,6 +1313,7 @@ async fn under_writes_that_never_let_up_a_tenant_is_still_cleaned_up() {
         inner: Arc::new(ObjectBlobs::new(Arc::new(
             object_store::memory::InMemory::new(),
         ))),
+        tenant: "written",
         listed: AtomicUsize::new(0),
     });
     let node = node_on(counted.clone(), |settings| {
@@ -1492,6 +1576,7 @@ async fn a_merge_queued_for_a_turn_holds_nothing_of_its_round_behind_it() {
         inner: Arc::new(ObjectBlobs::new(Arc::new(
             object_store::memory::InMemory::new(),
         ))),
+        tenant: "quiet",
         listed: AtomicUsize::new(0),
     });
     let node = node_on(counted.clone(), |settings| {
@@ -1520,24 +1605,116 @@ async fn a_merge_queued_for_a_turn_holds_nothing_of_its_round_behind_it() {
     .await;
 }
 
-/// A node whose flush task, once a flush has failed, tries no more for the
-/// length of the rule, on a store that fails as many flushes as are armed:
-/// and a tenant whose merge is held past loading, with a flush's worth of
-/// rows left to it by a flush that failed.
-async fn rows_left_to_a_merge() -> (
-    Node,
-    Arc<FailingFlushes>,
-    Arc<vellev_node::Tenant>,
-    Arc<MergeGate>,
-) {
-    let store = Arc::new(FailingFlushes {
+fn failing_flushes() -> Arc<FailingFlushes> {
+    Arc::new(FailingFlushes {
         inner: Arc::new(ObjectBlobs::new(Arc::new(
             object_store::memory::InMemory::new(),
         ))),
         failing: AtomicUsize::new(0),
         holding: AtomicBool::new(false),
         held: AtomicUsize::new(0),
+        holding_listings: AtomicBool::new(false),
+        listing: AtomicBool::new(false),
+    })
+}
+
+/// Tenant "merging" with its merge past loading and let go to its commit,
+/// behind a clean beside it that a held listing holds the lock for; then a
+/// flush's worth of rows, its flush task queued behind the merge. So that
+/// the merge's flush first is the next to run, once
+/// [`FailingFlushes::holding_listings`] is cleared.
+async fn a_flush_first_next(node: &Node, store: &FailingFlushes) -> Arc<vellev_node::Tenant> {
+    let gate = past_loading(node, "merging").await;
+    let held = node.tenant(&tenant("merging")).await.unwrap();
+    store.holding_listings.store(true, Ordering::SeqCst);
+    until(10, "no clean came beside the merge", || {
+        store.listing.load(Ordering::SeqCst)
+    })
+    .await;
+    gate.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let batch: Vec<Mutation> = (0..NOTES).map(|n| note(1_000 + n)).collect();
+    held.write(batch).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    held
+}
+
+/// Settings for [`a_flush_first_next`]'s node.
+fn cleaning_each_second(settings: &mut Settings) {
+    settings.flush_rows = NOTES as usize;
+    settings.tenant_idle = Duration::from_secs(60 * 60);
+    settings.clean_at_least_every = Duration::from_secs(1);
+}
+
+/// A flush first that fails counts as any flush that fails, in the tenant's
+/// backoff and the node's count, and leaves its rows to the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_first_that_fails_counts_as_a_flush_that_failed() {
+    let store = failing_flushes();
+    let node = node_on(store.clone(), cleaning_each_second);
+    let held = a_flush_first_next(&node, &store).await;
+    store.failing.store(1, Ordering::SeqCst);
+    store.holding_listings.store(false, Ordering::SeqCst);
+    until(30, "the flush first's failure was not counted", || {
+        node.flushing().failed == 1
+    })
+    .await;
+    until(30, "the merge never flushed its rows along", || {
+        held.read(State::unflushed) == 0
+    })
+    .await;
+    assert_eq!(node.flushing().failed, 1);
+    assert_eq!(held.flushes_failing(), 0, "the flush along is no flush");
+}
+
+/// A flush first that goes through ends the tenant's backoff, as any flush
+/// that goes through, and the round it was made in follows it, as it follows
+/// a flush along: it leaves the tenant settled in moments, with no round of
+/// its own to wait for, and nothing owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_first_that_goes_through_leaves_its_tenant_settled() {
+    let store = failing_flushes();
+    let backoff = Duration::from_secs(4);
+    let node = node_on(store.clone(), |settings| {
+        cleaning_each_second(settings);
+        settings.flush_backoff = backoff;
     });
+    let gate = past_loading(&node, "merging").await;
+    let held = node.tenant(&tenant("merging")).await.unwrap();
+    store.failing.store(1, Ordering::SeqCst);
+    let batch: Vec<Mutation> = (0..NOTES).map(|n| note(1_000 + n)).collect();
+    held.write(batch).await.unwrap();
+    until(10, "the flush never failed", || node.flushing().failed == 1).await;
+    let tried_again = std::time::Instant::now() + backoff;
+    store.holding_listings.store(true, Ordering::SeqCst);
+    until(3, "no clean came beside the merge", || {
+        store.listing.load(Ordering::SeqCst)
+    })
+    .await;
+    gate.release.notify_one();
+    tokio::time::sleep(tried_again.saturating_duration_since(std::time::Instant::now())).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(held.flushes_failing(), 1);
+    store.holding_listings.store(false, Ordering::SeqCst);
+    until(10, "a flush first left its tenant unsettled", || {
+        node.unsettled() == 0
+    })
+    .await;
+    assert_eq!(held.read(State::unflushed), 0);
+    assert_eq!(node.flushing().failed, 1);
+    assert_eq!(
+        held.flushes_failing(),
+        0,
+        "the backoff outlived the flush first"
+    );
+}
+
+/// A flush first asks the tenant's backoff, as its flush task does: with
+/// flushes failing lately it leaves the store alone, and the rows go with
+/// the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_first_is_put_off_by_a_failed_flush_as_any_flush_is() {
+    let store = failing_flushes();
     let node = node_on(store.clone(), |settings| {
         settings.flush_rows = NOTES as usize;
         settings.tenant_idle = Duration::from_secs(60 * 60);
@@ -1549,55 +1726,24 @@ async fn rows_left_to_a_merge() -> (
     let batch: Vec<Mutation> = (0..NOTES).map(|n| note(1_000 + n)).collect();
     held.write(batch).await.unwrap();
     until(10, "the flush never failed", || node.flushing().failed == 1).await;
-    (node, store, held, gate)
-}
-
-/// A flush first that fails counts as any flush that fails, in the tenant's
-/// backoff and the node's count, and leaves its rows to the commit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_flush_first_that_fails_counts_as_a_flush_that_failed() {
-    let (node, store, held, gate) = rows_left_to_a_merge().await;
-    store.failing.store(1, Ordering::SeqCst);
+    let flushes = || {
+        let holds = node.timings().seconds(Timed::BuildingHeld(Holder::Flush));
+        holds.count
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = flushes();
     gate.release.notify_one();
-    until(30, "the flush first's failure was not counted", || {
-        node.flushing().failed == 2
-    })
-    .await;
     until(30, "the merge never flushed its rows along", || {
         held.read(State::unflushed) == 0
     })
     .await;
-    assert_eq!(node.flushing().failed, 2);
+    assert_eq!(flushes(), before, "a flush first went through a backoff");
 }
 
-/// A flush first that goes through ends the tenant's backoff, as any flush
-/// that goes through. The round it was made in follows it, as it follows a
-/// flush along: it leaves the tenant settled in moments, with no round of
-/// its own to wait for, and nothing owed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_flush_first_that_goes_through_leaves_its_tenant_settled() {
-    let (node, _store, held, gate) = rows_left_to_a_merge().await;
-    assert_eq!(node.unsettled(), 1);
-    gate.release.notify_one();
-    until(10, "a flush first left its tenant unsettled", || {
-        node.unsettled() == 0
-    })
-    .await;
-    assert_eq!(held.read(State::unflushed), 0);
-    assert_eq!(node.flushing().failed, 1);
-    let batch: Vec<Mutation> = (0..NOTES).map(|n| note(2_000 + n)).collect();
-    held.write(batch).await.unwrap();
-    until(10, "the backoff outlived the flush first", || {
-        held.read(State::unflushed) == 0
-    })
-    .await;
-}
-
-/// The merge of [`rows_left_to_a_merge`] let go to its commit, with its flush
-/// first held part way.
-async fn a_flush_first_held_part_way(store: &FailingFlushes, gate: &MergeGate) {
+/// The merge of [`a_flush_first_next`], its flush first held part way up.
+async fn a_flush_first_held_part_way(store: &FailingFlushes) {
     store.holding.store(true, Ordering::SeqCst);
-    gate.release.notify_one();
+    store.holding_listings.store(false, Ordering::SeqCst);
     until(30, "the flush first never began to go up", || {
         store.held.load(Ordering::SeqCst) == 1
     })
@@ -1608,8 +1754,10 @@ async fn a_flush_first_held_part_way(store: &FailingFlushes, gate: &MergeGate) {
 /// the flush goes on, and the merge commits, as it would have at its commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_during_a_flush_first_ends_neither_it_nor_its_merge() {
-    let (node, store, held, gate) = rows_left_to_a_merge().await;
-    a_flush_first_held_part_way(&store, &gate).await;
+    let store = failing_flushes();
+    let node = node_on(store.clone(), cleaning_each_second);
+    let held = a_flush_first_next(&node, &store).await;
+    a_flush_first_held_part_way(&store).await;
     held.stop_merges();
     tokio::time::sleep(Duration::from_millis(200)).await;
     store.holding.store(false, Ordering::SeqCst);
@@ -1628,13 +1776,36 @@ async fn a_stop_during_a_flush_first_ends_neither_it_nor_its_merge() {
     assert_eq!(node.merges().stopped, MergesStopped::default());
 }
 
+/// Two nodes in turn on `coordinator` and `store`, set as `set` says.
+fn node_on_shared(
+    coordinator: &Arc<dyn Coordinator>,
+    store: &Arc<FailingFlushes>,
+    set: impl FnOnce(&mut Settings),
+) -> Node {
+    let mut settings = Settings {
+        warm: None,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    set(&mut settings);
+    Node::new(
+        coordinator.clone(),
+        store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        settings,
+    )
+}
+
 /// Losing the hold cuts a merge flushing first with its task, as it cuts one
-/// past loading anywhere: counted once, its build let go, and the rows of its
-/// flush, which went nowhere, read again by the next to open the tenant.
+/// past loading anywhere: counted once, its build let go. The rows of its
+/// flush went nowhere, and the next to open the tenant reads every row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hold_lost_during_a_flush_first_ends_it_with_its_merge_counted_once() {
-    let (node, store, _held, gate) = rows_left_to_a_merge().await;
-    a_flush_first_held_part_way(&store, &gate).await;
+    let store = failing_flushes();
+    let coordinator: Arc<dyn Coordinator> = Arc::new(MemoryCoordinator::default());
+    let node = node_on_shared(&coordinator, &store, cleaning_each_second);
+    let held = a_flush_first_next(&node, &store).await;
+    let rows = held.read(State::rows);
+    a_flush_first_held_part_way(&store).await;
     let builds = node.merge_builds().clone();
     within(10, "the shutdown never ended", node.shutdown()).await;
     let counted = MergesStopped {
@@ -1648,7 +1819,139 @@ async fn a_hold_lost_during_a_flush_first_ends_it_with_its_merge_counted_once() 
     .await;
     assert_eq!(node.merges().stopped, counted);
     store.holding.store(false, Ordering::SeqCst);
+    drop(held);
+    let next = node_on_shared(&coordinator, &store, cleaning_each_second);
+    let opened = next.tenant(&tenant("merging")).await.unwrap();
+    assert_eq!(
+        opened.read(State::rows),
+        rows,
+        "rows lost with a flush first"
+    );
 }
+
+/// A flush first and the flush along behind it that both fail leave the rows
+/// where they were: the next to open the tenant reads every one. With rows
+/// replayed, no write has asked for a flush, and the flush task, told of
+/// the backoff, tries again as it ends, where it would sleep for its minute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_first_that_fails_wakes_the_flush_task_and_loses_nothing() {
+    let store = failing_flushes();
+    let coordinator: Arc<dyn Coordinator> = Arc::new(MemoryCoordinator::default());
+    let first = node_on_shared(&coordinator, &store, |settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.flush_backoff = Duration::from_secs(60 * 60);
+    });
+    first.merge_builds().hold(Some(Holding::UntilLetGo));
+    four_flushes(&first, "merging").await;
+    let held = first.tenant(&tenant("merging")).await.unwrap();
+    store.failing.store(1, Ordering::SeqCst);
+    let batch: Vec<Mutation> = (0..NOTES).map(|n| note(1_000 + n)).collect();
+    held.write(batch).await.unwrap();
+    until(10, "the flush never failed", || {
+        first.flushing().failed == 1
+    })
+    .await;
+    let rows = held.read(State::rows);
+    drop(held);
+    within(10, "the shutdown never ended", first.shutdown()).await;
+    first.merge_builds().hold(None);
+
+    let next = node_on_shared(&coordinator, &store, |settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.flush_backoff = Duration::from_millis(100);
+    });
+    let opened = next.tenant(&tenant("merging")).await.unwrap();
+    assert_eq!(opened.read(State::rows), rows, "rows lost");
+    assert_eq!(opened.read(State::unflushed), NOTES as usize);
+    store.failing.store(2, Ordering::SeqCst);
+    let compacted = within(60, "the merge never ended", opened.compact(Duration::ZERO));
+    assert!(
+        compacted.await.is_err(),
+        "the rule is of a merge that failed"
+    );
+    assert_eq!(next.flushing().failed, 1, "its flush first was not made");
+    until(10, "the flush task slept through the backoff", || {
+        opened.read(State::unflushed) == 0
+    })
+    .await;
+    assert_eq!(opened.read(State::rows), rows, "rows lost");
+}
+
+/// A commit that gives its turn back goes on: nothing about it is for a sweep
+/// to answer. Counted in the total, it would go from nothing to its peak in
+/// a moment, and a sweep would let tenants go and stop merges for bytes that
+/// leave by themselves: §9.9's thrash, which A2 counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_giving_its_turn_back_moves_nothing_in_a_sweep() {
+    let set = |settings: &mut Settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    };
+    // Measured on a node like it, as a budget is set before a node starts.
+    let measuring = node(set);
+    four_flushes(&measuring, "other").await;
+    four_flushes(&measuring, "merging").await;
+    until(30, "the node never settled", || measuring.unsettled() == 0).await;
+    let holds = measuring.resident();
+    let peak = measuring.merges().largest;
+    assert!(peak > 0);
+    let store = failing_flushes();
+    let node = node_on(store.clone(), |settings| {
+        set(settings);
+        settings.memory = Some(holds + peak / 2);
+    });
+    let builds = node.merge_builds().clone();
+    builds.idle_for(Duration::from_millis(100));
+    four_flushes(&node, "other").await;
+    until(30, "the node never settled", || node.unsettled() == 0).await;
+    let gate = past_loading(&node, "merging").await;
+    let held = node.tenant(&tenant("merging")).await.unwrap();
+    let batch: Vec<Mutation> = (0..NOTES / 2).map(|n| note(1_000 + n)).collect();
+    held.write(batch).await.unwrap();
+    store.holding.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let held = held.clone();
+        async move { held.flush().await }
+    });
+    until(10, "the flush never began to go up", || {
+        store.held.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    gate.release.notify_one();
+    until(5, "the commit never gave its turn back", || {
+        builds.turns_free() == MERGE_BUILDS
+    })
+    .await;
+    assert!(node.merges().waiting_to_commit > 0, "not counted");
+    assert!(
+        node.merges().waiting_to_commit < peak,
+        "counted at its peak"
+    );
+    assert_eq!(node.merges().draining, 0, "a merge going on drains nothing");
+    let let_go = node.let_go();
+    tokio::time::sleep(RESIDENT_PAST).await;
+    within(10, "the sweep never ended", node.sweep_now()).await;
+    within(10, "the sweep never ended", node.sweep_now()).await;
+    assert_eq!(node.let_go(), let_go, "a sweep let a tenant go for it");
+    assert_eq!(node.census().holding.writers, 2, "a sweep let a tenant go");
+    assert_eq!(
+        node.merges().stopped_for_budget,
+        0,
+        "a sweep stopped a merge"
+    );
+    store.holding.store(false, Ordering::SeqCst);
+    within(30, "the flush never ended", flushing)
+        .await
+        .unwrap()
+        .unwrap();
+    until(30, "the commit never landed", || {
+        node.merges().waiting_to_commit == 0
+    })
+    .await;
+}
+
+/// Longer than a node keeps a tenant whatever a sweep finds.
+const RESIDENT_PAST: Duration = Duration::from_millis(1_200);
 
 /// A store whose next writes of flushed vectors, as many as are armed, fail.
 #[derive(Debug)]
@@ -1659,6 +1962,11 @@ struct FailingFlushes {
     holding: AtomicBool,
     /// How many writes of flushed vectors have come to wait.
     held: AtomicUsize,
+    /// Whether listings wait until it is cleared: as a clean, which holds
+    /// the building lock, waits on a slow store.
+    holding_listings: AtomicBool,
+    /// Whether a listing has come to wait.
+    listing: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -1693,6 +2001,10 @@ impl Blobs for FailingFlushes {
         self.inner.get(key).await
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        while self.holding_listings.load(Ordering::SeqCst) {
+            self.listing.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {

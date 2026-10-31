@@ -956,6 +956,12 @@ impl Tenant {
         self.work.writer.stop_merges();
     }
 
+    /// How many flushes in a row have failed. For tests.
+    #[doc(hidden)]
+    pub fn flushes_failing(&self) -> u32 {
+        self.work.backoff.lock().expect("backoff lock").0
+    }
+
     /// How many passes over its segments' rows its maintenance has made.
     /// For tests.
     #[doc(hidden)]
@@ -1824,6 +1830,10 @@ pub struct Merges {
     /// About how many bytes the largest merge build since the node started
     /// was reckoned to hold at its peak.
     pub largest: usize,
+    /// About how many bytes merges hold now that gave their turns back to
+    /// wait to commit: going on as any merge does, and so in no total a
+    /// sweep answers.
+    pub waiting_to_commit: usize,
 }
 
 /// How many merges losing a hold on a tenant has stopped, or cut off with
@@ -2171,6 +2181,7 @@ impl Node {
             stopped_for_budget: self.0.stopped_for_budget.load(Ordering::Relaxed),
             stopped: self.0.merges_stopped.counted(),
             largest: builds.largest_reckoned(),
+            waiting_to_commit: builds.waiting_to_commit(),
         }
     }
 

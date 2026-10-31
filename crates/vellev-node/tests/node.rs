@@ -74,6 +74,8 @@ struct Store {
     /// How many writes of a segment were asked for, right or wrong: as a
     /// flush comes to them once its vectors are up.
     segments_written: AtomicUsize,
+    /// How many listings were asked for: cleaning up lists the tenant.
+    listings: AtomicUsize,
 }
 
 impl Store {
@@ -159,6 +161,7 @@ impl Blobs for Store {
         self.inner.get(key).await
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.listings.fetch_add(1, Ordering::SeqCst);
         if self.unreadable.load(Ordering::SeqCst) {
             return Err(StorageError::Blob {
                 key: prefix.into(),
@@ -203,6 +206,7 @@ impl Cluster {
                 gate: tokio::sync::Semaphore::new(0),
                 merged_panics: AtomicBool::new(false),
                 segments_written: AtomicUsize::new(0),
+                listings: AtomicUsize::new(0),
             }),
         }
     }
@@ -1492,7 +1496,7 @@ fn a_hold_lapsed_with_a_failed_flush_due_keeps_nothing_busy() {
 /// so the tenant is given up, and opened afresh for the next caller, as one
 /// whose writer closed. Its rows are in the log, and flushed there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_tenant_whose_maintenance_panicked_is_given_up() {
+async fn a_tenant_whose_flush_panicked_is_given_up() {
     let cluster = Cluster::new();
     let coordinator = Arc::new(Unrenewing::slow(
         cluster.coordinator.clone(),
@@ -1514,7 +1518,7 @@ async fn a_tenant_whose_maintenance_panicked_is_given_up() {
     };
     tokio::time::timeout(Duration::from_secs(10), given_up)
         .await
-        .expect("a tenant whose maintenance panicked lived on");
+        .expect("a tenant whose flush panicked lived on");
     assert_eq!(node.tenants_given_up(), 1, "given up with nothing to show");
     let opened = node.tenant(&acme).await.unwrap();
     assert_eq!(opened.read(count), 10, "its rows were lost");
@@ -1633,6 +1637,71 @@ async fn a_flush_landing_in_a_lapse_has_its_round_after_it() {
         .await
         .expect("no round followed the flush once the hold was back");
     assert_eq!(node.tenants_given_up(), 0, "nothing panicked");
+}
+
+/// What a round does beside its merges is under #174's rule as a round is:
+/// nothing on a hold that may be lost. A clean falling due in a lapse waits
+/// for the hold to come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_clean_beside_a_merge_runs_through_a_lapse() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let lease = Duration::from_secs(2);
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            lease,
+            flush_rows: 10,
+            clean_at_least_every: Duration::from_secs(1),
+            ..cluster.settings()
+        },
+    );
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilLetGo));
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    let wrote = async {
+        for flush in 0..4 {
+            held.write(ten_notes(flush * 10)).await.unwrap();
+            while held.read(State::unflushed) > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        while builds.held() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), wrote)
+        .await
+        .expect("the tenant's merge never came to build");
+    coordinator.failing.store(true, Ordering::SeqCst);
+    until_lapsed(&held).await;
+    let listed = cluster.store.listings.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(
+        cluster.store.listings.load(Ordering::SeqCst),
+        listed,
+        "a clean ran through a lapse"
+    );
+    coordinator.failing.store(false, Ordering::SeqCst);
+    let cleaned = async {
+        while cluster.store.listings.load(Ordering::SeqCst) == listed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), cleaned)
+        .await
+        .expect("no clean came once the hold was back");
+    builds.hold(None);
 }
 
 /// A tenant with ten notes, a flush's worth on [`node_flushing`], and its

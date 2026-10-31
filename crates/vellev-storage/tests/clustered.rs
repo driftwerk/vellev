@@ -556,6 +556,67 @@ async fn curves_committed_for_a_segment_are_kept_and_a_replaced_one_gets_none() 
     assert_eq!(gone, None);
 }
 
+/// A curve committed between a merge's plan and its commit, as a rows pass
+/// beside a round's merges does: the merge commits, and the curve of a
+/// segment it left stays, a checkpoint having come between. Curves move no
+/// epoch: a merge takes them as it finds them.
+#[tokio::test]
+async fn a_curve_committed_between_a_merge_s_plan_and_its_commit_stays() {
+    use vellev_index::curve::{Curve, Source};
+    use vellev_storage::format::SegmentCurve;
+    let cluster = Cluster::new().await;
+    let vectors = vectors();
+    let writer = Arc::new(merged(&cluster, &vectors).await);
+    let segment = segments_of(&cluster).await[0].clone();
+    let built = segment.probes[0].clone();
+    let clusters = built.curve.clusters;
+    let asked = SegmentCurve {
+        collection: built.collection,
+        band: 0,
+        curve: Curve::of(
+            Source::Queries,
+            50,
+            clusters,
+            (0..500).map(|n| n % clusters).collect(),
+        )
+        .unwrap(),
+    };
+    // Four small segments beside the large one, and a merge of them held
+    // short of its commit.
+    for flush in 0..4u32 {
+        let rows = (0..4).map(|n| row("notes", ROWS + flush * 4 + n, vectors[0].clone()));
+        writer.commit(rows.collect()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    let gate = writer.hold_merges_before_commit();
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    tokio::time::timeout(Duration::from_secs(60), gate.reached.notified())
+        .await
+        .expect("the merge never came to its commit");
+    let committed = writer
+        .commit_curves(vec![(segment.key.clone(), asked.clone())])
+        .await
+        .unwrap();
+    assert!(committed.is_some(), "a curve for a segment that is there");
+    gate.release.notify_one();
+    let merged = tokio::time::timeout(Duration::from_secs(60), merging)
+        .await
+        .expect("the merge never ended");
+    assert!(merged.unwrap().unwrap().is_some());
+    let kept = segments_of(&cluster).await;
+    assert_eq!(kept[0].key, segment.key, "{kept:?}");
+    assert_eq!(kept[0].probes, vec![asked], "the curve was lost");
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    let follower = cluster.open().await;
+    assert_eq!(
+        follower.partition().read(State::rows),
+        writer.partition().read(State::rows)
+    );
+}
+
 /// Blobs as a node of a version before curves would leave them: every
 /// manifest read with its segments' curves left out.
 #[derive(Debug)]
