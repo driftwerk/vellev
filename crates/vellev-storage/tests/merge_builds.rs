@@ -551,14 +551,21 @@ async fn a_merge_keeps_its_turn_through_its_own_flush_and_builds_before_the_next
         .unwrap()
         .unwrap();
     until(10, "no merge came to build", || builds.held() == 1).await;
-    assert!(
-        builds.under_way_for(&key),
-        "a merge lost its turn to one queued behind it, for a flush of its own"
-    );
-    assert!(!builds.under_way_for(&second.lease().key));
-    builds.hold(None);
-    let merged = within(60, "the first merge never ended", merging).await;
+    // The build held is the first's: let go, it ends, and the second's comes.
+    builds.let_one_go();
+    let merged = within(
+        30,
+        "a merge lost its turn to one queued behind it, for a flush of its own",
+        merging,
+    )
+    .await;
     assert!(merged.unwrap().unwrap().is_some());
+    until(10, "the merge behind never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    assert!(!behind.is_finished());
+    builds.hold(None);
     let merged = within(60, "the second merge never ended", behind).await;
     assert!(merged.unwrap().unwrap().is_some());
 }
@@ -604,14 +611,21 @@ async fn a_merge_keeps_its_turn_through_its_own_clean_and_builds_before_the_next
         .unwrap()
         .unwrap();
     until(10, "no merge came to build", || builds.held() == 1).await;
-    assert!(
-        builds.under_way_for(&key),
-        "a merge lost its turn to one queued behind it, for a clean of its own"
-    );
-    assert!(!builds.under_way_for(&second.lease().key));
-    builds.hold(None);
-    let merged = within(60, "the first merge never ended", merging).await;
+    // The build held is the first's: let go, it ends, and the second's comes.
+    builds.let_one_go();
+    let merged = within(
+        30,
+        "a merge lost its turn to one queued behind it, for a clean of its own",
+        merging,
+    )
+    .await;
     assert!(merged.unwrap().unwrap().is_some());
+    until(10, "the merge behind never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    assert!(!behind.is_finished());
+    builds.hold(None);
     let merged = within(60, "the second merge never ended", behind).await;
     assert!(merged.unwrap().unwrap().is_some());
 }
