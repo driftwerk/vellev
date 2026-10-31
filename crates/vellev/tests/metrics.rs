@@ -304,6 +304,19 @@ async fn what_waits_for_a_flush_and_flushes_that_failed_are_reported() {
 /// Bench signals: the thread pools a node runs on, and how many reads may
 /// run at once, are reported as they are, so that a run that sets them
 /// can check they took.
+/// A merge's spills are reported whether or not a node has any to report:
+/// what they hold, those skipped for want of room, and those a disk failed.
+#[tokio::test]
+async fn what_merges_spill_is_reported() {
+    let (served, _) = embedded().await;
+    let text = served.app.metrics().encoded();
+    assert_eq!(sample(&text, "vellev_merge_spill_bytes", &[]), Some(0.0));
+    let skipped = sample(&text, "vellev_merge_spills_skipped_total", &[]);
+    assert_eq!(skipped, Some(0.0));
+    let failed = sample(&text, "vellev_merge_spill_failures_total", &[]);
+    assert_eq!(failed, Some(0.0));
+}
+
 #[tokio::test]
 async fn the_thread_pools_and_reads_at_once_are_reported_as_they_are() {
     let (served, _) = embedded().await;

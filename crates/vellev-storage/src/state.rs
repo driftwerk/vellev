@@ -18,7 +18,7 @@ use vellev_index::vector::{BinaryIndex, Coded, Skipped, Ties, VectorIndex};
 
 use crate::answers::Answers;
 use crate::catalog::Catalog;
-use crate::column::{Column, Gathering};
+use crate::column::{frame_bytes, Column, Gathering};
 use crate::coordinator::LogPosition;
 use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
@@ -685,7 +685,7 @@ impl Run {
         let mut rows: Vec<Row> = Vec::with_capacity(count);
         let mut vectors = match spill.filter(|_| values > 0) {
             None => Gathering::with_capacity(values, count),
-            Some(asked) => match asked.begin()? {
+            Some(asked) => match asked.begin(frame_bytes(values, count) as u64)? {
                 Some(spilling) => Gathering::spilled(values, count, spilling),
                 None => return Ok(None),
             },

@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch, OnceCell};
 use tokio::task::AbortHandle;
 use vellev_core::{Embedding, ModelFault, NodeId, Partition, RequestId, TenantId};
 use vellev_embed::{EmbedError, Embedders};
-use vellev_storage::blobs::Blobs;
+use vellev_storage::blobs::{Blobs, SpillFigures};
 use vellev_storage::coordinator::{
     Acquired, Clock, Coordinator, CoordinatorError, Generation, Lease, Lineage, LogPosition,
     ManifestRef, PartitionKey, Point, Restore, RestorePoint, Restored, SystemClock, TenantKey,
@@ -1392,29 +1392,37 @@ impl TenantWork {
         grace: Duration,
         flush_due: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<usize>> {
-        while self
-            .writer
-            .merge_giving_way(flush_due)
-            .await
-            .map_err(|error| self.failed(error))?
-            .is_some()
-        {}
+        // A merge that fails, as for a disk that fills, leaves the cleaning
+        // up to be done: that is what frees such a disk. Its failure is
+        // the round's, told once that is done.
+        let merged = loop {
+            match self.writer.merge_giving_way(flush_due).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(self.failed(error)),
+            }
+        };
+        if self.writer.is_closed() {
+            return merged.map(|()| None);
+        }
         // Given way to a flush, or one is due: cleaning up, which waits on
         // the store, waits for a later round, and the flush goes first;
         // but not for longer than [`Settings::clean_at_least_every`], or
         // writes that never let up would leave it undone for good.
         let cleaned_lately = self.cleaned_at().elapsed() < self.clean_at_least_every;
         if flush_due() && cleaned_lately {
-            return Ok(None);
+            return merged.map(|()| None);
         }
         let mut deleted = 0;
         loop {
-            let cleaned = self.writer.clean(grace).await;
-            let more = cleaned.map_err(|error| self.failed(error))?;
-            deleted += more;
-            if more < Writer::CLEANED_AT_ONCE {
+            let cleaned = match self.writer.clean(grace).await {
+                Ok(cleaned) => cleaned,
+                Err(error) => return merged.and(Err(self.failed(error))),
+            };
+            deleted += cleaned;
+            if cleaned < Writer::CLEANED_AT_ONCE {
                 *self.cleaned_at() = Instant::now();
-                return Ok(Some(deleted));
+                return merged.map(|()| Some(deleted));
             }
         }
     }
@@ -2085,6 +2093,12 @@ impl Node {
             stopped: self.0.merges_stopped.counted(),
             largest: builds.largest_reckoned(),
         }
+    }
+
+    /// What this node's merges have spilled to its store's local disk.
+    pub fn spills(&self) -> SpillFigures {
+        let spills = self.0.blobs.spills();
+        spills.map_or_else(SpillFigures::default, |spills| spills.figures())
     }
 
     /// Where the writers this node opens time their background work: the

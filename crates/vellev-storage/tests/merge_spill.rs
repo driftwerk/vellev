@@ -258,7 +258,7 @@ fn vector_in(state: &State, n: u32) -> Option<Vec<f32>> {
 }
 
 /// A store that reads what it is given where a store's client reads it, on
-/// the async thread that sends it, and counts the parts of each vectors
+/// the async thread that sends it, and counts the parts of a merge's vectors
 /// file. A page of a spill's mapping gone from memory would hold that thread
 /// for as long as the disk takes: so what lies in the mapping is taken to
 /// be such a page, for as long as `told` says reading it takes.
@@ -315,7 +315,7 @@ impl ObjectStore for Client {
             told: self.told.clone(),
             parts: location
                 .as_ref()
-                .ends_with(".vectors")
+                .ends_with("-merged.vectors")
                 .then(|| self.parts.clone()),
         }))
     }

@@ -747,6 +747,28 @@ impl Collector for Counted {
         ] {
             ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
         }
+        let spills = node.spills();
+        let gauge = gauge_of(spills.bytes);
+        gauge.encode(encoder.encode_descriptor(
+            "merge_spill_bytes",
+            "Bytes of merges' vectors on local disk in files of their own, each file counted whole from when it begins until the cache takes it up as a copy or it is removed",
+            None,
+            gauge.metric_type(),
+        )?)?;
+        let counter = ConstCounter::new(spills.skipped);
+        counter.encode(encoder.encode_descriptor(
+            "merge_spills_skipped",
+            "Merges skipped for want of room on local disk for their vectors, and what must be left there: nothing written, and tried again in a later round",
+            None,
+            counter.metric_type(),
+        )?)?;
+        let counter = ConstCounter::new(spills.failed);
+        counter.encode(encoder.encode_descriptor(
+            "merge_spill_failures",
+            "Times a local disk failed a merge's vectors as they were written or read back to go up",
+            None,
+            counter.metric_type(),
+        )?)?;
         let gauge = gauge_of(node.freeing());
         gauge.encode(encoder.encode_descriptor(
             "tenants_freeing_bytes",

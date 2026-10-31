@@ -767,13 +767,23 @@ dead connection passes to another node rather than waiting with it:
   the store has the file it becomes that copy, by a rename, and is not
   written again. So a node with its cache on a disk it can fill needs room
   for the vectors of each merge building at once, on top of the segments
-  they replace, from the start of the merge. A disk that fills or stops
-  answering fails the merge where it gathers, leaves the file gone and
-  commits nothing, and the merge is tried again in its time. A merge
-  stopped, dropped or failed takes its file with it; one left by a node that
+  they replace, from the start of the merge. A merge with too little room
+  for its vectors and as much again, or a gibibyte if that is more, is
+  skipped with nothing written, counted in
+  `vellev_merge_spills_skipped_total` and as `no_room` in
+  `vellev_merges_ended_total`, and tried again in a later round; the round
+  goes on to clean up, which is what frees that disk, as it does when a
+  merge fails. A disk that fills all the same, or stops answering, fails the
+  merge where it gathers, counted in `vellev_merge_spill_failures_total`,
+  leaves the file gone and commits nothing, and `vellev_merge_spill_bytes`
+  says how much such files hold. A merge stopped, dropped or failed takes
+  its file with it, on a thread nothing waits for; one left by a node that
   was killed goes as a node next starts on the directory, however new,
-  and a file another process is still writing is left alone. A node with no
-  cache directory gathers in memory.
+  and a file another process is still writing is left alone. Nothing sweeps
+  the directory while a node runs. As a file goes up it is read a piece at a
+  time off the threads that serve requests, so that a disk that stops
+  answering fails the upload and holds up nothing else. A node with no cache
+  directory gathers in memory.
 - A flush's, a merge's and a restore's segments are built and go up before
   writes wait on them; a failure there commits nothing, leaves the writer
   as it was and deletes what went up. Writes wait only while a commit is

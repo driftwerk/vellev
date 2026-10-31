@@ -64,6 +64,11 @@ impl AsRef<[u8]> for FrameBytes {
     }
 }
 
+/// How many bytes a frame of `values` values over `rows` rows comes to.
+pub(crate) fn frame_bytes(values: usize, rows: usize) -> usize {
+    (AHEAD + values + 2 * (rows + 1) + 2) * 4
+}
+
 /// A spilled frame as the bytes it uploads as, read where it lies: its
 /// mapping and its file go with the last copy of these.
 struct SpilledBytes(std::sync::Arc<Spill>);
@@ -676,7 +681,8 @@ mod tests {
         let asked = spills.asked(runtime, Stopping::never(), "k".into());
         tokio::task::spawn_blocking(move || {
             let values = vectors.iter().flatten().map(Vec::len).sum();
-            let spilling = asked.begin().unwrap().unwrap();
+            let frame = frame_bytes(values, vectors.len()) as u64;
+            let spilling = asked.begin(frame).unwrap().unwrap();
             let mut gathering = Gathering::spilled(values, vectors.len(), spilling);
             for vector in &vectors {
                 let width = vector.as_ref().map_or(0, Vec::len);

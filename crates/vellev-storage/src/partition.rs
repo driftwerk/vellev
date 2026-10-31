@@ -3329,7 +3329,22 @@ impl Writer {
             catalog.clone(),
         );
         let built = self.built_stopping(gather, catalog.clone(), stopping, Some(build.clone()));
-        let Some((built, shape)) = built.await? else {
+        let built = match built.await {
+            // Skipped, not failed: what it would have written would have
+            // filled the disk, and what frees that disk comes next. Tried
+            // again in a later round.
+            Err(StorageError::NoRoom { key, free, wanted }) => {
+                tracing::warn!(
+                    key,
+                    free,
+                    wanted,
+                    "a merge is skipped: no room on local disk"
+                );
+                return Ok(Ended::Dropped(MergeEnd::NoRoom));
+            }
+            built => built?,
+        };
+        let Some((built, shape)) = built else {
             return Ok(self.given_up(planned));
         };
         // Both segments, however large, are uploaded without the writer,

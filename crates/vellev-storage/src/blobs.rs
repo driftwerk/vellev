@@ -37,7 +37,7 @@ use object_store::{
 
 use crate::coordinator::{Generation, LogPosition, PartitionKey};
 use crate::format::verify;
-use crate::spill::{left_behind, SPILL_EXTENSION};
+use crate::spill::{left_behind, SpillsCounted, SPILL_EXTENSION};
 pub use crate::spill::{Spill, SpillFigures, Spills, SpillsTold};
 use crate::{Result, StorageError};
 
@@ -195,10 +195,10 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     /// does, and make the spill the store's copy of the file if the store
     /// keeps copies, once and only if the file is there. A store that sends
     /// a file from the async threads reads it with [`Spill::pieces`], not
-    /// from `bytes`, which read the mapping where they are touched. As
-    /// [`Self::put`] by default, for a store over another that forwards
-    /// [`Self::spills`] alone: a spill not taken up goes when the last of
-    /// it does.
+    /// from `bytes`, which read the mapping on whatever thread touches them,
+    /// so that a disk that stops holds that thread as long. As [`Self::put`]
+    /// by default, for a store over another that forwards [`Self::spills`]
+    /// alone: a spill not taken up goes when the last of it does.
     async fn put_spilled(&self, key: &str, bytes: Bytes, _spill: Arc<Spill>) -> Result<()> {
         self.put(key, bytes).await
     }
@@ -604,6 +604,8 @@ pub struct Disk {
     spills_told: Option<Arc<SpillsTold>>,
     /// How large a part of a file going to or from a store is.
     part_bytes: usize,
+    /// What is spilled here.
+    spilled: Arc<SpillsCounted>,
 }
 
 /// How many turns at a large file are had on a disk, and how many times
@@ -775,6 +777,7 @@ impl Disk {
             piece_takes: Duration::ZERO,
             spills_told: None,
             part_bytes: 0,
+            spilled: Arc::default(),
         }
         .fetching(&Transfers::default())
     }
@@ -806,6 +809,11 @@ impl Disk {
     /// What a test has told this disk of what is spilled to it, if it has.
     pub(crate) fn spills_are_told(&self) -> Option<Arc<SpillsTold>> {
         self.spills_told.clone()
+    }
+
+    /// What is spilled to this disk, shared by every clone of it.
+    pub(crate) fn spills_counted(&self) -> Arc<SpillsCounted> {
+        self.spilled.clone()
     }
 
     /// How many steps are on this disk's threads now, waited for or given
@@ -1058,6 +1066,39 @@ impl Disk {
                 }
             };
             return ended;
+        }
+    }
+
+    /// Run `step` on a thread of this disk's, and wait for nothing, as what
+    /// must never hold up whoever lets it go: from any thread, and from no
+    /// runtime. Refused, and `step` dropped unrun, if every thread is kept by
+    /// a step that was given up: a disk that has stopped costs nothing more
+    /// for it. One that is merely busy takes one thread more than it has.
+    pub(crate) fn run_unwaited(&self, step: impl FnOnce() + Send + 'static) {
+        if self.threads.stuck() {
+            tracing::warn!("a step on local disk is left undone, with every thread kept");
+            return;
+        }
+        let free = self.threads.free.clone().try_acquire_owned();
+        let stepping = free.ok().map(|thread| {
+            let step = self.threads.steps.fetch_add(1, Ordering::Relaxed);
+            let due = tokio::time::Instant::now() + self.within(0);
+            let mut steps = self.threads.due.lock().expect("disk steps lock");
+            steps.insert(step, due);
+            Stepping {
+                threads: self.threads.clone(),
+                step,
+                _thread: thread,
+            }
+        });
+        let spawned = std::thread::Builder::new()
+            .name("vellev-disk".into())
+            .spawn(move || {
+                let _stepping = stepping;
+                step();
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "a step on local disk is left undone");
         }
     }
 
@@ -1936,8 +1977,9 @@ impl CachedBlobs {
     /// the put's task has gone: so, as a link is (see
     /// [`CachedBlobs::link_local`]), a rename given up looks before it is
     /// made, and after, whether whoever asked has stopped waiting, and takes
-    /// back what it did. What remains is a rename given up after that last
-    /// look: in place before the caller hears, so that a delete that
+    /// back what it did, and only that, the very file, as a copy fetched
+    /// since is not its own. What remains is a rename given up after that
+    /// last look: in place before the caller hears, so that a delete that
     /// follows removes it.
     async fn take_up(&self, key: &str, spill: Arc<Spill>) {
         let Some(path) = self.path(key) else { return };
@@ -1960,12 +2002,16 @@ impl CachedBlobs {
                 return Err(gone());
             }
             crate::column::forget_summed(&path);
-            spill.renamed_to(&path)?;
+            let taken = spill.renamed_to(&path)?;
             if let Some(told) = told {
                 told.looks_again();
             }
             if given_up() {
-                let _ = std::fs::remove_file(&path);
+                let here = crate::column::seen(&path);
+                if here.is_ok_and(|here| here.same_file(&taken)) {
+                    crate::column::forget_summed(&path);
+                    let _ = std::fs::remove_file(&path);
+                }
                 return Err(gone());
             }
             Ok(())
@@ -1978,10 +2024,23 @@ impl CachedBlobs {
 }
 
 /// How much room there is on the file system of `path`, as far as a process
-/// with no privilege may use it, and how large it is, if the system says.
+/// with no privilege may use it, and how large it is, if the system says: it
+/// leaves out what is kept for root, which ext4 keeps 5% of by default.
 #[doc(hidden)]
-pub fn disk_room(_path: &Path) -> Option<(u64, u64)> {
-    None
+pub fn disk_room(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        let stats = nix::sys::statvfs::statvfs(path).ok()?;
+        let block = u64::from(stats.fragment_size());
+        let free = u64::from(stats.blocks_available()).saturating_mul(block);
+        let size = u64::from(stats.blocks()).saturating_mul(block);
+        Some((free, size))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// A file being fetched into the cache under a name of its own, removed
