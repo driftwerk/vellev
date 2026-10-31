@@ -935,10 +935,23 @@ async fn a_round_whose_merge_fails_or_is_skipped_still_cleans_up() {
             node.timings().merges_ended(end) > 0
         })
         .await;
-        until(30, "a round that merged nothing cleaned nothing", || {
-            deletes.load(Ordering::SeqCst) > 0
+        // The rounds before it cleaned, having no merge to fail: what counts
+        // is one more flush's leavings going, with every round's merge
+        // ending as this one did.
+        let ended = node.timings().merges_ended(end);
+        let cleaned = deletes.load(Ordering::SeqCst);
+        let held = node.tenant(&tenant("merging")).await.unwrap();
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(9_000 + n)).collect();
+        held.write(batch).await.unwrap();
+        until(30, "no later merge ended so", || {
+            node.timings().merges_ended(end) > ended
         })
         .await;
+        until(30, "a round that merged nothing cleaned nothing", || {
+            deletes.load(Ordering::SeqCst) > cleaned
+        })
+        .await;
+        drop(held);
         node.shutdown().await;
     }
 }
