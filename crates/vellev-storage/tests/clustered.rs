@@ -566,7 +566,13 @@ async fn a_curve_committed_between_a_merge_s_plan_and_its_commit_stays() {
     use vellev_storage::format::SegmentCurve;
     let cluster = Cluster::new().await;
     let vectors = vectors();
-    let writer = Arc::new(merged(&cluster, &vectors).await);
+    // So that the large segment is not small, and no merge takes it in.
+    let merging = vellev_storage::Merging {
+        rows: ROWS as usize,
+        ..vellev_storage::Merging::default()
+    };
+    let writer = merged(&cluster, &vectors).await.merging_with(merging);
+    let writer = Arc::new(writer);
     let segment = segments_of(&cluster).await[0].clone();
     let built = segment.probes[0].clone();
     let clusters = built.curve.clusters;

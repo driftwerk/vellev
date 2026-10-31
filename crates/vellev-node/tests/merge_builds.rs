@@ -1127,33 +1127,6 @@ async fn a_tenant_written_steadily_keeps_its_place_for_a_merge_turn() {
     .await;
 }
 
-/// A store whose listings, once armed, wait until it is disarmed: as
-/// cleaning up waits on a slow store.
-#[derive(Debug)]
-struct SlowListing {
-    inner: Arc<dyn Blobs>,
-    armed: AtomicBool,
-}
-
-#[async_trait::async_trait]
-impl Blobs for SlowListing {
-    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
-        self.inner.put(key, bytes).await
-    }
-    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
-        self.inner.get(key).await
-    }
-    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
-        while self.armed.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        self.inner.list(prefix).await
-    }
-    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
-        self.inner.delete(key).await
-    }
-}
-
 /// A tenant's flushes go on while its own merge waits for a turn, however
 /// long: they are on a task of their own, and nothing of them waits for its
 /// round.
@@ -1188,27 +1161,32 @@ async fn a_flush_goes_on_while_its_tenant_s_merge_waits_for_a_turn() {
     .await;
 }
 
-/// A round starting with cleaning up long overdue plans its merge first, and
-/// the clean comes a whole interval on: it holds the lock a merge plans
-/// under, and at its start it would take that lock from the merge it is
-/// beside.
+/// A clean long overdue as a round begins waits a whole interval from the
+/// round's start: at once, it would take the lock a merge about to plan is
+/// after. Seen with the merge queued for its turn, which leaves the clean no
+/// race to lose.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_round_s_merge_plans_before_a_clean_overdue_as_the_round_begins() {
-    let slow = Arc::new(SlowListing {
+async fn a_clean_overdue_as_a_round_begins_waits_an_interval_from_its_start() {
+    let counted = Arc::new(CountedListing {
         inner: Arc::new(ObjectBlobs::new(Arc::new(
             object_store::memory::InMemory::new(),
         ))),
-        armed: AtomicBool::new(false),
+        tenant: "late",
+        listed: AtomicUsize::new(0),
     });
-    let node = node_on(slow.clone(), |settings| {
+    let every = Duration::from_secs(2);
+    let node = node_on(counted.clone(), |settings| {
         settings.flush_rows = NOTES as usize;
         settings.tenant_idle = Duration::from_secs(60 * 60);
-        settings.clean_at_least_every = Duration::from_secs(1);
+        settings.clean_at_least_every = every;
     });
     let builds = node.merge_builds().clone();
     builds.hold(Some(Holding::UntilLetGo));
-    node.create_tenant(&tenant("merging")).await.unwrap();
-    let held = node.tenant(&tenant("merging")).await.unwrap();
+    four_flushes(&node, "first").await;
+    four_flushes(&node, "second").await;
+    until(30, "two merges never came to build", || builds.held() == 2).await;
+    node.create_tenant(&tenant("late")).await.unwrap();
+    let held = node.tenant(&tenant("late")).await.unwrap();
     held.write(vec![notes()]).await.unwrap();
     for flush in 0..3 {
         let batch: Vec<Mutation> = (0..NOTES).map(|n| note(flush * NOTES + n)).collect();
@@ -1218,17 +1196,26 @@ async fn a_round_s_merge_plans_before_a_clean_overdue_as_the_round_begins() {
         })
         .await;
     }
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    slow.armed.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let settled = counted.listed.load(Ordering::SeqCst);
+    tokio::time::sleep(every + Duration::from_millis(300)).await;
+    assert_eq!(counted.listed.load(Ordering::SeqCst), settled, "unasked");
     let batch: Vec<Mutation> = (0..NOTES).map(|n| note(3 * NOTES + n)).collect();
     held.write(batch).await.unwrap();
-    until(
-        5,
-        "a clean took the lock from the merge it is beside",
-        || builds.held() == 1,
-    )
+    until(30, "the node never flushed the tenant", || {
+        held.read(State::unflushed) == 0
+    })
     .await;
-    slow.armed.store(false, Ordering::SeqCst);
+    tokio::time::sleep(every / 2).await;
+    assert_eq!(
+        counted.listed.load(Ordering::SeqCst),
+        settled,
+        "a clean overdue fired as its round began"
+    );
+    until(10, "no clean came beside the merge", || {
+        counted.listed.load(Ordering::SeqCst) > settled
+    })
+    .await;
     builds.hold(None);
     until(60, "a build was left counted under way", || {
         builds.under_way() == 0
