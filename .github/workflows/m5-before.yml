@@ -1,0 +1,50 @@
+name: M5 before
+on:
+  push:
+    branches: [scratch-m5-before]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  RUST_BACKTRACE: 0
+jobs:
+  followup:
+    name: Review rules, before their code
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 128bf01a60fe2c1f8152a96797c282f0c7d7a3fe
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          { timeout 900 cargo test --locked -p vellev-storage --test merge_builds -- --test-threads=2 a_commit_behind_a_long_hold a_flush_first_whose_wait_runs_out a_merge_stopped_having_given a_commit_that_finds_few_rows a_restore_under_way_sends_a_commit a_merge_already_stale a_flush_first_that_closes a_restore_in_the_hand_off a_merge_flushes_first || true
+            timeout 300 cargo test --locked -p vellev-storage --test clustered -- --test-threads=2 a_curve_committed_between || true
+            timeout 900 cargo test --locked -p vellev-node --test merge_builds -- --test-threads=2 a_flush_goes_on_while a_round_s_merge_plans a_flush_task_behind a_flush_first_that a_flush_first_is_put_off a_stop_during a_hold_lost_during a_commit_giving_its_turn_back under_writes_that a_merge_queued_for || true
+            timeout 300 cargo test --locked -p vellev-node --test node -- --test-threads=2 no_clean_beside a_tenant_whose_flush_panicked || true
+          } 2>&1 | tee followup.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: followup
+          path: followup.log
+  original:
+    name: First rules, before their code
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: cfd408b
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          { timeout 900 cargo test --locked -p vellev-storage --test merge_builds -- --test-threads=2 a_turn_is_held_idle a_merge_keeps_its_turn a_merge_stopped_as_it_waits a_restore_under_way flushes_longer a_merge_flushes_first a_merge_leaves_fewer a_flush_first a_tenant_flushes_one a_commit_behind || true
+            timeout 900 cargo test --locked -p vellev-node --test merge_builds -- --test-threads=2 a_flush_due_as a_flush_landing_during a_clean_under_way a_merge_queued_for a_flush_first_that a_written_tenant_s_flushes || true
+            timeout 300 cargo test --locked -p vellev-node --test node -- --test-threads=2 a_tenant_whose_merge_panicked a_flush_landing_in_a_lapse a_tenant_dropped_flushes a_tenant_whose_lease_was_lost_flushes a_node_shut_down_flushes a_tenant_let_go_flushes a_tenant_is_kept_while_its_flush || true
+          } 2>&1 | tee original.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: original
+          path: original.log
