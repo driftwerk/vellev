@@ -495,7 +495,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     let counter = ConstCounter::new(0u64);
     let mut family = encoder.encode_descriptor(
         "merges_ended",
-        "Merges that had a turn among the node's merge builds, by how they ended: committed; with nothing to merge once planned again; dropped as a restore came between (stale), as the run was not as planned (changed), or as a row it held live was missing from what was built (uncovered); stopped; or failed",
+        "Merges that had a turn among the node's merge builds, by how they ended: committed; with nothing to merge once planned again; dropped as a restore came between (stale), as the run was not as planned (changed), or as a row it held live was missing from what was built (uncovered); stopped; skipped for want of room for its vectors on local disk (no_room); or failed",
         None,
         counter.metric_type(),
     )?;
@@ -747,6 +747,28 @@ impl Collector for Counted {
         ] {
             ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
         }
+        let spills = node.spills();
+        let gauge = gauge_of(spills.bytes);
+        gauge.encode(encoder.encode_descriptor(
+            "merge_spill_bytes",
+            "Bytes of merges' vectors on local disk in files of their own, each file counted whole from when it begins until the cache takes it up as a copy or it is removed",
+            None,
+            gauge.metric_type(),
+        )?)?;
+        let counter = ConstCounter::new(spills.skipped);
+        counter.encode(encoder.encode_descriptor(
+            "merge_spills_skipped",
+            "Merges skipped for want of room on local disk for their vectors, and what must be left there: nothing written, and tried again in a later round",
+            None,
+            counter.metric_type(),
+        )?)?;
+        let counter = ConstCounter::new(spills.failed);
+        counter.encode(encoder.encode_descriptor(
+            "merge_spill_failures",
+            "Times a local disk failed a merge's vectors as they were written or read back to go up",
+            None,
+            counter.metric_type(),
+        )?)?;
         let gauge = gauge_of(node.freeing());
         gauge.encode(encoder.encode_descriptor(
             "tenants_freeing_bytes",

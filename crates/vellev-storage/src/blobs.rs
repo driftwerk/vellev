@@ -37,6 +37,8 @@ use object_store::{
 
 use crate::coordinator::{Generation, LogPosition, PartitionKey};
 use crate::format::verify;
+use crate::spill::{left_behind, SpillsCounted, SPILL_EXTENSION};
+pub use crate::spill::{Spill, SpillFigures, Spills, SpillsTold};
 use crate::{Result, StorageError};
 
 /// Every call must end: whatever a store waits on, another machine or a
@@ -179,6 +181,26 @@ pub trait Blobs: fmt::Debug + Send + Sync {
             Ok(None) => Linked::Unmapped,
             Ok(Some(_)) | Err(_) => Linked::Unlinked,
         })
+    }
+    /// Where a frame too large to hold in memory may be gathered on local
+    /// disk, to be read in place there and put with [`Self::put_spilled`].
+    /// `None` from a store that keeps no copies there, as by default: such
+    /// frames are then gathered in memory. A store over one that keeps
+    /// them must forward this to spill: one that does not is simply taken
+    /// to keep none.
+    fn spills(&self) -> Option<Spills> {
+        None
+    }
+    /// Put `bytes`, which are all of `spill`, under `key`, as [`Self::put`]
+    /// does, and make the spill the store's copy of the file if the store
+    /// keeps copies, once and only if the file is there. A store that sends
+    /// a file from the async threads reads it with [`Spill::pieces`], not
+    /// from `bytes`, which read the mapping on whatever thread touches them,
+    /// so that a disk that stops holds that thread as long. As [`Self::put`]
+    /// by default, for a store over another that forwards [`Self::spills`]
+    /// alone: a spill not taken up goes when the last of it does.
+    async fn put_spilled(&self, key: &str, bytes: Bytes, _spill: Arc<Spill>) -> Result<()> {
+        self.put(key, bytes).await
     }
 }
 
@@ -578,6 +600,12 @@ pub struct Disk {
     /// How long each piece a step tells of takes at the least: none but
     /// for tests (see [`Self::each_piece_taking`]).
     piece_takes: Duration,
+    /// None but for tests (see [`Self::spills_told`]).
+    spills_told: Option<Arc<SpillsTold>>,
+    /// How large a part of a file going to or from a store is.
+    part_bytes: usize,
+    /// What is spilled here.
+    spilled: Arc<SpillsCounted>,
 }
 
 /// How many turns at a large file are had on a disk, and how many times
@@ -747,6 +775,9 @@ impl Disk {
             moved: Arc::default(),
             loads: Arc::default(),
             piece_takes: Duration::ZERO,
+            spills_told: None,
+            part_bytes: 0,
+            spilled: Arc::default(),
         }
         .fetching(&Transfers::default())
     }
@@ -763,6 +794,26 @@ impl Disk {
             piece_takes: taking,
             ..self
         }
+    }
+
+    /// As this disk, what is spilled to it going as `told` says: a disk
+    /// that fills or slows down, for tests. Not for use.
+    #[doc(hidden)]
+    pub fn spills_told(self, told: Arc<SpillsTold>) -> Self {
+        Self {
+            spills_told: Some(told),
+            ..self
+        }
+    }
+
+    /// What a test has told this disk of what is spilled to it, if it has.
+    pub(crate) fn spills_are_told(&self) -> Option<Arc<SpillsTold>> {
+        self.spills_told.clone()
+    }
+
+    /// What is spilled to this disk, shared by every clone of it.
+    pub(crate) fn spills_counted(&self) -> Arc<SpillsCounted> {
+        self.spilled.clone()
     }
 
     /// How many steps are on this disk's threads now, waited for or given
@@ -786,8 +837,15 @@ impl Disk {
             .saturating_add(written.max(transfers.request_within));
         Self {
             still_for: part.saturating_add(LOADING_STILL_BEYOND),
+            part_bytes: transfers.part_bytes,
             ..self
         }
+    }
+
+    /// How large a part of a file going to or from a store is, as
+    /// [`Self::fetching`] was told.
+    pub(crate) fn part_bytes(&self) -> usize {
+        self.part_bytes
     }
 
     /// How long those waiting for a turn at a large file go on waiting
@@ -1011,6 +1069,39 @@ impl Disk {
         }
     }
 
+    /// Run `step` on a thread of this disk's, and wait for nothing, as what
+    /// must never hold up whoever lets it go: from any thread, and from no
+    /// runtime. Refused, and `step` dropped unrun, if every thread is kept by
+    /// a step that was given up: a disk that has stopped costs nothing more
+    /// for it. One that is merely busy takes one thread more than it has.
+    pub(crate) fn run_unwaited(&self, step: impl FnOnce() + Send + 'static) {
+        if self.threads.stuck() {
+            tracing::warn!("a step on local disk is left undone, with every thread kept");
+            return;
+        }
+        let free = self.threads.free.clone().try_acquire_owned();
+        let stepping = free.ok().map(|thread| {
+            let step = self.threads.steps.fetch_add(1, Ordering::Relaxed);
+            let due = tokio::time::Instant::now() + self.within(0);
+            let mut steps = self.threads.due.lock().expect("disk steps lock");
+            steps.insert(step, due);
+            Stepping {
+                threads: self.threads.clone(),
+                step,
+                _thread: thread,
+            }
+        });
+        let spawned = std::thread::Builder::new()
+            .name("vellev-disk".into())
+            .spawn(move || {
+                let _stepping = stepping;
+                step();
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "a step on local disk is left undone");
+        }
+    }
+
     /// Run `step`, which works on `bytes` on local disk, waiting for it at
     /// most [`Self::within`] of them once it has a thread.
     pub(crate) async fn run<T: Send + 'static>(
@@ -1149,6 +1240,22 @@ impl ObjectBlobs {
                 Err(error)
             }
         }
+    }
+
+    /// Whether a file of `bytes` fits in as many parts as go up: one that
+    /// does not is refused before any of it does.
+    fn fits(&self, key: &str, bytes: usize) -> Result<()> {
+        if self.transfers.parts(bytes) > MOST_PARTS {
+            return Err(StorageError::Blob {
+                key: key.to_string(),
+                source: format!(
+                    "{bytes} bytes need more than {MOST_PARTS} parts of {}",
+                    self.transfers.part_bytes
+                )
+                .into(),
+            });
+        }
+        Ok(())
     }
 
     /// Bring `reading` of the file under `key` as far as `upto`, or its end
@@ -1480,17 +1587,7 @@ impl Blobs for ObjectBlobs {
     /// goes up.
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
         let path = ObjectPath::from(key);
-        if self.transfers.parts(bytes.len()) > MOST_PARTS {
-            return Err(StorageError::Blob {
-                key: key.to_string(),
-                source: format!(
-                    "{} bytes need more than {MOST_PARTS} parts of {}",
-                    bytes.len(),
-                    self.transfers.part_bytes
-                )
-                .into(),
-            });
-        }
+        self.fits(key, bytes.len())?;
         if bytes.len() > self.transfers.part_bytes {
             return self.put_in_parts(key, &path, bytes).await;
         }
@@ -1499,6 +1596,16 @@ impl Blobs for ObjectBlobs {
         bounded(key, within, self.store.put(&path, payload))
             .await
             .map(|_| ())
+    }
+
+    /// Read a piece at a time off the async threads, where a store's client
+    /// reads what it is given, a whole part at once as it signs it, and
+    /// where a page of the mapping gone from memory would hold a thread
+    /// for as long as the disk took. `bytes`, unread, hold what they hold
+    /// until the put ends.
+    async fn put_spilled(&self, key: &str, bytes: Bytes, spill: Arc<Spill>) -> Result<()> {
+        self.fits(key, bytes.len())?;
+        self.put_parts(key, spill.pieces(key)).await
     }
 
     /// One request, which `object_store` makes create only: on S3 with
@@ -1726,7 +1833,9 @@ impl Blobs for ObjectBlobs {
 ///
 /// Several processes on one host may share a cache directory: an entry is
 /// written under a name of its writer's own and renamed into place, and
-/// only files left part written an hour ago or more are swept away.
+/// only files left part written an hour ago or more are swept away, and
+/// spills nobody holds. A merge's vectors are gathered beside the entries,
+/// and each spill becomes an entry as its file is put.
 #[derive(Debug, Clone)]
 pub struct CachedBlobs {
     inner: Arc<dyn Blobs>,
@@ -1765,8 +1874,9 @@ impl CachedBlobs {
     }
 
     /// As [`Self::new`], first deleting the files left part written in
-    /// `dir` long ago, as far as the disk lets it in time: what is not
-    /// swept now is swept on, and does no harm meanwhile.
+    /// `dir` long ago, and the spills nobody holds, as far as the disk lets
+    /// it in time: what is not swept now is swept on, and does no harm
+    /// meanwhile.
     pub async fn open(inner: Arc<dyn Blobs>, dir: impl Into<PathBuf>) -> Self {
         let cached = Self::new(inner, dir);
         let dir = cached.dir.clone();
@@ -1858,6 +1968,82 @@ impl CachedBlobs {
     }
 }
 
+impl CachedBlobs {
+    /// Make `spill` the copy of the file under `key`, renaming it, as
+    /// [`Self::remember`] would write one, and failing as that does: logged,
+    /// the copy then fetched as it is next asked for.
+    ///
+    /// The file is put by now, and a merge given up may delete it as soon as
+    /// the put's task has gone: so, as a link is (see
+    /// [`CachedBlobs::link_local`]), a rename given up looks before it is
+    /// made, and after, whether whoever asked has stopped waiting, and takes
+    /// back what it did, and only that, the very file, as a copy fetched
+    /// since is not its own. What remains is a rename given up after that
+    /// last look: in place before the caller hears, so that a delete that
+    /// follows removes it.
+    async fn take_up(&self, key: &str, spill: Arc<Spill>) {
+        let Some(path) = self.path(key) else { return };
+        let mut taking = Linking {
+            given_up: Arc::default(),
+            answered: false,
+        };
+        let (given_up, told) = (taking.given_up.clone(), self.disk.spills_are_told());
+        let taken = self.disk.run(0, move || {
+            if let Some(told) = &told {
+                told.taken_up();
+            }
+            let given_up = || given_up.load(Ordering::SeqCst);
+            let gone = || std::io::Error::other("taking the spill up was given up");
+            let parent = path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("cache path has no parent"))?;
+            std::fs::create_dir_all(parent)?;
+            if given_up() {
+                return Err(gone());
+            }
+            crate::column::forget_summed(&path);
+            let taken = spill.renamed_to(&path)?;
+            if let Some(told) = told {
+                told.looks_again();
+            }
+            if given_up() {
+                let here = crate::column::seen(&path);
+                if here.is_ok_and(|here| here.same_file(&taken)) {
+                    crate::column::forget_summed(&path);
+                    let _ = std::fs::remove_file(&path);
+                }
+                return Err(gone());
+            }
+            Ok(())
+        });
+        match taken.await {
+            Ok(()) => taking.answered = true,
+            Err(error) => tracing::warn!(key, %error, "could not keep a spill as a file's copy"),
+        }
+    }
+}
+
+/// How much room there is on the file system of `path`, as far as a process
+/// with no privilege may use it, and how large it is, if the system says: it
+/// leaves out what is kept for root, which ext4 keeps 5% of by default.
+#[doc(hidden)]
+pub fn disk_room(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        let stats = nix::sys::statvfs::statvfs(path).ok()?;
+        // Each of its own width on each system.
+        let block = stats.fragment_size() as u64;
+        let free = (stats.blocks_available() as u64).saturating_mul(block);
+        let size = (stats.blocks() as u64).saturating_mul(block);
+        Some((free, size))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// A file being fetched into the cache under a name of its own, removed
 /// if this is dropped before it is renamed into place: by a failure, or
 /// by a caller that stops waiting, as one whose client went away does. It
@@ -1946,21 +2132,22 @@ impl Drop for Forgetting {
 }
 
 /// Delete every file under `dir` left part written [`PARTIAL_STALE`] ago
-/// or more, returning how many. A file or directory that cannot be read,
-/// or goes meanwhile, is passed over.
+/// or more, and every spill nobody holds, however new, returning how many. A
+/// file or directory that cannot be read, or goes meanwhile, is passed over.
 fn sweep(dir: &Path) -> usize {
     let stale = |entry: &std::fs::DirEntry| {
-        let partial = entry
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.starts_with(PARTIAL_MARK));
-        let age = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|written| written.elapsed().ok());
-        partial && age.is_some_and(|age| age >= PARTIAL_STALE)
+        let path = entry.path();
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        let partial = extension.is_some_and(|extension| extension.starts_with(PARTIAL_MARK));
+        let aged = || {
+            let written = entry.metadata().and_then(|meta| meta.modified()).ok();
+            let age = written.and_then(|written| written.elapsed().ok());
+            age.is_some_and(|age| age >= PARTIAL_STALE)
+        };
+        match extension == Some(SPILL_EXTENSION) {
+            true => left_behind(&path, aged),
+            false => partial && aged(),
+        }
     };
     std::fs::read_dir(dir)
         .into_iter()
@@ -1985,6 +2172,21 @@ impl Blobs for CachedBlobs {
     // No `put_new`, which is refused by default: nothing creates through a
     // cache, and a copy kept of a create could be bytes the store does not
     // hold, beside a put or a delete of the same key.
+
+    /// Off Unix nothing is read in place (see `Partition::column`), so
+    /// nothing is gathered to be.
+    fn spills(&self) -> Option<Spills> {
+        cfg!(unix).then(|| Spills::in_dir(self.dir.clone(), self.disk.clone()))
+    }
+
+    /// The store first, and the copy only once it has the file, as
+    /// [`Self::put`] writes one: no file is ever kept under a key the store
+    /// did not take.
+    async fn put_spilled(&self, key: &str, bytes: Bytes, spill: Arc<Spill>) -> Result<()> {
+        self.inner.put_spilled(key, bytes, spill.clone()).await?;
+        self.take_up(key, spill).await;
+        Ok(())
+    }
 
     /// Handed to the store as it comes, and no copy of it made: one is
     /// made when it is first read. Any copy of a file that was under `key`
@@ -2369,6 +2571,23 @@ mod tests {
         let (one, other) = (random(&one).unwrap(), random(&other).unwrap());
         assert_eq!(one.get_version_num(), 4);
         assert_ne!(one, other);
+    }
+
+    /// A store sends what it is given from the async threads, where a
+    /// mapped page that has gone from memory would be read from disk with
+    /// nothing to bound it. So what goes up of a spill is read from it by the
+    /// disk's own steps, and what the mapping's bytes come to is not read at
+    /// all: here they are not the frame, and the frame is what goes up, in
+    /// parts where it takes them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_goes_up_of_a_spill_is_read_from_it_not_from_its_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = crate::spill::tests::spill_in(dir.path()).await;
+        let frame = Bytes::copy_from_slice(spill.bytes());
+        let not_read = Bytes::from_static(b"the mapping, which is not to be read here");
+        let store = ObjectBlobs::new(Arc::new(InMemory::new()));
+        store.put_spilled("t/1/v", not_read, spill).await.unwrap();
+        assert_eq!(store.get("t/1/v").await.unwrap(), frame);
     }
 
     #[tokio::test]
