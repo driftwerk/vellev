@@ -4132,15 +4132,16 @@ fn a_grace_below_fifteen_minutes_or_three_requests_to_the_store_is_refused() {
     assert!(!refused.contains("backup claim"), "{refused}");
 }
 
-/// A merge pool of no threads could build nothing, and one at a negative
-/// nice would ask for a priority above the process's, which the image's
-/// user may not take and which a merge never needs (merge note, §3): both
-/// are refused by the settings' check, saying why, not left to panic as
-/// the node starts. From 0 to 19, the whole range of a lower priority, a
-/// pool of a thread or more is let through.
+/// A merge pool too small to give each build a thread could build nothing
+/// on some slot, and a negative nice would ask for a priority above the
+/// process's, which the image's user may not take and which a merge never
+/// needs; a nice past 19 is lower than any there is (merge note, §9.2).
+/// All are refused by the settings' check, saying why, not left to panic
+/// as the node starts, and what the bench asks is the same.
 #[test]
-fn a_merge_pool_of_no_threads_or_a_higher_priority_is_refused() {
+fn a_merge_pool_that_cannot_run_is_refused() {
     use vellev_node::MergePool;
+    use vellev_storage::MERGE_BUILDS;
     let pooled = |merge_pool| {
         Settings {
             merge_pool,
@@ -4153,23 +4154,36 @@ fn a_merge_pool_of_no_threads_or_a_higher_priority_is_refused() {
         other => panic!("not refused for its settings: {other:?}"),
     };
     pooled(MergePool::Global).unwrap();
-    for (threads, nice) in [(1, 0), (2, 5), (16, 10), (1, 19)] {
+    for (threads, nice) in [(MERGE_BUILDS, 0), (MERGE_BUILDS, 19), (16, 5), (16, 10)] {
         pooled(MergePool::Own { threads, nice }).unwrap();
     }
-    let refused = refusal(pooled(MergePool::Own {
-        threads: 0,
-        nice: 0,
-    }));
-    assert!(refused.contains("a merge pool of no threads"), "{refused}");
+    for threads in 0..MERGE_BUILDS {
+        let refused = refusal(pooled(MergePool::Own { threads, nice: 0 }));
+        assert!(refused.contains(&format!("{threads} threads")), "{refused}");
+        assert!(
+            refused.contains(&format!("{MERGE_BUILDS} builds")),
+            "{refused}"
+        );
+    }
     for nice in [-1, -20] {
-        let refused = refusal(pooled(MergePool::Own { threads: 2, nice }));
+        let refused = refusal(pooled(MergePool::Own { threads: 16, nice }));
         assert!(refused.contains(&format!("a nice of {nice}")), "{refused}");
+        assert!(refused.contains("above the process's"), "{refused}");
     }
     let refused = refusal(pooled(MergePool::Own {
-        threads: 2,
+        threads: 16,
         nice: 20,
     }));
     assert!(refused.contains("a nice of 20"), "{refused}");
+    assert!(refused.contains("past 19"), "{refused}");
+    assert!(!refused.contains("above"), "{refused}");
+    // The count a node starts with decides, whatever derived it.
+    let one_build = MergePool::Own {
+        threads: 1,
+        nice: 0,
+    };
+    assert_eq!(one_build.problem(1), None);
+    assert!(one_build.problem(2).is_some());
 }
 
 #[test]
