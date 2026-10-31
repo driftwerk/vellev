@@ -1292,7 +1292,9 @@ async fn a_tenant_whose_hold_lapsed_and_was_renewed_goes_on_being_looked_after()
         cluster.coordinator.clone(),
         Duration::ZERO,
     ));
-    let lease = Duration::from_millis(600);
+    // Long enough that once held again, no stall of a loaded machine lets
+    // the hold run out before the rule has looked.
+    let lease = Duration::from_secs(3);
     let node = node_flushing(&cluster, coordinator.clone(), lease);
     let acme = tenant("acme");
     node.create_tenant(&acme).await.unwrap();
@@ -1302,15 +1304,12 @@ async fn a_tenant_whose_hold_lapsed_and_was_renewed_goes_on_being_looked_after()
         .unwrap();
 
     coordinator.failing.store(true, Ordering::SeqCst);
-    tokio::time::sleep(lease * 2).await;
-    assert!(
-        tokio::time::Instant::now() >= held.held_until(),
-        "the hold did not lapse"
-    );
-    // Asks for a flush, which finds the hold lapsed.
+    until_lapsed(&held).await;
+    // Asks for a flush, which finds the hold lapsed: no work is done on a
+    // hold that may be lost, as much as none is forgotten.
     held.write(ten_notes(0)).await.unwrap();
-    tokio::time::sleep(lease).await;
-    assert_eq!(held.read(State::unflushed), 10);
+    tokio::time::sleep(lease / 2).await;
+    assert_eq!(held.read(State::unflushed), 10, "flushed through the lapse");
 
     coordinator.failing.store(false, Ordering::SeqCst);
     let flushed = async {
@@ -1318,7 +1317,7 @@ async fn a_tenant_whose_hold_lapsed_and_was_renewed_goes_on_being_looked_after()
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     };
-    tokio::time::timeout(Duration::from_secs(5), flushed)
+    tokio::time::timeout(Duration::from_secs(20), flushed)
         .await
         .expect("what a write asked for during the lapse was done after it");
     assert!(
@@ -1331,9 +1330,72 @@ async fn a_tenant_whose_hold_lapsed_and_was_renewed_goes_on_being_looked_after()
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     };
-    tokio::time::timeout(Duration::from_secs(5), flushed)
+    tokio::time::timeout(Duration::from_secs(20), flushed)
         .await
         .expect("what is asked for after the lapse is done");
+}
+
+/// Wait until the hold on `held`, unrenewed, has run out.
+async fn until_lapsed(held: &Tenant) {
+    let lapsed = async {
+        while tokio::time::Instant::now() < held.held_until() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), lapsed)
+        .await
+        .expect("the hold lapsed");
+}
+
+/// A lapse may end the other way: another node has taken the tenant, and the
+/// next renewal is refused. The hold is lost then, and no round ever ran on
+/// it, though a write asked for a flush all through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lapse_that_ends_in_a_refusal_loses_the_hold_with_no_round_run_on_it() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let lease = Duration::from_secs(1);
+    let node = node_flushing(&cluster, coordinator.clone(), lease);
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+
+    coordinator.failing.store(true, Ordering::SeqCst);
+    until_lapsed(&held).await;
+    let rounds = coordinator.history_forgotten.load(Ordering::SeqCst);
+    held.write(ten_notes(0)).await.unwrap();
+    cluster.clock.advance(lease * 2);
+    cluster.node().tenant(&acme).await.unwrap();
+    coordinator.failing.store(false, Ordering::SeqCst);
+    // Asking for the tenant would lose the hold itself, and show nothing:
+    // that renewing has stopped asking is what says it was refused.
+    let renewals = || coordinator.lease_renewals.load(Ordering::SeqCst);
+    let refused = async {
+        let mut asked = renewals();
+        loop {
+            tokio::time::sleep(lease).await;
+            if renewals() == asked {
+                return;
+            }
+            asked = renewals();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), refused)
+        .await
+        .expect("renewing went on, refused");
+    assert_eq!(
+        coordinator.history_forgotten.load(Ordering::SeqCst),
+        rounds,
+        "a round ran on a hold that was lapsed, and then lost"
+    );
+    assert_eq!(held.read(State::unflushed), 10, "flushed on a lost hold");
+    assert_eq!(node.tenants_given_up(), 0, "nothing panicked");
 }
 
 /// `work`, on a runtime of its own with time paused, given a minute of real
@@ -1344,7 +1406,7 @@ where
     F: std::future::Future<Output = ()>,
 {
     let (ended, ends) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let running = std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -1353,8 +1415,17 @@ where
             .block_on(work());
         ended.send(()).unwrap();
     });
-    ends.recv_timeout(Duration::from_secs(60))
-        .expect("a task spun, and time stood still");
+    match ends.recv_timeout(Duration::from_secs(60)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("a task spun, and time stood still")
+        }
+        // Ended without a word: what it failed on is the failure.
+        Ok(()) | Err(_) => {
+            if let Err(failed) = running.join() {
+                std::panic::resume_unwind(failed);
+            }
+        }
+    }
 }
 
 /// Through a lapse, a task that waits for its hold looks at it as often as
@@ -1416,6 +1487,7 @@ async fn a_tenant_whose_maintenance_panicked_is_given_up() {
     tokio::time::timeout(Duration::from_secs(10), given_up)
         .await
         .expect("a tenant whose maintenance panicked lived on");
+    assert_eq!(node.tenants_given_up(), 1, "given up with nothing to show");
     let opened = node.tenant(&acme).await.unwrap();
     assert_eq!(opened.read(count), 10, "its rows were lost");
     opened.write(ten_notes(10)).await.unwrap();

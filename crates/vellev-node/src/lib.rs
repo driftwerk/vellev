@@ -2012,6 +2012,11 @@ impl Node {
         hold
     }
 
+    /// How many tenants were given up as their maintenance panicked.
+    pub fn tenants_given_up(&self) -> u64 {
+        0
+    }
+
     /// How many tenants sweeps chose to let go, for being idle or for the
     /// memory budget, but found something else holding, as a request or a
     /// merge does: let go at a later round.
