@@ -788,6 +788,33 @@ impl StopCounts {
     }
 }
 
+/// Held by a task whose end is the end of the hold, however it comes: every
+/// way it means to end, the hold is lost or the tenant gone already, and a
+/// panic is the one that would leave the tenant open with no such task. A
+/// merge lost to a panic is in no count of merges stopped, and nothing else
+/// names the tenant, so that a panic is logged here and counted.
+#[derive(Debug)]
+struct GivesUp {
+    hold: Arc<Hold>,
+    tenant: TenantId,
+    /// The node's count of tenants given up for a panic.
+    given_up: Arc<AtomicU64>,
+}
+
+impl Drop for GivesUp {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!(tenant = %self.tenant, "maintenance panicked; the tenant is given up");
+            self.given_up.fetch_add(1, Ordering::Relaxed);
+        }
+        // Lost already, what stopped it said why: a second `lose` would
+        // count a merge begun since as a lease lost.
+        if !self.hold.is_lost() {
+            self.hold.lose(Lost::Lease);
+        }
+    }
+}
+
 /// A restore running on a tenant: as it was asked for, and what ends as
 /// the restore ends.
 #[derive(Debug)]
@@ -1303,6 +1330,14 @@ impl TenantWork {
         self.backoff.lock().expect("backoff lock").1
     }
 
+    /// How long until the flush that failed is to be tried again, if it is
+    /// to be: not with too few rows for maintenance to flush.
+    fn flush_wait(&self) -> Option<Duration> {
+        let at = self.flush_retried_at()?;
+        (self.read(State::unflushed) >= self.flush_rows)
+            .then(|| at.saturating_duration_since(Instant::now()))
+    }
+
     /// Note how the flush tried went: one that failed puts the next off,
     /// twice as long as the one before, and one that went through ends that.
     fn flush_tried(&self, went_through: bool) {
@@ -1630,6 +1665,8 @@ struct Inner {
     /// idle, and those let go for the memory budget.
     let_go_idle: AtomicU64,
     let_go_for_budget: AtomicU64,
+    /// How many tenants were given up as their maintenance panicked.
+    given_up: Arc<AtomicU64>,
     /// Where every writer this node opens times its background work.
     timings: Arc<Timings>,
 }
@@ -1874,6 +1911,7 @@ impl Node {
             merges_stopped: Arc::default(),
             let_go_idle: AtomicU64::new(0),
             let_go_for_budget: AtomicU64::new(0),
+            given_up: Arc::default(),
             timings: Arc::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
@@ -1990,6 +2028,11 @@ impl Node {
         let hold = Arc::new(SweepHold::default());
         *self.0.sweep_hold.lock().expect("sweep hold lock") = Some(hold.clone());
         hold
+    }
+
+    /// How many tenants were given up as their maintenance panicked.
+    pub fn tenants_given_up(&self) -> u64 {
+        self.0.given_up.load(Ordering::Relaxed)
     }
 
     /// How many tenants sweeps chose to let go, for being idle or for the
@@ -2806,7 +2849,12 @@ impl Inner {
     /// clean up its files after each flush and now and then regardless,
     /// for as long as the tenant is open and held. The task holds no
     /// [`Tenant`], and its work only for a round, so dropping the tenant
-    /// ends it, and losing the hold stops it wherever it is.
+    /// ends it, and losing the hold stops it wherever it is. A hold that has
+    /// run out is not lost: renewing goes on trying, and may yet bring it
+    /// back, so the task waits, looking as often as a hold is renewed, and
+    /// does then what it was asked to meanwhile. However the task ends, as
+    /// by a panic in a round, the hold ends with it, so that no tenant is
+    /// left open with nothing looking after it.
     fn maintaining(&self, work: &Arc<TenantWork>, mut wanted: mpsc::Receiver<()>) {
         let Settings {
             restore_window,
@@ -2815,18 +2863,30 @@ impl Inner {
         } = self.settings;
         let every =
             (restore_window / 24).clamp(Duration::from_secs(60), Duration::from_secs(60 * 60));
+        let lapsed_every = self.settings.lease / 3;
         let coordinator = self.coordinator.clone();
         let hold = work.hold.clone();
+        let ends = GivesUp {
+            hold: hold.clone(),
+            tenant: work.id.clone(),
+            given_up: self.given_up.clone(),
+        };
         let work = Arc::downgrade(work);
         let maintaining = tokio::spawn(async move {
+            let _ends = ends;
+            // A flush a write asked for, not yet looked at.
+            let mut asked = false;
             loop {
                 // While flushes fail, the next is tried as soon as its
-                // backoff lets it, whether or not a write asks for it.
-                let retried_at = work.upgrade().and_then(|work| work.flush_retried_at());
-                let wait = retried_at.map_or(every, |at| {
-                    every.min(at.saturating_duration_since(Instant::now()))
-                });
-                let flush = match tokio::time::timeout(wait, wanted.recv()).await {
+                // backoff lets it, whether or not a write asks for it. Only
+                // while one is due: with too few rows to flush, nothing here
+                // would try one, and the wait would be over for good.
+                let wait = match work.upgrade() {
+                    Some(work) if !work.held() => lapsed_every,
+                    Some(work) => work.flush_wait().map_or(every, |wait| every.min(wait)),
+                    None => every,
+                };
+                asked |= match tokio::time::timeout(wait, wanted.recv()).await {
                     Ok(Some(())) => true,
                     Ok(None) => return,
                     Err(_) => false,
@@ -2834,13 +2894,16 @@ impl Inner {
                 let Some(work) = work.upgrade() else {
                     return;
                 };
-                if !work.held() {
+                if work.hold.is_lost() {
                     return;
+                }
+                if !work.held() {
+                    continue;
                 }
                 // One that failed is tried again on its own, if no write
                 // asks, but never sooner than its backoff lets it. One put
                 // off for that still lets the tenant be looked after.
-                let due = flush || work.flush_retried_at().is_some();
+                let due = std::mem::take(&mut asked) || work.flush_retried_at().is_some();
                 if due
                     && work.read(State::unflushed) >= work.flush_rows
                     && work.flush_may_be_tried()

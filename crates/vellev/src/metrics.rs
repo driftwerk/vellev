@@ -719,6 +719,13 @@ impl Collector for Counted {
             None,
             counter.metric_type(),
         )?)?;
+        let counter = ConstCounter::new(node.tenants_given_up());
+        counter.encode(encoder.encode_descriptor(
+            "tenants_given_up",
+            "Tenants given up as their maintenance panicked, and opened afresh for the next caller: a merge lost so is in no count of merges stopped",
+            None,
+            counter.metric_type(),
+        )?)?;
         let counter = ConstCounter::new(merges.stopped_for_budget);
         counter.encode(encoder.encode_descriptor(
             "merges_stopped_for_budget",
