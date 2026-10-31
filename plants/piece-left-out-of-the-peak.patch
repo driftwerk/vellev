@@ -1,8 +1,8 @@
 diff --git a/crates/vellev-storage/src/state.rs b/crates/vellev-storage/src/state.rs
-index 3c0968a..f1d993f 100644
+index a5a8807..ce927c8 100644
 --- a/crates/vellev-storage/src/state.rs
 +++ b/crates/vellev-storage/src/state.rs
-@@ -877,7 +877,7 @@ impl Reckoning {
+@@ -890,7 +890,7 @@ impl Reckoning {
      pub(crate) fn peak(&self) -> usize {
          let built = self.indexed + self.training.max(self.encoded * ENCODED_AT_PEAK);
          let going_up = self.indexed + self.encoded + self.part;

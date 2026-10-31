@@ -1,0 +1,13 @@
+diff --git a/crates/vellev-storage/src/state.rs b/crates/vellev-storage/src/state.rs
+index a5a8807..7434b20 100644
+--- a/crates/vellev-storage/src/state.rs
++++ b/crates/vellev-storage/src/state.rs
+@@ -507,7 +507,7 @@ impl Fit {
+             self.vectors.clone(),
+             self.indexes.clone(),
+         );
+-        move || segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes)
++        move || segment_bytes(&file.rows, &vectors) + vectors.bytes() + indexes_bytes(&indexes)
+     }
+ }
+ 

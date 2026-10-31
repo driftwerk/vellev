@@ -1,0 +1,12 @@
+diff --git a/crates/vellev-storage/src/partition.rs b/crates/vellev-storage/src/partition.rs
+index 1e865b1..73781f4 100644
+--- a/crates/vellev-storage/src/partition.rs
++++ b/crates/vellev-storage/src/partition.rs
+@@ -3490,6 +3490,7 @@ impl Writer {
+         // Not at another epoch than it was planned at: a restore since may
+         // have brought the same segments back with other rows live.
+         if self.stale(planned) {
++            staged.keep();
+             return Ok(dropped(MergeEnd::Stale));
+         }
+         // Nor with a row the run holds live missing from the merged file,

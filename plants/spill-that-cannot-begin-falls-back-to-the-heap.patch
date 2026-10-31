@@ -1,8 +1,8 @@
 diff --git a/crates/vellev-storage/src/state.rs b/crates/vellev-storage/src/state.rs
-index 3c0968a..2b51f93 100644
+index a5a8807..73f7d4e 100644
 --- a/crates/vellev-storage/src/state.rs
 +++ b/crates/vellev-storage/src/state.rs
-@@ -685,9 +685,10 @@ impl Run {
+@@ -698,9 +698,10 @@ impl Run {
          let mut rows: Vec<Row> = Vec::with_capacity(count);
          let mut vectors = match spill.filter(|_| values > 0) {
              None => Gathering::with_capacity(values, count),

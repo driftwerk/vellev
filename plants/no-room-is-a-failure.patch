@@ -1,8 +1,8 @@
 diff --git a/crates/vellev-storage/src/partition.rs b/crates/vellev-storage/src/partition.rs
-index bae689d..5ec94af 100644
+index 1e865b1..9b9ac2f 100644
 --- a/crates/vellev-storage/src/partition.rs
 +++ b/crates/vellev-storage/src/partition.rs
-@@ -3340,7 +3340,7 @@ impl Writer {
+@@ -3395,7 +3395,7 @@ impl Writer {
                      wanted,
                      "a merge is skipped: no room on local disk"
                  );

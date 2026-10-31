@@ -1,8 +1,8 @@
 diff --git a/crates/vellev-storage/src/partition.rs b/crates/vellev-storage/src/partition.rs
-index bae689d..462a4d6 100644
+index 1e865b1..7409f13 100644
 --- a/crates/vellev-storage/src/partition.rs
 +++ b/crates/vellev-storage/src/partition.rs
-@@ -3466,7 +3466,8 @@ impl Writer {
+@@ -3630,7 +3630,8 @@ impl Writer {
      /// state's before it commits, a walk of its run's segments.
      fn merge_planned(&self) -> Option<MergePlanned> {
          let spills = self.partition.blobs.spills();

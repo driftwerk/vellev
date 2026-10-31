@@ -36,3 +36,6 @@ rename-undone-whatever-is-there | rename-undone-whatever-is-there | R4 | -p vell
 going-up-reckoned-at-a-part-and-a-piece | going-up-reckoned-at-a-part-and-a-piece | reckoning unit | -p vellev-storage --lib -- what_goes_up_is_reckoned
 a-name-gone-fails-the-merge | a-name-gone-fails-the-merge | R9 | -p vellev-storage --test merge_spill -- a_spill_whose_name_goes
 spill-that-cannot-begin-falls-back-to-the-heap | spill-that-cannot-begin-falls-back-to-the-heap | R6 no fallback | -p vellev-storage --test merge_spill -- a_cache_that_cannot_begin
+waiting-bytes-count-the-vectors | waiting-bytes-count-the-vectors | R16 gauge | -p vellev-storage --test merge_spill -- a_merge_that_gave_its_turn
+a-stale-merge-keeps-its-files | a-stale-merge-keeps-its-files | R16 stale | -p vellev-storage --test merge_spill -- a_merge_found_stale
+a-cut-merge-keeps-its-files | a-cut-merge-keeps-its-files | R16 cut | -p vellev-storage --test merge_spill -- a_merge_cut_off

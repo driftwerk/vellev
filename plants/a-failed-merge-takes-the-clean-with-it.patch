@@ -1,13 +1,17 @@
 diff --git a/crates/vellev-node/src/lib.rs b/crates/vellev-node/src/lib.rs
-index 6d6ffa4..22f2dd0 100644
+index 56b5237..9c33124 100644
 --- a/crates/vellev-node/src/lib.rs
 +++ b/crates/vellev-node/src/lib.rs
-@@ -1399,7 +1399,7 @@ impl TenantWork {
-             match self.writer.merge_giving_way(flush_due).await {
-                 Ok(Some(_)) => {}
-                 Ok(None) => break Ok(()),
--                Err(error) => break Err(self.failed(error)),
-+                Err(error) => return Err(self.failed(error)),
-             }
-         };
-         if self.writer.is_closed() {
+@@ -1586,10 +1586,8 @@ impl TenantWork {
+         // that disk: so it comes all the same, and the failure is the
+         // round's once it has. One that was skipped for want of room found
+         // nothing to fail on, and comes here as any other.
+-        if self.writer.is_closed() {
+-            merged?;
+-            return Ok(0);
+-        }
++        merged?;
++        let merged: Result<()> = Ok(());
+         // The round ends here if cleaning up was left for a later round:
+         // the flush due goes first, and the rest is done then.
+         let flush_due = || self.flush_due();

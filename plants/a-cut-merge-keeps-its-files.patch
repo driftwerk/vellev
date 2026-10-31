@@ -1,0 +1,12 @@
+diff --git a/crates/vellev-storage/src/partition.rs b/crates/vellev-storage/src/partition.rs
+index 1e865b1..39ca0aa 100644
+--- a/crates/vellev-storage/src/partition.rs
++++ b/crates/vellev-storage/src/partition.rs
+@@ -3472,6 +3472,7 @@ impl Writer {
+         let due = self.lag.due(self.partition.read(State::unflushed));
+         if due && build.holds_turn() && self.epoch() == planned && (flush_first.may_be_tried)() {
+             self.timed(Timed::BuildingWait(Holder::Flush), waited);
++            staged.keep();
+             flushed = self.flushed_first(guard, flush_first).await?;
+             (guard, waited) = self.lock_to_commit(&build, &merged).await;
+         }

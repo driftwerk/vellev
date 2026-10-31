@@ -1,8 +1,8 @@
 diff --git a/crates/vellev-storage/src/state.rs b/crates/vellev-storage/src/state.rs
-index 3c0968a..a050f71 100644
+index a5a8807..6b5a923 100644
 --- a/crates/vellev-storage/src/state.rs
 +++ b/crates/vellev-storage/src/state.rs
-@@ -683,7 +683,7 @@ impl Run {
+@@ -696,7 +696,7 @@ impl Run {
              }
          };
          let mut rows: Vec<Row> = Vec::with_capacity(count);
