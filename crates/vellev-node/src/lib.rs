@@ -1717,8 +1717,7 @@ impl Node {
     /// in memory together, as of now. Read under the node's own lock and
     /// holding no tenant, as warming asks it before each copy it opens: a
     /// sweep lets go only what nothing else holds, so asking must never
-    /// hold one. Each is a read of what its state counts as it changes,
-    /// and of what it has yet to free.
+    /// hold one. Each is a read of what its state counts as it changes.
     pub fn resident(&self) -> usize {
         self.0.resident()
     }
@@ -1887,6 +1886,18 @@ impl Node {
         self.0
             .each_writer(|tenant| unsettled += usize::from(!tenant.settled()));
         unsettled
+    }
+
+    /// About how many bytes the tenants this node writes have taken out of
+    /// their state and yet to free, as a merge's commit does what it
+    /// replaced. A figure of its own, for the eye: it goes by itself, so
+    /// neither a sweep nor warming acts on it, and [`Self::resident`] leaves
+    /// it out.
+    pub fn freeing(&self) -> usize {
+        let mut freeing = 0;
+        self.0
+            .each_writer(|tenant| freeing += tenant.partition().freeing());
+        freeing
     }
 
     /// The segments the tenants this node writes hold, by whether they
@@ -2316,7 +2327,7 @@ impl Inner {
         let open = self.opened();
         let writers: usize = (open.tenants.values())
             .filter_map(|opening| opening.get())
-            .map(|tenant| tenant.partition().resident())
+            .map(|tenant| tenant.figures().resident)
             .sum();
         let copies: usize = (open.followers.values())
             .filter_map(|following| following.get())
@@ -2353,9 +2364,7 @@ impl Inner {
         held.into_iter()
             .map(|(id, kind)| {
                 let (unused, size, warmed) = match &kind {
-                    Kind::Writer(_, tenant) => {
-                        (tenant.idle(), tenant.partition().resident(), false)
-                    }
+                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.figures().resident, false),
                     Kind::Copy(_, copy) => (copy.idle(), copy.resident(), copy.warmed().is_some()),
                 };
                 Held {

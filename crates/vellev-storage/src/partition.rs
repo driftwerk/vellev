@@ -26,6 +26,7 @@ use crate::format::{
     Head, Kind, LogSegment, Manifest, Op, SegmentCurve, SegmentFile, SegmentIndex, SegmentMeta,
     DEFAULT_MAX_FORMAT, FORMAT_VERSION, SUMMED_AT_ONCE,
 };
+use crate::freed::{off_the_async_threads, FreedOff};
 use crate::merge_builds::{
     HeldAt, MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
 };
@@ -388,18 +389,12 @@ impl Partition {
         self.state.figures()
     }
 
-    /// What segments a merge replaced are counted to hold until they are
-    /// freed, which are out of this partition's state and so not in
-    /// [`Self::figures`]. Read without its lock, as those are.
+    /// About how many bytes a checkpoint took out of this partition's state
+    /// and has yet to free: a merge's replaced segments, with the rows of
+    /// the flush committed with it. Not in [`Self::figures`], and held to
+    /// no budget: it goes by itself. Read without the lock, as those are.
     pub fn freeing(&self) -> usize {
         self.state.freeing()
-    }
-
-    /// About how many bytes the partition holds in memory now: its
-    /// [`Self::figures`], with what it has yet to free. Read without its
-    /// lock, as a node reads it of every tenant for its memory budget.
-    pub fn resident(&self) -> usize {
-        self.state.resident()
     }
 
     /// Hold the free of what a merge's commit takes out from now on, at the
@@ -619,12 +614,12 @@ impl Partition {
     async fn column_built(
         &self,
         key: &str,
-        held: Column,
+        held: FreedOff<Column>,
         stopping: Option<&Stopping>,
     ) -> Result<Column> {
         self.own(key)?;
         if !cfg!(unix) {
-            return Ok(held);
+            return Ok(held.into_inner());
         }
         // A merge stopped as it sums the copy gives up at once: no warning,
         // and no copy fetched afresh, as the copy is whole for all it knows.
@@ -650,8 +645,11 @@ impl Partition {
             }
         };
         match read.await {
-            Ok(Some(column)) => Ok(column),
-            Ok(None) => Ok(held),
+            Ok(Some(column)) => {
+                drop(held.into_inner());
+                Ok(column)
+            }
+            Ok(None) => Ok(held.into_inner()),
             Err(error) if stopping.is_some_and(Stopping::is_stopped) => Err(error),
             Err(error) => {
                 tracing::error!(key, %error, "a segment just built is not kept: its vectors could not be read from local disk");
@@ -789,7 +787,8 @@ impl Partition {
                 let mut state = self.restore(&key, manifest, held, reloading).await?;
                 let together = state.apply_together(&tail.logs)?;
                 self.replayed_together(together);
-                self.changing(|now| *now = state);
+                let replaced = self.changing(|now| std::mem::replace(now, state));
+                off_the_async_threads(move || drop(replaced));
             }
             None => {
                 // A run of logs at a time, the codes of each made together
@@ -1948,13 +1947,14 @@ impl Writer {
             }
         }
         drop(turn);
-        // The building lock is held here. Segments a merge replaced take
+        // The building lock is held here. All that a merge's commit took out
+        // goes off on its own, the flushed rows with the segments: it takes
         // seconds to free, and whatever waits for that lock is not to wait
-        // for them: they go off on their own (see `Discarded`'s `drop`). A
-        // flush's rows are few, and gone by the time it ends.
+        // for it (see `Discarded`'s `drop`). What a plain flush took out is
+        // gone by the time it ends, with no turn among the work to wait for.
         match discarded.replaced() {
             true => drop(discarded),
-            false => blocking(move || discarded.free()).await?,
+            false => at_once(move || discarded.free()).await?,
         }
         Ok(())
     }
@@ -1977,7 +1977,10 @@ impl Writer {
         }
         let named_at = snapshot.position;
         let segment = match self.uploaded(&mut snapshot, named_at, staged).await? {
-            Some(prepared) => Some(self.fit(prepared, &snapshot.catalog, None).await?),
+            Some(prepared) => {
+                let prepared = FreedOff::new(prepared);
+                Some(self.fit(prepared, &snapshot.catalog, None).await?)
+            }
             None => None,
         };
         Ok((snapshot, segment))
@@ -2063,7 +2066,7 @@ impl Writer {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
                 match self.uploaded(&mut snapshot, restored, &mut staged).await? {
                     Some(prepared) => {
-                        let (meta, loaded) = self.loaded(prepared, None).await?;
+                        let (meta, loaded) = self.loaded(FreedOff::new(prepared), None).await?;
                         held.insert(meta.key.clone(), loaded);
                         Some(meta)
                     }
@@ -2724,25 +2727,37 @@ impl Writer {
     /// from local disk where the store keeps a copy.
     async fn loaded(
         &self,
-        prepared: Prepared,
+        prepared: FreedOff<Prepared>,
         stopping: Option<&Stopping>,
     ) -> Result<(SegmentMeta, Loaded)> {
-        let Prepared { meta, built, .. } = prepared;
+        let build = prepared.build();
+        let Prepared { meta, built, index } = prepared.into_inner();
+        let Built {
+            file,
+            vectors,
+            indexes,
+            segment,
+            column,
+            parts,
+            _probe,
+        } = built;
+        // What is held across the wait, sent off the async threads should
+        // the wait be given up.
+        let held = FreedOff::new((file, indexes, parts, segment, column, index, _probe));
+        let held = held.of(build.clone());
+        let vectors = FreedOff::new(vectors).of(build);
         let vectors = match &meta.vectors {
-            Some(key) => {
-                self.partition
-                    .column_built(key, built.vectors, stopping)
-                    .await?
-            }
-            None => built.vectors,
+            Some(key) => self.partition.column_built(key, vectors, stopping).await?,
+            None => vectors.into_inner(),
         };
+        let (file, indexes, parts, _segment, _column, _index, _probe) = held.into_inner();
         let loaded = Loaded {
-            file: Arc::new(built.file),
+            file: Arc::new(file),
             vectors: Arc::new(vectors),
-            indexes: Some(Arc::new(built.indexes)),
+            indexes: Some(Arc::new(indexes)),
             stored: Stored::default(),
             tokenized_on: 0,
-            parts: Some(built.parts),
+            parts: Some(parts),
         };
         Ok((meta, loaded))
     }
@@ -2752,7 +2767,7 @@ impl Writer {
     /// a segment that is not fails with nothing committed or changed.
     async fn fit(
         &self,
-        prepared: Prepared,
+        prepared: FreedOff<Prepared>,
         catalog: &Catalog,
         stopping: Option<&Stopping>,
     ) -> Result<Fit> {
@@ -3009,6 +3024,9 @@ impl Writer {
             merged.built.parts.probe = self.built_probe.lock().expect("probe lock").take();
             merged
         };
+        // From here to its commit all it built is as large a thing to free
+        // as what it would replace, and a stop lets it go on an async thread.
+        let merged = FreedOff::new(merged).of(Some(build.clone()));
         if stopping.stopped(MergeStage::Encoding) {
             return Ok(None);
         }
@@ -3025,6 +3043,7 @@ impl Writer {
         let Some(merged) = stopping.unless_stopped(MergeStage::Loading, fit).await else {
             return Ok(None);
         };
+        let merged = merged.map(|fit| FreedOff::new(fit).of(Some(build.clone())));
         // From here the merge commits, or is dropped by what it finds under
         // the building lock: a stop no longer ends it. Marked so under the
         // lock a stop is asked under, so that every stop is either heeded
@@ -3070,6 +3089,7 @@ impl Writer {
         }
         let snapshot = self.partition.read(State::taken);
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let segment = FreedOff::new(segment);
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
@@ -3089,7 +3109,8 @@ impl Writer {
         staged.keep();
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, |state| {
-            let replaced = state.compacted(&merge, merged);
+            let replaced = state.compacted(&merge, merged.into_inner());
+            let segment = segment.into_inner();
             let flushed = state.flushed(&key, position, snapshot, segment, Some(kept));
             flushed.and(replaced)
         })
@@ -4107,7 +4128,7 @@ impl RestoreFrom<'_> {
                         let named = [meta.index.as_ref(), meta.vectors.as_ref()];
                         put.extend(named.into_iter().flatten().cloned());
                         put.insert(meta.key.clone());
-                        let (meta, loaded) = writer.loaded(prepared, None).await?;
+                        let (meta, loaded) = writer.loaded(FreedOff::new(prepared), None).await?;
                         held.insert(meta.key.clone(), loaded);
                         Some(meta)
                     }

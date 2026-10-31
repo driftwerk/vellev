@@ -11,6 +11,7 @@ mod draft;
 mod error;
 #[doc(hidden)]
 pub mod format;
+mod freed;
 mod group;
 mod hybrid;
 mod keyword;

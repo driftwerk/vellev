@@ -21,6 +21,7 @@ use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
     SegmentMeta,
 };
+use crate::freed::off_the_async_threads;
 use crate::published::FreesHeld;
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
@@ -584,9 +585,7 @@ pub(crate) struct Run {
 impl Drop for Run {
     /// Let go ungathered, as by a merge stopped before its gather begins,
     /// or one dropped: on an async thread, it may be the last to hold a
-    /// replaced segment of a million rows. Sent off without a turn among
-    /// the work there, and not waited for: what lets it go may have given
-    /// up waiting for that very turn, or be past waiting for anything.
+    /// replaced segment of a million rows.
     fn drop(&mut self) {
         let segments = std::mem::take(&mut self.segments);
         if segments.is_empty() {
@@ -601,10 +600,7 @@ impl Drop for Run {
                 let _ = freed_on.send(std::thread::current().id());
             }
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(free)),
-            Err(_) => free(),
-        }
+        off_the_async_threads(free);
     }
 }
 
@@ -1134,7 +1130,9 @@ pub(crate) struct Discarded {
     rows: Vec<Row>,
     indexes: Indexes,
     segments: Vec<Segment>,
-    /// The segments as counted until they are freed, if they are.
+    /// About how many bytes the state's figures counted it at.
+    bytes: usize,
+    /// Those bytes as counted until they are freed, if they are.
     counted: Option<Counted>,
 }
 
@@ -1155,20 +1153,21 @@ impl Discarded {
     /// out of the state, along with what the flush committed with it does.
     pub(crate) fn and(mut self, mut replaced: Discarded) -> Discarded {
         self.segments.append(&mut replaced.segments);
+        self.bytes += replaced.bytes;
         self
     }
 
-    /// Count its segments in `freeing`, as they leave what the state comes
-    /// to, until they are freed. Rows and indexes are not: all they ever
-    /// come to is what a flush holds.
+    /// Count it in `freeing`, as it leaves what the state comes to, until
+    /// it is freed.
     pub(crate) fn count_in(&mut self, freeing: &Arc<AtomicUsize>) {
-        let bytes = self.segments.iter().map(|segment| segment.resident).sum();
+        let bytes = self.bytes;
         freeing.fetch_add(bytes, Ordering::SeqCst);
         let freeing = freeing.clone();
         self.counted = Some(Counted { freeing, bytes });
     }
 
-    /// Whether it holds segments a merge replaced.
+    /// Whether it holds segments a merge replaced: all of it then goes on
+    /// alone, the rows of the flush committed with them too.
     pub(crate) fn replaced(&self) -> bool {
         !self.segments.is_empty()
     }
@@ -1202,10 +1201,9 @@ impl Discarded {
 impl Drop for Discarded {
     /// Let go on an async thread, as a merge's commit lets it go, and as a
     /// checkpoint dropped once adopted does where it stood: it may be the
-    /// last to hold a replaced segment of a million rows. Sent off without
-    /// a turn among the work there, and not waited for, as a [`Run`] is:
-    /// what lets it go holds the building lock, and whatever waits for
-    /// that, as a flush does, would wait for the turn and the free too.
+    /// last to hold a replaced segment of a million rows. What lets it go
+    /// holds the building lock, and whatever waits for that, as a flush
+    /// does, would wait for a turn and the free too.
     fn drop(&mut self) {
         #[cfg(test)]
         for segment in &self.segments {
@@ -1216,11 +1214,7 @@ impl Drop for Discarded {
         if self.rows.is_empty() && self.indexes.is_empty() && self.segments.is_empty() {
             return;
         }
-        let free = self.taken();
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(free)),
-            Err(_) => free(),
-        }
+        off_the_async_threads(self.taken());
     }
 }
 
@@ -2766,13 +2760,15 @@ impl State {
             dead: DeadRows::of(dead.into_iter()),
             parts,
         };
+        let segments: Vec<Segment> = self.segments.splice(run, [merged]).collect();
         Discarded {
             #[cfg(test)]
             probe: None,
             held: None,
             rows: Vec::new(),
             indexes: Indexes::new(),
-            segments: self.segments.splice(run, [merged]).collect(),
+            bytes: segments.iter().map(|segment| segment.resident).sum(),
+            segments,
             counted: None,
         }
     }
@@ -3059,16 +3055,18 @@ impl State {
             applied,
             ..
         } = &mut self.memtable;
-        let discarded = Discarded {
+        let mut discarded = Discarded {
             #[cfg(test)]
             probe: None,
             held: None,
             rows: rows.drain(..held).collect(),
             indexes: std::mem::take(indexes),
             segments: Vec::new(),
+            bytes: *bytes,
             counted: None,
         };
         *bytes = rows.iter().map(row_bytes).sum();
+        discarded.bytes -= *bytes;
         dead.drain(..held);
         *deaths -= held;
         if let Some(Kept {

@@ -52,7 +52,7 @@ impl FreesHeld {
 pub(crate) struct Published {
     state: RwLock<State>,
     figures: Mutex<Figures>,
-    /// What segments taken out of the state still hold, until they are
+    /// What a checkpoint took out of the state still holds, until it is
     /// freed: see [`Self::freeing`].
     freeing: Arc<AtomicUsize>,
     /// Where a test holds frees, if it does: see [`Self::hold_frees`].
@@ -72,18 +72,13 @@ impl Published {
         *self.figures.lock().expect("figures lock")
     }
 
-    /// What segments taken out of the state are counted to hold until they
-    /// are freed, which what the state comes to does not count. Read
-    /// without its lock.
+    /// What a checkpoint took out of the state is counted at until it is
+    /// freed. It is apart from what the state comes to, and nothing acts on
+    /// it: it goes by itself, so a sweep that let tenants go or stopped
+    /// merges for it would pay for good for what lasts moments. Read
+    /// without the lock.
     pub(crate) fn freeing(&self) -> usize {
         self.freeing.load(Ordering::SeqCst)
-    }
-
-    /// What the state came to as it was last changed, with what it took out
-    /// and has yet to free: all it holds in memory. Read in this order, as
-    /// [`Self::adopting`] counts in the other, so that it never falls short.
-    pub(crate) fn resident(&self) -> usize {
-        self.figures().resident + self.freeing()
     }
 
     /// Hold each merge's commit's free from now on: see [`FreesHeld`].
@@ -104,10 +99,9 @@ impl Published {
         changed
     }
 
-    /// As [`Self::changing`], for adopting a checkpoint: the segments `f`
-    /// takes out of the state go on being counted, in [`Self::freeing`],
-    /// until they are freed. Counted before what the state comes to without
-    /// them is published, so that they are never gone from both.
+    /// As [`Self::changing`], for adopting a checkpoint: what `f` takes out
+    /// of the state goes on being counted, in [`Self::freeing`], until it is
+    /// freed.
     pub(crate) fn adopting(&self, f: impl FnOnce(&mut State) -> Discarded) -> Discarded {
         self.changing(|state| {
             let mut discarded = f(state);

@@ -167,8 +167,9 @@ async fn a_sweep_during_a_free_stops_nothing_and_lets_nothing_go() {
     let set = |settings: &mut Settings| settings.flush_rows = NOTES as usize;
     let measured = node(set);
     let freeing = freeing_beside_a_merge(&measured).await;
-    let to_free = freeing.held.partition().freeing();
+    let to_free = measured.freeing();
     assert!(to_free > 0, "nothing counted as being freed");
+    assert_eq!(to_free, freeing.held.partition().freeing());
     let mut held = 0;
     for name in ["idle", "freeing", "merging"] {
         let tenant = measured.tenant(&tenant(name)).await.unwrap();
