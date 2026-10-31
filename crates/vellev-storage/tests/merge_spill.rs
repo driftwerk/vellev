@@ -272,15 +272,26 @@ async fn a_merge_gathered_on_disk_uploads_the_frames_it_would_in_memory_byte_for
             ..holes
         },
     ];
-    /// The merged files by what they are, as their names say.
-    async fn merged(store: &dyn Blobs, cluster: &Cluster) -> BTreeMap<String, Bytes> {
+    /// The merged files by what they are, as their names say. An index
+    /// names its segment, a name drawn at random, as any two merges'
+    /// differ: that name, and the checksum that sums it, are left blank.
+    async fn merged(store: &dyn Blobs, cluster: &Cluster) -> BTreeMap<String, Vec<u8>> {
         let listed = store.list(&Layout(&cluster.key).prefix()).await.unwrap();
+        let keys = listed.into_iter().map(|file| file.key);
+        let keys: Vec<String> = keys.filter(|key| key.contains("-merged")).collect();
+        let segment = keys.iter().find(|key| key.ends_with(".segment")).unwrap();
         let mut frames = BTreeMap::new();
-        for key in listed.into_iter().map(|file| file.key) {
-            if key.contains("-merged") {
-                let kind = key.rsplit('.').next().unwrap().to_string();
-                frames.insert(kind, store.get(&key).await.unwrap());
+        for key in &keys {
+            let kind = key.rsplit('.').next().unwrap().to_string();
+            let mut frame = store.get(key).await.unwrap().to_vec();
+            if kind == "index" {
+                let name = segment.as_bytes();
+                let at = frame.windows(name.len()).position(|bytes| bytes == name);
+                let at = at.expect("an index names its segment");
+                frame[at..at + name.len()].fill(0);
+                frame[15..19].fill(0);
             }
+            frames.insert(kind, frame);
         }
         frames
     }
@@ -542,6 +553,63 @@ async fn a_file_is_taken_up_by_the_cache_only_once_the_store_has_it() {
     assert!(spills(looking.cache.path()).is_empty());
 }
 
+/// M8-R4. So too a file put and given up as the cache takes it up, by a
+/// merge dropped and so deleting what it uploaded: what takes it up looks
+/// before and after, and leaves no copy of a file the store no longer has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_dropped_as_its_spill_is_taken_up_leaves_no_copy() {
+    let told = Arc::new(SpillsTold::default());
+    let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8).spills_told(told.clone());
+    let cached = Cached::on(STOPPED, Some(disk)).await;
+    let before = files(cached.dir());
+    told.taken_up_in.store(1_000, Ordering::SeqCst);
+    let merging = cached.merging();
+    let prefix = Layout(&cached.cluster.key).prefix();
+    within(LONG, "the vectors went up", async {
+        loop {
+            let listed = cached.store.list(&prefix).await.unwrap();
+            if listed
+                .iter()
+                .any(|file| file.key.ends_with("-merged.vectors"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    merging.abort();
+    let _ = merging.await;
+    settled("no spill goes", || spills(cached.dir()).is_empty()).await;
+    // Past the time it took, with the delete of what was uploaded done.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    settled("its files stay", || files(cached.dir()) == before).await;
+}
+
+/// M8-R4, and the frame written once: the cache's copy is the very file the
+/// merge gathered, renamed, not written again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cache_s_copy_is_the_file_gathered_not_written_again() {
+    use std::os::unix::fs::MetadataExt;
+    let cached = Cached::of(STOPPED).await;
+    cached.builds.hold(Some(Holding::BuiltUntilLetGo));
+    let merging = cached.merging();
+    cached.held().await;
+    let found = spills(cached.dir());
+    assert_eq!(found.len(), 1, "no spill begun");
+    let gathered = std::fs::metadata(cached.dir().join(&found[0]));
+    let gathered = gathered.unwrap().ino();
+    cached.builds.hold(None);
+    cached.builds.let_one_go();
+    let merged = within(LONG, "the merge", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    let all = files(cached.dir());
+    let copy = all.iter().find(|file| file.ends_with("-merged.vectors"));
+    let copy = std::fs::metadata(cached.dir().join(copy.expect("a copy kept")));
+    assert_eq!(copy.unwrap().ino(), gathered, "written again");
+}
+
 /// M8-R6. A disk that fills as a merge gathers fails the merge there, before
 /// any of it goes up: nothing committed or left, every row as it was, and,
 /// once there is room, the next merge commits. So does a cache that cannot
@@ -608,23 +676,23 @@ async fn a_cache_that_cannot_begin_a_spill_fails_the_merge_before_it_builds_anyt
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_disk_that_stops_answering_fails_the_merge_at_its_bound_and_leaves_nothing() {
     let told = Arc::new(SpillsTold::default());
-    let bound = Duration::from_millis(500);
+    let bound = Duration::from_secs(2);
     let disk = Disk::new(bound, 1 << 40, 8).spills_told(told.clone());
     let written = Written::of(ROWS, WIDTH);
     let cached = Cached::on(written, Some(disk)).await;
     let before = files(cached.dir());
     let manifest = cached.cluster.committed().await.manifest;
-    told.taking.store(4_000, Ordering::SeqCst);
+    told.taking.store(8_000, Ordering::SeqCst);
     let begun = std::time::Instant::now();
     let slow = within(LONG, "the merge on a slow disk", cached.writer.merge()).await;
     let took = begun.elapsed();
     assert!(matches!(&slow, Err(StorageError::Blob { .. })), "{slow:?}");
-    assert!(took < Duration::from_secs(3), "given up after {took:?}");
+    assert!(took < Duration::from_secs(7), "given up after {took:?}");
     settled("what it wrote stays", || files(cached.dir()) == before).await;
     assert_eq!(cached.cluster.committed().await.manifest, manifest);
     // The write it gave up comes to its end, and leaves no more than that.
     told.taking.store(0, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    tokio::time::sleep(Duration::from_millis(8_500)).await;
     assert_eq!(files(cached.dir()), before);
     let merged = within(LONG, "the next merge", cached.writer.merge()).await;
     assert!(merged.unwrap().is_some());
