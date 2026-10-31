@@ -122,8 +122,18 @@ impl Drop for Turn {
 /// goes, if it was given it.
 ///
 /// Never called from the tuning pool's own thread, nor from work done in
-/// a turn: that would wait for a turn its own caller holds, for ever.
+/// a turn: that would wait for a turn its own caller holds, for ever. Nor
+/// from a worker of a pool that builds: waiting for the tuning pool, that
+/// worker would take on its own pool's other work, and another build among
+/// it would then wait for its turn behind this one's, for good. A build
+/// given [`Passes`] asks from the thread that called it, which is on no
+/// pool.
 pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, Stopped> {
+    debug_assert_eq!(
+        rayon::current_thread_index(),
+        None,
+        "a turn to tune asked for from a pool's thread"
+    );
     let (turns, turned) = turns();
     let mut now = taken(turns);
     let ticket = now.next;
@@ -144,6 +154,92 @@ pub fn tune<T: Send>(stop: &Stop, work: impl FnOnce() -> T + Send) -> Result<T, 
     Ok(tuning().install(work))
 }
 
+/// The CPU time the calling thread has spent so far, if the system says.
+pub fn thread_cpu() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let mut spent = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `spent` is a timespec of this process's, for the call
+        // to fill in.
+        let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spent) };
+        (read == 0).then(|| {
+            Duration::new(
+                u64::try_from(spent.tv_sec).unwrap_or(0),
+                u32::try_from(spent.tv_nsec).unwrap_or(0),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Where a build runs each of its parallel passes. A build asks this from
+/// the thread that called it, which keeps the build's serial work and its
+/// turn to tune: only the passes go wherever this says. So a build given a
+/// pool never has a thread of that pool waiting for anything but a pass.
+///
+/// A pass names what it is, for whoever keeps track.
+pub trait Passes: Copy + Send + Sync {
+    /// Run `pass`, named `name`, and give back what it gives.
+    fn pass<R: Send>(self, name: &'static str, pass: impl FnOnce() -> R + Send) -> R;
+}
+
+/// Each pass on the pool of the thread that asks: rayon's global one, off
+/// any pool.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CallersPool;
+
+impl Passes for CallersPool {
+    fn pass<R: Send>(self, _: &'static str, pass: impl FnOnce() -> R + Send) -> R {
+        pass()
+    }
+}
+
+/// Pools for merges to build on, apart from rayon's global one, which
+/// builds flushes and loads: `slots` pools of `threads / slots` threads,
+/// one for each build that runs at once, the threads of slot `s` named
+/// `vellev-merge-s-N`, each run `nice` lower than the rest of the process
+/// (merge note, §3 and §9.2). Threads over a whole share are left unused,
+/// so that the slots are equal. Pools smaller than the global one leave
+/// cores to reads and flushes while merges build; ones lower in priority
+/// yield them the CPU while they want it. A build has a pool to itself,
+/// as a thread of a pool shared by two, waiting in one build's work, would
+/// take on the other's. Made after the read, tuning and passes pools, so
+/// that none of those is ever made from one of their threads and runs
+/// lower too.
+///
+/// On Linux a thread's priority is its own, and lowering it needs no
+/// privilege; raising it back would, so it is never asked. Elsewhere, and
+/// where Linux refuses, the threads run as the process does: whoever needs
+/// to know reads each thread's priority back, as the merge bench does.
+///
+/// # Panics
+///
+/// If `slots` is 0 or `threads` is under `slots`, or the pools' threads
+/// cannot be started.
+pub fn merge_slots(slots: usize, threads: usize, nice: i32) -> Vec<ThreadPool> {
+    assert!(slots >= 1, "merges are built at least one at a time");
+    assert!(threads >= slots, "a merge slot has a thread at least");
+    reads();
+    tuning();
+    passes();
+    (0..slots)
+        .map(|slot| {
+            ThreadPoolBuilder::new()
+                .num_threads(threads / slots)
+                .thread_name(move |n| format!("vellev-merge-{slot}-{n}"))
+                .start_handler(move |_| lowered_by(nice))
+                .build()
+                .expect("a merge slot's threads")
+        })
+        .collect()
+}
+
 /// The pool a rows pass makes its curve on (recall note, R9.5): one
 /// thread of its own, apart from the tuning pool, so that a merge's own
 /// tuning never waits behind the passes an upgrade makes, segment after
@@ -159,7 +255,7 @@ pub fn passes() -> &'static ThreadPool {
         ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "vellev-pass".to_string())
-            .start_handler(|_| lowered())
+            .start_handler(|_| lowered_by(BACKGROUND_NICE))
             .build()
             .expect("the rows passes' pool's thread")
     })
@@ -177,15 +273,20 @@ std::thread_local! {
     static LOWERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Lower the calling thread's priority by [`BACKGROUND_NICE`], from where
-/// the process runs, to 19 at the most. Nothing elsewhere, nor if Linux
-/// refuses, as the thread then runs as it would have.
+/// Lower the calling thread's priority by `nice`, from where the process
+/// runs, to 19 at the most; by nothing at all, as a merge pool at the
+/// normal priority asks. Nothing elsewhere, nor if Linux refuses, as the
+/// thread then runs as it would have.
 ///
 /// A thread such a thread makes would run lower too, for good, and do
 /// whatever work it is given: so the read and tuning pools are made before
-/// the passes' pool, and are said never to be made from its thread. A background thread has no async runtime to start a blocking
-/// thread on.
-fn lowered() {
+/// the passes' pool and any merge pool, and are said never to be made from
+/// their threads. A background thread has no async runtime to start a
+/// blocking thread on.
+fn lowered_by(nice: i32) {
+    if nice <= 0 {
+        return;
+    }
     LOWERED.with(|lowered| lowered.set(true));
     #[cfg(target_os = "linux")]
     {
@@ -193,7 +294,7 @@ fn lowered() {
         if let Some(now) = priority_of(tid) {
             // SAFETY: setpriority takes and gives plain numbers.
             unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, tid, (now + BACKGROUND_NICE).min(19));
+                libc::setpriority(libc::PRIO_PROCESS, tid, (now + nice).min(19));
             }
         }
     }

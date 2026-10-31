@@ -25,8 +25,8 @@ thiserror.workspace = true
 utoipa = { workspace = true, optional = true }
 
 # To lower the background pools' threads' priority, which Linux keeps a
-# thread at a time.
-[target.'cfg(target_os = "linux")'.dependencies]
+# thread at a time, and to read a thread's own CPU time.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

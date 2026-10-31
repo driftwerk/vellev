@@ -274,6 +274,13 @@ pub(crate) fn named_as_checkpoint(key: &str) -> bool {
     key.ends_with(".manifest")
 }
 
+/// Whether `key` names a segment file a merge wrote, `-merged` as
+/// [`Layout::nonced`] marks it, rather than a flush or a restore.
+pub(crate) fn merged_segment(key: &str) -> bool {
+    key.strip_suffix(".segment")
+        .is_some_and(|stem| stem.ends_with("-merged"))
+}
+
 /// Where a partition's files live.
 #[derive(Debug, Clone, Copy)]
 pub struct Layout<'a>(pub &'a PartitionKey);

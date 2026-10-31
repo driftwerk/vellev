@@ -25,12 +25,15 @@ use axum::routing::get;
 use axum::Router;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeMetric};
+use prometheus_client::encoding::{MetricEncoder, NoLabelSet};
 use prometheus_client::metrics::counter::ConstCounter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::ConstGauge;
 use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
+use prometheus_client::metrics::MetricType;
 use prometheus_client::registry::Registry;
 use vellev_node::Node;
+use vellev_storage::timings::{Holder, MergeEnd, MergePhase, Seconds, Timed};
 use vellev_storage::Work;
 
 use crate::allocator::Allocator;
@@ -386,6 +389,133 @@ impl Counted {
     }
 }
 
+/// A histogram of seconds as the node's timings hold it, encoded as it is.
+struct ConstSeconds(Seconds);
+
+impl prometheus_client::encoding::EncodeMetric for ConstSeconds {
+    fn encode(&self, mut encoder: MetricEncoder) -> Result<(), std::fmt::Error> {
+        // The encoder adds the buckets up itself: each is given what it
+        // holds over the one before, and the last, past every bound, what
+        // is past them all.
+        let Seconds {
+            count,
+            sum,
+            buckets,
+        } = self.0;
+        let mut each = Vec::with_capacity(buckets.len() + 1);
+        let mut below = 0;
+        for (bound, cumulative) in buckets {
+            each.push((bound, cumulative - below));
+            below = cumulative;
+        }
+        each.push((f64::MAX, count - below));
+        encoder.encode_histogram::<NoLabelSet>(sum, count, &each, None)
+    }
+
+    fn metric_type(&self) -> MetricType {
+        MetricType::Histogram
+    }
+}
+
+/// A family of histograms `name`, one for each of `values`, labelled
+/// `label`.
+fn histograms(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    label: &str,
+    values: impl IntoIterator<Item = (&'static str, Seconds)>,
+) -> Result<(), std::fmt::Error> {
+    let mut family = encoder.encode_descriptor(name, help, None, MetricType::Histogram)?;
+    for (key, seconds) in values {
+        ConstSeconds(seconds).encode(family.encode_family(&[(label, key)])?)?;
+    }
+    Ok(())
+}
+
+/// What the node times of its background work (merge note, §9.4).
+fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::fmt::Error> {
+    let timings = node.timings();
+    let by_holder = |kind: fn(Holder) -> Timed| {
+        Holder::ALL.map(|holder| (holder.name(), timings.seconds(kind(holder))))
+    };
+    histograms(
+        encoder,
+        "building_wait_seconds",
+        "How long a tenant's work waited for its partition's building lock, by what it was: a flush, a merge planning or committing, curves committed, cleaning up, or a restore",
+        "holder",
+        by_holder(Timed::BuildingWait),
+    )?;
+    histograms(
+        encoder,
+        "building_held_seconds",
+        "How long a tenant's work held its partition's building lock, by what it was, as for vellev_building_wait_seconds: what flushes of the tenant wait behind",
+        "holder",
+        by_holder(Timed::BuildingHeld),
+    )?;
+    histograms(
+        encoder,
+        "merge_phase_seconds",
+        "How long each phase of a merge took, that it came through: waiting for a turn among the node's merge builds, then for a thread off the async ones, gathering the run's rows with no lock held, building the merged segment, encoding its clustered index, uploading it, and loading it back",
+        "phase",
+        MergePhase::ALL.map(|phase| (phase.name(), timings.seconds(Timed::Merge(phase)))),
+    )?;
+    histograms(
+        encoder,
+        "merge_given_up_seconds",
+        "How long each phase of a merge ran or waited before it was stopped or failed, by phase as for vellev_merge_phase_seconds, a turn among the node's merge builds apart, which is not timed once given up: what no merge came of",
+        "phase",
+        MergePhase::GIVEN_UP.map(|phase| (phase.name(), timings.seconds(Timed::MergeGivenUp(phase)))),
+    )?;
+    for (name, help, timed) in [
+        (
+            "flush_due_seconds",
+            "How long rows waited from when a flush of them fell due to the commit of the checkpoint that took them: a flush, or a merge or curves flushing along",
+            Timed::FlushDue,
+        ),
+        (
+            "backlog_seconds",
+            "Each spell a tenant held as many rows unflushed as it may, refusing writes: from reaching that to the commit that took it below",
+            Timed::Backlog,
+        ),
+    ] {
+        let seconds = ConstSeconds(timings.seconds(timed));
+        seconds.encode(encoder.encode_descriptor(name, help, None, MetricType::Histogram)?)?;
+    }
+    histograms(
+        encoder,
+        "flush_to_let_go_seconds",
+        "The flush made before a tenant is let go: how long it waited for the building lock, and how long it held it",
+        "part",
+        [
+            ("wait", timings.seconds(Timed::LetGoFlushWait)),
+            ("held", timings.seconds(Timed::LetGoFlushHeld)),
+        ],
+    )?;
+    let counter = ConstCounter::new(0u64);
+    let mut family = encoder.encode_descriptor(
+        "merges_ended",
+        "Merges that had a turn among the node's merge builds, by how they ended: committed; with nothing to merge once planned again; dropped as a restore came between (stale), as the run was not as planned (changed), or as a row it held live was missing from what was built (uncovered); stopped; or failed",
+        None,
+        counter.metric_type(),
+    )?;
+    for end in MergeEnd::ALL {
+        ConstCounter::new(timings.merges_ended(end))
+            .encode(family.encode_family(&[("outcome", end.name())])?)?;
+    }
+    let let_go = node.let_go();
+    let mut family = encoder.encode_descriptor(
+        "tenants_let_go",
+        "Tenants, written for or copied, that sweeps let go: idle for longer than a tenant is kept unused, or for the memory budget",
+        None,
+        counter.metric_type(),
+    )?;
+    for (reason, count) in [("idle", let_go.idle), ("budget", let_go.for_budget)] {
+        ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
+    }
+    Ok(())
+}
+
 /// A family of gauges `name`, one for each value there is, labelled
 /// `label`; none at all if there is no value.
 fn labelled(
@@ -497,6 +627,21 @@ impl Collector for Counted {
             gauge.metric_type(),
         )?)?;
         let held = node.segments();
+        for (name, help, value) in [
+            (
+                "segments_unmerged",
+                "Segments the tenants this node writes hold as flushes and restores wrote them, which no merge has taken in yet",
+                held.unmerged as u64,
+            ),
+            (
+                "segment_rows_unmerged",
+                "Rows in those segments, as the segments were written: the rows awaiting a merge",
+                held.unmerged_rows,
+            ),
+        ] {
+            let gauge = gauge_of(value);
+            gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+        }
         for (name, help, values) in [
             (
                 "segments",
@@ -598,7 +743,7 @@ impl Collector for Counted {
         let gauge = gauge_of(node.freeing());
         gauge.encode(encoder.encode_descriptor(
             "tenants_freeing_bytes",
-            "About how many bytes the tenants this node writes have taken out of their state, as a merge's commit does what it replaced, and have yet to free: in the process's memory, not in what they are reckoned to hold, and held to no budget, as it goes by itself",
+            "About how many bytes the tenants this node writes, and any it has let go since, have taken out of their state, as a merge's commit does what it replaced, and have yet to free: in the process's memory, not in what they are reckoned to hold, and held to no budget, as it goes by itself",
             None,
             gauge.metric_type(),
         )?)?;
@@ -616,6 +761,14 @@ impl Collector for Counted {
              longer than any write of it may take",
             None,
             counter.metric_type(),
+        )?)?;
+        background(&mut encoder, node)?;
+        let gauge = gauge_of(merges.largest);
+        gauge.encode(encoder.encode_descriptor(
+            "merge_build_largest_bytes",
+            "About how many bytes the largest merge build since the node started was reckoned to hold at its peak: the node's memory may pass its budget by this, times the merges it builds at once",
+            None,
+            gauge.metric_type(),
         )?)?;
         for (name, help, value) in [
             (
