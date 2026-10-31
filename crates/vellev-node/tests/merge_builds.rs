@@ -1079,10 +1079,10 @@ fn steadily(
     })
 }
 
-/// A tenant written steadily, whose merge gives way to each flush that
-/// falls due while it waits for a turn, keeps its place: the next turn to
-/// come free is its, not that of a merge that queued behind it, however
-/// often it gives way. Its writes go on, and through, all the while.
+/// A tenant written steadily, whose flushes go on as its merge waits for a
+/// turn, keeps its place: the next turn to come free is its, not that of a
+/// merge that queued behind it, however often it flushes. Its writes go on,
+/// and through, all the while.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_written_steadily_keeps_its_place_for_a_merge_turn() {
     let node = node(|settings| {
@@ -1153,8 +1153,10 @@ impl Blobs for SlowListing {
     }
 }
 
-/// A maintenance round whose merge gives way to a flush does nothing more:
-/// it doesn't clean up, which waits on the store, before the flush.
+/// A tenant's flushes go on whatever its round waits on. Written when a
+/// round's merge gave way to a flush, and did nothing more: since M5 no merge
+/// of a node gives way, and the round waits for its turn, cleaning up not
+/// being overdue. Giving way's own rules are in the storage crate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_round_whose_merge_gives_way_to_a_flush_does_nothing_more() {
     let slow = Arc::new(SlowListing {
@@ -1220,9 +1222,8 @@ impl Blobs for CountedListing {
     }
 }
 
-/// Under writes that never let up, whose flushes a tenant's merge gives
-/// way to round after round, its maintenance still cleans up, at least as
-/// often as the node is set to.
+/// Under writes that never let up, with a tenant's merge queued for a turn,
+/// its maintenance still cleans up, at least as often as the node is set to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn under_writes_that_never_let_up_a_tenant_is_still_cleaned_up() {
     let counted = Arc::new(CountedListing {

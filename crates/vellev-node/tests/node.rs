@@ -1486,9 +1486,9 @@ fn a_hold_lapsed_with_a_failed_flush_due_keeps_nothing_busy() {
     });
 }
 
-/// A round of maintenance can panic: an upload that panics is raised again
-/// where the flush waits for it. The task is gone with it, and a tenant that
-/// lived on would never be flushed or merged again, with nothing to say so:
+/// A flush can panic: an upload that panics is raised again where the flush
+/// waits for it. Its task is gone with it, and a tenant that lived on would
+/// never be flushed again, with nothing to say so:
 /// so the tenant is given up, and opened afresh for the next caller, as one
 /// whose writer closed. Its rows are in the log, and flushed there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

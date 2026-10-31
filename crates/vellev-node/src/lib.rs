@@ -190,9 +190,8 @@ pub struct Settings {
     /// let go, its memory given back and its lease left for any node.
     pub tenant_idle: Duration,
     /// How long a tenant's maintenance goes, at most, without cleaning up
-    /// and making the curves of its segments' rows, though each round
-    /// gives way to a flush: under writes that never let up, rounds would
-    /// otherwise never get that far.
+    /// and making the curves of its segments' rows, though a round's merges
+    /// wait for a turn or build for far longer: both go on beside them.
     pub clean_at_least_every: Duration,
     /// The most queries a second one tenant may ask of this node, if any.
     pub queries_per_second: Option<f64>,
@@ -603,7 +602,7 @@ fn unembedded(error: EmbedError) -> Unembedded {
 
 /// A tenant this node writes for, as requests and restores hold it: a sweep
 /// lets a tenant go only if nothing but the node and the sweep holds this.
-/// Its maintenance holds what it works on instead, its `TenantWork`.
+/// Its tasks hold what they work on instead, its `TenantWork`.
 #[derive(Debug)]
 pub struct Tenant {
     work: Arc<TenantWork>,
@@ -619,9 +618,10 @@ pub struct Tenant {
     running: Mutex<Option<Running>>,
 }
 
-/// What a tenant's tasks work on. Maintenance upgrades its `Weak` of this
-/// for a round and holds no [`Tenant`], so that dropping the tenant ends it,
-/// wherever it is. What ends a restore holds this as well.
+/// What a tenant's tasks work on. Its flush task and its maintenance each
+/// upgrade a `Weak` of this for a flush or a round and hold no [`Tenant`], so
+/// that dropping the tenant ends them, wherever they are. What ends a restore
+/// holds this as well.
 #[derive(Debug)]
 struct TenantWork {
     id: TenantId,
@@ -794,11 +794,14 @@ impl StopCounts {
 /// way it means to end, the hold is lost or the tenant gone already, and a
 /// panic is the one that would leave the tenant open with no such task. A
 /// merge lost to a panic is in no count of merges stopped, and nothing else
-/// names the tenant, so that a panic is logged here and counted.
+/// names the tenant, so that a panic is logged here and counted. Each of a
+/// tenant's two tasks holds one: should both panic at once, two are counted.
 #[derive(Debug)]
 struct GivesUp {
     hold: Arc<Hold>,
     tenant: TenantId,
+    /// Which of the tenant's tasks it is.
+    task: &'static str,
     /// The node's count of tenants given up for a panic.
     given_up: Arc<AtomicU64>,
 }
@@ -806,7 +809,11 @@ struct GivesUp {
 impl Drop for GivesUp {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            tracing::error!(tenant = %self.tenant, "maintenance panicked; the tenant is given up");
+            tracing::error!(
+                tenant = %self.tenant,
+                task = self.task,
+                "a tenant's task panicked; the tenant is given up"
+            );
             self.given_up.fetch_add(1, Ordering::Relaxed);
         }
         // Lost already, what stopped it said why: a second `lose` would
@@ -1146,16 +1153,18 @@ impl Tenant {
     /// of that window names, and that is the caller's breach. What that
     /// floor does not cover is said at [`LEAST_GRACE`].
     pub async fn compact(&self, grace: Duration) -> Result<usize> {
-        let compacted = self.work.compacted(grace, &|| false).await?;
-        Ok(compacted.unwrap_or(0))
+        self.work.merged().await?;
+        let cleaned = self.work.cleaned_unless(grace, &|| false).await?;
+        Ok(cleaned.unwrap_or(0))
     }
 
     /// Whether nothing holds the tenant's work but the tenant: no round of
-    /// its maintenance is under way, nor is a restore ending. A round holds
-    /// no [`Tenant`], so only this says so. Until a sweep can let a tenant
-    /// go as it merges, with merging tenants last, a bounded wait, and
-    /// nothing cut (node memory note, M7b), a round keeps its tenant, as
-    /// when rounds held the tenant itself.
+    /// its maintenance is under way, no flush of its flush task, nor is a
+    /// restore ending. Neither task holds a [`Tenant`], so only this says
+    /// so. Until a sweep can let a tenant go as it merges, with merging
+    /// tenants last, a bounded wait, and nothing cut (node memory note,
+    /// M7b), a round or a flush keeps its tenant, as when rounds held the
+    /// tenant itself.
     fn between_rounds(&self) -> bool {
         Arc::strong_count(&self.work) == 1
     }
@@ -1328,7 +1337,7 @@ impl TenantWork {
         self.writer.partition().read(f)
     }
 
-    /// Whether the tenant's maintenance would flush it now: it holds a
+    /// Whether the tenant's flush task would flush it now: it holds a
     /// flush's worth of rows, and no failed flush puts the next off.
     fn flush_due(&self) -> bool {
         self.read(State::unflushed) >= self.flush_rows && self.flush_may_be_tried()
@@ -1346,7 +1355,7 @@ impl TenantWork {
     }
 
     /// How long until the flush that failed is to be tried again, if it is
-    /// to be: not with too few rows for maintenance to flush.
+    /// to be: not with too few rows for its flush task to flush.
     fn flush_wait(&self) -> Option<Duration> {
         let at = self.flush_retried_at()?;
         (self.read(State::unflushed) >= self.flush_rows)
@@ -1395,33 +1404,43 @@ impl TenantWork {
         Ok(position)
     }
 
-    /// As [`Tenant::compact`], each merge giving way to a flush that falls due
-    /// while it waits for a turn among the node's merge builds
-    /// ([`Writer::merge_giving_way`]): so that the tenant's maintenance,
-    /// which flushes it, is never held behind other tenants' merges, and
-    /// its writes are never refused for a backlog those let pile up.
-    /// Returns how many files were deleted, or `None` if cleaning up was
-    /// left for a later round.
-    async fn compacted(
-        &self,
-        grace: Duration,
-        flush_due: &(dyn Fn() -> bool + Sync),
-    ) -> Result<Option<usize>> {
+    /// Merge segments until a merge finds nothing to do. Nothing waits for
+    /// a merge, so none gives way, flushes being on a task of their own and
+    /// what is left of a round going on beside it: giving way is left for
+    /// the bench to show it is not missed (node memory note, D7).
+    async fn merged(&self) -> Result<()> {
+        let flush_tried = |went_through| self.flush_tried(went_through);
         while self
             .writer
-            .merge_giving_way(flush_due)
+            .merge_giving_way(&|| false, &flush_tried)
             .await
             .map_err(|error| self.failed(error))?
             .is_some()
         {}
-        // Given way to a flush, or one is due: cleaning up, which waits on
-        // the store, waits for a later round, and the flush goes first;
-        // but not for longer than [`Settings::clean_at_least_every`], or
-        // writes that never let up would leave it undone for good.
+        Ok(())
+    }
+
+    /// Delete the files nothing needs any more, as [`Writer::clean`] with
+    /// `grace`, which deletes so many at once, until one finds fewer than
+    /// that. Returns how many files were deleted, or `None` if cleaning up
+    /// was left for a later round, as a flush due goes first and cleaning
+    /// up waits on the store, holding the lock a flush needs; but not for
+    /// longer than [`Settings::clean_at_least_every`], or writes that never
+    /// let up would leave it undone for good.
+    async fn cleaned_unless(
+        &self,
+        grace: Duration,
+        flush_due: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<usize>> {
         let cleaned_lately = self.cleaned_at().elapsed() < self.clean_at_least_every;
         if flush_due() && cleaned_lately {
             return Ok(None);
         }
+        self.cleaned(grace).await.map(Some)
+    }
+
+    /// As [`Self::cleaned_unless`], whatever is due.
+    async fn cleaned(&self, grace: Duration) -> Result<usize> {
         let mut deleted = 0;
         loop {
             let cleaned = self.writer.clean(grace).await;
@@ -1429,7 +1448,51 @@ impl TenantWork {
             deleted += more;
             if more < Writer::CLEANED_AT_ONCE {
                 *self.cleaned_at() = Instant::now();
-                return Ok(Some(deleted));
+                return Ok(deleted);
+            }
+        }
+    }
+
+    /// Make the curves of its segments' rows, if no other tenant is: one
+    /// pass at a time on the node, another tenant's next round taking its
+    /// turn. What is missing is worked out afresh each time, so a pass
+    /// skipped or cut short is made at a later round.
+    async fn rows_passed(&self) {
+        if let Ok(_one) = ROWS_PASSES.try_acquire() {
+            self.settling.rows_passes.fetch_add(1, Ordering::SeqCst);
+            if let Err(error) = self.writer.rows_pass().await {
+                tracing::warn!(tenant = %self.id, %error, "the curves of segments' rows were not made");
+            }
+        }
+    }
+
+    /// Clean up and pass over the rows as often as
+    /// [`Settings::clean_at_least_every`] says, until `merges_ended` says
+    /// the merges beside this are done. A merge may wait for its turn for
+    /// as long as other tenants' merges take, and build for minutes, and
+    /// neither is to hold these up.
+    ///
+    /// Asked only between one clean and the next, so that no merge ending
+    /// cuts a clean part way, nor does anything else but what ends the
+    /// tenant's task with it. A clean holds the building lock, and so may
+    /// hold its own tenant's merge up: at its plan, and at its commit,
+    /// each giving its turn back past [`vellev_storage::TURN_IDLE_AT_MOST`].
+    async fn tidied_beside_merges(&self, merges_ended: &tokio::sync::Notify, grace: Duration) {
+        let every = self.clean_at_least_every.max(TIDIED_AT_LEAST_APART);
+        let mut tried = *self.cleaned_at();
+        loop {
+            let overdue = tokio::time::sleep(every.saturating_sub(tried.elapsed()));
+            tokio::select! {
+                biased;
+                () = merges_ended.notified() => return,
+                () = overdue => {}
+            }
+            tried = Instant::now();
+            match self.cleaned(grace).await {
+                Ok(_) => self.rows_passed().await,
+                Err(error) => {
+                    tracing::warn!(tenant = %self.id, %error, "cleaning up beside a merge failed");
+                }
             }
         }
     }
@@ -1442,8 +1505,10 @@ impl TenantWork {
     /// Forget the commits the tenant can no longer go back to, then merge
     /// its segments and delete the files no restore within its window
     /// needs, kept `grace` longer; then give any segment from before
-    /// curves the curve of its rows (recall note, R9.5). Returns how many
-    /// files were deleted.
+    /// curves the curve of its rows (recall note, R9.5). Cleaning up and
+    /// the curves go on beside the merges, should those take long; what
+    /// forgets commits comes first, and waits for the next round. Returns
+    /// how many files were deleted at the round's end.
     async fn maintained(
         &self,
         coordinator: &dyn Coordinator,
@@ -1452,24 +1517,25 @@ impl TenantWork {
     ) -> Result<usize> {
         let window = restore_window(coordinator, &self.id, default_window).await?;
         coordinator.forget_history(&key(&self.id), window).await?;
-        let flush_due = || self.flush_due();
-        let compacted = self
-            .compacted(window.saturating_add(grace), &flush_due)
-            .await?;
+        let grace = window.saturating_add(grace);
+        let merges_ended = tokio::sync::Notify::new();
+        let merged = async {
+            let merged = self.merged().await;
+            merges_ended.notify_one();
+            merged
+        };
+        // Joined: each runs to its end, a clean under way as the merges end
+        // included. Losing the hold aborts the task, and with it both.
+        let tidied = self.tidied_beside_merges(&merges_ended, grace);
+        let (merged, ()) = tokio::join!(merged, tidied);
+        merged?;
         // The round ends here if cleaning up was left for a later round:
         // the flush due goes first, and the rest is done then.
-        let Some(deleted) = compacted else {
+        let flush_due = || self.flush_due();
+        let Some(deleted) = self.cleaned_unless(grace, &flush_due).await? else {
             return Ok(0);
         };
-        // One pass at a time on the node: another tenant's next round
-        // takes its turn. What is missing is worked out afresh each time,
-        // so a pass skipped or cut short is made at a later round.
-        if let Ok(_one) = ROWS_PASSES.try_acquire() {
-            self.settling.rows_passes.fetch_add(1, Ordering::SeqCst);
-            if let Err(error) = self.writer.rows_pass().await {
-                tracing::warn!(tenant = %self.id, %error, "the curves of segments' rows were not made");
-            }
-        }
+        self.rows_passed().await;
         Ok(deleted)
     }
 
@@ -1506,6 +1572,11 @@ const RESTORE_WAITS: usize = 3;
 /// How long a tenant or copy is kept after it was last used, whatever the
 /// memory budget.
 const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
+
+/// The least time between one clean beside a tenant's merges and the next,
+/// whatever [`Settings::clean_at_least_every`] says: of none at all, they
+/// would run back to back.
+const TIDIED_AT_LEAST_APART: Duration = Duration::from_secs(1);
 
 /// The least time between sweeps that uses of tenants ask for (see
 /// `Inner::sweep_soon`). Over the budget every use asks for one, and with
@@ -2848,7 +2919,9 @@ impl Inner {
             hold,
             deadline,
         });
-        self.maintaining(&work, wanted);
+        let flushed = Arc::new(tokio::sync::Notify::new());
+        self.flushing(&work, wanted, flushed.clone());
+        self.maintaining(&work, flushed);
         Ok(Arc::new(Tenant {
             work,
             commits,
@@ -2861,34 +2934,42 @@ impl Inner {
         }))
     }
 
-    /// Flush the tenant when asked to and it is still due, and merge and
-    /// clean up its files after each flush and now and then regardless,
-    /// for as long as the tenant is open and held. The task holds no
-    /// [`Tenant`], and its work only for a round, so dropping the tenant
-    /// ends it, and losing the hold stops it wherever it is. A hold that has
-    /// run out is not lost: renewing goes on trying, and may yet bring it
-    /// back, so the task waits, looking as often as a hold is renewed, and
-    /// does then what it was asked to meanwhile. However the task ends, as
-    /// by a panic in a round, the hold ends with it, so that no tenant is
-    /// left open with nothing looking after it.
-    fn maintaining(&self, work: &Arc<TenantWork>, mut wanted: mpsc::Receiver<()>) {
-        let Settings {
-            restore_window,
-            grace,
-            ..
-        } = self.settings;
-        let every =
-            (restore_window / 24).clamp(Duration::from_secs(60), Duration::from_secs(60 * 60));
+    /// How often a tenant's tasks look at it unasked.
+    fn rounds_every(&self) -> Duration {
+        (self.settings.restore_window / 24)
+            .clamp(Duration::from_secs(60), Duration::from_secs(60 * 60))
+    }
+
+    /// Flush the tenant when asked to and it is still due, for as long as
+    /// the tenant is open and held, on a task of its own: so that no flush
+    /// is held behind its tenant's merges, for as long as they build, nor
+    /// by their turns (node memory note, M5). Each flush that goes through
+    /// is told to the tenant's maintenance, by `flushed`.
+    ///
+    /// The task holds no [`Tenant`], and its work only for a flush, so
+    /// dropping the tenant ends it, and losing the hold stops it wherever
+    /// it is. A hold that has run out is not lost: renewing goes on trying,
+    /// and may yet bring it back, so the task waits, looking as often as a
+    /// hold is renewed, and does then what it was asked to meanwhile. However
+    /// the task ends, as by a panic in a flush, the hold ends with it, so
+    /// that no tenant is left open and unflushed.
+    fn flushing(
+        &self,
+        work: &Arc<TenantWork>,
+        mut wanted: mpsc::Receiver<()>,
+        flushed: Arc<tokio::sync::Notify>,
+    ) {
+        let every = self.rounds_every();
         let lapsed_every = self.settings.lease / 3;
-        let coordinator = self.coordinator.clone();
         let hold = work.hold.clone();
         let ends = GivesUp {
             hold: hold.clone(),
             tenant: work.id.clone(),
+            task: "flush",
             given_up: self.given_up.clone(),
         };
         let work = Arc::downgrade(work);
-        let maintaining = tokio::spawn(async move {
+        let flushing = tokio::spawn(async move {
             let _ends = ends;
             // A flush a write asked for, not yet looked at.
             let mut asked = false;
@@ -2917,17 +2998,68 @@ impl Inner {
                     continue;
                 }
                 // One that failed is tried again on its own, if no write
-                // asks, but never sooner than its backoff lets it. One put
-                // off for that still lets the tenant be looked after.
+                // asks, but never sooner than its backoff lets it.
                 let due = std::mem::take(&mut asked) || work.flush_retried_at().is_some();
                 if due
                     && work.read(State::unflushed) >= work.flush_rows
                     && work.flush_may_be_tried()
                 {
-                    if let Err(error) = work.flush().await {
-                        tracing::error!(tenant = %work.id, %error, "flush failed; rows wait in memory");
-                        continue;
+                    match work.flush().await {
+                        Ok(_) => flushed.notify_one(),
+                        Err(error) => {
+                            tracing::error!(tenant = %work.id, %error, "flush failed; rows wait in memory");
+                        }
                     }
+                }
+            }
+        });
+        hold.stops(flushing.abort_handle());
+    }
+
+    /// Merge and clean up the tenant's files after each flush that goes
+    /// through, told by `flushed`, and now and then regardless, for as long
+    /// as the tenant is open and held. A flush that lands during a round
+    /// stays told, and has a round of its own. The task holds no [`Tenant`],
+    /// and its work only for a round, so dropping the tenant ends it, and
+    /// losing the hold stops it wherever it is. A hold that has run out is
+    /// not lost: the task waits, looking as often as a hold is renewed, and
+    /// runs a round once it is back. However the task ends, as by a panic in
+    /// a round, the hold ends with it, so that no tenant is left open with
+    /// nothing looking after it.
+    fn maintaining(&self, work: &Arc<TenantWork>, flushed: Arc<tokio::sync::Notify>) {
+        let Settings {
+            restore_window,
+            grace,
+            ..
+        } = self.settings;
+        let every = self.rounds_every();
+        let lapsed_every = self.settings.lease / 3;
+        let coordinator = self.coordinator.clone();
+        let hold = work.hold.clone();
+        let ends = GivesUp {
+            hold: hold.clone(),
+            tenant: work.id.clone(),
+            task: "maintenance",
+            given_up: self.given_up.clone(),
+        };
+        let work = Arc::downgrade(work);
+        let maintaining = tokio::spawn(async move {
+            let _ends = ends;
+            loop {
+                let wait = match work.upgrade() {
+                    Some(work) if !work.held() => lapsed_every,
+                    _ => every,
+                };
+                // Told, or only time to look: either way a round is run.
+                let _ = tokio::time::timeout(wait, flushed.notified()).await;
+                let Some(work) = work.upgrade() else {
+                    return;
+                };
+                if work.hold.is_lost() {
+                    return;
+                }
+                if !work.held() {
+                    continue;
                 }
                 let through = work.settling.flushed.load(Ordering::SeqCst);
                 let maintained = work.maintained(coordinator.as_ref(), restore_window, grace);

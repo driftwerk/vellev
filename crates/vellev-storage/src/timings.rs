@@ -466,6 +466,13 @@ impl Lag {
         state.saw(unflushed, Instant::now());
     }
 
+    /// Whether `unflushed` rows make a flush due: never, if nothing says
+    /// when one is.
+    pub(crate) fn due(&self, unflushed: usize) -> bool {
+        let due_at = self.state().due_at;
+        due_at > 0 && unflushed >= due_at
+    }
+
     /// Rows were applied, and the partition holds `unflushed`.
     pub(crate) fn applied(&self, unflushed: usize) {
         #[cfg(test)]
