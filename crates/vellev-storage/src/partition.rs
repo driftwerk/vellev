@@ -3620,6 +3620,13 @@ impl Writer {
         self.merge_panics.store(panics, Ordering::SeqCst);
     }
 
+    /// How many bytes of vectors the last merge this writer gathered on
+    /// local disk, none if it gathered them in memory. For tests.
+    #[doc(hidden)]
+    pub fn last_spilled(&self) -> usize {
+        0
+    }
+
     /// How many rows' tokens the last flush or merge held at once, at the
     /// most, as it indexed its rows: split and not yet indexed. Counts what
     /// the build says it holds; only the allocator tells of tokens kept

@@ -37,6 +37,7 @@ use object_store::{
 
 use crate::coordinator::{Generation, LogPosition, PartitionKey};
 use crate::format::verify;
+pub use crate::spill::{Spills, SpillsTold};
 use crate::{Result, StorageError};
 
 /// Every call must end: whatever a store waits on, another machine or a
@@ -179,6 +180,11 @@ pub trait Blobs: fmt::Debug + Send + Sync {
             Ok(None) => Linked::Unmapped,
             Ok(Some(_)) | Err(_) => Linked::Unlinked,
         })
+    }
+    /// Where a frame too large to hold in memory may be gathered on local
+    /// disk. `None` from a store that keeps no copies there.
+    fn spills(&self) -> Option<Spills> {
+        None
     }
 }
 
@@ -763,6 +769,13 @@ impl Disk {
             piece_takes: taking,
             ..self
         }
+    }
+
+    /// As this disk, what is spilled to it going as `told` says: a disk
+    /// that fills or slows down, for tests. Not for use.
+    #[doc(hidden)]
+    pub fn spills_told(self, _told: Arc<SpillsTold>) -> Self {
+        self
     }
 
     /// How many steps are on this disk's threads now, waited for or given
