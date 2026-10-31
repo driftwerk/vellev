@@ -391,6 +391,29 @@ async fn a_stop_mid_segment_ends_a_gather_within_a_chunk() {
     assert!(next.unwrap().is_some(), "the next one commits");
 }
 
+/// M7-R4: a merge is stopped once, however many ask. Repeated let-go
+/// attempts, a lease lost and a tenant dropped each ask, with the merge
+/// held mid-segment all the while: only the first says it stopped one, so
+/// that whoever counts stops counts merges. The next merge is one of its
+/// own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_again_and_again_is_stopped_once() {
+    let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let writer = two_large(&cluster, &builds).await;
+    let (held, merging) = gather_held(&writer, &builds).await;
+    let stopped = (0..20).filter(|_| writer.stop_merges()).count();
+    assert!(writer.merge_under_way(), "the gather held is held still");
+    assert_eq!(stopped, 1, "one merge, stopped 20 times over");
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    let (held, merging) = gather_held(&writer, &builds).await;
+    assert!(writer.stop_merges(), "the next merge is one of its own");
+    held.let_go();
+    let merged = within(LONG, "the next merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+}
+
 /// M4-G4, at the end of the copy: a stop that comes once the last chunk is
 /// copied ends the gather before its frame is sealed, a sum over every
 /// vector: no build begins, held where it would begin were it to.

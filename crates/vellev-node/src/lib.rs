@@ -1486,6 +1486,19 @@ pub struct Merges {
     /// How many merges sweeps have stopped since the node started, so that
     /// a tenant over the memory budget could be let go.
     pub stopped_for_budget: u64,
+    /// How many merges losing a hold on a tenant has stopped since the node
+    /// started.
+    pub stopped: MergesStopped,
+}
+
+/// How many merges losing a hold on a tenant has stopped, since the node
+/// started, by why the hold was lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MergesStopped {
+    pub let_go: u64,
+    pub lease: u64,
+    pub drop: u64,
+    pub shutdown: u64,
 }
 
 /// What this node holds open, and what it reckons that holds in memory:
@@ -1792,6 +1805,7 @@ impl Node {
             abandoned: builds.abandoned(),
             held_let_go: builds.held_let_go(),
             stopped_for_budget: self.0.stopped_for_budget.load(Ordering::Relaxed),
+            stopped: MergesStopped::default(),
         }
     }
 
