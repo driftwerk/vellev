@@ -131,6 +131,14 @@ const HELD_AT_MOST: Duration = Duration::from_secs(60);
 /// by a writer whose rounds have stopped, is let go.
 const PARKED_AT_MOST: Duration = Duration::from_secs(60);
 
+/// How long a merge holding its turn waits for its partition's building
+/// lock, at the most, while nothing else may use the turn: about five times
+/// a healthy flush's 99th percentile, so that it comes through its own
+/// tenant's flush with its turn, and far short of a restore. Past that it
+/// gives the turn back. With one turn on a node this idles every merge
+/// there: timed as [`crate::timings::MergePhase::TurnIdle`].
+pub const TURN_IDLE_AT_MOST: Duration = Duration::from_secs(10);
+
 /// How long what a store keeps of a stopped or failed merge's bytes holds
 /// its turn at most: longer than any store's own write of them may take, a
 /// cache's local copy of three gigabytes on a disk at 20 MiB a second and
@@ -142,7 +150,7 @@ const STORE_HELD_AT_MOST: Duration = Duration::from_secs(10 * 60);
 
 /// How often a build a test holds asks whether to go on, and a merge
 /// waiting for its turn whether a flush is due.
-const ASKS_EVERY: Duration = Duration::from_millis(20);
+pub(crate) const ASKS_EVERY: Duration = Duration::from_millis(20);
 
 /// A node's merge builds: their turns, and what each under way is reckoned
 /// to hold. Shared by every writer the node opens; a writer on its own has
@@ -169,6 +177,9 @@ pub struct MergeBuilds {
     /// How long a turn granted to a merge that gave way to a flush is kept
     /// for its next attempt: see [`Self::park_for`].
     parked_at_most: Mutex<Duration>,
+    /// How long a merge holding its turn waits for its partition's
+    /// building lock, at the most: see [`Self::idle_for`].
+    idle_at_most: Mutex<Duration>,
     /// How long what a store keeps of a stopped or failed merge's bytes
     /// holds its turn at most: see [`Self::let_go_held_after`].
     held_at_most: Mutex<Duration>,
@@ -211,6 +222,11 @@ struct Reckoned {
     /// Whether its merge is past where a stop ends it: one stopped after
     /// commits what it holds, and drains nothing.
     committing: AtomicBool,
+    /// Whether its merge has given its turn back to wait for the building
+    /// lock, holding what it built: a running build, with no turn.
+    turn_given_back: AtomicBool,
+    /// What its merge holds as it does: see [`MergeBuilds::waiting_to_commit`].
+    holding: AtomicUsize,
 }
 
 /// How a test holds each merge's build off the async threads, with its
@@ -314,6 +330,7 @@ impl MergeBuilds {
             released: AtomicUsize::new(0),
             last_gathered: AtomicUsize::new(0),
             parked_at_most: Mutex::new(PARKED_AT_MOST),
+            idle_at_most: Mutex::new(TURN_IDLE_AT_MOST),
             held_at_most: Mutex::new(STORE_HELD_AT_MOST),
             last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
@@ -356,7 +373,8 @@ impl MergeBuilds {
     /// About how many bytes the merges stopped and not yet ended hold:
     /// what each was reckoned to hold at its peak, until the last of its
     /// work has ended. Merges running unstopped are not counted, nor any
-    /// stopped once past where a stop ends it, which commits instead. With
+    /// stopped once past where a stop ends it, which commits instead, as
+    /// one that gave its turn back does ([`Self::waiting_to_commit`]). With
     /// what stores keep of merges whose turns were let go for it
     /// ([`Self::abandoned`]).
     pub fn draining(&self) -> usize {
@@ -369,10 +387,33 @@ impl MergeBuilds {
     }
 
     /// How many builds are under way: each from its turn to the end of the
-    /// last work that holds what it gathered or built. For tests.
+    /// last work that holds what it gathered or built, or until it gave
+    /// that turn back. For tests.
     #[doc(hidden)]
     pub fn under_way(&self) -> usize {
-        lock(&self.under_way).len()
+        let under_way = lock(&self.under_way);
+        let holding_turns = |build: &&Arc<Reckoned>| !build.turn_given_back.load(Ordering::SeqCst);
+        under_way.iter().filter(holding_turns).count()
+    }
+
+    /// About how many bytes merges hold that gave their turns back to wait
+    /// to commit: what each holds now, what it built, not its build's peak.
+    /// They are running builds, past where a stop ends them, and leave in
+    /// seconds by themselves, so that nothing here is in [`Self::draining`]
+    /// or any total a sweep answers. Nothing limits how many there are but
+    /// one to a writer.
+    pub fn waiting_to_commit(&self) -> usize {
+        lock(&self.under_way)
+            .iter()
+            .filter(|build| build.turn_given_back.load(Ordering::SeqCst))
+            .map(|build| build.holding.load(Ordering::SeqCst))
+            .sum()
+    }
+
+    /// How many times a merge has taken a turn, however it went. For tests.
+    #[doc(hidden)]
+    pub fn turns_taken(&self) -> u64 {
+        self.numbered.load(Ordering::SeqCst)
     }
 
     /// How many turns are free. For tests.
@@ -423,6 +464,19 @@ impl MergeBuilds {
     #[doc(hidden)]
     pub fn park_for(&self, parked: Duration) {
         *lock(&self.parked_at_most) = parked;
+    }
+
+    /// Have a merge holding its turn wait for its partition's building
+    /// lock for at most `idle`, instead of [`TURN_IDLE_AT_MOST`]. For tests.
+    #[doc(hidden)]
+    pub fn idle_for(&self, idle: Duration) {
+        *lock(&self.idle_at_most) = idle;
+    }
+
+    /// How long a merge holding its turn waits for its partition's
+    /// building lock, at the most.
+    pub(crate) fn idle_at_most(&self) -> Duration {
+        *lock(&self.idle_at_most)
     }
 
     /// How many times what a store kept of a stopped or failed merge's
@@ -527,24 +581,50 @@ impl MergeBuilds {
                 Some(Some(None)) => continue,
             }
         };
+        Ok(Some(self.taken(key, stopping, turn)))
+    }
+
+    /// A turn for the merge of `key`'s partition that `stopping` stops, if
+    /// one is free this moment, with no wait and no place taken: for a
+    /// merge that holds its building lock, which never waits for a turn
+    /// with that held. A free turn means none is waiting for one, as each
+    /// goes straight to the first in the queue.
+    pub(crate) fn turn_free_now(
+        self: &Arc<Self>,
+        key: &PartitionKey,
+        stopping: &Stopping,
+    ) -> Option<MergeBuild> {
+        let turn = self.turns.clone().try_acquire_owned().ok()?;
+        Some(self.taken(key, stopping, turn))
+    }
+
+    /// `turn` taken by the merge of `key`'s partition that `stopping` stops.
+    fn taken(
+        self: &Arc<Self>,
+        key: &PartitionKey,
+        stopping: &Stopping,
+        turn: OwnedSemaphorePermit,
+    ) -> MergeBuild {
         let reckoned = Arc::new(Reckoned {
             key: key.clone(),
             stop: stopping.stop().clone(),
             bytes: AtomicUsize::new(0),
             planned: AtomicUsize::new(0),
             committing: AtomicBool::new(false),
+            turn_given_back: AtomicBool::new(false),
+            holding: AtomicUsize::new(0),
         });
         lock(&self.under_way).push(reckoned.clone());
         let slot = self.slot_taken();
-        Ok(Some(MergeBuild {
+        MergeBuild {
             counted: Counted {
                 builds: self.clone(),
                 reckoned,
-                slot,
+                slot: Mutex::new(slot),
                 number: self.numbered.fetch_add(1, Ordering::SeqCst),
             },
-            _turn: turn,
-        }))
+            turn: Mutex::new(Some(turn)),
+        }
     }
 }
 
@@ -634,11 +714,12 @@ impl Drop for Reservation {
 /// Shared, as an `Arc`, by every piece of work that holds what the merge
 /// gathered or built, and let go with the last: its count first, then its
 /// turn, as fields drop in order, so that the builds under way never
-/// count one more than there are turns.
+/// count one more than there are turns. A merge waiting to commit may give
+/// its turn back before that: see [`Self::give_turn_back`].
 #[derive(Debug)]
 pub(crate) struct MergeBuild {
     counted: Counted,
-    _turn: OwnedSemaphorePermit,
+    turn: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 impl MergeBuild {
@@ -662,8 +743,31 @@ impl MergeBuild {
 
     /// The pool of the slot this merge holds, if merges build on their own.
     fn pool(&self) -> Option<&rayon::ThreadPool> {
-        let slot = self.counted.slot?;
+        let slot = (*lock(&self.counted.slot))?;
         Some(&*self.counted.builds.pools[slot])
+    }
+
+    /// Whether this merge holds its turn still.
+    pub(crate) fn holds_turn(&self) -> bool {
+        lock(&self.turn).is_some()
+    }
+
+    /// Give the turn back, with its slot, the build being over and `holding`
+    /// bytes of what it made held: as a merge past loading does that has
+    /// waited as long as a turn may for its building lock, however long
+    /// that is held yet, so that another tenant's merge may take the turn.
+    /// The turn goes to the first in the queue at once, with nothing asked
+    /// of what fits, and no limit but one to a writer on how many do this:
+    /// so a node's merges can hold a built segment each for as many writers
+    /// as it has, beside what the turns build. The merge goes on as a
+    /// running build: [`MergeBuilds::waiting_to_commit`] says what it holds.
+    pub(crate) fn give_turn_back(&self, holding: usize) {
+        let reckoned = &self.counted.reckoned;
+        reckoned.holding.store(holding, Ordering::SeqCst);
+        reckoned.turn_given_back.store(true, Ordering::SeqCst);
+        // The slot first, as ever: so that every turn finds one.
+        self.counted.slot_back();
+        lock(&self.turn).take();
     }
 
     /// This merge's number, as it took its turn.
@@ -912,10 +1016,24 @@ impl AsRef<[u8]> for Carried {
 struct Counted {
     builds: Arc<MergeBuilds>,
     reckoned: Arc<Reckoned>,
-    /// The slot it holds, if merges build on pools of their own.
-    slot: Option<usize>,
+    /// The slot it holds, if merges build on pools of their own, until it
+    /// gives its turn back or is let go.
+    slot: Mutex<Option<usize>>,
     /// Its number, as it took its turn.
     number: u64,
+}
+
+impl Counted {
+    /// The slot it holds, if any, given back.
+    fn slot_back(&self) {
+        if let Some(slot) = lock(&self.slot).take() {
+            lock(&self.builds.slots_free).push(slot);
+            #[cfg(test)]
+            self.builds
+                .turns_free_at_slot
+                .store(self.builds.turns.available_permits(), Ordering::SeqCst);
+        }
+    }
 }
 
 impl Drop for Counted {
@@ -927,13 +1045,7 @@ impl Drop for Counted {
         lock(&self.builds.under_way).retain(|build| !Arc::ptr_eq(build, &self.reckoned));
         // Before the turn is let go, which comes after: so that every turn
         // finds a slot.
-        if let Some(slot) = self.slot {
-            lock(&self.builds.slots_free).push(slot);
-            #[cfg(test)]
-            self.builds
-                .turns_free_at_slot
-                .store(self.builds.turns.available_permits(), Ordering::SeqCst);
-        }
+        self.slot_back();
     }
 }
 
@@ -1010,13 +1122,15 @@ mod nesting {
         let builds = MergeBuilds::building_on(pools(2, 1));
         for _ in 0..50 {
             let (one, two) = (turn_of(&builds, "one").await, turn_of(&builds, "two").await);
-            assert!(one.counted.slot.is_some() && two.counted.slot.is_some());
-            assert_ne!(one.counted.slot, two.counted.slot);
+            let (first, second) = (*lock(&one.counted.slot), *lock(&two.counted.slot));
+            assert!(first.is_some() && second.is_some());
+            assert_ne!(first, second);
         }
         assert_eq!(lock(&builds.slots_free).len(), 2);
         // Off pools of their own, there are none to hold.
         let global = MergeBuilds::new(2);
-        assert_eq!(turn_of(&global, "one").await.counted.slot, None);
+        let unslotted = turn_of(&global, "one").await;
+        assert_eq!(*lock(&unslotted.counted.slot), None);
     }
 
     /// A slot goes back before the turn that held it, so that a turn
