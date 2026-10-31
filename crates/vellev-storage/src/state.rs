@@ -2650,13 +2650,10 @@ impl State {
                 false => live,
             };
             for (collection, name, shape) in &parts.walked.fields {
-                // A dropped collection's rows are dead, whatever its sketch.
-                if self.catalog.schema(*collection).is_some() {
-                    fields
-                        .entry((*collection, name.as_str()))
-                        .or_default()
-                        .add(shape, live_tokens);
-                }
+                fields
+                    .entry((*collection, name.as_str()))
+                    .or_default()
+                    .add(shape, live_tokens);
             }
         }
         for (collection, rows) in rows_of {
@@ -3733,7 +3730,15 @@ mod tests {
     fn a_dictionary_holds_no_more_tokens_than_its_live_rows_do() {
         let mut built = Built::new(&[]);
         built.commit(vec![long_text_collection()]);
-        built.commit((0..8_192).map(|n| long_or_short(n, true)).collect());
+        let rows = (0..8_192).map(|n| Op::Upsert {
+            collection: CollectionId(0),
+            object: Object {
+                id: oid(n),
+                properties: BTreeMap::from([("title".to_string(), Value::Text(format!("o{n}")))]),
+                vector: None,
+            },
+        });
+        built.commit(rows.collect());
         built.flush();
         let whole = Merge {
             run: 0..1,
@@ -3742,10 +3747,12 @@ mod tests {
         let all = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE);
         built.commit((0..7_372).map(|n| delete(0, n)).collect());
         let tenth = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE);
-        assert!(tenth.indexed < 0.3 * all.indexed, "{tenth:?}, of {all:?}");
+        // 820 tokens' map, not 8,192's, which is most of what they hold.
+        assert!(tenth.indexed < 0.2 * all.indexed, "{tenth:?}, of {all:?}");
     }
 
-    /// A dropped collection's rows are dead, and it reckons nothing.
+    /// A dropped collection's rows are dead, so that its dictionary is
+    /// bounded by none, and it reckons nothing.
     #[test]
     fn a_dropped_collection_reckons_nothing() {
         let mut built = Built::new(&[]);

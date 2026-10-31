@@ -667,16 +667,17 @@ const RECKONED: [Shape; 28] = [
             unfiltered: false,
         },
     ),
-    // Tokens far past all else a row comes to, in a property no filter
-    // holds: a chunk's are what the peak is, which reckoned spread evenly
-    // over the run, or not at all, fall past the bound.
+    // Tokens past all else a row comes to, in a property no filter holds,
+    // and enough of them that encoding them does not stand in for them: a
+    // chunk's are what the peak is, reckoned spread evenly over the run or
+    // not at all, past the bound.
     Shape::of(
         CHUNKED_MORE,
         NARROW,
         Text::Block {
             from: CHUNKED_MORE - AT_ONCE,
             to: CHUNKED_MORE,
-            words: 800,
+            words: 1_600,
             short: true,
             unfiltered: true,
         },
