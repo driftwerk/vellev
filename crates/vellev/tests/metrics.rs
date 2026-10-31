@@ -982,7 +982,7 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
             "vellev_merge_given_up_seconds_count",
             &[("phase", phase)],
         );
-        assert!(given_up.is_some(), "{phase}: {text}");
+        assert_eq!(given_up.is_some(), phase != "turn", "{phase}: {text}");
     }
     for outcome in [
         "committed",

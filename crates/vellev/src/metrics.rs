@@ -463,14 +463,14 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "merge_given_up_seconds",
-        "How long each phase of a merge ran before it was stopped or failed, by phase as for vellev_merge_phase_seconds: work spent that no merge came of",
+        "How long each phase of a merge ran or waited before it was stopped or failed, by phase as for vellev_merge_phase_seconds, a turn among the node's merge builds apart, which is not timed once given up: what no merge came of",
         "phase",
-        MergePhase::ALL.map(|phase| (phase.name(), timings.seconds(Timed::MergeGivenUp(phase)))),
+        MergePhase::GIVEN_UP.map(|phase| (phase.name(), timings.seconds(Timed::MergeGivenUp(phase)))),
     )?;
     for (name, help, timed) in [
         (
             "flush_due_seconds",
-            "How long rows waited in memory from when a flush of them fell due to the commit of the checkpoint that took them: a flush, or a merge or curves flushing along",
+            "How long rows waited from when a flush of them fell due to the commit of the checkpoint that took them: a flush, or a merge or curves flushing along",
             Timed::FlushDue,
         ),
         (

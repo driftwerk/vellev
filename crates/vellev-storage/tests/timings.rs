@@ -250,6 +250,37 @@ async fn a_late_stop_does_not_hide_what_ended_a_merge() {
     assert_eq!(timings.merges_ended(MergeEnd::Stopped), 0);
 }
 
+/// A wait no checkpoint has ended yet is told, as no event can be: rows due
+/// and a spell at the backlog, each from when it began, gone once a
+/// checkpoint takes them, so that a bench counts what never ended (review
+/// of #169).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_still_open_is_told_until_a_checkpoint_ends_it() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 2 * DUE, MergeBuilds::new(1)).await;
+    let open = writer.waits_open();
+    assert!(
+        open.flush_due.is_empty() && open.backlog.is_none(),
+        "{open:?}"
+    );
+    let before = Instant::now();
+    writer.commit(notes(0, DUE)).await.unwrap();
+    let open = writer.waits_open();
+    assert_eq!(open.flush_due.len(), 1, "{open:?}");
+    assert!(open.flush_due[0] >= before, "{open:?}");
+    assert_eq!(open.backlog, None, "{open:?}");
+    writer.commit(notes(1_000, DUE)).await.unwrap();
+    let open = writer.waits_open();
+    assert!(open.backlog.is_some(), "{open:?}");
+    writer.flush().await.unwrap();
+    let open = writer.waits_open();
+    assert!(
+        open.flush_due.is_empty() && open.backlog.is_none(),
+        "{open:?}"
+    );
+}
+
 /// Rule 3. A spell at the backlog runs from the rows unflushed coming to
 /// it until the commit that takes the tenant below it: not from the flush
 /// that does so beginning, which comes a while later, nor to it.

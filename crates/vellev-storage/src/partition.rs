@@ -38,7 +38,7 @@ use crate::state::{
     Snapshot, State, Stored,
 };
 use crate::stopping::{MergeStage, Stopping};
-use crate::timings::{Holder, Lag, MergeEnd, MergePhase, Taking, Timed, Timings};
+use crate::timings::{Holder, Lag, MergeEnd, MergePhase, OpenWaits, Taking, Timed, Timings};
 use crate::{Refusal, Result, StorageError};
 use vellev_index::stop::Stop;
 
@@ -1498,6 +1498,12 @@ impl Writer {
         self
     }
 
+    /// The waits this writer has open: see [`OpenWaits`].
+    #[doc(hidden)]
+    pub fn waits_open(&self) -> OpenWaits {
+        self.lag.open()
+    }
+
     /// Where this writer's background work is timed.
     pub fn timings(&self) -> &Arc<Timings> {
         &self.timings
@@ -2078,7 +2084,8 @@ impl Writer {
                 self.publish(&turn, key, frame, position, None, None)
                     .await?;
                 let adopting = Instant::now();
-                let adopted = self.partition.adopting(adopt);
+                let mut adopted = self.partition.adopting(adopt);
+                adopted.count_in(self.timings.freeing_counted());
                 if let Some(taking) = taking {
                     let unflushed = self.partition.read(State::unflushed);
                     let (waited, capped) = taking.committed(unflushed);
@@ -3205,10 +3212,13 @@ impl Writer {
     }
 
     /// How a merge planned at the epoch `planned` ended, that gave up as it
-    /// was stopped or, if `restored`, as a restore began: stale if a restore
-    /// came, as a merge stopped by one, or both, could never have committed.
+    /// was stopped or as a restore began: stale if a restore came, whether
+    /// it was made, is under way, or, as `restored` says, was seen at the
+    /// gather and has ended since. A merge stopped by one, or both, could
+    /// never have committed.
     fn given_up(&self, planned: u64, restored: bool) -> Ended {
-        Ended::Dropped(match self.stale(planned) || restored {
+        let restoring = restored || self.restoring.load(Ordering::SeqCst);
+        Ended::Dropped(match self.stale(planned) || restoring {
             true => MergeEnd::Stale,
             false => MergeEnd::Stopped,
         })
@@ -3415,9 +3425,8 @@ impl Writer {
         let above = self.merging.clustered_above;
         let (timings, key) = (self.timings.clone(), self.lease.key.clone());
         move |stopping, build, on| {
-            // On the pool its node gives merge builds, as the rest of the
-            // build is; timed from its turn there, so that the copy alone
-            // is, however long it waits or is held.
+            // On the pool of the merge's slot, as the rest of the build is,
+            // and timed as the copy.
             on.section("gathering", || {
                 let gathering = Instant::now();
                 let mut goes_on = |rows| {
@@ -5443,6 +5452,9 @@ mod tests {
         });
         at_free.recv_timeout(FREE_HELD).expect("the free began");
         assert_eq!(writer.partition.freeing(), replaced);
+        // Counted for the node too, which goes on counting it once the
+        // writer is gone.
+        assert_eq!(writer.timings.freeing(), replaced);
         let figures = writer.partition.figures();
         assert_eq!(figures, writer.partition.read(State::figures));
         drop(let_go);
