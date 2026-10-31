@@ -722,10 +722,24 @@ impl Collector for Counted {
         let counter = ConstCounter::new(merges.stopped_for_budget);
         counter.encode(encoder.encode_descriptor(
             "merges_stopped_for_budget",
-            "Merges sweeps stopped, each under way when asked, so that a tenant over the memory budget, held by something else as it merged, could be let go",
+            "Merges sweeps stopped, each counted once, so that a tenant over the memory budget, held by something else as it merged, could be let go",
             None,
             counter.metric_type(),
         )?)?;
+        let mut family = encoder.encode_descriptor(
+            "merges_stopped",
+            "Merges stopped, or cut off with their task past where a stop ends them, each counted once, by what first stopped it: a sweep letting its tenant go, its lease lost or its writer unable to write, its tenant dropped, or the node shutting down. Those stopped for the memory budget are counted apart, in merges_stopped_for_budget",
+            None,
+            counter.metric_type(),
+        )?;
+        for (reason, count) in [
+            ("let_go", merges.stopped.let_go),
+            ("lease", merges.stopped.lease),
+            ("drop", merges.stopped.drop),
+            ("shutdown", merges.stopped.shutdown),
+        ] {
+            ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
+        }
         let gauge = gauge_of(node.freeing());
         gauge.encode(encoder.encode_descriptor(
             "tenants_freeing_bytes",

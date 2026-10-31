@@ -15,10 +15,10 @@ use vellev_core::{
     ObjectId, Property, TenantId,
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
-use vellev_node::{Node, Settings};
+use vellev_node::{MergesStopped, Node, NodeError, Settings};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
-use vellev_storage::{Holding, Mutation, State, MERGE_BUILDS};
+use vellev_storage::{Holding, MergeGate, Mutation, State, MERGE_BUILDS};
 
 /// Notes written between flushes: as many as a flush is made at.
 const NOTES: u128 = 10;
@@ -258,7 +258,7 @@ async fn over_its_budget_a_node_stops_a_tenant_s_merge_and_lets_it_go_once_the_b
     until(10, "the tenant was never let go", || node.resident() == 0).await;
 }
 
-/// A sweep cannot tell a request's hold on a tenant from its maintenance's:
+/// A sweep takes a request's hold on a tenant as it does its maintenance's:
 /// over its budget it stops a merge the request makes, but never takes the
 /// tenant out from under the request, however many rounds go by. Once the
 /// request ends, the tenant is let go.
@@ -624,6 +624,439 @@ async fn losing_a_tenant_stops_a_merge_a_request_makes() {
         builds.under_way() == 0 && builds.turns_free() == MERGE_BUILDS
     })
     .await;
+}
+
+/// Tenant `name`, with a request merging it, held where its build holds it
+/// (see [`MergeBuilds::hold`]), and that request.
+async fn merged_by_a_request(
+    node: &Node,
+    name: &str,
+) -> (Arc<vellev_node::Tenant>, tokio::task::JoinHandle<()>) {
+    let builds = node.merge_builds().clone();
+    node.create_tenant(&tenant(name)).await.unwrap();
+    let held = node.tenant(&tenant(name)).await.unwrap();
+    held.write(vec![notes()]).await.unwrap();
+    for flush in 0..4 {
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(flush * NOTES + n)).collect();
+        held.write(batch).await.unwrap();
+        held.flush().await.unwrap();
+    }
+    let request = tokio::spawn({
+        let held = held.clone();
+        async move {
+            // Whatever it answers once the merge is stopped: it answers.
+            let _ = held.compact(Duration::from_secs(60 * 60)).await;
+        }
+    });
+    until(30, "the request's merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    (held, request)
+}
+
+/// M7-R1, as far as the split shows it: a tenant's maintenance works on what
+/// its tasks need, not on the tenant requests hold. So in the middle of a
+/// merge, nothing holds the tenant but the node and whoever asks here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_s_maintenance_holds_no_tenant_while_it_merges() {
+    let node = node(|settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    four_flushes(&node, "merging").await;
+    until(30, "the tenant's merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    let held = node.tenant(&tenant("merging")).await.unwrap();
+    assert_eq!(
+        Arc::strong_count(&held),
+        2,
+        "held by more than the node and this rule while its merge builds"
+    );
+    builds.hold(None);
+    until(60, "the merge was never made", || builds.under_way() == 0).await;
+}
+
+/// What the split gives on its own: nothing of a tenant's maintenance keeps
+/// the tenant, so that once nothing else holds it, its merge is stopped at
+/// once, where it would have kept the tenant until it ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_nothing_holds_any_more_has_its_merge_stopped() {
+    let node = node(|settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    // A build that runs on until its merge is stopped.
+    builds.hold(Some(Holding::UntilStopped));
+    four_flushes(&node, "merging").await;
+    until(30, "the tenant's merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    drop(node);
+    until(5, "a merge outlived all that held its tenant", || {
+        builds.under_way() == 0
+    })
+    .await;
+}
+
+/// M7-R6, on the idle path, and so for as long as a round keeps its tenant:
+/// a tenant unused for longer than the node keeps one, with its merge
+/// building, is kept until the merge ends, and let go at a sweep after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_idle_while_it_merges_is_kept_until_its_merge_ends() {
+    let idle = Duration::from_secs(2);
+    let node = node(|settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = idle;
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    four_flushes(&node, "merging").await;
+    until(30, "the tenant's merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    tokio::time::sleep(idle + Duration::from_millis(200)).await;
+    // The census is taken as a sweep begins: a second one finds what the
+    // first let go.
+    node.sweep_now().await;
+    node.sweep_now().await;
+    assert_eq!(node.census().holding.writers, 1, "let go mid-merge");
+    assert_eq!(builds.held(), 1, "its merge was stopped");
+    assert_eq!(builds.draining(), 0, "its merge was stopped");
+    builds.hold(None);
+    node.sweeping();
+    until(
+        20,
+        "the tenant was never let go once its merge ended",
+        || node.resident() == 0,
+    )
+    .await;
+    assert_eq!(builds.under_way(), 0);
+}
+
+/// M7-R4, at the node: a merge is counted as stopped once, by what first
+/// stopped it. A tenant dropped mid-merge, with the build held, and a
+/// request that goes on writing finds the hold lost, and loses it again,
+/// 20 times over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_again_and_again_is_counted_once_as_what_first_stopped_it() {
+    let node = node(|settings| {
+        // Flushed only as the request asks.
+        settings.flush_rows = 1_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    let (held, request) = merged_by_a_request(&node, "asked").await;
+    node.drop_tenant(&tenant("asked")).await.unwrap();
+    for n in 0..20 {
+        let wrote = held.write(vec![note(1_000 + n)]).await;
+        assert!(
+            matches!(wrote, Err(NodeError::Storage(_))),
+            "a write after the hold was lost: {wrote:?}"
+        );
+    }
+    assert_eq!(builds.held(), 1, "the build held is held still");
+    assert_eq!(
+        node.merges().stopped,
+        MergesStopped {
+            drop: 1,
+            ..MergesStopped::default()
+        }
+    );
+    builds.hold(None);
+    within(30, "the request never ended", request)
+        .await
+        .unwrap();
+}
+
+/// M7-R4: a merge stopped by a lease lost is counted as that, and the same
+/// on a node given up, each once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_by_a_lease_lost_or_a_shutdown_is_counted_as_that() {
+    let lease = Duration::from_secs(1);
+    let coordinator: Arc<dyn Coordinator> = Arc::new(MemoryCoordinator::default());
+    let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(
+        object_store::memory::InMemory::new(),
+    )));
+    let on_both = || {
+        let settings = Settings {
+            warm: None,
+            lease,
+            // Flushed only as the request asks.
+            flush_rows: 1_000,
+            tenant_idle: Duration::from_secs(60 * 60),
+            ..Settings::new(NodeId::generate("node"))
+        };
+        let embedders = Arc::new(Embedders::new(EmbedSettings::default()));
+        Node::new(coordinator.clone(), blobs.clone(), embedders, settings)
+    };
+    let (node, other) = (on_both(), on_both());
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    let (_held, leased) = merged_by_a_request(&node, "leased").await;
+    // Removed elsewhere: this node finds out as it next renews its lease.
+    other.drop_tenant(&tenant("leased")).await.unwrap();
+    until(5, "the lost lease stopped no merge", || {
+        node.merges().stopped.lease == 1
+    })
+    .await;
+    let lost = MergesStopped {
+        lease: 1,
+        ..MergesStopped::default()
+    };
+    assert_eq!(node.merges().stopped, lost);
+    builds.hold(None);
+    within(30, "the request never ended", leased).await.unwrap();
+    until(5, "the stopped build's turn was never free", || {
+        builds.under_way() == 0
+    })
+    .await;
+
+    builds.hold(Some(Holding::UntilLetGo));
+    let (_held, shutting) = merged_by_a_request(&node, "shutting").await;
+    node.shutdown().await;
+    assert_eq!(
+        node.merges().stopped,
+        MergesStopped {
+            shutdown: 1,
+            ..lost
+        }
+    );
+    builds.hold(None);
+    within(30, "the request never ended", shutting)
+        .await
+        .unwrap();
+}
+
+/// M7-R4, for the sweep's own stop: every sweep that finds the tenant held
+/// asks again, with the build held throughout, and the merge is counted
+/// once, there and nowhere else, whatever goes on to stop it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_for_the_budget_is_counted_once_and_nowhere_else() {
+    let node = node(|settings| {
+        // Flushed only as the request asks.
+        settings.flush_rows = 1_000;
+        settings.memory = Some(1);
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::UntilLetGo));
+    let (held, request) = merged_by_a_request(&node, "asked").await;
+    // Unused for longer than any tenant is kept regardless.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    for _ in 0..3 {
+        node.sweep_now().await;
+    }
+    assert!(builds.draining() > 0, "the merge was not stopped");
+    assert_eq!(builds.held(), 1, "the build held is held still");
+    assert_eq!(
+        node.merges().stopped_for_budget,
+        1,
+        "one merge, three sweeps"
+    );
+    node.drop_tenant(&tenant("asked")).await.unwrap();
+    assert_eq!(node.merges().stopped, MergesStopped::default());
+    builds.hold(None);
+    within(30, "the request never ended", request)
+        .await
+        .unwrap();
+    drop(held);
+}
+
+/// Tenant `name`, its maintenance merging it, that merge held past loading
+/// back what it built, where a stop no longer ends it. The tenant is not
+/// held after.
+async fn past_loading(node: &Node, name: &str) -> Arc<MergeGate> {
+    node.create_tenant(&tenant(name)).await.unwrap();
+    let held = node.tenant(&tenant(name)).await.unwrap();
+    let gate = held.hold_merges_before_commit();
+    held.write(vec![notes()]).await.unwrap();
+    for flush in 0..4 {
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(flush * NOTES + n)).collect();
+        held.write(batch).await.unwrap();
+        let flushed = || held.read(State::unflushed) == 0;
+        until(30, "the node never flushed the tenant", flushed).await;
+    }
+    within(
+        30,
+        "the merge never came past loading",
+        gate.reached.notified(),
+    )
+    .await;
+    gate
+}
+
+/// Two nodes on one coordinator and store, flushing every `NOTES` rows, with
+/// a lease of a second, so that either learns of a tenant removed by the
+/// other within a third of that.
+fn two_nodes() -> (Node, Node) {
+    let coordinator: Arc<dyn Coordinator> = Arc::new(MemoryCoordinator::default());
+    let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(
+        object_store::memory::InMemory::new(),
+    )));
+    let on_both = || {
+        let settings = Settings {
+            warm: None,
+            lease: Duration::from_secs(1),
+            flush_rows: NOTES as usize,
+            tenant_idle: Duration::from_secs(60 * 60),
+            ..Settings::new(NodeId::generate("node"))
+        };
+        let embedders = Arc::new(Embedders::new(EmbedSettings::default()));
+        Node::new(coordinator.clone(), blobs.clone(), embedders, settings)
+    };
+    (on_both(), on_both())
+}
+
+/// A stop does not end a merge past loading, but aborting its task does: it
+/// is lost all the same, the dearest there is to lose, and is counted, once,
+/// as what lost it. For a tenant dropped, a renewal refused and a shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_past_loading_cut_off_with_its_task_is_counted_as_what_cut_it() {
+    let (node, other) = two_nodes();
+    let builds = node.merge_builds().clone();
+    let _gate = past_loading(&node, "dropped").await;
+    assert!(node.drop_tenant(&tenant("dropped")).await.unwrap());
+    let mut counted = MergesStopped {
+        drop: 1,
+        ..MergesStopped::default()
+    };
+    assert_eq!(node.merges().stopped, counted);
+    until(5, "the merge cut off left its build under way", || {
+        builds.under_way() == 0
+    })
+    .await;
+
+    let _gate = past_loading(&node, "leased").await;
+    other.drop_tenant(&tenant("leased")).await.unwrap();
+    until(5, "the refused renewal counted nothing", || {
+        node.merges().stopped.lease == 1
+    })
+    .await;
+    counted.lease = 1;
+    assert_eq!(node.merges().stopped, counted);
+    until(5, "the merge cut off left its build under way", || {
+        builds.under_way() == 0
+    })
+    .await;
+
+    let _gate = past_loading(&node, "shutting").await;
+    node.shutdown().await;
+    counted.shutdown = 1;
+    assert_eq!(node.merges().stopped, counted);
+}
+
+/// Losing a hold aborts nothing of a request's: its merge past loading goes
+/// on to its commit, so that no stop ended it, and none is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_past_loading_on_a_request_is_not_counted_when_the_hold_is_lost() {
+    let node = node(|settings| {
+        // Flushed only as the request asks.
+        settings.flush_rows = 1_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    node.create_tenant(&tenant("asked")).await.unwrap();
+    let held = node.tenant(&tenant("asked")).await.unwrap();
+    let gate = held.hold_merges_before_commit();
+    held.write(vec![notes()]).await.unwrap();
+    for flush in 0..4 {
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(flush * NOTES + n)).collect();
+        held.write(batch).await.unwrap();
+        held.flush().await.unwrap();
+    }
+    let request = tokio::spawn({
+        let held = held.clone();
+        async move { held.compact(Duration::from_secs(60 * 60)).await }
+    });
+    within(
+        30,
+        "the merge never came past loading",
+        gate.reached.notified(),
+    )
+    .await;
+    node.drop_tenant(&tenant("asked")).await.unwrap();
+    assert_eq!(node.merges().stopped, MergesStopped::default());
+    gate.release.notify_one();
+    let answered = within(30, "the request never ended", request).await;
+    // Refused or not, it ran to its end, with nothing to stop it.
+    let _ = answered.unwrap();
+    assert_eq!(node.merges().stopped, MergesStopped::default());
+}
+
+/// The sweep's stop aborts nothing either. One too late for a merge stops
+/// nothing, and counts nothing, and the merge commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_for_the_budget_too_late_counts_nothing_and_the_merge_commits() {
+    let node = node(|settings| {
+        // Flushed only as the request asks.
+        settings.flush_rows = 1_000;
+        settings.memory = Some(1);
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    node.create_tenant(&tenant("asked")).await.unwrap();
+    let held = node.tenant(&tenant("asked")).await.unwrap();
+    let gate = held.hold_merges_before_commit();
+    held.write(vec![notes()]).await.unwrap();
+    for flush in 0..4 {
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(flush * NOTES + n)).collect();
+        held.write(batch).await.unwrap();
+        held.flush().await.unwrap();
+    }
+    let request = tokio::spawn({
+        let held = held.clone();
+        async move { held.compact(Duration::from_secs(60 * 60)).await }
+    });
+    within(
+        30,
+        "the merge never came past loading",
+        gate.reached.notified(),
+    )
+    .await;
+    // Unused for longer than any tenant is kept regardless.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweep_now().await;
+    assert_eq!(node.merges().stopped_for_budget, 0, "a stop too late");
+    gate.release.notify_one();
+    let answered = within(30, "the request never ended", request).await;
+    answered.unwrap().expect("the merge commits");
+    assert_eq!(held.read(|state| state.segments().count()), 1, "merged");
+    assert_eq!(node.merges().stopped_for_budget, 0);
+}
+
+/// A merge the sweep's stop came too late for, cut off with its task after,
+/// is one merge, counted once, as what cut it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_too_late_for_the_budget_and_then_cut_off_is_counted_once() {
+    let node = node(|settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.memory = Some(1);
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let _gate = past_loading(&node, "merging").await;
+    // Unused for longer than any tenant is kept regardless.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweep_now().await;
+    assert_eq!(node.merges().stopped_for_budget, 0, "a stop too late");
+    node.drop_tenant(&tenant("merging")).await.unwrap();
+    let merges = node.merges();
+    assert_eq!(
+        (merges.stopped_for_budget, merges.stopped),
+        (
+            0,
+            MergesStopped {
+                drop: 1,
+                ..MergesStopped::default()
+            }
+        )
+    );
 }
 
 /// Write `held` steadily, half a flush every tenth of a second, until
