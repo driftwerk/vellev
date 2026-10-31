@@ -515,6 +515,33 @@ impl Drop for Tokenizing {
     }
 }
 
+/// Wait until the count stands still: what the merges before this one let
+/// go is freed off the async threads, and nothing waits for it. Measured
+/// while that falls, a merge reads as holding less than it does, by whatever
+/// fell before its peak: 3 collections' merge, the same to the byte alone,
+/// read 13 MB of its 47 MB short in the rule's order, and looked like a
+/// spread as threads fell.
+async fn count_settled() {
+    within(WRITTEN_WITHIN, "the count settled", async {
+        let (mut last, mut still) = (COUNTING.now(), 0);
+        while still < COUNT_STILL_FOR {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let now = COUNTING.now();
+            still = match now.abs_diff(last) < COUNT_STILL_WITHIN {
+                true => still + 1,
+                false => 0,
+            };
+            last = now;
+        }
+    })
+    .await;
+}
+
+/// How many readings 20 ms apart show the count standing still, and how
+/// little it may move between them: a task's few allocations go on.
+const COUNT_STILL_FOR: usize = 5;
+const COUNT_STILL_WITHIN: usize = 16 * 1024;
+
 /// What a merge of `shape`, `at_once` rows' text tokenized at a time, is
 /// [`Measured`] to hold.
 async fn merge_measured(shape: Shape, at_once: usize, gathered: Gathered) -> Measured {
@@ -573,6 +600,7 @@ async fn merge_measured(shape: Shape, at_once: usize, gathered: Gathered) -> Mea
         }
     };
     within(WRITTEN_WITHIN, "the rows written and flushed", written).await;
+    count_settled().await;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     let merged = within(MERGED_WITHIN, "the merge ended", writer.merge()).await;
