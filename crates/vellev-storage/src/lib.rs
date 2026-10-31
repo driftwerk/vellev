@@ -41,6 +41,7 @@ pub use mutation::{
 pub use partition::{
     Embedded, Follower, MergeGate, Partition, RestoreFrom, Writer, GATHERED_AT_ONCE,
 };
+pub use published::FreesHeld;
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
 pub use state::{Figures, Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM};
 pub use stopping::MergeStage;

@@ -3,9 +3,47 @@
 //! for its metrics and its memory budget, it is never behind a change made.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::state::{Discarded, Figures, State};
+
+/// The longest a free waits where a test holds it, were the test never to
+/// let it go.
+const HELD_AT_MOST: Duration = Duration::from_secs(60);
+
+/// Where a test holds what a merge's commit took out of a partition, as its
+/// free is about to begin. Not for use.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct FreesHeld {
+    let_go: Mutex<bool>,
+    told: Condvar,
+    reached: AtomicUsize,
+}
+
+impl FreesHeld {
+    /// How many frees have come to where they are held.
+    pub fn reached(&self) -> usize {
+        self.reached.load(Ordering::SeqCst)
+    }
+
+    /// Let every free held go, and those to come pass.
+    pub fn let_go(&self) {
+        *self.let_go.lock().expect("held lock") = true;
+        self.told.notify_all();
+    }
+
+    /// Wait here until let go, at most [`HELD_AT_MOST`].
+    pub(crate) fn wait(&self) {
+        self.reached.fetch_add(1, Ordering::SeqCst);
+        let let_go = self.let_go.lock().expect("held lock");
+        let held = self
+            .told
+            .wait_timeout_while(let_go, HELD_AT_MOST, |let_go| !*let_go);
+        drop(held.expect("held lock"));
+    }
+}
 
 /// The state, and what it came to as it was last changed. The fields are
 /// private, so that nothing changes the state but [`Self::changing`] and
@@ -17,6 +55,8 @@ pub(crate) struct Published {
     /// What segments taken out of the state still hold, until they are
     /// freed: see [`Self::freeing`].
     freeing: Arc<AtomicUsize>,
+    /// Where a test holds frees, if it does: see [`Self::hold_frees`].
+    frees_held: Mutex<Option<Arc<FreesHeld>>>,
 }
 
 impl Published {
@@ -46,9 +86,11 @@ impl Published {
         self.figures().resident + self.freeing()
     }
 
-    /// Count `bytes` as being freed, for good: for a test.
-    pub(crate) fn count_as_freeing(&self, bytes: usize) {
-        self.freeing.fetch_add(bytes, Ordering::SeqCst);
+    /// Hold each merge's commit's free from now on: see [`FreesHeld`].
+    pub(crate) fn hold_frees(&self) -> Arc<FreesHeld> {
+        let held = Arc::new(FreesHeld::default());
+        *self.frees_held.lock().expect("frees held lock") = Some(held.clone());
+        held
     }
 
     /// Change the state as `f` does, under its lock, and publish all it
@@ -70,6 +112,9 @@ impl Published {
         self.changing(|state| {
             let mut discarded = f(state);
             discarded.count_in(&self.freeing);
+            if discarded.replaced() {
+                discarded.held = self.frees_held.lock().expect("frees held lock").clone();
+            }
             discarded
         })
     }

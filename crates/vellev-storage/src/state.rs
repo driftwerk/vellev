@@ -21,6 +21,7 @@ use crate::format::{
     Answer, CollectionId, LogSegment, Manifest, Op, Row, SegmentCurve, SegmentFile, SegmentIndex,
     SegmentMeta,
 };
+use crate::published::FreesHeld;
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
 
@@ -863,6 +864,10 @@ impl Reckoning {
 /// over their rows.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Parts {
+    /// Told as the last of the segment goes, however far it got, as a test
+    /// asks: these go with it from its build on.
+    #[cfg(test)]
+    pub(crate) probe: Option<Arc<Probe>>,
     count: usize,
     /// Its rows, as [`copied_bytes`] counts them.
     copied: usize,
@@ -885,6 +890,8 @@ impl Parts {
             collections.push((*collection, index.rows.rows().len() as usize));
         }
         Self {
+            #[cfg(test)]
+            probe: None,
             count: file.rows.len(),
             copied: file.rows.iter().map(copied_bytes).sum(),
             text,
@@ -1122,6 +1129,8 @@ pub(crate) struct Discarded {
     /// Told as it is freed, as a test asks.
     #[cfg(test)]
     pub(crate) probe: Option<Arc<Probe>>,
+    /// Where a test holds its free, if it does.
+    pub(crate) held: Option<Arc<FreesHeld>>,
     rows: Vec<Row>,
     indexes: Indexes,
     segments: Vec<Segment>,
@@ -1175,9 +1184,13 @@ impl Discarded {
         let indexes = std::mem::take(&mut self.indexes);
         let segments = std::mem::take(&mut self.segments);
         let counted = self.counted.take();
+        let held = self.held.take();
         #[cfg(test)]
         let probe = self.probe.take();
         move || {
+            if let Some(held) = held {
+                held.wait();
+            }
             #[cfg(test)]
             drop(probe);
             drop((segments, rows, indexes));
@@ -2756,6 +2769,7 @@ impl State {
         Discarded {
             #[cfg(test)]
             probe: None,
+            held: None,
             rows: Vec::new(),
             indexes: Indexes::new(),
             segments: self.segments.splice(run, [merged]).collect(),
@@ -3048,6 +3062,7 @@ impl State {
         let discarded = Discarded {
             #[cfg(test)]
             probe: None,
+            held: None,
             rows: rows.drain(..held).collect(),
             indexes: std::mem::take(indexes),
             segments: Vec::new(),
