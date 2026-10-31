@@ -5173,6 +5173,32 @@ mod tests {
         }
     }
 
+    /// A stopped merge's turn is held until what it built is freed: sent off
+    /// the async threads, it has outlived the merge, and no further merge
+    /// is to gather beside it (merge note, §7.7).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_merge_stopped_uploading_holds_its_turn_until_what_it_built_is_freed() {
+        let builds = MergeBuilds::new(1);
+        builds.probe(true);
+        let writer = writer().await.merging_among(builds.clone());
+        writer.commit(vec![create()]).await.unwrap();
+        for n in 0..2 {
+            writer.commit(vec![upsert(n)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        writer.stop_merges_at(Some(MergeStage::Uploading));
+        assert_eq!(writer.merge().await.unwrap(), None);
+        tokio::time::timeout(ANSWERED, async {
+            while builds.under_way() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the build ended");
+        let probed = builds.probed().expect("what it built was dropped");
+        assert_eq!((probed.under_way, probed.turns_free), (1, 0), "{probed:?}");
+    }
+
     /// As [`a_merge_stopped_uploading_frees_what_it_built_off_the_async_threads`],
     /// stopped before its load back has begun, or as it goes.
     #[tokio::test(flavor = "current_thread")]

@@ -192,6 +192,15 @@ async fn a_sweep_during_a_free_stops_nothing_and_lets_nothing_go() {
     assert_eq!(merges.draining, 0, "a merge was stopped");
     assert_eq!(builds.held(), 1, "the other merge did not go on");
     assert_eq!(node.census().holding.writers, 3, "a tenant was let go");
+    assert!(node.freeing() > 0, "the free is over");
+    // Nor does warming see it: what the tenants hold is what their states
+    // come to.
+    let mut figures = 0;
+    for name in ["idle", "freeing", "merging"] {
+        let tenant = node.tenant(&tenant(name)).await.unwrap();
+        figures += tenant.partition().figures().resident;
+    }
+    assert_eq!(node.resident(), figures);
     builds.hold(None);
     drop(freeing);
 }
