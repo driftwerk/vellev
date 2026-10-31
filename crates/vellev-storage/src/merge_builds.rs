@@ -223,9 +223,10 @@ struct Reckoned {
     /// commits what it holds, and drains nothing.
     committing: AtomicBool,
     /// Whether its merge has given its turn back to wait for the building
-    /// lock, holding what it built: no turn stands for that, so it counts
-    /// as draining until the merge ends.
+    /// lock, holding what it built: a running build, with no turn.
     turn_given_back: AtomicBool,
+    /// What its merge holds as it does: see [`MergeBuilds::waiting_to_commit`].
+    holding: AtomicUsize,
 }
 
 /// How a test holds each merge's build off the async threads, with its
@@ -372,20 +373,17 @@ impl MergeBuilds {
     /// About how many bytes the merges stopped and not yet ended hold:
     /// what each was reckoned to hold at its peak, until the last of its
     /// work has ended. Merges running unstopped are not counted, nor any
-    /// stopped once past where a stop ends it, which commits instead. With
-    /// those that gave their turns back with what they built, waiting to
-    /// commit it, which no turn stands for; and what stores keep of merges
-    /// whose turns were let go for it ([`Self::abandoned`]).
+    /// stopped once past where a stop ends it, which commits instead, as
+    /// one that gave its turn back does ([`Self::waiting_to_commit`]). With
+    /// what stores keep of merges whose turns were let go for it
+    /// ([`Self::abandoned`]).
     pub fn draining(&self) -> usize {
-        let held: usize = lock(&self.under_way)
+        let stopped: usize = lock(&self.under_way)
             .iter()
-            .filter(|build| {
-                let stopped = build.stop.is_stopped() && !build.committing.load(Ordering::SeqCst);
-                stopped || build.turn_given_back.load(Ordering::SeqCst)
-            })
+            .filter(|build| build.stop.is_stopped() && !build.committing.load(Ordering::SeqCst))
             .map(|build| build.bytes.load(Ordering::SeqCst))
             .sum();
-        held + self.abandoned()
+        stopped + self.abandoned()
     }
 
     /// How many builds are under way: each from its turn to the end of the
@@ -399,9 +397,17 @@ impl MergeBuilds {
     }
 
     /// About how many bytes merges hold that gave their turns back to wait
-    /// to commit. None yet.
+    /// to commit: what each holds now, what it built, not its build's peak.
+    /// They are running builds, past where a stop ends them, and leave in
+    /// seconds by themselves, so that nothing here is in [`Self::draining`]
+    /// or any total a sweep answers. Nothing limits how many there are but
+    /// one to a writer.
     pub fn waiting_to_commit(&self) -> usize {
-        0
+        lock(&self.under_way)
+            .iter()
+            .filter(|build| build.turn_given_back.load(Ordering::SeqCst))
+            .map(|build| build.holding.load(Ordering::SeqCst))
+            .sum()
     }
 
     /// How many times a merge has taken a turn, however it went. For tests.
@@ -606,6 +612,7 @@ impl MergeBuilds {
             planned: AtomicUsize::new(0),
             committing: AtomicBool::new(false),
             turn_given_back: AtomicBool::new(false),
+            holding: AtomicUsize::new(0),
         });
         lock(&self.under_way).push(reckoned.clone());
         let slot = self.slot_taken();
@@ -745,17 +752,18 @@ impl MergeBuild {
         lock(&self.turn).is_some()
     }
 
-    /// Give the turn back, with its slot, the build being over and what it
-    /// made held: as a merge past loading does that has waited as long as
-    /// a turn may for its building lock, however long that is held yet, so
-    /// that another tenant's merge may take the turn. What it holds is
-    /// counted as draining from here until the merge ends, there being no
-    /// turn to stand for it, so that it counts against the node's budget.
-    /// That is its peak's reckoning, more than it holds now. Until it
-    /// commits, the merges' reckonings may come to [`MERGE_BUILDS`] builds'
-    /// and this one's: the cost of not idling a turn.
-    pub(crate) fn give_turn_back(&self) {
+    /// Give the turn back, with its slot, the build being over and `holding`
+    /// bytes of what it made held: as a merge past loading does that has
+    /// waited as long as a turn may for its building lock, however long
+    /// that is held yet, so that another tenant's merge may take the turn.
+    /// The turn goes to the first in the queue at once, with nothing asked
+    /// of what fits, and no limit but one to a writer on how many do this:
+    /// so a node's merges can hold a built segment each for as many writers
+    /// as it has, beside what the turns build. The merge goes on as a
+    /// running build: [`MergeBuilds::waiting_to_commit`] says what it holds.
+    pub(crate) fn give_turn_back(&self, holding: usize) {
         let reckoned = &self.counted.reckoned;
+        reckoned.holding.store(holding, Ordering::SeqCst);
         reckoned.turn_given_back.store(true, Ordering::SeqCst);
         // The slot first, as ever: so that every turn finds one.
         self.counted.slot_back();

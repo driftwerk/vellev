@@ -463,13 +463,17 @@ and say what the caller then answers for.
   task of their own, so a flush due while the tenant's merge builds
   commits in a flush's own time, where it waited for the build. A merge
   flushes what is due before its commit, so `vellev_building_held_seconds`
-  reads less for `merge_commit` and more for `flush`.
+  reads less for `merge_commit` and more for `flush`. A tenant's merges
+  may see more than one clean, as cleaning up goes on beside them, and
+  `vellev_building_held_seconds{holder="clean"}` can count a little more.
   `vellev_merge_phase_seconds{phase="turn_idle"}` is new: each wait for the
   building lock with a merge turn held, 10 s at the most, after which the
-  turn goes back. `vellev_merge_draining_bytes` now also counts a merge
-  that gave its turn back to wait to commit, so it can read above zero
-  with no merge stopped, and what merges are reckoned to hold can exceed
-  `MERGE_BUILDS` builds by that merge until it commits.
+  turn goes back and the merge goes on without one.
+  `vellev_merge_commits_waiting_bytes` is new: what merges hold now that
+  gave their turns back to wait to commit. Nothing limits how many do but
+  one to a tenant, so a node can hold a built segment for each tenant
+  beside the builds its turns allow. It is in no total a sweep answers, as
+  those bytes leave in seconds by themselves.
   `vellev_tenants_given_up_total` counts a panic on either task, two at
   once on one tenant counting twice, and the line logged for it now reads
   "a tenant's task panicked" with the task named.

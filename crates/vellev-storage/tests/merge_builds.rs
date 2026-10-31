@@ -10,7 +10,9 @@ use common::*;
 use vellev_storage::backups::Held;
 use vellev_storage::coordinator::{Clock, Restore};
 use vellev_storage::timings::{Holder, MergeEnd, MergePhase, Timed};
-use vellev_storage::{Holding, MergeBuilds, MergeGate, MergeStage, Merging, TURN_IDLE_AT_MOST};
+use vellev_storage::{
+    FlushFirst, Holding, MergeBuilds, MergeGate, MergeStage, Merging, TURN_IDLE_AT_MOST,
+};
 
 /// Notes in each segment merged.
 const NOTES: u32 = 300;
@@ -1795,7 +1797,7 @@ async fn one_gave_way(
         let (second, due) = (second.clone(), due.clone());
         async move {
             second
-                .merge_giving_way(&|| due.load(Ordering::SeqCst), &|_| {})
+                .merge_giving_way(&|| due.load(Ordering::SeqCst), FlushFirst::default())
                 .await
         }
     });
@@ -1835,7 +1837,7 @@ async fn a_merge_that_gives_way_to_a_flush_keeps_its_place_for_a_turn() {
         let (second, due) = (second.clone(), due.clone());
         async move {
             second
-                .merge_giving_way(&|| due.load(Ordering::SeqCst), &|_| {})
+                .merge_giving_way(&|| due.load(Ordering::SeqCst), FlushFirst::default())
                 .await
         }
     });
@@ -1865,7 +1867,7 @@ async fn a_merge_that_gives_way_to_a_flush_keeps_its_place_for_a_turn() {
         let (second, due) = (second.clone(), due.clone());
         async move {
             second
-                .merge_giving_way(&|| due.load(Ordering::SeqCst), &|_| {})
+                .merge_giving_way(&|| due.load(Ordering::SeqCst), FlushFirst::default())
                 .await
         }
     });
