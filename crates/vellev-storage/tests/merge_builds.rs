@@ -1375,6 +1375,8 @@ async fn a_restore_in_the_hand_off_after_a_flush_first_has_the_merge_asked_again
     );
     assert_eq!(writer.timings().merges_ended(MergeEnd::Stale), 1);
     assert_eq!(writer.partition().read(State::rows), rows, "rows lost");
+    // The gate holds each merge: this one goes straight through it.
+    gate.release.notify_one();
     let again = within(60, "the next merge never ended", writer.merge()).await;
     assert!(again.unwrap().is_some(), "nothing left to merge");
 }
