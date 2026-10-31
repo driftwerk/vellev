@@ -2,9 +2,27 @@
 //! end of loading what it built back, it asks its stop in each long stage,
 //! and gives up, leaving nothing behind, once it is stopped.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use vellev_index::stop::{Stage, Stop};
+
+use crate::state::TOKENIZED_AT_ONCE;
+
+/// How many rows' text a build holds tokenized at once, at the most, as a
+/// test asks: see [`tokenize_at_once`].
+static ASKED_AT_ONCE: AtomicUsize = AtomicUsize::new(TOKENIZED_AT_ONCE);
+
+/// Have every merge, flush and open from now on hold `rows` rows' text
+/// tokenized at once, at the most. For rules that weigh a build tokenized in
+/// chunks against one tokenized all at once, in a binary of their own, one
+/// measurement at a time: it is the process's, as an open has no writer to
+/// ask, and what it weighs, the allocator's count, is the process's too. Not
+/// for use.
+#[doc(hidden)]
+pub fn tokenize_at_once(rows: usize) {
+    ASKED_AT_ONCE.store(rows.max(1), Ordering::SeqCst);
+}
 
 /// The stages of a merge in which it asks its stop. Named for tests that
 /// show each one asks; not for use.
@@ -38,13 +56,30 @@ pub enum MergeStage {
 /// How often a merge waiting on the store or the disk asks its stop.
 const ASKS_EVERY: Duration = Duration::from_millis(20);
 
-/// A build's stop, and the stage a test has it stop itself in.
+/// A build's stop, the stage a test has it stop itself in, and what else a
+/// test asks of the build.
 #[derive(Clone, Debug)]
 pub(crate) struct Stopping {
     stop: Stop,
     at: Option<MergeStage>,
     /// Whether the build panics, as a test asks.
     panics: bool,
+    /// How many rows' text the build holds tokenized at once, at the most:
+    /// [`TOKENIZED_AT_ONCE`], unless a test asks otherwise. Rows, not bytes:
+    /// a chunk of long documents holds what they come to.
+    tokenized_at_once: usize,
+    /// Its askings, counted as a test asks.
+    #[cfg(test)]
+    asked: Option<std::sync::Arc<Asked>>,
+}
+
+/// How often a build asked its stop in any stage, and the asking at which
+/// the stop stops itself.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct Asked {
+    pub times: AtomicUsize,
+    pub stops_at: usize,
 }
 
 impl Stopping {
@@ -55,7 +90,14 @@ impl Stopping {
             Some(MergeStage::Vectors(stage)) => Stop::at_first(stage),
             _ => Stop::new(),
         };
-        Self { stop, at, panics }
+        Self {
+            stop,
+            at,
+            panics,
+            tokenized_at_once: ASKED_AT_ONCE.load(Ordering::SeqCst),
+            #[cfg(test)]
+            asked: None,
+        }
     }
 
     /// For a flush or a restore, which nothing stops.
@@ -64,7 +106,34 @@ impl Stopping {
             stop: Stop::new(),
             at: None,
             panics: false,
+            tokenized_at_once: ASKED_AT_ONCE.load(Ordering::SeqCst),
+            #[cfg(test)]
+            asked: None,
         }
+    }
+
+    /// As this, holding `rows` rows' text tokenized at once, at the most,
+    /// and at least one.
+    #[cfg(test)]
+    pub(crate) fn tokenizing(self, rows: usize) -> Self {
+        Self {
+            tokenized_at_once: rows.max(1),
+            ..self
+        }
+    }
+
+    /// As this, its askings counted, and stopped at the `stops_at`th.
+    #[cfg(test)]
+    pub(crate) fn counted(self, stops_at: usize) -> (Self, std::sync::Arc<Asked>) {
+        let asked = std::sync::Arc::new(Asked {
+            times: AtomicUsize::new(0),
+            stops_at,
+        });
+        let stopping = Self {
+            asked: Some(asked.clone()),
+            ..self
+        };
+        (stopping, asked)
     }
 
     /// The stop an index build is given.
@@ -77,7 +146,19 @@ impl Stopping {
         if self.at == Some(stage) {
             self.stop.stop();
         }
+        #[cfg(test)]
+        if let Some(asked) = &self.asked {
+            let times = asked.times.fetch_add(1, Ordering::SeqCst);
+            if times + 1 >= asked.stops_at {
+                self.stop.stop();
+            }
+        }
         self.stop.is_stopped()
+    }
+
+    /// How many rows' text the build holds tokenized at once, at the most.
+    pub(crate) fn tokenized_at_once(&self) -> usize {
+        self.tokenized_at_once
     }
 
     /// Whether the build is to panic, as a test asks.

@@ -45,8 +45,11 @@ pub use partition::{
 };
 pub use published::FreesHeld;
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
-pub use state::{Figures, Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM};
-pub use stopping::MergeStage;
+pub use state::{
+    Figures, Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM,
+    TOKENIZED_AT_ONCE,
+};
+pub use stopping::{tokenize_at_once, MergeStage};
 pub use vellev_index::curve;
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;
