@@ -1888,6 +1888,18 @@ impl Node {
         unsettled
     }
 
+    /// About how many bytes the tenants this node writes have taken out of
+    /// their state and yet to free, as a merge's commit does what it
+    /// replaced. A figure of its own, for the eye: it goes by itself, so
+    /// neither a sweep nor warming acts on it, and [`Self::resident`] leaves
+    /// it out.
+    pub fn freeing(&self) -> usize {
+        let mut freeing = 0;
+        self.0
+            .each_writer(|tenant| freeing += tenant.partition().freeing());
+        freeing
+    }
+
     /// The segments the tenants this node writes hold, by whether they
     /// have a clustered index, as they are now.
     pub fn segments(&self) -> Segments {
