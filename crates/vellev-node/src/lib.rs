@@ -24,6 +24,7 @@ use vellev_storage::coordinator::{
     Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
+use vellev_storage::timings::{Timed, Timings};
 use vellev_storage::{
     Batch, Embedded, GroupCommitter, MergeBuilds, Mutation, Receipt, State, StorageError,
     Transfers, Unembedded, Vectorize, Writer, MERGE_BUILDS,
@@ -254,6 +255,56 @@ pub struct Settings {
     /// no other node: the node never holds, follows or backs up a tenant
     /// it does not serve. Every tenant, unless told otherwise.
     pub served: Served,
+    /// Where merges are built: on rayon's global pool, with flushes and
+    /// loads, unless told otherwise (merge note, §3).
+    pub merge_pool: MergePool,
+}
+
+/// The threads a node builds its merges on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MergePool {
+    /// Rayon's global pool, which builds flushes and loads too, at the
+    /// process's priority.
+    #[default]
+    Global,
+    /// Pools of their own among `threads` threads, one pool for each
+    /// merge built at once and an equal share to each, any left over
+    /// unused, each thread run `nice` lower than the rest of the process,
+    /// on Linux, from 0, which runs them as it does, to 19, as
+    /// [`Settings::check`] makes sure. A build's clustered indexes tune on
+    /// the one tuning thread whatever this says.
+    Own { threads: usize, nice: i32 },
+}
+
+impl MergePool {
+    /// Why a node that builds `builds` merges at once cannot build them on
+    /// this, if it cannot: each build has its share of the threads, so
+    /// fewer than that leaves one with none; a nice below 0 would raise a
+    /// merge above the process's priority, which it never needs and the
+    /// image's user may not take; and one past 19 is lower than any there
+    /// is. [`Settings::check`] asks it, and so does whoever makes a node
+    /// without that check.
+    pub fn problem(&self, builds: usize) -> Option<String> {
+        let MergePool::Own { threads, nice } = *self else {
+            return None;
+        };
+        if threads < builds {
+            return Some(format!(
+                "a merge pool of {threads} threads cannot give each of {builds} builds at \
+                 once a thread"
+            ));
+        }
+        match nice {
+            0..=19 => None,
+            ..0 => Some(format!(
+                "a nice of {nice} for the merge pool would run merges above the process's \
+                 priority"
+            )),
+            _ => Some(format!(
+                "a nice of {nice} for the merge pool is past 19, the lowest there is"
+            )),
+        }
+    }
 }
 
 /// The tenants a node serves.
@@ -312,6 +363,7 @@ impl Settings {
             purge_after: Duration::from_secs(10 * 60),
             transfers: Transfers::default(),
             served: Served::Every,
+            merge_pool: MergePool::Global,
         }
     }
 
@@ -325,6 +377,7 @@ impl Settings {
             .grace_problem(self.grace)
             .or_else(|| self.request_bounds.claim_problem(self.backup_claim))
             .or_else(|| self.backlog_problem())
+            .or_else(|| self.merge_pool.problem(MERGE_BUILDS))
             .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
     }
 
@@ -1028,6 +1081,24 @@ impl Tenant {
         flushed.map_err(|error| self.failed(error))
     }
 
+    /// As [`Self::flush`], made before the tenant is let go: its wait for
+    /// the building lock and its hold are timed under their own name, as
+    /// the merge bench holds the wait to a mark of its own (merge note,
+    /// §3).
+    async fn flush_to_let_go(&self) -> Result<LogPosition> {
+        let flushed = self.writer.flush_timed().await;
+        self.flush_tried(flushed.is_ok());
+        let (position, times) = flushed.map_err(|error| self.failed(error))?;
+        self.settling.flushed.fetch_add(1, Ordering::SeqCst);
+        let timings = self.writer.timings();
+        let partition = &self.writer.lease().key;
+        timings.record(Timed::LetGoFlushWait, partition, times.waited);
+        if let Some(held) = times.held {
+            timings.record(Timed::LetGoFlushHeld, partition, held);
+        }
+        Ok(position)
+    }
+
     /// Merge segments until a merge finds nothing to do, and then delete
     /// the files nothing needs any more, as [`Writer::clean`] with `grace`,
     /// which deletes so many at once, until one finds fewer than that.
@@ -1345,12 +1416,27 @@ struct Taken {
     held_elsewhere: u64,
     /// About how many bytes what was taken out held.
     freed: usize,
+    /// How many were taken out for being idle, and for the budget.
+    idle: u64,
+    for_budget: u64,
 }
 
 impl Taken {
     /// Take `held` out of `open` if it is still the one held and nobody but
     /// the node and this sweep has it, nor is opening it; else keep it.
-    fn take(&mut self, open: &mut Open, held: &Held) {
+    /// Counted as taken out for the budget, or for being idle.
+    fn take(&mut self, open: &mut Open, held: &Held, for_budget: bool) {
+        if !self.taken(open, held) {
+            return;
+        }
+        match for_budget {
+            true => self.for_budget += 1,
+            false => self.idle += 1,
+        }
+    }
+
+    /// As [`Self::take`], saying whether it was taken out.
+    fn taken(&mut self, open: &mut Open, held: &Held) -> bool {
         match &held.kind {
             Kind::Writer(opening, tenant) => {
                 let same = open
@@ -1361,10 +1447,12 @@ impl Taken {
                     open.tenants.remove(&held.id);
                     self.going.push(tenant.clone());
                     self.freed += held.size;
+                    return true;
                 } else if same {
                     self.kept.push((tenant.clone(), held.size));
                     self.held_elsewhere += 1;
                 }
+                false
             }
             Kind::Copy(following, copy) => {
                 let same = open
@@ -1374,9 +1462,11 @@ impl Taken {
                 if same && Arc::strong_count(following) == 2 && Arc::strong_count(copy) == 2 {
                     open.followers.remove(&held.id);
                     self.freed += held.size;
+                    return true;
                 } else if same {
                     self.held_elsewhere += 1;
                 }
+                false
             }
         }
     }
@@ -1452,6 +1542,12 @@ struct Inner {
     /// How many merges sweeps have stopped so that a tenant over the
     /// budget could be let go.
     stopped_for_budget: AtomicU64,
+    /// How many tenants, written for or copied, sweeps have let go: those
+    /// idle, and those let go for the memory budget.
+    let_go_idle: AtomicU64,
+    let_go_for_budget: AtomicU64,
+    /// Where every writer this node opens times its background work.
+    timings: Arc<Timings>,
 }
 
 /// Flushes that failed, and writes refused while they did.
@@ -1475,6 +1571,10 @@ pub struct Segments {
     pub clustered_rows: u64,
     pub plain: usize,
     pub plain_rows: u64,
+    /// Segments as flushes and restores wrote them, which no merge has
+    /// taken in yet, and their rows as written: the rows awaiting a merge.
+    pub unmerged: usize,
+    pub unmerged_rows: u64,
     /// Where the clustered indexes' probes come from.
     pub probes: Probes,
 }
@@ -1487,6 +1587,8 @@ impl Segments {
         self.clustered_rows += figures.clustered_rows;
         self.plain += figures.plain;
         self.plain_rows += figures.plain_rows;
+        self.unmerged += figures.unmerged;
+        self.unmerged_rows += figures.unmerged_rows;
         self.probes += figures.probes;
     }
 }
@@ -1506,6 +1608,17 @@ pub struct Merges {
     /// How many merges sweeps have stopped since the node started, so that
     /// a tenant over the memory budget could be let go.
     pub stopped_for_budget: u64,
+    /// About how many bytes the largest merge build since the node started
+    /// was reckoned to hold at its peak.
+    pub largest: usize,
+}
+
+/// How many tenants sweeps have let go: those idle for
+/// [`Settings::tenant_idle`], and those let go for the memory budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LetGo {
+    pub idle: u64,
+    pub for_budget: u64,
 }
 
 /// What this node holds open, and what it reckons that holds in memory:
@@ -1636,7 +1749,15 @@ impl Node {
             writes_format: Arc::new(AtomicU16::new(0)),
             flushing: Arc::default(),
             warm: warm::Warm::default(),
-            merge_builds: MergeBuilds::new(MERGE_BUILDS),
+            merge_builds: match settings.merge_pool {
+                MergePool::Global => MergeBuilds::new(MERGE_BUILDS),
+                MergePool::Own { threads, nice } => MergeBuilds::building_on(
+                    vellev_storage::merge_slots(MERGE_BUILDS, threads, nice)
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect(),
+                ),
+            },
             census: Mutex::default(),
             sweeping: Arc::new(tokio::sync::Mutex::new(())),
             sweep_again: AtomicBool::new(false),
@@ -1648,6 +1769,9 @@ impl Node {
             started: Instant::now(),
             held_elsewhere: AtomicU64::new(0),
             stopped_for_budget: AtomicU64::new(0),
+            let_go_idle: AtomicU64::new(0),
+            let_go_for_budget: AtomicU64::new(0),
+            timings: Arc::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -1812,7 +1936,34 @@ impl Node {
             abandoned: builds.abandoned(),
             held_let_go: builds.held_let_go(),
             stopped_for_budget: self.0.stopped_for_budget.load(Ordering::Relaxed),
+            largest: builds.largest_reckoned(),
         }
+    }
+
+    /// Where the writers this node opens time their background work: the
+    /// building lock by holder, merges by phase and by how they ended,
+    /// flushes from when they fell due, spells at the backlog, and the
+    /// flush made before a tenant is let go.
+    pub fn timings(&self) -> &Arc<Timings> {
+        &self.0.timings
+    }
+
+    /// How many tenants, written for or copied, sweeps have let go since
+    /// the node started.
+    pub fn let_go(&self) -> LetGo {
+        LetGo {
+            idle: self.0.let_go_idle.load(Ordering::Relaxed),
+            for_budget: self.0.let_go_for_budget.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Each tenant this node writes for, and what it comes to as it was
+    /// last changed: read as [`Self::segments`] reads them, holding none.
+    pub fn tenant_figures(&self) -> Vec<(TenantId, vellev_storage::Figures)> {
+        let mut figures = Vec::new();
+        self.0
+            .each_writer(|tenant| figures.push((tenant.id.clone(), tenant.figures())));
+        figures
     }
 
     /// The merge builds of the tenants this node writes for. For tests.
@@ -1908,16 +2059,23 @@ impl Node {
         unsettled
     }
 
-    /// About how many bytes the tenants this node writes have taken out of
-    /// their state and yet to free, as a merge's commit does what it
-    /// replaced. A figure of its own, for the eye: it goes by itself, so
+    /// About how many bytes the tenants this node writes, and any it has
+    /// let go since, have taken out of their state and yet to free, as a
+    /// merge's commit does what it replaced. A figure of its own, for the eye: it goes by itself, so
     /// neither a sweep nor warming acts on it, and [`Self::resident`] leaves
     /// it out.
     pub fn freeing(&self) -> usize {
-        let mut freeing = 0;
+        self.0.timings.freeing()
+    }
+
+    /// The waits of the tenants this node writes for that no checkpoint
+    /// has ended. For a bench, as no event times them.
+    #[doc(hidden)]
+    pub fn waits_open(&self) -> Vec<vellev_storage::timings::OpenWaits> {
+        let mut open = Vec::new();
         self.0
-            .each_writer(|tenant| freeing += tenant.partition().freeing());
-        freeing
+            .each_writer(|tenant| open.push(tenant.writer.waits_open()));
+        open
     }
 
     /// The segments the tenants this node writes hold, by whether they
@@ -2239,6 +2397,9 @@ impl Inner {
         let taken = self.taken_out(&idle, &older, total);
         self.held_elsewhere
             .fetch_add(taken.held_elsewhere, Ordering::Relaxed);
+        self.let_go_idle.fetch_add(taken.idle, Ordering::Relaxed);
+        self.let_go_for_budget
+            .fetch_add(taken.for_budget, Ordering::Relaxed);
         if let Some(budget) = self.settings.memory {
             // Only what was taken out comes off: what something else held
             // is held still.
@@ -2270,7 +2431,7 @@ impl Inner {
         }
         for tenant in taken.going {
             if tenant.read(State::unflushed) > 0 {
-                if let Err(error) = tenant.flush().await {
+                if let Err(error) = tenant.flush_to_let_go().await {
                     tracing::warn!(tenant = %tenant.id, %error, "flush before letting go failed");
                 }
             }
@@ -2407,14 +2568,14 @@ impl Inner {
         let mut open = self.opened();
         let mut taken = Taken::default();
         for held in idle {
-            taken.take(&mut open, held);
+            taken.take(&mut open, held, false);
         }
         if let Some(budget) = self.settings.memory {
             for held in older {
                 if total - taken.freed <= budget {
                     break;
                 }
-                taken.take(&mut open, held);
+                taken.take(&mut open, held, true);
             }
         }
         taken
@@ -2485,6 +2646,8 @@ impl Inner {
                     writer
                         .writing_format(self.writes_format.clone())
                         .merging_among(self.merge_builds.clone())
+                        .measured_by(self.timings.clone())
+                        .flushing_due_at(*flush_rows, self.settings.backlog())
                         .embedding_with(documents)
                         .transferring(self.settings.transfers)
                         .timed_by(self.settings.clock.clone()),
@@ -2724,9 +2887,10 @@ mod segment_tests {
     use super::*;
     use vellev_storage::format::SegmentMeta;
 
-    fn meta(rows: u64, clustered: bool) -> SegmentMeta {
+    fn meta(rows: u64, clustered: bool, merged: bool) -> SegmentMeta {
+        let marker = if merged { "-merged" } else { "" };
         SegmentMeta {
-            key: format!("segment-{rows}"),
+            key: format!("segment/{rows}{marker}.segment"),
             rows,
             tombstones: 0,
             index: clustered.then(|| format!("index-{rows}")),
@@ -2735,14 +2899,16 @@ mod segment_tests {
         }
     }
 
+    /// A segment with an index file is counted as clustered, and one no
+    /// merge wrote as awaiting a merge, whichever it is.
     #[test]
     fn a_segment_with_an_index_file_is_counted_as_clustered() {
         // Two tenants' figures, the first of two segments, added up.
         let (mut first, mut second) = (vellev_storage::Figures::default(), Default::default());
-        for (rows, clustered) in [(800_000, true), (200_000, false)] {
-            first.count(&meta(rows, clustered));
+        for (rows, clustered, merged) in [(800_000, true, true), (200_000, false, false)] {
+            first.count(&meta(rows, clustered, merged));
         }
-        vellev_storage::Figures::count(&mut second, &meta(50_000, false));
+        vellev_storage::Figures::count(&mut second, &meta(50_000, false, false));
         let mut segments = Segments::default();
         segments.add(&first);
         segments.add(&second);
@@ -2753,6 +2919,8 @@ mod segment_tests {
                 clustered_rows: 800_000,
                 plain: 2,
                 plain_rows: 250_000,
+                unmerged: 2,
+                unmerged_rows: 250_000,
                 probes: Probes::default(),
             }
         );

@@ -16,6 +16,7 @@ use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{Node, Settings};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
+use vellev_storage::timings::{Holder, Timed};
 use vellev_storage::{Mutation, State};
 
 fn tenant(name: &str) -> TenantId {
@@ -285,4 +286,28 @@ async fn a_sweep_asked_for_now_never_waits_on_the_spacing() {
         "a sweep asked for now waited {:?} on the spacing",
         asked.elapsed()
     );
+}
+
+/// Merge note, §9.7 rule 8: the flush a sweep makes before it lets a
+/// tenant go over the memory budget is timed under its own name, its wait
+/// for the building lock apart from its hold, as the bench holds that wait
+/// to a mark of its own; and the tenant is counted as let go for the
+/// budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_flush_before_letting_a_tenant_go_is_timed_under_its_own_name() {
+    let node = node_on(memory(), |settings| settings.memory = Some(1));
+    node.timings().keep_events(true);
+    node.create_tenant(&tenant("over")).await.unwrap();
+    let over = node.tenant(&tenant("over")).await.unwrap();
+    over.write(vec![notes(), note(1), note(2)]).await.unwrap();
+    drop(over);
+    // Used longer ago than a tenant is kept whatever the budget says.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweep_now().await;
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    let events = node.timings().drain_events();
+    let named = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
+    assert_eq!(named(Timed::LetGoFlushWait), 1, "{events:?}");
+    assert_eq!(named(Timed::LetGoFlushHeld), 1, "{events:?}");
+    assert_eq!(named(Timed::BuildingHeld(Holder::Flush)), 1, "{events:?}");
 }

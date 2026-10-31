@@ -28,7 +28,8 @@ use crate::format::{
 };
 use crate::freed::{off_the_async_threads, FreedOff};
 use crate::merge_builds::{
-    HeldAt, MergeBuild, MergeBuilds, Probe, Reservation, UnlessDeleted, Uploading, MERGE_BUILDS,
+    HeldAt, MergeBuild, MergeBuilds, OnPool, Probe, Reservation, UnlessDeleted, Uploading,
+    MERGE_BUILDS,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::published::{FreesHeld, Published};
@@ -37,6 +38,7 @@ use crate::state::{
     Snapshot, State, Stored,
 };
 use crate::stopping::{MergeStage, Stopping};
+use crate::timings::{Holder, Lag, MergeEnd, MergePhase, OpenWaits, Taking, Timed, Timings};
 use crate::{Refusal, Result, StorageError};
 use vellev_index::stop::Stop;
 
@@ -98,6 +100,7 @@ fn segment_built(
     build: Option<&MergeBuild>,
     above: Option<usize>,
     format: u16,
+    on: OnPool<'_>,
 ) -> Result<Option<Built>> {
     let _turn = turn;
     // Before the rows it was given are bound below it, as parameters are
@@ -109,7 +112,7 @@ fn segment_built(
         build.held_here(stopping, HeldAt::Start);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
-    let vectors = vectors.map(|gathered| gathered.finish(format));
+    let vectors = vectors.map(|gathered| on.section("finishing", || gathered.finish(format)));
     let indexes = match &vectors {
         Some(column) => state::indexed(
             catalog,
@@ -119,6 +122,7 @@ fn segment_built(
             |_, _| {},
             above,
             stopping,
+            on,
         ),
         None => state::indexed(
             catalog,
@@ -128,6 +132,7 @@ fn segment_built(
             |_, _| {},
             above,
             stopping,
+            on,
         ),
     };
     let Some(indexes) = indexes else {
@@ -137,13 +142,13 @@ fn segment_built(
         return Ok(None);
     }
     let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
-    let segment = encode_as(Kind::Segment, format, &file)?;
+    let segment = on.section("encoding", || encode_as(Kind::Segment, format, &file))?;
     if stopping.stopped(MergeStage::Encoding) {
         return Ok(None);
     }
-    let column = vectors.encode_as(format);
+    let column = on.section("encoding_vectors", || vectors.encode_as(format));
     // Here, off the async threads and the state's lock, once.
-    let parts = state::Parts::of(&file, &indexes);
+    let parts = on.section("parts", || state::Parts::of(&file, &indexes));
     if let Some(build) = build {
         build.held_here(stopping, HeldAt::Built);
     }
@@ -1187,6 +1192,10 @@ pub struct Writer {
     /// Its place among the merges waiting for a turn, kept while a merge
     /// gives way to a flush: see [`Reservation`].
     merge_place: std::sync::Mutex<Option<Reservation>>,
+    /// Where its background work is timed: the node's, or its own.
+    timings: Arc<Timings>,
+    /// When its flushes fell due, and its backlog was reached.
+    lag: Arc<Lag>,
 }
 
 /// The stop of the merge under way, there until the merge ends, however it
@@ -1222,6 +1231,58 @@ pub struct MergeGate {
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
 }
+
+/// A writer's building lock held, for whom and since when: the hold is
+/// timed as it is let go.
+struct Building<'a> {
+    _guard: MutexGuard<'a, ()>,
+    holder: Holder,
+    since: Instant,
+    writer: &'a Writer,
+    /// Whether its hold is timed as it is let go: not when it built
+    /// nothing, as a flush with nothing to flush.
+    timed: bool,
+}
+
+impl Building<'_> {
+    /// How long it has been held.
+    fn held(&self) -> Duration {
+        self.since.elapsed()
+    }
+
+    /// It built nothing: its hold is not timed as one of its holder's.
+    fn built_nothing(&mut self) {
+        self.timed = false;
+    }
+}
+
+impl Drop for Building<'_> {
+    fn drop(&mut self) {
+        if self.timed {
+            let held = self.since.elapsed();
+            self.writer.timed(Timed::BuildingHeld(self.holder), held);
+        }
+    }
+}
+
+/// How a merge that had its turn ended.
+enum Ended {
+    Committed(LogPosition),
+    Dropped(MergeEnd),
+}
+
+/// How long a flush waited for its partition's building lock, and then
+/// held it: its whole build and commit, or `None` if it found nothing to
+/// flush and so built nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlushTimes {
+    pub waited: Duration,
+    pub held: Option<Duration>,
+}
+
+/// The rows a build is of, ready to index, with what else their making
+/// says: `None` if there are to be none, as a merge's gather given up.
+type RowsToBuild<T> = Option<(SegmentFile, Option<Gathering>, T)>;
 
 /// A merge as it was planned, with all it takes of the state to build.
 struct MergePlanned {
@@ -1362,6 +1423,8 @@ impl Writer {
             merge_past_loading: AtomicBool::new(false),
             merge_builds: MergeBuilds::new(MERGE_BUILDS),
             merge_place: std::sync::Mutex::new(None),
+            timings: Arc::default(),
+            lag: Arc::default(),
         })
     }
 
@@ -1417,6 +1480,63 @@ impl Writer {
     /// ([`Self::clean`]), instead of by the machine's.
     pub fn timed_by(self, clock: Arc<dyn Clock>) -> Self {
         Self { clock, ..self }
+    }
+
+    /// Time this writer's background work into `timings`, shared with the
+    /// other writers of the node, instead of into its own.
+    pub fn measured_by(self, timings: Arc<Timings>) -> Self {
+        Self { timings, ..self }
+    }
+
+    /// Time how long rows wait from when a flush of them falls due, at
+    /// `rows` unflushed, to the checkpoint that takes them out of memory,
+    /// and each spell at a backlog of `backlog` rows unflushed, from now
+    /// on: as a node flushes and refuses writes. Zero times neither.
+    pub fn flushing_due_at(self, rows: usize, backlog: usize) -> Self {
+        let unflushed = self.partition.read(State::unflushed);
+        self.lag.due_at(rows, backlog, unflushed);
+        self
+    }
+
+    /// The waits this writer has open: see [`OpenWaits`].
+    #[doc(hidden)]
+    pub fn waits_open(&self) -> OpenWaits {
+        self.lag.open()
+    }
+
+    /// Where this writer's background work is timed.
+    pub fn timings(&self) -> &Arc<Timings> {
+        &self.timings
+    }
+
+    /// The building lock, for `holder`, its wait and then its hold timed.
+    async fn building(&self, holder: Holder) -> Building<'_> {
+        let asked = Instant::now();
+        let guard = self.building.lock().await;
+        self.timed(Timed::BuildingWait(holder), asked.elapsed());
+        Building {
+            _guard: guard,
+            holder,
+            since: Instant::now(),
+            writer: self,
+            timed: true,
+        }
+    }
+
+    /// What has been committed since the last checkpoint, as a checkpoint
+    /// that flushes it along takes it ([`State::taken`]), and the note
+    /// that it is taken, made under the same lock.
+    fn taken_noted(&self) -> (Snapshot, Taking<'_>) {
+        self.partition.read(|state| {
+            let snapshot = state.taken();
+            let taking = self.lag.taking(snapshot.held());
+            (snapshot, taking)
+        })
+    }
+
+    /// Count `took` as `timed` of this writer's partition.
+    fn timed(&self, timed: Timed, took: Duration) {
+        self.timings.record(timed, &self.lease.key, took);
     }
 
     pub fn partition(&self) -> &Arc<Partition> {
@@ -1743,11 +1863,22 @@ impl Writer {
                 // Applied to its end even if whoever waits here stops
                 // waiting, which closes the writer: the commit is made.
                 let (partition, applied) = (self.partition.clone(), key.clone());
+                let lag = self.lag.clone();
                 turn.at_once(move || {
                     // Coded first, while readers may still read; the apply
                     // under the lock then only stores the codes.
                     let prepared = partition.read(|state| state.prepared(&log));
-                    partition.applying(|state| state.apply_prepared(&applied, &log, prepared))
+                    // Noted under the state's lock, as a checkpoint notes
+                    // what it takes under it: so that no checkpoint comes
+                    // between the rows applied and their note (review of
+                    // #169). The partition's lock, then the lag's, always.
+                    partition.applying(|state| {
+                        let made = state.apply_prepared(&applied, &log, prepared);
+                        if made.is_ok() {
+                            lag.applied(state.unflushed());
+                        }
+                        made
+                    })
                 })
                 .await??;
                 tracing::debug!(
@@ -1880,8 +2011,33 @@ impl Writer {
     /// checkpoint was committed at, or the current one when nothing needed
     /// flushing or a checkpoint made meanwhile left nothing to do.
     pub async fn flush(&self) -> Result<LogPosition> {
-        let _building = self.building.lock().await;
-        let Some(snapshot) = self.partition.read(State::snapshot) else {
+        self.flush_timed().await.map(|(position, _)| position)
+    }
+
+    /// As [`Self::flush`], saying how long it waited for the building lock
+    /// and then held it: as a node times the flush it makes before it
+    /// lets a tenant go.
+    pub async fn flush_timed(&self) -> Result<(LogPosition, FlushTimes)> {
+        let asked = Instant::now();
+        let mut building = self.building(Holder::Flush).await;
+        let waited = asked.elapsed().saturating_sub(building.held());
+        let position = self.flushing_held(&mut building).await?;
+        let held = building.timed.then(|| building.held());
+        Ok((position, FlushTimes { waited, held }))
+    }
+
+    /// What [`Self::flush`] does once it holds the building lock, as
+    /// `building`: which, if there is nothing to flush, built nothing.
+    async fn flushing_held(&self, building: &mut Building<'_>) -> Result<LogPosition> {
+        // Noted under the lock it is taken under, so that no rows are
+        // applied between: the rows it takes are exactly those it notes.
+        let taken = self.partition.read(|state| {
+            let snapshot = state.snapshot()?;
+            let taking = self.lag.taking(snapshot.held());
+            Some((snapshot, taking))
+        });
+        let Some((snapshot, taking)) = taken else {
+            building.built_nothing();
             return Ok(self.partition.read(State::position));
         };
         let mut staged = self.staging();
@@ -1897,7 +2053,7 @@ impl Writer {
         // The memtable it keeps, made while readers may still read: with
         // the turn held, nothing is committed before it is adopted.
         let kept = self.partition.read(|state| state.kept(&snapshot));
-        self.checkpoint(turn, &key, frame, position, |state| {
+        self.checkpoint(turn, &key, frame, position, Some(taking), |state| {
             state.flushed(&key, position, snapshot, segment, Some(kept))
         })
         .await?;
@@ -1910,12 +2066,17 @@ impl Writer {
     /// took out of memory, off the async threads. Once the commit is made
     /// nothing is left to fail: what `adopt` adopts was seen to be fit
     /// before the writer was held.
+    ///
+    /// `taking`, the memtable's rows the checkpoint takes out of memory, is
+    /// timed as it is adopted: how long those rows waited once due, and
+    /// the spell at the backlog it ends.
     async fn checkpoint(
         &self,
         turn: Turn<'_>,
         key: &str,
         frame: Bytes,
         position: LogPosition,
+        taking: Option<Taking<'_>>,
         adopt: impl FnOnce(&mut State) -> Discarded,
     ) -> Result<()> {
         let discarded = self
@@ -1923,7 +2084,18 @@ impl Writer {
                 self.publish(&turn, key, frame, position, None, None)
                     .await?;
                 let adopting = Instant::now();
-                let adopted = self.partition.adopting(adopt);
+                let mut adopted = self.partition.adopting(adopt);
+                adopted.count_in(self.timings.freeing_counted());
+                if let Some(taking) = taking {
+                    let unflushed = self.partition.read(State::unflushed);
+                    let (waited, capped) = taking.committed(unflushed);
+                    if let Some(waited) = waited {
+                        self.timed(Timed::FlushDue, waited);
+                    }
+                    if let Some(capped) = capped {
+                        self.timed(Timed::Backlog, capped);
+                    }
+                }
                 tracing::debug!(
                     partition = %self.lease.key,
                     ?position,
@@ -2030,7 +2202,7 @@ impl Writer {
         restore: Option<Restore>,
         adopting: Option<Lineage>,
     ) -> Result<LogPosition> {
-        let _building = self.building.lock().await;
+        let _building = self.building(Holder::Restore).await;
         let _refusing = Refusing::writes(self).await;
         self.abreast().await?;
         let at = Committed {
@@ -2097,6 +2269,7 @@ impl Writer {
                     .await?;
                 let replaced = self.partition.changing(|now| std::mem::replace(now, state));
                 self.epoch.fetch_add(1, Ordering::SeqCst);
+                self.lag.put_back(self.partition.read(State::unflushed));
                 Ok(replaced)
             })
             .await?;
@@ -2142,7 +2315,7 @@ impl Writer {
         adopting: Option<Lineage>,
         held: &dyn Held,
     ) -> Result<RestoreFrom<'a>> {
-        let building = self.building.lock().await;
+        let building = self.building(Holder::Restore).await;
         let refusing = Refusing::writes(self).await;
         self.abreast().await?;
         // With writes refused and the building lock held nothing commits
@@ -2567,7 +2740,8 @@ impl Writer {
         vectors: Option<Gathering>,
         catalog: Catalog,
     ) -> Result<Built> {
-        let rows = move |_: &Stopping, _: Option<&MergeBuild>| Some((file, vectors, ()));
+        let rows =
+            move |_: &Stopping, _: Option<&MergeBuild>, _: OnPool<'_>| Some((file, vectors, ()));
         match self
             .built_stopping(rows, catalog, &Stopping::never(), None)
             .await?
@@ -2586,22 +2760,26 @@ impl Writer {
     /// ends, whoever stops waiting for it.
     async fn built_stopping<T: Send + 'static>(
         &self,
-        rows: impl FnOnce(&Stopping, Option<&MergeBuild>) -> Option<(SegmentFile, Option<Gathering>, T)>
-            + Send
-            + 'static,
+        rows: impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<T> + Send + 'static,
         catalog: Catalog,
         stopping: &Stopping,
         build: Option<Arc<MergeBuild>>,
     ) -> Result<Option<(Built, T)>> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
+        let (timings, key) = (self.timings.clone(), self.lease.key.clone());
         // Its turn among the work off the async threads is waited for as
         // the merge's stop is: given up before it begins, the work never
         // runs. Once begun it is waited for to its end, which comes at the
         // stop as it asks it: so that the merge gives up only once what the
         // work holds is let go, not while it runs on unseen.
+        let waiting = Instant::now();
         let turn = working().acquire_owned();
-        let turn = match stopping.unless_stopped(MergeStage::Turn, turn).await {
+        let turn = stopping.unless_stopped(MergeStage::Turn, turn).await;
+        if build.is_some() {
+            self.phase_ended(MergePhase::Working, turn.is_some(), waiting);
+        }
+        let turn = match turn {
             Some(turn) => turn.map_err(|error| StorageError::Background(error.to_string()))?,
             None => return Ok(None),
         };
@@ -2614,20 +2792,45 @@ impl Writer {
         // it. Never left to the closure's captures, whose order is not set.
         let built = at_once(move || {
             let build = build;
-            let built = match rows(&stopping, build.as_deref()) {
-                Some((file, vectors, with)) => segment_built(
-                    turn,
-                    file,
-                    vectors,
-                    &catalog,
-                    &stopping,
-                    build.as_deref(),
-                    above,
-                    format,
-                )
-                .map(|built| built.map(|built| (built, with))),
+            // A merge's build's sections on the pool its node gives merge
+            // builds, if not the global one, the rest here; a flush's where
+            // it is. Its gather and its build each timed where they run, so
+            // that neither counts the other.
+            let on = match &build {
+                Some(build) => OnPool::merge(build),
+                None => OnPool::global(),
+            };
+            let cpu = vellev_index::pool::thread_cpu();
+            let built = match rows(&stopping, build.as_deref(), on) {
+                Some((file, vectors, with)) => {
+                    let building = Instant::now();
+                    let built = segment_built(
+                        turn,
+                        file,
+                        vectors,
+                        &catalog,
+                        &stopping,
+                        build.as_deref(),
+                        above,
+                        format,
+                        on,
+                    );
+                    let phase = match &built {
+                        Ok(Some(_)) => Timed::Merge(MergePhase::Build),
+                        Ok(None) | Err(_) => Timed::MergeGivenUp(MergePhase::Build),
+                    };
+                    if build.is_some() {
+                        timings.record(phase, &key, building.elapsed());
+                    }
+                    built.map(|built| built.map(|built| (built, with)))
+                }
                 None => Ok(None),
             };
+            if let (Some(build), Some(before), Some(after)) =
+                (&build, cpu, vellev_index::pool::thread_cpu())
+            {
+                build.builds().spent_on_top(after.saturating_sub(before));
+            }
             (built, build)
         });
         built.await?.0
@@ -2818,7 +3021,7 @@ impl Writer {
         &self,
         curves: Vec<(String, SegmentCurve)>,
     ) -> Result<Option<LogPosition>> {
-        let _building = self.building.lock().await;
+        let _building = self.building(Holder::Curves).await;
         let there: HashSet<String> = self
             .partition
             .read(|state| state.segments().map(|meta| meta.key.clone()).collect());
@@ -2844,7 +3047,7 @@ impl Writer {
             )));
         }
         let mut staged = self.staging();
-        let snapshot = self.partition.read(State::taken);
+        let (snapshot, taking) = self.taken_noted();
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
@@ -2858,7 +3061,7 @@ impl Writer {
         let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
         staged.keep();
         let kept = self.partition.read(|state| state.kept(&snapshot));
-        self.checkpoint(turn, &key, frame, position, |state| {
+        self.checkpoint(turn, &key, frame, position, Some(taking), |state| {
             state.tuned(&curves);
             state.flushed(&key, position, snapshot, segment, Some(kept))
         })
@@ -2881,6 +3084,15 @@ impl Writer {
         flush_due: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<LogPosition>> {
         self.merging(None, flush_due).await
+    }
+
+    /// Time a merge's `phase`, begun at `began`, as come through or not.
+    fn phase_ended(&self, phase: MergePhase, through: bool, began: Instant) {
+        let timed = match through {
+            true => Timed::Merge(phase),
+            false => Timed::MergeGivenUp(phase),
+        };
+        self.timed(timed, began.elapsed());
     }
 
     /// Whether a merge planned at epoch `planned` is stale now, and so is
@@ -2982,10 +3194,50 @@ impl Writer {
         let Some((build, planning)) = self.turn_and_building(&stopping, flush_due).await? else {
             return Ok(None);
         };
+        // Counted by what ended it, once it has its turn: a stop too late
+        // to end it, as one past loading back, hides nothing of what did.
+        let ended = self
+            .merged_in_turn(build, planning, planned, &stopping)
+            .await;
+        let end = match &ended {
+            Ok(Ended::Committed(_)) => MergeEnd::Committed,
+            Ok(Ended::Dropped(end)) => *end,
+            Err(_) => MergeEnd::Failed,
+        };
+        self.timings.ended(end);
+        ended.map(|ended| match ended {
+            Ended::Committed(position) => Some(position),
+            Ended::Dropped(_) => None,
+        })
+    }
+
+    /// How a merge planned at the epoch `planned` ended, that gave up as it
+    /// was stopped or as a restore began: stale if a restore was made or is
+    /// under way, as a merge stopped by one, or both, could never have
+    /// committed. One whose gather a restore ended, that then failed before
+    /// this is asked, reads as stopped.
+    fn given_up(&self, planned: u64) -> Ended {
+        let restoring = self.restoring.load(Ordering::SeqCst);
+        Ended::Dropped(match self.stale(planned) || restoring {
+            true => MergeEnd::Stale,
+            false => MergeEnd::Stopped,
+        })
+    }
+
+    /// What [`Self::merging`] does with its turn and the building lock to
+    /// plan under: plan and gather, build, upload and load back, and
+    /// commit, each phase timed.
+    async fn merged_in_turn(
+        &self,
+        build: MergeBuild,
+        planning: Building<'_>,
+        planned: Option<u64>,
+        stopping: &Stopping,
+    ) -> Result<Ended> {
         let build = Arc::new(build);
         let planned = planned.unwrap_or_else(|| self.epoch());
         let Some(plan) = self.merge_planned() else {
-            return Ok(None);
+            return Ok(Ended::Dropped(MergeEnd::Nothing));
         };
         drop(planning);
         let MergePlanned {
@@ -2999,25 +3251,26 @@ impl Writer {
         // A merge planned at another epoch than this is dropped before any
         // work is spent on it, and again at its commit below.
         if self.stale(planned) {
-            return Ok(None);
+            return Ok(Ended::Dropped(MergeEnd::Stale));
         }
         let dead = run.dead();
         let gather = self.gathered(run, planned, reckoning, named_at, catalog.clone());
-        let built = self.built_stopping(gather, catalog.clone(), &stopping, Some(build.clone()));
+        let built = self.built_stopping(gather, catalog.clone(), stopping, Some(build.clone()));
         let Some((built, shape)) = built.await? else {
-            // Said if a restore is what ended it.
-            self.stale(planned);
-            return Ok(None);
+            return Ok(self.given_up(planned));
         };
         // Both segments, however large, are uploaded without the writer,
         // under names of their own at the position each was built from;
         // `clean` leaves the merge's while it is under way.
         let mut staged = self.staging();
+        let encoding = Instant::now();
         let merged = Self::prepared(
             self.named(named_at, "-merged").meta(shape),
             built,
             self.writes(),
-        )?;
+        );
+        self.phase_ended(MergePhase::Encode, merged.is_ok(), encoding);
+        let merged = merged?;
         #[cfg(test)]
         let merged = {
             let mut merged = merged;
@@ -3028,20 +3281,24 @@ impl Writer {
         // as what it would replace, and a stop lets it go on an async thread.
         let merged = FreedOff::new(merged).of(Some(build.clone()));
         if stopping.stopped(MergeStage::Encoding) {
-            return Ok(None);
+            return Ok(self.given_up(planned));
         }
         let _keeping = self.keep(&merged.meta);
         let uploading = Uploading::new(build.clone());
         staged.carrying = Some(uploading.clone());
-        if !self
-            .upload_stopping(&merged, &mut staged, &stopping, Some(&uploading))
-            .await?
-        {
-            return Ok(None);
+        let upload = Instant::now();
+        let uploaded = self
+            .upload_stopping(&merged, &mut staged, stopping, Some(&uploading))
+            .await;
+        self.phase_ended(MergePhase::Upload, matches!(uploaded, Ok(true)), upload);
+        if !uploaded? {
+            return Ok(self.given_up(planned));
         }
-        let fit = self.fit(merged, &catalog, Some(&stopping));
+        let loading = Instant::now();
+        let fit = self.fit(merged, &catalog, Some(stopping));
         let Some(merged) = stopping.unless_stopped(MergeStage::Loading, fit).await else {
-            return Ok(None);
+            self.phase_ended(MergePhase::Load, false, loading);
+            return Ok(self.given_up(planned));
         };
         let merged = merged.map(|fit| FreedOff::new(fit).of(Some(build.clone())));
         // From here the merge commits, or is dropped by what it finds under
@@ -3059,8 +3316,9 @@ impl Writer {
         };
         // A stop heeded here wins over what loading back came to: a load
         // given up as it was stopped fails, and is no failure of the merge.
+        self.phase_ended(MergePhase::Load, !heeded && merged.is_ok(), loading);
         if heeded {
-            return Ok(None);
+            return Ok(self.given_up(planned));
         }
         let merged = merged?;
         let gate = self.merge_gate.lock().expect("gate lock").clone();
@@ -3068,11 +3326,11 @@ impl Writer {
             gate.reached.notify_one();
             gate.release.notified().await;
         }
-        let _building = self.building.lock().await;
+        let _building = self.building(Holder::MergeCommit).await;
         // Not at another epoch than it was planned at: a restore since may
         // have brought the same segments back with other rows live.
         if self.stale(planned) {
-            return Ok(None);
+            return Ok(Ended::Dropped(MergeEnd::Stale));
         }
         // Nor with a row the run holds live missing from the merged file,
         // which carrying it out could not place: checked before the turn
@@ -3085,9 +3343,9 @@ impl Writer {
             tracing::error!(
                 "a merged segment lacks a row its run holds live; the merge is dropped"
             );
-            return Ok(None);
+            return Ok(Ended::Dropped(MergeEnd::Uncovered));
         }
-        let snapshot = self.partition.read(State::taken);
+        let (snapshot, taking) = self.taken_noted();
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
         let segment = FreedOff::new(segment);
         let turn = self.turn().await?;
@@ -3102,13 +3360,13 @@ impl Writer {
             state.merged_manifest(position, &snapshot, flushed, &merge, merged.meta.clone())
         })?
         else {
-            return Ok(None);
+            return Ok(Ended::Dropped(MergeEnd::Changed));
         };
         let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
         // Kept from here, and let go by the merge: see `Staged::keep`.
         staged.keep();
         let kept = self.partition.read(|state| state.kept(&snapshot));
-        self.checkpoint(turn, &key, frame, position, |state| {
+        self.checkpoint(turn, &key, frame, position, Some(taking), |state| {
             let replaced = state.compacted(&merge, merged.into_inner());
             let segment = segment.into_inner();
             let flushed = state.flushed(&key, position, snapshot, segment, Some(kept));
@@ -3116,7 +3374,7 @@ impl Writer {
         })
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(Some(position))
+        Ok(Ended::Committed(position))
     }
 
     /// The merge most worth doing, as the state stands, with all it takes
@@ -3150,33 +3408,49 @@ impl Writer {
         reckoning: Reckoning,
         named_at: LogPosition,
         catalog: Catalog,
-    ) -> impl FnOnce(&Stopping, Option<&MergeBuild>) -> Option<(SegmentFile, Option<Gathering>, Shape)>
-           + Send
-           + 'static {
+    ) -> impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<Shape> + Send + 'static
+    {
         let (epoch, restoring) = (self.epoch.clone(), self.restoring.clone());
         let above = self.merging.clustered_above;
-        move |stopping, build| {
-            let mut goes_on = |rows| {
-                if let Some(build) = build {
-                    build.gathering(rows, stopping);
+        let (timings, key) = (self.timings.clone(), self.lease.key.clone());
+        move |stopping, build, on| {
+            // On the pool of the merge's slot, as the rest of the build is,
+            // and timed as the copy.
+            on.section("gathering", || {
+                let gathering = Instant::now();
+                let mut goes_on = |rows| {
+                    if let Some(build) = build {
+                        build.gathering(rows, stopping);
+                    }
+                    let stopped = stopping.stopped(MergeStage::Gathering);
+                    let restoring =
+                        restoring.load(Ordering::SeqCst) || epoch.load(Ordering::SeqCst) != planned;
+                    !stopped && !restoring
+                };
+                let given_up = |gathering: Instant| {
+                    let phase = Timed::MergeGivenUp(MergePhase::Gather);
+                    timings.record(phase, &key, gathering.elapsed());
+                };
+                let merged = run.merged(named_at, GATHERED_AT_ONCE, &mut goes_on);
+                let Some((file, vectors, copied)) = merged else {
+                    given_up(gathering);
+                    return None;
+                };
+                let tombstones = file.tombstones.len();
+                let shape = Shape::of_gathered(&catalog, &file.rows, &vectors, tombstones, above);
+                // Asked once more, as what comes next, sealing the frame,
+                // sums every vector with nothing to ask it.
+                if !goes_on(file.rows.len()) {
+                    given_up(gathering);
+                    return None;
                 }
-                !stopping.stopped(MergeStage::Gathering)
-                    && !restoring.load(Ordering::SeqCst)
-                    && epoch.load(Ordering::SeqCst) == planned
-            };
-            let (file, vectors, copied) = run.merged(named_at, GATHERED_AT_ONCE, &mut goes_on)?;
-            let tombstones = file.tombstones.len();
-            let shape = Shape::of_gathered(&catalog, &file.rows, &vectors, tombstones, above);
-            // Asked once more, as what comes next, sealing the frame, sums
-            // every vector with nothing to ask it.
-            if !goes_on(file.rows.len()) {
-                return None;
-            }
-            if let Some(build) = build {
-                let reckoning = reckoning.gathered(file.rows.len(), copied, &vectors);
-                build.reckon(reckoning.peak());
-            }
-            Some((file, Some(vectors), shape))
+                if let Some(build) = build {
+                    let reckoning = reckoning.gathered(file.rows.len(), copied, &vectors);
+                    build.reckon(reckoning.peak());
+                }
+                timings.record(Timed::Merge(MergePhase::Gather), &key, gathering.elapsed());
+                Some((file, Some(vectors), shape))
+            })
         }
     }
 
@@ -3192,7 +3466,11 @@ impl Writer {
         &self,
         stopping: &Stopping,
         flush_due: &(dyn Fn() -> bool + Sync),
-    ) -> Result<Option<(MergeBuild, tokio::sync::MutexGuard<'_, ()>)>> {
+    ) -> Result<Option<(MergeBuild, Building<'_>)>> {
+        // What it waited for the lock without a turn, timed as the plan's
+        // wait for it; the rest as its wait for a turn.
+        let asked_turn = Instant::now();
+        let mut waited = Duration::ZERO;
         loop {
             if self.restoring.load(Ordering::SeqCst) {
                 // Its place, or a turn kept for it, is given up too.
@@ -3206,16 +3484,25 @@ impl Writer {
             else {
                 return Ok(None);
             };
-            if let Ok(planning) = self.building.try_lock() {
+            if let Ok(guard) = self.building.try_lock() {
+                let turn = asked_turn.elapsed().saturating_sub(waited);
+                self.timed(Timed::Merge(MergePhase::Turn), turn);
+                self.timed(Timed::BuildingWait(Holder::MergePlan), waited);
+                let planning = Building {
+                    _guard: guard,
+                    holder: Holder::MergePlan,
+                    since: Instant::now(),
+                    writer: self,
+                    timed: true,
+                };
                 return Ok(Some((build, planning)));
             }
             drop(build);
+            let asked = Instant::now();
             let free = async { drop(self.building.lock().await) };
-            if stopping
-                .unless_stopped(MergeStage::Queued, free)
-                .await
-                .is_none()
-            {
+            let free = stopping.unless_stopped(MergeStage::Queued, free).await;
+            waited += asked.elapsed();
+            if free.is_none() {
                 return Ok(None);
             }
         }
@@ -3451,7 +3738,7 @@ impl Writer {
     /// the next call, which finds it again. Finding what to delete is
     /// given a minute too, and a call that takes longer fails.
     pub async fn clean(&self, grace: Duration) -> Result<usize> {
-        let _building = self.building.lock().await;
+        let _building = self.building(Holder::Clean).await;
         let unneeded = tokio::time::timeout(CLEANING_WITHIN, self.unneeded(grace));
         let Unneeded { orphans, below } = unneeded.await.map_err(|_| StorageError::Blob {
             key: Layout(&self.lease.key).prefix(),
@@ -4014,7 +4301,7 @@ impl Drop for Refusing<'_> {
 /// deletes the copies.
 pub struct RestoreFrom<'a> {
     writer: &'a Writer,
-    _building: MutexGuard<'a, ()>,
+    _building: Building<'a>,
     _refusing: Refusing<'a>,
     staged: Staged,
     /// The state put back, loaded from the copies.
@@ -4164,6 +4451,7 @@ impl RestoreFrom<'_> {
                     .partition
                     .changing(|now| std::mem::replace(now, state));
                 writer.epoch.fetch_add(1, Ordering::SeqCst);
+                writer.lag.put_back(writer.partition.read(State::unflushed));
                 Ok(replaced)
             })
             .await?;
@@ -4526,6 +4814,51 @@ mod tests {
 
     /// A writer of a partition of its own, in memory, which merges two
     /// segments as soon as there are two.
+    /// Review of #169 (MEDIUM 2): rows applied are noted under the state's
+    /// lock, as a checkpoint notes what it takes. A checkpoint asked for
+    /// while the note is being made waits for it, so the rows it takes are
+    /// timed as due; were the note made after the lock, the checkpoint
+    /// would take rows it never knew had fallen due, and their wait would
+    /// be lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_applied_are_noted_before_a_checkpoint_can_take_them() {
+        let timings = Arc::new(Timings::default());
+        timings.keep_events(true);
+        let writer = writer()
+            .await
+            .measured_by(timings.clone())
+            .flushing_due_at(3, 0);
+        let writer = Arc::new(writer);
+        writer.commit(vec![create()]).await.unwrap();
+        let paused = Arc::new(std::sync::Barrier::new(2));
+        *writer.lag.paused.lock().unwrap() = Some(paused.clone());
+        let committing = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.commit(vec![upsert(1), upsert(2), upsert(3)]).await }
+        });
+        let wait = |paused: Arc<std::sync::Barrier>| {
+            tokio::task::spawn_blocking(move || {
+                paused.wait();
+            })
+        };
+        // The rows are applied, and their note waits to be made.
+        wait(paused.clone()).await.unwrap();
+        let flushing = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.flush().await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait(paused).await.unwrap();
+        committing.await.unwrap().unwrap();
+        flushing.await.unwrap().unwrap();
+        let due = timings
+            .drain_events()
+            .into_iter()
+            .filter(|event| event.timed == Timed::FlushDue)
+            .count();
+        assert_eq!(due, 1, "the rows the checkpoint took not timed as due");
+    }
+
     async fn writer() -> Writer {
         let blobs = Arc::new(ObjectBlobs::new(Arc::new(InMemory::new())));
         writer_on(blobs).await.0
@@ -5107,6 +5440,9 @@ mod tests {
         });
         at_free.recv_timeout(FREE_HELD).expect("the free began");
         assert_eq!(writer.partition.freeing(), replaced);
+        // Counted for the node too, which goes on counting it once the
+        // writer is gone.
+        assert_eq!(writer.timings.freeing(), replaced);
         let figures = writer.partition.figures();
         assert_eq!(figures, writer.partition.read(State::figures));
         drop(let_go);
