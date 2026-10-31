@@ -250,6 +250,29 @@ async fn a_late_stop_does_not_hide_what_ended_a_merge() {
     assert_eq!(timings.merges_ended(MergeEnd::Stopped), 0);
 }
 
+/// Rows awaiting a merge are those of segments a flush wrote: what a merge
+/// wrote awaits none, though its rows are there (rule 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merged_segment_is_not_counted_as_awaiting_a_merge() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    for round in 0..2 {
+        writer.commit(notes(round * 10, 10)).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    let awaiting = || {
+        let figures = writer.partition().read(|state| state.figures());
+        (figures.unmerged, figures.unmerged_rows)
+    };
+    assert_eq!(awaiting(), (2, 20));
+    assert!(writer.merge().await.unwrap().is_some());
+    assert_eq!(awaiting(), (0, 0));
+    writer.commit(notes(100, 5)).await.unwrap();
+    writer.flush().await.unwrap();
+    assert_eq!(awaiting(), (1, 5));
+}
+
 /// A wait no checkpoint has ended yet is told, as no event can be: rows due
 /// and a spell at the backlog, each from when it began, gone once a
 /// checkpoint takes them, so that a bench counts what never ended (review
