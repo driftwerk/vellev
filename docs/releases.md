@@ -401,7 +401,12 @@ and say what the caller then answers for.
 - **A merge gathers its vectors in the cache directory**, in a file of its
   own that becomes the merged segment's copy: what it holds in memory falls
   by its vectors' bytes at every stage, and the disk is written as it
-  gathers, not after it uploads. Nothing stored changes, and a node with no
+  gathers, not after it uploads, and holds that file for the whole build. A
+  merge with too little room for it, and as much again or a gibibyte, is
+  skipped, as `no_room` in `vellev_merges_ended_total` and in
+  `vellev_merge_spills_skipped_total`; `vellev_merge_spill_bytes` and
+  `vellev_merge_spill_failures_total` are new too. A round now cleans up
+  whether or not its merge failed. Nothing stored changes, and a node with no
   cache directory gathers in memory as before. `vellev-storage`'s `Blobs`
   gains `spills` and `put_spilled`, which a store over another forwards for
   its merges to gather on disk; one that does not gathers in memory.
@@ -466,6 +471,24 @@ and say what the caller then answers for.
   neither its rate nor a bench's `stopped_for_budget` across the change.
   `vellev_merges_stopped_total{reason}` is new: merges stopped or cut off
   as a hold on a tenant is lost, each once, by why.
+- **A tenant's flushes no longer wait behind its merges.** They run on a
+  task of their own, so a flush due while the tenant's merge builds
+  commits in a flush's own time, where it waited for the build. A merge
+  flushes what is due before its commit, so `vellev_building_held_seconds`
+  reads less for `merge_commit` and more for `flush`. A tenant's merges
+  may see more than one clean, as cleaning up goes on beside them, and
+  `vellev_building_held_seconds{holder="clean"}` can count a little more.
+  `vellev_merge_phase_seconds{phase="turn_idle"}` is new: each wait for the
+  building lock with a merge turn held, 10 s at the most, after which the
+  turn goes back and the merge goes on without one.
+  `vellev_merge_commits_waiting_bytes` is new: what merges hold now that
+  gave their turns back to wait to commit. Nothing limits how many do but
+  one to a tenant, so a node can hold a built segment for each tenant
+  beside the builds its turns allow. It is in no total a sweep answers, as
+  those bytes leave in seconds by themselves.
+  `vellev_tenants_given_up_total` counts a panic on either task, two at
+  once on one tenant counting twice, and the line logged for it now reads
+  "a tenant's task panicked" with the task named.
 
 ### Numbers are read exactly
 

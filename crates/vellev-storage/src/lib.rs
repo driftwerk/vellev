@@ -37,12 +37,15 @@ pub use hybrid::{
     default_oversample, Fused, Hybrid, DEFAULT_ALPHA, DEFAULT_CANDIDATES, HYBRID_DEFAULT_RESCORE,
 };
 pub use keyword::{Keywords, Scored, MAX_WEIGHT};
-pub use merge_builds::{sections_ran_on, Holding, MergeBuilds, Probed, SectionRan, MERGE_BUILDS};
+pub use merge_builds::{
+    sections_ran_on, Holding, MergeBuilds, Probed, SectionRan, MERGE_BUILDS, TURN_IDLE_AT_MOST,
+};
 pub use mutation::{
     Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
 };
 pub use partition::{
-    Embedded, FlushTimes, Follower, MergeGate, Partition, RestoreFrom, Writer, GATHERED_AT_ONCE,
+    Embedded, FlushFirst, FlushTimes, Follower, MergeGate, Partition, RestoreFrom, Writer,
+    GATHERED_AT_ONCE,
 };
 pub use published::FreesHeld;
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
