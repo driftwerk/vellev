@@ -762,6 +762,15 @@ up, and the builds that take one, `ClusteredIndex::build_stopping` and
 giving up while it waits if its `Stop` is stopped; a clustered build takes
 its turn to tune through it. `build` is unchanged.
 
+New, additive: `TextIndex`, `text::Field` and `RowIndex` implement
+`PartialEq`, comparing what they hold, not the order of their maps. And for
+a merge's reckoning, `TextIndex::shapes`, `text::{FieldShape, Vocabulary}`,
+a sketch of how many different tokens a field holds, which two segments'
+can say of the both of them, `text::VOCABULARY_OFF`, how far it can be off,
+and `text::{table_bytes, last_grown_at, dictionary_bytes}`, what a field's
+map and dictionary take. `RowIndex::resident` counts a value at what it is
+measured to take, about 245 bytes past its text where it said about 85.
+
 New, additive: `TextIndex::resident` and `RowIndex::resident`, about how
 many bytes each index takes in memory, and `TextIndex::tokenized_resident`,
 about how many its rows take tokenized all at once before they are

@@ -86,15 +86,20 @@ jobs:
       - name: Index tests, optimised
         run: cargo test --release --locked -p vellev-index --lib -- --nocapture
       # What a merge reckons it holds, held to what a counting allocator
-      # measures over a dozen merges and more: built for debugging, the
-      # merges take minutes, so the rule is left out above and run here.
-      - name: Merge reckoning, optimised
+      # measures over a score of merges, and what a merge's, a flush's and an
+      # open's whole build holds tokenized in chunks, weighed against every
+      # row tokenized at once, up to 200,000 rows: built for debugging they
+      # take far too long, so the rules are left out above and run here.
+      - name: Merge reckoning and tokenizing, optimised
         run: |
           cargo test --release --locked -p vellev-storage --test flush_memory -- \
-            --ignored --nocapture --exact a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent \
+            --ignored --nocapture --exact \
+            a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent \
+            a_merge_holds_a_chunk_of_tokens_at_once_and_its_whole_build_no_more_for_it \
+            a_flush_and_an_open_hold_a_chunk_of_tokens_at_once_and_an_open_saves_them \
             | tee reckoning.log
-          # The rule ran, and alone: not left out by its name or its ignore.
-          grep -q "test result: ok. 1 passed" reckoning.log
+          # The rules ran, all three: not left out by their names or their ignore.
+          grep -q "test result: ok. 3 passed" reckoning.log
 
   # The benchmark fixture's tools, on tiny hand-made data.
   fixture-scripts:
