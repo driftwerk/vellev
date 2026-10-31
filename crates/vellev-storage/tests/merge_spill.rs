@@ -227,7 +227,8 @@ impl Cached {
         rows: usize,
     ) -> Self {
         let cache = tempfile::tempdir().unwrap();
-        cluster.blobs = Arc::new(CachedBlobs::new(store.clone(), cache.path()));
+        let cached = CachedBlobs::new(store.clone(), cache.path());
+        cluster.blobs = Arc::new(cached.on(disk_of_its_own()));
         let builds = MergeBuilds::new(1);
         let writer = cluster.writer().await.flushing_due_at(rows, 1 << 30);
         let writer = written_on(writer, &builds, written).await;
@@ -1228,6 +1229,12 @@ impl Blobs for FlushesHeld {
     }
 }
 
+/// A disk nothing else is on, as what a disk says of its spills is all that
+/// lie on it: on the one every store shares, the tests beside this one's.
+fn disk_of_its_own() -> Disk {
+    Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8)
+}
+
 /// How long a commit here waits with its turn before it gives it back.
 const TURN_IDLE: Duration = Duration::from_millis(100);
 
@@ -1241,7 +1248,8 @@ struct AtCommit {
 
 impl AtCommit {
     async fn over(store: Arc<dyn Blobs>, written: Written) -> Self {
-        let cached = Cached::over(Cluster::new().await, store, written, None).await;
+        let disk = Some(disk_of_its_own());
+        let cached = Cached::over(Cluster::new().await, store, written, disk).await;
         cached.builds.idle_for(TURN_IDLE);
         Self::of(cached).await
     }
