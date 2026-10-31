@@ -1181,6 +1181,8 @@ pub struct Writer {
     /// Whether the merge under way is past loading back what it built,
     /// from where a stop no longer ends it.
     merge_past_loading: AtomicBool,
+    /// The task the merge under way runs on, if it runs on one.
+    merge_task: std::sync::Mutex<Option<tokio::task::Id>>,
     /// The merge builds this writer's merges take turns among: the node's,
     /// or, on its own, its own.
     merge_builds: Arc<MergeBuilds>,
@@ -1360,6 +1362,7 @@ impl Writer {
             merge_panics: AtomicBool::new(false),
             stops_past_loading: AtomicU64::new(0),
             merge_past_loading: AtomicBool::new(false),
+            merge_task: std::sync::Mutex::new(None),
             merge_builds: MergeBuilds::new(MERGE_BUILDS),
             merge_place: std::sync::Mutex::new(None),
         })
@@ -2934,6 +2937,7 @@ impl Writer {
         {
             let mut under_way = lock(&self.merge_stop);
             self.merge_past_loading.store(false, Ordering::SeqCst);
+            *lock(&self.merge_task) = tokio::task::try_id();
             *under_way = Some(stopping.stop().clone());
         }
         let _stopped = MergeStopped {
@@ -3228,6 +3232,8 @@ impl Writer {
     /// this is not stopped. Returns whether this stopped a merge: one was
     /// under way, not stopped already nor past where a stop ends it, so
     /// that a merge is counted as stopped once, however often it is asked.
+    /// An attempt that has yet to find out there is nothing to merge is
+    /// under way too, for the moment it takes to.
     pub fn stop_merges(&self) -> bool {
         self.merges_stopped.fetch_add(1, Ordering::SeqCst);
         let stopped = if let Some(stop) = &*lock(&self.merge_stop) {
@@ -3249,6 +3255,23 @@ impl Writer {
         // under this lock, leaves none behind.
         lock(&self.merge_place).take();
         stopped
+    }
+
+    /// As [`Self::stop_merges`], for a caller that is about to abort the
+    /// tasks `aborting` says, after which a stop is not all that ends a
+    /// merge: one past loading back what it built, on one of those tasks,
+    /// is lost with it. Such a merge is lost at once, or as its commit is
+    /// cut, and that may close the writer; if the commit lands first it was
+    /// not lost after all, and there is no telling from here. Returns
+    /// whether this stopped a merge, or is about to cut one off. A merge on
+    /// any other task, as a request's, goes on to its commit.
+    pub fn stop_merges_aborting(&self, aborting: impl Fn(tokio::task::Id) -> bool) -> bool {
+        let stopped = self.stop_merges();
+        // Stopped now: a merge past loading stays so until it ends.
+        let cut_off = lock(&self.merge_stop).is_some()
+            && self.merge_past_loading.load(Ordering::SeqCst)
+            && lock(&self.merge_task).is_some_and(aborting);
+        stopped || cut_off
     }
 
     /// Have each merge's build panic from now on, or not. For tests that

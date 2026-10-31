@@ -452,6 +452,13 @@ and say what the caller then answers for.
   13,340 objects/s, group commits unchanged), opening 4M rows from
   their segments about 12% longer, resident memory about 10% more.
   Searches are unchanged.
+- **`vellev_merges_stopped_for_budget_total` counts each merge once, and
+  none a stop came too late for**, where it counted one for every sweep
+  that found a merge stopped still under way, and for stops that let the
+  merge commit. It reads lower than before for the same load, so compare
+  neither its rate nor a bench's `stopped_for_budget` across the change.
+  `vellev_merges_stopped_total{reason}` is new: merges stopped or cut off
+  as a hold on a tenant is lost, each once, by why.
 
 ### Numbers are read exactly
 

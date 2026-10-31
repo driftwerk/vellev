@@ -32,12 +32,17 @@ fn note(n: u32, random: &mut Random) -> Mutation {
 /// A writer of two flushed segments of [`NOTES`] notes each, which merge
 /// into one with a clustered index.
 async fn two_large(cluster: &Cluster) -> Arc<Writer> {
+    two_large_on(cluster.writer().await).await
+}
+
+/// As [`two_large`], of `writer`.
+async fn two_large_on(writer: Writer) -> Arc<Writer> {
     let merging = Merging {
         fanout: 2,
         clustered_above: 4_000,
         ..Merging::default()
     };
-    let writer = Arc::new(cluster.writer().await.merging_with(merging));
+    let writer = Arc::new(writer.merging_with(merging));
     writer.commit(vec![create("notes")]).await.unwrap();
     let mut random = Random(7);
     for round in 0..2 {
@@ -71,6 +76,51 @@ async fn within<T>(limit: u64, what: &str, work: impl std::future::Future<Output
     tokio::time::timeout(Duration::from_secs(limit), work)
         .await
         .unwrap_or_else(|_| panic!("{what} within {limit} s"))
+}
+
+/// What aborting a merge's task does in its commit, as losing a hold does:
+/// the abort lands inside the attempt, so the writer closes, as it would on
+/// any commit cut short, and nothing is lost. Cut before the coordinator
+/// heard, the merge is gone. Cut once it had, the merge landed all the same:
+/// whoever aborted it cannot tell, and whoever opens the tenant next reads
+/// it. Either way every note is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_aborted_in_its_commit_closes_the_writer_and_loses_nothing() {
+    for lands in [false, true] {
+        let cluster = Cluster::new().await;
+        let unreliable = Arc::new(Unreliable::over(cluster.coordinator.clone()));
+        let writer = two_large_on(cluster.writer_on(unreliable.clone()).await).await;
+        let before = cluster.committed().await;
+        let manifests = stored(&cluster, "manifest").await.len();
+        let gate = writer.hold_merges_before_commit();
+        let merging = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        within(120, "the merge was built", gate.reached.notified()).await;
+        let cut_at = match lands {
+            true => &unreliable.hang_after_commit,
+            false => &unreliable.unanswered,
+        };
+        cut_at.store(true, Ordering::SeqCst);
+        gate.release.notify_one();
+        settled("the commit never began", || async {
+            stored(&cluster, "manifest").await.len() > manifests
+        })
+        .await;
+        if lands {
+            settled("the commit never landed", || async {
+                cluster.committed().await.manifest != before.manifest
+            })
+            .await;
+        }
+        assert!(!writer.is_closed(), "closed before it was cut");
+        merging.abort();
+        let _ = merging.await;
+        assert!(writer.is_closed(), "landed: {lands}");
+        assert_eq!(cluster.committed().await.manifest != before.manifest, lands);
+        all_there(&cluster).await;
+    }
 }
 
 /// Every note, read by a copy loaded afresh.

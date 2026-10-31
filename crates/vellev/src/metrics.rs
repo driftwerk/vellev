@@ -583,7 +583,7 @@ impl Collector for Counted {
         )?)?;
         let mut family = encoder.encode_descriptor(
             "merges_stopped",
-            "Merges stopped, each counted once, by what first stopped it: a sweep letting its tenant go, its lease lost or its writer unable to write, its tenant dropped, or the node shutting down. Those stopped for the memory budget are counted apart, in merges_stopped_for_budget",
+            "Merges stopped, or cut off with their task past where a stop ends them, each counted once, by what first stopped it: a sweep letting its tenant go, its lease lost or its writer unable to write, its tenant dropped, or the node shutting down. Those stopped for the memory budget are counted apart, in merges_stopped_for_budget",
             None,
             counter.metric_type(),
         )?;

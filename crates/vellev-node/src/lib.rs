@@ -548,10 +548,9 @@ fn unembedded(error: EmbedError) -> Unembedded {
     }
 }
 
-/// A tenant this node writes for, as requests hold it: nothing is taken
-/// from under one, so a sweep lets a tenant go only once nothing but the
-/// node holds this. Its tasks hold what they work on instead, its
-/// `TenantWork`.
+/// A tenant this node writes for, as requests and restores hold it: a sweep
+/// lets a tenant go only if nothing but the node and the sweep holds this.
+/// Its maintenance holds what it works on instead, its `TenantWork`.
 #[derive(Debug)]
 pub struct Tenant {
     work: Arc<TenantWork>,
@@ -567,8 +566,9 @@ pub struct Tenant {
     running: Mutex<Option<Running>>,
 }
 
-/// What a tenant's tasks work on. A task holds this only for a round, and
-/// never the [`Tenant`], so that a task holds nothing a request would.
+/// What a tenant's tasks work on. Maintenance upgrades its `Weak` of this
+/// for a round and holds no [`Tenant`], so that dropping the tenant ends it,
+/// wherever it is. What ends a restore holds this as well.
 #[derive(Debug)]
 struct TenantWork {
     id: TenantId,
@@ -634,22 +634,25 @@ impl Hold {
     /// go of what it holds (merge note, step 3). All of it under the tasks'
     /// lock, which [`Self::opened`] takes too, so that writes and a writer
     /// set as the tenant opens are stopped whichever comes first. A merge
-    /// this stops is counted as stopped for `why`; one stopped already is
-    /// not, so what first stopped it is what it is counted as.
+    /// this stops, or cuts off with its task past where a stop ends it, is
+    /// counted for `why`; one stopped already is not, so what first stopped
+    /// it is what it is counted as. A merge that no task of this hold runs,
+    /// as a request's, past where a stop ends it, goes on: nothing here
+    /// stopped it.
     fn lose(&self, why: Lost) {
         let mut tasks = self.tasks.lock().expect("tasks lock");
         self.lost.store(true, Ordering::SeqCst);
         if let Some(commits) = self.commits.get() {
             commits.stop();
         }
+        let tasks = std::mem::take(&mut *tasks);
         if let Some(writer) = self.writer.get().and_then(Weak::upgrade) {
-            if writer.stop_merges() {
+            let aborting = |merging| tasks.iter().any(|task| task.id() == merging);
+            if writer.stop_merges_aborting(aborting) {
                 self.stops.count(why);
             }
         }
-        std::mem::take(&mut *tasks)
-            .iter()
-            .for_each(AbortHandle::abort);
+        tasks.iter().for_each(AbortHandle::abort);
     }
 
     /// Note the tenant's `writer` and queue of `commits` as it opens:
@@ -701,7 +704,8 @@ enum Lost {
     Shutdown,
 }
 
-/// How many merges losing a hold has stopped, each once, by why it was lost.
+/// How many merges losing a hold has stopped or cut off, each once, by why
+/// it was lost.
 #[derive(Debug, Default)]
 struct StopCounts {
     let_go: AtomicU64,
@@ -1051,10 +1055,12 @@ impl Tenant {
         Ok(compacted.unwrap_or(0))
     }
 
-    /// Whether none of the tenant's tasks is in a round. A task holds no
-    /// [`Tenant`], so nothing else says so, and until a sweep lets a tenant
-    /// go as it merges, waiting for what must not be cut and with merging
-    /// tenants last (node memory note, M7b), a round keeps its tenant.
+    /// Whether nothing holds the tenant's work but the tenant: no round of
+    /// its maintenance is under way, nor is a restore ending. A round holds
+    /// no [`Tenant`], so only this says so. Until a sweep can let a tenant
+    /// go as it merges, with merging tenants last, a bounded wait, and
+    /// nothing cut (node memory note, M7b), a round keeps its tenant, as
+    /// when rounds held the tenant itself.
     fn between_rounds(&self) -> bool {
         Arc::strong_count(&self.work) == 1
     }
@@ -1582,18 +1588,20 @@ pub struct Merges {
     /// How many merge turns were let go so, since the node started.
     pub held_let_go: u64,
     /// How many merges sweeps have stopped since the node started, so that
-    /// a tenant over the memory budget could be let go, each once: none
-    /// among [`Self::stopped`].
+    /// a tenant over the memory budget could be let go: each once, and none
+    /// a stop came too late for, which goes on to commit. None is among
+    /// [`Self::stopped`].
     pub stopped_for_budget: u64,
-    /// How many merges losing a hold on a tenant has stopped since the node
-    /// started, each once, by what first stopped it.
+    /// How many merges losing a hold on a tenant has stopped or cut off
+    /// since the node started, each once, by what first stopped it.
     pub stopped: MergesStopped,
 }
 
-/// How many merges losing a hold on a tenant has stopped, since the node
-/// started, by why the hold was lost: a sweep let the tenant go, its lease
-/// was lost or its writer can write no more, it was dropped, or the node
-/// shut down.
+/// How many merges losing a hold on a tenant has stopped, or cut off with
+/// their task past where a stop ends them, since the node started, by why
+/// the hold was lost: a sweep let the tenant go, its lease was lost or its
+/// writer can write no more, it was dropped, or the node shut down. A merge
+/// cut off in its commit may have landed all the same, and is counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MergesStopped {
     pub let_go: u64,
