@@ -2947,6 +2947,7 @@ async fn arm(bench: Bench, running: Running) {
                         "census_largest": census.largest,
                         "merge_builds_under_way": node.merge_builds().under_way(),
                         "draining": merges.draining,
+                        "commits_waiting": merges.waiting_to_commit,
                         "freeing": freeing,
                         "freeing_peak": freeing_peak,
                         "largest_merge_build": merges.largest,

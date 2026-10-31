@@ -288,6 +288,11 @@ async fn what_waits_for_a_flush_and_flushes_that_failed_are_reported() {
         "{text}"
     );
     assert_eq!(value("vellev_merge_draining_bytes"), Some(0.0), "{text}");
+    assert_eq!(
+        value("vellev_merge_commits_waiting_bytes"),
+        Some(0.0),
+        "{text}"
+    );
     assert_eq!(value("vellev_merge_abandoned_bytes"), Some(0.0), "{text}");
     assert_eq!(value("vellev_tenants_freeing_bytes"), Some(0.0), "{text}");
     assert!(
@@ -1127,7 +1132,14 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
         assert!(waited.is_some(), "{holder}: {text}");
     }
     for phase in [
-        "turn", "working", "gather", "build", "encode", "upload", "load",
+        "turn",
+        "turn_idle",
+        "working",
+        "gather",
+        "build",
+        "encode",
+        "upload",
+        "load",
     ] {
         let count = sample(
             &text,
@@ -1140,7 +1152,8 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
             "vellev_merge_given_up_seconds_count",
             &[("phase", phase)],
         );
-        assert_eq!(given_up.is_some(), phase != "turn", "{phase}: {text}");
+        let timed_given_up = !phase.starts_with("turn");
+        assert_eq!(given_up.is_some(), timed_given_up, "{phase}: {text}");
     }
     for outcome in [
         "committed",

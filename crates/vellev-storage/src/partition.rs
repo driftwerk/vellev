@@ -29,7 +29,7 @@ use crate::format::{
 use crate::freed::{off_the_async_threads, FreedOff};
 use crate::merge_builds::{
     HeldAt, MergeBuild, MergeBuilds, OnPool, Probe, Reservation, UnlessDeleted, Uploading,
-    MERGE_BUILDS,
+    ASKS_EVERY, MERGE_BUILDS,
 };
 use crate::mutation::{Batch, Mutation, Receipt, Unembedded, Vectorize, Weight};
 use crate::published::{FreesHeld, Published};
@@ -1300,6 +1300,36 @@ impl Drop for Building<'_> {
 enum Ended {
     Committed(LogPosition),
     Dropped(MergeEnd),
+    /// Dropped having flushed first, at the position: a checkpoint was
+    /// made, and whatever it makes due has yet to be looked at.
+    DroppedFlushed(MergeEnd, LogPosition),
+}
+
+/// What whoever merges is asked and told of the flush a merge makes before
+/// its commit: a flush as any other, whose backoff it keeps, and which is
+/// not the merge's to decide on.
+#[derive(Clone, Copy)]
+pub struct FlushFirst<'a> {
+    /// Whether a flush may be tried now.
+    pub may_be_tried: &'a (dyn Fn() -> bool + Sync),
+    /// Told how one went: whether it went through.
+    pub tried: &'a (dyn Fn(bool) + Sync),
+}
+
+impl std::fmt::Debug for FlushFirst<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlushFirst").finish_non_exhaustive()
+    }
+}
+
+impl Default for FlushFirst<'_> {
+    /// With no backoff, and nobody told.
+    fn default() -> Self {
+        Self {
+            may_be_tried: &|| true,
+            tried: &|_| {},
+        }
+    }
 }
 
 /// How long a flush waited for its partition's building lock, and then
@@ -2045,6 +2075,20 @@ impl Writer {
     /// flushing or a checkpoint made meanwhile left nothing to do.
     pub async fn flush(&self) -> Result<LogPosition> {
         self.flush_timed().await.map(|(position, _)| position)
+    }
+
+    /// As [`Self::flush`], if it still holds `rows` rows unflushed once it
+    /// has the building lock; `None` if not, and nothing done. What was
+    /// counted before it may be what another flush has taken, not yet
+    /// adopted: rows that flush is about to take out, and flushing what is
+    /// left of them would make a small segment of a few.
+    pub async fn flush_if_holding(&self, rows: usize) -> Result<Option<LogPosition>> {
+        let mut building = self.building(Holder::Flush).await;
+        if self.partition.read(State::unflushed) < rows {
+            building.built_nothing();
+            return Ok(None);
+        }
+        self.flushing_held(&mut building).await.map(Some)
     }
 
     /// As [`Self::flush`], saying how long it waited for the building lock
@@ -3018,13 +3062,6 @@ impl Writer {
         loaded.fit(meta, catalog)
     }
 
-    /// Carry out the merge the partition most needs, if any: replace a run
-    /// of segments with one holding their live rows, in a checkpoint that
-    /// also flushes what is unflushed, as [`Self::flush`] does. Both
-    /// segments are built from the partition as it is now and written while
-    /// commits go on; a row that dies meanwhile is dead in the new segment
-    /// too. Returns the checkpoint's position, or `None` when there was
-    /// nothing to merge.
     /// Make and commit the curve of its rows for every clustered index of a
     /// segment that has none, as a segment written before curves (recall
     /// note, R9.5): the curve its build would have given, made off the
@@ -3109,6 +3146,16 @@ impl Writer {
         Ok(Some(position))
     }
 
+    /// Carry out the merge the partition most needs, if any: replace a run
+    /// of segments with one holding their live rows, in a checkpoint that
+    /// also flushes what is unflushed, as [`Self::flush`] does. Both
+    /// segments are built from the partition as it is now and written while
+    /// commits go on; a row that dies meanwhile is dead in the new segment
+    /// too. Returns the position of a checkpoint it made, or `None` when
+    /// there was nothing to merge or it was dropped with none made. A
+    /// position says to ask again, not that the merge landed: one dropped
+    /// once it had flushed first returns that flush's, as what the flush
+    /// made due has yet to be looked at.
     pub async fn merge(&self) -> Result<Option<LogPosition>> {
         self.merge_planned_at(None).await
     }
@@ -3118,12 +3165,16 @@ impl Writer {
     /// gives the wait up, `None`, once `flush_due` says a flush of this
     /// writer is due, so that the flush is not held behind other tenants'
     /// merges. Planned afresh when next asked. Once its turn has come it
-    /// goes on, as [`Self::merge`] does.
+    /// goes on, as [`Self::merge`] does. `flush_first` is asked of the flush
+    /// it makes before its commit, and told how it went. Also returns a
+    /// position, as a checkpoint was made, for a merge dropped once it had
+    /// flushed first: what that made due is for the next to look at.
     pub async fn merge_giving_way(
         &self,
         flush_due: &(dyn Fn() -> bool + Sync),
+        flush_first: FlushFirst<'_>,
     ) -> Result<Option<LogPosition>> {
-        self.merging(None, flush_due).await
+        self.merging(None, flush_due, flush_first).await
     }
 
     /// Time a merge's `phase`, begun at `began`, as come through or not.
@@ -3166,15 +3217,17 @@ impl Writer {
     /// merge planned at another epoch commits nothing. Not for use.
     #[doc(hidden)]
     pub async fn merge_planned_at(&self, planned: Option<u64>) -> Result<Option<LogPosition>> {
-        self.merging(planned, &|| false).await
+        self.merging(planned, &|| false, FlushFirst::default())
+            .await
     }
 
-    /// As [`Self::merge_planned_at`], giving way to a flush as
-    /// [`Self::merge_giving_way`] says.
+    /// As [`Self::merge_planned_at`], giving way to a flush and asking of
+    /// its flush first as [`Self::merge_giving_way`] says.
     async fn merging(
         &self,
         planned: Option<u64>,
         flush_due: &(dyn Fn() -> bool + Sync),
+        flush_first: FlushFirst<'_>,
     ) -> Result<Option<LogPosition>> {
         let asked = self.merges_stopped.load(Ordering::SeqCst);
         let _merging = self.merge_build.lock().await;
@@ -3238,17 +3291,18 @@ impl Writer {
         // Counted by what ended it, once it has its turn: a stop too late
         // to end it, as one past loading back, hides nothing of what did.
         let ended = self
-            .merged_in_turn(build, planning, planned, &stopping)
+            .merged_in_turn(build, planning, planned, &stopping, flush_first)
             .await;
         let end = match &ended {
             Ok(Ended::Committed(_)) => MergeEnd::Committed,
-            Ok(Ended::Dropped(end)) => *end,
+            Ok(Ended::Dropped(end) | Ended::DroppedFlushed(end, _)) => *end,
             Err(_) => MergeEnd::Failed,
         };
         self.timings.ended(end);
         ended.map(|ended| match ended {
             Ended::Committed(position) => Some(position),
             Ended::Dropped(_) => None,
+            Ended::DroppedFlushed(_, position) => Some(position),
         })
     }
 
@@ -3274,6 +3328,7 @@ impl Writer {
         planning: Building<'_>,
         planned: Option<u64>,
         stopping: &Stopping,
+        flush_first: FlushFirst<'_>,
     ) -> Result<Ended> {
         let build = Arc::new(build);
         let planned = planned.unwrap_or_else(|| self.epoch());
@@ -3367,11 +3422,32 @@ impl Writer {
             gate.reached.notify_one();
             gate.release.notified().await;
         }
-        let _building = self.building(Holder::MergeCommit).await;
+        // Flush first what is due, if it has the lock with its turn and is
+        // not to be dropped: see `lock_to_commit`, and `flushed_first`.
+        let (mut guard, mut waited) = self.lock_to_commit(&build, &merged).await;
+        let mut flushed = None;
+        let due = self.lag.due(self.partition.read(State::unflushed));
+        if due && build.holds_turn() && self.epoch() == planned && (flush_first.may_be_tried)() {
+            self.timed(Timed::BuildingWait(Holder::Flush), waited);
+            flushed = self.flushed_first(guard, flush_first).await?;
+            (guard, waited) = self.lock_to_commit(&build, &merged).await;
+        }
+        self.timed(Timed::BuildingWait(Holder::MergeCommit), waited);
+        let _building = Building {
+            _guard: guard,
+            holder: Holder::MergeCommit,
+            since: Instant::now(),
+            writer: self,
+            timed: true,
+        };
+        let dropped = |end| match flushed {
+            Some(position) => Ended::DroppedFlushed(end, position),
+            None => Ended::Dropped(end),
+        };
         // Not at another epoch than it was planned at: a restore since may
         // have brought the same segments back with other rows live.
         if self.stale(planned) {
-            return Ok(Ended::Dropped(MergeEnd::Stale));
+            return Ok(dropped(MergeEnd::Stale));
         }
         // Nor with a row the run holds live missing from the merged file,
         // which carrying it out could not place: checked before the turn
@@ -3384,7 +3460,7 @@ impl Writer {
             tracing::error!(
                 "a merged segment lacks a row its run holds live; the merge is dropped"
             );
-            return Ok(Ended::Dropped(MergeEnd::Uncovered));
+            return Ok(dropped(MergeEnd::Uncovered));
         }
         let (snapshot, taking) = self.taken_noted();
         let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
@@ -3401,7 +3477,7 @@ impl Writer {
             state.merged_manifest(position, &snapshot, flushed, &merge, merged.meta.clone())
         })?
         else {
-            return Ok(Ended::Dropped(MergeEnd::Changed));
+            return Ok(dropped(MergeEnd::Changed));
         };
         let frame = self.stamped(Kind::Manifest, &manifest, manifest.least_format())?;
         // Kept from here, and let go by the merge: see `Staged::keep`.
@@ -3416,6 +3492,94 @@ impl Writer {
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);
         Ok(Ended::Committed(position))
+    }
+
+    /// Flush what is due as a plain flush, under `guard`, the lock a merge
+    /// waited for to commit, and give it back: right before the commit, so
+    /// that the commit's hold is its checks, its state change and the few
+    /// rows since, not a flush of up to a backlog that a tenant's flushes
+    /// would wait behind. Returns the position, if it went through.
+    ///
+    /// A flush that holds the lock goes on to its end, as cut off it would
+    /// leave what it built running, beside the commit's build of the same
+    /// rows, and its commit given up halfway closes the writer. If it fails
+    /// the rows go with the commit, as they always did, and nothing is
+    /// lost. If it closed the writer the merge ends here, as a commit
+    /// would be refused once it had built the rows again. A stop can't end
+    /// it, being past where a stop ends a merge. Losing the hold aborts it
+    /// with the merge, by the same fence as any flush, and the rows are in
+    /// the log.
+    async fn flushed_first(
+        &self,
+        guard: MutexGuard<'_, ()>,
+        flush_first: FlushFirst<'_>,
+    ) -> Result<Option<LogPosition>> {
+        let mut building = Building {
+            _guard: guard,
+            holder: Holder::Flush,
+            since: Instant::now(),
+            writer: self,
+            timed: true,
+        };
+        let flushed = self.flushing_held(&mut building).await;
+        (flush_first.tried)(flushed.is_ok());
+        match flushed {
+            Ok(position) => Ok(Some(position)),
+            Err(error) if self.is_closed() => Err(error),
+            Err(error) => {
+                tracing::warn!(partition = %self.lease.key, %error, "a flush before a merge's commit failed; its rows go with the commit");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The building lock for a merge past loading, holding `merged`, to
+    /// flush and commit under, and how long it waited: one place in the
+    /// lock's queue from the first, so that nothing behind it goes first.
+    /// With its turn it waits at most [`crate::TURN_IDLE_AT_MOST`], and
+    /// until a restore is seen to hold the lock, which holds it for longer
+    /// than that. Then the turn goes back, and the merge waits on: it has
+    /// done its work, and only commits. A merge with no turn, or one that
+    /// gave it back here, flushes its rows along with its commit, however
+    /// many, up to the backlog, as what waited this long is no flush's
+    /// place to add to.
+    async fn lock_to_commit(
+        &self,
+        build: &MergeBuild,
+        merged: &Fit,
+    ) -> (MutexGuard<'_, ()>, Duration) {
+        let asked = Instant::now();
+        let building = self.building.lock();
+        tokio::pin!(building);
+        if build.holds_turn() {
+            let at_most = build.builds().idle_at_most();
+            let with_its_turn = async {
+                tokio::select! {
+                    biased;
+                    guard = &mut building => Some(guard),
+                    () = self.restore_seen() => None,
+                    () = tokio::time::sleep(at_most) => None,
+                }
+            };
+            let held = with_its_turn.await;
+            self.timed(Timed::Merge(MergePhase::TurnIdle), asked.elapsed());
+            if let Some(guard) = held {
+                return (guard, asked.elapsed());
+            }
+            // Weighed first, or it would read as holding nothing meanwhile.
+            let holding = at_once(merged.weighing()).await.unwrap_or_default();
+            build.give_turn_back(holding);
+        }
+        let guard = building.await;
+        (guard, asked.elapsed())
+    }
+
+    /// Done once a restore is seen to have begun, which holds the building
+    /// lock from before that until it ends.
+    async fn restore_seen(&self) {
+        while !self.restoring.load(Ordering::SeqCst) {
+            tokio::time::sleep(ASKS_EVERY).await;
+        }
     }
 
     /// The merge most worth doing, as the state stands, with all it takes
@@ -3499,23 +3663,55 @@ impl Writer {
     /// to plan under: `None` if the merge is stopped first, or a flush falls
     /// due while it waits for a turn, or the writer is restoring, when the
     /// merge would only be dropped. The turn is never waited for with the
-    /// lock held, so that flushes never wait on other tenants' merges; nor
-    /// held idle while the lock is, as a long flush, restore or clean holds
-    /// it: it goes back, the lock is waited for without one, and a turn is
-    /// taken again once it is free.
+    /// lock held, so that flushes never wait on other tenants' merges.
+    ///
+    /// With its turn it waits for the lock, in the lock's queue, so that a
+    /// flush of its own tenant costs it neither the turn nor its place, and
+    /// no flush that comes later goes first. That idles the turn, for at
+    /// most [`crate::TURN_IDLE_AT_MOST`]: past that, or as soon as a restore
+    /// is seen to hold the lock, the turn goes back, and the merge waits on
+    /// in the queue without one. Holding the lock, it takes a turn that is
+    /// free there and then, or lets the lock go and asks for one. Let go
+    /// each time, flushes longer than the wait, back to back, would have
+    /// the lock again before it had a turn, and it would see the start of a
+    /// flush every time. With every turn taken, and each flush longer than
+    /// the wait, whether it comes through with one depends on when its turn
+    /// falls in a flush: on timing, not by construction.
     async fn turn_and_building(
         &self,
         stopping: &Stopping,
         flush_due: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<(MergeBuild, Building<'_>)>> {
-        // What it waited for the lock without a turn, timed as the plan's
-        // wait for it; the rest as its wait for a turn.
+        // What it waited for the lock, timed as the plan's wait for it; the
+        // rest as its wait for a turn.
         let asked_turn = Instant::now();
         let mut waited = Duration::ZERO;
+        // A merge that had a turn and gives up is one that took a turn,
+        // counted by what ended it, whether or not it holds one now.
+        let mut had_turn = false;
+        let ended = |had_turn: bool, end| {
+            if had_turn {
+                self.timings.ended(end);
+            }
+        };
+        let planning = |build, guard, waited: Duration| {
+            let turn = asked_turn.elapsed().saturating_sub(waited);
+            self.timed(Timed::Merge(MergePhase::Turn), turn);
+            self.timed(Timed::BuildingWait(Holder::MergePlan), waited);
+            let planning = Building {
+                _guard: guard,
+                holder: Holder::MergePlan,
+                since: Instant::now(),
+                writer: self,
+                timed: true,
+            };
+            (build, planning)
+        };
         loop {
             if self.restoring.load(Ordering::SeqCst) {
                 // Its place, or a turn kept for it, is given up too.
                 lock(&self.merge_place).take();
+                ended(had_turn, MergeEnd::Stale);
                 return Ok(None);
             }
             let Some(build) = self
@@ -3523,28 +3719,53 @@ impl Writer {
                 .turn(&self.lease.key, stopping, flush_due, &self.merge_place)
                 .await?
             else {
+                ended(had_turn && stopping.is_stopped(), MergeEnd::Stopped);
                 return Ok(None);
             };
-            if let Ok(guard) = self.building.try_lock() {
-                let turn = asked_turn.elapsed().saturating_sub(waited);
-                self.timed(Timed::Merge(MergePhase::Turn), turn);
-                self.timed(Timed::BuildingWait(Holder::MergePlan), waited);
-                let planning = Building {
-                    _guard: guard,
-                    holder: Holder::MergePlan,
-                    since: Instant::now(),
-                    writer: self,
-                    timed: true,
-                };
-                return Ok(Some((build, planning)));
-            }
-            drop(build);
-            let asked = Instant::now();
-            let free = async { drop(self.building.lock().await) };
-            let free = stopping.unless_stopped(MergeStage::Queued, free).await;
-            waited += asked.elapsed();
-            if free.is_none() {
-                return Ok(None);
+            had_turn = true;
+            let idle = Instant::now();
+            let at_most = self.merge_builds.idle_at_most();
+            let building = self.building.lock();
+            tokio::pin!(building);
+            let with_its_turn = async {
+                tokio::select! {
+                    biased;
+                    guard = &mut building => Some(guard),
+                    () = self.restore_seen() => None,
+                    () = tokio::time::sleep(at_most) => None,
+                }
+            };
+            let held = stopping
+                .unless_stopped(MergeStage::Queued, with_its_turn)
+                .await;
+            self.timed(Timed::Merge(MergePhase::TurnIdle), idle.elapsed());
+            waited += idle.elapsed();
+            let guard = match held {
+                // A merge that had its turn, and built nothing of it.
+                None => {
+                    ended(true, MergeEnd::Stopped);
+                    return Ok(None);
+                }
+                Some(Some(guard)) => return Ok(Some(planning(build, guard, waited))),
+                Some(None) => {
+                    drop(build);
+                    let asked = Instant::now();
+                    let free = stopping
+                        .unless_stopped(MergeStage::Queued, &mut building)
+                        .await;
+                    waited += asked.elapsed();
+                    match free {
+                        Some(guard) => guard,
+                        None => {
+                            ended(true, MergeEnd::Stopped);
+                            return Ok(None);
+                        }
+                    }
+                }
+            };
+            let free = self.merge_builds.turn_free_now(&self.lease.key, stopping);
+            if let Some(build) = free {
+                return Ok(Some(planning(build, guard, waited)));
             }
         }
     }
