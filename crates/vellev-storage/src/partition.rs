@@ -111,13 +111,7 @@ fn segment_built(
         build.held_here(stopping, HeldAt::Start);
     }
     assert!(!stopping.panics(), "a merge's build panics, as a test asks");
-    let vectors = match vectors {
-        Some(gathered) => match on.section("finishing", || gathered.finish(format)) {
-            Ok(column) => Some(column),
-            Err(_) => return Ok(None),
-        },
-        None => None,
-    };
+    let vectors = vectors.map(|gathered| on.section("finishing", || gathered.finish(format)));
     let indexes = match &vectors {
         Some(column) => state::indexed(
             catalog,
@@ -147,20 +141,13 @@ fn segment_built(
         return Ok(None);
     }
     let vectors = vectors.unwrap_or_else(|| Column::taken_from(&mut file.rows));
-    let Ok(segment) = on.section("encoding", || encode_as(Kind::Segment, format, &file)) else {
-        return Ok(None);
-    };
-    let segment = segment?;
+    let segment = on.section("encoding", || encode_as(Kind::Segment, format, &file))?;
     if stopping.stopped(MergeStage::Encoding) {
         return Ok(None);
     }
-    let Ok(column) = on.section("encoding_vectors", || vectors.encode_as(format)) else {
-        return Ok(None);
-    };
+    let column = on.section("encoding_vectors", || vectors.encode_as(format));
     // Here, off the async threads and the state's lock, once.
-    let Ok(parts) = on.section("parts", || state::Parts::of(&file, &indexes)) else {
-        return Ok(None);
-    };
+    let parts = on.section("parts", || state::Parts::of(&file, &indexes));
     if let Some(build) = build {
         build.held_here(stopping, HeldAt::Built);
     }
@@ -2730,7 +2717,7 @@ impl Writer {
             // it is. Its gather and its build each timed where they run, so
             // that neither counts the other.
             let on = match &build {
-                Some(build) => OnPool::merge(build.builds(), stopping.stop()),
+                Some(build) => OnPool::merge(build),
                 None => OnPool::global(),
             };
             let cpu = vellev_index::pool::thread_cpu();
@@ -3320,7 +3307,7 @@ impl Writer {
             // On the pool its node gives merge builds, as the rest of the
             // build is; timed from its turn there, so that the copy alone
             // is, however long it waits or is held.
-            let gathered = on.section("gathering", || {
+            on.section("gathering", || {
                 let gathering = Instant::now();
                 let mut goes_on = |rows| {
                     if let Some(build) = build {
@@ -3347,8 +3334,7 @@ impl Writer {
                 }
                 timings.record(Timed::Merge(MergePhase::Gather), &key, gathering.elapsed());
                 Some((file, Some(vectors), shape))
-            });
-            gathered.ok().flatten()
+            })
         }
     }
 

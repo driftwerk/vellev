@@ -1720,8 +1720,10 @@ impl Node {
             merge_builds: match settings.merge_pool {
                 MergePool::Global => MergeBuilds::new(MERGE_BUILDS),
                 MergePool::Own { threads, nice } => MergeBuilds::building_on(
-                    MERGE_BUILDS,
-                    Arc::new(vellev_storage::merge_pool(threads, nice)),
+                    vellev_storage::merge_slots(MERGE_BUILDS, threads, nice)
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect(),
                 ),
             },
             census: Mutex::default(),

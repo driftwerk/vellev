@@ -33,7 +33,7 @@ fn nice_of_threads(prefix: &str) -> Vec<i64> {
 /// lower, and the read and tuning pools, made first, as the process runs.
 #[test]
 fn a_merge_pools_threads_run_at_its_nice_and_no_other_pools_do() {
-    let merges = pool::merge_builds(3, 5);
+    let merges = pool::merge_slots(1, 3, 5).pop().unwrap();
     // Every thread started and running.
     merges.broadcast(|_| ());
     pool::reads().broadcast(|_| ());

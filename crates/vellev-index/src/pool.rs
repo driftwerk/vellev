@@ -185,14 +185,8 @@ pub fn thread_cpu() -> Option<Duration> {
 ///
 /// A pass names what it is, for whoever keeps track.
 pub trait Passes: Copy + Send + Sync {
-    /// Run `pass`, named `name`, and give back what it gives; or give up
-    /// without running it, [`Stopped`], should the build be stopped while
-    /// waiting for it to be run.
-    fn pass<R: Send>(
-        self,
-        name: &'static str,
-        pass: impl FnOnce() -> R + Send,
-    ) -> Result<R, Stopped>;
+    /// Run `pass`, named `name`, and give back what it gives.
+    fn pass<R: Send>(self, name: &'static str, pass: impl FnOnce() -> R + Send) -> R;
 }
 
 /// Each pass on the pool of the thread that asks: rayon's global one, off
@@ -201,18 +195,23 @@ pub trait Passes: Copy + Send + Sync {
 pub struct CallersPool;
 
 impl Passes for CallersPool {
-    fn pass<R: Send>(self, _: &'static str, pass: impl FnOnce() -> R + Send) -> Result<R, Stopped> {
-        Ok(pass())
+    fn pass<R: Send>(self, _: &'static str, pass: impl FnOnce() -> R + Send) -> R {
+        pass()
     }
 }
 
-/// A pool for merges to build on, apart from rayon's global one, which
-/// builds flushes and loads: `threads` threads, named `vellev-merge-N`,
-/// each run `nice` lower than the rest of the process (merge note, §3). A
-/// pool smaller than the global one leaves cores to reads and flushes
-/// while merges build; one lower in priority yields them the CPU while
-/// they want it. Made after the read, tuning and passes pools, so that
-/// none of those is ever made from one of its threads and runs lower too.
+/// Pools for merges to build on, apart from rayon's global one, which
+/// builds flushes and loads: `slots` pools of `threads / slots` threads,
+/// one for each build that runs at once, the threads of slot `s` named
+/// `vellev-merge-s-N`, each run `nice` lower than the rest of the process
+/// (merge note, §3 and §9.2). Threads over a whole share are left unused,
+/// so that the slots are equal. Pools smaller than the global one leave
+/// cores to reads and flushes while merges build; ones lower in priority
+/// yield them the CPU while they want it. A build has a pool to itself,
+/// as a thread of a pool shared by two, waiting in one build's work, would
+/// take on the other's. Made after the read, tuning and passes pools, so
+/// that none of those is ever made from one of their threads and runs
+/// lower too.
 ///
 /// On Linux a thread's priority is its own, and lowering it needs no
 /// privilege; raising it back would, so it is never asked. Elsewhere, and
@@ -221,18 +220,24 @@ impl Passes for CallersPool {
 ///
 /// # Panics
 ///
-/// If `threads` is 0, or the pool's threads cannot be started.
-pub fn merge_builds(threads: usize, nice: i32) -> ThreadPool {
-    assert!(threads >= 1, "a merge pool has a thread at least");
+/// If `slots` is 0 or `threads` is under `slots`, or the pools' threads
+/// cannot be started.
+pub fn merge_slots(slots: usize, threads: usize, nice: i32) -> Vec<ThreadPool> {
+    assert!(slots >= 1, "merges are built at least one at a time");
+    assert!(threads >= slots, "a merge slot has a thread at least");
     reads();
     tuning();
     passes();
-    ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|n| format!("vellev-merge-{n}"))
-        .start_handler(move |_| lowered_by(nice))
-        .build()
-        .expect("the merge pool's threads")
+    (0..slots)
+        .map(|slot| {
+            ThreadPoolBuilder::new()
+                .num_threads(threads / slots)
+                .thread_name(move |n| format!("vellev-merge-{slot}-{n}"))
+                .start_handler(move |_| lowered_by(nice))
+                .build()
+                .expect("a merge slot's threads")
+        })
+        .collect()
 }
 
 /// The pool a rows pass makes its curve on (recall note, R9.5): one

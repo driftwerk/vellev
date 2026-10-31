@@ -896,7 +896,7 @@ fn kmeans(
                     Err(Stopped) => 0,
                 })
                 .collect()
-        })?;
+        });
         stop.passed()?;
         if next == assigned {
             break;
@@ -990,7 +990,7 @@ impl ClusteredIndex {
                     Err(Stopped) => Vec::new(),
                 })
                 .collect()
-        })?;
+        });
         stop.passed()?;
         let centroids = match training.is_empty() {
             true => vec![0.0; k * width],
@@ -1042,7 +1042,7 @@ impl ClusteredIndex {
                     (cluster, code, factor)
                 })
                 .collect()
-        })?;
+        });
         stop.passed()?;
 
         let mut members: Vec<(Vec<u32>, Vec<u64>, Vec<Factor>)> =
