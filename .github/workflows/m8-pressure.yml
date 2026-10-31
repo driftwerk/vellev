@@ -33,7 +33,7 @@ jobs:
           git checkout -- crates/vellev/examples/merge_pressure.rs
       - name: Build main before it
         run: |
-          git worktree add ../before ada7a63
+          git worktree add ../before 155af7f
           mkdir -p ../before/crates/vellev/examples
           cp crates/vellev/examples/merge_pressure.rs ../before/crates/vellev/examples/
           cp crates/vellev/Cargo.toml ../before/crates/vellev/Cargo.toml
