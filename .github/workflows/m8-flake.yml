@@ -1,0 +1,60 @@
+name: M8 a handover's rule, again and again (scratch)
+on:
+  push:
+    branches: [scratch-m8-flake]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  RUST_BACKTRACE: 0
+jobs:
+  again:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, main]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: vellev
+          POSTGRES_PASSWORD: vellev
+          POSTGRES_DB: vellev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vellev"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      VELLEV_TEST_DATABASE_URL: postgres://vellev:vellev@127.0.0.1:5432/vellev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup show
+      - name: Main, if this side is main's
+        if: matrix.side == 'main'
+        run: git checkout 155af7f
+      - name: The rule, 40 times, each alone and then under load
+        run: |
+          cargo test --locked -p vellev --test client --no-run 2>&1 | tail -2
+          bin=$(ls -t target/debug/deps/client-* | grep -v '\.d$' | head -1)
+          fails=0
+          for run in $(seq 1 40); do
+            if ! "$bin" --exact a_node_stopped_and_replaced_under_load_fails_no_request > out.log 2>&1; then
+              fails=$((fails + 1)); tail -30 out.log | cut -c1-300
+            fi
+          done
+          echo "alone: $fails of 40 failed" | tee -a "$GITHUB_STEP_SUMMARY"
+          fails=0
+          for run in $(seq 1 40); do
+            if ! "$bin" --test-threads=4 > out.log 2>&1; then
+              fails=$((fails + 1)); grep -E 'FAILED$' out.log | head -3
+            fi
+          done
+          echo "the binary whole: $fails of 40 failed" | tee -a "$GITHUB_STEP_SUMMARY"
