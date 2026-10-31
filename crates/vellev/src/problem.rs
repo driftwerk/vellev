@@ -160,6 +160,7 @@ fn code(error: &StorageError) -> Code {
         }
         E::Coordinator(_)
         | E::Blob { .. }
+        | E::NoRoom { .. }
         | E::Embedding { .. }
         | E::Closed
         | E::Restoring
