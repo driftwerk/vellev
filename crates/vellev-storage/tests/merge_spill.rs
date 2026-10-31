@@ -889,7 +889,8 @@ async fn a_disk_that_really_fills_fails_the_merge_and_leaves_nothing() {
     settled("what it wrote stays", || files(cache.path()) == before).await;
     assert_eq!(cluster.committed().await.manifest, manifest);
 
-    told.free.store(SpillsTold::ASK_THE_DISK, Ordering::SeqCst);
+    // With the room back the merge commits, told so: a small disk never has
+    // what asking wants to spare.
     std::fs::remove_file(&ballast).unwrap();
     let merged = within(LONG, "the merge with room", writer.merge()).await;
     assert!(merged.unwrap().is_some());
