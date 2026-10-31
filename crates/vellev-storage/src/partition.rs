@@ -389,10 +389,17 @@ impl Partition {
     }
 
     /// What segments a merge replaced are counted to hold until they are
-    /// freed, off this partition's state and so not in [`Self::figures`].
-    /// Read without its lock, as those are.
+    /// freed, which are out of this partition's state and so not in
+    /// [`Self::figures`]. Read without its lock, as those are.
     pub fn freeing(&self) -> usize {
         self.state.freeing()
+    }
+
+    /// About how many bytes the partition holds in memory now: its
+    /// [`Self::figures`], with what it has yet to free. Read without its
+    /// lock, as a node reads it of every tenant for its memory budget.
+    pub fn resident(&self) -> usize {
+        self.state.resident()
     }
 
     /// Count `bytes` as being freed, for good. For tests.
@@ -405,6 +412,12 @@ impl Partition {
     /// [`Published::changing`].
     fn changing<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
         self.state.changing(f)
+    }
+
+    /// Adopt a checkpoint as `f` does, publishing all the state then comes
+    /// to: see [`Published::adopting`].
+    fn adopting(&self, f: impl FnOnce(&mut State) -> Discarded) -> Discarded {
+        self.state.adopting(f)
     }
 
     /// Apply a commit as `f` does, publishing what it changes: see
@@ -1881,9 +1894,11 @@ impl Writer {
 
     /// Commit the checkpoint `frame` under `key` at `position` and adopt it
     /// in memory as `adopt` does, which is all a checkpoint does while the
-    /// writer is held; then give the turn back and free what the checkpoint
-    /// took out of memory. Once the commit is made nothing is left to fail:
-    /// what `adopt` adopts was seen to be fit before the writer was held.
+    /// writer is held; then give the turn back and let what the checkpoint
+    /// took out of memory go, to be freed off the async threads with nothing
+    /// waiting for it (see [`Discarded`]). Once the commit is made nothing
+    /// is left to fail: what `adopt` adopts was seen to be fit before the
+    /// writer was held.
     async fn checkpoint(
         &self,
         turn: Turn<'_>,
@@ -1897,7 +1912,7 @@ impl Writer {
                 self.publish(&turn, key, frame, position, None, None)
                     .await?;
                 let adopting = Instant::now();
-                let adopted = self.partition.changing(adopt);
+                let adopted = self.partition.adopting(adopt);
                 tracing::debug!(
                     partition = %self.lease.key,
                     ?position,
@@ -1918,7 +1933,8 @@ impl Writer {
             }
         }
         drop(turn);
-        blocking(move || drop(discarded)).await
+        drop(discarded);
+        Ok(())
     }
 
     /// What a checkpoint does before the writer is held: copy the rows of
@@ -3045,8 +3061,9 @@ impl Writer {
         staged.keep();
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, |state| {
-            state.compacted(&merge, merged);
-            state.flushed(&key, position, snapshot, segment, Some(kept))
+            let replaced = state.compacted(&merge, merged);
+            let flushed = state.flushed(&key, position, snapshot, segment, Some(kept));
+            flushed.and(replaced)
         })
         .await?;
         self.epoch.fetch_add(1, Ordering::SeqCst);

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use vellev_index::curve::{Curve, Source};
 
@@ -1105,11 +1106,80 @@ pub struct TextsApplied {
     pub under_lock: usize,
 }
 
-/// What a flush takes out of the memtable: freeing it takes long enough
-/// that it is better done without holding the state.
+/// What a checkpoint takes out of the state: the rows and indexes a flush
+/// takes out of the memtable, and the segments a merge replaces. Freeing it
+/// takes long enough that it is better done without holding the state: of
+/// replaced segments, most of what a merge's commit would hold the state's
+/// write lock for (node memory note, §2.9).
 pub(crate) struct Discarded {
-    _rows: Vec<Row>,
-    _indexes: Indexes,
+    rows: Vec<Row>,
+    indexes: Indexes,
+    segments: Vec<Segment>,
+    /// The segments as counted until they are freed, if they are.
+    counted: Option<Counted>,
+}
+
+/// `bytes` counted in `freeing` until this goes.
+struct Counted {
+    freeing: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.freeing.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+impl Discarded {
+    /// This, and the segments `replaced` holds: what a merge's commit takes
+    /// out of the state, along with what the flush committed with it does.
+    pub(crate) fn and(mut self, mut replaced: Discarded) -> Discarded {
+        self.segments.append(&mut replaced.segments);
+        self
+    }
+
+    /// Count its segments in `freeing`, as they leave what the state comes
+    /// to, until they are freed. Rows and indexes are not: all they ever
+    /// come to is what a flush holds.
+    pub(crate) fn count_in(&mut self, freeing: &Arc<AtomicUsize>) {
+        let bytes = self.segments.iter().map(|segment| segment.resident).sum();
+        freeing.fetch_add(bytes, Ordering::SeqCst);
+        let freeing = freeing.clone();
+        self.counted = Some(Counted { freeing, bytes });
+    }
+}
+
+impl Drop for Discarded {
+    /// Let go on an async thread, as a checkpoint lets it go, and as one
+    /// dropped once adopted does where it stood: it may be the last to hold
+    /// a replaced segment of a million rows. Sent off without a turn among
+    /// the work there, and not waited for, as a [`Run`] is: what lets it go
+    /// holds the building lock, and whatever waits for that, as a flush
+    /// does, would wait for the turn and the free too.
+    fn drop(&mut self) {
+        #[cfg(test)]
+        for segment in &self.segments {
+            if let Some(probe) = &segment.probe {
+                (probe.0)(Probed::LetGo);
+            }
+        }
+        let rows = std::mem::take(&mut self.rows);
+        let indexes = std::mem::take(&mut self.indexes);
+        let segments = std::mem::take(&mut self.segments);
+        let counted = self.counted.take();
+        if rows.is_empty() && indexes.is_empty() && segments.is_empty() {
+            return;
+        }
+        let free = move || {
+            drop((segments, rows, indexes));
+            drop(counted);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(free)),
+            Err(_) => free(),
+        }
+    }
 }
 
 /// What a flush takes from the state to build its segment while commits go
@@ -2604,8 +2674,9 @@ impl State {
     /// Carry out a committed merge: the run's segments go, and the merged
     /// one takes their place. A row of the run that died since the merged
     /// file was made is dead in it too. The flush committed with it is
-    /// adopted after, by [`Self::flushed`].
-    pub(crate) fn compacted(&mut self, merge: &Merge, merged: Fit) {
+    /// adopted after, by [`Self::flushed`]. Returns the run's segments, to
+    /// be freed without holding the state.
+    pub(crate) fn compacted(&mut self, merge: &Merge, merged: Fit) -> Discarded {
         let Fit {
             meta,
             file,
@@ -2642,20 +2713,23 @@ impl State {
                 }
             }
         }
-        self.segments.splice(
-            run.clone(),
-            [Segment {
-                #[cfg(test)]
-                probe: None,
-                resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
-                meta,
-                file,
-                vectors,
-                indexes,
-                dead: DeadRows::of(dead.into_iter()),
-                parts,
-            }],
-        );
+        let merged = Segment {
+            #[cfg(test)]
+            probe: None,
+            resident: segment_bytes(&file.rows, &vectors) + indexes_bytes(&indexes),
+            meta,
+            file,
+            vectors,
+            indexes,
+            dead: DeadRows::of(dead.into_iter()),
+            parts,
+        };
+        Discarded {
+            rows: Vec::new(),
+            indexes: Indexes::new(),
+            segments: self.segments.splice(run, [merged]).collect(),
+            counted: None,
+        }
     }
 
     /// What a flush needs to build its segment without the writer, or
@@ -2941,8 +3015,10 @@ impl State {
             ..
         } = &mut self.memtable;
         let discarded = Discarded {
-            _rows: rows.drain(..held).collect(),
-            _indexes: std::mem::take(indexes),
+            rows: rows.drain(..held).collect(),
+            indexes: std::mem::take(indexes),
+            segments: Vec::new(),
+            counted: None,
         };
         *bytes = rows.iter().map(row_bytes).sum();
         dead.drain(..held);

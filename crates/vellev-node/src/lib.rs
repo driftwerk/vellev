@@ -2315,7 +2315,7 @@ impl Inner {
         let open = self.opened();
         let writers: usize = (open.tenants.values())
             .filter_map(|opening| opening.get())
-            .map(|tenant| tenant.figures().resident)
+            .map(|tenant| tenant.partition().resident())
             .sum();
         let copies: usize = (open.followers.values())
             .filter_map(|following| following.get())
@@ -2352,7 +2352,9 @@ impl Inner {
         held.into_iter()
             .map(|(id, kind)| {
                 let (unused, size, warmed) = match &kind {
-                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.figures().resident, false),
+                    Kind::Writer(_, tenant) => {
+                        (tenant.idle(), tenant.partition().resident(), false)
+                    }
                     Kind::Copy(_, copy) => (copy.idle(), copy.resident(), copy.warmed().is_some()),
                 };
                 Held {

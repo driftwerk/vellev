@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::state::{Figures, State};
+use crate::state::{Discarded, Figures, State};
 
 /// The state, and what it came to as it was last changed. The fields are
 /// private, so that nothing changes the state but [`Self::changing`] and
@@ -33,10 +33,17 @@ impl Published {
     }
 
     /// What segments taken out of the state are counted to hold until they
-    /// are freed, which is not counted in what the state comes to. Read
+    /// are freed, which what the state comes to does not count. Read
     /// without its lock.
     pub(crate) fn freeing(&self) -> usize {
         self.freeing.load(Ordering::SeqCst)
+    }
+
+    /// What the state came to as it was last changed, with what it took out
+    /// and has yet to free: all it holds in memory. Read in this order, as
+    /// [`Self::adopting`] counts in the other, so that it never falls short.
+    pub(crate) fn resident(&self) -> usize {
+        self.figures().resident + self.freeing()
     }
 
     /// Count `bytes` as being freed, for good: for a test.
@@ -53,6 +60,18 @@ impl Published {
         let changed = f(&mut state);
         *self.figures.lock().expect("figures lock") = state.figures();
         changed
+    }
+
+    /// As [`Self::changing`], for adopting a checkpoint: the segments `f`
+    /// takes out of the state go on being counted, in [`Self::freeing`],
+    /// until they are freed. Counted before what the state comes to without
+    /// them is published, so that they are never gone from both.
+    pub(crate) fn adopting(&self, f: impl FnOnce(&mut State) -> Discarded) -> Discarded {
+        self.changing(|state| {
+            let mut discarded = f(state);
+            discarded.count_in(&self.freeing);
+            discarded
+        })
     }
 
     /// As [`Self::changing`], for applying a commit, which changes the
