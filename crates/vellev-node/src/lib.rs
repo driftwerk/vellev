@@ -613,6 +613,8 @@ struct Settling {
 #[derive(Debug, Default)]
 struct Hold {
     lost: AtomicBool,
+    /// The node's counts of the merges stopped by losing a hold.
+    stops: Arc<StopCounts>,
     /// The tenant's queue of writes, once it is open.
     commits: OnceLock<GroupCommitter>,
     /// The tenant's writer, once it is open.
@@ -631,15 +633,19 @@ impl Hold {
     /// build, which an aborted task would leave running, gives up and lets
     /// go of what it holds (merge note, step 3). All of it under the tasks'
     /// lock, which [`Self::opened`] takes too, so that writes and a writer
-    /// set as the tenant opens are stopped whichever comes first.
-    fn lose(&self) {
+    /// set as the tenant opens are stopped whichever comes first. A merge
+    /// this stops is counted as stopped for `why`; one stopped already is
+    /// not, so what first stopped it is what it is counted as.
+    fn lose(&self, why: Lost) {
         let mut tasks = self.tasks.lock().expect("tasks lock");
         self.lost.store(true, Ordering::SeqCst);
         if let Some(commits) = self.commits.get() {
             commits.stop();
         }
         if let Some(writer) = self.writer.get().and_then(Weak::upgrade) {
-            writer.stop_merges();
+            if writer.stop_merges() {
+                self.stops.count(why);
+            }
         }
         std::mem::take(&mut *tasks)
             .iter()
@@ -678,7 +684,50 @@ impl Hold {
 
 impl Drop for Tenant {
     fn drop(&mut self) {
-        self.work.hold.lose();
+        self.work.hold.lose(Lost::Dropped);
+    }
+}
+
+/// Why a hold on a tenant was lost, as a merge that stopped is counted.
+#[derive(Debug, Clone, Copy)]
+enum Lost {
+    /// A sweep let the tenant go.
+    LetGo,
+    /// Its lease ran out or was lost, or its writer can write no more.
+    Lease,
+    /// It was dropped, by a request or as nothing held it any more.
+    Dropped,
+    /// The node gave up every tenant.
+    Shutdown,
+}
+
+/// How many merges losing a hold has stopped, each once, by why it was lost.
+#[derive(Debug, Default)]
+struct StopCounts {
+    let_go: AtomicU64,
+    lease: AtomicU64,
+    dropped: AtomicU64,
+    shutdown: AtomicU64,
+}
+
+impl StopCounts {
+    fn count(&self, why: Lost) {
+        let count = match why {
+            Lost::LetGo => &self.let_go,
+            Lost::Lease => &self.lease,
+            Lost::Dropped => &self.dropped,
+            Lost::Shutdown => &self.shutdown,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn counted(&self) -> MergesStopped {
+        MergesStopped {
+            let_go: self.let_go.load(Ordering::Relaxed),
+            lease: self.lease.load(Ordering::Relaxed),
+            drop: self.dropped.load(Ordering::Relaxed),
+            shutdown: self.shutdown.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1103,7 +1152,7 @@ impl Tenant {
         let ended = tokio::spawn(async move {
             let ended = restoring.await;
             if work.writer.is_closed() {
-                work.hold.lose();
+                work.hold.lose(Lost::Lease);
             }
             ended.map(|(restored, _ending)| restored)
         });
@@ -1297,7 +1346,7 @@ impl TenantWork {
     /// that says it is closed is gone for good too.
     fn failed(&self, error: StorageError) -> NodeError {
         if self.writer.is_closed() || matches!(error.root(), StorageError::Closed) {
-            self.hold.lose();
+            self.hold.lose(Lost::Lease);
         }
         self.told(error)
     }
@@ -1472,6 +1521,8 @@ struct Inner {
     /// How many merges sweeps have stopped so that a tenant over the
     /// budget could be let go.
     stopped_for_budget: AtomicU64,
+    /// How many merges losing a hold on a tenant has stopped.
+    merges_stopped: Arc<StopCounts>,
 }
 
 /// Flushes that failed, and writes refused while they did.
@@ -1524,15 +1575,18 @@ pub struct Merges {
     /// How many merge turns were let go so, since the node started.
     pub held_let_go: u64,
     /// How many merges sweeps have stopped since the node started, so that
-    /// a tenant over the memory budget could be let go.
+    /// a tenant over the memory budget could be let go, each once: none
+    /// among [`Self::stopped`].
     pub stopped_for_budget: u64,
     /// How many merges losing a hold on a tenant has stopped since the node
-    /// started.
+    /// started, each once, by what first stopped it.
     pub stopped: MergesStopped,
 }
 
 /// How many merges losing a hold on a tenant has stopped, since the node
-/// started, by why the hold was lost.
+/// started, by why the hold was lost: a sweep let the tenant go, its lease
+/// was lost or its writer can write no more, it was dropped, or the node
+/// shut down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MergesStopped {
     pub let_go: u64,
@@ -1681,6 +1735,7 @@ impl Node {
             started: Instant::now(),
             held_elsewhere: AtomicU64::new(0),
             stopped_for_budget: AtomicU64::new(0),
+            merges_stopped: Arc::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -1845,7 +1900,7 @@ impl Node {
             abandoned: builds.abandoned(),
             held_let_go: builds.held_let_go(),
             stopped_for_budget: self.0.stopped_for_budget.load(Ordering::Relaxed),
-            stopped: MergesStopped::default(),
+            stopped: self.0.merges_stopped.counted(),
         }
     }
 
@@ -1992,7 +2047,7 @@ impl Node {
         self.0.opened().followers.remove(tenant);
         let opening = self.0.opened().tenants.remove(tenant);
         if let Some(opened) = opening.as_ref().and_then(|opening| opening.get()) {
-            opened.work.hold.lose();
+            opened.work.hold.lose(Lost::Dropped);
         }
         // What is left of its history is forgotten by its purge, under the
         // claim that purges it, a batch at a time.
@@ -2124,7 +2179,7 @@ impl Node {
                 .filter(|tenant| !tenant.held())
                 .cloned();
             if let Some(lost) = lost {
-                lost.work.hold.lose();
+                lost.work.hold.lose(Lost::Lease);
                 open.tenants.remove(tenant);
             }
             open.tenants.entry(tenant.clone()).or_default().clone()
@@ -2174,7 +2229,7 @@ impl Node {
         for opening in openings {
             let unopened = || async { Err(NodeError::Stopped) };
             if let Ok(tenant) = opening.get_or_try_init(unopened).await {
-                tenant.work.hold.lose();
+                tenant.work.hold.lose(Lost::Shutdown);
                 self.0.release(tenant.work.writer.lease()).await;
             }
         }
@@ -2308,7 +2363,7 @@ impl Inner {
                     tracing::warn!(tenant = %tenant.id(), %error, "flush before letting go failed");
                 }
             }
-            tenant.work.hold.lose();
+            tenant.work.hold.lose(Lost::LetGo);
             self.release(tenant.work.writer.lease()).await;
             tracing::info!(tenant = %tenant.id(), "let go of a tenant");
         }
@@ -2499,7 +2554,10 @@ impl Inner {
             }
             Err(error) => return Err(error.into()),
         };
-        let hold = Arc::new(Hold::default());
+        let hold = Arc::new(Hold {
+            stops: self.merges_stopped.clone(),
+            ..Hold::default()
+        });
         let deadline = Arc::new(Mutex::new(lease.deadline()));
         self.renewing(lease.clone(), hold.clone(), &deadline);
         let opened = Writer::open(
@@ -2674,7 +2732,7 @@ impl Inner {
                     .is_some_and(|writer| writer.is_closed() || writer.stalled());
                 if unusable {
                     tracing::warn!(partition = %lease.key, "the writer is closed or stuck; the hold on the tenant is given up");
-                    hold.lose();
+                    hold.lose(Lost::Lease);
                     return;
                 }
                 let asked = Instant::now();
@@ -2685,7 +2743,7 @@ impl Inner {
                     }
                     Ok(Err(error)) if !error.is_retryable() => {
                         tracing::warn!(partition = %lease.key, %error, "hold on the tenant lost");
-                        hold.lose();
+                        hold.lose(Lost::Lease);
                         return;
                     }
                     Ok(Err(error)) => {
