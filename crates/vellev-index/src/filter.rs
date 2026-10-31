@@ -498,8 +498,10 @@ pub struct RowIndex {
 impl RowIndex {
     /// About how many bytes the index takes in memory: every row recorded,
     /// and each property's values, with the text of each, the rows holding
-    /// each, and the runs over them. Rough, and a walk over every value.
+    /// each, and the runs over them. Rough, and a walk over every value, a
+    /// property to a thread.
     pub fn resident(&self) -> usize {
+        use rayon::prelude::*;
         // Its place in its map, a node's share of it, and what a bitmap's
         // vector of containers takes at its least, four of them: as a value
         // held by one row is measured to take, 245 bytes past its text.
@@ -507,7 +509,7 @@ impl RowIndex {
         let bitmap = |rows: &RoaringBitmap| rows.serialized_size();
         let properties: usize = self
             .properties
-            .iter()
+            .par_iter()
             .map(|(name, index)| {
                 let values: usize = index
                     .values

@@ -714,7 +714,7 @@ const RECKONED_DEATHS: [Shape; 6] = [
         .dying(AT_ONCE, 2 * AT_ONCE),
     // Long rows die as short rows stay.
     Shape::of(CHUNKED, NARROW, LONG_FIRST)
-        .shared(&[1])
+        .shared(&[1, 1])
         .dying(0, AT_ONCE),
     Shape::of(2 * AT_ONCE, NARROW, LONG_FIRST)
         .shared(&[1])

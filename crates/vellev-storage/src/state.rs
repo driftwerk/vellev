@@ -883,11 +883,13 @@ pub(crate) struct Parts {
 
 impl Parts {
     /// Of a segment of `file`'s rows, indexed as `indexes`. A walk over
-    /// every row, token and value, each once.
+    /// every row, token and value, each once, and the rows on several
+    /// threads.
     pub(crate) fn of(file: &SegmentFile, indexes: &Indexes) -> Self {
+        use rayon::prelude::*;
         let mut blocks: Vec<Block> = file
             .rows
-            .chunks(ROWS_IN_BLOCK)
+            .par_chunks(ROWS_IN_BLOCK)
             .map(|rows| {
                 let mut block = Block::default();
                 for row in rows {
