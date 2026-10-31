@@ -722,7 +722,7 @@ impl Collector for Counted {
         let counter = ConstCounter::new(node.tenants_kept_by_sweeps());
         counter.encode(encoder.encode_descriptor(
             "sweep_tenants_kept",
-            "Tenants a sweep chose to let go, for being idle or for the memory budget, but found something else holding, as a request or a merge does: let go at a later round",
+            "Tenants a sweep chose to let go, for being idle or for the memory budget, but found something else holding, as a request or a merge does, or with their building lock busy: let go at a later round",
             None,
             counter.metric_type(),
         )?)?;

@@ -2259,7 +2259,7 @@ impl Node {
 
     /// How many tenants sweeps chose to let go, for being idle or for the
     /// memory budget, but found something else holding, as a request or a
-    /// merge does: let go at a later round.
+    /// merge does, or with their building lock busy: let go at a later round.
     pub fn tenants_kept_by_sweeps(&self) -> u64 {
         self.0.held_elsewhere.load(Ordering::Relaxed)
     }
