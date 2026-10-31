@@ -796,13 +796,6 @@ impl Tenant {
         self.deadline.lock().expect("deadline lock")
     }
 
-    /// Have each of the tenant's merges panic as it builds, or not. For
-    /// tests.
-    #[doc(hidden)]
-    pub fn panic_merges_in_build(&self, panics: bool) {
-        self.writer.panic_merges_in_build(panics);
-    }
-
     /// When the hold on the tenant runs out unless renewed: each renewal
     /// moves it on. For tests.
     #[doc(hidden)]
@@ -986,6 +979,14 @@ impl Tenant {
     /// When the next flush may be tried, if the last one tried failed.
     fn flush_retried_at(&self) -> Option<Instant> {
         self.backoff.lock().expect("backoff lock").1
+    }
+
+    /// How long until the flush that failed is to be tried again, if it is
+    /// to be: not with too few rows for maintenance to flush.
+    fn flush_wait(&self) -> Option<Duration> {
+        let at = self.flush_retried_at()?;
+        (self.read(State::unflushed) >= self.flush_rows)
+            .then(|| at.saturating_duration_since(Instant::now()))
     }
 
     /// Note how the flush tried went: one that failed puts the next off,
@@ -2521,7 +2522,10 @@ impl Inner {
     /// clean up its files after each flush and now and then regardless,
     /// for as long as the tenant is open and held. The task holds no
     /// reference of its own between rounds, so dropping the tenant ends
-    /// it, and losing the hold stops it wherever it is.
+    /// it, and losing the hold stops it wherever it is. A hold that has run
+    /// out is not lost: renewing goes on trying, and may yet bring it back,
+    /// so the task waits, looking as often as a hold is renewed, and does
+    /// then what it was asked to meanwhile.
     fn maintaining(&self, tenant: &Arc<Tenant>, mut wanted: mpsc::Receiver<()>) {
         let Settings {
             restore_window,
@@ -2530,20 +2534,24 @@ impl Inner {
         } = self.settings;
         let every =
             (restore_window / 24).clamp(Duration::from_secs(60), Duration::from_secs(60 * 60));
+        let lapsed_every = self.settings.lease / 3;
         let coordinator = self.coordinator.clone();
         let hold = tenant.hold.clone();
         let tenant = Arc::downgrade(tenant);
         let maintaining = tokio::spawn(async move {
+            // A flush a write asked for, not yet looked at.
+            let mut asked = false;
             loop {
                 // While flushes fail, the next is tried as soon as its
-                // backoff lets it, whether or not a write asks for it.
-                let retried_at = tenant
-                    .upgrade()
-                    .and_then(|tenant| tenant.flush_retried_at());
-                let wait = retried_at.map_or(every, |at| {
-                    every.min(at.saturating_duration_since(Instant::now()))
-                });
-                let flush = match tokio::time::timeout(wait, wanted.recv()).await {
+                // backoff lets it, whether or not a write asks for it. Only
+                // while one is due: with too few rows to flush, nothing here
+                // would try one, and the wait would be over for good.
+                let wait = match tenant.upgrade() {
+                    Some(tenant) if !tenant.held() => lapsed_every,
+                    Some(tenant) => tenant.flush_wait().map_or(every, |wait| every.min(wait)),
+                    None => every,
+                };
+                asked |= match tokio::time::timeout(wait, wanted.recv()).await {
                     Ok(Some(())) => true,
                     Ok(None) => return,
                     Err(_) => false,
@@ -2551,13 +2559,16 @@ impl Inner {
                 let Some(tenant) = tenant.upgrade() else {
                     return;
                 };
-                if !tenant.held() {
+                if tenant.hold.is_lost() {
                     return;
+                }
+                if !tenant.held() {
+                    continue;
                 }
                 // One that failed is tried again on its own, if no write
                 // asks, but never sooner than its backoff lets it. One put
                 // off for that still lets the tenant be looked after.
-                let due = flush || tenant.flush_retried_at().is_some();
+                let due = std::mem::take(&mut asked) || tenant.flush_retried_at().is_some();
                 if due
                     && tenant.read(State::unflushed) >= tenant.flush_rows
                     && tenant.flush_may_be_tried()

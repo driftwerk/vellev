@@ -42,6 +42,8 @@ enum Fault {
     NeverAnswers,
     /// Each write waits for a permit from [`Store::gate`], then goes right.
     Gated,
+    /// The next write panics, and then they go right again.
+    Panics,
 }
 
 /// Object storage whose writes can be made to fail.
@@ -86,18 +88,22 @@ impl Store {
             let fault = faulty
                 .filter(|(kind, _)| key.ends_with(&format!(".{kind}")))
                 .map(|(_, fault)| fault);
-            if let Some(Fault::FailsOnce) = fault {
+            if let Some(Fault::FailsOnce | Fault::Panics) = fault {
                 *faulty = None;
             }
             fault
         };
+        assert!(
+            !matches!(fault, Some(Fault::Panics)),
+            "a write panics, as a test asks"
+        );
         if let Some(Fault::NeverAnswers) = fault {
             std::future::pending::<()>().await;
         }
         if let Some(Fault::Gated) = fault {
             self.gate.acquire().await.expect("gate open").forget();
         }
-        let failed = fault.is_some_and(|fault| !matches!(fault, Fault::Gated));
+        let failed = fault.is_some_and(|fault| !matches!(fault, Fault::Gated | Fault::Panics));
         if self.failing.load(Ordering::SeqCst) || failed {
             return Err(StorageError::Blob {
                 key: key.into(),
@@ -1244,10 +1250,11 @@ fn a_hold_lapsed_with_a_failed_flush_due_keeps_nothing_busy() {
     });
 }
 
-/// A round of maintenance can panic, as any code can. The task is gone with
-/// it, and a tenant that lived on would never be flushed or merged again,
-/// with nothing to say so: so the tenant is given up, and opened afresh for
-/// the next caller, as one whose writer closed.
+/// A round of maintenance can panic: an upload that panics is raised again
+/// where the flush waits for it. The task is gone with it, and a tenant that
+/// lived on would never be flushed or merged again, with nothing to say so:
+/// so the tenant is given up, and opened afresh for the next caller, as one
+/// whose writer closed. Its rows are in the log, and flushed there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_whose_maintenance_panicked_is_given_up() {
     let cluster = Cluster::new();
@@ -1259,22 +1266,11 @@ async fn a_tenant_whose_maintenance_panicked_is_given_up() {
     let acme = tenant("acme");
     node.create_tenant(&acme).await.unwrap();
     let held = node.tenant(&acme).await.unwrap();
-    held.panic_merges_in_build(true);
     held.write(vec![schema(EmbeddingProvider::None)])
         .await
         .unwrap();
-    // Four flushes' worth, and the round after the fourth merges them.
-    for flush in 0..4 {
-        held.write(ten_notes(flush * 10)).await.unwrap();
-        let flushed = async {
-            while held.read(State::unflushed) > 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(30), flushed)
-            .await
-            .expect("flushed, its maintenance still there");
-    }
+    cluster.store.fault(Some(("segment", Fault::Panics)));
+    held.write(ten_notes(0)).await.unwrap();
     let given_up = async {
         while Arc::ptr_eq(&held, &node.tenant(&acme).await.unwrap()) {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1283,6 +1279,17 @@ async fn a_tenant_whose_maintenance_panicked_is_given_up() {
     tokio::time::timeout(Duration::from_secs(10), given_up)
         .await
         .expect("a tenant whose maintenance panicked lived on");
+    let opened = node.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 10, "its rows were lost");
+    opened.write(ten_notes(10)).await.unwrap();
+    let flushed = async {
+        while opened.read(State::unflushed) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), flushed)
+        .await
+        .expect("flushed by the tenant opened afresh");
 }
 
 /// L5: a flush that failed leaves its backoff set, and maintenance, which
