@@ -924,32 +924,42 @@ pub(crate) struct Parts {
 
 impl Parts {
     /// Of a segment of `file`'s rows, indexed as `indexes`. A walk over
-    /// every row, token and value, each once, and the rows on several
-    /// threads.
+    /// every row, token and value, each once, on as many threads as there
+    /// are to take them: the rows, a property's values and its tokens all at
+    /// once.
     pub(crate) fn of(file: &SegmentFile, indexes: &Indexes) -> Self {
         use rayon::prelude::*;
-        let mut blocks: Vec<Block> = file
-            .rows
-            .par_chunks(ROWS_IN_BLOCK)
-            .map(|rows| {
-                let mut block = Block::default();
-                for row in rows {
-                    let (copied, encoded) = row_sizes(row);
-                    block.copied += copied;
-                    block.encoded += encoded;
+        let rows = || -> Vec<Block> {
+            file.rows
+                .par_chunks(ROWS_IN_BLOCK)
+                .map(|rows| {
+                    let mut block = Block::default();
+                    for row in rows {
+                        let (copied, encoded) = row_sizes(row);
+                        block.copied += copied;
+                        block.encoded += encoded;
+                    }
+                    block
+                })
+                .collect()
+        };
+        let indexed = || {
+            let (mut filters, mut collections, mut fields) = (0, Vec::new(), Vec::new());
+            let mut tokens = vec![0; file.rows.len().div_ceil(ROWS_IN_BLOCK)];
+            for (collection, index) in indexes {
+                let (values, shapes) = rayon::join(
+                    || index.rows.resident(),
+                    || index.text.shapes(ROWS_IN_BLOCK, &mut tokens),
+                );
+                filters += values;
+                collections.push((*collection, index.rows.rows().len() as usize));
+                for (name, shape) in shapes {
+                    fields.push((*collection, name.to_string(), shape));
                 }
-                block
-            })
-            .collect();
-        let (mut filters, mut collections, mut fields) = (0, Vec::new(), Vec::new());
-        let mut tokens = vec![0; blocks.len()];
-        for (collection, index) in indexes {
-            filters += index.rows.resident();
-            collections.push((*collection, index.rows.rows().len() as usize));
-            for (name, shape) in index.text.shapes(ROWS_IN_BLOCK, &mut tokens) {
-                fields.push((*collection, name.to_string(), shape));
             }
-        }
+            (filters, collections, fields, tokens)
+        };
+        let (mut blocks, (filters, collections, fields, tokens)) = rayon::join(rows, indexed);
         for (block, tokens) in blocks.iter_mut().zip(tokens) {
             block.tokens = tokens;
         }
