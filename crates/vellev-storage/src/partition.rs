@@ -3453,6 +3453,11 @@ impl Writer {
             build.give_turn_back();
             return;
         };
+        // A flush it waited behind took what was due: what is left is few.
+        if !self.lag.due(self.partition.read(State::unflushed)) {
+            building.built_nothing();
+            return;
+        }
         let flushed = self.flushing_held(&mut building).await;
         flush_tried(flushed.is_ok());
         if let Err(error) = flushed {

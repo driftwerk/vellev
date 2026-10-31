@@ -1535,6 +1535,8 @@ async fn rows_left_to_a_merge() -> (
             object_store::memory::InMemory::new(),
         ))),
         failing: AtomicUsize::new(0),
+        holding: AtomicBool::new(false),
+        held: AtomicUsize::new(0),
     });
     let node = node_on(store.clone(), |settings| {
         settings.flush_rows = NOTES as usize;
@@ -1591,11 +1593,72 @@ async fn a_flush_first_that_goes_through_leaves_its_tenant_settled() {
     .await;
 }
 
+/// The merge of [`rows_left_to_a_merge`] let go to its commit, with its flush
+/// first held part way.
+async fn a_flush_first_held_part_way(store: &FailingFlushes, gate: &MergeGate) {
+    store.holding.store(true, Ordering::SeqCst);
+    gate.release.notify_one();
+    until(30, "the flush first never began to go up", || {
+        store.held.load(Ordering::SeqCst) == 1
+    })
+    .await;
+}
+
+/// A stop comes too late for a merge flushing first, past where one ends it:
+/// the flush goes on, and the merge commits, as it would have at its commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_during_a_flush_first_ends_neither_it_nor_its_merge() {
+    let (node, store, held, gate) = rows_left_to_a_merge().await;
+    a_flush_first_held_part_way(&store, &gate).await;
+    held.stop_merges();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    store.holding.store(false, Ordering::SeqCst);
+    until(
+        30,
+        "the merge stopped during its flush first never ended",
+        || node.unsettled() == 0,
+    )
+    .await;
+    assert_eq!(held.read(State::unflushed), 0);
+    assert_eq!(
+        held.read(|state| state.segments().count()),
+        2,
+        "the merge was lost: its segment and the flush's are all there should be"
+    );
+    assert_eq!(node.merges().stopped, MergesStopped::default());
+}
+
+/// Losing the hold cuts a merge flushing first with its task, as it cuts one
+/// past loading anywhere: counted once, its build let go, and the rows of its
+/// flush, which went nowhere, read again by the next to open the tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_lost_during_a_flush_first_ends_it_with_its_merge_counted_once() {
+    let (node, store, _held, gate) = rows_left_to_a_merge().await;
+    a_flush_first_held_part_way(&store, &gate).await;
+    let builds = node.merge_builds().clone();
+    node.shutdown().await;
+    let counted = MergesStopped {
+        shutdown: 1,
+        ..MergesStopped::default()
+    };
+    assert_eq!(node.merges().stopped, counted);
+    until(5, "the merge cut off left its build under way", || {
+        builds.under_way() == 0
+    })
+    .await;
+    assert_eq!(node.merges().stopped, counted);
+    store.holding.store(false, Ordering::SeqCst);
+}
+
 /// A store whose next writes of flushed vectors, as many as are armed, fail.
 #[derive(Debug)]
 struct FailingFlushes {
     inner: Arc<dyn Blobs>,
     failing: AtomicUsize,
+    /// Whether writes of flushed vectors wait until it is cleared.
+    holding: AtomicBool,
+    /// How many writes of flushed vectors have come to wait.
+    held: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -1614,6 +1677,15 @@ impl Blobs for FailingFlushes {
                 key: key.into(),
                 source: "connection reset".into(),
             });
+        }
+        if key.ends_with(".vectors")
+            && !key.contains("-merged")
+            && self.holding.load(Ordering::SeqCst)
+        {
+            self.held.fetch_add(1, Ordering::SeqCst);
+            while self.holding.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
         self.inner.put(key, bytes).await
     }

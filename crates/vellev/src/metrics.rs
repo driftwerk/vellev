@@ -456,14 +456,14 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "merge_phase_seconds",
-        "How long each phase of a merge took, that it came through: waiting for a turn among the node's merge builds, then for a thread off the async ones, gathering the run's rows with no lock held, building the merged segment, encoding its clustered index, uploading it, and loading it back",
+        "How long each phase of a merge took, that it came through: waiting for a turn among the node's merge builds, each wait for the building lock with a turn held, which nothing else may use meanwhile, however it ended (turn_idle), then for a thread off the async ones, gathering the run's rows with no lock held, building the merged segment, encoding its clustered index, uploading it, and loading it back",
         "phase",
         MergePhase::ALL.map(|phase| (phase.name(), timings.seconds(Timed::Merge(phase)))),
     )?;
     histograms(
         encoder,
         "merge_given_up_seconds",
-        "How long each phase of a merge ran or waited before it was stopped or failed, by phase as for vellev_merge_phase_seconds, a turn among the node's merge builds apart, which is not timed once given up: what no merge came of",
+        "How long each phase of a merge ran or waited before it was stopped or failed, by phase as for vellev_merge_phase_seconds, a turn among the node's merge builds and a wait with one apart, which are not timed once given up: what no merge came of",
         "phase",
         MergePhase::GIVEN_UP.map(|phase| (phase.name(), timings.seconds(Timed::MergeGivenUp(phase)))),
     )?;
@@ -722,7 +722,7 @@ impl Collector for Counted {
         let counter = ConstCounter::new(node.tenants_given_up());
         counter.encode(encoder.encode_descriptor(
             "tenants_given_up",
-            "Tenants given up as their maintenance panicked, and opened afresh for the next caller: a merge lost so is in no count of merges stopped",
+            "Tenants given up as their maintenance or their flush task panicked, and opened afresh for the next caller: a merge lost so is in no count of merges stopped",
             None,
             counter.metric_type(),
         )?)?;
@@ -780,8 +780,8 @@ impl Collector for Counted {
         for (name, help, value) in [
             (
                 "merge_draining_bytes",
-                "About how many bytes merges stopped and not yet ended hold, counted against \
-                 the memory budget",
+                "About how many bytes merges stopped and not yet ended hold, and merges that \
+                 gave their turns back to wait to commit, counted against the memory budget",
                 merges.draining,
             ),
             (

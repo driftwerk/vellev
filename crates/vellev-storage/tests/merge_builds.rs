@@ -1011,6 +1011,105 @@ async fn a_flush_first_is_bounded_in_its_wait_and_never_in_its_flush() {
     assert_eq!(rows.len(), 2, "{rows:?}");
 }
 
+/// A flush first's wait running out costs nothing but the commit's hold: the
+/// turn, having waited as long as it may, goes back, stays counted, and the
+/// rows go with the commit, behind what held the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_first_whose_wait_runs_out_leaves_its_rows_to_the_commit() {
+    let builds = MergeBuilds::new(1);
+    builds.idle_for(Duration::from_millis(200));
+    let mut cluster = Cluster::new().await;
+    let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
+    let held = Arc::new(HeldUpload {
+        inner: cluster.blobs.clone(),
+        kind: |key| key.ends_with(".vectors") && !key.contains("-merged"),
+        builds: builds.clone(),
+        armed: AtomicBool::new(false),
+        putting,
+        let_go: tokio::sync::Notify::new(),
+        ended: Arc::default(),
+    });
+    cluster.blobs = held.clone();
+    let writer = flushed_due_at(&cluster, &builds, 2, 1_000).await;
+    let (gate, merging) = at_its_gate(&writer).await;
+    more_notes(&writer, 1_000_000, 1_000).await;
+    held.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    within(60, "the flush never began to go up", put.recv()).await;
+    more_notes(&writer, 2_000_000, 1_000).await;
+    gate.release.notify_one();
+    until(5, "a flush first's wait held its turn", || {
+        builds.turns_free() == 1
+    })
+    .await;
+    assert!(builds.draining() > 0, "what the merge holds is not counted");
+    held.armed.store(false, Ordering::SeqCst);
+    held.let_go.notify_one();
+    within(60, "the flush never ended", flushing)
+        .await
+        .unwrap()
+        .unwrap();
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    assert_eq!(builds.draining(), 0);
+    let rows = rows_by_segment(&writer);
+    assert!(rows.contains(&1_000), "{rows:?}");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(writer.partition().read(State::unflushed), 0);
+}
+
+/// A flush under way as a merge comes to commit takes what was due, and the
+/// flush first, once it has the lock, finds too few rows to flush: those go
+/// with the commit, as fewer than a flush do, and make no segment of their
+/// own, as a flush behind a flush would on every commit under writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_first_behind_a_flush_that_took_its_rows_flushes_nothing() {
+    let builds = MergeBuilds::new(1);
+    let mut cluster = Cluster::new().await;
+    let (putting, mut put) = tokio::sync::mpsc::unbounded_channel();
+    let held = Arc::new(HeldUpload {
+        inner: cluster.blobs.clone(),
+        kind: |key| key.ends_with(".vectors") && !key.contains("-merged"),
+        builds: builds.clone(),
+        armed: AtomicBool::new(false),
+        putting,
+        let_go: tokio::sync::Notify::new(),
+        ended: Arc::default(),
+    });
+    cluster.blobs = held.clone();
+    let writer = flushed_due_at(&cluster, &builds, 2, 1_000).await;
+    writer.timings().keep_events(true);
+    let (gate, merging) = at_its_gate(&writer).await;
+    more_notes(&writer, 1_000_000, 2_000).await;
+    held.armed.store(true, Ordering::SeqCst);
+    let flushing = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    within(60, "the flush never began to go up", put.recv()).await;
+    more_notes(&writer, 2_000_000, 10).await;
+    gate.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    held.armed.store(false, Ordering::SeqCst);
+    held.let_go.notify_one();
+    within(60, "the flush never ended", flushing)
+        .await
+        .unwrap()
+        .unwrap();
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(merged.unwrap().unwrap().is_some());
+    let events = writer.timings().drain_events();
+    assert_eq!(
+        holds(&events, Holder::Flush).len(),
+        1,
+        "flushed behind a flush"
+    );
+    assert_eq!(writer.partition().read(State::unflushed), 0);
+}
+
 /// What flushes goes up one flush at a time, whoever asks: a flush asked for
 /// by a request or a tenant's flush task, a merge's flush first, a flush
 /// before letting go, and a merge's flush along. Each holds a flush's bytes,
