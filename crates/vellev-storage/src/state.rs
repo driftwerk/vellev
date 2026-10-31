@@ -25,6 +25,7 @@ use crate::format::{
     SegmentMeta,
 };
 use crate::freed::off_the_async_threads;
+use crate::merge_builds::OnPool;
 use crate::published::FreesHeld;
 use crate::stopping::{MergeStage, Stopping};
 use crate::{Result, StorageError};
@@ -1440,7 +1441,7 @@ pub(crate) struct Discarded {
     /// About how many bytes the state's figures counted it at.
     bytes: usize,
     /// Those bytes as counted until they are freed, if they are.
-    counted: Option<Counted>,
+    counted: Vec<Counted>,
 }
 
 /// `bytes` counted in `freeing` until this goes.
@@ -1470,7 +1471,7 @@ impl Discarded {
         let bytes = self.bytes;
         freeing.fetch_add(bytes, Ordering::SeqCst);
         let freeing = freeing.clone();
-        self.counted = Some(Counted { freeing, bytes });
+        self.counted.push(Counted { freeing, bytes });
     }
 
     /// Whether it holds segments a merge replaced: all of it then goes on
@@ -1489,7 +1490,7 @@ impl Discarded {
         let rows = std::mem::take(&mut self.rows);
         let indexes = std::mem::take(&mut self.indexes);
         let segments = std::mem::take(&mut self.segments);
-        let counted = self.counted.take();
+        let counted = std::mem::take(&mut self.counted);
         let held = self.held.take();
         #[cfg(test)]
         let probe = self.probe.take();
@@ -1571,6 +1572,12 @@ impl State {
 }
 
 impl Snapshot {
+    /// How many rows the memtable held as it was taken: what the
+    /// checkpoint takes out of memory.
+    pub(crate) fn held(&self) -> usize {
+        self.held
+    }
+
     /// The taken rows' vectors as gathered, taken out of the snapshot, to
     /// be sealed into their column where nothing waits on it.
     pub(crate) fn gathered(&mut self) -> Gathering {
@@ -1626,6 +1633,7 @@ pub(crate) fn indexed_on<'a>(
         unused,
         clustered_above,
         &never,
+        OnPool::global(),
     ) {
         Some(indexed) => indexed,
         None => unreachable!("indexing nothing stops is never stopped"),
@@ -1679,6 +1687,7 @@ pub(crate) struct Indexed {
 /// is split, at every [`ROWS_BETWEEN_ASKING`] rows of the values and text
 /// indexed in row order, and by the vector indexes' builds in their own
 /// passes. No chunk is begun once it is.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn indexed_stopping<'a>(
     catalog: &Catalog,
     rows: &'a [Row],
@@ -1687,6 +1696,7 @@ pub(crate) fn indexed_stopping<'a>(
     unused: impl Fn(CollectionId, Unfit),
     clustered_above: Option<usize>,
     stopping: &Stopping,
+    on: OnPool<'_>,
 ) -> Option<Indexed> {
     use rayon::prelude::*;
     let threads = Threads::default();
@@ -1702,16 +1712,18 @@ pub(crate) fn indexed_stopping<'a>(
         if stopping.is_stopped() {
             return None;
         }
-        let tokenized: Vec<Option<Tokenized>> = chunk_rows
-            .par_iter()
-            .map(|Row { collection, object }| {
-                if stopping.stopped(MergeStage::Indexing) {
-                    return None;
-                }
-                let schema = catalog.schema(*collection)?;
-                Some(threads.on(|| TextIndex::tokenize(schema, object)))
-            })
-            .collect();
+        let tokenized: Vec<Option<Tokenized>> = on.section("tokenizing", || {
+            chunk_rows
+                .par_iter()
+                .map(|Row { collection, object }| {
+                    if stopping.stopped(MergeStage::Indexing) {
+                        return None;
+                    }
+                    let schema = catalog.schema(*collection)?;
+                    Some(threads.on(|| TextIndex::tokenize(schema, object)))
+                })
+                .collect()
+        });
         if stopping.is_stopped() {
             return None;
         }
@@ -1721,39 +1733,41 @@ pub(crate) fn indexed_stopping<'a>(
         // The filterable values and vectors on one thread, the text on
         // another: each in row order, as indexing each row in turn makes
         // them.
-        rayon::join(
-            || {
-                for (row, Row { collection, object }) in numbered() {
-                    if asked(row) {
-                        break;
-                    }
-                    if let Some(schema) = catalog.schema(*collection) {
-                        let index = indexes.entry(*collection).or_default();
-                        index.rows.insert(schema, row as u32, object);
-                        if let Some(vector) = vector_of(row) {
-                            vectors
-                                .entry(*collection)
-                                .or_default()
-                                .push((row as u32, vector));
+        on.section("indexing", || {
+            rayon::join(
+                || {
+                    for (row, Row { collection, object }) in numbered() {
+                        if asked(row) {
+                            break;
+                        }
+                        if let Some(schema) = catalog.schema(*collection) {
+                            let index = indexes.entry(*collection).or_default();
+                            index.rows.insert(schema, row as u32, object);
+                            if let Some(vector) = vector_of(row) {
+                                vectors
+                                    .entry(*collection)
+                                    .or_default()
+                                    .push((row as u32, vector));
+                            }
                         }
                     }
-                }
-            },
-            || {
-                for ((row, Row { collection, .. }), tokenized) in numbered().zip(tokenized) {
-                    if asked(row) {
-                        break;
+                },
+                || {
+                    for ((row, Row { collection, .. }), tokenized) in numbered().zip(tokenized) {
+                        if asked(row) {
+                            break;
+                        }
+                        if let Some(tokenized) = tokenized {
+                            held -= 1;
+                            texts
+                                .entry(*collection)
+                                .or_default()
+                                .insert_tokenized(row as u32, tokenized);
+                        }
                     }
-                    if let Some(tokenized) = tokenized {
-                        held -= 1;
-                        texts
-                            .entry(*collection)
-                            .or_default()
-                            .insert_tokenized(row as u32, tokenized);
-                    }
-                }
-            },
-        );
+                },
+            );
+        });
     }
     if stopping.is_stopped() {
         return None;
@@ -1778,11 +1792,11 @@ pub(crate) fn indexed_stopping<'a>(
             None if clustered_above
                 .is_some_and(|above| vectors.len() > above.max(SHORTLIST_ABOVE)) =>
             {
-                ClusteredIndex::build_stopping(schema.distance, vectors, stop)
+                ClusteredIndex::build_stopping_on(schema.distance, vectors, stop, on)
                     .ok()?
                     .map(|clustered| Vectors::Clustered(Arc::new(clustered)))
             }
-            None => BinaryIndex::build_stopping(schema.distance, vectors, stop)
+            None => BinaryIndex::build_stopping_on(schema.distance, vectors, stop, on)
                 .ok()?
                 .map(Vectors::Binary),
         };
@@ -1791,7 +1805,7 @@ pub(crate) fn indexed_stopping<'a>(
         if stopping.stopped(MergeStage::Indexing) {
             return None;
         }
-        index.rows.summarise();
+        on.section("summarising", || index.rows.summarise());
     }
     Some(Indexed {
         indexes,
@@ -1996,6 +2010,10 @@ pub struct Figures {
     /// The rest, and their rows as written.
     pub plain: usize,
     pub plain_rows: u64,
+    /// Segments as a flush or a restore wrote them, which no merge has
+    /// taken in yet, and their rows as written: the rows awaiting a merge.
+    pub unmerged: usize,
+    pub unmerged_rows: u64,
     /// As [`State::probes`].
     pub probes: Probes,
 }
@@ -2020,6 +2038,10 @@ impl State {
 impl Figures {
     /// Count the segment `meta` names: clustered if it has an index file.
     pub fn count(&mut self, meta: &SegmentMeta) {
+        if !crate::blobs::merged_segment(&meta.key) {
+            self.unmerged += 1;
+            self.unmerged_rows += meta.rows;
+        }
         match meta.index.is_some() {
             true => {
                 self.clustered += 1;
@@ -3143,7 +3165,7 @@ impl State {
             indexes: Indexes::new(),
             bytes: segments.iter().map(|segment| segment.resident).sum(),
             segments,
-            counted: None,
+            counted: Vec::new(),
         }
     }
 
@@ -3437,7 +3459,7 @@ impl State {
             indexes: std::mem::take(indexes),
             segments: Vec::new(),
             bytes: *bytes,
-            counted: None,
+            counted: Vec::new(),
         };
         *bytes = rows.iter().map(row_bytes).sum();
         discarded.bytes -= *bytes;
@@ -3703,7 +3725,10 @@ mod tests {
         let vector_of = |row: usize| rows[row].object.vector.as_deref();
         let unused = |_: CollectionId, _: Unfit| {};
         let stored = Stored::default();
-        indexed_stopping(catalog, rows, vector_of, &stored, unused, None, stopping)
+        let on = OnPool::global();
+        indexed_stopping(
+            catalog, rows, vector_of, &stored, unused, None, stopping, on,
+        )
     }
 
     /// The vectors of an index built, by a digest of their codes and rows.

@@ -25,6 +25,7 @@ use vellev_core::Distance;
 
 use crate::curve::{Curve, Source};
 use crate::fastscan::{chosen, Blocks, Tables, BLOCK};
+use crate::pool::{CallersPool, Passes};
 use crate::rotation::{Random, Rotation};
 use crate::stop::{Stage, Stop, Stopped};
 use crate::vector::{
@@ -876,6 +877,7 @@ fn kmeans(
     width: usize,
     random: &mut Random,
     stop: &Stop,
+    on: impl Passes,
 ) -> Result<Vec<f32>, Stopped> {
     let mut centroids: Vec<f32> = training
         .iter()
@@ -886,13 +888,15 @@ fn kmeans(
     let mut assigned = vec![usize::MAX; training.len()];
     for _ in 0..ITERATIONS {
         stop.check(Stage::Clustering)?;
-        let next: Vec<usize> = training
-            .par_iter()
-            .map(|vector| match stop.check(Stage::Clustering) {
-                Ok(()) => nearest_centroid(&centroids, width, vector),
-                Err(Stopped) => 0,
-            })
-            .collect();
+        let next: Vec<usize> = on.pass("clustering", || {
+            training
+                .par_iter()
+                .map(|vector| match stop.check(Stage::Clustering) {
+                    Ok(()) => nearest_centroid(&centroids, width, vector),
+                    Err(Stopped) => 0,
+                })
+                .collect()
+        });
         stop.passed()?;
         if next == assigned {
             break;
@@ -943,6 +947,19 @@ impl ClusteredIndex {
         vectors: &[(u32, &[f32])],
         stop: &Stop,
     ) -> Result<Option<Self>, Stopped> {
+        Self::build_stopping_on(metric, vectors, stop, CallersPool)
+    }
+
+    /// As [`Self::build_stopping`], each parallel pass where `on` says:
+    /// sampling, each iteration of clustering, and coding. The rest, the
+    /// serial work between them and the turn to tune, stays on the calling
+    /// thread, which must be on no pool that builds: see [`crate::pool::tune`].
+    pub fn build_stopping_on(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        stop: &Stop,
+        on: impl Passes,
+    ) -> Result<Option<Self>, Stopped> {
         let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
             return Ok(None);
         };
@@ -964,62 +981,68 @@ impl ClusteredIndex {
         let rotated = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
 
         let k = clusters_for(measured.len().max(1));
-        let training: Vec<Vec<f32>> = random
-            .sample(measured.len(), k * TRAINING_PER_CLUSTER)
-            .into_par_iter()
-            .map(|at| match stop.check(Stage::Sampling) {
-                Ok(()) => rotated(measured[at].1),
-                Err(Stopped) => Vec::new(),
-            })
-            .collect();
+        let sample = random.sample(measured.len(), k * TRAINING_PER_CLUSTER);
+        let training: Vec<Vec<f32>> = on.pass("sampling", || {
+            sample
+                .into_par_iter()
+                .map(|at| match stop.check(Stage::Sampling) {
+                    Ok(()) => rotated(measured[at].1),
+                    Err(Stopped) => Vec::new(),
+                })
+                .collect()
+        });
         stop.passed()?;
         let centroids = match training.is_empty() {
             true => vec![0.0; k * width],
-            false => kmeans(&training, k, width, &mut random, stop)?,
+            false => kmeans(&training, k, width, &mut random, stop, on)?,
         };
 
         let scale = 1.0 / (width as f32).sqrt();
-        let coded: Vec<(usize, Vec<u64>, Factor)> = vectors
-            .par_iter()
-            .map(|(_, vector)| {
-                // Given up: nothing is made of the rows left, and the build
-                // gives up once the pass is through them.
-                if stop.check(Stage::Coding).is_err() {
-                    return (0, Vec::new(), Factor::UNMEASURED);
-                }
-                // Defence in depth: its length, worked out again from its
-                // factors, would set such a row apart even if it were coded.
-                if !measurable(metric, vector) {
-                    return (0, vec![0; width / 64], Factor::UNMEASURED);
-                }
-                let rotated = rotated(vector);
-                let cluster = nearest_centroid(&centroids, width, &rotated);
-                let centroid = &centroids[cluster * width..][..width];
-                let residual: Vec<f32> = rotated.iter().zip(centroid).map(|(v, c)| v - c).collect();
-                let norm = dot(&residual, &residual).sqrt();
-                let code: Vec<u64> = residual
-                    .chunks_exact(64)
-                    .map(|values| {
-                        values.iter().enumerate().fold(0u64, |word, (bit, value)| {
-                            word | (u64::from(*value > 0.0) << bit)
+        let coded: Vec<(usize, Vec<u64>, Factor)> = on.pass("coding", || {
+            vectors
+                .par_iter()
+                .map(|(_, vector)| {
+                    // Given up: nothing is made of the rows left, and the build
+                    // gives up once the pass is through them.
+                    if stop.check(Stage::Coding).is_err() {
+                        return (0, Vec::new(), Factor::UNMEASURED);
+                    }
+                    // Defence in depth: its length, worked out again from its
+                    // factors, would set such a row apart even if it were coded.
+                    if !measurable(metric, vector) {
+                        return (0, vec![0; width / 64], Factor::UNMEASURED);
+                    }
+                    let rotated = rotated(vector);
+                    let cluster = nearest_centroid(&centroids, width, &rotated);
+                    let centroid = &centroids[cluster * width..][..width];
+                    let residual: Vec<f32> =
+                        rotated.iter().zip(centroid).map(|(v, c)| v - c).collect();
+                    let norm = dot(&residual, &residual).sqrt();
+                    let code: Vec<u64> = residual
+                        .chunks_exact(64)
+                        .map(|values| {
+                            values.iter().enumerate().fold(0u64, |word, (bit, value)| {
+                                word | (u64::from(*value > 0.0) << bit)
+                            })
                         })
-                    })
-                    .collect();
-                let factor = match norm > 0.0 {
-                    true => Factor {
-                        norm,
-                        align: residual.iter().map(|value| value.abs()).sum::<f32>() * scale / norm,
-                        along: dot(&residual, centroid) / norm,
-                    },
-                    false => Factor {
-                        norm: 0.0,
-                        align: 1.0,
-                        along: 0.0,
-                    },
-                };
-                (cluster, code, factor)
-            })
-            .collect();
+                        .collect();
+                    let factor = match norm > 0.0 {
+                        true => Factor {
+                            norm,
+                            align: residual.iter().map(|value| value.abs()).sum::<f32>() * scale
+                                / norm,
+                            along: dot(&residual, centroid) / norm,
+                        },
+                        false => Factor {
+                            norm: 0.0,
+                            align: 1.0,
+                            along: 0.0,
+                        },
+                    };
+                    (cluster, code, factor)
+                })
+                .collect()
+        });
         stop.passed()?;
 
         let mut members: Vec<(Vec<u32>, Vec<u64>, Vec<Factor>)> =
