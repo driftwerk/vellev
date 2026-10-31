@@ -2112,6 +2112,7 @@ async fn arm(bench: Bench, running: Running) {
     let cpu_before = cpu_by_pool();
     let ticks_before = cpu_ticks();
     let throttled_before = cgroup_throttled();
+    let top_level_before = node.merge_builds().top_level_cpu();
     let backlogged_before = node.flushing().backlogged;
     let ended_before = merges_ended(&node);
     let let_go_before = node.let_go();
@@ -2222,6 +2223,9 @@ async fn arm(bench: Bench, running: Running) {
     // What is set against the marks is taken here, as the soak ends, not
     // after settling, as the marks are windowed to the soak.
     let ended_over_soak = since(&ended_before, &merges_ended(&node));
+    let throttled_after = cgroup_throttled();
+    // Of builds ended by now: each is counted as it ends.
+    let top_level_cpu = node.merge_builds().top_level_cpu() - top_level_before;
     let let_go_after = node.let_go();
     let metrics_at_soak_end = app.metrics().encoded();
     let _ = tokio::time::timeout(Duration::from_secs(30), sampler).await;
@@ -2244,7 +2248,6 @@ async fn arm(bench: Bench, running: Running) {
     )
     .unwrap();
     let merges = node.merges();
-    let top_level_cpu = node.merge_builds().top_level_cpu().as_secs_f64();
     node.shutdown().await;
     // What was still open as the soak ended ends by here at the latest.
     events.lock().unwrap().extend(node.timings().drain_events());
@@ -2479,7 +2482,8 @@ async fn arm(bench: Bench, running: Running) {
         "memory": {
             "baseline_allocated": baseline_allocated, "allocated_peak": sampled.allocated_peak,
             "baseline_rss_anon": baseline_rss_anon, "rss_anon_peak": sampled.rss_anon_peak,
-            "cgroup_peak": cgroup_peak(), "draining_peak": sampled.draining_peak,
+            "cgroup_peak_of_the_whole_process": cgroup_peak(),
+            "draining_peak": sampled.draining_peak,
             "preloaded_resident": preloaded_resident,
             "largest_merge_build_at_soak_end": largest_at_soak_end,
             "largest_merge_build_settled": merges.largest,
@@ -2493,10 +2497,10 @@ async fn arm(bench: Bench, running: Running) {
         "steal": { "share": steal, "at_most": STEAL_AT_MOST,
                    "stolen_for": stolen_for(&sampled.steal), "for_at_most": STOLEN_FOR_AT_MOST,
                    "peaks": steal_peaks(&sampled.steal, bench.window.as_secs_f64()) },
-        "throttled_usec": throttled_before.zip(cgroup_throttled())
+        "throttled_usec": throttled_before.zip(throttled_after)
             .map(|(before, after)| after.saturating_sub(before)),
         "machine": machine(),
-        "merge_builds": { "top_level_cpu_s": top_level_cpu },
+        "merge_builds": { "top_level_cpu_s": top_level_cpu.as_secs_f64() },
         "memory_series": sampled.memory,
         "nice": { "checks": sampled.nice_checks, "wrong": sampled.nice_wrong },
     });
