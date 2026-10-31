@@ -1475,7 +1475,7 @@ async fn a_clean_under_way_as_its_tenant_s_merges_end_is_not_cut() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clean_under_way_ends_with_the_hold() {
     let (node, _held, deletes) = cleaning_beside_a_merge().await;
-    node.shutdown().await;
+    within(10, "the shutdown never ended", node.shutdown()).await;
     until(5, "a clean outlived the hold on its tenant", || {
         deletes.cut.load(Ordering::SeqCst) > 0
     })
@@ -1636,7 +1636,7 @@ async fn a_hold_lost_during_a_flush_first_ends_it_with_its_merge_counted_once() 
     let (node, store, _held, gate) = rows_left_to_a_merge().await;
     a_flush_first_held_part_way(&store, &gate).await;
     let builds = node.merge_builds().clone();
-    node.shutdown().await;
+    within(10, "the shutdown never ended", node.shutdown()).await;
     let counted = MergesStopped {
         shutdown: 1,
         ..MergesStopped::default()
@@ -1754,7 +1754,8 @@ async fn a_written_tenant_s_flushes_go_up_one_at_a_time() {
     let writing = Arc::new(AtomicBool::new(true));
     let writes = steadily(written.clone(), writing.clone());
     for _ in 0..30 {
-        written.flush().await.unwrap();
+        let flushed = within(30, "a request's flush never ended", written.flush());
+        flushed.await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     writing.store(false, Ordering::SeqCst);

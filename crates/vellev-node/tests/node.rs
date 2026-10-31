@@ -1676,7 +1676,8 @@ async fn a_tenant_dropped_flushes_no_more() {
     let node = cluster.node_with(10);
     let acme = tenant("acme");
     let _held = a_flush_held_part_way(&cluster, &node, &acme).await;
-    assert!(node.drop_tenant(&acme).await.unwrap());
+    let dropped = tokio::time::timeout(Duration::from_secs(10), node.drop_tenant(&acme));
+    assert!(dropped.await.expect("the drop never ended").unwrap());
     no_flush_goes_on(&cluster).await;
 }
 
@@ -1691,7 +1692,9 @@ async fn a_tenant_whose_lease_was_lost_flushes_no_more() {
     let node = node_flushing(&cluster, coordinator, Duration::from_secs(1));
     let acme = tenant("acme");
     let held = a_flush_held_part_way(&cluster, &node, &acme).await;
-    assert!(cluster.node().drop_tenant(&acme).await.unwrap());
+    let other = cluster.node();
+    let dropped = tokio::time::timeout(Duration::from_secs(10), other.drop_tenant(&acme));
+    assert!(dropped.await.expect("the drop never ended").unwrap());
     let lost = async {
         while held.write(vec![note(99, "owl", None)]).await.is_ok() {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1710,7 +1713,9 @@ async fn a_node_shut_down_flushes_no_more() {
     let node = cluster.node_with(10);
     let acme = tenant("acme");
     let _held = a_flush_held_part_way(&cluster, &node, &acme).await;
-    node.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(10), node.shutdown())
+        .await
+        .expect("the shutdown never ended");
     no_flush_goes_on(&cluster).await;
 }
 
@@ -1793,12 +1798,19 @@ async fn a_tenant_is_kept_while_its_flush_is_under_way() {
     drop(a_flush_held_part_way(&cluster, &node, &acme).await);
     tokio::time::sleep(idle + Duration::from_millis(100)).await;
     // The census is taken as a sweep begins: a second one finds what the
-    // first let go.
-    node.sweep_now().await;
-    node.sweep_now().await;
+    // first let go. One let go mid-flush would wait for that flush, which
+    // waits for this rule.
+    let swept = async {
+        node.sweep_now().await;
+        node.sweep_now().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), swept)
+        .await
+        .expect("a sweep waited for a flush under way: let go mid-flush");
     assert_eq!(node.census().holding.writers, 1, "let go mid-flush");
     cluster.store.fault(None);
     cluster.store.gate.add_permits(1);
+    // Bounded with the rest, as a sweep may wait for a flush.
     let let_go = async {
         while node.resident() > 0 {
             node.sweep_now().await;
