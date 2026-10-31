@@ -119,7 +119,7 @@ P=[
 ('node: nice past 19 let through',[(NO,'            0..=19 => None,','            0.. => None,')],nod('node','a_merge_pool_that')),
 ('node 8: the let-go flush timed as ordinary',[(NO,'timings.record(Timed::LetGoFlushWait, partition, times.waited);','timings.record(Timed::FlushDue, partition, times.waited);')],nod('sweeps','the_flush_before_letting')),
 # metrics
-('metrics: merged segments counted as unmerged',[(ST,'        if !crate::blobs::merged_segment(&meta.key) {\n            self.unmerged += 1;','        if true || !crate::blobs::merged_segment(&meta.key) {\n            self.unmerged += 1;')],met('background_work')),
+('storage: merged segments counted as unmerged',[(ST,'        if !crate::blobs::merged_segment(&meta.key) {\n            self.unmerged += 1;','        if true || !crate::blobs::merged_segment(&meta.key) {\n            self.unmerged += 1;')],sto('timings','a_merged_segment')),
 ('metrics: the +Inf bucket left out',[(ME,'        each.push((f64::MAX, count - below));\n','')],met('background_work')),
 ('metrics: a turn given up served',[(ME,'MergePhase::GIVEN_UP.map(|phase|','MergePhase::ALL.map(|phase|')],met('background_work')),
 # bench: the arms and marks
@@ -203,6 +203,7 @@ P=[
             .filter(|_| busy_s > 0.0)''')],ben('slot_use')),
 ('bench: any build called lone',[(BE,'.filter(|one| spans.iter().filter(|other| overlaps(one, other)).count() == 1)','.filter(|one| spans.iter().filter(|other| overlaps(one, other)).count() >= 1)')],ben('slot_use')),
 ('bench: spans not clipped',[(BE,'let clipped = ended.min(soak_s);','let clipped = *ended;')],ben('slot_use')),
+('bench: what began after the soak counted',[(BE,'        .filter(|(_, ended, took)| ended - took < soak_s)\n','')],ben('slot_use')),
 ('bench: a cut-off build called lone',[(BE,'.filter(|one| one.0 && one.1 < soak_s)','.filter(|one| one.0)')],ben('slot_use')),
 ]
 bad=0; out=[]
