@@ -1852,10 +1852,11 @@ async fn a_tenant_let_go_flushes_no_more() {
 }
 
 /// A sweep is held up by no lease it gives up: sweeps run one at a time, so
-/// one that never heard back would hold every let-go of the node. Two
-/// tenants let go by one sweep wait for their releases together, and the
-/// node goes on: their leases run out, and until then each can be taken up
-/// again here, as a lease of the holder's own always can.
+/// one that never heard back would hold every let-go of the node. The
+/// tenants let go by one sweep wait for their releases together, past the
+/// limit on flushes at once, and the node goes on: their leases run out, and
+/// until then each can be taken up again here, as a lease of the holder's own
+/// always can.
 #[tokio::test(start_paused = true)]
 async fn a_release_that_hangs_holds_up_no_sweep() {
     let cluster = Cluster::new();
@@ -1871,7 +1872,7 @@ async fn a_release_that_hangs_holds_up_no_sweep() {
             ..cluster.settings()
         },
     );
-    let names = ["acme", "globex"];
+    let names = ["acme", "globex", "initech"];
     for name in names {
         node.create_tenant(&tenant(name)).await.unwrap();
         let held = node.tenant(&tenant(name)).await.unwrap();
@@ -1890,7 +1891,7 @@ async fn a_release_that_hangs_holds_up_no_sweep() {
         .await
         .expect("the sweep was held by a release that hangs");
     assert!(asked.elapsed() >= RELEASE_WITHIN, "{:?}", asked.elapsed());
-    assert_eq!(node.let_go().for_budget, 2, "{:?}", node.let_go());
+    assert_eq!(node.let_go().for_budget, 3, "{:?}", node.let_go());
     tokio::time::timeout(bound, node.sweep_now())
         .await
         .expect("the next sweep");

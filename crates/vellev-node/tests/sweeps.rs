@@ -601,11 +601,15 @@ async fn a_flush_queued_behind_a_let_go_never_runs() {
     let events = node.timings().drain_events();
     let named = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
     assert_eq!(
+        named(Timed::LetGoFlushHeld),
+        3,
+        "a tenant's rows went with a flush of another's making: {events:?}"
+    );
+    assert_eq!(
         named(Timed::BuildingWait(Holder::Flush)),
         0,
-        "a flush had the lock between a tenant's taking and its let-go: {events:?}"
+        "a flush had the lock between a tenant's taking and its hold lost: {events:?}"
     );
-    assert_eq!(named(Timed::LetGoFlushHeld), 3, "{events:?}");
     assert_eq!(node.let_go().for_budget, 3, "{:?}", node.let_go());
     let opened = node.tenant(&tenant("third")).await.unwrap();
     assert_eq!(noted(&opened), 3, "rows lost");
