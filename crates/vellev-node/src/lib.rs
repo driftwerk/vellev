@@ -796,6 +796,13 @@ impl Tenant {
         self.deadline.lock().expect("deadline lock")
     }
 
+    /// Have each of the tenant's merges panic as it builds, or not. For
+    /// tests.
+    #[doc(hidden)]
+    pub fn panic_merges_in_build(&self, panics: bool) {
+        self.writer.panic_merges_in_build(panics);
+    }
+
     /// When the hold on the tenant runs out unless renewed: each renewal
     /// moves it on. For tests.
     #[doc(hidden)]
