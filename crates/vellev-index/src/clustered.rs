@@ -31,10 +31,21 @@ use crate::vector::{
 
 /// The share of the true nearest ten that the clusters scanned must hold,
 /// over sample queries, when the index is built.
-pub const RECALL_FLOOR: f64 = 0.97;
+///
+/// The samples are rows of the index, and a row's neighbours lie in or by
+/// its own cluster; a question embedded for search lies apart from the
+/// passages it is asked of, and its neighbours spread over more clusters.
+/// At 0.97 the probes held 0.91 of real questions' nearest ten on the
+/// benchmark fixture (1M Wikipedia passages, bge-base-en-v1.5). At 0.999,
+/// over [`TUNING_QUERIES`] samples, they held 0.991 at 237,605 rows,
+/// 0.994 at 475,155 and 0.997 at 950,215 (recall note, §6), scanning about
+/// two clusters in five.
+pub const RECALL_FLOOR: f64 = 0.999;
 /// How many bits the query is quantized to for the scan.
 const QUERY_BITS: u32 = 4;
-const TUNING_QUERIES: usize = 100;
+/// Sample queries the probes are tuned on: enough that a floor of 0.999
+/// is a share of 4,000 neighbours, not of 1,000.
+const TUNING_QUERIES: usize = 400;
 const TUNING_NEIGHBOURS: usize = 10;
 const ITERATIONS: usize = 8;
 const MOST_CLUSTERS: usize = 4096;
