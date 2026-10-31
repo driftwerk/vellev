@@ -1428,12 +1428,12 @@ async fn cleaning_beside_a_merge() -> (Node, Arc<vellev_node::Tenant>, Arc<Delet
     });
     let builds = node.merge_builds().clone();
     builds.hold(Some(Holding::UntilStopped));
-    held.armed.store(true, Ordering::SeqCst);
     four_flushes(&node, "merging").await;
     until(30, "the tenant's merge never came to build", || {
         builds.held() == 1
     })
     .await;
+    held.armed.store(true, Ordering::SeqCst);
     let tenant_held = node.tenant(&tenant("merging")).await.unwrap();
     let batch: Vec<Mutation> = (0..NOTES).map(|n| note(1_000 + n)).collect();
     tenant_held.write(batch).await.unwrap();
