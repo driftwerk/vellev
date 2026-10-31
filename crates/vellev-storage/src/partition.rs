@@ -3062,13 +3062,6 @@ impl Writer {
         loaded.fit(meta, catalog)
     }
 
-    /// Carry out the merge the partition most needs, if any: replace a run
-    /// of segments with one holding their live rows, in a checkpoint that
-    /// also flushes what is unflushed, as [`Self::flush`] does. Both
-    /// segments are built from the partition as it is now and written while
-    /// commits go on; a row that dies meanwhile is dead in the new segment
-    /// too. Returns the checkpoint's position, or `None` when there was
-    /// nothing to merge.
     /// Make and commit the curve of its rows for every clustered index of a
     /// segment that has none, as a segment written before curves (recall
     /// note, R9.5): the curve its build would have given, made off the
@@ -3153,6 +3146,16 @@ impl Writer {
         Ok(Some(position))
     }
 
+    /// Carry out the merge the partition most needs, if any: replace a run
+    /// of segments with one holding their live rows, in a checkpoint that
+    /// also flushes what is unflushed, as [`Self::flush`] does. Both
+    /// segments are built from the partition as it is now and written while
+    /// commits go on; a row that dies meanwhile is dead in the new segment
+    /// too. Returns the position of a checkpoint it made, or `None` when
+    /// there was nothing to merge or it was dropped with none made. A
+    /// position says to ask again, not that the merge landed: one dropped
+    /// once it had flushed first returns that flush's, as what the flush
+    /// made due has yet to be looked at.
     pub async fn merge(&self) -> Result<Option<LogPosition>> {
         self.merge_planned_at(None).await
     }

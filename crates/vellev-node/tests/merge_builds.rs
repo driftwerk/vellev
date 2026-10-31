@@ -1864,34 +1864,20 @@ async fn a_flush_first_that_fails_wakes_the_flush_task_and_loses_nothing() {
     assert_eq!(opened.read(State::rows), rows, "rows lost");
 }
 
-/// A commit that gives its turn back goes on: nothing about it is for a sweep
-/// to answer. Counted in the total, it would go from nothing to its peak in
-/// a moment, and a sweep would let tenants go and stop merges for bytes that
-/// leave by themselves: §9.9's thrash, which A2 counts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_commit_giving_its_turn_back_moves_nothing_in_a_sweep() {
-    let set = |settings: &mut Settings| {
-        settings.flush_rows = NOTES as usize;
-        settings.tenant_idle = Duration::from_secs(60 * 60);
-    };
-    // Measured on a node like it, as a budget is set before a node starts.
-    let measuring = node(set);
-    four_flushes(&measuring, "other").await;
-    four_flushes(&measuring, "merging").await;
-    until(30, "the node never settled", || measuring.unsettled() == 0).await;
-    let holds = measuring.resident();
-    let peak = measuring.merges().largest;
-    assert!(peak > 0);
-    let store = failing_flushes();
-    let node = node_on(store.clone(), |settings| {
-        set(settings);
-        settings.memory = Some(holds + peak / 2);
-    });
+/// On `node`, on `store`: tenant "other" settled, and tenant "merging" with
+/// its commit waiting behind a held flush, its turn given back.
+async fn a_commit_waiting(
+    node: &Node,
+    store: &FailingFlushes,
+) -> (
+    Arc<vellev_node::Tenant>,
+    tokio::task::JoinHandle<vellev_node::Result<vellev_storage::coordinator::LogPosition>>,
+) {
     let builds = node.merge_builds().clone();
     builds.idle_for(Duration::from_millis(100));
-    four_flushes(&node, "other").await;
+    four_flushes(node, "other").await;
     until(30, "the node never settled", || node.unsettled() == 0).await;
-    let gate = past_loading(&node, "merging").await;
+    let gate = past_loading(node, "merging").await;
     let held = node.tenant(&tenant("merging")).await.unwrap();
     let batch: Vec<Mutation> = (0..NOTES / 2).map(|n| note(1_000 + n)).collect();
     held.write(batch).await.unwrap();
@@ -1909,12 +1895,43 @@ async fn a_commit_giving_its_turn_back_moves_nothing_in_a_sweep() {
         builds.turns_free() == MERGE_BUILDS
     })
     .await;
-    assert!(node.merges().waiting_to_commit > 0, "not counted");
+    (held, flushing)
+}
+
+/// A commit that gives its turn back goes on: nothing about it is for a sweep
+/// to answer. Counted in the total, it would go from nothing to all it holds
+/// in a moment, and a sweep would let tenants go and stop merges for bytes
+/// that leave by themselves: §9.9's thrash, which A2 counts. The budget is
+/// set for that to be seen: what the same state comes to on a like node, and
+/// half of what the commit holds on top, so that it alone is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_giving_its_turn_back_moves_nothing_in_a_sweep() {
+    let set = |settings: &mut Settings| {
+        settings.flush_rows = NOTES as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    };
+    let measured = failing_flushes();
+    let measuring = node_on(measured.clone(), set);
+    let (_held, flushing) = a_commit_waiting(&measuring, &measured).await;
+    let holds = measuring.resident();
+    let waiting = measuring.merges().waiting_to_commit;
+    assert!(waiting > 0, "not counted");
+    measured.holding.store(false, Ordering::SeqCst);
+    within(30, "the flush never ended", flushing)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let store = failing_flushes();
+    let node = node_on(store.clone(), |settings| {
+        set(settings);
+        settings.memory = Some(holds + waiting / 2);
+    });
+    let (held, flushing) = a_commit_waiting(&node, &store).await;
     assert!(
-        node.merges().waiting_to_commit < peak,
-        "counted at its peak"
+        node.merges().waiting_to_commit > waiting / 2,
+        "what it holds would not take this node over its budget"
     );
-    assert_eq!(node.merges().draining, 0, "a merge going on drains nothing");
     let let_go = node.let_go();
     tokio::time::sleep(RESIDENT_PAST).await;
     within(10, "the sweep never ended", node.sweep_now()).await;
@@ -1926,6 +1943,7 @@ async fn a_commit_giving_its_turn_back_moves_nothing_in_a_sweep() {
         0,
         "a sweep stopped a merge"
     );
+    assert_eq!(node.merges().draining, 0, "a merge going on drains nothing");
     store.holding.store(false, Ordering::SeqCst);
     within(30, "the flush never ended", flushing)
         .await
@@ -1935,6 +1953,7 @@ async fn a_commit_giving_its_turn_back_moves_nothing_in_a_sweep() {
         node.merges().waiting_to_commit == 0
     })
     .await;
+    assert_eq!(held.read(State::unflushed), 0);
 }
 
 /// Longer than a node keeps a tenant whatever a sweep finds.

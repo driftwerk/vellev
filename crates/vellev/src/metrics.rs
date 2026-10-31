@@ -780,8 +780,8 @@ impl Collector for Counted {
         for (name, help, value) in [
             (
                 "merge_draining_bytes",
-                "About how many bytes merges stopped and not yet ended hold, and merges that \
-                 gave their turns back to wait to commit, counted against the memory budget",
+                "About how many bytes merges stopped and not yet ended hold, counted against \
+                 the memory budget",
                 merges.draining,
             ),
             (
