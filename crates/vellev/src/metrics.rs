@@ -442,7 +442,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "building_wait_seconds",
-        "How long a tenant's work waited for its partition's building lock, by what it was: a flush, a merge planning (gathering its rows) or committing, curves committed, cleaning up, or a restore",
+        "How long a tenant's work waited for its partition's building lock, by what it was: a flush, a merge planning or committing, curves committed, cleaning up, or a restore",
         "holder",
         by_holder(Timed::BuildingWait),
     )?;
@@ -456,9 +456,16 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "merge_phase_seconds",
-        "How long each phase of a merge took: waiting for a turn among the node's merge builds, gathering the run's rows under the building lock, building the merged segment without it, uploading it, and loading it back",
+        "How long each phase of a merge took, that it came through: waiting for a turn among the node's merge builds, then for a thread off the async ones, gathering the run's rows with no lock held, building the merged segment, encoding its clustered index, uploading it, and loading it back",
         "phase",
         MergePhase::ALL.map(|phase| (phase.name(), timings.seconds(Timed::Merge(phase)))),
+    )?;
+    histograms(
+        encoder,
+        "merge_given_up_seconds",
+        "How long each phase of a merge ran before it was stopped or failed, by phase as for vellev_merge_phase_seconds: work spent that no merge came of",
+        "phase",
+        MergePhase::ALL.map(|phase| (phase.name(), timings.seconds(Timed::MergeGivenUp(phase)))),
     )?;
     for (name, help, timed) in [
         (

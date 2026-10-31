@@ -7,7 +7,7 @@
 mod common;
 
 use common::*;
-use vellev_storage::timings::{MergeEnd, MergePhase, Timed};
+use vellev_storage::timings::{Holder, MergeEnd, MergePhase, Timed};
 use vellev_storage::{Holding, MergeBuilds, Merging, Query, GATHERED_AT_ONCE};
 
 /// Rows in each of the two segments merged: several chunks, so that a
@@ -344,12 +344,38 @@ async fn a_gather_a_restore_and_a_stop_both_ended_is_counted_stale() {
     assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
 }
 
+/// A restore and a stop that come to a merge once it is built end it stale
+/// too, as at its gather: stale is asked wherever a stop is heeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_a_restore_and_a_stop_ended_once_built_is_counted_stale() {
+    let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let writer = two_large(&cluster, &builds).await;
+    let committed = cluster.committed().await;
+    let (head, position) = (committed.manifest.unwrap(), committed.log_position);
+    written(&writer, vec![upsert_as(0, -1)]).await;
+    builds.hold(Some(Holding::BuiltUntilLetGo));
+    let held = Held(builds.clone());
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    until(LONG, "no build came to be held", || builds.held() == 1).await;
+    let restoring = writer.restore(Some(&head), position);
+    within(LONG, "the restore went through", restoring)
+        .await
+        .unwrap();
+    writer.stop_merges();
+    held.let_go();
+    let merged = within(LONG, "the merge ended", merging).await;
+    assert_eq!(merged.unwrap().unwrap(), None, "the merge is dropped");
+    assert_eq!(ended(&writer), vec![(MergeEnd::Stale, 1)]);
+}
+
 /// A merge's gather is timed for the copy, however long it runs, and its
 /// build begins after it ends: neither counts the other (§9.7 rule 5).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_gather_is_timed_as_the_copy_and_apart_from_the_build() {
+async fn a_gather_is_timed_as_the_copy(builds: Arc<MergeBuilds>) {
     const HELD: Duration = Duration::from_millis(500);
-    let (builds, cluster) = (MergeBuilds::new(1), Cluster::new().await);
+    let cluster = Cluster::new().await;
     let writer = two_large(&cluster, &builds).await;
     let timings = writer.timings().clone();
     timings.keep_events(true);
@@ -359,21 +385,38 @@ async fn a_gather_is_timed_as_the_copy_and_apart_from_the_build() {
     let merged = within(LONG, "the merge ended", merging).await;
     assert!(merged.unwrap().unwrap().is_some(), "the merge committed");
     let events = timings.drain_events();
-    let one = |phase: MergePhase| {
-        let mut of = events
-            .iter()
-            .filter(|event| event.timed == Timed::Merge(phase));
+    let one = |timed: Timed| {
+        let mut of = events.iter().filter(|event| event.timed == timed);
         let event = of.next().expect("a phase timed");
-        assert!(of.next().is_none(), "{phase:?} timed twice");
+        assert!(of.next().is_none(), "{timed:?} timed twice");
         event.clone()
     };
-    let (gather, build) = (one(MergePhase::Gather), one(MergePhase::Build));
+    let gather = one(Timed::Merge(MergePhase::Gather));
+    let build = one(Timed::Merge(MergePhase::Build));
+    let plan = one(Timed::BuildingHeld(Holder::MergePlan));
     assert!(gather.took >= HELD, "the copy timed {:?}", gather.took);
+    assert!(
+        plan.took < HELD / 2,
+        "the plan held the lock through the gather: {:?}",
+        plan.took
+    );
     assert!(
         build.at - build.took >= gather.at,
         "the build began before the gather ended: it took {:?}",
         build.took
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gather_is_timed_as_the_copy_on_the_global_pool() {
+    a_gather_is_timed_as_the_copy(MergeBuilds::new(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gather_is_timed_as_the_copy_on_a_pool_of_its_own() {
+    let pools = vellev_storage::merge_slots(1, 2, 0);
+    let builds = MergeBuilds::building_on(pools.into_iter().map(Arc::new).collect());
+    a_gather_is_timed_as_the_copy(builds).await;
 }
 
 /// A store whose gets, once armed, wait until let go.
