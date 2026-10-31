@@ -188,6 +188,10 @@ pub struct MergeBuilds {
     slots_free: Mutex<Vec<usize>>,
     /// How many merges have taken a turn: each one's number.
     numbered: AtomicU64,
+    /// How many turns were free as the last slot went back: none more than
+    /// before, as a slot goes back before the turn that held it.
+    #[cfg(test)]
+    turns_free_at_slot: AtomicUsize,
     /// The most any build was reckoned to hold at its peak, since the node
     /// started.
     largest: AtomicUsize,
@@ -318,6 +322,8 @@ impl MergeBuilds {
             slots_free: Mutex::new((0..pools.len()).rev().collect()),
             pools,
             numbered: AtomicU64::new(0),
+            #[cfg(test)]
+            turns_free_at_slot: AtomicUsize::new(usize::MAX),
             largest: AtomicUsize::new(0),
             top_level_cpu: AtomicU64::new(0),
         })
@@ -923,6 +929,10 @@ impl Drop for Counted {
         // finds a slot.
         if let Some(slot) = self.slot {
             lock(&self.builds.slots_free).push(slot);
+            #[cfg(test)]
+            self.builds
+                .turns_free_at_slot
+                .store(self.builds.turns.available_permits(), Ordering::SeqCst);
         }
     }
 }
@@ -1007,6 +1017,16 @@ mod nesting {
         // Off pools of their own, there are none to hold.
         let global = MergeBuilds::new(2);
         assert_eq!(turn_of(&global, "one").await.counted.slot, None);
+    }
+
+    /// A slot goes back before the turn that held it, so that a turn
+    /// granted at once to a merge waiting finds it: told from the turns
+    /// free as it goes back, none with the only one still held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slot_goes_back_before_its_turn() {
+        let builds = MergeBuilds::building_on(pools(1, 1));
+        drop(turn_of(&builds, "one").await);
+        assert_eq!(builds.turns_free_at_slot.load(Ordering::SeqCst), 0);
     }
 
     /// A section that panics unwinds to its build, and leaves the slot

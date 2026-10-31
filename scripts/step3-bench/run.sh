@@ -52,6 +52,10 @@ done
   for f in cpu.max cpu.weight memory.max cpuset.cpus.effective; do
     printf '%s: ' "$f"; cat "/sys/fs/cgroup$cg/$f" 2>/dev/null || echo "(none)"
   done
+  echo "## steal since boot, all and per CPU, as the kernel accounts it"
+  awk '/^cpu/{print $1, $9}' /proc/stat
+  echo "## virtualisation"; systemd-detect-virt 2>&1 || true
+  echo "## the kernel on steal"; as_root dmesg 2>/dev/null | grep -i steal || echo "(nothing)"
   echo "## limits"; ulimit -a
   echo "## disk"; df -h "$data" "$out"
 } > "$out/machine.txt" 2>&1
