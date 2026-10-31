@@ -19,7 +19,7 @@ use vellev_core::{
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{
     ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Served, Settings, Tenant,
-    LOOKED_OVER_EVERY, RELEASE_WITHIN, REMEMBERED,
+    LET_GO_FLUSH_WITHIN, LOOKED_OVER_EVERY, RELEASE_WITHIN, REMEMBERED,
 };
 use vellev_storage::backups::{Backup, Backups, DELETED_AT_ONCE};
 use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs};
@@ -1899,6 +1899,57 @@ async fn a_release_that_hangs_holds_up_no_sweep() {
         .store(false, Ordering::SeqCst);
     let opened = node.tenant(&tenant("acme")).await.unwrap();
     assert!(opened.held_until() > tokio::time::Instant::now());
+}
+
+/// M7-R5b: a let-go's flush cut in its commit closes its writer, which costs
+/// nothing with the hold lost at once. The next opener finds every row,
+/// whether the commit never landed, and it replays them, or landed unheard,
+/// and it reads them from the head.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_s_flush_cut_in_its_commit_costs_no_row() {
+    for landed in [false, true] {
+        let cluster = Cluster::new();
+        let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+        let node = Node::new(
+            coordinator.clone(),
+            cluster.store.clone(),
+            Arc::new(Embedders::new(EmbedSettings::default())),
+            Settings {
+                memory: Some(1),
+                flush_rows: 1_000_000,
+                tenant_idle: Duration::from_secs(60 * 60),
+                // Longer than a commit is bounded to by the lease: only what
+                // a sweep gives its flushes ends this one.
+                lease: Duration::from_secs(10 * 60),
+                ..cluster.settings()
+            },
+        );
+        let acme = tenant("acme");
+        node.create_tenant(&acme).await.unwrap();
+        let held = node.tenant(&acme).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+        held.write(ten_notes(0)).await.unwrap();
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let unheard = match landed {
+            true => &coordinator.hang_after_commit,
+            false => &coordinator.unanswered_commits,
+        };
+        unheard.store(true, Ordering::SeqCst);
+        let bound = LET_GO_FLUSH_WITHIN + Duration::from_secs(1);
+        tokio::time::timeout(bound, node.sweep_now())
+            .await
+            .expect("the sweep was held past its bound by a commit unanswered");
+        assert_eq!(node.let_go().flushes_skipped, 1, "landed: {landed}");
+        assert_eq!(node.let_go().for_budget, 1, "landed: {landed}");
+        unheard.store(false, Ordering::SeqCst);
+        let opened = node.tenant(&acme).await.unwrap();
+        assert_eq!(opened.read(count), 10, "rows lost, landed: {landed}");
+        let replayed = opened.read(State::unflushed);
+        assert_eq!(replayed, if landed { 0 } else { 10 }, "landed: {landed}");
+    }
 }
 
 /// A flush under way keeps its tenant, as a round does: a sweep takes out

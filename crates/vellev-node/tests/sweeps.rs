@@ -697,6 +697,14 @@ async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
     assert_eq!(waited.len(), 4, "{events:?}");
     let whole = waited.iter().filter(|took| **took >= LET_GO_FLUSH_WITHIN);
     assert_eq!(whole.count(), 2, "not reached, so not told: {waited:?}");
+    let begun = events
+        .iter()
+        .filter(|event| event.timed == Timed::BuildingHeld(Holder::Flush));
+    assert_eq!(
+        begun.count(),
+        LET_GO_FLUSHES_AT_ONCE,
+        "one begun at the deadline"
+    );
     store.held.lock().unwrap().clear();
     for name in names {
         let opened = node.tenant(&tenant(name)).await.unwrap();
