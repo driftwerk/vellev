@@ -1734,8 +1734,9 @@ fn debt_is_the_tails_average_not_its_last_instant() {
 /// how long the builds that overlapped nothing took. `spans` are whether
 /// each is a build, when it ended, and how long it took; a slot is held a
 /// while longer, through a merge's upload and load, which use no thread of
-/// its pool. It decides nothing.
-fn slot_use(spans: &[(bool, f64, f64)], slots: usize) -> Value {
+/// its pool. `slots` is `None` for an arm with no pools of its own, where
+/// nothing of them can stand idle. It decides nothing.
+fn slot_use(spans: &[(bool, f64, f64)], slots: Option<usize>) -> Value {
     let mut edges: Vec<(f64, i64)> = spans
         .iter()
         .flat_map(|(_, ended, took)| [(ended - took, 1), (*ended, -1)])
@@ -1764,7 +1765,9 @@ fn slot_use(spans: &[(bool, f64, f64)], slots: usize) -> Value {
         .collect();
     json!({
         "busy_s": busy_s, "lone_s": lone_s,
-        "idle_share": (busy_s > 0.0).then(|| 1.0 - slot_s / (busy_s * slots as f64)),
+        "idle_share": slots
+            .filter(|_| busy_s > 0.0)
+            .map(|slots| 1.0 - slot_s / (busy_s * slots as f64)),
         "lone_builds": summary(lone_builds),
         "builds": spans.iter().filter(|span| span.0).count(),
     })
@@ -1776,13 +1779,18 @@ fn slot_use(spans: &[(bool, f64, f64)], slots: usize) -> Value {
 #[test]
 fn slot_use_says_how_long_a_build_ran_alone_and_the_pools_stood_idle() {
     let spans = [(true, 20.0, 20.0), (true, 30.0, 20.0), (true, 50.0, 5.0)];
-    let used = slot_use(&spans, 2);
+    let used = slot_use(&spans, Some(2));
     assert_eq!(used["busy_s"], json!(35.0), "{used}");
     assert_eq!(used["lone_s"], json!(25.0), "{used}");
     assert_eq!(used["idle_share"], json!(1.0 - 45.0 / 70.0), "{used}");
     assert_eq!(used["lone_builds"]["count"], json!(1), "{used}");
     assert_eq!(used["lone_builds"]["max"], json!(5.0), "{used}");
-    assert_eq!(slot_use(&[], 2)["idle_share"], json!(null));
+    assert_eq!(slot_use(&[], Some(2))["idle_share"], json!(null));
+    // Arm (a) has no slots, so nothing of them stands idle: its figure
+    // would mean nothing, though its builds are still timed.
+    let global = slot_use(&spans, None);
+    assert_eq!(global["idle_share"], json!(null), "{global}");
+    assert_eq!(global["lone_s"], json!(25.0), "{global}");
 }
 
 /// A build counts as idle by when it began: one begun on an active tenant
@@ -2461,7 +2469,10 @@ async fn arm(bench: Bench, running: Running) {
         "merges_ended": ended_over_soak,
         "open_at_soak_end": open_at_soak_end,
         "idle_merge_builds": idle_merge_builds(&merge_work_timed, &schedule),
-        "slot_use": slot_use(&slot_spans, MERGE_BUILDS),
+        "slot_use": slot_use(
+            &slot_spans,
+            (pool != MergePool::Global).then_some(MERGE_BUILDS),
+        ),
         "clustered_merges_seen": sampled.clustered_merges_seen,
         "let_go": { "idle": let_go_after.idle - let_go_before.idle,
                     "budget": let_go_after.for_budget - let_go_before.for_budget },
