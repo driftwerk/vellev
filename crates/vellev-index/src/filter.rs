@@ -352,7 +352,7 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct PropertyIndex {
     values: BTreeMap<Key, RoaringBitmap>,
     present: RoaringBitmap,
@@ -366,7 +366,7 @@ const RUN: usize = 256;
 /// range over many values unions a few of these and the values at its
 /// edges. Level 0 unions `run` values, and each level above unions `run`
 /// runs of the level below.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Runs {
     run: usize,
     /// The first value of each run of level 0.
@@ -489,7 +489,7 @@ impl PropertyIndex {
 /// Every distinct value of a filterable property is kept as a key, so a
 /// property holding long, mostly unique text is cheaper declared not
 /// filterable.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RowIndex {
     rows: RoaringBitmap,
     properties: HashMap<String, PropertyIndex>,
@@ -498,13 +498,18 @@ pub struct RowIndex {
 impl RowIndex {
     /// About how many bytes the index takes in memory: every row recorded,
     /// and each property's values, with the text of each, the rows holding
-    /// each, and the runs over them. Rough, and a walk over every value.
+    /// each, and the runs over them. Rough, and a walk over every value, a
+    /// property to a thread.
     pub fn resident(&self) -> usize {
-        const VALUE: usize = std::mem::size_of::<(Key, RoaringBitmap)>() + 16;
+        use rayon::prelude::*;
+        // Its place in its map, a node's share of it, and what a bitmap's
+        // vector of containers takes at its least, four of them: as a value
+        // held by one row is measured to take, 245 bytes past its text.
+        const VALUE: usize = std::mem::size_of::<(Key, RoaringBitmap)>() + 176;
         let bitmap = |rows: &RoaringBitmap| rows.serialized_size();
         let properties: usize = self
             .properties
-            .iter()
+            .par_iter()
             .map(|(name, index)| {
                 let values: usize = index
                     .values
