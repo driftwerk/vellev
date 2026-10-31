@@ -729,7 +729,7 @@ impl Collector for Counted {
         let gauge = gauge_of(node.freeing());
         gauge.encode(encoder.encode_descriptor(
             "tenants_freeing_bytes",
-            "About how many bytes the tenants this node writes have taken out of their state, as a merge's commit does what it replaced, and have yet to free: in the process's memory, not in what they are reckoned to hold, and held to no budget, as it goes by itself",
+            "About how many bytes the tenants this node writes, and any it has let go since, have taken out of their state, as a merge's commit does what it replaced, and have yet to free: in the process's memory, not in what they are reckoned to hold, and held to no budget, as it goes by itself",
             None,
             gauge.metric_type(),
         )?)?;

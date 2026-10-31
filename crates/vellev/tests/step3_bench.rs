@@ -2690,6 +2690,30 @@ mod reported_from_what_was_read {
         assert_eq!(open["at_shutdown"]["backlog"]["longest_s"], json!(400.0));
     }
 
+    /// The segments set against the 10% are those of the last rotation:
+    /// over 20 minutes this rising debt would come to under its end.
+    #[test]
+    fn the_tail_reported_is_the_last_rotations() {
+        let mut soak = a_soak();
+        soak.preloaded = vec![Preloaded {
+            tenant: "t0".into(),
+            rows: 0,
+            clustered: 0,
+            clustered_rows: 0,
+            plain: 100,
+            plain_rows: 0,
+            segments: Vec::new(),
+        }];
+        let rising = (0..=180).map(|n| {
+            let t = f64::from(n) * 10.0;
+            (t, 100.0 + (t - 600.0).max(0.0) * 19.6 / 1_200.0, 0.0)
+        });
+        soak.sampled.debt = BTreeMap::from([("t0".to_string(), rising.collect())]);
+        let report = report_of(soak);
+        let tail = report["tail_segments_mean"].as_f64().unwrap();
+        assert!(tail > 110.0, "{tail}");
+    }
+
     /// Steal is read end to end: what comes before the sampler's first read
     /// and after its last counts, by the soak's own two readings.
     #[test]

@@ -2039,9 +2039,9 @@ impl Node {
         unsettled
     }
 
-    /// About how many bytes the tenants this node writes have taken out of
-    /// their state and yet to free, as a merge's commit does what it
-    /// replaced. A figure of its own, for the eye: it goes by itself, so
+    /// About how many bytes the tenants this node writes, and any it has
+    /// let go since, have taken out of their state and yet to free, as a
+    /// merge's commit does what it replaced. A figure of its own, for the eye: it goes by itself, so
     /// neither a sweep nor warming acts on it, and [`Self::resident`] leaves
     /// it out.
     pub fn freeing(&self) -> usize {

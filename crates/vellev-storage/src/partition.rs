@@ -3212,12 +3212,12 @@ impl Writer {
     }
 
     /// How a merge planned at the epoch `planned` ended, that gave up as it
-    /// was stopped or as a restore began: stale if a restore came, whether
-    /// it was made, is under way, or, as `restored` says, was seen at the
-    /// gather and has ended since. A merge stopped by one, or both, could
-    /// never have committed.
-    fn given_up(&self, planned: u64, restored: bool) -> Ended {
-        let restoring = restored || self.restoring.load(Ordering::SeqCst);
+    /// was stopped or as a restore began: stale if a restore was made or is
+    /// under way, as a merge stopped by one, or both, could never have
+    /// committed. One whose gather a restore ended, that then failed before
+    /// this is asked, reads as stopped.
+    fn given_up(&self, planned: u64) -> Ended {
+        let restoring = self.restoring.load(Ordering::SeqCst);
         Ended::Dropped(match self.stale(planned) || restoring {
             true => MergeEnd::Stale,
             false => MergeEnd::Stopped,
@@ -3254,20 +3254,10 @@ impl Writer {
             return Ok(Ended::Dropped(MergeEnd::Stale));
         }
         let dead = run.dead();
-        let restored = Arc::new(AtomicBool::new(false));
-        let gather = self.gathered(
-            run,
-            planned,
-            reckoning,
-            named_at,
-            catalog.clone(),
-            restored.clone(),
-        );
+        let gather = self.gathered(run, planned, reckoning, named_at, catalog.clone());
         let built = self.built_stopping(gather, catalog.clone(), stopping, Some(build.clone()));
         let Some((built, shape)) = built.await? else {
-            // A restore under way that the gather gave up for is said so,
-            // though it may have ended since.
-            return Ok(self.given_up(planned, restored.load(Ordering::SeqCst)));
+            return Ok(self.given_up(planned));
         };
         // Both segments, however large, are uploaded without the writer,
         // under names of their own at the position each was built from;
@@ -3291,7 +3281,7 @@ impl Writer {
         // as what it would replace, and a stop lets it go on an async thread.
         let merged = FreedOff::new(merged).of(Some(build.clone()));
         if stopping.stopped(MergeStage::Encoding) {
-            return Ok(self.given_up(planned, false));
+            return Ok(self.given_up(planned));
         }
         let _keeping = self.keep(&merged.meta);
         let uploading = Uploading::new(build.clone());
@@ -3302,13 +3292,13 @@ impl Writer {
             .await;
         self.phase_ended(MergePhase::Upload, matches!(uploaded, Ok(true)), upload);
         if !uploaded? {
-            return Ok(self.given_up(planned, false));
+            return Ok(self.given_up(planned));
         }
         let loading = Instant::now();
         let fit = self.fit(merged, &catalog, Some(stopping));
         let Some(merged) = stopping.unless_stopped(MergeStage::Loading, fit).await else {
             self.phase_ended(MergePhase::Load, false, loading);
-            return Ok(self.given_up(planned, false));
+            return Ok(self.given_up(planned));
         };
         let merged = merged.map(|fit| FreedOff::new(fit).of(Some(build.clone())));
         // From here the merge commits, or is dropped by what it finds under
@@ -3328,7 +3318,7 @@ impl Writer {
         // given up as it was stopped fails, and is no failure of the merge.
         self.phase_ended(MergePhase::Load, !heeded && merged.is_ok(), loading);
         if heeded {
-            return Ok(self.given_up(planned, false));
+            return Ok(self.given_up(planned));
         }
         let merged = merged?;
         let gate = self.merge_gate.lock().expect("gate lock").clone();
@@ -3418,7 +3408,6 @@ impl Writer {
         reckoning: Reckoning,
         named_at: LogPosition,
         catalog: Catalog,
-        restored: Arc<AtomicBool>,
     ) -> impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<Shape> + Send + 'static
     {
         let (epoch, restoring) = (self.epoch.clone(), self.restoring.clone());
@@ -3436,7 +3425,6 @@ impl Writer {
                     let stopped = stopping.stopped(MergeStage::Gathering);
                     let restoring =
                         restoring.load(Ordering::SeqCst) || epoch.load(Ordering::SeqCst) != planned;
-                    restored.fetch_or(restoring, Ordering::SeqCst);
                     !stopped && !restoring
                 };
                 let given_up = |gathering: Instant| {
