@@ -974,6 +974,14 @@ impl Tenant {
         self.work.settling.rows_passes.load(Ordering::SeqCst)
     }
 
+    /// The tenant's writer, which holds no tenant: what a test holds its
+    /// building lock through, a sweep finding nothing else holding it. For
+    /// tests.
+    #[doc(hidden)]
+    pub fn writer(&self) -> &Arc<Writer> {
+        &self.work.writer
+    }
+
     /// When the hold on the tenant runs out unless renewed: each renewal
     /// moves it on. For tests.
     #[doc(hidden)]
@@ -1626,6 +1634,16 @@ const RESTORE_WAITS: usize = 3;
 /// memory budget.
 const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
 
+/// How long a sweep gives the flushes of all the tenants it lets go,
+/// together.
+pub const LET_GO_FLUSH_WITHIN: Duration = Duration::from_secs(30);
+
+/// How many tenants a sweep flushes at once as it lets them go.
+pub const LET_GO_FLUSHES_AT_ONCE: usize = 2;
+
+/// How long giving a lease up early is waited for.
+pub const RELEASE_WITHIN: Duration = Duration::from_secs(5);
+
 /// The least time from the start of one clean beside a tenant's merges to
 /// the start of the next, whatever [`Settings::clean_at_least_every`] says,
 /// and how often a lapsed hold is looked at meanwhile: of none at all, they
@@ -1903,6 +1921,9 @@ pub struct MergesStopped {
 pub struct LetGo {
     pub idle: u64,
     pub for_budget: u64,
+    /// How many of the tenants let go, with rows to flush, were not
+    /// flushed: not yet.
+    pub flushes_skipped: u64,
 }
 
 /// What this node holds open, and what it reckons that holds in memory:
@@ -2247,6 +2268,7 @@ impl Node {
         LetGo {
             idle: self.0.let_go_idle.load(Ordering::Relaxed),
             for_budget: self.0.let_go_for_budget.load(Ordering::Relaxed),
+            flushes_skipped: 0,
         }
     }
 

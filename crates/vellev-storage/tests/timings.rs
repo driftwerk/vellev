@@ -191,6 +191,82 @@ async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
 }
 
+/// What a node lets a tenant go under: the building lock tried, never
+/// waited for, and a flush made with it held, which holds it no longer than
+/// whoever took it does. The flush is timed as a flush's hold, and has no wait
+/// for the lock to time: the flush wait mark sets those against a flush's own
+/// build, and a run of zeros would make it read better than it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_can_be_made_under_a_building_lock_held_already() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    writer.commit(notes(0, 3)).await.unwrap();
+    writer.flush().await.unwrap();
+    writer.commit(notes(10, 3)).await.unwrap();
+    timings.drain_events();
+    let held = writer.building_if_free().expect("nothing holds the lock");
+    assert!(writer.building_if_free().is_none(), "held, and free");
+    let flushing = writer.flush_holding(&held);
+    let (_, built) = tokio::time::timeout(Duration::from_secs(10), flushing)
+        .await
+        .expect("a flush under a lock held waited for that lock")
+        .unwrap();
+    assert!(built.is_some(), "nothing flushed");
+    assert_eq!(writer.partition().read(State::unflushed), 0);
+    assert!(writer.building_if_free().is_none(), "let go by the flush");
+    let events = timings.drain_events();
+    assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 0);
+    assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
+    // Nothing written since: nothing to flush, and no flush's hold.
+    let (_, built) = writer.flush_holding(&held).await.unwrap();
+    assert_eq!(built, None);
+    let events = timings.drain_events();
+    assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 0);
+    drop(held);
+    assert!(writer.building_if_free().is_some(), "held for good");
+}
+
+/// A queue for the lock is holding it: what tries the lock finds it busy, and
+/// so never goes ahead of a merge or a flush that waits for it.
+#[tokio::test]
+async fn a_lock_queued_for_is_not_free() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    let held = writer.building_if_free().expect("nothing holds the lock");
+    let queued = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    // Queued by now, or it would not be a queue this looks at.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!queued.is_finished(), "a flush went ahead of the lock held");
+    drop(held);
+    assert!(
+        writer.building_if_free().is_none(),
+        "the lock let go to whoever queued is free to try"
+    );
+    tokio::time::timeout(Duration::from_secs(10), queued)
+        .await
+        .expect("the flush queued ended")
+        .unwrap()
+        .unwrap();
+}
+
+/// A flush says what it flushes under by the lock it is given, which is
+/// worth nothing if the lock is another writer's.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "another writer's building lock")]
+async fn a_flush_under_another_writer_s_lock_is_refused() {
+    let (first, second) = (Cluster::new().await, Cluster::new().await);
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&first, &timings, 0, MergeBuilds::new(1)).await;
+    let other = timed_writer(&second, &timings, 0, MergeBuilds::new(1)).await;
+    let held = other.building_if_free().expect("nothing holds the lock");
+    let _ = writer.flush_holding(&held).await;
+}
+
 /// Merge work given up is timed apart from what finished, phase by phase:
 /// a merge stopped again and again spends real CPU, and an arm's idle
 /// share of its build seconds must count it (review of #169). A build

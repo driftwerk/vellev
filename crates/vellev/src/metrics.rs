@@ -513,6 +513,13 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     for (reason, count) in [("idle", let_go.idle), ("budget", let_go.for_budget)] {
         ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
     }
+    let counter = ConstCounter::new(let_go.flushes_skipped);
+    counter.encode(encoder.encode_descriptor(
+        "let_go_flushes_skipped",
+        "Tenants let go with rows unflushed that the flush before letting them go did not reach, or that it was cut short for, as a sweep's flushes are bounded: their rows are in the log, and the next opener replays them",
+        None,
+        counter.metric_type(),
+    )?)?;
     Ok(())
 }
 

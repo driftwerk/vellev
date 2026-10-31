@@ -4,8 +4,9 @@
 //! that a sweep held up, as by a flush that hangs, never has a sweep a
 //! request queued behind it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vellev_core::{
@@ -13,11 +14,11 @@ use vellev_core::{
     ObjectId, Property, RequestId, TenantId,
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
-use vellev_node::{Node, Settings};
+use vellev_node::{Node, Settings, Tenant, LET_GO_FLUSHES_AT_ONCE, LET_GO_FLUSH_WITHIN};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator, Point};
 use vellev_storage::timings::{Holder, Timed};
-use vellev_storage::{Mutation, State};
+use vellev_storage::{Mutation, State, StorageError, Writer};
 
 fn tenant(name: &str) -> TenantId {
     TenantId::new(name).unwrap()
@@ -114,6 +115,118 @@ impl Blobs for HeldPuts {
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
         self.inner.delete(key).await
     }
+}
+
+/// A store that holds flushes up tenant by tenant: the next put of a tenant
+/// named by [`Self::hold`] waits as long as that says, and the vectors of
+/// one named by [`Self::fail_vectors`] fail to go up.
+#[derive(Debug)]
+struct TenantPuts {
+    inner: Arc<dyn Blobs>,
+    held: Mutex<HashMap<String, Duration>>,
+    failing: Mutex<HashSet<String>>,
+    /// The tenants whose flushes have come to a put held.
+    reached: Mutex<HashSet<String>>,
+    /// How many puts held wait now, and the most that ever did at once.
+    waiting: AtomicUsize,
+    most_waiting: AtomicUsize,
+}
+
+impl TenantPuts {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: memory(),
+            held: Mutex::default(),
+            failing: Mutex::default(),
+            reached: Mutex::default(),
+            waiting: AtomicUsize::new(0),
+            most_waiting: AtomicUsize::new(0),
+        })
+    }
+
+    fn hold(&self, tenant: &str, held: Duration) {
+        self.held.lock().unwrap().insert(tenant.into(), held);
+    }
+
+    fn fail_vectors(&self, tenant: &str, failing: bool) {
+        let mut tenants = self.failing.lock().unwrap();
+        match failing {
+            true => tenants.insert(tenant.into()),
+            false => tenants.remove(tenant),
+        };
+    }
+
+    fn reached(&self) -> usize {
+        self.reached.lock().unwrap().len()
+    }
+}
+
+#[async_trait::async_trait]
+impl Blobs for TenantPuts {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        let tenant = key.split('/').next().unwrap_or_default();
+        if key.ends_with(".vectors") && self.failing.lock().unwrap().contains(tenant) {
+            return Err(StorageError::Background("no room for vectors".into()));
+        }
+        let held = self.held.lock().unwrap().remove(tenant);
+        if let Some(held) = held {
+            self.reached.lock().unwrap().insert(tenant.into());
+            let waiting = self.waiting.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_waiting.fetch_max(waiting, Ordering::SeqCst);
+            tokio::time::sleep(held).await;
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A node over its memory budget from its first row, whose tenants are
+/// flushed only as they are let go and let go only for the budget.
+fn over_budget(blobs: Arc<dyn Blobs>) -> Node {
+    node_on(blobs, |settings| {
+        settings.memory = Some(1);
+        settings.flush_rows = 1_000_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    })
+}
+
+/// `name` made on `node` with `rows` notes in memory, and no longer used:
+/// its writer, which holds no tenant, is what is left of it here.
+async fn written(node: &Node, name: &str, rows: u128) -> Arc<Writer> {
+    node.create_tenant(&tenant(name)).await.unwrap();
+    let held = node.tenant(&tenant(name)).await.unwrap();
+    held.write(vec![notes()]).await.unwrap();
+    let rows: Vec<Mutation> = (1..=rows).map(note).collect();
+    held.write(rows).await.unwrap();
+    // Told apart from the next by when each was last used.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    held.writer().clone()
+}
+
+/// Past when a tenant last used is kept whatever the budget says.
+async fn unused_long_enough() {
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+}
+
+/// How many notes `tenant` holds.
+fn noted(tenant: &Tenant) -> usize {
+    let notes = CollectionName::new("notes").unwrap();
+    tenant.read(|state| state.count(&notes))
+}
+
+/// The tenants `node` writes for, by name.
+fn written_for(node: &Node) -> Vec<String> {
+    let figures = node.tenant_figures();
+    figures.iter().map(|(id, _)| id.to_string()).collect()
 }
 
 /// Delta review of #165, M1: every use of a tenant over the budget asks for
@@ -383,4 +496,259 @@ async fn the_flush_before_letting_a_tenant_go_is_timed_under_its_own_name() {
     assert_eq!(named(Timed::LetGoFlushWait), 1, "{events:?}");
     assert_eq!(named(Timed::LetGoFlushHeld), 1, "{events:?}");
     assert_eq!(named(Timed::BuildingHeld(Holder::Flush)), 1, "{events:?}");
+}
+
+/// M7-R5: a sweep waits on no lock of a tenant's. A tenant chosen with its
+/// building lock held, by what holds nothing that would keep it otherwise,
+/// is kept, however long that lasts; the sweep ends in moments, and a second
+/// tenant goes in it. The first goes at the first sweep once the lock is free.
+#[tokio::test(start_paused = true)]
+async fn a_tenant_whose_building_lock_is_held_is_kept_and_holds_up_no_sweep() {
+    let node = over_budget(memory());
+    let writer = written(&node, "held", 2).await;
+    written(&node, "idle", 2).await;
+    unused_long_enough().await;
+    let building = writer.building_when_free().await;
+    let kept = node.tenants_kept_by_sweeps();
+    tokio::time::timeout(Duration::from_secs(1), node.sweep_now())
+        .await
+        .expect("the sweep waited for the lock held");
+    assert_eq!(node.let_go().for_budget, 1, "the second tenant stays");
+    assert_eq!(written_for(&node), ["held"], "the wrong tenant went");
+    assert_eq!(node.tenants_kept_by_sweeps(), kept + 1, "not kept");
+    // Held for the 30 s of a slow clean or restore: no sweep waits for it.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::timeout(Duration::from_secs(1), node.sweep_now())
+        .await
+        .expect("a later sweep waited for the lock held");
+    assert_eq!(written_for(&node), ["held"], "let go with its lock held");
+    drop(building);
+    tokio::time::timeout(Duration::from_secs(1), node.sweep_now())
+        .await
+        .expect("the sweep once the lock was free");
+    assert_eq!(node.let_go().for_budget, 2, "{:?}", node.let_go());
+    assert_eq!(written_for(&node), Vec::<String>::new());
+    let opened = node.tenant(&tenant("held")).await.unwrap();
+    assert_eq!(noted(&opened), 2);
+    assert_eq!(opened.read(State::unflushed), 0, "not flushed as it went");
+}
+
+/// M7-R5b: a store that never answers holds the let-go's flush for as long
+/// as a sweep gives its flushes and no longer. The flush is cut there, and
+/// counted as skipped and as no flush that failed; the tenant is let go; and
+/// the next opener finds every row, by replaying them.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_s_flush_that_hangs_is_cut_at_its_bound_and_its_rows_replay() {
+    let store = TenantPuts::new();
+    let node = over_budget(store.clone());
+    written(&node, "hung", 2).await;
+    unused_long_enough().await;
+    store.hold("hung", Duration::from_secs(60 * 60));
+    let asked = tokio::time::Instant::now();
+    let bound = LET_GO_FLUSH_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.sweep_now())
+        .await
+        .expect("the sweep was held past the bound by a flush that hangs");
+    assert!(
+        asked.elapsed() >= LET_GO_FLUSH_WITHIN,
+        "{:?}",
+        asked.elapsed()
+    );
+    assert_eq!(store.reached(), 1, "the flush never came to the store");
+    assert_eq!(node.let_go().flushes_skipped, 1, "{:?}", node.let_go());
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    assert_eq!(node.flushing().failed, 0, "a flush cut counted as failed");
+    assert_eq!(written_for(&node), Vec::<String>::new(), "not let go");
+    let opened = node.tenant(&tenant("hung")).await.unwrap();
+    assert_eq!(noted(&opened), 2, "rows lost");
+    assert_eq!(opened.read(State::unflushed), 2, "not by replay");
+}
+
+/// M7-R5b, nothing else in the gap: the tenant's own flush task comes to try
+/// again as the tenant waits among those a sweep flushes, its building lock
+/// taken as it was taken out. It queues behind that lock, and never has it:
+/// the flush that goes through is the let-go's, under the lock it was taken
+/// with, and losing the hold ends what queued.
+#[tokio::test(start_paused = true)]
+async fn a_flush_queued_behind_a_let_go_never_runs() {
+    let store = TenantPuts::new();
+    let backoff = Duration::from_secs(2);
+    let node = node_on(store.clone(), |settings| {
+        settings.memory = Some(1);
+        settings.flush_rows = 3;
+        settings.flush_backoff = backoff;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    node.timings().keep_events(true);
+    written(&node, "first", 1).await;
+    written(&node, "second", 1).await;
+    store.fail_vectors("third", true);
+    written(&node, "third", 3).await;
+    until(5, "its flush task's flush failed", || {
+        node.flushing().failed == 1
+    })
+    .await;
+    store.fail_vectors("third", false);
+    node.timings().drain_events();
+    unused_long_enough().await;
+    // The two before it hold the sweep's flushes past the try of its flush
+    // task, with `backoff` left of 2 s from the failure.
+    store.hold("first", Duration::from_secs(3));
+    store.hold("second", Duration::from_secs(3));
+    tokio::time::timeout(Duration::from_secs(10), node.sweep_now())
+        .await
+        .expect("the sweep ended");
+    let events = node.timings().drain_events();
+    let named = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
+    assert_eq!(
+        named(Timed::BuildingWait(Holder::Flush)),
+        0,
+        "a flush had the lock between a tenant's taking and its let-go: {events:?}"
+    );
+    assert_eq!(named(Timed::LetGoFlushHeld), 3, "{events:?}");
+    assert_eq!(node.let_go().for_budget, 3, "{:?}", node.let_go());
+    let opened = node.tenant(&tenant("third")).await.unwrap();
+    assert_eq!(noted(&opened), 3, "rows lost");
+    assert_eq!(opened.read(State::unflushed), 0, "not flushed as it went");
+}
+
+/// M7-R5c: a sweep's let-gos run together, so that none waits for the whole
+/// of another's, and flush at most two at once, so that a sweep of many does
+/// not build them all together. Three flushes of 4 s each take 8 s: 12 s
+/// one after another, and 4 s with no limit, three at once.
+#[tokio::test(start_paused = true)]
+async fn a_sweep_flushes_two_tenants_at_once_and_no_more() {
+    assert_eq!(LET_GO_FLUSHES_AT_ONCE, 2);
+    let store = TenantPuts::new();
+    let node = over_budget(store.clone());
+    node.timings().keep_events(true);
+    let names = ["one", "two", "three"];
+    for name in names {
+        written(&node, name, 1).await;
+    }
+    unused_long_enough().await;
+    let flush = Duration::from_secs(4);
+    for name in names {
+        store.hold(name, flush);
+    }
+    let asked = tokio::time::Instant::now();
+    tokio::time::timeout(2 * flush + Duration::from_secs(1), node.sweep_now())
+        .await
+        .expect("let go one after another");
+    assert_eq!(
+        store.most_waiting.load(Ordering::SeqCst),
+        LET_GO_FLUSHES_AT_ONCE,
+        "flushes at once, after {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
+    assert_eq!(written_for(&node), Vec::<String>::new());
+    // What a let-go's flush waited for: the others of its sweep.
+    let events = node.timings().drain_events();
+    let waited: Vec<Duration> = events
+        .iter()
+        .filter(|event| event.timed == Timed::LetGoFlushWait)
+        .map(|event| event.took)
+        .collect();
+    assert_eq!(waited.len(), 3, "{events:?}");
+    let least = |at_least: Duration| waited.iter().filter(|took| **took >= at_least).count();
+    assert_eq!(least(flush), 1, "one waited behind the others: {waited:?}");
+}
+
+/// M7-R5c: one deadline for the whole sweep. With every flush hanging, the
+/// two let-gos at the head are cut at it, those behind are not reached and
+/// never begin, each is counted as skipped, and all are let go by then, not
+/// one pair after another. Those not reached replay their rows; one with
+/// nothing to flush waits for nothing and is no flush skipped.
+#[tokio::test(start_paused = true)]
+async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
+    let store = TenantPuts::new();
+    let node = over_budget(store.clone());
+    node.timings().keep_events(true);
+    let names = ["one", "two", "three", "four"];
+    for name in names {
+        written(&node, name, 1).await;
+    }
+    let writer = written(&node, "flushed", 1).await;
+    writer.flush().await.unwrap();
+    node.timings().drain_events();
+    unused_long_enough().await;
+    for name in names {
+        store.hold(name, Duration::from_secs(60 * 60));
+    }
+    let bound = LET_GO_FLUSH_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.sweep_now())
+        .await
+        .expect("the sweep's flushes outlasted its one deadline");
+    assert_eq!(
+        store.reached(),
+        LET_GO_FLUSHES_AT_ONCE,
+        "begun past the bound"
+    );
+    assert_eq!(node.let_go().flushes_skipped, 4, "{:?}", node.let_go());
+    assert_eq!(node.let_go().for_budget, 5, "{:?}", node.let_go());
+    assert_eq!(written_for(&node), Vec::<String>::new(), "not let go");
+    let events = node.timings().drain_events();
+    let waited: Vec<Duration> = events
+        .iter()
+        .filter(|event| event.timed == Timed::LetGoFlushWait)
+        .map(|event| event.took)
+        .collect();
+    assert_eq!(waited.len(), 4, "{events:?}");
+    let whole = waited.iter().filter(|took| **took >= LET_GO_FLUSH_WITHIN);
+    assert_eq!(whole.count(), 2, "not reached, so not told: {waited:?}");
+    store.held.lock().unwrap().clear();
+    for name in names {
+        let opened = node.tenant(&tenant(name)).await.unwrap();
+        assert_eq!(noted(&opened), 1, "{name}'s rows lost");
+        assert_eq!(opened.read(State::unflushed), 1, "{name}, not by replay");
+    }
+}
+
+/// M7-R9: a tail of one row, far under a flush's worth, is flushed as its
+/// tenant is let go: the next opener replays no log.
+#[tokio::test(start_paused = true)]
+async fn a_tail_under_a_flush_s_rows_is_flushed_as_its_tenant_is_let_go() {
+    let node = over_budget(memory());
+    node.timings().keep_events(true);
+    written(&node, "tail", 1).await;
+    unused_long_enough().await;
+    tokio::time::timeout(Duration::from_secs(5), node.sweep_now())
+        .await
+        .expect("the sweep ended");
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    let events = node.timings().drain_events();
+    let held = events
+        .iter()
+        .filter(|event| event.timed == Timed::LetGoFlushHeld);
+    assert_eq!(held.count(), 1, "no flush made: {events:?}");
+    let opened = node.tenant(&tenant("tail")).await.unwrap();
+    assert_eq!(noted(&opened), 1);
+    assert_eq!(opened.read(State::unflushed), 0, "its log was replayed");
+}
+
+/// The eviction flush's mark is held to flushes: a let-go with nothing to
+/// flush adds no sample to it, which a run of them would make read better
+/// than it is, and takes up no flush of its sweep's, so that one behind it
+/// waits for nothing.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_with_nothing_to_flush_adds_no_sample() {
+    let store = TenantPuts::new();
+    let node = over_budget(store.clone());
+    node.timings().keep_events(true);
+    for name in ["flushed", "empty"] {
+        written(&node, name, 1).await.flush().await.unwrap();
+    }
+    written(&node, "tail", 1).await;
+    node.timings().drain_events();
+    unused_long_enough().await;
+    tokio::time::timeout(Duration::from_secs(5), node.sweep_now())
+        .await
+        .expect("the sweep ended");
+    assert_eq!(node.let_go().for_budget, 3, "{:?}", node.let_go());
+    assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
+    let events = node.timings().drain_events();
+    let named = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
+    assert_eq!(named(Timed::LetGoFlushWait), 1, "{events:?}");
+    assert_eq!(named(Timed::LetGoFlushHeld), 1, "{events:?}");
 }
