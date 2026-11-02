@@ -414,6 +414,14 @@ export VELLEV_API_KEYS=dev-key
 cargo run -p vellev -- serve --listen 127.0.0.1:8080
 ```
 
+A supervisor can hand the database URL and the admin keys over on an
+inherited pipe instead, so they are in neither the node's command line nor
+its environment, which other processes of the same user can read:
+`serve --secrets-fd 3` reads, from descriptor 3, a 4-byte big-endian length
+and then a JSON object holding `VELLEV_DATABASE_URL` and `VELLEV_API_KEYS`.
+They take the place of whatever the environment gave. The descriptor must be
+a pipe, and the node gives up on it after 10 seconds.
+
 `VELLEV_API_KEYS` are admin keys: they reach every tenant, and only they
 create, drop and list tenants. Give each tenant's caller a key of its own,
 which reaches that tenant alone; to it every other tenant is as one that
