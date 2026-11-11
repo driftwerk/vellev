@@ -477,6 +477,25 @@ and say what the caller then answers for.
   `vellev_tenants_given_up_total` counts a panic on either task, two at
   once on one tenant counting twice, and the line logged for it now reads
   "a tenant's task panicked" with the task named.
+- **A sweep waits on no tenant, and its flushes are bounded.** A tenant
+  chosen to be let go whose building lock is busy is kept for a later sweep.
+  One it takes has that lock from then on, with the flush before letting go
+  made under it, so nothing comes in between and whatever queued for the
+  lock ends with the hold. The tenants of a sweep go together, two flushing
+  at a time, with 30 s for all those flushes between them. A flush cut at
+  that, or not reached by then, is skipped: the tenant goes all the same,
+  and whoever opens it next replays its rows from the log, which costs that
+  open more. `vellev_let_go_flushes_skipped_total` is new and counts those;
+  none is a flush that failed. A lease is given up within 5 s, or left to
+  run out.
+  `vellev_flush_to_let_go_seconds{part="wait"}` no longer reads a wait for
+  the building lock, which a sweep tries and never waits for. It reads the
+  wait, with that lock held, for one of the sweep's two flushes: nothing for
+  the first two tenants of a sweep with rows to flush, as long as those take
+  for each after them, and 30 s for one never reached. A tenant with nothing
+  to flush adds no sample, as before. So compare neither that series nor a
+  bench's eviction flush mark across the change: three tenants with rows in
+  one sweep, each flush over 2 s, now read as a wait over 2 s.
 
 ### Numbers are read exactly
 

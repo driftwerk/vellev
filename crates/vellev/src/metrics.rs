@@ -485,7 +485,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "flush_to_let_go_seconds",
-        "The flush made before a tenant is let go: how long it waited for the building lock, and how long it held it",
+        "The flush made before a tenant is let go, if it had rows to flush: how long it waited, with the building lock held from when its sweep took the tenant out, for one of the flushes a sweep makes at once, and how long its flush then took",
         "part",
         [
             ("wait", timings.seconds(Timed::LetGoFlushWait)),
@@ -513,6 +513,13 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     for (reason, count) in [("idle", let_go.idle), ("budget", let_go.for_budget)] {
         ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
     }
+    let counter = ConstCounter::new(let_go.flushes_skipped);
+    counter.encode(encoder.encode_descriptor(
+        "let_go_flushes_skipped",
+        "Tenants let go with rows unflushed that the flush before letting them go did not reach, or that it was cut short for, as a sweep's flushes are bounded: their rows are in the log, and the next opener replays them",
+        None,
+        counter.metric_type(),
+    )?)?;
     Ok(())
 }
 
@@ -715,7 +722,7 @@ impl Collector for Counted {
         let counter = ConstCounter::new(node.tenants_kept_by_sweeps());
         counter.encode(encoder.encode_descriptor(
             "sweep_tenants_kept",
-            "Tenants a sweep chose to let go, for being idle or for the memory budget, but found something else holding, as a request or a merge does: let go at a later round",
+            "Tenants a sweep chose to let go, for being idle or for the memory budget, but found something else holding, as a request or a merge does, or with their building lock busy: let go at a later round",
             None,
             counter.metric_type(),
         )?)?;

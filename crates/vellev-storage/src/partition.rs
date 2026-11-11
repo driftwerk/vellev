@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
 use futures::StreamExt;
 use serde::Serialize;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
 
@@ -1149,8 +1149,9 @@ pub struct Writer {
     /// Held while a flush builds its segment without `writing`, and while
     /// a merge plans and while it commits, so that what replaces segments
     /// goes one at a time, and a flush never builds on a state a merge is
-    /// about to replace.
-    building: Mutex<()>,
+    /// about to replace. An `Arc`, as a sweep holds it for as long as it
+    /// lets a tenant go: see [`Self::building_if_free`].
+    building: Arc<Mutex<()>>,
     /// Set while a restore runs, when writes are refused. Shared with a
     /// gather, which a restore ends.
     restoring: Arc<AtomicBool>,
@@ -1266,7 +1267,9 @@ pub struct MergeGate {
 /// A writer's building lock held, for whom and since when: the hold is
 /// timed as it is let go.
 struct Building<'a> {
-    _guard: MutexGuard<'a, ()>,
+    /// The lock, unless whoever asked holds it, and goes on holding it past
+    /// this: see [`Writer::flush_holding`].
+    _guard: Option<MutexGuard<'a, ()>>,
     holder: Holder,
     since: Instant,
     writer: &'a Writer,
@@ -1295,6 +1298,11 @@ impl Drop for Building<'_> {
         }
     }
 }
+
+/// A writer's building lock, held from outside the writer for as long as
+/// this is kept: see [`Writer::building_if_free`].
+#[derive(Debug)]
+pub struct BuildingHeld(OwnedMutexGuard<()>);
 
 /// How a merge that had its turn ended.
 enum Ended {
@@ -1462,7 +1470,7 @@ impl Writer {
             clock: Arc::new(SystemClock),
             writing: Mutex::new(()),
             closed: AtomicBool::new(false),
-            building: Mutex::new(()),
+            building: Arc::new(Mutex::new(())),
             restoring: Arc::default(),
             held: Arc::default(),
             format: Arc::new(AtomicU16::new(DEFAULT_MAX_FORMAT)),
@@ -1578,7 +1586,7 @@ impl Writer {
         let guard = self.building.lock().await;
         self.timed(Timed::BuildingWait(holder), asked.elapsed());
         Building {
-            _guard: guard,
+            _guard: Some(guard),
             holder,
             since: Instant::now(),
             writer: self,
@@ -2091,9 +2099,49 @@ impl Writer {
         self.flushing_held(&mut building).await.map(Some)
     }
 
+    /// The building lock, if nothing holds it or queues for it this moment,
+    /// to hold for as long as what is returned is kept. It never waits.
+    pub fn building_if_free(&self) -> Option<BuildingHeld> {
+        let guard = self.building.clone().try_lock_owned().ok()?;
+        Some(BuildingHeld(guard))
+    }
+
+    /// The building lock, once it is free, held for as long as what is
+    /// returned is kept, by a test: it holds no tenant of a node's, and so
+    /// reaches what only a sweep that finds nothing else holding one sees.
+    #[doc(hidden)]
+    pub async fn building_when_free(&self) -> BuildingHeld {
+        BuildingHeld(self.building.clone().lock_owned().await)
+    }
+
+    /// As [`Self::flush`], whatever the rows, with the building lock `held`
+    /// already, by whoever goes on holding it past this: as a node flushes a
+    /// tenant it lets go, whose lock it took as it took the tenant out, and
+    /// holds until the hold on the tenant is lost. Says how long it held the
+    /// lock for its flush, its whole build and commit, or `None` if it found
+    /// nothing to flush and so built nothing. Having no wait for the lock,
+    /// it times none.
+    pub async fn flush_holding(
+        &self,
+        held: &BuildingHeld,
+    ) -> Result<(LogPosition, Option<Duration>)> {
+        assert!(
+            Arc::ptr_eq(OwnedMutexGuard::mutex(&held.0), &self.building),
+            "a flush under another writer's building lock"
+        );
+        let mut building = Building {
+            _guard: None,
+            holder: Holder::Flush,
+            since: Instant::now(),
+            writer: self,
+            timed: true,
+        };
+        let position = self.flushing_held(&mut building).await?;
+        Ok((position, building.timed.then(|| building.held())))
+    }
+
     /// As [`Self::flush`], saying how long it waited for the building lock
-    /// and then held it: as a node times the flush it makes before it
-    /// lets a tenant go.
+    /// and then held it.
     pub async fn flush_timed(&self) -> Result<(LogPosition, FlushTimes)> {
         let asked = Instant::now();
         let mut building = self.building(Holder::Flush).await;
@@ -3434,7 +3482,7 @@ impl Writer {
         }
         self.timed(Timed::BuildingWait(Holder::MergeCommit), waited);
         let _building = Building {
-            _guard: guard,
+            _guard: Some(guard),
             holder: Holder::MergeCommit,
             since: Instant::now(),
             writer: self,
@@ -3515,7 +3563,7 @@ impl Writer {
         flush_first: FlushFirst<'_>,
     ) -> Result<Option<LogPosition>> {
         let mut building = Building {
-            _guard: guard,
+            _guard: Some(guard),
             holder: Holder::Flush,
             since: Instant::now(),
             writer: self,
@@ -3699,7 +3747,7 @@ impl Writer {
             self.timed(Timed::Merge(MergePhase::Turn), turn);
             self.timed(Timed::BuildingWait(Holder::MergePlan), waited);
             let planning = Building {
-                _guard: guard,
+                _guard: Some(guard),
                 holder: Holder::MergePlan,
                 since: Instant::now(),
                 writer: self,

@@ -179,8 +179,10 @@ pub enum Timed {
     /// A spell at the backlog: from a tenant's rows unflushed reaching the
     /// most it may hold to the commit that took it below.
     Backlog,
-    /// The flush a node makes before it lets a tenant go: its wait for
-    /// the building lock.
+    /// The flush a node makes before it lets a tenant go: its wait, from
+    /// when its sweep took the tenant out with the building lock, for one of
+    /// the flushes the sweep makes at once. One never reached waits for as
+    /// long as they are given. None if there was nothing to flush.
     LetGoFlushWait,
     /// The same flush's hold of the lock: its whole build and commit.
     LetGoFlushHeld,
